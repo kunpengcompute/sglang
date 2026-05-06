@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -184,6 +186,8 @@ def is_cpu() -> bool:
     is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
+def is_cpu_kunpeng() -> bool:
+    return is_host_cpu_arm64() and os.getenv("SGLANG_USE_CPU_KUNPENG", "0") == "1"
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
     """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""

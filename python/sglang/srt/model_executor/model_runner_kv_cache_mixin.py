@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 from __future__ import annotations
 
 import logging
@@ -28,6 +42,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
     is_npu,
+    is_cpu_kunpeng,
 )
 
 if TYPE_CHECKING:
@@ -41,6 +56,7 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cpu_kunpeng = is_cpu_kunpeng()
 
 
 class ModelRunnerKVCacheMixin:
@@ -461,6 +477,24 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+            elif _is_cpu_kunpeng:
+                from sglang.srt.hardware_backend.cpu_kunpeng.memory_pool_cpu_kunpeng import (
+                    KunpnengCPUMLATokenToKVPool,
+                )
+                logger.info(f"KunpnengCPUMLATokenToKVPool")
+                self.token_to_kv_pool = KunpnengCPUMLATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    tp_rank=self.tp_rank % get_attention_tp_size(),
+                )
             else:
                 self.token_to_kv_pool = MLATokenToKVPool(
                     self.max_total_num_tokens,
@@ -595,6 +629,19 @@ class ModelRunnerKVCacheMixin:
                 )
 
                 self.token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                    need_sort=need_sort,
+                )
+            if _is_cpu_kunpeng:
+                from sglang.srt.hardware_backend.cpu_kunpeng.allocator_kunpeng import (
+                    KunpengPagedTokenToKVPoolAllocator,
+                )
+                logger.info(f"KunpengPagedTokenToKVPoolAllocator")
+                self.token_to_kv_pool_allocator = KunpengPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,

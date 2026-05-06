@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -833,7 +835,11 @@ def _set_envs_and_config(server_args: ServerArgs):
         signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
 
     # Set mp start method
-    mp.set_start_method("spawn", force=True)
+    if (os.getenv("SGLANG_USE_CPU_KUNPENG", "0") == "1"):
+        logger.info("Using start method: fork")
+        mp.set_start_method("fork", force=True)
+    else:
+        mp.set_start_method("spawn", force=True)
 
 
 def _wait_for_scheduler_ready(

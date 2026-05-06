@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -85,6 +87,7 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_group,
+    get_attention_tp_size,
     initialize_dp_attention,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -123,6 +126,8 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
+
+from sglang.srt.hardware_backend.cpu_kunpeng.kunpeng_cpu_runner import KunpengModelRunner
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -150,6 +155,7 @@ from sglang.srt.utils import (
     is_hip,
     is_host_cpu_arm64,
     is_npu,
+    is_cpu_kunpeng,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     require_attn_tp_gather,
@@ -178,6 +184,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_cpu_kunpeng = is_cpu_kunpeng()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
@@ -358,7 +365,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         global_server_args.use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
-        if self.device == "cpu":
+        if self.device == "cpu" and not _is_cpu_kunpeng:
             self.init_threads_binding()
 
         # Get memory before model loading
@@ -551,6 +558,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
+        if _is_cpu_kunpeng:
+            from sgl_kernel.cpu_kunpeng.shm_tools import KunpengShmConnector
+
+            local_rank = self.tp_rank % get_attention_tp_size()
+            self.kp_shm_connector = KunpengShmConnector(local_rank)
+            logger.info("Detected Kunpeng device. Enabling KunpengModelRunner.")
         # Init memory pool and attention backends
         self.init_memory_pool(min_per_gpu_memory)
 
@@ -580,6 +593,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
+
+        if _is_cpu_kunpeng:
+            self.kunpeng_model_runner = KunpengModelRunner(self.kp_shm_connector)
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
@@ -737,7 +753,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                if _is_cpu_amx_available or _is_cpu_arm64:
+                if _is_cpu_amx_available:
                     # Bind OpenMP threads to CPU cores
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
@@ -2302,10 +2318,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
-        if forward_batch.global_num_tokens_cpu is not None:
-            forward_batch.prepare_mlp_sync_batch(self)
-        else:
-            forward_batch.prepare_attn_tp_scatter_input(self)
+        if not _is_cpu_kunpeng:
+            if forward_batch.global_num_tokens_cpu is not None:
+                forward_batch.prepare_mlp_sync_batch(self)
+            else:
+                forward_batch.prepare_attn_tp_scatter_input(self)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (
@@ -2317,6 +2334,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,
             )
+
+        if _is_cpu_kunpeng:
+            logger.debug("Running on Kunpeng device %s", forward_batch)
+            ret = self.kunpeng_model_runner.forward(forward_batch)
+        return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

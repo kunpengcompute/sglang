@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -41,7 +43,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed, is_cpu_kunpeng
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -286,6 +288,7 @@ class TpModelWorker(BaseTpWorker):
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.model_runner.max_token_pool_size - 1,
+            4096,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert (
@@ -484,9 +487,14 @@ class TpModelWorker(BaseTpWorker):
 
             if not model_worker_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
-                batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
-                )
+                if is_cpu_kunpeng() and forward_batch.batch_size != 0:
+                    kp_shm_connector = self.model_runner.kp_shm_connector
+                    out_tensor = kp_shm_connector.get_greedy_tokens(forward_batch.batch_size)
+                    batch_result.next_token_ids = out_tensor
+                else:
+                    batch_result.next_token_ids = self.model_runner.sample(
+                        logits_output, forward_batch
+                    )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens

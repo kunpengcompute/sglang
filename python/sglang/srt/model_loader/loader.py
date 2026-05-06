@@ -1,5 +1,18 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/model_loader/loader.py
-
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 from __future__ import annotations
 
 # ruff: noqa: SIM117
@@ -108,6 +121,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
     is_npu,
+    is_cpu_kunpeng,
     is_pin_memory_available,
     rank0_log,
     set_weight_attrs,
@@ -119,6 +133,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
+_is_cpu_kunpeng = is_cpu_kunpeng()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
 # which contains the complete mapping of quantization config choices
 
@@ -658,6 +673,10 @@ class DefaultModelLoader(BaseModelLoader):
                     model_config,
                     self.load_config,
                 )
+
+            # TODO: kunpeng cpu场景下 调用cpu算子加载权重，sglang不需要加载权重
+            if(_is_cpu_kunpeng):
+                return model.eval()
 
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device

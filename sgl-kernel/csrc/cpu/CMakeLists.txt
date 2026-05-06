@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(sgl_kernel)
 
@@ -84,12 +98,21 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
-add_compile_options(
-    -O3
-    -Wno-unknown-pragmas
-    -march=native
-    -fopenmp
-)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    add_compile_options(
+        -O3
+        -Wno-unknown-pragmas
+        -march=armv8.2-a+fp16
+        -fopenmp
+    )
+else()
+    add_compile_options(
+        -O3
+        -Wno-unknown-pragmas
+        -march=native
+        -fopenmp
+    )
+endif()
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})

@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -198,6 +200,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
+    is_cpu_kunpeng,
 )
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -214,6 +217,7 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
+_is_cpu_kunpeng = is_cpu_kunpeng()
 
 @dataclass
 class EmbeddingBatchResult:
@@ -1340,6 +1344,7 @@ class Scheduler(
                 else 1 << 30
             ),
             self.max_req_len - len(req.origin_input_ids) - 1,
+            4096,
         )
 
     def _process_and_broadcast_mm_inputs(
@@ -2914,9 +2919,16 @@ def run_scheduler_process(
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(
-            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
-        )
+        if _is_cpu_kunpeng:
+            p = psutil.Process(os.getpid())
+            attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
+            # TODO (kunpeng): hard code here, should use a more elegant way.
+            bind_cpu_ids = list(range((attn_tp_rank + 1) * 38 - 3, (attn_tp_rank + 1) * 38 - 2))
+            p.cpu_affinity(bind_cpu_ids)
+        else:
+            set_gpu_proc_affinity(
+                server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+            )
     if (
         numa_node := server_args.numa_node
     ) is not None and not envs.SGLANG_NUMA_BIND_V2.get():
@@ -2962,6 +2974,15 @@ def run_scheduler_process(
             )
 
         pipe_writer.send(result_dict)
+
+        # Isolate the main process from communication threads
+        # assign core 36 on each NUMA node exclusively to the main process.
+        if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+            if _is_cpu_kunpeng:
+                p = psutil.Process(os.getpid())
+                attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
+                # TODO (kunpeng): hard code here, should use a more elegant way.
+                p.cpu_affinity([(attn_tp_rank + 1) * 38 - 2])
 
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode

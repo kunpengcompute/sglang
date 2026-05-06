@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -57,6 +59,8 @@ from sglang.srt.utils.common import (
     configure_ipv6,
     configure_logger,
     get_zmq_socket,
+    get_bool_env_var,
+    is_cpu_kunpeng,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
@@ -548,6 +552,16 @@ def run_data_parallel_controller_process(
     pipe_writer,
     run_scheduler_process_func: Callable = run_scheduler_process,
 ):
+    # Set cpu affinity to this process
+    # Currently, the detokenizer is pinned to logical core 0 (physical core 152) on NUMA node 5.
+    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+        if is_cpu_kunpeng():
+            import os
+            pid = os.getpid()
+            p = psutil.Process(pid)
+            # TODO (kunpeng): hard code here, should use a more elegant way.
+            p.cpu_affinity([152])
+
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     kill_itself_when_parent_died()
