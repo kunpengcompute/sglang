@@ -569,6 +569,9 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # CPU(Kunpeng 920F)
+    SGLANG_USE_CPU_920F = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

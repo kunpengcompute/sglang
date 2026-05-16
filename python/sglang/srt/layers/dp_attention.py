@@ -29,7 +29,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, is_cpu_920f
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -48,6 +48,7 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_is_cpu_920f = is_cpu_920f()
 
 
 class DpPaddingMode(IntEnum):
@@ -443,6 +444,38 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
+def memcpy_920f(dst: torch.Tensor, src: torch.Tensor, dim: int,
+               offset: int, sz: int, offset_src: bool):
+    """
+    将 memcpy_triton 的 GPU kernel 逻辑用 CPU 张量操作实现。
+    参数含义与原函数完全一致：
+        dst, src: 目标与源张量
+        dim: 必须为 0（仅支持在第一个维度上进行偏移拷贝）
+        offset: 第一维上的偏移量（以“第一维元素”为单位，即跳过 offset 个第一维元素）
+        sz: 要拷贝的第一维元素个数
+        offset_src: True 表示从 src 的偏移处拷贝到 dst 开头；
+                    False 表示从 src 开头拷贝到 dst 的偏移处
+    """
+    assert dim == 0, "dim != 0 unsupported"
+    assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape[1:]"
+
+    # 每个第一维元素所包含的标量个数
+    chunk_size = src[0].numel()  # 等价于 prod(src.shape[1:])
+
+    # 转换为标量级别的起始位置和拷贝长度
+    start = offset * chunk_size
+    length = sz * chunk_size
+
+    # 平坦化为 1D 视图（不复制数据），便于按标量偏移拷贝
+    src_flat = src.reshape(-1)
+    dst_flat = dst.reshape(-1)
+
+    if offset_src:
+        dst_flat[:length].copy_(src_flat[start:start + length])
+    else:
+        dst_flat[start:start + length].copy_(src_flat[:length])
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -450,6 +483,11 @@ def _dp_gather_via_all_reduce(
     is_partial: bool,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+
+    if _is_cpu_920f:
+        # 将 0 维 CPU 张量转为 Python int
+        start = local_start_pos.item()
+        num   = local_num_tokens.item()
 
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
@@ -460,9 +498,12 @@ def _dp_gather_via_all_reduce(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        memcpy_triton(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
-        )
+        if _is_cpu_920f:
+            memcpy_920f(global_tokens, local_tokens, 0, start, num, False)
+        else:
+            memcpy_triton(
+                global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+            )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
@@ -539,6 +580,11 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
+    if _is_cpu_920f:
+        # 将 0 维 CPU 张量转为 Python int
+        start = local_start_pos.item()
+        num   = local_num_tokens.item()
+
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
@@ -547,9 +593,12 @@ def dp_scatter(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
 
-        memcpy_triton(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
-        )
+        if _is_cpu_920f:
+            memcpy_920f(local_tokens, global_tokens, 0, start, num, True)
+        else:
+            memcpy_triton(
+                local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+            )
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):

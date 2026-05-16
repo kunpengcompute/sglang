@@ -1474,6 +1474,7 @@ class DeepseekV2AttentionMLA(
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        attn_forward_method = AttnForwardMethod.MLA
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator

@@ -102,6 +102,7 @@ if _use_aiter:
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
+logger = logging.getLogger(__name__)
 
 def _fused_rmsnorm_fp8_per_token_quant(
     hidden_states: torch.Tensor,
@@ -804,7 +805,12 @@ class CommunicateSimpleFn:
         output_mode: ScatterMode,
         context: CommunicateContext,
     ):
+        if get_attention_tp_rank() == 0:
+            logger.info(f"[prepare_attn] layer_input_mode: {input_mode} attn_mode: {output_mode}")
+
         if context.is_same_group_size(input_mode, output_mode):
+            if get_attention_tp_rank() == 0:
+                logger.info("[prepare_attn] fn: _trivial")
             return CommunicateSimpleFn._trivial
 
         if (input_mode == ScatterMode.SCATTERED) and (
@@ -812,6 +818,8 @@ class CommunicateSimpleFn:
         ):
             if _use_ag_after_qlora:
                 return CommunicateSimpleFn._trivial
+            if get_attention_tp_rank() == 0:
+                logger.info("[prepare_attn] fn: attn_tp_all_gather_into_tensor")
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
@@ -877,6 +885,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
         residual_output_mode: ScatterMode,
         context: CommunicateContext,
     ):
+        if get_attention_tp_rank() == 0:
+            logger.info(f"[prepare_mlp] mlp_mode: {hidden_states_output_mode} middle_residual_mode: {residual_output_mode}")
 
         if (
             context.is_same_group_size(
@@ -885,6 +895,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
+            if get_attention_tp_rank() == 0:
+                logger.info(f"[prepare_mlp] fn: _simple")
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
         if (
@@ -895,6 +907,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (hidden_states_output_mode == ScatterMode.FULL)
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):
+            if get_attention_tp_rank() == 0:
+                logger.info("[prepare_mlp] fn: dp_gather_partial + dp_scatter")
             return partial(
                 CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
                 residual_input_mode=residual_input_mode,
@@ -921,6 +935,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (hidden_states_output_mode == ScatterMode.SCATTERED)
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
+            if get_attention_tp_rank() == 0:
+                logger.info("[prepare_mlp] fn: attn_tp_reduce_scatter_tensor")
             return partial(
                 CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
                 residual_input_mode=residual_input_mode,
@@ -1153,9 +1169,14 @@ class CommunicateSummableTensorPairFn:
         output_mode: ScatterMode,
         context: CommunicateContext,
     ):
+        if get_attention_tp_rank() == 0:
+            logger.info(f"[postprocess_layer] layer_output_mode: {output_mode}")
+
         if context.is_same_group_size(
             hidden_states_input_mode, output_mode
         ) and context.is_same_group_size(residual_input_mode, output_mode):
+            if get_attention_tp_rank() == 0:
+                logger.info("[postprocess_layer] fn: _trivial")
             return CommunicateSummableTensorPairFn._trivial
 
         if (
@@ -1163,6 +1184,8 @@ class CommunicateSummableTensorPairFn:
             and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
         ):
+            if get_attention_tp_rank() == 0:
+                logger.info("[postprocess_layer] fn: dp_reduce_scatter_tensor / dp_scatter")
             return CommunicateSummableTensorPairFn._scatter_hidden_states
 
         if (
@@ -1170,6 +1193,8 @@ class CommunicateSummableTensorPairFn:
             and (residual_input_mode == ScatterMode.SCATTERED)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
         ):
+            if get_attention_tp_rank() == 0:
+                logger.info("[postprocess_layer] fn: attn_tp_all_gather_into_tensor")
             return CommunicateSummableTensorPairFn._gather
 
         if (
@@ -1177,6 +1202,8 @@ class CommunicateSummableTensorPairFn:
             and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
             and (output_mode == ScatterMode.SCATTERED)
         ):
+            if get_attention_tp_rank() == 0:
+                logger.info("[postprocess_layer] fn: _scatter")
             return CommunicateSummableTensorPairFn._scatter
 
         if (

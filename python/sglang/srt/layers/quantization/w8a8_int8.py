@@ -159,10 +159,11 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
-            _amx_process_weight_after_loading(layer, ["weight"])
+            # assert (
+            #     _is_cpu_amx_available
+            # ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
+            # _amx_process_weight_after_loading(layer, ["weight"])
+            layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         else:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
@@ -218,6 +219,17 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
         output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
+
+        def int8_scaled_mm(x_q, w_q, x_scale, w_scale, out_dtype, bias=None):
+            # fix mlp gate_up_proj
+            output_fp32 = torch.mm(x_q.float(), w_q.float())
+            output_float = output_fp32 * x_scale * w_scale.t()
+            
+            output = output_float.to(out_dtype)
+            if bias is not None:
+                output += bias
+                
+            return output
 
         output = int8_scaled_mm(
             x_q_2d,
@@ -311,10 +323,12 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
-            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            # assert (
+            #     _is_cpu_amx_available
+            # ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
+            # _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         else:
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
             layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
@@ -376,6 +390,64 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
+        
+        import torch.nn.functional as F
+
+        topk_weights, topk_ids, _ = topk_output
+
+        # 初始化输出 Tensor，全 0
+        output = torch.zeros_like(x)
+        num_experts = layer.w13_weight.shape[0]
+        apply_on_input = self.moe_runner_config.apply_router_weight_on_input
+        dtype = x.dtype
+
+        # 遍历每一个 Expert
+        for expert_idx in range(num_experts):
+            # 找到被路由到当前 expert 的所有 token 索引及其对应的 top_k 索引
+            token_indices, k_indices = torch.where(topk_ids == expert_idx)
+            
+            # 如果没有 token 被路由到这个 expert，直接跳过
+            if token_indices.numel() == 0:
+                continue
+
+            # 提取属于当前 expert 的 tokens 及其路由权重
+            tokens = x[token_indices]
+            weights = topk_weights[token_indices, k_indices].unsqueeze(-1).to(dtype)
+
+            # DeepSeek 等模型：路由权重乘在输入上
+            if apply_on_input:
+                tokens = tokens * weights
+
+            # 提取当前 expert 的权重并对齐数据类型 (避免 fp16/bf16 类型不匹配)
+            w13 = layer.w13_weight[expert_idx].to(dtype)
+            w2 = layer.w2_weight[expert_idx].to(dtype)
+
+            # --- [可选] 如果你使用了 INT8 权重，可以在这里进行反量化 (Dequantize) ---
+            # 如果没开启量化或者 ARM 上跑的是 fp16/bf16，这部分可以忽略
+            if getattr(layer, "w13_weight_scale", None) is not None:
+                w13 = w13 * layer.w13_weight_scale[expert_idx].to(dtype)
+            if getattr(layer, "w2_weight_scale", None) is not None:
+                w2 = w2 * layer.w2_weight_scale[expert_idx].to(dtype)
+
+            # 1. 线性变换：W13 (融合了 Gate proj 和 Up proj)
+            # 结果形状通常为 (num_routed_tokens, 2 * intermediate_size)
+            h = F.linear(tokens, w13)
+
+            # 2. 激活函数：SwiGLU (切分为 gate 和 up 两部分)
+            h_gate, h_up = h.chunk(2, dim=-1)
+            h_act = F.silu(h_gate) * h_up
+
+            # 3. 线性变换：W2 (Down proj)
+            expert_out = F.linear(h_act, w2)
+
+            # Mixtral 等模型：路由权重乘在输出上
+            if not apply_on_input:
+                expert_out = expert_out * weights
+
+            # 将当前 expert 的计算结果累加回原先的 token 位置中
+            output.index_add_(0, token_indices, expert_out)
+
+        return StandardCombineInput(hidden_states=output)
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)

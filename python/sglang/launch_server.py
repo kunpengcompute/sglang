@@ -8,6 +8,7 @@ import warnings
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import suppress_noisy_warnings
+from sglang.srt.environ import envs
 
 suppress_noisy_warnings()
 
@@ -46,6 +47,12 @@ def run_server(server_args):
     else:
         # Default mode: HTTP mode.
         from sglang.srt.entrypoints.http_server import launch_server
+
+        if envs.SGLANG_SET_CPU_AFFINITY.get():
+            if envs.SGLANG_USE_CPU_920F.get():
+                import psutil
+                p = psutil.Process(os.getpid())
+                p.cpu_affinity(list(range(0, 2)))
 
         launch_server(server_args)
 

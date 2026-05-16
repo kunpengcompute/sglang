@@ -284,3 +284,6 @@ class TorchNativeAttnBackend(AttentionBackend):
 
     def support_triton(self):
         return False
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 0

@@ -53,6 +53,7 @@ from sglang.srt.utils.common import (
     configure_logger,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
+    is_cpu_920f,
 )
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -68,6 +69,7 @@ logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
+_is_cpu_920f = is_cpu_920f()
 
 class LoadBalanceMethod(Enum):
     """Load balance method."""
@@ -626,6 +628,15 @@ def run_data_parallel_controller_process(
     pipe_writer,
     run_scheduler_process_func: Callable = run_scheduler_process,
 ):
+    # Set cpu affinity to this process
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
+        if _is_cpu_920f:
+            import os
+            p = psutil.Process(os.getpid())
+            # TODO (kunpeng): hard code here, should use a more elegant way.
+            p.cpu_affinity(list(range(38, 40)))
+            logger.info(os.sched_getaffinity(os.getpid()))
+
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     kill_itself_when_parent_died()
