@@ -8,7 +8,7 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
-DEFAULT_MOE_PADDING_SIZE = 32
+DEFAULT_MOE_PADDING_SIZE = 1
 
 
 if TYPE_CHECKING:
