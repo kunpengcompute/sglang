@@ -35,6 +35,7 @@ from sglang.srt.utils.common import (
     get_device,
     is_hip,
 )
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -108,6 +109,7 @@ class StandardDispatcher(BaseDispatcher):
         self.local_expert_mapping = None
         self.expert_mask_gpu = None
 
+    @KunpengProfiler(depth=2)
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
@@ -213,6 +215,7 @@ class StandardDispatcher(BaseDispatcher):
             topk_output=topk_output,
         )
 
+    @KunpengProfiler(depth=2)
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
         if should_use_flashinfer_cutlass_moe_fp4_allgather():

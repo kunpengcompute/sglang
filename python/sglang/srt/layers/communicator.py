@@ -77,6 +77,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
 )
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
@@ -497,6 +498,7 @@ class LayerCommunicator:
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
 
+    @KunpengProfiler
     def prepare_attn(
         self,
         hidden_states: torch.Tensor,
@@ -663,6 +665,7 @@ class LayerCommunicator:
             ]
         return output, residual
 
+    @KunpengProfiler
     def prepare_mlp(
         self,
         hidden_states: torch.Tensor,
@@ -681,6 +684,7 @@ class LayerCommunicator:
             context=self._context,
         )
 
+    @KunpengProfiler
     def postprocess_layer(
         self,
         hidden_states: torch.Tensor,

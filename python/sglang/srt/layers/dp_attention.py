@@ -30,6 +30,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, is_cpu_920f
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -476,6 +477,7 @@ def memcpy_920f(dst: torch.Tensor, src: torch.Tensor, dim: int,
         dst_flat[start:start + length].copy_(src_flat[:length])
 
 
+@KunpengProfiler(depth=1)
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -519,6 +521,7 @@ def _dp_gather_via_all_reduce(
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
+@KunpengProfiler(depth=1)
 def _dp_gather_via_all_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -570,7 +573,7 @@ def dp_gather_replicate(
 ):
     _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
 
-
+@KunpengProfiler(depth=1)
 def dp_scatter(
     local_tokens: torch.Tensor,  # output
     global_tokens: torch.Tensor,  # input
@@ -601,6 +604,7 @@ def dp_scatter(
             )
 
 
+@KunpengProfiler(depth=1)
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
         get_tp_group().reduce_scatter_tensor(output, input)
@@ -612,6 +616,7 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
         get_attention_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
 
 
+@KunpengProfiler(depth=1)
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_tp_group().reduce_scatter_tensor(output, input)
 
@@ -624,6 +629,7 @@ def attn_tp_all_reduce(input: torch.Tensor):
     return get_attention_tp_group().all_reduce(input)
 
 
+@KunpengProfiler(depth=1)
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_tp_group().all_gather_into_tensor(output, input)
 
