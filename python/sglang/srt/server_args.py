@@ -66,6 +66,7 @@ from sglang.srt.utils.common import (
     parse_connector_type,
     torch_release,
     xpu_has_xmx_support,
+    is_kunpeng_binary_launch,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
@@ -74,6 +75,8 @@ from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+_is_kunpeng_binary_launch = is_kunpeng_binary_launch()
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -159,6 +162,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "kunpeng_920f",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
@@ -471,6 +475,7 @@ class ServerArgs:
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
+    tp_rank_in_node: int = 0
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
@@ -5152,6 +5157,9 @@ class ServerArgs:
         parser.add_argument(
             "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
         )
+        parser.add_argument(
+            "--tp-rank-in-node", type=int, default=ServerArgs.tp_rank_in_node, help="The tp rank in node."
+        )
 
         # Model override args
         parser.add_argument(
@@ -7370,21 +7378,30 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                assert worker_ports is not None
-                scheduler_input_port = worker_ports[dp_rank]
+                if _is_kunpeng_binary_launch and server_args.tp_rank_in_node>=1:
+                    scheduler_input_port = port_base + 4 + 1 + dp_rank
+                else:
+                    assert worker_ports is not None
+                    scheduler_input_port = worker_ports[dp_rank]
 
             try:
                 if dp_rank is None:
-                    wait_port_available(dist_init_port, "dist_init_port")
-                    wait_port_available(port_base, "port_base")
-                    wait_port_available(detokenizer_port, "detokenizer_port")
-                    wait_port_available(nccl_port, "nccl_port")
-                    wait_port_available(rpc_port, "rpc_port")
-                    wait_port_available(metrics_port, "metrics_port")
+                    if _is_kunpeng_binary_launch and server_args.tp_rank_in_node>=1:
+                        pass
+                    else:
+                        wait_port_available(dist_init_port, "dist_init_port")
+                        wait_port_available(port_base, "port_base")
+                        wait_port_available(detokenizer_port, "detokenizer_port")
+                        wait_port_available(nccl_port, "nccl_port")
+                        wait_port_available(rpc_port, "rpc_port")
+                        wait_port_available(metrics_port, "metrics_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
-                    wait_port_available(scheduler_input_port, "scheduler_input_port")
+                    if _is_kunpeng_binary_launch and server_args.tp_rank_in_node>=1:
+                        pass
+                    else:
+                        wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
                     f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"

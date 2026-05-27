@@ -3870,9 +3870,9 @@ def configure_scheduler_process(
         if _is_cpu_920f:
             p = psutil.Process(os.getpid())
             attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
-            bind_cpu_ids = list(range((attn_tp_rank + 1) * 38 - 5, (attn_tp_rank + 1) * 38))
+            # TODO (kunpeng): hard code here, should use a more elegant way.
+            bind_cpu_ids = list(range(attn_tp_rank * 38 + 1, attn_tp_rank * 38 + 33))  # 1~32
             p.cpu_affinity(bind_cpu_ids)
-            # numa_bind_to_node(attn_tp_rank)
             logger.info(os.sched_getaffinity(os.getpid()))
         else:
             set_gpu_proc_affinity(
@@ -3938,7 +3938,8 @@ def run_scheduler_process(
         )
 
         # Send initialization info back to the parent process
-        pipe_writer.send(scheduler.get_init_info())
+        if pipe_writer is not None:
+            pipe_writer.send(scheduler.get_init_info())
 
         # Isolate the main process from communication threads
         # assign core 36 on each NUMA node exclusively to the main process.
@@ -3947,7 +3948,7 @@ def run_scheduler_process(
                 p = psutil.Process(os.getpid())
                 attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
                 # TODO (kunpeng): hard code here, should use a more elegant way.
-                p.cpu_affinity([(attn_tp_rank + 1) * 38 - 4])
+                p.cpu_affinity({attn_tp_rank * 38 + 35}) # 35
 
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()

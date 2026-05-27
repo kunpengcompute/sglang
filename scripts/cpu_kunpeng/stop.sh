@@ -1,7 +1,6 @@
 #!/bin/bash
 # Usage: ./stop.sh [prefill|decode|native]
 
-# set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
     echo "Usage: $0 [prefill|decode|native]" >&2
@@ -19,7 +18,7 @@ cd "$SCRIPT_DIR"
 
 # Source config for the specified role
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-source env.sh "$ROLE"
+source ./env.sh "$ROLE"
 
 # Convert space-separated IP list to array
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"

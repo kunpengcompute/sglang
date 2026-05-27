@@ -54,6 +54,7 @@ from sglang.srt.utils.common import (
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
     is_cpu_920f,
+    is_kunpeng_binary_launch,
 )
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -70,6 +71,7 @@ logger = logging.getLogger(__name__)
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
 _is_cpu_920f = is_cpu_920f()
+_is_kunpeng_binary_launch = is_kunpeng_binary_launch()
 
 class LoadBalanceMethod(Enum):
     """Load balance method."""
@@ -143,9 +145,12 @@ class DataParallelController:
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >=1 :
+                pass
+            else:
+                self.recv_from_tokenizer = get_zmq_socket(
+                    self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -268,12 +273,15 @@ class DataParallelController:
             )
 
             if server_args.node_rank == 0:
-                self.workers[dp_rank] = get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    tmp_port_args.scheduler_input_ipc_name,
-                    True,
-                )
+                if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+                    pass
+                else:
+                    self.workers[dp_rank] = get_zmq_socket(
+                        self.context,
+                        zmq.PUSH,
+                        tmp_port_args.scheduler_input_ipc_name,
+                        True,
+                    )
 
         # Free all sockets before starting the threads to launch TP workers
         for sock in sockets:
@@ -330,12 +338,18 @@ class DataParallelController:
 
         if server_args.node_rank == 0:
             # Node 0: Broadcast worker ports to all other nodes
-            return self._broadcast_ports_as_server(
-                endpoint, server_args.nnodes - 1, worker_ports
-            )
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+                return []
+            else:
+                return self._broadcast_ports_as_server(
+                    endpoint, server_args.nnodes - 1, worker_ports
+                )
         else:
             # Other nodes: Receive worker ports from node 0
-            return self._receive_ports_as_client(endpoint, server_args.node_rank)
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+                return []
+            else:
+                return self._receive_ports_as_client(endpoint, server_args.node_rank)
 
     def _broadcast_ports_as_server(
         self, endpoint: str, expected_clients: int, worker_ports: List[int]
@@ -426,18 +440,21 @@ class DataParallelController:
         # Pre-allocate worker ports on node 0 to avoid conflicts
         worker_ports = []
         if server_args.node_rank == 0:
-            for dp_rank in range(server_args.dp_size):
-                worker_port, worker_socket = get_zmq_socket_on_host(
-                    self.context, zmq.PUSH, host=bind_host
-                )
-                worker_ports.append(worker_port)
-                self.workers[dp_rank] = worker_socket
-                logger.debug(
-                    "Assigned port %s to worker %s on host %s",
-                    worker_port,
-                    dp_rank,
-                    bind_host,
-                )
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+                pass
+            else:
+                for dp_rank in range(server_args.dp_size):
+                    worker_port, worker_socket = get_zmq_socket_on_host(
+                        self.context, zmq.PUSH, host=bind_host
+                    )
+                    worker_ports.append(worker_port)
+                    self.workers[dp_rank] = worker_socket
+                    logger.debug(
+                        "Assigned port %s to worker %s on host %s",
+                        worker_port,
+                        dp_rank,
+                        bind_host,
+                    )
 
         broadcasted_ports = self._broadcast_worker_ports(
             server_args, worker_ports if worker_ports else None
@@ -472,10 +489,16 @@ class DataParallelController:
 
         nnodes_per_tp_group = nnodes_per_pp_rank
         tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
-        )
+        if _is_kunpeng_binary_launch:
+            tp_rank_range = range(
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node,
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node + 1,
+            )
+        else:
+            tp_rank_range = range(
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+            )
 
         attn_cp_rank = 0
         moe_dp_rank = 0
@@ -634,7 +657,7 @@ def run_data_parallel_controller_process(
             import os
             p = psutil.Process(os.getpid())
             # TODO (kunpeng): hard code here, should use a more elegant way.
-            p.cpu_affinity(list(range(38, 40)))
+            p.cpu_affinity({74}) # 36
             logger.info(os.sched_getaffinity(os.getpid()))
 
     setproctitle.setproctitle("sglang::data_parallel_controller")
@@ -668,7 +691,10 @@ def run_data_parallel_controller_process(
             }
         )
         if server_args.node_rank == 0:
-            controller.event_loop()
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >=1 :
+                pass
+            else:
+                controller.event_loop()
         for proc in controller.scheduler_procs:
             proc.join()
             logger.error(

@@ -57,8 +57,6 @@ CONDA_ENV_NAME="my_env"
 CONDA_SH_PATH="/path-to-conda-start-sh"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
 
-# Parallelism settings
-TP_SIZE=256
 
 # ------------------------------------------------------------
 # Function: prefill_config
@@ -106,7 +104,10 @@ native_config() {
 # ------------------------------------------------------------
 # Main: dispatch based on command-line argument
 # ------------------------------------------------------------
-case "$1" in
+ACTION="$1"
+shift
+
+case "$ACTION" in
     prefill)
         prefill_config
         ;;
@@ -123,7 +124,8 @@ case "$1" in
 esac
 
 export CONDA_ACTIVATE_CMD
-export TP_SIZE
+export TP_SIZE=256
+export EP_SIZE=1
 
 # Communication
 export GLOO_SOCKET_IFNAME=enp26s0f0
@@ -131,6 +133,9 @@ export GLOO_SOCKET_IFNAME=enp26s0f0
 # Thread
 export OMP_NUM_THREADS=1
 export OMP_PROC_BIND=close
+export TORCH_USE_KUPL=0
+export KUPL_EXECUTOR_BACKEND=pthread
+export KUPL_EXECUTOR_COUNT=32
 export TORCH_COMPILE_DISABLE=1
 export SGLANG_ENABLE_TORCH_COMPILE=0
 
@@ -143,10 +148,11 @@ export SGLANG_WARMUP_TIMEOUT=1600
 
 # Kunpeng
 export SGLANG_USE_CPU_920F=1
+export SGLANG_KUNPENG_PROFILE=0
+export SGLANG_ENABLE_BINARY_LAUNCH=1
+export SGLANG_ENABLE_KUTACC_COMM_OPS=0
 
 # Optional
-# export OpenBLAS_HOME=/path-to-openblas
-# export LD_LIBRARY_PATH=${OpenBLAS_HOME}/lib:$LD_LIBRARY_PATH
 # HPCKIT_PATH=/path-to-HPCKit
 # source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 # source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh

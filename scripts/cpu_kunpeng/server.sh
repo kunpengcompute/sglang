@@ -1,18 +1,19 @@
 #!/bin/bash
 # server.sh - Single node execution for SGLang (prefill or decode).
-# Usage: ./server.sh <role> <rank>
+# Usage: ./server.sh <role> <dp_rank> <log_path>
 
-if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <role> <rank>" >&2
+if [[ $# -lt 3 ]]; then
+    echo "Usage: $0 <role> <dp_rank> <log_path>" >&2
     exit 1
 fi
 
 ROLE="$1"
-RANK="$2"
+DP_RANK="$2"
+LOG_PATH="$3"
 IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 
 # Source environment config (exports CONDA_ACTIVATE_CMD, PYTHON_SCRIPT, etc.)
-source env.sh "$ROLE"
+source ./env.sh "$ROLE"
 
 # Activate conda
 eval "$CONDA_ACTIVATE_CMD"
@@ -23,18 +24,18 @@ BASE_ARGS=(
     --device cpu
     --trust-remote-code
     --host "$IP"
-    --port 30001
     --dist-init-addr "$MASTER_ADDR:$MASTER_PORT"
     --nnodes "$WORLD_SIZE"
-    --node-rank "$RANK"
+    --node-rank "$DP_RANK"
     --dist-timeout 600
     --enable-dp-attention
     --dp-size "$WORLD_SIZE"
     --tp-size "$TP_SIZE"
+    --ep-size "$EP_SIZE"
     --page-size 1
     --mem-fraction-static 0.88
     --chunked-prefill-size -1
-#    --skip-server-warmup
+    --skip-server-warmup
     --disable-custom-all-reduce
     --disable-radix-cache
     --disable-overlap-schedule
@@ -84,4 +85,15 @@ case "$ROLE" in
 esac
 
 # Combine and execute
-python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}"
+if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
+    for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
+        python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
+          --tp-rank-in-node ${ATTN_TP_RANK} \
+          --port $((30000 + ATTN_TP_RANK)) \
+          > "${LOG_PATH}/${DP_RANK}_${ATTN_TP_RANK}_$IP.log" 2>&1 &
+    done
+else
+    python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
+      --port 30000 \
+      > "$LOG_PATH/${DP_RANK}_$IP.log" 2>&1
+fi

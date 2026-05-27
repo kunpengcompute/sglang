@@ -84,6 +84,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.data_parallel_controller import DataParallelController
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -99,6 +100,7 @@ from sglang.srt.utils import (
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
+    is_kunpeng_binary_launch
 )
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -110,7 +112,7 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
-
+_is_kunpeng_binary_launch = is_kunpeng_binary_launch()
 
 @dataclasses.dataclass
 class SchedulerInitResult:
@@ -223,9 +225,12 @@ class Engine(EngineScoreMixin, EngineBase):
         # Initialize ZMQ sockets
         context = zmq.Context(2)
         if self.server_args.node_rank == 0:
-            self.send_to_rpc = get_zmq_socket(
-                context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-            )
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+                pass
+            else:
+                self.send_to_rpc = get_zmq_socket(
+                    context, zmq.DEALER, self.port_args.rpc_ipc_name, True
+                )
         else:
             self.send_to_rpc = None
 
@@ -601,17 +606,20 @@ class Engine(EngineScoreMixin, EngineBase):
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
-            proc = mp.Process(
-                target=run_data_parallel_controller_process,
-                kwargs=dict(
-                    server_args=server_args,
-                    port_args=port_args,
-                    pipe_writer=writer,
-                    run_scheduler_process_func=run_scheduler_process_func,
-                ),
-            )
-            proc.start()
-            scheduler_procs.append(proc)
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+                DataParallelController(server_args, port_args, run_scheduler_process_func)
+            else:
+                proc = mp.Process(
+                    target=run_data_parallel_controller_process,
+                    kwargs=dict(
+                        server_args=server_args,
+                        port_args=port_args,
+                        pipe_writer=writer,
+                        run_scheduler_process_func=run_scheduler_process_func,
+                    ),
+                )
+                proc.start()
+                scheduler_procs.append(proc)
 
         all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
@@ -713,10 +721,26 @@ class Engine(EngineScoreMixin, EngineBase):
         if server_args.node_rank >= 1:
             # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
             # so they can just wait here.
-            scheduler_init_result.wait_for_ready()
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+                pass
+            else:
+                scheduler_init_result.wait_for_ready()
 
-            if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
-                # When using `Engine` as a Python API, we don't want to block here.
+                if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
+                    # When using `Engine` as a Python API, we don't want to block here.
+                    return (
+                        None,
+                        None,
+                        port_args,
+                        scheduler_init_result,
+                        None,
+                    )
+
+                launch_dummy_health_check_server(
+                    server_args.host, server_args.port, server_args.enable_metrics
+                )
+
+                scheduler_init_result.wait_for_completion()
                 return (
                     None,
                     None,
@@ -725,18 +749,8 @@ class Engine(EngineScoreMixin, EngineBase):
                     None,
                 )
 
-            launch_dummy_health_check_server(
-                server_args.host, server_args.port, server_args.enable_metrics
-            )
-
-            scheduler_init_result.wait_for_completion()
-            return (
-                None,
-                None,
-                port_args,
-                scheduler_init_result,
-                None,
-            )
+        if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+            return None, None, port_args, scheduler_init_result, None
 
         # Launch detokenizer process
         detoken_proc = mp.Process(
@@ -1204,10 +1218,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
 
     # Set mp start method
-    if envs.SGLANG_USE_CPU_920F.get():
-        mp.set_start_method("fork", force=True)
-    else:
-        mp.set_start_method("spawn", force=True)
+    mp.set_start_method("spawn", force=True)
 
 
 def _set_gc(server_args: ServerArgs):
@@ -1287,10 +1298,16 @@ def _calculate_rank_ranges(
 
     nnodes_per_tp_group = nnodes_per_pp_rank
     tp_size_per_node = tp_size // nnodes_per_tp_group
-    tp_rank_range = range(
-        tp_size_per_node * (node_rank % nnodes_per_tp_group),
-        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
-    )
+    if _is_kunpeng_binary_launch:
+        tp_rank_range = range(
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node,
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node + 1,
+        )
+    else:
+        tp_rank_range = range(
+            tp_size_per_node * (node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
+        )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
 

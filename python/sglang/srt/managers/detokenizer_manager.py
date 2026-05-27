@@ -423,7 +423,7 @@ def run_detokenizer_process(
             import os
             p = psutil.Process(os.getpid())
             # TODO (kunpeng): hard code here, should use a more elegant way.
-            p.cpu_affinity(list(range(76, 78)))
+            p.cpu_affinity({112}) # 36
             logger.info(os.sched_getaffinity(os.getpid()))
 
     kill_itself_when_parent_died()

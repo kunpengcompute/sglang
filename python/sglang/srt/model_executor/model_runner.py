@@ -1304,6 +1304,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model_config.dtype = torch.float16
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
+        else:
+            if _is_cpu_920f and os.environ.get("TORCH_USE_KUPL", "0"):
+                torch.set_num_threads(os.environ.get("KUPL_EXECUTOR_COUNT", "1"))
+                logger.info(f"torch_num_threads = {torch.get_num_threads()}, enable kupl multi-threads")
 
         set_cuda_arch()
 

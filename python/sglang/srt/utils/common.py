@@ -180,6 +180,8 @@ def is_host_cpu_arm64() -> bool:
 def is_cpu_920f() -> bool:
     return is_host_cpu_arm64() and os.environ.get("SGLANG_USE_CPU_920F", "0") == "1"
 
+def is_kunpeng_binary_launch() -> bool:
+    return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_BINARY_LAUNCH") == "1"
 
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
