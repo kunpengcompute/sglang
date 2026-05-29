@@ -276,3 +276,6 @@ sgl-kernel/csrc/**/*_musa/
 *.ply
 *.npz
 artifacts/
+
+# TRAE
+.trae

@@ -57,6 +57,38 @@ CONDA_ENV_NAME="my_env"
 CONDA_SH_PATH="/path-to-conda-start-sh"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
 
+# TP/EP size
+export TP_SIZE=256
+export EP_SIZE=256
+
+# Communication
+export GLOO_SOCKET_IFNAME=enp26s0f0
+
+# Thread
+export OMP_NUM_THREADS=1
+export OMP_PROC_BIND=close
+export TORCH_USE_KUPL=0
+export KUPL_EXECUTOR_BACKEND=pthread
+export KUPL_EXECUTOR_COUNT=32
+export TORCH_COMPILE_DISABLE=1
+export SGLANG_ENABLE_TORCH_COMPILE=0
+
+# SGLang
+export SGLANG_LOG_MS=1
+export SGLANG_USE_CPU_ENGINE=1
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_WARMUP_TIMEOUT=1600
+
+# Kunpeng CPU
+export SGLANG_USE_CPU_920F=1
+export SGLANG_KUNPENG_PROFILE=0
+export SGLANG_ENABLE_BINARY_LAUNCH=1
+export SGLANG_ENABLE_KUTACC_COMM_OPS=0
+
+HPCKIT_PATH=/path-to-HPCKit
+source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
+source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh
 
 # ------------------------------------------------------------
 # Function: prefill_config
@@ -70,7 +102,7 @@ prefill_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="prefill"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
+    export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
 # ------------------------------------------------------------
@@ -84,7 +116,7 @@ decode_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="decode"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
+    export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
 # ------------------------------------------------------------
@@ -98,7 +130,7 @@ native_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="native"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$(date +%H%M%S)"
-    CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
+    export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
 # ------------------------------------------------------------
@@ -122,37 +154,3 @@ case "$ACTION" in
         return 1
         ;;
 esac
-
-export CONDA_ACTIVATE_CMD
-export TP_SIZE=256
-export EP_SIZE=1
-
-# Communication
-export GLOO_SOCKET_IFNAME=enp26s0f0
-
-# Thread
-export OMP_NUM_THREADS=1
-export OMP_PROC_BIND=close
-export TORCH_USE_KUPL=0
-export KUPL_EXECUTOR_BACKEND=pthread
-export KUPL_EXECUTOR_COUNT=32
-export TORCH_COMPILE_DISABLE=1
-export SGLANG_ENABLE_TORCH_COMPILE=0
-
-# SGLang
-export SGLANG_LOG_MS=1
-export SGLANG_USE_CPU_ENGINE=1
-export SGLANG_SET_CPU_AFFINITY=1
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-export SGLANG_WARMUP_TIMEOUT=1600
-
-# Kunpeng
-export SGLANG_USE_CPU_920F=1
-export SGLANG_KUNPENG_PROFILE=0
-export SGLANG_ENABLE_BINARY_LAUNCH=1
-export SGLANG_ENABLE_KUTACC_COMM_OPS=0
-
-# Optional
-# HPCKIT_PATH=/path-to-HPCKit
-# source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
-# source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh
