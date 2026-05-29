@@ -1,4 +1,5 @@
 #include <torch/all.h>
+#include <arm_fp16.h>
 
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 

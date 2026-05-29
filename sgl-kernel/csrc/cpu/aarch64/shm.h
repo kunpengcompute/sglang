@@ -1,5 +1,6 @@
 #pragma once
 #include <arm_neon.h>
+#include <arm_fp16.h>
 
 #define VECTOR_LENGTH_IN_BYTES 16
 
