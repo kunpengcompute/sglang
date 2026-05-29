@@ -3884,6 +3884,10 @@ def configure_scheduler_process(
         if numa_node is not None:
             numa_bind_to_node(numa_node)
 
+    if _is_cpu_920f and os.environ.get("TORCH_USE_KUPL", "") == "1":
+        torch.set_num_threads(int(os.environ.get("KUPL_EXECUTOR_COUNT", "1")))
+        logger.info(f"torch_num_threads = {torch.get_num_threads()}, enable kupl multi-threads")
+
     return dp_rank
 
 

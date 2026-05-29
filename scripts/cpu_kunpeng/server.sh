@@ -75,7 +75,7 @@ case "$ROLE" in
             --max-total-tokens 18496
             --load-balance-method round_robin
             --quantization w8a8_int8
-            # --load-format dummy
+            # --load-format sharded_state
         )
         ;;
     *)
@@ -87,6 +87,7 @@ esac
 # Combine and execute
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
+        taskset -c $((ATTN_TP_RANK * 38)) \
         python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
           --tp-rank-in-node ${ATTN_TP_RANK} \
           --port $((30000 + ATTN_TP_RANK)) \

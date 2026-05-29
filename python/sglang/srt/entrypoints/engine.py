@@ -1218,7 +1218,10 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
 
     # Set mp start method
-    mp.set_start_method("spawn", force=True)
+    if envs.SGLANG_USE_CPU_920F.get():	 
+        mp.set_start_method("fork", force=True) 
+    else: 
+        mp.set_start_method("spawn", force=True)
 
 
 def _set_gc(server_args: ServerArgs):
