@@ -39,11 +39,6 @@ BASE_ARGS=(
     --disable-custom-all-reduce
     --disable-radix-cache
     --disable-overlap-schedule
-    --disaggregation-ib-device \
-'{"0":"roceroh0","1":"roceroh0","2":"roceroh1","3":"roceroh1",'\
-'"4":"roceroh2","5":"roceroh2","6":"roceroh3","7":"roceroh3",'\
-'"8":"roceroh4","9":"roceroh4","10":"roceroh5","11":"roceroh5",'\
-'"12":"roceroh6","13":"roceroh6", "14":"roceroh7","15":"roceroh7"}'
 )
 
 # Role-specific arguments
@@ -57,6 +52,7 @@ case "$ROLE" in
             --prefill-max-requests 4
             --load-balance-method follow_bootstrap_room
             --enable-dynamic-batch-tokenizer
+            --quantization w8a8_int8
         )
         ;;
     decode)
@@ -66,6 +62,7 @@ case "$ROLE" in
             --load-balance-method follow_bootstrap_room
             --decode-log-interval 1
             --num-reserved-decode-tokens 256
+            --quantization w8a8_int8
         )
         ;;
     native)
