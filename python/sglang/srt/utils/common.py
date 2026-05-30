@@ -177,6 +177,12 @@ def is_host_cpu_arm64() -> bool:
     )
 
 
+def is_cpu_920f() -> bool:
+    return is_host_cpu_arm64() and os.environ.get("SGLANG_USE_CPU_920F", "0") == "1"
+
+def is_kunpeng_binary_launch() -> bool:
+    return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_BINARY_LAUNCH") == "1"
+
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
     is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
@@ -365,7 +371,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "kunpeng_920f"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(

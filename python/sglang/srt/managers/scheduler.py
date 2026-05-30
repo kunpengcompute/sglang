@@ -225,7 +225,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_npu, is_cpu_920f
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -255,6 +255,7 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+_is_cpu_920f = is_cpu_920f()
 
 
 @dataclass
@@ -3866,13 +3867,26 @@ def configure_scheduler_process(
 
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
-        set_gpu_proc_affinity(
-            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
-        )
+        if _is_cpu_920f:
+            p = psutil.Process(os.getpid())
+            attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
+            # TODO (kunpeng): hard code here, should use a more elegant way.
+            bind_cpu_ids = list(range(attn_tp_rank * 38 + 1, attn_tp_rank * 38 + 33))  # 1~32
+            p.cpu_affinity(bind_cpu_ids)
+            logger.info(os.sched_getaffinity(os.getpid()))
+        else:
+            set_gpu_proc_affinity(
+                server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+            )
     if not envs.SGLANG_NUMA_BIND_V2.get():
+        logger.info("SGLANG_NUMA_BIND_V2 is false")
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
             numa_bind_to_node(numa_node)
+
+    if _is_cpu_920f and os.environ.get("TORCH_USE_KUPL", "") == "1":
+        torch.set_num_threads(int(os.environ.get("KUPL_EXECUTOR_COUNT", "1")))
+        logger.info(f"torch_num_threads = {torch.get_num_threads()}, enable kupl multi-threads")
 
     return dp_rank
 
@@ -3928,7 +3942,17 @@ def run_scheduler_process(
         )
 
         # Send initialization info back to the parent process
-        pipe_writer.send(scheduler.get_init_info())
+        if pipe_writer is not None:
+            pipe_writer.send(scheduler.get_init_info())
+
+        # Isolate the main process from communication threads
+        # assign core 36 on each NUMA node exclusively to the main process.
+        if envs.SGLANG_SET_CPU_AFFINITY.get():
+            if _is_cpu_920f:
+                p = psutil.Process(os.getpid())
+                attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
+                # TODO (kunpeng): hard code here, should use a more elegant way.
+                p.cpu_affinity({attn_tp_rank * 38 + 35}) # 35
 
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()

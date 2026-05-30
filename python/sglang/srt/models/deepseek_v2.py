@@ -145,6 +145,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_musa,
     _is_npu,
     _is_xpu,
+    _is_cpu_920f,
     _use_aiter,
     _use_aiter_gfx95,
 )
@@ -160,6 +161,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -241,6 +243,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
+    @KunpengProfiler
     def forward(
         self,
         x,
@@ -307,6 +310,7 @@ class MoEGate(nn.Module):
             self.quant_method = PackWeightMethod(weight_names=["weight"])
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
+    @KunpengProfiler(depth=1)
     def forward(
         self,
         hidden_states,
@@ -586,6 +590,7 @@ class DeepseekV2MoE(nn.Module):
             )
         ]
 
+    @KunpengProfiler
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1419,6 +1424,7 @@ class DeepseekV2AttentionMLA(
         else:
             state.hidden_states_after_attn = result
 
+    @KunpengProfiler
     def forward(
         self,
         positions: torch.Tensor,
@@ -1440,6 +1446,7 @@ class DeepseekV2AttentionMLA(
         )
         return self.forward_core(s)
 
+    @KunpengProfiler(depth=1)
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -1474,6 +1481,7 @@ class DeepseekV2AttentionMLA(
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        attn_forward_method = AttnForwardMethod.MLA
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -1760,6 +1768,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if get_attention_tp_rank() == 0:
+            logger.info(f"[DeepseekV2DecoderLayer] layer {self.layer_id} forward")
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,

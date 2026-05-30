@@ -569,6 +569,12 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # CPU(Kunpeng 920F)
+    SGLANG_USE_CPU_920F = EnvBool(False)
+    SGLANG_KUNPENG_PROFILE = EnvBool(False)
+    SGLANG_ENABLE_BINARY_LAUNCH = EnvBool(False)
+    SGLANG_ENABLE_KUTACC_COMM_OPS = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

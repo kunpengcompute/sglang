@@ -182,6 +182,7 @@ from sglang.srt.utils import (
     is_hip,
     is_host_cpu_arm64,
     is_npu,
+    is_cpu_920f,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     require_attn_tp_gather,
@@ -214,6 +215,7 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_cpu_920f = is_cpu_920f()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -474,7 +476,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         global_server_args.use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
-        if self.device == "cpu":
+        if self.device == "cpu" and not _is_cpu_920f:
             self.init_threads_binding()
 
         # Get available memory before model loading
@@ -1146,7 +1148,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                if _is_cpu_amx_available or _is_cpu_arm64:
+                if _is_cpu_amx_available or (_is_cpu_arm64 and not _is_cpu_920f):
                     # Bind OpenMP threads to CPU cores
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
@@ -1340,9 +1342,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             draft_model_idx=self.draft_model_idx,
         )
         if self.device == "cpu":
-            self.model_config = adjust_config_with_unaligned_cpu_tp(
-                self.model_config, self.load_config, self.tp_size
-            )
+            if _is_cpu_920f:
+                pass
+            else:
+                self.model_config = adjust_config_with_unaligned_cpu_tp(
+                    self.model_config, self.load_config, self.tp_size
+                )
 
         if (
             self.server_args.load_format == LoadFormat.REMOTE_INSTANCE

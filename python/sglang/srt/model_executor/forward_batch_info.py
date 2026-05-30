@@ -919,7 +919,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
-        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
+        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=False)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
         TboForwardBatchPreparer.prepare(

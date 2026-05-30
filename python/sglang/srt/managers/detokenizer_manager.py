@@ -50,6 +50,7 @@ from sglang.utils import (
     find_printable_text,
     get_exception_traceback,
 )
+from sglang.srt.utils.common import is_cpu_920f
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ logger = logging.getLogger(__name__)
 # Use power of 2 values for better memory allocation.
 DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
 
+_is_cpu_920f = is_cpu_920f()
 
 @dataclasses.dataclass
 class DecodeStatus:
@@ -415,6 +417,15 @@ def run_detokenizer_process(
     port_args: PortArgs,
     detokenizer_manager_class=DetokenizerManager,
 ):
+    # Set cpu affinity to this process
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
+        if _is_cpu_920f:
+            import os
+            p = psutil.Process(os.getpid())
+            # TODO (kunpeng): hard code here, should use a more elegant way.
+            p.cpu_affinity({112}) # 36
+            logger.info(os.sched_getaffinity(os.getpid()))
+
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)

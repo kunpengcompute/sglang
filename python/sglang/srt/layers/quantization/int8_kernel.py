@@ -56,34 +56,72 @@ def _per_token_quant_int8(
     tl.store(scale_ptr + row_id, scale_x.to(scale_ptr.dtype.element_ty))
 
 
-def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
-    M = x.numel() // x.shape[-1]
-    N = x.shape[-1]
-    x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
-    scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=scale_dtype)
-    if cal_sum:
-        x_sum = torch.empty(x.shape[:-1], device=x.device, dtype=x.dtype)
-    else:
-        x_sum = None
-    BLOCK = triton.next_power_of_2(N)
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK // 256, 1), 8)
+# def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
+#     M = x.numel() // x.shape[-1]
+#     N = x.shape[-1]
+#     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
+#     scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=scale_dtype)
+#     if cal_sum:
+#         x_sum = torch.empty(x.shape[:-1], device=x.device, dtype=x.dtype)
+#     else:
+#         x_sum = None
+#     BLOCK = triton.next_power_of_2(N)
+#     # heuristics for number of warps
+#     num_warps = min(max(BLOCK // 256, 1), 8)
 
-    assert x.is_contiguous()
-    _per_token_quant_int8[(M,)](
-        x,
-        x_q,
-        scales,
-        x_sum,
-        stride_x=x.stride(-2),
-        stride_xq=x_q.stride(-2),
-        N=N,
-        CAL_SUM=cal_sum,
-        BLOCK=BLOCK,
-        num_warps=num_warps,
-        num_stages=1,
-    )
+#     assert x.is_contiguous()
+#     _per_token_quant_int8[(M,)](
+#         x,
+#         x_q,
+#         scales,
+#         x_sum,
+#         stride_x=x.stride(-2),
+#         stride_xq=x_q.stride(-2),
+#         N=N,
+#         CAL_SUM=cal_sum,
+#         BLOCK=BLOCK,
+#         num_warps=num_warps,
+#         num_stages=1,
+#     )
+#     if cal_sum:
+#         return x_q, scales, x_sum
+#     else:
+#         return x_q, scales
+
+
+def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
+    """
+    针对 ARM CPU 优化的 PyTorch 原生实现
+    # fix mlp self.gate_up_proj
+    """
+    # 记录原始形状，以便最后还原
+    original_shape = x.shape
+    N = x.shape[-1]
+    # 将输入 reshape 为 [M, N]，其中 M 是 token 数量
+    x_flat = x.view(-1, N).to(torch.float32)
+    
+    # 1. 计算每一行（每个 token）的绝对值的最大值
+    # absmax 形状: [M, 1]
+    absmax = torch.amax(torch.abs(x_flat), dim=-1, keepdim=True)
+    absmax = torch.clamp(absmax, min=1e-10)
+    
+    # 2. 计算 scale (用于将 int8 还原回 float)
+    # scale = max / 127
+    scales = absmax / 127.0
+    scales = scales.to(scale_dtype)
+    
+    # 3. 执行量化
+    # x_q = round(x / scale) -> 映射到 [-128, 127] 范围
+    x_q = torch.round(x_flat * (127.0 / absmax))
+    x_q = torch.clamp(x_q, -128, 127).to(torch.int8)
+    
+    # 还原形状
+    x_q = x_q.view(original_shape)
+    scales = scales.view(original_shape[:-1] + (1,))
+
     if cal_sum:
+        # 4. 计算每一行的和（通常用于处理量化后的 Bias 修正）
+        x_sum = torch.sum(x_flat, dim=-1).view(original_shape[:-1])
         return x_q, scales, x_sum
     else:
         return x_q, scales
