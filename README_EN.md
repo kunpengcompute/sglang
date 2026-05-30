@@ -19,17 +19,12 @@ The SGLang Kunpeng optimized version is a reference implementation for deploying
 
 ### 2.1 SGLang Dependency Installation
 
-Before installing SGLang components, you need to create a Python virtual environment and install the Torch library. The commands are as follows. For more information, refer to the [installation guide](https://docs.sglang.com.cn/platforms/cpu_server.html#install-from-source) provided by the SGLang community.
+Before installing SGLang components, you need to create and activate a Python virtual environment. The reference commands are as follows. For more information, refer to the [installation guide](https://docs.sglang.com.cn/platforms/cpu_server.html#install-from-source) provided by the SGLang community.
 
 ```shell
 source ~/anaconda3/start_conda.sh
 conda create -n sgl-cpu python=3.12 -y
 conda activate sgl-cpu
-
-pip install --upgrade pip setuptools
-conda install -y tbb libnuma numactl
-
-pip install torch==2.9.0 torchvision==0.24.0 triton==3.5.0 --force-reinstall
 ```
 
 In addition, compiling the SGLang kernel module requires the Bisheng Compiler. Please obtain the HPCKit installation package from <https://www.hikunpeng.com/developer/hpc/hpckit-download> and follow the official installation steps.
@@ -46,10 +41,9 @@ Before installing SGLang, activate the configured Python virtual environment. Th
 ```shell
 # Install the SGLang main module (including CPU-related dependencies)
 cd sglang/python
-cp pyproject_cpu.toml pyproject.toml
 pip install --upgrade pip setuptools
-pip install -e "python[all]"
-pip install vllm
+pip install -e .
+pip install torchvision==0.24.0 triton==3.5.0 --force-reinstall
 
 # Load Bisheng Compiler environment variables
 HPCKIT_PATH=/path-to-HPCKit
@@ -59,8 +53,18 @@ export CXX=$(which clang++)
 
 # Enter the sgl-kernel subdirectory and install the kernel module
 cd ../sgl-kernel
-cp pyproject_cpu.toml pyproject.toml
 pip install -v . --no-build-isolation
+```
+
+### 2.3 PyTorch v2.9.0 Installation
+
+The SGLang Kunpeng optimized version requires PyTorch v2.9.0 built with the Bisheng Compiler, with the kupl multi-threading backend enabled for optimal performance. Before installation, obtain the adaptation patch from <https://gitcode.com/kunpengcompute/kunpeng-extension-for-pytorch/tree/main/thirdparty>, then apply the patch using the following commands.
+
+```shell
+git clone -b v2.9.0 --depth=1 --recursive https://github.com/pytorch/pytorch.git
+cd pytorch
+git submodule update --init --recursive
+git apply pytorch-v2.9.0-kupl.patch
 ```
 
 ## 3. Non-PD Disaggregated Startup
@@ -90,20 +94,21 @@ When using non-DeepSeek models, you need to comment out lines 98~99 in `srt/mode
 
 ## 4. Correctness Verification
 
-In non-PD disaggregated scenarios, correctness can be verified by sending a curl request to the specified port on the master node. An example verification script is as follows:
+In non-PD disaggregated scenarios, correctness can be verified by sending a curl request to the specified port on the master node. An example verification script `scripts/cpu_kunpeng/curl.sh` is as follows:
 
 ```shell
-export PORT=30000
-MODEL_PATH=/path-to-model
+IP=$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+PORT=30000
 
-time curl -s http://localhost:$PORT/v1/completions  \
-  -H "Content-Type: application/json"   \
+time curl -s http://${IP}:${PORT}/v1/completions \
+  -H "Content-Type: application/json" \
   -d '{
-    "model": "$MODEL_PATH",
+    "model": "deepseek-v2",
     "prompt": [
-      "What is the capital of France?"
+        "Once upon a time"
     ],
-    "max_tokens": 64,
+    "stream": true,
+    "max_tokens": 10,
     "temperature": 0.01
   }'
 ```

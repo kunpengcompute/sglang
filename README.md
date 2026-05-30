@@ -19,17 +19,12 @@ SGLang鲲鹏优化版本是基于开源高性能推理框架SGLang与鲲鹏平�
 
 ### 2.1 SGLang依赖安装
 
-在正式安装SGLang相关组件之前，需先完成Python虚拟环境的创建与Torch库的安装，命令如下所示，更多信息可参考SGLang官方社区提供的[安装指南](https://docs.sglang.com.cn/platforms/cpu_server.html#install-from-source)。
+在正式安装SGLang相关组件之前，需先完成Python虚拟环境的创建与激活，参考命令如下所示，更多信息可参考SGLang官方社区提供的[安装指南](https://docs.sglang.com.cn/platforms/cpu_server.html#install-from-source)。
 
 ```shell
 source ~/anaconda3/start_conda.sh
 conda create -n sgl-cpu python=3.12 -y
 conda activate sgl-cpu
-
-pip install --upgrade pip setuptools
-conda install -y tbb libnuma numactl
-
-pip install torch==2.9.0 torchvision==0.24.0 triton==3.5.0 --force-reinstall
 ```
 
 此外，编译SGLang内核模块需要毕昇编译器，请从<https://www.hikunpeng.com/developer/hpc/hpckit-download>获取HPCKit安装包，参考官方安装步骤完成安装。
@@ -46,10 +41,9 @@ pip install torch==2.9.0 torchvision==0.24.0 triton==3.5.0 --force-reinstall
 ```shell
 # 安装SGLang主模块（包含CPU相关依赖）
 cd sglang/python
-cp pyproject_cpu.toml pyproject.toml
 pip install --upgrade pip setuptools
-pip install -e "python[all]"
-pip install vllm
+pip install -e .
+pip install torchvision==0.24.0 triton==3.5.0 --force-reinstall
 
 # 加载毕昇编译器环境变量
 HPCKIT_PATH=/path-to-HPCKit
@@ -59,8 +53,18 @@ export CXX=$(which clang++)
 
 # 进入sgl-kernel子目录并安装内核模块
 cd ../sgl-kernel
-cp pyproject_cpu.toml pyproject.toml
 pip install -v . --no-build-isolation
+```
+
+### 2.3 PyTorch v2.9.0安装
+
+SGLang鲲鹏优化版本需依赖通过毕昇编译器构建的PyTorch v2.9.0，并启用kupl多线程后端以获得最佳性能。安装前请先从 <https://gitcode.com/kunpengcompute/kunpeng-extension-for-pytorch/tree/main/thirdparty> 获取适配补丁，然后按后续命令完成补丁应用。
+
+```shell
+git clone -b v2.9.0 --depth=1 --recursive https://github.com/pytorch/pytorch.git
+cd pytorch
+git submodule update --init --recursive
+git apply pytorch-v2.9.0-kupl.patch
 ```
 
 ## 3. 非PD分离场景启动过程
@@ -84,26 +88,27 @@ sh stop.sh native
 
 ### 3.3 环境变量说明
 
-- **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**：仅在`TORCH_USE_KUPL`设置为`1`时生效，需要使用以kupl作为多线程后端的PyTorch。常规安装的PyTorch仅支持omp多线程后端。
+- **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**：仅在`TORCH_USE_KUPL`设置为`1`时生效，需要使用以kupl作为多线程后端的PyTorch，常规安装的PyTorch仅支持omp多线程后端。
 - **SGLANG\_ENABLE\_BINARY\_LAUNCH**：用于优化启动和多线程绑核，默认开启。开启后每个scheduler进程独立启动，通过`--tp-rank-in-node`参数区分rank号。
 - **SGLANG\_KUNPENG\_PROFILE**：开启函数调用开销打印，默认关闭。开启后会在标准输出中打印每个函数的调用时间，帮助定位性能瓶颈。
 
 ## 4. 正确性验证
 
-非PD分离场景下的正确性验证，可通过向主节点的指定端口发送curl请求来验证。验证脚本示例如下：
+非PD分离场景下的正确性验证，可通过向主节点的指定端口发送curl请求来验证。验证脚本`scripts/cpu_kunpeng/curl.sh`示例如下：
 
 ```shell
-export PORT=30000
-MODEL_PATH=/path-to-model
+IP=$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+PORT=30000
 
-time curl -s http://localhost:$PORT/v1/completions  \
-  -H "Content-Type: application/json"   \
+time curl -s http://${IP}:${PORT}/v1/completions \
+  -H "Content-Type: application/json" \
   -d '{
-    "model": "$MODEL_PATH",
+    "model": "deepseek-v2",
     "prompt": [
-      "What is the capital of France?"
+        "Once upon a time"
     ],
-    "max_tokens": 64,
+    "stream": true,
+    "max_tokens": 10,
     "temperature": 0.01
   }'
 ```

@@ -67,7 +67,7 @@ export GLOO_SOCKET_IFNAME=enp26s0f0
 # Thread
 export OMP_NUM_THREADS=1
 export OMP_PROC_BIND=close
-export TORCH_USE_KUPL=0
+export TORCH_USE_KUPL=1
 export KUPL_EXECUTOR_BACKEND=pthread
 export KUPL_EXECUTOR_COUNT=32
 export TORCH_COMPILE_DISABLE=1
@@ -85,10 +85,6 @@ export SGLANG_USE_CPU_920F=1
 export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_KUTACC_COMM_OPS=0
-
-HPCKIT_PATH=/path-to-HPCKit
-source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
-source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh
 
 # ------------------------------------------------------------
 # Function: prefill_config
@@ -154,3 +150,11 @@ case "$ACTION" in
         return 1
         ;;
 esac
+
+HPCKIT_PATH=/path-to-HPCKit
+OpenBLAS_PATH=/path-to-OpenBLAS
+
+source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
+source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh
+
+export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
