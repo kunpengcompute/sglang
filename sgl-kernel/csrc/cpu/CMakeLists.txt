@@ -85,24 +85,26 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-    add_compile_options(
-        -O3
-        -Wno-unknown-pragmas
-        -march=armv8.2-a+fp16
-        -fopenmp
-    )
-else()
-    add_compile_options(
-        -O3
-        -Wno-unknown-pragmas
-        -march=native
-        -fopenmp
-    )
-endif()
+     add_compile_options(
+         -O3
+         -Wno-unknown-pragmas
+         -march=armv8.2-a+sve+fp16
+         -fopenmp
+     )
+ else()
+     add_compile_options(
+         -O3
+         -Wno-unknown-pragmas
+         -march=native
+         -fopenmp
+     )
+ endif()
 
+set(KUTACC_LIB "$ENV{KUTACC_LIB}/libkutacc.so")
+set(KUTACC_INCLUDE "$ENV{KUTACC_INCLUDE}")
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
-target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB} ${KUTACC_LIB})
+target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS} ${KUTACC_INCLUDE})
 
 install(TARGETS common_ops
     LIBRARY DESTINATION sgl_kernel

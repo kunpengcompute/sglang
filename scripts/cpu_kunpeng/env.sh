@@ -153,8 +153,14 @@ esac
 
 HPCKIT_PATH=/path-to-HPCKit
 OpenBLAS_PATH=/path-to-OpenBLAS
+KUTACC_PATH=/path-to-KUTACC
 
 source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh
 
 export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/usr/lib64/libibverbs:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:$LD_LIBRARY_PATH
+
+export KUTACC_LIB=${KUTACC_PATH}/install/lib
+export KUTACC_INCLUDE=${KUTACC_PATH}/install/include
