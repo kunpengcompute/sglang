@@ -33,6 +33,7 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_cpu,
 )
 
 if TYPE_CHECKING:
@@ -646,14 +647,29 @@ class ModelRunnerKVCacheMixin:
                             need_sort=need_sort,
                         )
                     else:
-                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            page_size=self.page_size,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
+                        # 添加鲲鹏分支，要保留原生分支
+                        if is_cpu():
+                            from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_allocator import (
+                                KunpengPagedTokenToKVPoolAllocator,
+                            )   
+                            self.token_to_kv_pool_allocator = KunpengPagedTokenToKVPoolAllocator(
+                                self.max_total_num_tokens,
+                                page_size=self.page_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
+                        else:
+                            self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                                self.max_total_num_tokens,
+                                page_size=self.page_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                            )   
+
 
         else:
             assert self.is_draft_worker

@@ -179,11 +179,11 @@ def create_intel_amx_backend(runner):
 
     return IntelAMXAttnBackend(runner)
 
-@register_attention_backend("kunpeng_920f")
-def create_kunpeng920f_backend(runner):
-    from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_920f_backend import Kunpeng920FBackend
+@register_attention_backend("kunpeng_cpu")
+def create_kunpeng_backend(runner):
+    from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_cpu_backend import KunpengCpuBackend
 
-    return Kunpeng920FBackend(runner)
+    return KunpengCpuBackend(runner)
 
 @register_attention_backend("dual_chunk_flash_attn")
 def create_dual_chunk_flash_attn_backend(runner):

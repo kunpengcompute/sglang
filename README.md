@@ -51,6 +51,11 @@ source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 export CC=$(which clang)
 export CXX=$(which clang++)
 
+# 加载kutacc环境变量
+KUTACC_PATH=/path-to-KUTACC
+export KUTACC_LIB=${KUTACC_PATH}/install/lib
+export KUTACC_INCLUDE=${KUTACC_PATH}/install/include
+
 # 进入sgl-kernel子目录并安装内核模块
 cd ../sgl-kernel
 pip install -v . --no-build-isolation
