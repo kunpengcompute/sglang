@@ -96,8 +96,50 @@ void varlen_attention_kunpeng(
 
 // === Memory 算子声明 ===
 at::Tensor hbw_allocator_kunpeng(int64_t size);
+
 void hbw_destroy_kunpeng(at::Tensor ptr_tensor);
+
 void sync_swap_kunpeng(at::Tensor dst, at::Tensor src, int64_t byte_size);
+
+// on_package_memory -> ddr, 异步将数据从on_package_memory拷贝回ddr
+void queue_async_swapout_kunpeng(
+    int64_t index,
+    int64_t byte_size,
+    int64_t byte_offset,
+    at::Tensor src,
+    at::Tensor dst,
+    at::Tensor ddr2swap,
+    at::Tensor swapout_tables,
+    at::Tensor swapout_lengths
+);
+
+// ddr -> on_package_memory, 异步将数据从DDR拷到on_package_memory
+int64_t queue_async_swapin_kunpeng(
+    int64_t index,
+    int64_t byte_size,
+    int64_t now_buf_id,
+    at::Tensor src,
+    at::Tensor dst,
+    at::Tensor ddr2swap,
+    at::Tensor swapin_tables,
+    at::Tensor swapin_lengths,
+    int64_t num_swap_buffers
+);
+
+// 获取安全的 on-package memory 索引
+int64_t get_safe_on_package_memory_index_kunpeng(
+    int64_t index,
+    at::Tensor ddr2swap,
+    at::Tensor swap2ddr,
+    at::Tensor swapin_tables,
+    at::Tensor swapout_tables,
+    at::Tensor swapin_lengths,
+    at::Tensor swapout_lengths
+);
+
+void init_sdma(int64_t sdmathreshold);
+
+void finalize_sdma();
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
     // Flash MLA metadata lifecycle management
@@ -169,5 +211,28 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
     m.impl("hbw_destroy_kunpeng", hbw_destroy_kunpeng);
 
     m.def("sync_swap_kunpeng(Tensor dst, Tensor src, int byte_size) -> ()");
-    m.impl("sync_swap_kunpeng", sync_swap);
+    m.impl("sync_swap_kunpeng", sync_swap_kunpeng);
+
+    m.def("queue_async_swapout_kunpeng("
+        "int index, int byte_size, int byte_offset, Tensor src, Tensor dst, "
+        "Tensor(a!) ddr2swap, Tensor(b!) swapout_tables, Tensor(c!) swapout_lengths) -> ()");
+    m.impl("queue_async_swapout_kunpeng", queue_async_swapout_kunpeng);
+
+    m.def("queue_async_swapin_kunpeng("
+        "int index, int byte_size, int now_buf_id, Tensor src, Tensor dst, "
+        "Tensor(a!) ddr2swap, Tensor(b!) swapin_tables, Tensor(c!) swapin_lengths, "
+        "int num_swap_buffers) -> int");
+    m.impl("queue_async_swapin_kunpeng", queue_async_swapin_kunpeng);
+
+    m.def("get_safe_on_package_memory_index_kunpeng("
+        "int index, Tensor(a!) ddr2swap, Tensor(b!) swap2ddr, "
+        "Tensor(c!) swapin_tables, Tensor(d!) swapout_tables, "
+        "Tensor(e!) swapin_lengths, Tensor(f!) swapout_lengths) -> int");
+    m.impl("get_safe_on_package_memory_index_kunpeng", get_safe_on_package_memory_index_kunpeng);
+
+    m.def("init_sdma(int sdmathreshold) -> ()");
+    m.impl("init_sdma", init_sdma);
+
+    m.def("finalize_sdma() -> ()");
+    m.impl("finalize_sdma", finalize_sdma);
 }

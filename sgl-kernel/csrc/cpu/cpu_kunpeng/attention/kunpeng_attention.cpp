@@ -69,7 +69,7 @@ void flash_mla_dense_decode_kunpeng(
     auto kt_q      = to_kutacc<bfloat16_t, 4>(q);
     auto kt_kcache = to_kutacc<bfloat16_t, 3>(kcache);
 
-    std::optional<kutacc::Tensor<bfloat16_t, 3>> kt_vcache;
+    std::optional<kutacc::Tensor<bfloat16_t, 3>> kt_vcache = std::nullopt;
     if (vcache.has_value()) {
         kt_vcache = kutacc::Tensor<bfloat16_t, 3>(
             reinterpret_cast<bfloat16_t*>(vcache->data_ptr<at::BFloat16>()),
@@ -89,7 +89,7 @@ void flash_mla_dense_decode_kunpeng(
     kutacc::flash_mla_dense_decode(
         kt_q,
         kt_kcache,
-        std::nullopt,
+        kt_vcache,
         kt_block_table,
         kt_seqlens_kv,
         kt_o,
