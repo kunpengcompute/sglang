@@ -71,27 +71,28 @@ def move_tensor_to_hbw(ddr_tensor: torch.Tensor) -> torch.Tensor:
 
 
 class KunpengHBWPool:
-    """Bump allocator for HBW memory.
+    """Free-list based HBW memory allocator.
 
-    Pre-allocates a large HBW memory region and sub-allocates tensors
-    from it using simple pointer arithmetic. All allocations are freed
-    at once via reset(), which is ideal for per-batch allocation patterns.
+    Pre-allocates a large HBW memory region and manages sub-allocations
+    using a free-list strategy. Supports both individual tensor deallocation
+    and bulk reset. Ideal for scenarios where tensors have varying lifetimes.
 
     Usage::
 
         pool = KunpengHBWPool(pool_size_bytes=64 * 1024 * 1024)
         tensor, handle = pool.alloc((bs, num_heads, head_dim), torch.bfloat16)
         # ... use tensor ...
-        pool.reset()
+        pool.free(handle)  # Free individual tensor
+        # or
+        pool.reset()       # Free all at once
     """
 
     def __init__(self, pool_size_bytes: int):
         self.pool_size = pool_size_bytes
-        self._offset = 0
         self._base_ptr: Optional[torch.Tensor] = None
         self._base_addr: int = 0
-        self._allocations = []
 
+        # Allocate the entire pool
         self._base_ptr = torch.ops.sgl_kernel.hbw_allocator_kunpeng(pool_size_bytes)
         self._base_addr = self._base_ptr.item()
         if self._base_addr == 0:
@@ -100,38 +101,120 @@ class KunpengHBWPool:
         self._buffer = (ctypes.c_char * pool_size_bytes).from_address(self._base_addr)
         self._np_array = np.frombuffer(self._buffer, dtype=np.uint8)
 
+        # Initialize free list with entire pool as one block
+        # Each entry is (start_offset, size)
+        self._free_blocks = [(0, pool_size_bytes)]
+        # Track allocated blocks: {handle: (start, size, tensor)}
+        self._allocated = {}
+
     def alloc(
         self,
         shape: Tuple[int, ...],
         dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, int]:
-        """Allocate a tensor from the pool."""
-        num_elements = 1
-        for s in shape:
-            num_elements *= s
+        """Allocate a tensor from the pool.
+
+        Args:
+            shape: Tensor shape.
+            dtype: Tensor data type.
+
+        Returns:
+            (tensor, handle) where handle is used for deallocation.
+
+        Raises:
+            RuntimeError: If pool is exhausted.
+        """
+        num_elements = math.prod(shape)
         alloc_bytes = num_elements * dtype.itemsize
 
-        aligned_offset = (self._offset + ALIGNMENT - 1) & ~(ALIGNMENT - 1)
+        # Only align start offset, don't round up allocation size
+        # This reduces internal fragmentation for small tensors
+        handle = self._find_and_alloc(alloc_bytes, shape, dtype)
+        if handle is not None:
+            return self._allocated[handle][2], handle
 
-        if aligned_offset + alloc_bytes > self.pool_size:
-            raise RuntimeError(
-                f"HBW pool exhausted: requested {alloc_bytes} bytes at offset "
-                f"{aligned_offset}, pool size is {self.pool_size} bytes "
-                f"(used {aligned_offset / self.pool_size * 100:.1f}%)"
-            )
+        # Retry: merge free blocks and search again
+        self._merge_free_blocks()
+        handle = self._find_and_alloc(alloc_bytes, shape, dtype)
+        if handle is not None:
+            return self._allocated[handle][2], handle
 
-        start = aligned_offset
-        end = start + alloc_bytes
-        tensor = (
-            torch.from_numpy(self._np_array[start:end])
-            .view(dtype)
-            .reshape(shape)
+        # No suitable block found after all retries
+        raise RuntimeError(
+            f"HBW pool exhausted: requested {alloc_bytes} bytes "
+            f"(aligned to {aligned_size}), pool utilization: "
+            f"{self.utilization * 100:.1f}%, "
+            f"free blocks: {len(self._free_blocks)}, "
+            f"largest free: {max(s for _, s in self._free_blocks) if self._free_blocks else 0} bytes"
         )
 
-        self._offset = end
-        self._allocations.append(tensor)
+    def _find_and_alloc(
+        self,
+        alloc_bytes: int,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> Optional[int]:
+        """Try to find a free block and allocate from it.
 
-        return tensor, start
+        Aligns the start offset within the free block, then carves out
+        exactly alloc_bytes for the tensor. Remaining space before and
+        after the allocation is returned to the free list.
+
+        Returns:
+            Handle if successful, None if no suitable block found.
+        """
+        for i, (block_start, block_size) in enumerate(self._free_blocks):
+            # Align start offset within this block
+            aligned_start = (block_start + ALIGNMENT - 1) & ~(ALIGNMENT - 1)
+            padding_before = aligned_start - block_start
+
+            if padding_before + alloc_bytes > block_size:
+                continue
+
+            # Create tensor view
+            tensor = (
+                torch.from_numpy(self._np_array[aligned_start:aligned_start + alloc_bytes])
+                .view(dtype)
+                .reshape(shape)
+            )
+
+            # Update free list: remove the original block
+            self._free_blocks.pop(i)
+
+            # Return unused space before the aligned start
+            if padding_before > 0:
+                self._free_blocks.append((block_start, padding_before))
+
+            # Return unused space after the allocation
+            remaining_after = block_size - padding_before - alloc_bytes
+            if remaining_after > 0:
+                self._free_blocks.append((aligned_start + alloc_bytes, remaining_after))
+
+            handle = aligned_start
+            self._allocated[handle] = (aligned_start, alloc_bytes, tensor)
+            return handle
+
+        return None
+
+    def free(self, handle: int) -> None:
+        """Free a previously allocated tensor.
+
+        Args:
+            handle: The handle returned by alloc() or move_to_hbw().
+
+        Raises:
+            KeyError: If handle is not found in allocated blocks.
+        """
+        if handle not in self._allocated:
+            raise KeyError(f"Invalid allocation handle: {handle}")
+
+        start, size, tensor = self._allocated.pop(handle)
+
+        # Add back to free list
+        self._free_blocks.append((start, size))
+
+        # Merge adjacent blocks
+        self._merge_free_blocks()
 
     def move_to_hbw(
         self,
@@ -142,18 +225,44 @@ class KunpengHBWPool:
         hbw_tensor.copy_(ddr_tensor)
         return hbw_tensor, handle
 
+    def _merge_free_blocks(self) -> None:
+        """Merge adjacent free blocks to reduce fragmentation."""
+        if len(self._free_blocks) < 2:
+            return
+
+        # Sort by start offset
+        self._free_blocks.sort(key=lambda x: x[0])
+
+        merged = [self._free_blocks[0]]
+        for current_start, current_size in self._free_blocks[1:]:
+            last_start, last_size = merged[-1]
+            if current_start == last_start + last_size:
+                # Adjacent, merge them
+                merged[-1] = (last_start, last_size + current_size)
+            else:
+                merged.append((current_start, current_size))
+
+        self._free_blocks = merged
+
     def reset(self) -> None:
         """Reset the pool, freeing all allocations at once."""
-        self._offset = 0
-        self._allocations.clear()
+        self._free_blocks = [(0, self.pool_size)]
+        self._allocated.clear()
 
     @property
     def used_bytes(self) -> int:
-        return self._offset
+        """Return total bytes currently allocated."""
+        return sum(size for _, size, _ in self._allocated.values())
 
     @property
     def utilization(self) -> float:
-        return self._offset / self.pool_size if self.pool_size > 0 else 0.0
+        """Return pool utilization as a fraction."""
+        return self.used_bytes / self.pool_size if self.pool_size > 0 else 0.0
+
+    @property
+    def num_allocated(self) -> int:
+        """Return number of currently allocated tensors."""
+        return len(self._allocated)
 
     def __del__(self):
         if self._base_ptr is not None:

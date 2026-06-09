@@ -21,35 +21,51 @@ logger.disabled = False
 PAGE_SIZE = 64
 
 class KunpengCpuMetadata:
-    """Metadata for a single forward pass, holding HBW-allocated tensors."""
+    """Metadata for a single forward pass, holding HBW-allocated tensors and pool handles."""
 
     def __init__(self):
         self.extra_bytes_sizes: int = 0
         self.flash_mla_meta = None
 
+        # HBW tensors (pool mode: managed via handles; direct mode: managed via ptrs)
         self.block_table: Optional[torch.Tensor] = None
-        self.block_table_ptr: Optional[torch.Tensor] = None
         self.seq_lens: Optional[torch.Tensor] = None
-        self.seq_lens_ptr: Optional[torch.Tensor] = None
-
         self.o_hbw: Optional[torch.Tensor] = None
-        self.o_ptr: Optional[torch.Tensor] = None
         self.softmax_lse_hbw: Optional[torch.Tensor] = None
-        self.softmax_lse_ptr: Optional[torch.Tensor] = None
         self.extra_buffer_hbw: Optional[torch.Tensor] = None
+
+        # Pool handles (used when enable_hbw_pool=True)
+        self.block_table_handle: Optional[int] = None
+        self.seq_lens_handle: Optional[int] = None
+        self.o_handle: Optional[int] = None
+        self.softmax_lse_handle: Optional[int] = None
+        self.extra_buffer_handle: Optional[int] = None
+
+        # Direct mode pointers (used when enable_hbw_pool=False)
+        self.block_table_ptr: Optional[torch.Tensor] = None
+        self.seq_lens_ptr: Optional[torch.Tensor] = None
+        self.o_ptr: Optional[torch.Tensor] = None
+        self.softmax_lse_ptr: Optional[torch.Tensor] = None
         self.extra_buffer_ptr: Optional[torch.Tensor] = None
 
     def reset(self):
-        """Reset all tensor references to None."""
+        """Reset all tensor references and handles to None."""
         self.block_table = None
-        self.block_table_ptr = None
         self.seq_lens = None
-        self.seq_lens_ptr = None
         self.o_hbw = None
-        self.o_ptr = None
         self.softmax_lse_hbw = None
-        self.softmax_lse_ptr = None
         self.extra_buffer_hbw = None
+
+        self.block_table_handle = None
+        self.seq_lens_handle = None
+        self.o_handle = None
+        self.softmax_lse_handle = None
+        self.extra_buffer_handle = None
+
+        self.block_table_ptr = None
+        self.seq_lens_ptr = None
+        self.o_ptr = None
+        self.softmax_lse_ptr = None
         self.extra_buffer_ptr = None
 
 class KunpengCpuBackend(AttentionBackend):
@@ -114,12 +130,18 @@ class KunpengCpuBackend(AttentionBackend):
 
     def _free_forward_metadata(self):
         """Release all HBW-allocated tensors in forward_metadata."""
+        meta = self.forward_metadata
         if self.enable_hbw_pool:
-            # Pool mode: simply reset the pool, all allocations freed at once
-            self.hbw_pool.reset()
+            # Pool mode: free each tensor individually via handle
+            for handle_name in (
+                "block_table_handle", "seq_lens_handle",
+                "o_handle", "softmax_lse_handle", "extra_buffer_handle",
+            ):
+                handle = getattr(meta, handle_name, None)
+                if handle is not None:
+                    self.hbw_pool.free(handle)
         else:
-            # Direct mode: free each HBW tensor individually
-            meta = self.forward_metadata
+            # Direct mode: free each HBW tensor individually via ptr
             for ptr_name in (
                 "block_table_ptr", "seq_lens_ptr",
                 "o_ptr", "softmax_lse_ptr", "extra_buffer_ptr",
@@ -127,9 +149,8 @@ class KunpengCpuBackend(AttentionBackend):
                 ptr = getattr(meta, ptr_name, None)
                 if ptr is not None:
                     free_tensor_from_hbw(ptr)
-                    setattr(meta, ptr_name, None)
 
-        self.forward_metadata.reset()
+        meta.reset()
 
     def __del__(self):
         if hasattr(self, "forward_metadata"):
@@ -145,6 +166,7 @@ class KunpengCpuBackend(AttentionBackend):
             self,
             forward_batch: ForwardBatch,
     ):
+        t1 = time.perf_counter_ns()
         if forward_batch.forward_mode.is_decode_or_idle():
             kv_len = 1
             bs = forward_batch.batch_size
@@ -161,6 +183,7 @@ class KunpengCpuBackend(AttentionBackend):
                 is_kv_packed=False,
                 meta=self.forward_metadata.flash_mla_meta,
             )
+            t2 = time.perf_counter_ns()
 
             # Build block table from req_to_token mapping
             token_indices = forward_batch.req_to_token_pool.req_to_token[
@@ -174,7 +197,9 @@ class KunpengCpuBackend(AttentionBackend):
             if self.enable_hbw_swap:
                 # Move block_table to HBW
                 if self.enable_hbw_pool:
-                    self.forward_metadata.block_table, _ = self.hbw_pool.move_to_hbw(block_table_data)
+                    self.forward_metadata.block_table, self.forward_metadata.block_table_handle = self.hbw_pool.move_to_hbw(
+                        block_table_data
+                    )
                 else:
                     self.forward_metadata.block_table, self.forward_metadata.block_table_ptr = move_tensor_to_hbw(
                         block_table_data
@@ -192,7 +217,9 @@ class KunpengCpuBackend(AttentionBackend):
                 # Move seq_lens to HBW
                 seq_lens_int32 = forward_batch.seq_lens.to(torch.int32)
                 if self.enable_hbw_pool:
-                    self.forward_metadata.seq_lens, _ = self.hbw_pool.move_to_hbw(seq_lens_int32)
+                    self.forward_metadata.seq_lens, self.forward_metadata.seq_lens_handle = self.hbw_pool.move_to_hbw(
+                        seq_lens_int32
+                    )
                 else:
                     self.forward_metadata.seq_lens, self.forward_metadata.seq_lens_ptr = move_tensor_to_hbw(
                         seq_lens_int32
@@ -201,16 +228,20 @@ class KunpengCpuBackend(AttentionBackend):
                 # Allocate output tensor on HBW
                 o_shape = (bs, kv_len, self.num_q_heads, self.kv_lora_rank)
                 if self.enable_hbw_pool:
-                    self.forward_metadata.o_hbw, _ = self.hbw_pool.alloc(o_shape, torch.bfloat16)
+                    self.forward_metadata.o_hbw, self.forward_metadata.o_handle = self.hbw_pool.alloc(
+                        o_shape, torch.bfloat16
+                    )
                 else:
                     self.forward_metadata.o_hbw, self.forward_metadata.o_ptr = create_tensor_from_hbw(
-                         o_shape, torch.bfloat16,
+                        o_shape, torch.bfloat16,
                     )
 
                 # Allocate softmax LSE on HBW
                 lse_shape = (bs, kv_len, self.num_q_heads)
                 if self.enable_hbw_pool:
-                    self.forward_metadata.softmax_lse_hbw, _ = self.hbw_pool.alloc(lse_shape, torch.float32)
+                    self.forward_metadata.softmax_lse_hbw, self.forward_metadata.softmax_lse_handle = self.hbw_pool.alloc(
+                        lse_shape, torch.float32
+                    )
                 else:
                     self.forward_metadata.softmax_lse_hbw, self.forward_metadata.softmax_lse_ptr = create_tensor_from_hbw(
                         lse_shape, torch.float32,
@@ -218,7 +249,7 @@ class KunpengCpuBackend(AttentionBackend):
 
                 # Allocate extra buffer on HBW
                 if self.enable_hbw_pool:
-                    self.forward_metadata.extra_buffer_hbw, _ = self.hbw_pool.alloc(
+                    self.forward_metadata.extra_buffer_hbw, self.forward_metadata.extra_buffer_handle = self.hbw_pool.alloc(
                         (self.forward_metadata.extra_bytes_sizes,), torch.uint8,
                     )
                 else:
@@ -226,10 +257,16 @@ class KunpengCpuBackend(AttentionBackend):
                         (self.forward_metadata.extra_bytes_sizes,),
                         torch.uint8,
                     )
-
+                t3 = time.perf_counter_ns()
+                
                 # Trigger async swapin for layer 0
                 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(0)
                 self.hbw_kvbuffer.queue_async_swapin(0, k_cache)
+                t4 = time.perf_counter_ns()
+                logger.info(f"[Kunpeng_cpu] : flash_mla_dense_decode_sched_kunpeng time: {(t2 - t1)/1000} us")
+                logger.info(f"[Kunpeng_cpu] : move to hbw time: {(t3 - t2)/1000} us")
+                logger.info(f"[Kunpeng_cpu] : queue_async_swapin time: {(t4 - t3)/1000} us")
+                logger.info(f"[Kunpeng_cpu] : forward metadata time: {(t4 - t1)/1000} us")
             else:
                 # Non-HBW path: keep block_table and seq_lens in DDR
                 self.forward_metadata.block_table = block_table_data
@@ -288,7 +325,7 @@ class KunpengCpuBackend(AttentionBackend):
 
             # Move query tensor to HBW
             if self.enable_hbw_pool:
-                reshape_q,_ = self.hbw_pool.move_to_hbw(reshape_q)
+                reshape_q, reshape_q_handle = self.hbw_pool.move_to_hbw(reshape_q)
             else:
                 reshape_q, reshape_q_ptr = move_tensor_to_hbw(reshape_q)
 
@@ -304,7 +341,7 @@ class KunpengCpuBackend(AttentionBackend):
                 softmax_scale=1.0 / math.sqrt(self.kv_cache_dim),
                 is_causal=True,
                 extra_buffer=self.forward_metadata.extra_buffer_hbw,
-                meta=self.forward_metadata.flash_mla_meta
+                meta=self.forward_metadata.flash_mla_meta,
             )
 
             # SDMA pipeline: swapout current layer, swapin next layer
@@ -320,7 +357,10 @@ class KunpengCpuBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.get_key_buffer(next_layer_id),
                 )
 
-            if not self.enable_hbw_pool:
+            # Free per-layer query HBW allocation
+            if self.enable_hbw_pool:
+                self.hbw_pool.free(reshape_q_handle)
+            else:
                 free_tensor_from_hbw(reshape_q_ptr)
 
             return self.forward_metadata.o_hbw.view(-1, self.num_q_heads * self.kv_lora_rank)
