@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 Huawei Technologies Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==============================================================================
+ */
+
 #include <torch/extension.h>
 #include <kutacc.h>
 #include <kupl.h>
@@ -69,7 +85,7 @@ void flash_mla_dense_decode_kunpeng(
     auto kt_q      = to_kutacc<bfloat16_t, 4>(q);
     auto kt_kcache = to_kutacc<bfloat16_t, 3>(kcache);
 
-    std::optional<kutacc::Tensor<bfloat16_t, 3>> kt_vcache;
+    std::optional<kutacc::Tensor<bfloat16_t, 3>> kt_vcache = std::nullopt;
     if (vcache.has_value()) {
         kt_vcache = kutacc::Tensor<bfloat16_t, 3>(
             reinterpret_cast<bfloat16_t*>(vcache->data_ptr<at::BFloat16>()),
@@ -89,7 +105,7 @@ void flash_mla_dense_decode_kunpeng(
     kutacc::flash_mla_dense_decode(
         kt_q,
         kt_kcache,
-        std::nullopt,
+        kt_vcache,
         kt_block_table,
         kt_seqlens_kv,
         kt_o,

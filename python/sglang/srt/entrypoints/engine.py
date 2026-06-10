@@ -1301,7 +1301,7 @@ def _calculate_rank_ranges(
 
     nnodes_per_tp_group = nnodes_per_pp_rank
     tp_size_per_node = tp_size // nnodes_per_tp_group
-    if _is_kunpeng_binary_launch:
+    if _is_kunpeng_binary_launch and nnodes > 1:
         tp_rank_range = range(
             tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node,
             tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node + 1,

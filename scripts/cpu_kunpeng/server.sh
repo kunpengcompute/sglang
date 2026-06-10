@@ -70,9 +70,11 @@ case "$ROLE" in
             --disaggregation-bootstrap-port 9001
             --max-prefill-tokens 4096
             --max-total-tokens 18496
+            --page-size 64
             --load-balance-method round_robin
             --quantization w8a8_int8
-            # --load-format sharded_state
+            --decode-attention-backend kunpeng_cpu
+            #--load-format sharded_state
         )
         ;;
     *)
