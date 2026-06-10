@@ -183,6 +183,12 @@ def is_cpu_920f() -> bool:
 def is_kunpeng_binary_launch() -> bool:
     return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_BINARY_LAUNCH") == "1"
 
+def is_kunpeng_hbw_pool() -> bool:
+    return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_HBW_POOL") == "1"
+
+def is_kunpeng_hbw_swap() -> bool:
+    return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_HBW_SWAP") == "1"
+
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
     is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()

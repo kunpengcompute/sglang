@@ -1,3 +1,21 @@
+/*
+ * Copyright 2026 Huawei Technologies Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==============================================================================
+ */
+
+#include <torch/all.h>
+#include <torch/library.h>
 #include <torch/extension.h>
 #include <kupl.h>
 #include "sgl_kernel_ops.h"
@@ -11,6 +29,7 @@
 #include "../utils/sdma_thres_util.h"
 
 constexpr bool debug = false;
+// 分块拷贝的阈值，用于将大块内存拷贝操作分割成多个小块异步拷贝任务
 const int64_t ASYNC_COPY_THRES_SIZE = 14 * 1024 * 1024;
 
 inline int64_t now_ns() {
@@ -63,11 +82,11 @@ void queue_async_swapout_kunpeng(
     // 获取指针
     int* ddr2swap_ptr = ddr2swap.data_ptr<int>();
     int swap_index = ddr2swap_ptr[index];
-    PARAMETER_CHECK(swap_index != -1, "swap_index == -1, no swapin before");
+    TORCH_CHECK(swap_index != -1, "swap_index == -1, no swapin before");
 
     if (byte_size == -1) {
         // byte_size = swap_buffer_size;
-        PARAMETER_CHECK(false, "byte_size == -1 not supported without swap_buffer_size");
+        TORCH_CHECK(false, "byte_size == -1 not supported without swap_buffer_size");
     }
 
     int64_t buffer_stride = src.size(1) * src.size(2) * src.size(3) * src.element_size();
@@ -113,7 +132,7 @@ int64_t queue_async_swapin_kunpeng(
     now_buf_id = (now_buf_id + 1) % num_swap_buffers;
 
     if (byte_size == -1) {
-        PARAMETER_CHECK(false, "byte_size == -1 not supported without swap_buffer_size");
+        TORCH_CHECK(false, "byte_size == -1 not supported without swap_buffer_size");
     }
 
     int64_t send_num = (byte_size + ASYNC_COPY_THRES_SIZE - 1) / ASYNC_COPY_THRES_SIZE;
@@ -151,7 +170,7 @@ int64_t get_safe_on_package_memory_index_kunpeng(
     int* swapin_lengths_ptr = swapin_lengths.data_ptr<int>();
     int* swapout_lengths_ptr = swapout_lengths.data_ptr<int>();
     int swap_index = ddr2swap_ptr[index];
-    PARAMETER_CHECK(swap_index != -1, "swap_index == -1, no swapin before");
+    TORCH_CHECK(swap_index != -1, "swap_index == -1, no swapin before");
 
     int ddr_index = swap2ddr_ptr[swap_index];
     if (ddr_index == index) {

@@ -183,6 +183,7 @@ from sglang.srt.utils import (
     is_host_cpu_arm64,
     is_npu,
     is_cpu_920f,
+    is_kunpeng_hbw_pool,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     require_attn_tp_gather,
@@ -216,6 +217,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_920f = is_cpu_920f()
+_is_kunpeng_hbw_pool = is_kunpeng_hbw_pool()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -733,6 +735,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
+        if _is_cpu_920f and _is_kunpeng_hbw_pool:
+            self.init_hbw_pool_kunpeng()
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -2281,6 +2285,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
+
+    def init_hbw_pool_kunpeng(self):
+        """Initialize HBW memory pool for Kunpeng CPU backend."""
+        from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import (
+            KunpengHBWPool,
+        )
+
+        pool_size_mb = int(os.environ.get("SGLANG_KUNPENG_HBW_POOL_SIZE_MB"))
+        if pool_size_mb > 0:
+            pool_size_bytes = pool_size_mb * 1024 * 1024
+        else:
+            raise ValueError(f"pool_size_mb must be positive, got {pool_size_mb}")
+
+        self.hbw_pool = KunpengHBWPool(pool_size_bytes, alignment=self.page_size)
+        logger.info(
+            f"[KunpengCpu] HBW pool created: "
+            f"{pool_size_bytes / 1024 / 1024:.1f} MB"
+        )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""

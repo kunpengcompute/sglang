@@ -1,6 +1,21 @@
+# Copyright 2026 Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 import ctypes
 import logging
 import math
+import os
 from typing import Tuple, Optional
 
 import numpy as np
@@ -9,66 +24,47 @@ import torch
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "create_tensor_from_hbw",
-    "free_tensor_from_hbw",
-    "move_tensor_to_hbw",
     "KunpengHBWPool",
     "KunpengHBWKVbuffer",
 ]
 
-# ==================== KV Cache page size ====================
-PAGE_SIZE = 64
-
-# ==================== SDMA async swap parameters ====================
-BLOCK_NUM = 63 * 2
-SWAP_BUFF_NUM = 2
-MAX_EVENTS = 10
-SDMA_THRESHOLD = 5
-
-# ==================== HBW Pool alignment ====================
-ALIGNMENT = PAGE_SIZE
-
-
 def create_tensor_from_hbw(
-        tensor_shape: Tuple[int, ...],
-        tensor_dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Allocate a tensor on Kunpeng HBW memory."""
-    if not tensor_shape:
-        raise ValueError("tensor_shape cannot be empty")
+ 	         tensor_shape: Tuple[int, ...],
+ 	         tensor_dtype: torch.dtype,
+ 	 ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """Allocate a tensor on Kunpeng HBW memory."""
+     if not tensor_shape:
+         raise ValueError("tensor_shape cannot be empty")
 
-    num_elements = math.prod(tensor_shape)
-    element_size = torch.empty(1, dtype=tensor_dtype).element_size()
-    alloc_size_bytes = num_elements * element_size
+     num_elements = math.prod(tensor_shape)
+     element_size = torch.empty(1, dtype=tensor_dtype).element_size()
+     alloc_size_bytes = num_elements * element_size
 
-    # 分配 HBW 内存
-    hbw_ptr_tensor = torch.ops.sgl_kernel.hbw_allocator_kunpeng(alloc_size_bytes)
-    hbw_raw_ptr = hbw_ptr_tensor.item()
+     # allocator HBW memory
+     hbw_ptr_tensor = torch.ops.sgl_kernel.hbw_allocator_kunpeng(alloc_size_bytes)
+     hbw_raw_ptr = hbw_ptr_tensor.item()
 
-    if hbw_raw_ptr == 0:
-        raise RuntimeError(
-            f"HBW allocation failed: shape={tensor_shape}, dtype={tensor_dtype}, "
-            f"size={alloc_size_bytes} bytes ({alloc_size_bytes / 1024 / 1024:.2f} MB)"
-        )
+     if hbw_raw_ptr == 0:
+         raise RuntimeError(
+             f"HBW allocation failed: shape={tensor_shape}, dtype={tensor_dtype}, "
+             f"size={alloc_size_bytes} bytes ({alloc_size_bytes / 1024 / 1024:.2f} MB)"
+         )
 
-    hbw_buffer = (ctypes.c_char * alloc_size_bytes).from_address(hbw_raw_ptr)
-    hbw_np_array = np.frombuffer(hbw_buffer, dtype=np.uint8)
-    hbw_tensor = torch.from_numpy(hbw_np_array).view(tensor_dtype).reshape(tensor_shape)
+     hbw_buffer = (ctypes.c_char * alloc_size_bytes).from_address(hbw_raw_ptr)
+     hbw_np_array = np.frombuffer(hbw_buffer, dtype=np.uint8)
+     hbw_tensor = torch.from_numpy(hbw_np_array).view(tensor_dtype).reshape(tensor_shape)
 
-    return hbw_tensor, hbw_ptr_tensor
-
-
+     return hbw_tensor, hbw_ptr_tensor
+ 	 
 def free_tensor_from_hbw(hbw_ptr_tensor: torch.Tensor) -> None:
     """Free HBW memory."""
     torch.ops.sgl_kernel.hbw_destroy_kunpeng(hbw_ptr_tensor)
 
-
 def move_tensor_to_hbw(ddr_tensor: torch.Tensor) -> torch.Tensor:
-    """Copy a DDR tensor to HBW memory."""
-    hbw_tensor, hbw_ptr_tensor = create_tensor_from_hbw(ddr_tensor.shape, ddr_tensor.dtype)
-    hbw_tensor.copy_(ddr_tensor)
-    return hbw_tensor, hbw_ptr_tensor
-
+     """Copy a DDR tensor to HBW memory."""
+     hbw_tensor, hbw_ptr_tensor = create_tensor_from_hbw(ddr_tensor.shape, ddr_tensor.dtype)
+     hbw_tensor.copy_(ddr_tensor)
+     return hbw_tensor, hbw_ptr_tensor
 
 class KunpengHBWPool:
     """Free-list based HBW memory allocator.
@@ -87,8 +83,9 @@ class KunpengHBWPool:
         pool.reset()       # Free all at once
     """
 
-    def __init__(self, pool_size_bytes: int):
+    def __init__(self, pool_size_bytes: int, alignment: int = 64):
         self.pool_size = pool_size_bytes
+        self.alignment = alignment
         self._base_ptr: Optional[torch.Tensor] = None
         self._base_addr: int = 0
 
@@ -101,10 +98,9 @@ class KunpengHBWPool:
         self._buffer = (ctypes.c_char * pool_size_bytes).from_address(self._base_addr)
         self._np_array = np.frombuffer(self._buffer, dtype=np.uint8)
 
-        # Initialize free list with entire pool as one block
-        # Each entry is (start_offset, size)
+        # Free list: each entry is (start_offset, size)
         self._free_blocks = [(0, pool_size_bytes)]
-        # Track allocated blocks: {handle: (start, size, tensor)}
+        # Allocated blocks: {handle: (start, size, tensor)}
         self._allocated = {}
 
     def alloc(
@@ -112,18 +108,7 @@ class KunpengHBWPool:
         shape: Tuple[int, ...],
         dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, int]:
-        """Allocate a tensor from the pool.
-
-        Args:
-            shape: Tensor shape.
-            dtype: Tensor data type.
-
-        Returns:
-            (tensor, handle) where handle is used for deallocation.
-
-        Raises:
-            RuntimeError: If pool is exhausted.
-        """
+        """Allocate a tensor from the pool."""
         num_elements = math.prod(shape)
         alloc_bytes = num_elements * dtype.itemsize
 
@@ -142,7 +127,7 @@ class KunpengHBWPool:
         # No suitable block found after all retries
         raise RuntimeError(
             f"HBW pool exhausted: requested {alloc_bytes} bytes "
-            f"(aligned to {aligned_size}), pool utilization: "
+            f"(alignment={self.alignment}), pool utilization: "
             f"{self.utilization * 100:.1f}%, "
             f"free blocks: {len(self._free_blocks)}, "
             f"largest free: {max(s for _, s in self._free_blocks) if self._free_blocks else 0} bytes"
@@ -154,18 +139,10 @@ class KunpengHBWPool:
         shape: Tuple[int, ...],
         dtype: torch.dtype,
     ) -> Optional[int]:
-        """Try to find a free block and allocate from it.
-
-        Aligns the start offset within the free block, then carves out
-        exactly alloc_bytes for the tensor. Remaining space before and
-        after the allocation is returned to the free list.
-
-        Returns:
-            Handle if successful, None if no suitable block found.
-        """
+        """Try to find a free block and allocate from it."""
         for i, (block_start, block_size) in enumerate(self._free_blocks):
             # Align start offset within this block
-            aligned_start = (block_start + ALIGNMENT - 1) & ~(ALIGNMENT - 1)
+            aligned_start = (block_start + self.alignment - 1) & ~(self.alignment - 1)
             padding_before = aligned_start - block_start
 
             if padding_before + alloc_bytes > block_size:
@@ -197,14 +174,7 @@ class KunpengHBWPool:
         return None
 
     def free(self, handle: int) -> None:
-        """Free a previously allocated tensor.
-
-        Args:
-            handle: The handle returned by alloc() or move_to_hbw().
-
-        Raises:
-            KeyError: If handle is not found in allocated blocks.
-        """
+        """Free a previously allocated tensor."""
         if handle not in self._allocated:
             raise KeyError(f"Invalid allocation handle: {handle}")
 
@@ -269,7 +239,6 @@ class KunpengHBWPool:
             torch.ops.sgl_kernel.hbw_destroy_kunpeng(self._base_ptr)
             self._base_ptr = None
 
-
 class KunpengHBWKVbuffer:
     """SDMA-based async KV Cache HBW buffer manager.
 
@@ -295,24 +264,33 @@ class KunpengHBWKVbuffer:
         self,
         size: int,
         page_size: int,
+        num_layers: int,
         kv_cache_dim: int,
         store_dtype: torch.dtype = torch.bfloat16,
         device: str = "cpu",
     ):
-        if page_size != PAGE_SIZE:
-            raise ValueError(f"kunpeng hbw swap only supports page_size = {PAGE_SIZE}, got {page_size}")
-
+        # KV cache dimensions
         self.size = size
         self.page_size = page_size
         self.kv_cache_dim = kv_cache_dim
         self.store_dtype = store_dtype
         self.device = device
+        self.num_layers = num_layers
 
+        # SDMA parameters
+        self.swap_buff_num = self.store_dtype.itemsize
+        self.block_num = num_layers * self.swap_buff_num
+        self.max_events = int(os.environ.get("SGLANG_KUNPENG_SDMA_MAX_EVENTS"))
+        self.sdma_threshold = int(os.environ.get("SGLANG_KUNPENG_SDMA_THRESHOLD"))
+
+        # HBW buffer state
         self.kv_buffer: Optional[torch.Tensor] = None
         self.kv_buffer_ptr: Optional[torch.Tensor] = None
         self.kv_buffer_size: int = 0
         self.kv_buffer_size_per_buffer: int = 0
+        self.now_buf_id: int = 0
 
+        # SDMA management metadata
         self.ddr2swap: Optional[torch.Tensor] = None
         self.swap2ddr: Optional[torch.Tensor] = None
         self.swapin_tables: Optional[torch.Tensor] = None
@@ -320,64 +298,62 @@ class KunpengHBWKVbuffer:
         self.swapin_lengths: Optional[torch.Tensor] = None
         self.swapout_lengths: Optional[torch.Tensor] = None
 
-        self.now_buf_id: int = 0
-        self._initialized: bool = False
-
     def __del__(self):
         self.free_hbw_kvbuffer()
 
-    def init_hbw_swapbuffer(self, num_layer: int) -> None:
+    def init_hbw_swapbuffer(self) -> None:
         """Initialize HBW swap buffers and SDMA management metadata."""
 
         element_size = torch.tensor([], dtype=self.store_dtype).element_size()
-        shape = (SWAP_BUFF_NUM, self.size + self.page_size, 1, self.kv_cache_dim)
+        shape = (self.swap_buff_num, self.size + self.page_size, 1, self.kv_cache_dim)
         total_elements_per_buffer = (self.size + self.page_size) * self.kv_cache_dim
         self.kv_buffer_size_per_buffer = total_elements_per_buffer * element_size
-        self.kv_buffer_size = SWAP_BUFF_NUM * self.kv_buffer_size_per_buffer
+        self.kv_buffer_size = self.swap_buff_num * self.kv_buffer_size_per_buffer
 
+        # Allocate HBW KV buffer
         self.kv_buffer, self.kv_buffer_ptr = create_tensor_from_hbw(
             shape, self.store_dtype
         )
         self.kv_buffer.zero_()
 
-        self.ddr2swap = torch.full((num_layer,), -1, dtype=torch.int)
-        self.swap2ddr = torch.full((SWAP_BUFF_NUM,), -1, dtype=torch.int)
-        self.swapin_tables = torch.full((BLOCK_NUM, MAX_EVENTS), -1, dtype=torch.int)
-        self.swapout_tables = torch.full((BLOCK_NUM, MAX_EVENTS), -1, dtype=torch.int)
-        self.swapin_lengths = torch.zeros(BLOCK_NUM, dtype=torch.int)
-        self.swapout_lengths = torch.zeros(BLOCK_NUM, dtype=torch.int)
+        # Initialize SDMA management tables
+        self.ddr2swap = torch.full((self.num_layers,), -1, dtype=torch.int)
+        self.swap2ddr = torch.full((self.swap_buff_num,), -1, dtype=torch.int)
+        self.swapin_tables = torch.full((self.block_num, self.max_events), -1, dtype=torch.int)
+        self.swapout_tables = torch.full((self.block_num, self.max_events), -1, dtype=torch.int)
+        self.swapin_lengths = torch.zeros(self.block_num, dtype=torch.int)
+        self.swapout_lengths = torch.zeros(self.block_num, dtype=torch.int)
 
-        torch.ops.sgl_kernel.init_sdma(SDMA_THRESHOLD)
-
-        self._initialized = True
+        # Initialize SDMA engine
+        torch.ops.sgl_kernel.init_sdma(self.sdma_threshold)
 
     def queue_async_swapin(self, layer_id: int, src_tensor: torch.Tensor) -> None:
         """Asynchronously swap KV Cache from DDR to HBW."""
 
         self.now_buf_id = torch.ops.sgl_kernel.queue_async_swapin_kunpeng(
-            layer_id,
-            self.kv_buffer_size_per_buffer,
-            self.now_buf_id,
-            src_tensor,
-            self.kv_buffer,
-            self.ddr2swap,
-            self.swapin_tables,
-            self.swapin_lengths,
-            SWAP_BUFF_NUM,
+            index=layer_id,
+            byte_size=self.kv_buffer_size_per_buffer,
+            now_buf_id=self.now_buf_id,
+            src=src_tensor,
+            dst=self.kv_buffer,
+            ddr2swap=self.ddr2swap,
+            swapin_tables=self.swapin_tables,
+            swapin_lengths=self.swapin_lengths,
+            num_swap_buffers=self.swap_buff_num,
         )
 
     def queue_async_swapout(self, layer_id: int, dst_tensor: torch.Tensor) -> None:
         """Asynchronously swap KV Cache from HBW back to DDR."""
 
         torch.ops.sgl_kernel.queue_async_swapout_kunpeng(
-            layer_id,
-            self.kv_buffer_size_per_buffer,
-            0,
-            self.kv_buffer,
-            dst_tensor,
-            self.ddr2swap,
-            self.swapout_tables,
-            self.swapout_lengths,
+            index=layer_id,
+            byte_size=self.kv_buffer_size_per_buffer,
+            byte_offset=0,
+            src=self.kv_buffer,
+            dst=dst_tensor,
+            ddr2swap=self.ddr2swap,
+            swapout_tables=self.swapout_tables,
+            swapout_lengths=self.swapout_lengths,
         )
 
     def get_safe_on_package_memory_index(self, layer_id: int) -> int:
@@ -388,13 +364,13 @@ class KunpengHBWKVbuffer:
 
         """
         return torch.ops.sgl_kernel.get_safe_on_package_memory_index_kunpeng(
-            layer_id,
-            self.ddr2swap,
-            self.swap2ddr,
-            self.swapin_tables,
-            self.swapout_tables,
-            self.swapin_lengths,
-            self.swapout_lengths,
+            index=layer_id,
+            ddr2swap=self.ddr2swap,
+            swap2ddr=self.swap2ddr,
+            swapin_tables=self.swapin_tables,
+            swapout_tables=self.swapout_tables,
+            swapin_lengths=self.swapin_lengths,
+            swapout_lengths=self.swapout_lengths,
         )
 
     def sync_swap(self, dst_tensor: torch.Tensor, ori_tensor: torch.Tensor) -> None:
@@ -407,4 +383,3 @@ class KunpengHBWKVbuffer:
             free_tensor_from_hbw(self.kv_buffer_ptr)
             self.kv_buffer_ptr = None
             self.kv_buffer = None
-        self._initialized = False
