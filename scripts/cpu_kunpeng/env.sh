@@ -48,20 +48,16 @@ expand_ip_range() {
 # ------------------------------------------------------------
 # Configuration variables (edit these as needed)
 # ------------------------------------------------------------
-# IP range for prefill nodes
+# IP range, Master address/port for prefill nodes
 PREFILL_IP_SPEC="xxx.xxx.xxx. | 1-16"
-# IP range for decode nodes
-DECODE_IP_SPEC="xxx.xxx.xxx. | 17-32"
-
-NATIVE_IP_SPEC="xxx.xxx.xxx. | 1-16"
-
-# Master address/port (common or per role)
 PREFILL_MASTER_ADDR="xxx.xxx.xxx.1"
 PREFILL_MASTER_PORT="5000"
 
+DECODE_IP_SPEC="xxx.xxx.xxx. | 17-32"
 DECODE_MASTER_ADDR="xxx.xxx.xxx.17"
 DECODE_MASTER_PORT="5010"
 
+NATIVE_IP_SPEC="xxx.xxx.xxx. | 17-32"
 NATIVE_MASTER_ADDR="xxx.xxx.xxx.1"
 NATIVE_MASTER_PORT="5010"
 
@@ -70,17 +66,20 @@ LOG_BASE_DIR="/path-to-logs"
 CONDA_ENV_NAME="my_env"
 CONDA_SH_PATH="/path-to-conda-start-sh"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
+HPCKIT_PATH=/path-to-HPCKit
+OpenBLAS_PATH=/path-to-OpenBLAS
+KUTACC_PATH=/path-to-KUTACC
 
 # TP/EP size
 export TP_SIZE=256
-export EP_SIZE=256
+export EP_SIZE=${TP_SIZE}
 
 # Communication
 export GLOO_SOCKET_IFNAME=enp26s0f0
 
 # Thread
 export OMP_NUM_THREADS=1
-export OMP_PROC_BIND=close
+export OMP_PROC_BIND=false
 export TORCH_USE_KUPL=1
 export KUPL_EXECUTOR_BACKEND=pthread
 export KUPL_EXECUTOR_COUNT=32
@@ -106,6 +105,17 @@ export SGLANG_KUNPENG_HBW_POOL_SIZE_MB=2048
 # Kunpeng SDMA parameters
 export SGLANG_KUNPENG_SDMA_MAX_EVENTS=10
 export SGLANG_KUNPENG_SDMA_THRESHOLD=5
+
+# Load format (e.g. "sharded_state", leave empty for default)
+export LOAD_FORMAT=""
+
+# ------------------------------------------------------------
+# load local config
+# ------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/.user_env.sh" ]]; then
+    source "$SCRIPT_DIR/.user_env.sh"
+fi
 
 # ------------------------------------------------------------
 # Function: prefill_config
@@ -150,6 +160,8 @@ native_config() {
     export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
+
+
 # ------------------------------------------------------------
 # Main: dispatch based on command-line argument
 # ------------------------------------------------------------
@@ -172,9 +184,6 @@ case "$ACTION" in
         ;;
 esac
 
-HPCKIT_PATH=/path-to-HPCKit
-OpenBLAS_PATH=/path-to-OpenBLAS
-KUTACC_PATH=/path-to-KUTACC
 
 source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh
