@@ -1,3 +1,19 @@
+# Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
@@ -175,6 +191,14 @@ def handle_attention_triton(attn, forward_batch):
 def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
+def handle_attention_kunpeng_cpu(attn, forward_batch):
+    if (
+        forward_batch.forward_mode.is_extend_without_speculative()
+        and sum(forward_batch.extend_prefix_lens_cpu) == 0
+    ):
+        return AttnForwardMethod.MHA_KUNPENG
+    else:
+        return AttnForwardMethod.MLA_KUNPENG
 
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
@@ -187,3 +211,4 @@ AttentionBackendRegistry.register("aiter", handle_attention_aiter)
 AttentionBackendRegistry.register("nsa", handle_attention_nsa)
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
+AttentionBackendRegistry.register("kunpeng_cpu", handle_attention_kunpeng_cpu)

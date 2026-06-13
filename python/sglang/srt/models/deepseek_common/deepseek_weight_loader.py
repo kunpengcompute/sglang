@@ -49,6 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    _is_cpu_920f,
     _is_cuda,
     _is_fp8_fnuz,
     _is_hip,
@@ -560,6 +561,14 @@ class DeepseekV2WeightLoaderMixin:
                         ).to(torch.bfloat16)
                 else:
                     # channel-wise int8 need it
+                    if _is_cpu_920f:
+                        w_kc_int8, w_vc_int8 = w.unflatten(
+                            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                        ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                        w_kc_scale, w_vc_scale = self_attn.kv_b_proj.weight_scale.unflatten(
+                            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                        ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+
                     w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
                         torch.bfloat16
                     )
@@ -584,10 +593,16 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
+                if _is_cpu_920f:
+                    self_attn.w_kc_int8 = bind_or_assign(self_attn.w_kc_int8, w_kc_int8.contiguous())
+                    self_attn.w_kc_scale = bind_or_assign(self_attn.w_kc_scale, w_kc_scale.contiguous())
                 w_vc = w_vc.contiguous().transpose(1, 2)
                 if _is_npu:
                     w_vc = w_vc.contiguous()
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
+                if _is_cpu_920f:
+                    self_attn.w_vc_int8 = bind_or_assign(self_attn.w_vc_int8, w_vc_int8.contiguous())
+                    self_attn.w_vc_scale = bind_or_assign(self_attn.w_vc_scale, w_vc_scale.contiguous())
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None

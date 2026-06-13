@@ -50,6 +50,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
@@ -127,8 +128,10 @@ from sglang.srt.models.deepseek_common.attention_backend_handler import (
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
     DeepseekMHAForwardMixin,
+    DeepseekMHAKunpengForwardMixin,
     DeepseekMLACpuForwardMixin,
     DeepseekMLAForwardMixin,
+    DeepseekMLAKunpengForwardMixin,
     DeepseekMLARocmForwardMixin,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
@@ -138,6 +141,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _get_llama_4_scaling,
     _is_cpu,
+    _is_cpu_920f,
     _is_cpu_amx_available,
     _is_cuda,
     _is_gfx95_supported,
@@ -145,7 +149,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_musa,
     _is_npu,
     _is_xpu,
-    _is_cpu_920f,
     _use_aiter,
     _use_aiter_gfx95,
 )
@@ -161,7 +164,6 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -1148,7 +1150,9 @@ class DeepseekV2MoE(nn.Module):
 class DeepseekV2AttentionMLA(
     nn.Module,
     DeepseekMHAForwardMixin,
+    DeepseekMHAKunpengForwardMixin,
     DeepseekMLAForwardMixin,
+    DeepseekMLAKunpengForwardMixin,
     DeepseekMLARocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
@@ -1351,7 +1355,11 @@ class DeepseekV2AttentionMLA(
         self.attn_mha.kv_b_proj = None
 
         self.w_kc = None
+        self.w_kc_int8 = None
+        self.w_kc_scale = None
         self.w_vc = None
+        self.w_vc_int8 = None
+        self.w_vc_scale = None
         self.w_scale = 1.0
 
         self.w_scale_k = None
@@ -1380,7 +1388,9 @@ class DeepseekV2AttentionMLA(
         )
 
         self.init_mha_forward()
+        self.init_mha_kunpeng_forward()
         self.init_mla_forward()
+        self.init_mla_forward_kunpeng()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
 
@@ -1481,9 +1491,12 @@ class DeepseekV2AttentionMLA(
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
-        attn_forward_method = AttnForwardMethod.MLA
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MHA_KUNPENG:
+            inner_state = self.forward_normal_prepare_kunpeng(
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
@@ -1496,6 +1509,15 @@ class DeepseekV2AttentionMLA(
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
             inner_state = self.forward_absorb_prepare(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
+            )
+        elif attn_forward_method == AttnForwardMethod.MLA_KUNPENG:
+            inner_state = self.forward_absorb_prepare_kunpeng(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -1558,10 +1580,14 @@ class DeepseekV2AttentionMLA(
             return self.forward_normal_one_shot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
             return self.forward_absorb_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA_KUNPENG:
+            return self.forward_absorb_core_kunpeng(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
             return self.forward_absorb_fused_mla_rope_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
             return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_KUNPENG:
+            return self.forward_normal_core_kunpeng(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_NPU:
             return forward_mha_core_npu(self, *inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
