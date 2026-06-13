@@ -51,6 +51,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_kunpeng_binary_launch,
     is_mps,
     is_musa,
     is_no_spec_infer_or_topk_one,
@@ -66,7 +67,6 @@ from sglang.srt.utils.common import (
     parse_connector_type,
     torch_release,
     xpu_has_xmx_support,
-    is_kunpeng_binary_launch,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
@@ -663,6 +663,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_attention_local_control_broadcast: bool = False
     enable_dp_lm_head: bool = False
+    enable_dp_mlp: bool = False
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
@@ -2934,6 +2935,7 @@ class ServerArgs:
         if self.dp_size == 1:
             self.enable_dp_attention = False
             self.enable_dp_lm_head = False
+            self.enable_dp_mlp = False
 
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -2947,6 +2949,14 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention
             ), "Please enable dp attention when setting enable_dp_lm_head. "
+
+        if self.enable_dp_mlp:
+            assert (
+                self.enable_dp_attention
+            ), "Please enable dp attention when setting enable_dp_mlp. "
+            assert (
+                self.moe_dense_tp_size != 1
+            ), "enable_dp_mlp is not compatible with moe_dense_tp_size=1. Please use one or the other."
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
@@ -6117,6 +6127,11 @@ class ServerArgs:
             "--enable-dp-lm-head",
             action="store_true",
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+        )
+        parser.add_argument(
+            "--enable-dp-mlp",
+            action="store_true",
+            help="Enable dense MLP parallel across the attention TP group to avoid all-gather/all-reduce across DP groups, optimizing performance under DP attention.",
         )
         parser.add_argument(
             "--enable-two-batch-overlap",

@@ -33,6 +33,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
@@ -77,7 +78,6 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
 )
-from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
@@ -382,6 +382,8 @@ class LayerScatterModes:
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
         else:
+            if enable_dp_mlp_mode():
+                return ScatterMode.TP_ATTN_FULL
             return (
                 ScatterMode.SCATTERED
                 if enable_moe_dense_fully_dp()
@@ -404,6 +406,8 @@ class LayerScatterModes:
             return ScatterMode.SCATTERED
         if mlp_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
             return ScatterMode.TP_ATTN_FULL
+        if mlp_mode == ScatterMode.TP_ATTN_FULL:
+            return ScatterMode.TP_ATTN_FULL
         raise NotImplementedError
 
     @classmethod
@@ -417,11 +421,17 @@ class LayerScatterModes:
             return ScatterMode.SCATTERED
         if mlp_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
             return ScatterMode.TP_ATTN_FULL
+        if mlp_mode == ScatterMode.TP_ATTN_FULL:
+            return ScatterMode.TP_ATTN_FULL
         raise NotImplementedError
 
 
 def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
+
+
+def enable_dp_mlp_mode():
+    return get_global_server_args().enable_dp_mlp
 
 
 class LayerCommunicator:
@@ -735,6 +745,9 @@ class LayerCommunicator:
         if get_attn_tp_context().input_scattered:
             return False
 
+        if enable_dp_mlp_mode():
+            return False
+
         batch_size = (
             forward_batch.input_ids.shape[0]
             if hasattr(forward_batch, "input_ids")
@@ -908,6 +921,23 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (
                 residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
             )
+            and (hidden_states_output_mode == ScatterMode.TP_ATTN_FULL)
+            and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
+        ):
+            if get_attention_tp_rank() == 0:
+                logger.info(
+                    "[prepare_mlp] fn: attn_tp_all_reduce + layernorm (enable_dp_mlp)"
+                )
+            return partial(
+                CommunicateWithAllReduceAndLayerNormFn._all_reduce_and_layernorm,
+                residual_input_mode=residual_input_mode,
+            )
+
+        if (
+            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (
+                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+            )
             and (hidden_states_output_mode == ScatterMode.FULL)
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):
@@ -961,6 +991,55 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
+    def _all_reduce_and_layernorm(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+        *,
+        residual_input_mode,
+    ):
+        if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
+            residual, local_residual = (
+                get_local_dp_buffer(),
+                residual,
+            )
+            attn_tp_all_gather_into_tensor(residual, local_residual)
+
+        if context.attn_tp_size == 1:
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
+        else:
+            handled = False
+            if (
+                apply_aiter_all_reduce_fusion(hidden_states)
+                or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+            ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
+                hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+                    hidden_states, residual, use_attn_tp_group=True
+                )
+                handled = True
+
+            if not handled:
+                quantize_communications = (
+                    not forward_batch.forward_mode.is_decode_or_idle()
+                    and get_global_server_args().enable_quant_communications
+                )
+                if quantize_communications:
+                    hidden_states = attention_tensor_model_parallel_quant_all_reduce(
+                        hidden_states
+                    )
+                else:
+                    hidden_states = attention_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
+                if _is_npu and context.cache is not None:
+                    _ = prepare_weight_cache(hidden_states, context.cache)
+                hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod
