@@ -40,6 +40,7 @@ BASE_ARGS=(
     --disable-custom-all-reduce
     --disable-radix-cache
     --disable-overlap-schedule
+    --enable-dp-lm-head
 )
 
 # Role-specific arguments

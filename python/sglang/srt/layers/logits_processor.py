@@ -940,14 +940,18 @@ class LogitsProcessor(nn.Module):
         if self.vocab_size % self.attn_tp_size == 0:
             global_logits = torch.empty(
                 (
-                    self.attn_tp_size,
-                    logits.shape[0],
+                    self.attn_tp_size * logits.shape[0],
                     self.vocab_size // self.attn_tp_size,
                 ),
                 device=logits.device,
                 dtype=logits.dtype,
             )
             attn_tp_all_gather_into_tensor(global_logits, logits)
+            global_logits = global_logits.reshape(
+                self.attn_tp_size,
+                logits.shape[0],
+                self.vocab_size // self.attn_tp_size,
+            )
             global_logits = global_logits.permute(1, 0, 2).reshape(
                 logits.shape[0], self.vocab_size
             )
