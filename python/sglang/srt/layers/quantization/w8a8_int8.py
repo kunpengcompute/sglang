@@ -1,3 +1,19 @@
+# Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -27,6 +43,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
+    is_cpu_920f,
     is_cuda,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -39,6 +56,7 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_cpu_920f = is_cpu_920f()
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -158,12 +176,15 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # TODO: weight prepack should be executed here
         if _is_cpu:
-            # assert (
-            #     _is_cpu_amx_available
-            # ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
-            # _amx_process_weight_after_loading(layer, ["weight"])
-            layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+            assert (
+                _is_cpu_amx_available or _is_cpu_920f
+            ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support or 920f"
+            if _is_cpu_amx_available:
+                _amx_process_weight_after_loading(layer, ["weight"])
+            else:
+                layer.weight = Parameter(layer.weight.data, requires_grad=False)
         else:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
@@ -214,11 +235,15 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
+        if _is_cpu_920f:
+            weight = layer.weight.t()
+        else:
+            weight = layer.weight
         x_q, x_scale = per_token_quant_int8(x)
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
-        output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
+        output_shape = [*x_q.shape[:-1], weight.shape[1]]
 
         def int8_scaled_mm(x_q, w_q, x_scale, w_scale, out_dtype, bias=None):
             # fix mlp gate_up_proj
@@ -233,7 +258,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
         output = int8_scaled_mm(
             x_q_2d,
-            layer.weight,
+            weight,
             x_scale_2d,
             layer.weight_scale,
             out_dtype=x.dtype,
@@ -323,12 +348,14 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
-            # assert (
-            #     _is_cpu_amx_available
-            # ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
-            # _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-            layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-            layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
+            assert (
+                _is_cpu_amx_available or _is_cpu_920f
+            ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support or 920f"
+            if _is_cpu_amx_available:
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            else:
+                layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
+                layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         else:
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
             layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)

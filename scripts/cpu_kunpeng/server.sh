@@ -23,6 +23,7 @@ BASE_ARGS=(
     --model "$MODEL_PATH"
     --device cpu
     --trust-remote-code
+    --attention-backend kunpeng_cpu
     --host "$IP"
     --dist-init-addr "$MASTER_ADDR:$MASTER_PORT"
     --nnodes "$WORLD_SIZE"
@@ -32,7 +33,7 @@ BASE_ARGS=(
     --dp-size "$WORLD_SIZE"
     --tp-size "$TP_SIZE"
     --ep-size "$EP_SIZE"
-    --page-size 1
+    --page-size 64
     --mem-fraction-static 0.88
     --chunked-prefill-size -1
     --skip-server-warmup
@@ -70,11 +71,9 @@ case "$ROLE" in
             --disaggregation-bootstrap-port 9001
             --max-prefill-tokens 4096
             --max-total-tokens 18496
-            --page-size 64
             --load-balance-method round_robin
             --quantization w8a8_int8
-            --decode-attention-backend kunpeng_cpu
-            #--load-format sharded_state
+            ${LOAD_FORMAT:+--load-format "$LOAD_FORMAT"}
         )
         ;;
     *)
