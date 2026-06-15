@@ -583,7 +583,6 @@ def grouped_topk_gpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     scores = torch.softmax(gating_output, dim=-1)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]

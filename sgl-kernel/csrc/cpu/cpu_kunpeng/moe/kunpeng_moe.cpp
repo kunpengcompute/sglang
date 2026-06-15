@@ -22,7 +22,6 @@
 #include <fstream>
 #include <arm_sve.h>
 #include "../matmul/tiling.h"
-#include "../utils/parallel.h"
 #include "../utils/math.h"
 
 extern void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c);
@@ -113,7 +112,7 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
     auto active_expert = active_expert_.data();
 
     // bool moe_balance = context.moe_balance();
-    parallel_for(0, num_token, 1, [&](int64_t start, int64_t end) {
+    at::parallel_for(0, num_token, 1, [&](int64_t start, int64_t end) {
         SmallVector<float, 256> origin_score_(num_expert);
         auto origin_score = origin_score_.data();
         SmallVector<float, 256> score_(num_expert);
