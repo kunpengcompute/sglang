@@ -1,6 +1,23 @@
+# Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
@@ -40,6 +57,7 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -594,6 +612,96 @@ class NpuFuseEPMoE(DeepEPMoE):
             )
 
 
+class KunpengMoE(FusedMoE):
+    """Kunpeng CPU MoE with RDMA-based dispatch/combine pipeline.
+
+    Pipeline:
+        1. dispatch: quantize + RDMA send/recv → raw int8+scale buffers
+        2. run_moe_core: dequantize + expert computation (placeholder)
+        3. combine: RDMA combine_send/recv → weighted reduction
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+            num_fused_shared_experts=num_fused_shared_experts,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            activation=activation,
+            routed_scaling_factor=routed_scaling_factor,
+            **kwargs,
+        )
+
+    @KunpengProfiler(depth=1)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+            KunpengCombineInput,
+            KunpengDispatchOutput,
+        )
+
+        # Step 1: Dispatch — quantize + RDMA send/recv
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+        assert isinstance(dispatch_output, KunpengDispatchOutput)
+
+        # Step 2: Expert computation (placeholder)
+        combine_input = self.run_moe_core(dispatch_output)
+
+        # Step 3: Combine — RDMA combine_send/recv
+        hidden_states = self.dispatcher.combine(combine_input=combine_input)
+
+        return hidden_states
+
+    @KunpengProfiler(depth=2)
+    def run_moe_core(
+        self,
+        dispatch_output: KunpengDispatchOutput,
+    ) -> KunpengCombineInput:
+        """Run expert computation on received tokens.
+
+        Dequantizes received int8+scale data, applies expert computation
+        (W13 -> SwiGLU -> W2) per local_expert, and copies results into
+        combine_send_buf. Will be replaced with kutacc operator later.
+        """
+        from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+            KunpengCombineInput,
+        )
+
+        self.dispatcher.dequantize_and_copy_to_combine(dispatch_output, layer=self)
+
+        return KunpengCombineInput(
+            topk_weights=dispatch_output.topk_weights,
+            topk_ids_index=dispatch_output.topk_ids_index,
+            num_tokens=dispatch_output.num_tokens,
+            batch_size=dispatch_output.batch_size,
+        )
+
+
 class MoriEPMoE(DeepEPMoE):
     def __init__(
         self,
@@ -808,5 +916,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
+    if get_moe_a2a_backend().is_kunpeng_cpu():
+        return KunpengMoE
 
     return FusedMoE

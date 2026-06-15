@@ -58,6 +58,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -556,6 +557,7 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
+    @KunpengProfiler(depth=2)
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -752,6 +754,7 @@ class GroupCoordinator:
             )
         return output
 
+    @KunpengProfiler(depth=2)
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
