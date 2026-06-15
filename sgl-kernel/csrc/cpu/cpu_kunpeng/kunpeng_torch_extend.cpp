@@ -127,6 +127,54 @@ void init_sdma(int64_t sdmathreshold);
 
 void finalize_sdma();
 
+// === MoE 算子声明 ===
+void moe_comm_create_kunpeng(int64_t process_group_ptr);
+void moe_comm_finalize_kunpeng();
+void moe_comm_barrier_kunpeng();
+
+void moe_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor recv_src_info, at::Tensor recv_src_info_bak,
+                               int64_t num_experts, int64_t num_max_dispatch_tokens_per_rank, int64_t hidden,
+                               int64_t num_tokens, int64_t recv_src_info_count, int64_t dtp,
+                               at::Tensor dispatch_recv_buf);
+
+void moe_combine_init_kunpeng(at::Tensor combine_send_buf, at::Tensor combined_x, int64_t num_tokens,
+                              int64_t num_experts, int64_t num_max_dispatch_tokens_per_rank, int64_t num_topk,
+                              int64_t hidden, int64_t local_rank, int64_t local_size, at::Tensor combine_recv_buf,
+                              bool use_static_route);
+
+void moe_dispatch_send_kunpeng(at::Tensor x, at::Tensor topk_idx, int64_t num_experts,
+                               int64_t num_max_dispatch_tokens_per_rank, at::Tensor parallel_policy, int64_t num_tokens,
+                               int64_t batch_id);
+
+void moe_dispatch_recv_kunpeng(int64_t batch_id);
+
+void moe_dispatch_finalize_kunpeng();
+
+void moe_combine_send_kunpeng(at::Tensor x, at::Tensor src_info, int64_t num_max_dispatch_tokens_per_rank,
+                              int64_t num_experts, int64_t hidden, at::Tensor parallel_sizes, int64_t batch_id,
+                              at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights, int64_t num_tokens,
+                              int64_t num_topk, bool enable_allgather);
+
+void moe_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights, int64_t num_tokens,
+                              int64_t num_max_dispatch_tokens_per_rank, int64_t num_topk, int64_t hidden,
+                              int64_t batch_id);
+
+void moe_combine_finalize_kunpeng();
+
+// === SHM Reduce Scatter 算子声明 ===
+void shm_reduce_scatter_init_kunpeng();
+void shm_reduce_scatter_kunpeng(int64_t height, int64_t width, at::Tensor tensor_data);
+void shm_reduce_scatter_finalize_kunpeng();
+
+// === SHM 算子声明 ===
+void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
+
+void shm_pool_destroy_kunpeng();
+
+bool is_shm_tensor(at::Tensor tensor);
+
+at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t> shape);
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 {
     // quant
@@ -306,4 +354,77 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("finalize_sdma() -> ()");
     m.impl("finalize_sdma", finalize_sdma);
+
+    // RDMA MoE communication operators
+    m.def("moe_comm_create_kunpeng(int process_group_ptr) -> ()");
+    m.impl("moe_comm_create_kunpeng", moe_comm_create_kunpeng);
+
+    m.def("moe_comm_finalize_kunpeng() -> ()");
+    m.impl("moe_comm_finalize_kunpeng", moe_comm_finalize_kunpeng);
+
+    m.def("moe_comm_barrier_kunpeng() -> ()");
+    m.impl("moe_comm_barrier_kunpeng", moe_comm_barrier_kunpeng);
+
+    m.def(
+        "moe_dispatch_init_kunpeng(Tensor dispatch_send_buf, Tensor recv_src_info, Tensor recv_src_info_bak, "
+        "int num_experts, int num_max_dispatch_tokens_per_rank, int hidden, int num_tokens, "
+        "int recv_src_info_count, int dtp, Tensor dispatch_recv_buf) -> ()");
+    m.impl("moe_dispatch_init_kunpeng", moe_dispatch_init_kunpeng);
+
+    m.def(
+        "moe_combine_init_kunpeng(Tensor combine_send_buf, Tensor combined_x, "
+        "int num_tokens, int num_experts, int num_max_dispatch_tokens_per_rank, int num_topk, int hidden, "
+        "int local_rank, int local_size, Tensor combine_recv_buf, bool use_static_route) -> ()");
+    m.impl("moe_combine_init_kunpeng", moe_combine_init_kunpeng);
+
+    m.def(
+        "moe_dispatch_send_kunpeng(Tensor x, Tensor topk_idx, int num_experts, int num_max_dispatch_tokens_per_rank, "
+        "Tensor parallel_policy, int num_tokens, int batch_id) -> ()");
+    m.impl("moe_dispatch_send_kunpeng", moe_dispatch_send_kunpeng);
+
+    m.def("moe_dispatch_recv_kunpeng(int batch_id) -> ()");
+    m.impl("moe_dispatch_recv_kunpeng", moe_dispatch_recv_kunpeng);
+
+    m.def("moe_dispatch_finalize_kunpeng() -> ()");
+    m.impl("moe_dispatch_finalize_kunpeng", moe_dispatch_finalize_kunpeng);
+
+    m.def(
+        "moe_combine_send_kunpeng(Tensor x, Tensor src_info, "
+        "int num_max_dispatch_tokens_per_rank, int num_experts, int hidden, "
+        "Tensor parallel_sizes, int batch_id, "
+        "Tensor combined_x, Tensor topk_idx, Tensor topk_weights, "
+        "int num_tokens, int num_topk, bool enable_allgather) -> ()");
+    m.impl("moe_combine_send_kunpeng", moe_combine_send_kunpeng);
+
+    m.def(
+        "moe_combine_recv_kunpeng(Tensor combined_x, Tensor topk_idx, Tensor topk_weights, "
+        "int num_tokens, int num_max_dispatch_tokens_per_rank, int num_topk, "
+        "int hidden, int batch_id) -> ()");
+    m.impl("moe_combine_recv_kunpeng", moe_combine_recv_kunpeng);
+
+    m.def("moe_combine_finalize_kunpeng() -> ()");
+    m.impl("moe_combine_finalize_kunpeng", moe_combine_finalize_kunpeng);
+
+    // SHM operators
+    m.def("shm_pool_create_kunpeng(int intra_node_pg, int intra_socket_pg, int intra_die_pg, int shm_size_mb) -> ()");
+    m.impl("shm_pool_create_kunpeng", shm_pool_create_kunpeng);
+
+    m.def("shm_pool_destroy_kunpeng() -> ()");
+    m.impl("shm_pool_destroy_kunpeng", shm_pool_destroy_kunpeng);
+
+    m.def("is_shm_tensor(Tensor tensor) -> bool");
+    m.impl("is_shm_tensor", is_shm_tensor);
+
+    m.def("create_shm_tensor_kunpeng(ScalarType dtype, int[] shape) -> Tensor");
+    m.impl("create_shm_tensor_kunpeng", create_shm_tensor_kunpeng);
+
+    // SHM Reduce Scatter operators
+    m.def("shm_reduce_scatter_init_kunpeng() -> ()");
+    m.impl("shm_reduce_scatter_init_kunpeng", shm_reduce_scatter_init_kunpeng);
+
+    m.def("shm_reduce_scatter_kunpeng(int height, int width, Tensor tensor_data) -> ()");
+    m.impl("shm_reduce_scatter_kunpeng", shm_reduce_scatter_kunpeng);
+
+    m.def("shm_reduce_scatter_finalize_kunpeng() -> ()");
+    m.impl("shm_reduce_scatter_finalize_kunpeng", shm_reduce_scatter_finalize_kunpeng);
 }
