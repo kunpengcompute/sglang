@@ -665,7 +665,6 @@ class KunpengDispatcher(BaseDispatcher):
             recv_src_info = state.recv_src_info_bak
         stride_per_rank = state.num_max_dispatch_tokens_per_rank * 2 + 1
 
-        # state.combine_send_buf.zero_()
         send_bias = 0
 
         for local_expert in range(state.num_local_experts):

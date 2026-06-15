@@ -37,14 +37,14 @@ _SHM_POOL_INITIALIZED: bool = False
 
 
 def get_intra_socket_group() -> dist.ProcessGroup:
-    assert (
-        _INTRA_SOCKET is not None,
-    ), "intra-socket parallel group is not initialized"
+    if _INTRA_SOCKET is None:
+        raise ValueError("intra-socket parallel group is not initialized")
     return _INTRA_SOCKET
 
 
 def get_intra_die_group() -> dist.ProcessGroup:
-    assert _INTRA_DIE is not None, "intra-die parallel group is not initialized"
+    if _INTRA_DIE is None:
+        raise ValueError("intra-die parallel group is not initialized")
     return _INTRA_DIE
 
 
@@ -54,15 +54,15 @@ def is_shm_pool_initialized() -> bool:
 
 def init_oob_comms():
     global _INTRA_SOCKET, _INTRA_DIE
-    assert (
-        _INTRA_SOCKET is None and _INTRA_DIE is None
-    ), "Kunpeng out-of-band comms already initialized"
+    if not (_INTRA_SOCKET is None and _INTRA_DIE is None):
+        raise ValueError("Kunpeng out-of-band comms already initialized")
 
     # Kunpeng CPU: each node has 16 NUMA nodes, each socket has 8 NUMA nodes, each die has 4 NUMA nodes
     intra_socket_size = 8
     intra_die_size = 4
 
-    assert dist.is_initialized(), "Distributed environment not initialized"
+    if not dist.is_initialized():
+        raise ValueError("Distributed environment not initialized")
     rank = dist.get_rank()
 
     start_socket = (rank // intra_socket_size) * intra_socket_size
@@ -84,8 +84,14 @@ def init_oob_comms():
             f"Expected size={expected_size}, rank={expected_rank} | "
             f"match: {actual_size == expected_size and actual_rank == expected_rank}"
         )
-        assert actual_size == expected_size, f"Size mismatch in intra_socket_group"
-        assert actual_rank == expected_rank, f"Rank mismatch in intra_socket_group"
+        if actual_size != expected_size:
+            raise ValueError(
+                f"Size mismatch in intra_socket_group: {actual_size} != {expected_size}"
+            )
+        if actual_rank != expected_rank:
+            raise ValueError(
+                f"Rank mismatch in intra_socket_group: {actual_rank} != {expected_rank}"
+            )
     else:
         logger.info(
             f"[KunpengCommunicator rank {rank}] Not in any intra_socket_group (unexpected)"
@@ -101,8 +107,14 @@ def init_oob_comms():
             f"Expected size={expected_size}, rank={expected_rank} | "
             f"match: {actual_size == expected_size and actual_rank == expected_rank}"
         )
-        assert actual_size == expected_size, f"Size mismatch in intra_die_group"
-        assert actual_rank == expected_rank, f"Rank mismatch in intra_die_group"
+        if actual_size != expected_size:
+            raise ValueError(
+                f"Size mismatch in intra_die_group: {actual_size} != {expected_size}"
+            )
+        if actual_rank != expected_rank:
+            raise ValueError(
+                f"Rank mismatch in intra_die_group: {actual_rank} != {expected_rank}"
+            )
     else:
         logger.info(
             f"[KunpengCommunicator rank {rank}] Not in any intra_die_group (unexpected)"
@@ -122,9 +134,8 @@ def init_shm_pool():
     if _SHM_POOL_INITIALIZED:
         return
 
-    assert (
-        _INTRA_SOCKET is not None and _INTRA_DIE is not None
-    ), "init_oob_comms must be called before init_shm_pool"
+    if not (_INTRA_SOCKET is not None and _INTRA_DIE is not None):
+        raise ValueError("init_oob_comms must be called before init_shm_pool")
 
     from sgl_kernel import pg_helper
 
