@@ -63,6 +63,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    enable_dp_mlp_mode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -207,6 +208,7 @@ class DeepseekV2MLP(nn.Module):
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
@@ -229,6 +231,7 @@ class DeepseekV2MLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_rank=tp_rank,
             tp_size=tp_size,
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         if not hasattr(self.gate_up_proj, "weight") and hasattr(
             self.gate_up_proj, "weight_packed"
@@ -1731,8 +1734,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
+                mlp_use_dp_attention_reduce = False
+            elif enable_dp_mlp_mode():
+                mlp_tp_rank = get_attention_tp_rank()
+                mlp_tp_size = get_attention_tp_size()
+                mlp_use_dp_attention_reduce = True
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
+                mlp_use_dp_attention_reduce = False
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -1741,6 +1750,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                use_dp_attention_reduce=mlp_use_dp_attention_reduce,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1900,11 +1910,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def op_mlp(self, state):
         hidden_states = state.pop("hidden_states_mlp_input")
-        if not (
-            enable_moe_dense_fully_dp()
+        skip_empty = (
+            (enable_moe_dense_fully_dp() or enable_dp_mlp_mode())
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
-        ):
+        )
+        if enable_dp_mlp_mode() and not enable_moe_dense_fully_dp():
+            skip_empty = skip_empty and (get_attention_tp_size() == 1)
+        if not skip_empty:
             state.hidden_states_mlp_output = self.mlp(
                 hidden_states, state.forward_batch
             )
