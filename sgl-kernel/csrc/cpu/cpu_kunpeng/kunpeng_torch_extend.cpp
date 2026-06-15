@@ -128,29 +128,14 @@ void init_sdma(int64_t sdmathreshold);
 void finalize_sdma();
 
 // === MOE 算子声明 ===
-at::Tensor linear_kunpeng(
-    const at::Tensor& input,
-    const at::Tensor& weight,
-    const at::Tensor& bias,
-    bool is_prefill
-);
+at::Tensor linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias, bool is_prefill);
 
-void bf16_gemm_prepack_kunpeng(at::Tensor& weight, int64_t batch_size, bool is_prefill = true);
+void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size, bool is_prefill);
 
-void grouped_topk_kunpeng(
-    at::Tensor router_logits,
-    at::Tensor token_weights,
-    at::Tensor token_ids,
-    int64_t topk,
-    int64_t num_expert_group,
-    int64_t topk_group,
-    const c10::optional<at::Tensor> bias,
-    const c10::optional<at::Tensor> experts_offset,
-    bool renormalize,
-    bool scoring_func_sigmoid,
-    bool moe_balance,
-    int64_t v2
-);
+void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at::Tensor token_ids, int64_t topk,
+                          int64_t num_expert_group, int64_t topk_group, const c10::optional<at::Tensor> bias,
+                          const c10::optional<at::Tensor> experts_offset, bool renormalize, bool scoring_func_sigmoid,
+                          bool moe_balance, int64_t v2);
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 {
@@ -211,7 +196,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     // bgemm
     m.def(
-        "bf16_packed_gemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output, Tensor workspace, int num_threads, bool is_prefill) "
+        "bf16_packed_gemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output, Tensor workspace, int num_threads, "
+        "bool is_prefill) "
         "-> ()");
     m.impl("bf16_packed_gemm_kunpeng", bf16_packed_gemm_kunpeng);
 
@@ -339,7 +325,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("bf16_gemm_prepack_kunpeng(Tensor(a!) weight, int batch_size, bool is_prefill) -> ()");
     m.impl("bf16_gemm_prepack_kunpeng", bf16_gemm_prepack_kunpeng);
 
-    m.def("grouped_topk_kunpeng("
+    m.def(
+        "grouped_topk_kunpeng("
         "Tensor router_logits, Tensor(a!) token_weights, Tensor(b!) token_ids, "
         "int topk, int num_expert_group, int topk_group, "
         "Tensor? bias=None, Tensor? experts_offset=None, "

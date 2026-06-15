@@ -26,7 +26,8 @@
 #include "../utils/math.h"
 
 extern void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c);
-extern void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace, int64_t num_threads, bool is_prefill = true);
+extern void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
+                                     int64_t num_threads, bool is_prefill = true);
 
 template <typename T, int64_t N>
 struct SmallVector {
@@ -35,18 +36,20 @@ struct SmallVector {
 
     SmallVector(int64_t n)
     {
-        if (n > N) { ptr.reset(new T[n]); }
+        if (n > N) {
+            ptr.reset(new T[n]);
+        }
     }
 
-    T* data() { return ptr ? ptr.get() : array; }
+    T *data()
+    {
+        return ptr ? ptr.get() : array;
+    }
 };
 
-at::Tensor linear_kunpeng(
-    const at::Tensor& input,
-    const at::Tensor& weight,
-    const at::Tensor& bias,
-    bool is_prefill = true
-) {
+at::Tensor linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias,
+                          bool is_prefill = true)
+{
     TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be BF16");
     TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
 
@@ -81,19 +84,10 @@ at::Tensor linear_kunpeng(
     return output;
 }
 
-void grouped_topk_kunpeng(
-    at::Tensor router_logits,
-    at::Tensor token_weights,
-    at::Tensor token_ids,
-    int64_t topk,
-    int64_t num_expert_group,
-    int64_t topk_group,
-    const c10::optional<at::Tensor> bias,
-    const c10::optional<at::Tensor> experts_offset,
-    bool renormalize,
-    bool scoring_func_sigmoid,
-    bool moe_balance,
-    int64_t v2)
+void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at::Tensor token_ids, int64_t topk,
+                          int64_t num_expert_group, int64_t topk_group, const c10::optional<at::Tensor> bias,
+                          const c10::optional<at::Tensor> experts_offset, bool renormalize, bool scoring_func_sigmoid,
+                          bool moe_balance, int64_t v2)
 {
     TORCH_CHECK(router_logits.scalar_type() == at::kBFloat16, "router_logits must be BF16");
     TORCH_CHECK(token_weights.scalar_type() == at::kFloat, "token_weights must be Float");
@@ -106,7 +100,7 @@ void grouped_topk_kunpeng(
     int64_t num_token = router_logits.size(0);
     int64_t num_expert = router_logits.size(1);
     int64_t group_size = num_expert / num_expert_group;
-    auto router_logits_data = (__bf16*)router_logits.data_ptr();
+    auto router_logits_data = (__bf16 *)router_logits.data_ptr();
     int64_t router_logits_stride = router_logits.stride(0);
     auto bias_data = (bias.has_value() && bias->defined()) ? bias->data_ptr<float>() : nullptr;
     int64_t token_weights_stride = token_weights.stride(0);
@@ -118,7 +112,7 @@ void grouped_topk_kunpeng(
     SmallVector<Active, 128 * 8> active_expert_(num_token * topk);
     auto active_expert = active_expert_.data();
 
-    //bool moe_balance = context.moe_balance();
+    // bool moe_balance = context.moe_balance();
     parallel_for(0, num_token, 1, [&](int64_t start, int64_t end) {
         SmallVector<float, 256> origin_score_(num_expert);
         auto origin_score = origin_score_.data();
@@ -130,7 +124,7 @@ void grouped_topk_kunpeng(
             int index;
             float score;
         };
-        SmallVector<Group, 8> sorted_group_(num_expert_group);      
+        SmallVector<Group, 8> sorted_group_(num_expert_group);
         auto sorted_group = sorted_group_.data();
         for (int64_t bi = start; bi < end; bi++) {
             const int64_t vl = svcntw();
@@ -161,21 +155,21 @@ void grouped_topk_kunpeng(
             // sort experts
             auto cmp_expert = [score](int x, int y) { return score[x] > score[y]; };
             for (int gi = 0; gi < num_expert_group; gi++) {
-                int* sorted_expert_data = sorted_expert + gi * group_size;
+                int *sorted_expert_data = sorted_expert + gi * group_size;
                 for (int i = 0; i < group_size; ++i) {
                     sorted_expert_data[i] = gi * group_size + i;
                 }
                 std::partial_sort(sorted_expert_data, sorted_expert_data + topk, sorted_expert_data + group_size,
-                    cmp_expert);
+                                  cmp_expert);
                 sorted_group[gi].index = gi;
                 sorted_group[gi].score = score[sorted_expert_data[0]] + (bias_data ? score[sorted_expert_data[1]] : 0);
             }
             std::nth_element(sorted_group, sorted_group + topk_group, sorted_group + num_expert_group,
-                [](Group x, Group y) { return x.score > y.score; });
+                             [](Group x, Group y) { return x.score > y.score; });
             std::sort(sorted_group, sorted_group + topk_group, [](Group x, Group y) { return x.index < y.index; });
             for (int i = 0; i < topk_group; ++i) {
-                int* src = sorted_expert + sorted_group[i].index * group_size;
-                int* dst = sorted_expert + i * topk;
+                int *src = sorted_expert + sorted_group[i].index * group_size;
+                int *dst = sorted_expert + i * topk;
                 memmove(dst, src, topk * sizeof(int));
             }
             std::nth_element(sorted_expert, sorted_expert + topk, sorted_expert + topk_group * topk, cmp_expert);
@@ -195,11 +189,11 @@ void grouped_topk_kunpeng(
             }
         }
     });
-    float* token_weights_data = token_weights.data_ptr<float>();
-    int16_t* token_ids_data = token_ids.data_ptr<int16_t>();
+    float *token_weights_data = token_weights.data_ptr<float>();
+    int16_t *token_ids_data = token_ids.data_ptr<int16_t>();
     if (!sort_by_experts) {
         for (int i = 0; i < num_token; ++i) {
-            Active* active_expert_data = active_expert + i * topk;
+            Active *active_expert_data = active_expert + i * topk;
             for (int j = 0; j < topk; ++j) {
                 token_weights_data[i * token_weights_stride + j] = active_expert_data[j].origin_score;
                 token_ids_data[i * token_ids_stride + j] = active_expert_data[j].index;
@@ -207,7 +201,7 @@ void grouped_topk_kunpeng(
         }
         return;
     }
-    int* experts_offset_data = experts_offset->data_ptr<int>();
+    int *experts_offset_data = experts_offset->data_ptr<int>();
     memset(experts_offset_data, 0, (num_expert + 1) * sizeof(int));
     for (int i = 0; i < num_token * topk; ++i) {
         experts_offset_data[active_expert[i].index]++;
@@ -216,10 +210,10 @@ void grouped_topk_kunpeng(
         experts_offset_data[i] += experts_offset_data[i - 1];
     }
     for (int i = num_token - 1; i >= 0; --i) {
-        Active* active_expert_data = active_expert + i * topk;
+        Active *active_expert_data = active_expert + i * topk;
         for (int j = 0; j < topk; ++j) {
             int k = active_expert_data[j].index;
-            int& idx = experts_offset_data[k];
+            int &idx = experts_offset_data[k];
             idx--;
             token_weights_data[idx] = active_expert_data[j].origin_score;
             token_ids_data[idx] = active_expert_data[j].index;

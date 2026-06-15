@@ -56,9 +56,9 @@ inline int64_t divup(int64_t x, int64_t y)
     return (x + y - 1) / y;
 }
 
-static inline svfloat32_t sigmoid(svbool_t pg, svfloat32_t x, int vl)
+inline svfloat32_t sigmoid(svbool_t pg, svfloat32_t x, int vl)
 {
-    //const int vl = __ARM_FEATURE_SVE_BITS / 32;
+    // const int vl = __ARM_FEATURE_SVE_BITS / 32;
     float data[vl];
     svst1(pg, data, x);
     for (int i = 0; i < vl; i++) {
@@ -67,9 +67,7 @@ static inline svfloat32_t sigmoid(svbool_t pg, svfloat32_t x, int vl)
     return svld1(pg, data);
 }
 
-
-
-void softmax_fusion_kernel(int64_t width, float* data, float scale, std::optional<int64_t> causal_width)
+void softmax_fusion_kernel(int64_t width, float *data, float scale, std::optional<int64_t> causal_width)
 {
     const int64_t vl = svcntw();
     // mul scale & add mask & reduce max
@@ -106,4 +104,4 @@ void softmax_fusion_kernel(int64_t width, float* data, float scale, std::optiona
     }
 }
 
-} // namespace kmath
+}  // namespace kmath

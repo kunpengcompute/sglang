@@ -1077,8 +1077,6 @@ def biased_grouped_topk_kunpeng(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    logger.info(f"[MoeGate] bias_grouped_topk_kunpeng")
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     num_token = gating_output.shape[0]
     num_experts = gating_output.shape[1]
 
@@ -1116,18 +1114,7 @@ def biased_grouped_topk_kunpeng(
                 topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
             )
 
-    if renormalize:
-        topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
-            if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-        )
-        topk_weights = topk_weights / topk_weights_sum
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
-
     return topk_weights, topk_ids
-
 
 if _is_cpu and _is_cpu_amx_available:
     biased_grouped_topk = biased_grouped_topk_cpu

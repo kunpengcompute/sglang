@@ -151,20 +151,20 @@ void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor ou
                              reinterpret_cast<bfloat16_t *>(output.data_ptr()), tmpc);
 }
 
-void bf16_gemm_prepack_kunpeng(at::Tensor& weight, int64_t batch_size, bool is_prefill = true)
+void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size, bool is_prefill = true)
 {
     int64_t m = weight.size(0);
     int64_t k = weight.size(1);
     int64_t workspace_size = m * k * weight.element_size();
     auto workspace = at::empty({workspace_size}, weight.options().dtype(at::kByte));
     kutacc::MatrixTilingBlock t;
-    if (is_prefill){
+    if (is_prefill) {
         t = bgemm_find_optimal_tiling_plan_prefill(batch_size, m, k, kutacc::get_thread_num());
     } else {
         t = bgemm_find_optimal_tiling_plan_decode(batch_size, m, k, kutacc::get_thread_num());
     }
-    bfloat16_t* i_ptr = reinterpret_cast<bfloat16_t*>(weight.data_ptr());
-    bfloat16_t* o_ptr = reinterpret_cast<bfloat16_t*>(workspace.data_ptr());
+    bfloat16_t *i_ptr = reinterpret_cast<bfloat16_t *>(weight.data_ptr());
+    bfloat16_t *o_ptr = reinterpret_cast<bfloat16_t *>(workspace.data_ptr());
     TORCH_CHECK(std::get<2>(t) % 2 == 0, "bgemm_pack k%2 != 0");
     kutacc::bf16_gemm_pack(m, k, std::get<1>(t), std::get<2>(t), i_ptr, o_ptr);
     memcpy(i_ptr, o_ptr, m * k * weight.element_size());

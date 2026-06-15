@@ -67,13 +67,11 @@ void parallel_for(int64_t begin, int64_t end, int64_t grain_size, const std::fun
         Task task{begin, end, chunk_size, f};
         kspin_run_with_pool(Task::call, &task);
 #elif defined(USE_KUPL_PARALLEL)
-        kupl_parallel_for_desc_t desc = {
-            .field_mask = KUPL_PARALLEL_FOR_DESC_FIELD_DEFAULT,
-            .range = NULL,
-            .egroup = NULL,
-            .concurrency = static_cast<int>(num_threads),
-            .policy = KUPL_LOOP_POLICY_STATIC
-        };
+        kupl_parallel_for_desc_t desc = {.field_mask = KUPL_PARALLEL_FOR_DESC_FIELD_DEFAULT,
+                                         .range = NULL,
+                                         .egroup = NULL,
+                                         .concurrency = static_cast<int>(num_threads),
+                                         .policy = KUPL_LOOP_POLICY_STATIC};
         func_args args = {begin, end, chunk_size, f};
         kupl_parallel_for(&desc, parallel_for_kernel, &args);
 #else
@@ -87,9 +85,9 @@ void parallel_for(int64_t begin, int64_t end, int64_t grain_size, const std::fun
     }
 }
 
-static void parallel_for_kernel(kupl_nd_range_t *nd_range, void *args, int tid, int tnum)
+void parallel_for_kernel(kupl_nd_range_t *nd_range, void *args, int tid, int tnum)
 {
-    auto data = (func_args *) args;
+    auto data = (func_args *)args;
     int64_t begin = data->begin;
     int64_t end = data->end;
     int64_t chunk_size = data->chunk_size;
