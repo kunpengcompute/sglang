@@ -85,20 +85,20 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-    add_compile_options(
-        -O3
-        -Wno-unknown-pragmas
-        -march=armv8.2-a+sve+fp16
-        -fopenmp
-    )
-else()
-    add_compile_options(
-        -O3
-        -Wno-unknown-pragmas
-        -march=native
-        -fopenmp
-    )
-endif()
+     add_compile_options(
+         -O3
+         -Wno-unknown-pragmas
+         -march=armv8.2-a+sve+fp16+bf16
+         -fopenmp
+     )
+ else()
+     add_compile_options(
+         -O3
+         -Wno-unknown-pragmas
+         -march=native
+         -fopenmp
+     )
+ endif()
 add_compile_options(-Wno-unused-value)
 add_compile_options(-Wno-vla-cxx-extension)
 

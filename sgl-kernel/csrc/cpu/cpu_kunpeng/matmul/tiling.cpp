@@ -59,12 +59,16 @@ static const InnerTilingMap bgemm_plan_prefill_32 = {
     // deepseek v3
     {{256, 7168}, {128, 448}},  {{8080, 7186}, {2020, 896}}, {{16160, 7186}, {4040, 896}},
     {{448, 14336}, {224, 896}}, {{896, 14336}, {448, 896}},
+    // deepseek v2
+    {{64, 2048}, {64, 64}},
 };
 
 static const InnerTilingMap bgemm_plan_decode_32 = {
     // deepseek v3
     {{256, 7168}, {256, 224}},  {{8080, 7186}, {2020, 896}}, {{16160, 7186}, {4040, 896}},
     {{448, 14336}, {448, 448}}, {{896, 14336}, {448, 896}},
+    // deepseek v2
+    {{64, 2048}, {64, 64}},
 };
 
 static const ThreadToPlanMap bgemm_prefill_plans_by_threads = {{32, &bgemm_plan_prefill_32}};

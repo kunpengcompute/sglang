@@ -289,6 +289,7 @@ class MoEGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
+        self.is_pack_weight = False
         if config.topk_method == "noaux_tc":
             correction_bias_dtype = torch.float32
             if quant_config is not None:
@@ -357,6 +358,16 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+            elif _is_cpu_920f:
+                is_prefill = forward_batch is not None and forward_batch.forward_mode == ForwardMode.Prefill
+                if not self.is_pack_weight:
+                    torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                        self.weight, hidden_states.shape[0], is_prefill
+                    )
+                    self.is_pack_weight = True
+                logits = torch.ops.sgl_kernel.linear_kunpeng(
+                    hidden_states, self.weight, None, is_prefill
+                )
             else:
                 logits = F.linear(hidden_states, self.weight, None)
 
