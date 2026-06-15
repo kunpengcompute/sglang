@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,
     is_cpu,
+    is_cpu_920f,
     is_cuda,
     is_hip,
     is_musa,
@@ -76,10 +77,10 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_cpu_920f = is_cpu_920f()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
@@ -582,8 +583,6 @@ def grouped_topk_gpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
     scores = torch.softmax(gating_output, dim=-1)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
@@ -659,6 +658,68 @@ def grouped_topk_cpu(
         # num_token_non_padded must be None since it is not supported in kernel
         num_token_non_padded=None,
     )
+
+def grouped_topk_kunpeng(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    logger.info(f"[MoeGate] grouped_topk_kunpeng")
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    num_token = gating_output.shape[0]
+    num_experts = gating_output.shape[1]
+
+    token_weights = torch.empty(num_token, topk, dtype=torch.float32, device=gating_output.device)
+    token_ids = torch.empty(num_token, topk, dtype=torch.int16, device=gating_output.device)
+
+    torch.ops.sgl_kernel.grouped_topk_kunpeng(
+        router_logits=gating_output,
+        token_weights=token_weights,
+        token_ids=token_ids,
+        topk=topk,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        bias=None,
+        experts_offset=None,
+        renormalize=renormalize,
+        scoring_func_sigmoid=False,
+        moe_balance=False,
+        v2=0,
+    )
+
+    topk_weights = token_weights
+    topk_ids = token_ids.to(torch.int32)
+
+    if num_fused_shared_experts:
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + num_fused_shared_experts,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        if routed_scaling_factor is not None:
+            topk_weights[:, -1] = (
+                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+            )
+
+    if renormalize:
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True)
+            if num_fused_shared_experts == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        )
+        topk_weights = topk_weights / topk_weights_sum
+        if apply_routed_scaling_factor_on_output:
+            topk_weights *= routed_scaling_factor
+
+    return topk_weights, topk_ids
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
@@ -1002,17 +1063,71 @@ def biased_grouped_topk_cpu(
         num_token_non_padded=None,
     )
 
+def biased_grouped_topk_kunpeng(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    compiled: bool = True,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    num_token = gating_output.shape[0]
+    num_experts = gating_output.shape[1]
+
+    token_weights = torch.empty(num_token, topk, dtype=torch.float32, device=gating_output.device)
+    token_ids = torch.empty(num_token, topk, dtype=torch.int16, device=gating_output.device)
+
+    torch.ops.sgl_kernel.grouped_topk_kunpeng(
+        router_logits=gating_output,
+        token_weights=token_weights,
+        token_ids=token_ids,
+        topk=topk,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        bias=correction_bias,
+        experts_offset=None,
+        renormalize=renormalize,
+        scoring_func_sigmoid=True,
+        moe_balance=False,
+        v2=0,
+    )
+
+    topk_weights = token_weights
+    topk_ids = token_ids.to(torch.int32)
+
+    if num_fused_shared_experts:
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + num_fused_shared_experts,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        if routed_scaling_factor is not None:
+            topk_weights[:, -1] = (
+                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+            )
+
+    return topk_weights, topk_ids
 
 if _is_cpu and _is_cpu_amx_available:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
     fused_topk_native = fused_topk_cpu
     fused_topk = fused_topk_cpu
+elif _is_cpu_920f:
+    biased_grouped_topk = biased_grouped_topk_kunpeng
+    grouped_topk = grouped_topk_kunpeng
+    fused_topk_native = fused_topk_torch_native
 else:
     biased_grouped_topk = biased_grouped_topk_gpu
     grouped_topk = grouped_topk_gpu
     fused_topk_native = fused_topk_torch_native
-
 
 def _remap_topk_for_deepep(
     topk_ids: torch.Tensor,

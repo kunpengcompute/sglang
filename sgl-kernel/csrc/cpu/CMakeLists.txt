@@ -88,7 +88,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     add_compile_options(
         -O3
         -Wno-unknown-pragmas
-        -march=armv8.2-a+sve+fp16
+        -march=armv8.2-a+sve+fp16+bf16
         -fopenmp
     )
 else()
