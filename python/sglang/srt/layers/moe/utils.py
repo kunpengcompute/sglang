@@ -1,3 +1,19 @@
+# Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -30,6 +46,7 @@ class MoeA2ABackend(Enum):
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
     CUSTOMIZED = "customized"
+    KUNPENG_CPU = "kunpeng_cpu"
 
     @classmethod
     def _missing_(cls, value):
@@ -63,6 +80,9 @@ class MoeA2ABackend(Enum):
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def is_kunpeng_cpu(self):
+        return self == MoeA2ABackend.KUNPENG_CPU
 
 
 class MoeRunnerBackend(Enum):

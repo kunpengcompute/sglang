@@ -202,6 +202,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "mori",
     "ascend_fuseep",
     "flashinfer",
+    "kunpeng_cpu",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -552,7 +553,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
+        "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer", "kunpeng_cpu"
     ] = "none"
     moe_runner_backend: str = "auto"
     record_nolora_graph: bool = True
@@ -3128,6 +3129,12 @@ class ServerArgs:
                 assert (
                     self.chunked_prefill_size
                 ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+
+        if self.moe_a2a_backend == "kunpeng_cpu":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Kunpeng MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
