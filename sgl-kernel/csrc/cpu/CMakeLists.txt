@@ -111,3 +111,23 @@ target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS} ${KUTACC_INC
 install(TARGETS common_ops
     LIBRARY DESTINATION sgl_kernel
 )
+
+# === pg_helper: standalone pybind11 module for ProcessGroup pointer extraction ===
+# This module bypasses the torch dispatcher schema (which does not support
+# ProcessGroup as a parameter type) by using pybind11 directly.
+set(PG_HELPER_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../pg_helper/pg_helper.cpp")
+Python_add_library(pg_helper MODULE WITH_SOABI ${PG_HELPER_SOURCES})
+target_link_libraries(pg_helper PRIVATE 
+    ${TORCH_LIBRARIES}
+)
+target_include_directories(pg_helper PRIVATE
+    ${TORCH_INCLUDE_DIRS}
+    ${TORCH_INSTALL_PREFIX}/include
+    ${Python_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+
+install(TARGETS pg_helper
+    LIBRARY DESTINATION sgl_kernel
+)
