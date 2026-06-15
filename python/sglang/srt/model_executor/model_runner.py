@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -209,6 +211,10 @@ from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
+)
+from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
+    init_oob_comms,
+    init_shm_pool,
 )
 
 _is_hip = is_hip()
@@ -1197,6 +1203,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
+
+            if _is_cpu_920f:
+                init_oob_comms()
+                init_shm_pool()
 
             # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
@@ -2300,8 +2310,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.hbw_pool = KunpengHBWPool(pool_size_bytes, alignment=self.page_size)
         logger.info(
-            f"[KunpengCpu] HBW pool created: "
-            f"{pool_size_bytes / 1024 / 1024:.1f} MB"
+            f"[KunpengCpu] HBW pool created: " f"{pool_size_bytes / 1024 / 1024:.1f} MB"
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):

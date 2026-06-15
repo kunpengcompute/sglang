@@ -4,6 +4,20 @@
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Distributed state.
 It takes over the control of the distributed environment from PyTorch.
 The typical workflow is:
@@ -428,6 +442,9 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.xpu_communicator import (
             XpuCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
+            KunpengCommunicator,
+        )
 
         self.hpu_communicator: Optional[HpuCommunicator] = None
         if use_hpu_communicator and self.world_size > 1:
@@ -440,6 +457,15 @@ class GroupCoordinator:
         self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
+
+        self.kunpeng_communicator: Optional[KunpengCommunicator] = None
+        if _is_cpu_920f and self.world_size > 1:
+            self.kunpeng_communicator = KunpengCommunicator(group=self.cpu_group)
+            # Kunpeng CPU: only support shm kunpeng when attn_tp_size is a multiple of 8
+            self.use_shm_kunpeng = (
+                self.world_size < torch.distributed.get_world_size()
+                and self.world_size % 8 == 0
+            )
 
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
@@ -759,9 +785,13 @@ class GroupCoordinator:
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
         elif _is_cpu_920f:
-            torch.distributed.reduce_scatter_tensor(
-                output, input, group=self.cpu_group
-            )
+            if self.use_shm_kunpeng:
+                if input.shape[0] > 0:
+                    self.kunpeng_communicator.shm_reduce_scatter_tensor(input)
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    output, input, group=self.cpu_group
+                )
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
