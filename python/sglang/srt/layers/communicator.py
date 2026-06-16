@@ -913,10 +913,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (hidden_states_output_mode == ScatterMode.TP_ATTN_FULL)
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            if get_attention_tp_rank() == 0:
-                logger.info(
-                    "[prepare_mlp] fn: attn_tp_all_reduce + layernorm (enable_dp_mlp)"
-                )
             return partial(
                 CommunicateWithAllReduceAndLayerNormFn._all_reduce_and_layernorm,
                 residual_input_mode=residual_input_mode,

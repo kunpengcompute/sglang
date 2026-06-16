@@ -122,7 +122,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    ForwardMode,
+)
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
 )
@@ -362,7 +366,8 @@ class MoEGate(nn.Module):
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif _is_cpu_920f:
-                is_prefill = forward_batch is not None and forward_batch.forward_mode == ForwardMode.Prefill
+                # TODO: support prefill
+                is_prefill = False
                 if not self.is_pack_weight:
                     torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
                         self.weight, hidden_states.shape[0], is_prefill

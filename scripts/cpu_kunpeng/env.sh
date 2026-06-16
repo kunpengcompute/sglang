@@ -76,6 +76,7 @@ export EP_SIZE=${TP_SIZE}
 
 # Communication
 export GLOO_SOCKET_IFNAME=enp26s0f0
+export MV2_COMM_WORLD_LOCAL_SIZE=16
 
 # Thread
 export OMP_NUM_THREADS=1
@@ -97,7 +98,8 @@ export SGLANG_WARMUP_TIMEOUT=1600
 export SGLANG_USE_CPU_920F=1
 export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
-export SGLANG_ENABLE_KUTACC_COMM_OPS=0
+# Kunpeng SHM
+export SGLANG_KUNPENG_SHM_SIZE_MB=24
 # Kunpeng HBW pool
 export SGLANG_ENABLE_HBW_POOL=1
 export SGLANG_ENABLE_HBW_SWAP=1
@@ -105,7 +107,8 @@ export SGLANG_KUNPENG_HBW_POOL_SIZE_MB=2048
 # Kunpeng SDMA parameters
 export SGLANG_KUNPENG_SDMA_MAX_EVENTS=10
 export SGLANG_KUNPENG_SDMA_THRESHOLD=5
-
+# Maximum number of tokens output per decode round within dp
+export SGLANG_KUNPENG_DECODE_MAX_TOKENS=128
 # Load format (e.g. "sharded_state", leave empty for default)
 export LOAD_FORMAT=""
 
@@ -160,8 +163,6 @@ native_config() {
     export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
-
-
 # ------------------------------------------------------------
 # Main: dispatch based on command-line argument
 # ------------------------------------------------------------
@@ -183,7 +184,6 @@ case "$ACTION" in
         return 1
         ;;
 esac
-
 
 source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh
