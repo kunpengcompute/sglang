@@ -132,6 +132,7 @@ prefill_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="prefill"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
+    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
@@ -146,6 +147,7 @@ decode_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="decode"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
+    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
@@ -160,6 +162,7 @@ native_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="native"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$(date +%H%M%S)"
+    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
