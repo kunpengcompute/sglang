@@ -122,7 +122,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    ForwardMode,
+)
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
 )
@@ -362,7 +366,8 @@ class MoEGate(nn.Module):
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif _is_cpu_920f:
-                is_prefill = forward_batch is not None and forward_batch.forward_mode == ForwardMode.Prefill
+                # TODO: support prefill
+                is_prefill = False
                 if not self.is_pack_weight:
                     torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
                         self.weight, hidden_states.shape[0], is_prefill
@@ -526,6 +531,7 @@ class DeepseekV2MoE(nn.Module):
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_kunpeng_cpu()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -570,6 +576,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_kunpeng_cpu()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
@@ -593,6 +600,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_kunpeng_cpu()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -1815,7 +1823,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if get_attention_tp_rank() == 0:
+        if get_attention_tp_rank() == 0 and KunpengProfiler.enabled:
             logger.info(f"[DeepseekV2DecoderLayer] layer {self.layer_id} forward")
 
         hidden_states, residual = self.layer_communicator.prepare_attn(

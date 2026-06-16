@@ -24,6 +24,7 @@ BASE_ARGS=(
     --device cpu
     --trust-remote-code
     --attention-backend kunpeng_cpu
+    --moe-a2a-backend kunpeng_cpu
     --host "$IP"
     --dist-init-addr "$MASTER_ADDR:$MASTER_PORT"
     --nnodes "$WORLD_SIZE"
@@ -42,6 +43,8 @@ BASE_ARGS=(
     --disable-overlap-schedule
     --enable-dp-lm-head
     --enable-dp-mlp
+    --quantization w8a8_int8
+    ${LOAD_FORMAT:+--load-format "$LOAD_FORMAT"}
 )
 
 # Role-specific arguments
@@ -55,7 +58,6 @@ case "$ROLE" in
             --prefill-max-requests 4
             --load-balance-method follow_bootstrap_room
             --enable-dynamic-batch-tokenizer
-            --quantization w8a8_int8
         )
         ;;
     decode)
@@ -65,7 +67,6 @@ case "$ROLE" in
             --load-balance-method follow_bootstrap_room
             --decode-log-interval 1
             --num-reserved-decode-tokens 256
-            --quantization w8a8_int8
         )
         ;;
     native)
@@ -74,8 +75,6 @@ case "$ROLE" in
             --max-prefill-tokens 4096
             --max-total-tokens 18496
             --load-balance-method round_robin
-            --quantization w8a8_int8
-            ${LOAD_FORMAT:+--load-format "$LOAD_FORMAT"}
         )
         ;;
     *)

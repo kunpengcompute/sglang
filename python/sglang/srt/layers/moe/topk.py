@@ -68,6 +68,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -1242,6 +1243,7 @@ def _post_process_topk_ids(
     return topk_ids, topk_weights
 
 
+@KunpengProfiler(depth=1)
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,

@@ -1,4 +1,18 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 import logging
 from enum import Enum
@@ -43,6 +57,7 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatch
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher import KunpengDispatcher
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
@@ -125,6 +140,15 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
+        )
+    elif a2a_backend.is_kunpeng_cpu():
+        return KunpengDispatcher(
+            group=get_tp_group().cpu_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
