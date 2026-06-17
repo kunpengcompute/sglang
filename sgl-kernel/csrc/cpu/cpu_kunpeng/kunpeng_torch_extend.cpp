@@ -30,6 +30,8 @@ void rmsnorm_quant_kunpeng(at::Tensor acts, at::Tensor weights, double eps, at::
 void fused_add_rmsnorm_quant_kunpeng(at::Tensor acts, at::Tensor residual, at::Tensor weights, double eps,
                                      at::Tensor outs, at::Tensor scales);
 
+void silu_mul_quant_kunpeng(at::Tensor gateup, at::Tensor outs, at::Tensor scales);
+
 void s8_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c, int64_t ldc,
                           bool with_idx, std::optional<at::Tensor> idx);
 
@@ -205,6 +207,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "fused_add_rmsnorm_quant_kunpeng(Tensor acts, Tensor residual, "
         "Tensor weights, float eps, Tensor outs, Tensor scales) -> ()");
     m.impl("fused_add_rmsnorm_quant_kunpeng", fused_add_rmsnorm_quant_kunpeng);
+
+    m.def("silu_mul_quant_kunpeng(Tensor gateup, Tensor(a!) outs, Tensor(b!) scales) -> ()");
+    m.impl("silu_mul_quant_kunpeng", silu_mul_quant_kunpeng);
 
     // s8_gemm_pack
     m.def(

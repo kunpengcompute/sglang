@@ -49,6 +49,16 @@ static const InnerTilingMap igemm_plan_decode_32 = {
     {{264, 7168}, {132, 448}},    // qkva
     {{1536, 1536}, {768, 1536}},  // q_b
     {{2048, 512}, {256, 512}},    // kv_b
+    {{2304, 7168}, {576, 896}},   // mlp gateup, kpinfer use tp=8
+    {{7168, 1152}, {224, 1152}},  // mlp down
+    {{4096, 7168}, {2048, 448}},  // shared expert gateup
+    {{7168, 2048}, {448, 1024}},  // shared expert down
+    // deepseek v2
+    {{1368, 2048}, {342, 256}},   // mlp gateup
+    {{2048, 684}, {64, 684}},     // mlp down
+    {{5632, 2048}, {352, 1024}},  // shared expert gateup
+    {{2048, 2816}, {512, 352}},   // shared expert down
+
 };
 
 static const ThreadToPlanMap igemm_prefill_plans_by_threads = {{32, &igemm_plan_prefill_32}};

@@ -124,8 +124,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
-    PPProxyTensors,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
@@ -216,6 +216,7 @@ class DeepseekV2MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
+        self.use_dp_attention_reduce = use_dp_attention_reduce
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -264,23 +265,134 @@ class DeepseekV2MLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        if (
-            gemm_output_zero_allocator is not None
-            and x.shape[0] <= 256
-            and self.gate_up_proj.weight.dtype == torch.uint8
-        ):
-            y = gemm_output_zero_allocator.allocate(
-                x.shape[0] * self.gate_up_proj.output_size_per_partition
-            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
-            x = (x, None, y)
+        if not _is_cpu_920f:
+            if (
+                gemm_output_zero_allocator is not None
+                and x.shape[0] <= 256
+                and self.gate_up_proj.weight.dtype == torch.uint8
+            ):
+                y = gemm_output_zero_allocator.allocate(
+                    x.shape[0] * self.gate_up_proj.output_size_per_partition
+                ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+                x = (x, None, y)
 
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-        )
-        return x
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+            x, _ = self.down_proj(
+                x,
+                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            )
+            return x
+        else:
+            # quant
+            batch_size = x.shape[0]
+            dim = x.shape[1]
+            scale_size = 4  # fp32
+            row_bytes = dim + scale_size
+            total_bytes = batch_size * row_bytes
+            norm_int8_and_scale = torch.zeros((total_bytes), dtype=torch.uint8)
+
+            int8_shape = (batch_size, dim)
+            int8_strides = (row_bytes, 1)  # (7172, 1)
+            norm_int8 = norm_int8_and_scale.view(torch.int8).as_strided(
+                int8_shape, int8_strides
+            )
+
+            f32_shape = (batch_size, 1)
+            f32_strides = (row_bytes // 4, 1)
+            scale_start_offset = dim
+            norm_scale = (
+                norm_int8_and_scale[scale_start_offset:]
+                .view(torch.float32)
+                .as_strided(f32_shape, f32_strides)
+            )
+
+            torch.ops.sgl_kernel.quant_kunpeng(x, norm_int8, norm_scale)
+
+            # gate_up_proj
+            m = batch_size
+            n, k = self.gate_up_proj.weight.shape
+            tile_m, tile_n, tile_k = (
+                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+            )
+
+            gate_up = torch.empty([m, n], dtype=torch.bfloat16)
+
+            pack_a = torch.empty_like(norm_int8)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                norm_int8.contiguous(), pack_a, tile_m, tile_k
+            )
+
+            pack_w = torch.empty_like(self.gate_up_proj.weight)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                self.gate_up_proj.weight.contiguous(), pack_w, tile_n, tile_k
+            )
+
+            workspace_size = m * n * 64
+            workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
+
+            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
+                pack_a,
+                pack_w,
+                self.gate_up_proj.weight_scale.view(-1),
+                norm_scale.contiguous().view(-1),
+                gate_up,
+                workspace,
+                32,
+            )
+
+            gateup_int8 = torch.empty([m, n // 2], dtype=torch.int8)
+            gateup_scale = torch.empty([m, 1], dtype=torch.float32)
+
+            # silu_mul_quant
+            torch.ops.sgl_kernel.silu_mul_quant_kunpeng(
+                gate_up, gateup_int8, gateup_scale
+            )
+
+            # down proj
+            m = batch_size
+            n, k = self.down_proj.weight.shape
+            tile_m, tile_n, tile_k = (
+                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+            )
+
+            pack_a = torch.empty_like(gateup_int8)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                gateup_int8.contiguous(), pack_a, tile_m, tile_k
+            )
+
+            pack_w = torch.empty_like(self.down_proj.weight)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                self.down_proj.weight.contiguous(), pack_w, tile_n, tile_k
+            )
+
+            workspace_size = m * n * 64
+            workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
+
+            out = torch.empty([m, n], dtype=torch.bfloat16)
+
+            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
+                pack_a,
+                pack_w,
+                self.down_proj.weight_scale.view(-1),
+                gateup_scale.contiguous().view(-1),
+                out,
+                workspace,
+                32,
+            )
+
+            # allreduce
+            if (
+                self.down_proj.reduce_results
+                and self.tp_size > 1
+                and not (should_allreduce_fusion or use_reduce_scatter)
+            ):
+                if self.use_dp_attention_reduce:
+                    out = get_attention_tp_group().all_reduce(out)
+                else:
+                    out = tensor_model_parallel_all_reduce(out)
+
+            return out
 
 
 class MoEGate(nn.Module):
