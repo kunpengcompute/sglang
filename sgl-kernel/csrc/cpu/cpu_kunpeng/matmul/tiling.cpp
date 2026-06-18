@@ -54,6 +54,7 @@ static const InnerTilingMap igemm_plan_decode_32 = {
     {{4096, 7168}, {2048, 448}},  // shared expert gateup
     {{7168, 2048}, {448, 1024}},  // shared expert down
     // deepseek v2
+    {{2048, 128}, {64, 128}},     // o_proj
     {{1368, 2048}, {342, 256}},   // mlp gateup
     {{2048, 684}, {64, 684}},     // mlp down
     {{5632, 2048}, {352, 1024}},  // shared expert gateup

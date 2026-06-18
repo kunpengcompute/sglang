@@ -336,11 +336,7 @@ class DeepseekMLAKunpengForwardMixin:
             self.o_proj.weight.contiguous(), pack_w, tile_n, tile_k
         )
 
-        workspace_size = (
-            batch_size
-            * (self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim)
-            * 32
-        )
+        workspace_size = m * n * 32
         workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
 
         torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
