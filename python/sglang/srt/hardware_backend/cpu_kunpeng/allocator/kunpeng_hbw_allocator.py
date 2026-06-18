@@ -183,9 +183,6 @@ class KunpengHBWPool:
         # Add back to free list
         self._free_blocks.append((start, size))
 
-        # Merge adjacent blocks
-        self._merge_free_blocks()
-
     def move_to_hbw(
         self,
         ddr_tensor: torch.Tensor,
