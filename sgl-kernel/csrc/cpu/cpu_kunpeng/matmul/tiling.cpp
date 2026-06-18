@@ -49,6 +49,7 @@ static const InnerTilingMap igemm_plan_decode_32 = {
     {{264, 7168}, {132, 448}},    // qkva
     {{1536, 1536}, {768, 1536}},  // q_b
     {{2048, 512}, {256, 512}},    // kv_b
+    {{7168, 1024}, {224, 1024}},  // o_proj
     {{2304, 7168}, {576, 896}},   // mlp gateup, kpinfer use tp=8
     {{7168, 1152}, {224, 1152}},  // mlp down
     {{4096, 7168}, {2048, 448}},  // shared expert gateup
