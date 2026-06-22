@@ -88,14 +88,6 @@ class DeepseekMLAKunpengForwardMixin:
                 norm_int8.contiguous(), pack_a, tile_m, tile_k
             )
 
-            pack_w = torch.empty_like(self.fused_qkv_a_proj_with_mqa.weight)
-            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
-                self.fused_qkv_a_proj_with_mqa.weight.contiguous(),
-                pack_w,
-                tile_n,
-                tile_k,
-            )
-
             workspace_size = (
                 batch_size
                 * (self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim)
@@ -105,7 +97,7 @@ class DeepseekMLAKunpengForwardMixin:
 
             torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
                 pack_a,
-                pack_w,
+                self.fused_qkv_a_proj_with_mqa.weight,
                 self.fused_qkv_a_proj_with_mqa.weight_scale.view(-1),
                 norm_scale.contiguous().view(-1),
                 qkva,
@@ -141,11 +133,6 @@ class DeepseekMLAKunpengForwardMixin:
                 qa_norm.contiguous(), pack_a, tile_m, tile_k
             )
 
-            pack_w = torch.empty_like(self.q_b_proj.weight)
-            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
-                self.q_b_proj.weight.contiguous(), pack_w, tile_n, tile_k
-            )
-
             workspace_size = (
                 batch_size
                 * (self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim)
@@ -155,7 +142,7 @@ class DeepseekMLAKunpengForwardMixin:
 
             torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
                 pack_a,
-                pack_w,
+                self.q_b_proj.weight,
                 self.q_b_proj.weight_scale.view(-1),
                 norm_scale.contiguous().view(-1),
                 out,
