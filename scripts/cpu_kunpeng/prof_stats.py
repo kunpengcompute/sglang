@@ -23,57 +23,35 @@ Features:
 - CSV output mode as fallback only
 """
 
-import json
-import sys
 import argparse
 import csv
+import gzip
+import json
 import os
 import re
+import sys
 from datetime import datetime
 
-# ===== Target function names for JSON search =====
-TARGET_NAMES = [
-    "recv_requests",
-    "get_next_batch_to_run",
-    "init_forward_metadata",
-    "VocabParallelEmbedding_0",
-    "_scattered_to_tp_attn_full",
-    "forward_prepare",
-    "forward_core",
-    "_all_reduce_and_layernorm",
-    "deepseek_v2.py(255): forward",
-    "_scatter_hidden_states_and_residual",
-    "deepseek_v2.py(323): forward",
-    "topk.py(1246): select_experts",
-    "kunpeng.py(479): dispatch",
-    "layer.py(680): run_moe_core",
-    "kunpeng.py(580): combine",
-    "logits_processor.py(285): forward",
-    "model_runner.py(3341): sample",
-    "process_batch_result",
-]
-
-# ===== Display names for Excel output (1:1 mapping with TARGET_NAMES) =====
-DISPLAY_NAMES = [
-    "recv_requests",
-    "get_next_batch_to_run",
-    "init_forward_metadata",
-    "vocab_parallel_embedding",
-    "prepare_attn(allgather)",
-    "forward_prepare",
-    "forward_core",
-    "prepare_mlp(dense)",
-    "forward_mlp",
-    "prepare_mlp(sparse)",
-    "moe_gate",
-    "topk",
-    "moe_dispatch",
-    "run_moe_core",
-    "moe_combine",
-    "logits_processor",
-    "sampler",
-    "process_batch_result",
-]
+# ===== Target name -> Display name mapping =====
+TARGET_MAP = {
+    "recv_requests": "recv_requests",
+    "get_next_batch_to_run": "get_next_batch_to_run",
+    "VocabParallelEmbedding_0": "vocab_parallel_embedding",
+    "_scattered_to_tp_attn_full": "prepare_attn(allgather)",
+    "forward_prepare": "forward_prepare",
+    "forward_core": "forward_core",
+    "_all_reduce_and_layernorm": "prepare_mlp(dense)",
+    "deepseek_v2.py(256): forward": "forward_mlp",
+    "_scatter_hidden_states_and_residual": "prepare_mlp(sparse)",
+    "deepseek_v2.py(435): forward": "moe_gate",
+    "topk.py(1246): select_experts": "topk",
+    "kunpeng.py(479): dispatch": "moe_dispatch",
+    "layer.py(680): run_moe_core": "run_moe_core",
+    "kunpeng.py(580): combine": "moe_combine",
+    "logits_processor.py(285): forward": "logits_processor",
+    "model_runner.py(3341): sample": "sampler",
+    "process_batch_result": "process_batch_result",
+}
 # ===================================================================
 
 FRONT_COUNT = 4  # First FRONT_COUNT items use total=avg_ms
@@ -81,8 +59,12 @@ FRONT_COUNT = 4  # First FRONT_COUNT items use total=avg_ms
 
 def iter_events_robust(file_path):
     """Safely iterate JSON events, skipping corrupted parts"""
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
+    if file_path.endswith(".gz"):
+        with gzip.open(file_path, "rt", encoding="utf-8") as f:
+            content = f.read()
+    else:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
     decoder = json.JSONDecoder()
     match = re.search(r'"traceEvents"\s*:\s*\[', content)
     if match:
@@ -118,7 +100,7 @@ def main():
     file_path = args.file
 
     # Collect statistics
-    stats = {name: [] for name in TARGET_NAMES}
+    stats = {name: [] for name in TARGET_MAP}
     try:
         for ev in iter_events_robust(file_path):
             if ev.get("ph") != "X":
@@ -127,7 +109,7 @@ def main():
             dur_us = ev.get("dur")
             if dur_us is None:
                 continue
-            for target in TARGET_NAMES:
+            for target in TARGET_MAP:
                 if target in raw_name:
                     dur_ms = float(dur_us) / 1000.0
                     stats[target].append(dur_ms)
@@ -149,8 +131,7 @@ def main():
     results = []
     print(f"File: {file_path}")
     print("-" * 60)
-    for i, name in enumerate(TARGET_NAMES):
-        display_name = DISPLAY_NAMES[i]
+    for i, (name, display_name) in enumerate(TARGET_MAP.items()):
         durations = stats[name]
         count = len(durations)
         if count == 0:
@@ -199,7 +180,7 @@ def main():
     total_sum = sum(r["total"] for r in results if r["total"] is not None)
 
     # Prepare Excel output
-    excel_file = "prof_stats.xlsx"
+    excel_file = "stats.xlsx"
     sheet_name = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
 
     try:
