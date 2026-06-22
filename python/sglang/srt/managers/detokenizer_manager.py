@@ -62,6 +62,7 @@ DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 <
 
 _is_cpu_920f = is_cpu_920f()
 
+
 @dataclasses.dataclass
 class DecodeStatus:
     """Store the status of incremental decoding."""
@@ -421,9 +422,10 @@ def run_detokenizer_process(
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         if _is_cpu_920f:
             import os
+
             p = psutil.Process(os.getpid())
             # TODO (kunpeng): hard code here, should use a more elegant way.
-            p.cpu_affinity({112}) # 36
+            p.cpu_affinity({96})  # 20
             logger.info(os.sched_getaffinity(os.getpid()))
 
     kill_itself_when_parent_died()
