@@ -30,6 +30,8 @@
 #   moe             -- RDMA MoE communication create/finalize smoke test
 #   shm             -- Shared memory pool create/destroy smoke test
 #   reduce_scatter  -- SHM reduce_scatter benchmark vs torch.distributed
+#   allgather       -- SHM dual_allgather benchmark vs torch.distributed
+#   allreduce       -- SHM allreduce benchmark vs torch.distributed
 #
 # Options (environment variables):
 #   PYTHON        -- python interpreter       (default: python3)
@@ -41,7 +43,7 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: bash run.sh <test_name>" >&2
-    echo "Available tests: moe, shm, reduce_scatter" >&2
+    echo "Available tests: moe, shm, reduce_scatter, allgather, allreduce" >&2
     exit 1
 fi
 
@@ -65,9 +67,19 @@ case "${TEST_NAME}" in
         MASTER_PORT=5002
         TEST_LABEL="SHM reduce_scatter benchmark"
         ;;
+    allgather)
+        TEST_FILE="${SCRIPT_DIR}/test_allgather.py"
+        MASTER_PORT=5003
+        TEST_LABEL="SHM dual_allgather benchmark"
+        ;;
+    allreduce)
+        TEST_FILE="${SCRIPT_DIR}/test_allreduce.py"
+        MASTER_PORT=5004
+        TEST_LABEL="SHM allreduce benchmark"
+        ;;
     *)
         echo "ERROR: unknown test '${TEST_NAME}'" >&2
-        echo "Available tests: moe, shm, reduce_scatter" >&2
+        echo "Available tests: moe, shm, reduce_scatter, allgather, allreduce" >&2
         exit 1
         ;;
 esac
@@ -106,8 +118,7 @@ PIDS=()
 
 for RANK in $(seq 0 $((WORLD_SIZE - 1))); do
     CPU_START=$((RANK * CPU_PER_RANK))
-    CPU_END=$((CPU_START + 32 - 1))
-    CPU_RANGE="${CPU_START}-${CPU_END}"
+    CPU_RANGE="${CPU_START}-$((CPU_START + 15)),$((CPU_START + 21))-$((CPU_START + 36))"
 
     export RANK
 
