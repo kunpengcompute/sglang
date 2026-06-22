@@ -294,7 +294,61 @@ class DeepseekMHAKunpengForwardMixin:
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+
+        # quant without rmsnorm
+        batch_size = attn_output.shape[0]
+        dim = attn_output.shape[-1]
+        scale_size = 4  # fp32
+        row_bytes = dim + scale_size
+        total_bytes = batch_size * row_bytes
+        attn_bmm_output_int8_and_scale = torch.zeros((total_bytes), dtype=torch.uint8)
+
+        int8_shape = (batch_size, dim)
+        int8_strides = (row_bytes, 1)
+        attn_bmm_output_int8 = attn_bmm_output_int8_and_scale.view(
+            torch.int8
+        ).as_strided(int8_shape, int8_strides)
+
+        f32_shape = (batch_size, 1)
+        f32_strides = (row_bytes // 4, 1)
+        scale_start_offset = dim
+        attn_bmm_output_scale = (
+            attn_bmm_output_int8_and_scale[scale_start_offset:]
+            .view(torch.float32)
+            .as_strided(f32_shape, f32_strides)
+        )
+
+        torch.ops.sgl_kernel.quant_kunpeng(
+            attn_output, attn_bmm_output_int8, attn_bmm_output_scale
+        )
+
+        # o_proj
+        m, k = attn_output.shape
+        n = self.o_proj.weight.shape[0]
+        tile_m, tile_n, tile_k = (
+            torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+        )
+
+        output = torch.empty([m, n], dtype=torch.bfloat16)
+
+        pack_a = torch.empty_like(attn_bmm_output_int8)
+        torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+            attn_bmm_output_int8.contiguous(), pack_a, tile_m, tile_k
+        )
+
+        workspace_size = m * n * 32
+        workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
+
+        torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
+            pack_a,
+            self.o_proj.weight,
+            self.o_proj.weight_scale.view(-1),
+            attn_bmm_output_scale.contiguous().view(-1),
+            output,
+            workspace,
+            32,
+        )
+
         return output
 
     def _set_mla_kv_buffer(

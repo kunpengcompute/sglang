@@ -445,6 +445,22 @@ class DeepseekV2WeightLoaderMixin:
                 else self.model.decoder.self_attn
             )
 
+            if _is_cpu_920f:
+                # o_proj prepack
+                n, k = self_attn.o_proj.weight.shape
+                m = 32
+                tile_m, tile_n, tile_k = (
+                    torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
+                        m, n, k, 32
+                    )
+                )
+
+                pack_w = torch.empty_like(self_attn.o_proj.weight)
+                torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                    self_attn.o_proj.weight.contiguous(), pack_w, tile_n, tile_k
+                )
+                self_attn.o_proj.weight.copy_(pack_w)
+
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
                 awq_dequantize_f = awq_dequantize_func()
