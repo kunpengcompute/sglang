@@ -62,13 +62,13 @@ def run_server(server_args):
 
 
 if __name__ == "__main__":
-    warnings.warn(
-        "'python -m sglang.launch_server' is still supported, but "
-        "'sglang serve' is the recommended entrypoint.\n"
-        "  Example: sglang serve --model-path <model> [options]",
-        UserWarning,
-        stacklevel=1,
-    )
+    # warnings.warn(
+    #     "'python -m sglang.launch_server' is still supported, but "
+    #     "'sglang serve' is the recommended entrypoint.\n"
+    #     "  Example: sglang serve --model-path <model> [options]",
+    #     UserWarning,
+    #     stacklevel=1,
+    # )
 
     from sglang.srt.plugins import load_plugins
 
