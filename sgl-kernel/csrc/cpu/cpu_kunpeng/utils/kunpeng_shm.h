@@ -109,3 +109,30 @@ void shm_reduce_scatter_init_kunpeng();
  * Called automatically in shm_pool_destroy_kunpeng().
  */
 void shm_reduce_scatter_finalize_kunpeng();
+
+/**
+ * Initialize the SHM allgather request.
+ * Called automatically at the end of shm_pool_create_kunpeng().
+ */
+void shm_allgather_init_kunpeng();
+
+/**
+ * Finalize the SHM allgather request.
+ * Called automatically in shm_pool_destroy_kunpeng().
+ */
+void shm_allgather_finalize_kunpeng();
+
+/**
+ * Initialize the SHM allreduce request.
+ * Called automatically at the end of shm_pool_create_kunpeng().
+ *
+ * @param max_num_elements  Maximum number of elements that allreduce will
+ *                          be called with.
+ */
+void shm_allreduce_init_kunpeng(int64_t max_num_elements);
+
+/**
+ * Finalize the SHM allreduce request.
+ * Called automatically in shm_pool_destroy_kunpeng().
+ */
+void shm_allreduce_finalize_kunpeng();

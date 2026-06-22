@@ -24,8 +24,8 @@ from sglang.srt.distributed.parallel_state import (
     create_custom_parallel_group,
     get_attn_tp_group,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size, get_attention_tp_rank
 from sglang.srt.environ import envs
+from sgl_kernel import pg_helper
 
 kernel = torch.ops.sgl_kernel
 
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 _INTRA_SOCKET: Optional[dist.ProcessGroup] = None
 _INTRA_DIE: Optional[dist.ProcessGroup] = None
 _SHM_POOL_INITIALIZED: bool = False
+_OOB_COMMS_INITIALIZED: bool = False
 
 
 def get_intra_socket_group() -> dist.ProcessGroup:
@@ -48,14 +49,10 @@ def get_intra_die_group() -> dist.ProcessGroup:
     return _INTRA_DIE
 
 
-def is_shm_pool_initialized() -> bool:
-    return _SHM_POOL_INITIALIZED
-
-
 def init_oob_comms():
-    global _INTRA_SOCKET, _INTRA_DIE
-    if not (_INTRA_SOCKET is None and _INTRA_DIE is None):
-        raise ValueError("Kunpeng out-of-band comms already initialized")
+    global _OOB_COMMS_INITIALIZED, _INTRA_SOCKET, _INTRA_DIE
+    if _OOB_COMMS_INITIALIZED:
+        return
 
     # Kunpeng CPU: each node has 16 NUMA nodes, each socket has 8 NUMA nodes, each die has 4 NUMA nodes
     intra_socket_size = 8
@@ -120,8 +117,11 @@ def init_oob_comms():
             f"[KunpengCommunicator rank {rank}] Not in any intra_die_group (unexpected)"
         )
 
+    _OOB_COMMS_INITIALIZED = True
+    logger.info(f"[KunpengCommunicator rank {dist.get_rank()}] oob_comms_init OK")
 
-def init_shm_pool():
+
+def init_shm_pool(group: dist.ProcessGroup):
     """Initialize the Kunpeng shared memory pool.
 
     Must be called after ``init_oob_comms`` since it needs the
@@ -130,16 +130,14 @@ def init_shm_pool():
     This function is idempotent -- calling it multiple times is safe
     (the C++ side also guards against double-init).
     """
-    global _SHM_POOL_INITIALIZED
+    global _SHM_POOL_INITIALIZED, _OOB_COMMS_INITIALIZED, _INTRA_SOCKET, _INTRA_DIE
     if _SHM_POOL_INITIALIZED:
         return
 
-    if not (_INTRA_SOCKET is not None and _INTRA_DIE is not None):
+    if not _OOB_COMMS_INITIALIZED:
         raise ValueError("init_oob_comms must be called before init_shm_pool")
 
-    from sgl_kernel import pg_helper
-
-    intra_node_ptr = pg_helper.get_process_group_ptr(get_attn_tp_group().cpu_group)
+    intra_node_ptr = pg_helper.get_process_group_ptr(group)
     intra_socket_ptr = pg_helper.get_process_group_ptr(_INTRA_SOCKET)
     intra_die_ptr = pg_helper.get_process_group_ptr(_INTRA_DIE)
 
@@ -154,12 +152,20 @@ def init_shm_pool():
 
 
 class KunpengCommunicator:
-    def __init__(self, group: dist.ProcessGroup):
+    def __init__(self, group: dist.ProcessGroup, max_elements: int):
         self.group = group
         self.comm_size = group.size()
         self.comm_rank = group.rank()
         self.world_size = dist.get_world_size()
         self.rs_tensor: Optional[torch.Tensor] = None
+        self.ar_tensor: Optional[torch.Tensor] = None
+
+        init_oob_comms()
+        init_shm_pool(self.group)
+
+        kernel.shm_reduce_scatter_init_kunpeng()
+        kernel.shm_allgather_init_kunpeng()
+        kernel.shm_allreduce_init_kunpeng(max_elements)
 
     @KunpengProfiler(depth=3)
     def shm_reduce_scatter_tensor(self, input: torch.Tensor):
@@ -195,6 +201,48 @@ class KunpengCommunicator:
             logger.info(
                 f"[KunpengCommunicator rank {dist.get_rank()}] shm_reduce_scatter timing (ms): "
                 f"copy_in={1000*(t_copy_in_end - t_copy_in_start):.2f}, "
-                f"reduce={1000*(t_reduce_end - t_reduce_start):.2f}, "
+                f"reduce_scatter={1000*(t_reduce_end - t_reduce_start):.2f}, "
                 f"copy_out={1000*(t_copy_out_end - t_copy_out_start):.2f}"
             )
+
+    @KunpengProfiler(depth=3)
+    def shm_all_reduce(self, input: torch.Tensor):
+        if (
+            self.ar_tensor is None
+            or self.ar_tensor.shape != input.shape
+            or self.ar_tensor.dtype != input.dtype
+        ):
+            self.ar_tensor = kernel.create_shm_tensor_kunpeng(
+                torch.bfloat16, input.shape
+            )
+            if envs.SGLANG_KUNPENG_PROFILE.get():
+                logger.info(
+                    f"[KunpengCommunicator rank {dist.get_rank()}] "
+                    f"create_shm_tensor_kunpeng OK, shape={list(self.ar_tensor.shape)}"
+                )
+
+        t_copy_in_start = time.perf_counter()
+        self.ar_tensor.copy_(input)
+        t_copy_in_end = time.perf_counter()
+
+        t_reduce_start = time.perf_counter()
+        kernel.shm_allreduce_kunpeng(self.ar_tensor)
+        t_reduce_end = time.perf_counter()
+
+        t_copy_out_start = time.perf_counter()
+        input.copy_(self.ar_tensor)
+        t_copy_out_end = time.perf_counter()
+
+        if envs.SGLANG_KUNPENG_PROFILE.get():
+            logger.info(
+                f"[KunpengCommunicator rank {dist.get_rank()}] shm_all_reduce timing (ms): "
+                f"copy_in={1000*(t_copy_in_end - t_copy_in_start):.2f}, "
+                f"all_reduce={1000*(t_reduce_end - t_reduce_start):.2f}, "
+                f"copy_out={1000*(t_copy_out_end - t_copy_out_start):.2f}"
+            )
+
+    def __del__(self):
+        kernel.shm_reduce_scatter_finalize_kunpeng()
+        kernel.shm_allgather_finalize_kunpeng()
+        kernel.shm_allreduce_finalize_kunpeng()
+        kernel.shm_pool_destroy_kunpeng()
