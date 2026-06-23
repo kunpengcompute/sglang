@@ -36,13 +36,15 @@ void shm_reduce_scatter_init_kunpeng()
 {
     TORCH_CHECK(is_shm_initialized(), "shm_reduce_scatter_init_kunpeng called before shm_pool_create_kunpeng");
 
+    if (g_rs_initialized) return;
+
     intra_node_rank = get_intra_node_rank();
     intra_node_size = get_intra_node_size();
 
     size_t fence_buffer_size = 0;
     kutacc::shm_reduce_scatter_request_create(intra_node_rank, intra_node_size, kutacc::SHM_DATATYPE_BFLOAT16,
                                               fence_buffer_size, g_rs_request);
-    std::cout << "[KuTACC] reduce_scatter fence_buffer_size = " << fence_buffer_size << std::endl;
+    std::cout << "[KuTACC] ReduceScatter fence_buffer_size = " << fence_buffer_size << std::endl;
 
     int16_t *fence_buffers[intra_node_size];
 
@@ -59,7 +61,7 @@ void shm_reduce_scatter_init_kunpeng()
                                             kupl_win_intra_node, g_rs_request);
 
     g_rs_initialized = true;
-    std::cout << "[KuTACC] Reduce scatter initialized, rank=" << intra_node_rank << ", size=" << intra_node_size
+    std::cout << "[KuTACC] ReduceScatter initialized, rank=" << intra_node_rank << ", size=" << intra_node_size
               << std::endl;
 }
 
@@ -84,5 +86,5 @@ void shm_reduce_scatter_finalize_kunpeng()
         g_rs_request = nullptr;
     }
     g_rs_initialized = false;
-    std::cout << "[KuTACC] Reduce scatter finalized" << std::endl;
+    std::cout << "[KuTACC] ReduceScatter finalized" << std::endl;
 }

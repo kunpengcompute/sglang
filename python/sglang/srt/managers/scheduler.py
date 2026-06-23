@@ -3871,8 +3871,10 @@ def configure_scheduler_process(
             p = psutil.Process(os.getpid())
             attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
             # TODO (kunpeng): hard code here, should use a more elegant way.
-            bind_cpu_ids = list(range(attn_tp_rank * 38 + 1, attn_tp_rank * 38 + 33))  # 1~32
-            p.cpu_affinity(bind_cpu_ids)
+            p.cpu_affinity(
+                list(range(attn_tp_rank * 38, attn_tp_rank * 38 + 16))
+                + list(range(attn_tp_rank * 38 + 21, attn_tp_rank * 38 + 37))
+            )  # 0~15, 21~36
             logger.info(os.sched_getaffinity(os.getpid()))
         else:
             set_gpu_proc_affinity(
@@ -3886,7 +3888,9 @@ def configure_scheduler_process(
 
     if _is_cpu_920f and os.environ.get("TORCH_USE_KUPL", "") == "1":
         torch.set_num_threads(int(os.environ.get("KUPL_EXECUTOR_COUNT", "1")))
-        logger.info(f"torch_num_threads = {torch.get_num_threads()}, enable kupl multi-threads")
+        logger.info(
+            f"torch_num_threads = {torch.get_num_threads()}, enable kupl multi-threads"
+        )
 
     return dp_rank
 
@@ -3952,7 +3956,7 @@ def run_scheduler_process(
                 p = psutil.Process(os.getpid())
                 attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
                 # TODO (kunpeng): hard code here, should use a more elegant way.
-                p.cpu_affinity({attn_tp_rank * 38 + 35}) # 35
+                p.cpu_affinity({attn_tp_rank * 38 + 16})  # 16
 
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()

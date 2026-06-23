@@ -349,6 +349,11 @@ class GroupCoordinator:
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
+        self.use_kunpeng_communicator = (
+            _is_cpu_920f
+            and self.world_size < torch.distributed.get_world_size()  # attn_tp_group
+            and self.world_size % 8 == 0  # attn_tp_size must be divisible by 8
+        )
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -459,12 +464,15 @@ class GroupCoordinator:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
         self.kunpeng_communicator: Optional[KunpengCommunicator] = None
-        if _is_cpu_920f and self.world_size > 1:
-            self.kunpeng_communicator = KunpengCommunicator(group=self.cpu_group)
-            # Kunpeng CPU: only support shm kunpeng when attn_tp_size is a multiple of 8
-            self.use_shm_kunpeng = (
-                self.world_size < torch.distributed.get_world_size()
-                and self.world_size % 8 == 0
+        if self.use_kunpeng_communicator:
+            # TODO(kunpeng): 7168 is the hidden size of DeepSeek V3, used to
+            # pre-allocate SHM buffer for decode allreduce. This is hardcoded
+            # and should be derived from model config in the future.
+            _max_elements = (
+                int(os.environ.get("SGLANG_KUNPENG_DECODE_MAX_TOKENS", 128)) * 7168
+            )
+            self.kunpeng_communicator = KunpengCommunicator(
+                group=self.cpu_group, max_elements=_max_elements
             )
 
         # Create message queue
@@ -606,6 +614,9 @@ class GroupCoordinator:
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
+            elif self.use_kunpeng_communicator:
+                if input_.shape[0] > 0:
+                    self.kunpeng_communicator.shm_all_reduce(input_)
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
@@ -784,14 +795,9 @@ class GroupCoordinator:
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
-        elif _is_cpu_920f:
-            if self.use_shm_kunpeng:
-                if input.shape[0] > 0:
-                    self.kunpeng_communicator.shm_reduce_scatter_tensor(input)
-            else:
-                torch.distributed.reduce_scatter_tensor(
-                    output, input, group=self.cpu_group
-                )
+        elif self.use_kunpeng_communicator:
+            if input.shape[0] > 0:
+                self.kunpeng_communicator.shm_reduce_scatter_tensor(input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 

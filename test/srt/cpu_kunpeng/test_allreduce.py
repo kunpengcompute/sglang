@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Multi-process benchmark for Kunpeng SHM reduce_scatter vs torch.distributed.
+"""Multi-process benchmark for Kunpeng SHM allreduce vs torch.distributed.
 
 Each rank is launched individually by the companion ``run.sh``
 script with ``taskset`` pre-setting CPU affinity.  The script sets the
@@ -22,17 +22,18 @@ can rendezvous without ``torchrun``.
 
 The test:
   1. Initializes the shared memory pool (shm_pool_create_kunpeng)
-  2. Initializes the reduce_scatter request (shm_reduce_scatter_init_kunpeng)
-  3. Benchmarks kutacc reduce_scatter over multiple iterations
-  4. Benchmarks torch.distributed reduce_scatter over the same iterations
+  2. Allreduce is initialized automatically inside shm_pool_create_kunpeng
+  3. Benchmarks kutacc shm_allreduce over multiple iterations
+  4. Benchmarks torch.distributed all_reduce over the same iterations
   5. Verifies numerical correctness (kutacc vs gloo)
   6. Prints per-rank latency comparison
 
-Data shape: [128, 7168] in bfloat16.
+Data shape: [HEIGHT, WIDTH] in bfloat16.  The allreduce is in-place:
+each rank's shm tensor holds the reduced sum after the call.
 
 Usage:
   source scripts/cpu_kunpeng/env.sh native
-  bash test/srt/cpu_kunpeng/run.sh reduce_scatter
+  bash test/srt/cpu_kunpeng/run.sh allreduce
 """
 
 import logging
@@ -99,27 +100,23 @@ def worker_main() -> None:
     init_oob_comms()
     init_shm_pool(dist.group.WORLD)
 
+    kernel.shm_allreduce_init_kunpeng(128 * 7168)
+
     dist.barrier()
 
+    # The allreduce buffer must live in shared memory because the C++ side
+    # builds remote peer buffers from its data_ptr via get_peer_shm_baseptr.
     shm_tensor = kernel.create_shm_tensor_kunpeng(torch.bfloat16, [HEIGHT, WIDTH])
     _rank_log(rank, "create_shm_tensor_kunpeng OK, shape=%s", list(shm_tensor.shape))
 
-    shm_tensor.fill_(float(rank + 1))
-
-    kernel.shm_reduce_scatter_init_kunpeng()
-    _rank_log(rank, "shm_reduce_scatter_init_kunpeng OK")
-
-    dist.barrier()
-
-    chunk_height = HEIGHT // world_size
-
+    # ---- Benchmark kutacc shm_allreduce ------------------------------------
     kutacc_times = []
     for i in range(WARMUP_ITERS + BENCH_ITERS):
         shm_tensor.fill_(float(rank + 1))
         dist.barrier()
 
         t0 = time.perf_counter()
-        kernel.shm_reduce_scatter_kunpeng(HEIGHT, WIDTH, shm_tensor)
+        kernel.shm_allreduce_kunpeng(shm_tensor)
         t1 = time.perf_counter()
 
         if i >= WARMUP_ITERS:
@@ -127,19 +124,19 @@ def worker_main() -> None:
 
         dist.barrier()
 
-    kutacc_result = shm_tensor[rank * chunk_height : (rank + 1) * chunk_height].clone()
+    kutacc_result = shm_tensor.clone()
 
     avg_kutacc = sum(kutacc_times) / len(kutacc_times)
     _rank_log(
         rank,
-        "[kutacc] reduce_scatter avg=%.3f ms  min=%.3f ms  max=%.3f ms",
+        "[kutacc] allreduce avg=%.3f ms  min=%.3f ms  max=%.3f ms",
         avg_kutacc,
         min(kutacc_times),
         max(kutacc_times),
     )
 
+    # ---- Reference: torch.distributed all_reduce ---------------------------
     gloo_tensor = torch.full((HEIGHT, WIDTH), float(rank + 1), dtype=torch.bfloat16)
-    gloo_recv = torch.empty(chunk_height, WIDTH, dtype=torch.bfloat16)
 
     gloo_times = []
     for i in range(WARMUP_ITERS + BENCH_ITERS):
@@ -147,7 +144,7 @@ def worker_main() -> None:
         dist.barrier()
 
         t0 = time.perf_counter()
-        dist.reduce_scatter_tensor(gloo_recv, gloo_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(gloo_tensor, op=dist.ReduceOp.SUM)
         t1 = time.perf_counter()
 
         if i >= WARMUP_ITERS:
@@ -158,18 +155,18 @@ def worker_main() -> None:
     avg_gloo = sum(gloo_times) / len(gloo_times)
     _rank_log(
         rank,
-        "[gloo]   reduce_scatter avg=%.3f ms  min=%.3f ms  max=%.3f ms",
+        "[gloo]   all_reduce avg=%.3f ms  min=%.3f ms  max=%.3f ms",
         avg_gloo,
         min(gloo_times),
         max(gloo_times),
     )
 
-    max_diff = (kutacc_result.float() - gloo_recv.float()).abs().max().item()
+    # ---- Correctness check --------------------------------------------------
+    max_diff = (kutacc_result.float() - gloo_tensor.float()).abs().max().item()
     _rank_log(
         rank,
-        "correctness: max_diff(kutacc, gloo) = %.6e  (rank %d chunk)",
+        "correctness: max_diff(kutacc, gloo) = %.6e",
         max_diff,
-        rank,
     )
 
     if max_diff > 1e-2:
@@ -190,8 +187,8 @@ def worker_main() -> None:
         speedup,
     )
 
-    kernel.shm_reduce_scatter_finalize_kunpeng()
-    _rank_log(rank, "shm_reduce_scatter_finalize_kunpeng OK")
+    kernel.shm_allreduce_finalize_kunpeng()
+    _rank_log(rank, "shm_allreduce_finalize_kunpeng OK")
 
     kernel.shm_pool_destroy_kunpeng()
     _rank_log(rank, "shm_pool_destroy_kunpeng OK")

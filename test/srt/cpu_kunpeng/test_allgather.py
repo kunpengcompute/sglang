@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Multi-process benchmark for Kunpeng SHM reduce_scatter vs torch.distributed.
+"""Multi-process benchmark for Kunpeng SHM dual_allgather vs torch.distributed.
 
 Each rank is launched individually by the companion ``run.sh``
 script with ``taskset`` pre-setting CPU affinity.  The script sets the
@@ -22,17 +22,19 @@ can rendezvous without ``torchrun``.
 
 The test:
   1. Initializes the shared memory pool (shm_pool_create_kunpeng)
-  2. Initializes the reduce_scatter request (shm_reduce_scatter_init_kunpeng)
-  3. Benchmarks kutacc reduce_scatter over multiple iterations
-  4. Benchmarks torch.distributed reduce_scatter over the same iterations
-  5. Verifies numerical correctness (kutacc vs gloo)
+  2. Initializes the allgather request (shm_allgather_init_kunpeng)
+  3. Benchmarks kutacc shm_dual_allgather over multiple iterations
+  4. Benchmarks torch.distributed all_gather over the same iterations
+  5. Verifies numerical correctness (kutacc vs gloo) for both paths
   6. Prints per-rank latency comparison
 
-Data shape: [128, 7168] in bfloat16.
+Data shape: each rank sends [HEIGHT, WIDTH] in bfloat16; the destination
+buffer holds the gathered result of shape [HEIGHT * WORLD_SIZE, WIDTH].
+Both dst0 and dst1 are allocated on shared memory.
 
 Usage:
   source scripts/cpu_kunpeng/env.sh native
-  bash test/srt/cpu_kunpeng/run.sh reduce_scatter
+  bash test/srt/cpu_kunpeng/run.sh allgather
 """
 
 import logging
@@ -61,8 +63,8 @@ logging.basicConfig(
     force=True,
 )
 
-HEIGHT = 128
-WIDTH = 7168
+HEIGHT = 16
+WIDTH = 128
 WARMUP_ITERS = 5
 BENCH_ITERS = 20
 
@@ -101,25 +103,44 @@ def worker_main() -> None:
 
     dist.barrier()
 
-    shm_tensor = kernel.create_shm_tensor_kunpeng(torch.bfloat16, [HEIGHT, WIDTH])
-    _rank_log(rank, "create_shm_tensor_kunpeng OK, shape=%s", list(shm_tensor.shape))
+    # Each rank allocates only two dst buffers on shared memory; the src
+    # buffer is a slice of the corresponding dst buffer
+    # (dst[rank*HEIGHT:(rank+1)*HEIGHT, :]).  Writing into the src slice
+    # places this rank's data at the correct offset of the dst buffer.
+    dst0_shm = kernel.create_shm_tensor_kunpeng(
+        torch.float32, [world_size * HEIGHT, WIDTH]
+    )
+    dst1_shm = kernel.create_shm_tensor_kunpeng(
+        torch.int32, [world_size * HEIGHT, WIDTH]
+    )
+    _rank_log(
+        rank,
+        "create_shm_tensor_kunpeng OK, dst0 shape=%s dst1 shape=%s",
+        list(dst0_shm.shape),
+        list(dst1_shm.shape),
+    )
 
-    shm_tensor.fill_(float(rank + 1))
+    # src buf is a slice of dst buf at this rank's offset.
+    src0 = dst0_shm[rank * HEIGHT : (rank + 1) * HEIGHT, :]
+    src1 = dst1_shm[rank * HEIGHT : (rank + 1) * HEIGHT, :]
 
-    kernel.shm_reduce_scatter_init_kunpeng()
-    _rank_log(rank, "shm_reduce_scatter_init_kunpeng OK")
+    kernel.shm_allgather_init_kunpeng()
+    _rank_log(rank, "shm_allgather_init_kunpeng OK")
 
     dist.barrier()
 
-    chunk_height = HEIGHT // world_size
-
     kutacc_times = []
     for i in range(WARMUP_ITERS + BENCH_ITERS):
-        shm_tensor.fill_(float(rank + 1))
+        dst0_shm.zero_()
+        dst1_shm.zero_()
+        # src0/src1 are slices of dst0_shm/dst1_shm; writing to them places
+        # this rank's data at the correct offset of the dst buffer.
+        src0.fill_(float(rank + 1))
+        src1.fill_(int(rank + 1))
         dist.barrier()
 
         t0 = time.perf_counter()
-        kernel.shm_reduce_scatter_kunpeng(HEIGHT, WIDTH, shm_tensor)
+        kernel.shm_dual_allgather_kunpeng(src0, dst0_shm, src1, dst1_shm)
         t1 = time.perf_counter()
 
         if i >= WARMUP_ITERS:
@@ -127,27 +148,34 @@ def worker_main() -> None:
 
         dist.barrier()
 
-    kutacc_result = shm_tensor[rank * chunk_height : (rank + 1) * chunk_height].clone()
+    kutacc_result0 = dst0_shm.clone()
+    kutacc_result1 = dst1_shm.clone()
 
     avg_kutacc = sum(kutacc_times) / len(kutacc_times)
     _rank_log(
         rank,
-        "[kutacc] reduce_scatter avg=%.3f ms  min=%.3f ms  max=%.3f ms",
+        "[kutacc] dual_allgather avg=%.3f ms  min=%.3f ms  max=%.3f ms",
         avg_kutacc,
         min(kutacc_times),
         max(kutacc_times),
     )
 
-    gloo_tensor = torch.full((HEIGHT, WIDTH), float(rank + 1), dtype=torch.bfloat16)
-    gloo_recv = torch.empty(chunk_height, WIDTH, dtype=torch.bfloat16)
+    # ---- Reference: torch.distributed all_gather for path 0 -----------------
+    gloo_src0 = torch.full((HEIGHT, WIDTH), float(rank + 1), dtype=torch.float32)
+    gloo_recv0 = torch.empty((world_size * HEIGHT, WIDTH), dtype=torch.float32)
+
+    gloo_src1 = torch.full((HEIGHT, WIDTH), int(rank + 1), dtype=torch.int32)
+    gloo_recv1 = torch.empty((world_size * HEIGHT, WIDTH), dtype=torch.int32)
 
     gloo_times = []
     for i in range(WARMUP_ITERS + BENCH_ITERS):
-        gloo_tensor.fill_(float(rank + 1))
+        gloo_src0.fill_(float(rank + 1))
+        gloo_src1.fill_(int(rank + 1))
         dist.barrier()
 
         t0 = time.perf_counter()
-        dist.reduce_scatter_tensor(gloo_recv, gloo_tensor, op=dist.ReduceOp.SUM)
+        dist.all_gather_into_tensor(gloo_recv0, gloo_src0)
+        dist.all_gather_into_tensor(gloo_recv1, gloo_src1)
         t1 = time.perf_counter()
 
         if i >= WARMUP_ITERS:
@@ -158,40 +186,43 @@ def worker_main() -> None:
     avg_gloo = sum(gloo_times) / len(gloo_times)
     _rank_log(
         rank,
-        "[gloo]   reduce_scatter avg=%.3f ms  min=%.3f ms  max=%.3f ms",
+        "[gloo]   all_gather x2 avg=%.3f ms  min=%.3f ms  max=%.3f ms",
         avg_gloo,
         min(gloo_times),
         max(gloo_times),
     )
 
-    max_diff = (kutacc_result.float() - gloo_recv.float()).abs().max().item()
+    # ---- Correctness check --------------------------------------------------
+    max_diff0 = (kutacc_result0 - gloo_recv0).abs().max().item()
+    max_diff1 = (kutacc_result1 - gloo_recv1).abs().max().item()
     _rank_log(
         rank,
-        "correctness: max_diff(kutacc, gloo) = %.6e  (rank %d chunk)",
-        max_diff,
-        rank,
+        "correctness: max_diff0(kutacc, gloo) = %.6e  max_diff1 = %.6e",
+        max_diff0,
+        max_diff1,
     )
 
-    if max_diff > 1e-2:
+    if max_diff0 > 1e-2 or max_diff1 > 1e-2:
         logger.error(
-            "[rank %d] NUMERICAL MISMATCH: max_diff=%.6e exceeds threshold 1e-2",
+            "[rank %d] NUMERICAL MISMATCH: max_diff0=%.6e max_diff1=%.6e exceeds threshold 1e-2",
             rank,
-            max_diff,
+            max_diff0,
+            max_diff1,
         )
 
     speedup = avg_gloo / avg_kutacc if avg_kutacc > 0 else float("inf")
     _rank_log(
         rank,
-        "=== SUMMARY ===  data=[%d x %d] bf16  kutacc=%.3f ms  gloo=%.3f ms  speedup=%.2fx",
-        HEIGHT,
+        "=== SUMMARY ===  data=[%d x %d] (fp32, int32)  kutacc=%.3f ms  gloo=%.3f ms  speedup=%.2fx",
+        world_size * HEIGHT,
         WIDTH,
         avg_kutacc,
         avg_gloo,
         speedup,
     )
 
-    kernel.shm_reduce_scatter_finalize_kunpeng()
-    _rank_log(rank, "shm_reduce_scatter_finalize_kunpeng OK")
+    kernel.shm_allgather_finalize_kunpeng()
+    _rank_log(rank, "shm_allgather_finalize_kunpeng OK")
 
     kernel.shm_pool_destroy_kunpeng()
     _rank_log(rank, "shm_pool_destroy_kunpeng OK")

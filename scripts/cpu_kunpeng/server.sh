@@ -100,7 +100,7 @@ esac
 # Combine and execute
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
-        taskset -c $((ATTN_TP_RANK * 38)) \
+        taskset -c $((ATTN_TP_RANK * 38 + 20)) \
         python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
           --tp-rank-in-node ${ATTN_TP_RANK} \
           --port $((30000 + ATTN_TP_RANK)) \

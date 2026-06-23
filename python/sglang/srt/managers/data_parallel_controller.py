@@ -73,6 +73,7 @@ SCHEDULER_PIDS_ARG = "scheduler_pids"
 _is_cpu_920f = is_cpu_920f()
 _is_kunpeng_binary_launch = is_kunpeng_binary_launch()
 
+
 class LoadBalanceMethod(Enum):
     """Load balance method."""
 
@@ -145,7 +146,7 @@ class DataParallelController:
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >=1 :
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
                 pass
             else:
                 self.recv_from_tokenizer = get_zmq_socket(
@@ -491,8 +492,11 @@ class DataParallelController:
         tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
         if _is_kunpeng_binary_launch:
             tp_rank_range = range(
-                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node,
-                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node + 1,
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group)
+                + server_args.tp_rank_in_node,
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group)
+                + server_args.tp_rank_in_node
+                + 1,
             )
         else:
             tp_rank_range = range(
@@ -655,9 +659,10 @@ def run_data_parallel_controller_process(
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         if _is_cpu_920f:
             import os
+
             p = psutil.Process(os.getpid())
             # TODO (kunpeng): hard code here, should use a more elegant way.
-            p.cpu_affinity({74}) # 36
+            p.cpu_affinity({58})  # 20
             logger.info(os.sched_getaffinity(os.getpid()))
 
     setproctitle.setproctitle("sglang::data_parallel_controller")
@@ -691,7 +696,7 @@ def run_data_parallel_controller_process(
             }
         )
         if server_args.node_rank == 0:
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >=1 :
+            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
                 pass
             else:
                 controller.event_loop()
