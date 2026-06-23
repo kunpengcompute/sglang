@@ -17,7 +17,7 @@ KUPL_LIB=$HPCKIT_PATH/latest/kupl/bisheng/release/lib
 KUTACC_LIB=${KUTACC_PATH}/install/lib
 SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_path('purelib'))")
 
-# rm -rf $PYINSTALL_PATH/dist
+rm -rf $PYINSTALL_PATH/dist
 
 # ===================== PyInstaller 打包 =====================
 if [ ! -f sglang_server.spec ]; then
@@ -75,7 +75,7 @@ filter_code = "a.pure = [m for m in a.pure if not m[0].startswith('sglang') and 
 if filter_code in content:
     print("Spec 已经包含过滤代码，无需修改")
 else:
-    # 匹配 pyz = PYZ(a.pure) 并替换（不管有没有逗号）
+    # 匹配 pyz = PYZ(a.pure) 并替换
     import re
     new_content, count = re.subn(
         r'pyz = PYZ\(a\.pure.*?\)',
@@ -95,7 +95,7 @@ echo "[pyinstall] 开始打包..."
 pyinstaller sglang_server.spec --distpath ./dist --workpath ./build --noconfirm
 
 # echo "[pyinstall] numa duplication ..."
-# bash numa_duplication.sh
+bash numa_duplication.sh
 
 echo "=================================================================="
 echo "complete! output dir: dist/sglang_server"
