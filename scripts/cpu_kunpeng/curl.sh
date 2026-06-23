@@ -15,9 +15,11 @@
 #!/bin/bash
 
 PROFILE=false
-while getopts "p" opt; do
+MAX_TOKENS=10
+while getopts "pm:" opt; do
   case $opt in
     p) PROFILE=true ;;
+    m) MAX_TOKENS=$OPTARG ;;
   esac
 done
 
@@ -36,7 +38,7 @@ time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
         "Once upon a time"
     ],
     "stream": true,
-    "max_tokens": 10,
+    "max_tokens": '"$MAX_TOKENS"',
     "temperature": 0.01
   }'
 
