@@ -1,3 +1,17 @@
+# Copyright 2026 Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 #!/bin/bash
 set -e
 
@@ -21,7 +35,7 @@ rm -rf $PYINSTALL_PATH/dist
 
 # ===================== PyInstaller 打包 =====================
 if [ ! -f sglang_server.spec ]; then
-    echo "[pyinstall] 生成 spec 文件..."
+    echo "[pyinstall] generate spec file..."
     pyi-makespec \
       --name sglang_server \
       --onedir \
@@ -66,14 +80,14 @@ if [ ! -f sglang_server.spec ]; then
 fi
 
 # ===================== 自动修改 spec 文件 =====================
-echo "[pyinstall] 修改 spec 文件，将 sglang/sgl_kernel 移出 PYZ..."
+echo "[pyinstall] modify spec file, move sglang/sgl_kernel out of PYZ..."
 python - <<EOF
 with open('sglang_server.spec', 'r') as f:
     content = f.read()
 
 filter_code = "a.pure = [m for m in a.pure if not m[0].startswith('sglang') and not m[0].startswith('sgl_kernel')]\n"
 if filter_code in content:
-    print("Spec 已经包含过滤代码，无需修改")
+    print("Spec already contains filter code, no need to modify")
 else:
     # 匹配 pyz = PYZ(a.pure) 并替换
     import re
@@ -85,13 +99,13 @@ else:
     if count == 1:
         with open('sglang_server.spec', 'w') as f:
             f.write(new_content)
-        print("Spec 修改成功")
+        print("Spec modified successfully")
     else:
-        print("警告：未找到预期的 pyz = PYZ(...) 行，请手动修改 spec")
+        print("Warning: not found expected pyz = PYZ(...) line, please modify spec file manually")
 EOF
 
 # ===================== 用修改后的 spec 打包 =====================
-echo "[pyinstall] 开始打包..."
+echo "[pyinstall] start build..."
 pyinstaller sglang_server.spec --distpath ./dist --workpath ./build --noconfirm
 
 # echo "[pyinstall] numa duplication ..."

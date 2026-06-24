@@ -1,148 +1,133 @@
-# PyInstaller 打包指南
+# SGLang PyInstaller 打包工具
 
-使用 PyInstaller 将 SGLang 服务打包为独立的可执行目录，无需依赖完整 Conda 环境即可运行。
+将 SGLang 及其依赖打包为独立的目录结构，无需完整 Conda 环境即可在多节点、多 NUMA 上部署。
+
+---
 
 ## 目录结构
 
 ```
 pyinstall/
-├── pyinstall.sh       # 首次打包脚本（完整打包）
-├── updata.sh          # 增量更新脚本（仅更新 Python 源代码）
-├── updata.spec        # 增量更新的 PyInstaller 配置文件
-├── numa_duplication.sh# 复制打包产物用于 NUMA 多实例部署
+├── pyinstall.sh        # 首次全量打包脚本
+├── updata.sh           # 增量更新脚本（拷贝源码，不重新 PyInstaller）
+├── numa_duplication.sh # 将打包产物复制为 NUMA 多副本（0~15）
 └── readme.md
 ```
 
-## 使用流程
+---
+
+## 一、首次使用
 
 ### 1. 配置环境变量
 
-首次使用前，需要配置 `scripts/cpu_kunpeng/env.sh` 中的 4 个路径变量。
+编辑 `scripts/cpu_kunpeng/env.sh`，按实际环境设置以下路径：
 
-参考 [env.sh](file:///m:/code/sglang/scripts/cpu_kunpeng/env.sh) 示例：
-
-```bash
-# 鲲鹏 CPU 工具链路径
-HPCKIT_PATH=/path/to/HPCKit_26.0.RC1/HPCKit
-
-# kutacc 库路径
-KUTACC_PATH=/path/to/kutacc/kutacc-630
-
-# SGLang 源码路径
-SGLANG_PATH=/path/to/sglang/sglang-0.5.11-open
-
-# Conda 环境路径
-CONDA_ENV_PATH=/path/to/anaconda3/envs/$CONDA_ENV_NAME
-```
-
-> **注意**：确保这些路径指向正确的目录，否则打包过程可能因找不到依赖库而失败。
-
-### 2. 首次打包
-
-确保在 Conda 目标环境中已安装所有依赖（包括 `sglang`、`sgl_kernel`、`torch`、`triton` 等），然后执行：
-
-```bash
-cd scripts/cpu_kunpeng/pyinstall
-bash pyinstall.sh
-```
-
-打包完成后，产物位于 `dist/sglang_server/`，可直接执行：
-
-```bash
-./dist/sglang_server/sglang_server
-```
-
-### 3. 增量更新（仅更新源代码）
-
-如果只修改了 SGLang 的 Python 源代码（未新增依赖库），无需重新执行完整的 `pyinstall.sh`，使用增量更新脚本更快：
-
-```bash
-bash updata.sh
-```
-
-`updata.sh` 基于 `updata.spec` 配置，只重新打包变化的 Python 文件，并输出到 `dist/sglang_server_update/`。
-
-### 4. （可选）NUMA 多实例部署
-
-如需在多 NUMA 节点上分别启动服务实例，可用 `numa_duplication.sh` 将打包产物复制为多份：
-
-```bash
-bash numa_duplication.sh
-```
-
-该脚本会将 `dist/sglang_server` 重命名为 `dist/sglang_server_tp0`，并复制出 `dist/sglang_server_tp1` 至 `dist/sglang_server_tp15` 共 16 份，供不同 NUMA 节点使用。
-
-## 注意事项
-
-- `pyinstall.sh` 会将 Conda 环境中的标准库完整复制到打包产物中，以确保在没有标准库的环境中也能运行。
-- 如果新增了 Python 依赖（如通过 `pip install` 新安装了库），需要重新执行 `pyinstall.sh` 完整打包。
-- `updata.spec` 中的 `sglang/launch_server.py` 路径基于示例配置，需确认与实际 `SGLANG_PATH` 一致。# SGLang PyInstaller 打包工具
-
-本工具用于将 SGLang 及其依赖打包为独立可执行文件，方便在鲲鹏 CPU 环境上部署。
-
----
-
-## 目录结构
-
-```
-pyinstall/
-├── pyinstall.sh        # 首次打包脚本（全量打包）
-├── updata.sh           # 增量更新脚本（仅更新源代码）
-├── updata.spec         # 增量更新的 PyInstaller spec 文件
-├── numa_duplication.sh # 生成 NUMA 多副本（0~15）
-└── readme.md           # 本文件
-```
-
----
-
-## 一、首次使用：配置环境路径
-
-在执行打包前，需先编辑 `../env.sh`，配置以下路径变量：
-
-| 变量 | `env.sh` | 说明 |
-|---|---|---|
-| `HPCKIT_PATH`  | HPCKit 安装路径 |
+| 变量 | 说明 |
+|---|---|
+| `HPCKIT_PATH` | HPCKit 安装路径 |
 | `OpenBLAS_PATH` | OpenBLAS 安装路径 |
 | `KUTACC_PATH` | kutacc 安装路径 |
 | `SGLANG_PATH` | SGLang 源码根目录 |
-| `CONDA_ENV_PATH` | Conda 虚拟环境路径（由 `CONDA_ENV_NAME` 拼接） |
+| `CONDA_ENV_PATH` | Conda 虚拟环境路径 |
+| `PYINSTALL_PATH` | pyinstall 脚本所在目录 |
 
-修改后执行 `pyinstall.sh`：
+示例：
+
+```bash
+export HPCKIT_PATH=/path/to/HPCKit_26.0.RC1/HPCKit
+export OpenBLAS_PATH=/path/to/openblas
+export KUTACC_PATH=/path/to/kutacc/kutacc-630
+export SGLANG_PATH=/path/to/sglang/sglang-0.5.11-open
+export CONDA_ENV_PATH=/path/to/anaconda3/envs/sgl-env
+export PYINSTALL_PATH=$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall
+```
+
+### 2. 执行全量打包
 
 ```bash
 cd scripts/cpu_kunpeng/pyinstall
 bash pyinstall.sh
 ```
 
-打包完成后，输出位于 `dist/sglang_server/`，可直接执行：
+`pyinstall.sh` 会依次完成：
+1. 读取 `env.sh` 中的环境变量
+2. 生成 `sglang_server.spec`（包括依赖的 `.so` 库、数据文件、hidden-import）
+3. 自动修改 spec 将 `sglang`/`sgl_kernel` 移出 PYZ（确保更新时可直接替换源码）
+4. 执行 `pyinstaller` 全量打包
+5. 自动执行 `numa_duplication.sh` 生成 NUMA 多副本
+
+打包产物位于 `dist/sglang_server_tp0` ~ `dist/sglang_server_tp15`，可直接执行：
 
 ```bash
-./dist/sglang_server/sglang_server
+./dist/sglang_server_tp0/sglang_server
 ```
 
 ---
 
-## 二、后续仅更新源代码
+## 二、后续源码更新
 
-如果只修改了 SGLang 或 sgl-kernel 源码，无需重新全量打包，只需运行 `updata.sh` 快速更新打包产物。
-
-1. 确保 `env.sh` 中的 `SGLANG_PATH` 已指向最新的源码路径
-2. 执行增量更新：
+代码更新已集成到 `scripts/cpu_kunpeng/launch.sh` 启动流程中。当环境变量 `SGLANG_ENABLE_BINARY_LAUNCH=1` 时，每次调用 `launch.sh` 都会自动执行增量更新：
 
 ```bash
+# 启动 prefill/decode 节点时，自动先更新打包产物中的源码
+export SGLANG_ENABLE_BINARY_LAUNCH=1
+bash launch.sh native
+```
+
+`launch.sh` 中的自动更新逻辑（`sh ./pyinstall/updata.sh`）会直接拷贝最新源码覆盖各 NUMA 副本的 `_internal` 目录，**无需重新执行 PyInstaller**，速度远快于全量打包。
+
+也可以手动执行增量更新：
+
+```bash
+# 更新所有（sglang + sgl_kernel）
 bash updata.sh
+
+# 只更新 sglang 源码
+bash updata.sh sglang
+
+# 只更新 sgl_kernel 源码
+bash updata.sh kernel
 ```
 
-> **注意**：`updata.sh` 会通过 `updata.spec` 重新编译 Python 字节码并打包，速度比全量打包快得多。如需更新依赖库（如 PyTorch、Triton 等），仍需重新执行 `pyinstall.sh` 全量打包。
+> **注意**：增量更新只替换 Python 源码（`.py` 文件）。如果依赖库发生变化（如 PyTorch、Triton 升级），仍需重新执行 `pyinstall.sh` 全量打包或手动更新。
 
 ---
 
-## 三、NUMAT 多副本部署
+## 三、依赖更新与 NUMA 副本重置
 
-生成 `sglang_server_tp0` ~ `sglang_server_tp15` 共 16 份副本，用于不同 NUMA 节点绑定，后续若更新依赖库，需执行 `numa_duplication.sh` 更新所有副本依赖。
+当依赖库（如 `torch`、`triton`、`sgl_kernel` 的 `_internal` 目录中除 `.py` 外的 `.so` 文件等）发生变化时，需按以下步骤处理：
+
+### 1. 重新全量打包 or 手动更新 tp0
+
+- 执行 `pyinstall.sh` 全量打包即可自动覆盖所有副本。
+- 或仅手动替换 `dist/sglang_server_tp0/_internal/` 中的依赖文件。
+
+### 2. 执行 NUMA 副本复制
 
 ```bash
 bash numa_duplication.sh
 ```
 
-位于 `pyinstall/dist/` 目录下。
+该脚本将 `dist/sglang_server` 重命名为 `dist/sglang_server_tp0`，然后复制出 `sglang_server_tp1` ~ `sglang_server_tp15` 共 16 份。
+
+> `pyinstall.sh` 末尾已自动调用 `numa_duplication.sh`，全量打包后无需手动执行。
+
+---
+
+## 四、使用场景速查
+
+| 场景 | 操作 | 耗时 |
+|---|---|---|
+| 首次部署 | 配置 `env.sh` → `bash pyinstall.sh` | 较长 |
+| 修改了 `.py` 源码 | 直接调用 `launch.sh`（自动增量更新）或 `bash updata.sh` | 较短 |
+| 新增/升级了 pip 依赖 | `bash pyinstall.sh` 全量打包 | 较长 |
+| 只想重新分发 NUMA 副本 | `bash numa_duplication.sh` | 较短 |
+
+---
+
+## 五、注意事项
+
+- `pyinstall.sh` 会将 Conda 环境中的标准库完整复制到 `_internal` 中，确保打包产物可在无标准库的目标机器上运行。
+- `updata.sh` 直接拷贝源码替换所有 NUMA 副本的 `_internal/sglang` 和 `_internal/sgl_kernel`，不重新编译 `.pyc`，因此速度极快。
+- 如果新增了 Python 依赖（`hidden-import` 或 `.so` 库），需要同步更新 `pyinstall.sh` 中的 `--add-binary` 和 `--hidden-import` 参数，然后执行全量打包。
+- `numa_duplication.sh` 的副本数量固定为 16 个（tp0 ~ tp15），如需调整，可手动修改脚本中的 `seq` 范围。

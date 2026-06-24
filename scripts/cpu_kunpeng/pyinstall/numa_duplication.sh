@@ -1,3 +1,17 @@
+# Copyright 2026 Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 #!/bin/bash
 
 BASE_DIR="./dist"
@@ -9,8 +23,12 @@ if [ ! -e "$SOURCE" ]; then
     exit 1
 fi
 
-mv "$SOURCE" "${BASE_DIR}/${PREFIX}0"
-echo "[numa_duplication] source file rename to: ${PREFIX}0"
+if [ -e "$SOURCE" ]; then
+    mv "$SOURCE" "${BASE_DIR}/${PREFIX}0"
+    echo "[numa_duplication] source file rename to: ${PREFIX}0"
+else
+    echo "[numa_duplication] source file $SOURCE does not exist, skipping rename"
+fi
 
 for i in $(seq 1 15); do
     echo "[numa_duplication] copy to: ${PREFIX}${i}"

@@ -107,14 +107,6 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
           --port $((30000 + ATTN_TP_RANK)) \
           > "${LOG_PATH}/${DP_RANK}_${ATTN_TP_RANK}_$IP.log" 2>&1 &
     done
-elif [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "2" ]]; then
-    for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
-        taskset -c $((ATTN_TP_RANK * 38 + 20)) \
-        python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
-          --tp-rank-in-node ${ATTN_TP_RANK} \
-          --port $((30000 + ATTN_TP_RANK)) \
-          > "${LOG_PATH}/${DP_RANK}_${ATTN_TP_RANK}_$IP.log" 2>&1 &
-    done
 else
     python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
       --port 30000 \

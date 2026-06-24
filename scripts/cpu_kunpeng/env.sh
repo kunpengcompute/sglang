@@ -62,43 +62,21 @@ NATIVE_MASTER_ADDR="xxx.xxx.xxx.1"
 NATIVE_MASTER_PORT="5010"
 
 # Paths
-LOG_BASE_DIR="/root/pacific_ext/huawei/ljp/sglang/sglang-0.5.11-open/logs"
-CONDA_ENV_NAME="sgl-ljp-0516"
-CONDA_SH_PATH="/root/pacific_ext/huawei/z00515076/anaconda3/start_anaconda.sh"
-#MODEL_PATH="/root/pacific_ext/psi/users/lix/data"
-export HPCKIT_PATH=/root/pacific_ext/chenyi/HPCKit_26.0.RC1/HPCKit
-export OpenBLAS_PATH=/root/pacific_ext/psi/users/lix/sglang/install/openblas
-export KUTACC_PATH=/root/pacific_ext/huawei/ljp/kutacc/kutacc-630
-export SGLANG_PATH=/root/pacific_ext/huawei/ljp/sglang/sglang-0.5.11-open
-export CONDA_ENV_PATH=/root/pacific_ext/huawei/z00515076/anaconda3/envs/$CONDA_ENV_NAME
-export PYINSTALL_PATH=/root/pacific_ext/huawei/ljp/sglang/sglang-0.5.11-open/scripts/cpu_kunpeng/pyinstall
-# export LD_LIBRARY_PATH=/root/pacific_ext/huawei/ljp/library/kupl:$LD_LIBRARY_PATH
-export SGLANG_TORCH_PROFILER_DIR="/root/pacific_ext/huawei/ljp/torch_profile"
+LOG_BASE_DIR="/path-to-logs"
+CONDA_ENV_NAME="my_env"
+CONDA_SH_PATH="/path-to-conda-start-sh"
+MODEL_PATH="/path-to-deepseek-r1-channel-int8"
+HPCKIT_PATH=/path-to-HPCKit
+OpenBLAS_PATH=/path-to-OpenBLAS
+KUTACC_PATH=/path-to-KUTACC
+SGLANG_PATH=/path-to-SGLang
+CONDA_ENV_PATH=/path-to-anaconda3/envs/sgl-env
+PYINSTALL_PATH=/path-to-pyinstall
+
 
 # TP/EP size
-#export TP_SIZE=256
-#export EP_SIZE=${TP_SIZE}
-
-NATIVE_IP_SPEC="29.204.25. | 24-27"
-NATIVE_MASTER_ADDR="29.204.25.24"
-MODEL_PATH="/root/pacific_ext/psi/model_files/deepseek-ai/DeepSeek-V2-Lite-Channel-INT8"
-export TP_SIZE=64
+export TP_SIZE=256
 export EP_SIZE=${TP_SIZE}
-export LOAD_FORMAT=""
-
-# NATIVE_IP_SPEC="29.204.25. | 80-87"
-# NATIVE_MASTER_ADDR="29.204.25.80"
-# MODEL_PATH="/root/pacific_ext/huawei/z00515076/DeepSeek/DeepSeek-R1-Channel-INT8"
-# export TP_SIZE=128
-# export EP_SIZE=${TP_SIZE}
-# export LOAD_FORMAT=""
-
-# NATIVE_IP_SPEC="29.204.25. | 60-67, 80-87"
-# NATIVE_MASTER_ADDR="29.204.25.60"
-# MODEL_PATH="/root/pacific_ext/huawei/z00515076/DeepSeek/DeepSeek-R1-Channel-INT8"
-# export TP_SIZE=256
-# export EP_SIZE=${TP_SIZE}
-# export LOAD_FORMAT=""
 
 # Communication
 export GLOO_SOCKET_IFNAME=enp26s0f0
@@ -115,7 +93,6 @@ export SGLANG_ENABLE_TORCH_COMPILE=0
 
 # SGLang
 export SGLANG_LOG_MS=1
-export TRITON_INTERPRET=1
 export SGLANG_USE_CPU_ENGINE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
@@ -123,7 +100,7 @@ export SGLANG_WARMUP_TIMEOUT=1600
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
-export SGLANG_KUNPENG_PROFILE=1
+export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 # Kunpeng SHM
 export SGLANG_KUNPENG_SHM_SIZE_MB=24
@@ -137,7 +114,7 @@ export SGLANG_KUNPENG_SDMA_THRESHOLD=5
 # Maximum number of tokens output per decode round within dp
 export SGLANG_KUNPENG_DECODE_MAX_TOKENS=128
 # Load format (e.g. "sharded_state", leave empty for default)
-
+export LOAD_FORMAT=""
 
 # ------------------------------------------------------------
 # load local config
@@ -217,8 +194,6 @@ esac
 
 source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh
-
-# export LD_LIBRARY_PATH=/root/pacific_ext/huawei/ljp/library/kupl:$LD_LIBRARY_PATH
 
 export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
 export LD_LIBRARY_PATH=/usr/lib64/libibverbs:$LD_LIBRARY_PATH
