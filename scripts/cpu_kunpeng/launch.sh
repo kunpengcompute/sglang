@@ -42,6 +42,11 @@ sh stop.sh "$ROLE"
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
 WORLD_SIZE=${#NODES[@]}
 
+if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
+    echo "Update binary sglang..."
+    sh ./pyinstall/updata.sh
+fi
+
 echo "Launching $ROLE on $WORLD_SIZE node(s)"
 
 for i in "${!NODES[@]}"; do

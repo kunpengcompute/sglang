@@ -99,8 +99,6 @@ esac
 
 # Combine and execute
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
-    echo "Update binary sglang..."
-    sh ./pyinstall/updata.sh
     echo "Launch binary server..."
     for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
         taskset -c $((ATTN_TP_RANK * 38)) \
