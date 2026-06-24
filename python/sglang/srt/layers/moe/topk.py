@@ -671,7 +671,6 @@ def grouped_topk_kunpeng(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    logger.info(f"[MoeGate] grouped_topk_kunpeng")
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     num_token = gating_output.shape[0]
     num_experts = gating_output.shape[1]

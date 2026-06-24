@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -34,7 +35,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-import logging
 
 logger = logging.getLogger(__name__)
 logger.disabled = False
@@ -85,6 +85,16 @@ def run_sdpa_forward_mha(
         start = end
 
 
+class KunpengCpuMetadataDecode:
+    """Metadata for a single forward pass, holding pre-computed tensors reused across layers."""
+
+    def __init__(self):
+        self.block_table: Optional[torch.Tensor] = None
+        self.seq_lens: Optional[torch.Tensor] = None
+        self.page_size: int = 0
+        self.extra_bytes: int = 0
+
+
 class KunpengCpuMetadata:
     """Metadata for a single forward pass, holding HBW-allocated tensors and pool handles."""
 
@@ -95,8 +105,6 @@ class KunpengCpuMetadata:
         self.kv_len: int = 1
 
         self.reset()
-
-
 
     def reset(self):
         """Reset all tensor references and handles to None."""
@@ -151,6 +159,7 @@ class KunpengCpuMetadata:
         self.attn_packed_v_handle = None
         self.attn_o_handle = None
 
+
 class KunpengCpuBackend(AttentionBackend):
 
     def __init__(
@@ -158,6 +167,17 @@ class KunpengCpuBackend(AttentionBackend):
         model_runner: ModelRunner,
     ):
         super().__init__()
+
+        self.forward_metadata_decode = None
+
+        model_config = model_runner.model_config
+        self.num_q_heads = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        )
+        self.head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
+        self.head_dim_v = model_config.v_head_dim
+
+        self._decode_meta = torch.ops.sgl_kernel.flash_mla_meta_create_kunpeng()
 
         # Model configuration
         self.device = model_runner.device
@@ -167,9 +187,7 @@ class KunpengCpuBackend(AttentionBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
         # Attention head dimensions
-        self.num_q_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
-        )
+
         self.num_local_heads = self.num_q_heads
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -199,7 +217,9 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata.extra_bytes_sizes = 0
 
         # kutacc_export flash_attention
-        self.block_row, self.block_col = torch.ops.sgl_kernel.get_flash_attention_block_kunpeng()
+        self.block_row, self.block_col = (
+            torch.ops.sgl_kernel.get_flash_attention_block_kunpeng()
+        )
         self.attn_thread_num = 0
         self.attn_total_token_num = 0
         self.enable_chunked_prefill = True
@@ -284,141 +304,7 @@ class KunpengCpuBackend(AttentionBackend):
         forward_batch: ForwardBatch,
     ):
         if forward_batch.forward_mode.is_decode_or_idle():
-            bs = forward_batch.batch_size
-            self._free_forward_metadata()
-
-            # Schedule flash MLA decode
-            self.forward_metadata.extra_bytes_sizes = (
-                torch.ops.sgl_kernel.flash_mla_dense_decode_sched_kunpeng(
-                    seqlens_kv=forward_batch.seq_lens.to(torch.int32),
-                    seqlen_q=self.forward_metadata.kv_len,
-                    num_heads_q=self.num_q_heads,
-                    head_dim=self.kv_cache_dim,
-                    head_dim_v=self.kv_lora_rank,
-                    page_block_size=self.page_size,
-                    is_kv_packed=False,
-                    meta=self.forward_metadata.flash_mla_meta,
-                )
-            )
-
-            # Build block table from req_to_token mapping
-            token_indices = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : forward_batch.seq_lens.max().item()
-            ]
-            block_table_data = token_indices[:, :: self.page_size] >> int(
-                math.log2(self.page_size)
-            )
-
-            # Pad block_table: set unused page slots to -1
-            num_pages = (
-                torch.ceil(forward_batch.seq_lens.float() / self.page_size)
-                .int()
-                .unsqueeze(1)
-            )
-
-            if self.enable_hbw_swap:
-                # Move block_table to HBW
-                if self.enable_hbw_pool:
-                    (
-                        self.forward_metadata.block_table,
-                        self.forward_metadata.block_table_handle,
-                    ) = self.hbw_pool.move_to_hbw(block_table_data)
-                else:
-                    (
-                        self.forward_metadata.block_table,
-                        self.forward_metadata.block_table_ptr,
-                    ) = move_tensor_to_hbw(block_table_data)
-
-                mask = (
-                    torch.arange(
-                        self.forward_metadata.block_table.size(1),
-                        device=self.forward_metadata.block_table.device,
-                    ).unsqueeze(0)
-                    >= num_pages
-                )
-                self.forward_metadata.block_table[mask] = -1
-
-                # Move seq_lens to HBW
-                seq_lens_int32 = forward_batch.seq_lens.to(torch.int32)
-                if self.enable_hbw_pool:
-                    (
-                        self.forward_metadata.seq_lens,
-                        self.forward_metadata.seq_lens_handle,
-                    ) = self.hbw_pool.move_to_hbw(seq_lens_int32)
-                else:
-                    (
-                        self.forward_metadata.seq_lens,
-                        self.forward_metadata.seq_lens_ptr,
-                    ) = move_tensor_to_hbw(seq_lens_int32)
-
-                # Allocate output tensor on HBW
-                o_shape = (
-                    bs,
-                    self.forward_metadata.kv_len,
-                    self.num_q_heads,
-                    self.kv_lora_rank,
-                )
-                if self.enable_hbw_pool:
-                    self.forward_metadata.o_hbw, self.forward_metadata.o_handle = (
-                        self.hbw_pool.alloc(o_shape, torch.bfloat16)
-                    )
-                else:
-                    self.forward_metadata.o_hbw, self.forward_metadata.o_ptr = (
-                        create_tensor_from_hbw(
-                            o_shape,
-                            torch.bfloat16,
-                        )
-                    )
-
-                # Allocate softmax LSE on HBW
-                lse_shape = (bs, self.forward_metadata.kv_len, self.num_q_heads)
-                if self.enable_hbw_pool:
-                    (
-                        self.forward_metadata.softmax_lse_hbw,
-                        self.forward_metadata.softmax_lse_handle,
-                    ) = self.hbw_pool.alloc(lse_shape, torch.float32)
-                else:
-                    (
-                        self.forward_metadata.softmax_lse_hbw,
-                        self.forward_metadata.softmax_lse_ptr,
-                    ) = create_tensor_from_hbw(
-                        lse_shape,
-                        torch.float32,
-                    )
-
-                # Allocate extra buffer on HBW
-                if self.enable_hbw_pool:
-                    (
-                        self.forward_metadata.extra_buffer_hbw,
-                        self.forward_metadata.extra_buffer_handle,
-                    ) = self.hbw_pool.alloc(
-                        (self.forward_metadata.extra_bytes_sizes,),
-                        torch.uint8,
-                    )
-                else:
-                    (
-                        self.forward_metadata.extra_buffer_hbw,
-                        self.forward_metadata.extra_buffer_ptr,
-                    ) = create_tensor_from_hbw(
-                        (self.forward_metadata.extra_bytes_sizes,),
-                        torch.uint8,
-                    )
-
-                # Trigger async swapin for layer 0
-                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(0)
-                self.hbw_kvbuffer.queue_async_swapin(0, k_cache)
-            else:
-                # Non-HBW path: keep block_table and seq_lens in DDR
-                self.forward_metadata.block_table = block_table_data
-                mask = (
-                    torch.arange(
-                        self.forward_metadata.block_table.size(1),
-                        device=self.forward_metadata.block_table.device,
-                    ).unsqueeze(0)
-                    >= num_pages
-                )
-                self.forward_metadata.block_table[mask] = -1
-                self.forward_metadata.seq_lens = forward_batch.seq_lens.to(torch.int32)
+            self._init_decode_metadata(forward_batch)
         else:
             bs = forward_batch.batch_size
 
@@ -427,21 +313,74 @@ class KunpengCpuBackend(AttentionBackend):
             self.attn_is_kv_packed = bs == 1
             self.enable_native_flash_attention = False
             self._ensure_packed_cache(forward_batch)
-            self._ensure_temp_buffers(self.attn_thread_num, self.block_row, self.block_col)
+            self._ensure_temp_buffers(
+                self.attn_thread_num, self.block_row, self.block_col
+            )
 
-            self.forward_metadata.query_start_loc = torch.empty((bs + 1,), dtype=torch.int32, device=self.device)
+            self.forward_metadata.query_start_loc = torch.empty(
+                (bs + 1,), dtype=torch.int32, device=self.device
+            )
             if forward_batch.extend_start_loc is not None:
-                self.forward_metadata.query_start_loc[:bs] = forward_batch.extend_start_loc
+                self.forward_metadata.query_start_loc[:bs] = (
+                    forward_batch.extend_start_loc
+                )
                 self.forward_metadata.query_start_loc[bs] = (
-                        forward_batch.extend_start_loc[-1]
-                        + forward_batch.extend_seq_lens[-1]
+                    forward_batch.extend_start_loc[-1]
+                    + forward_batch.extend_seq_lens[-1]
                 )
 
-            self.forward_metadata.key_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
-            self.forward_metadata.key_start_loc[1:] = torch.cumsum(forward_batch.seq_lens.to(torch.int32), dim=0)
+            self.forward_metadata.key_start_loc = torch.zeros(
+                bs + 1, dtype=torch.int32, device=self.device
+            )
+            self.forward_metadata.key_start_loc[1:] = torch.cumsum(
+                forward_batch.seq_lens.to(torch.int32), dim=0
+            )
 
             self.forward_metadata.attn_seq_lens = forward_batch.seq_lens
-            self.forward_metadata.attn_cur_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
+            self.forward_metadata.attn_cur_lens = (
+                forward_batch.seq_lens - forward_batch.extend_prefix_lens
+            )
+
+    def _init_decode_metadata(self, forward_batch: ForwardBatch):
+        metadata = KunpengCpuMetadata()
+
+        metadata.page_size = forward_batch.token_to_kv_pool.page_size
+        metadata.seq_lens = forward_batch.seq_lens.to(torch.int32)
+        req_to_token = forward_batch.req_to_token_pool.req_to_token.to(torch.int32)
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+
+        batch_size = metadata.seq_lens.shape[0]
+        max_seq_len = metadata.seq_lens.max().item()
+        max_blocks = (max_seq_len + metadata.page_size - 1) // metadata.page_size
+        metadata.block_table = torch.zeros(
+            (batch_size, max_blocks),
+            dtype=torch.int32,
+            device=metadata.seq_lens.device,
+        )
+        for b in range(batch_size):
+            req_idx = req_pool_indices[b].item()
+            seq_len = metadata.seq_lens[b].item()
+            if seq_len == 0:
+                continue
+            num_blocks = (seq_len + metadata.page_size - 1) // metadata.page_size
+            for j in range(num_blocks):
+                token_idx = req_to_token[req_idx, j * metadata.page_size].item()
+                metadata.block_table[b, j] = token_idx // metadata.page_size
+
+        metadata.extra_bytes = (
+            torch.ops.sgl_kernel.flash_mla_dense_decode_sched_kunpeng(
+                metadata.seq_lens,
+                seqlen_q=1,
+                num_heads_q=self.num_q_heads,
+                head_dim=self.head_dim,
+                head_dim_v=self.head_dim_v,
+                page_block_size=metadata.page_size,
+                is_kv_packed=False,
+                meta=self._decode_meta,
+            )
+        )
+
+        self.forward_metadata_decode = metadata
 
     def forward_extend_native(
         self,
@@ -501,7 +440,9 @@ class KunpengCpuBackend(AttentionBackend):
         save_kv_cache: bool = True,
     ):
         if self.enable_native_flash_attention:
-            return self.forward_extend_native(q, k, v, layer, forward_batch, save_kv_cache)
+            return self.forward_extend_native(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
 
         if self.enable_debug:
             logger.info(f"[kunpeng_attention] attention backend start forward prefill")
@@ -511,34 +452,49 @@ class KunpengCpuBackend(AttentionBackend):
 
         packed_q = self.forward_metadata.attn_packed_q
         tgt_indices = None
-        
+
         if self.attn_is_kv_packed:
             # Align to 1024 boundary (for PagedAttention block efficiency) and reserve 100 tokens for decoding length variance
-            max_seq_len = int(((forward_batch.seq_lens.max().item() + 1023) // 1024) * 1024 + 100)
+            max_seq_len = int(
+                ((forward_batch.seq_lens.max().item() + 1023) // 1024) * 1024 + 100
+            )
             packed_k, packed_v = self.pack_single_layer(k, v, max_seq_len)
             pack_attn_k = packed_k
             pack_attn_v = packed_v
         else:
-            logger.warning(f"[kunpeng_attention] attention backend start forward prefill with non packed kv is not supported")
+            logger.warning(
+                f"[kunpeng_attention] attention backend start forward prefill with non packed kv is not supported"
+            )
             pack_attn_k = self.forward_metadata.attn_packed_k
             pack_attn_v = self.forward_metadata.attn_packed_v
-            q, packed_k, packed_v, self.forward_metadata.query_start_loc, tgt_indices = self.pad_flash_attn_metadata(
-                q, k, v, self.forward_metadata.query_start_loc, forward_batch.extend_seq_lens
+            (
+                q,
+                packed_k,
+                packed_v,
+                self.forward_metadata.query_start_loc,
+                tgt_indices,
+            ) = self.pad_flash_attn_metadata(
+                q,
+                k,
+                v,
+                self.forward_metadata.query_start_loc,
+                forward_batch.extend_seq_lens,
             )
 
         if self.enable_debug:
-            logger.info(f"[kunpeng_attention] start to flash_attention_kunpeng"
-                        f"[kunpeng_attention] ========== Layer {layer.layer_id} Shape Debug =========="
-                        f"[kunpeng_attention] bs: {forward_batch.batch_size}"
-                        f"[kunpeng_attention] forward seq_len: {forward_batch.seq_lens}"
-                        f"[kunpeng_attention] Original q shape: {q.shape}"
-                        f"[kunpeng_attention] Packed q shape: {packed_q.shape}"
-                        f"[kunpeng_attention] packed_k shape: {packed_k.shape}"
-                        f"[kunpeng_attention] packed_v shape: {packed_v.shape}"
-                        f"[kunpeng_attention] out o shape: {self.forward_metadata.attn_o.shape}"
-                        f"[kunpeng_attention] query_start_loc : {self.forward_metadata.query_start_loc}"
-                        f"[kunpeng_attention] key_start_loc : {self.forward_metadata.key_start_loc}"
-                        f"[kunpeng_attention] seq_lens : {self.forward_metadata.attn_seq_lens}"
+            logger.info(
+                f"[kunpeng_attention] start to flash_attention_kunpeng"
+                f"[kunpeng_attention] ========== Layer {layer.layer_id} Shape Debug =========="
+                f"[kunpeng_attention] bs: {forward_batch.batch_size}"
+                f"[kunpeng_attention] forward seq_len: {forward_batch.seq_lens}"
+                f"[kunpeng_attention] Original q shape: {q.shape}"
+                f"[kunpeng_attention] Packed q shape: {packed_q.shape}"
+                f"[kunpeng_attention] packed_k shape: {packed_k.shape}"
+                f"[kunpeng_attention] packed_v shape: {packed_v.shape}"
+                f"[kunpeng_attention] out o shape: {self.forward_metadata.attn_o.shape}"
+                f"[kunpeng_attention] query_start_loc : {self.forward_metadata.query_start_loc}"
+                f"[kunpeng_attention] key_start_loc : {self.forward_metadata.key_start_loc}"
+                f"[kunpeng_attention] seq_lens : {self.forward_metadata.attn_seq_lens}"
             )
 
         # kutacc_export flash_attention_kunpeng :
@@ -570,8 +526,12 @@ class KunpengCpuBackend(AttentionBackend):
         )
 
         if tgt_indices is not None:
-            return self.forward_metadata.attn_o[tgt_indices].reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
-        return self.forward_metadata.attn_o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return self.forward_metadata.attn_o[tgt_indices].reshape(
+                -1, layer.tp_q_head_num * layer.v_head_dim
+            )
+        return self.forward_metadata.attn_o.view(
+            -1, layer.tp_q_head_num * layer.v_head_dim
+        )
 
     def forward_decode(
         self,
@@ -582,115 +542,74 @@ class KunpengCpuBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        logger.info(f"[kunpeng_cpu] attention backend start forward decode")
-        bs = forward_batch.batch_size
-        cache_loc = forward_batch.out_cache_loc
-        reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
+        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
-        if k is not None and save_kv_cache and not self.enable_hbw_swap:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer,
-                cache_loc,
-                k,
-                v,
-            )
-
-        if self.enable_hbw_swap:
-            swap_index = self.hbw_kvbuffer.get_safe_on_package_memory_index(
-                layer.layer_id
-            )
-
-            if self.enable_debug:
-                diff = torch.abs(
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                    - self.hbw_kvbuffer.kv_buffer[swap_index]
-                )
-                max_diff = diff.max().item()
-                if max_diff > 1e-5:
-                    logger.error(
-                        f"layer {layer.layer_id} swap error, max_diff={max_diff}"
-                    )
-            # Write new KV data into HBW buffer
-            self.hbw_kvbuffer.kv_buffer[swap_index][cache_loc] = k
-            k_cache = self.hbw_kvbuffer.kv_buffer[swap_index]
-
-            # Move query tensor to HBW
-            if self.enable_hbw_pool:
-                reshape_q, reshape_q_handle = self.hbw_pool.move_to_hbw(reshape_q)
-            else:
-                reshape_q, reshape_q_ptr = move_tensor_to_hbw(reshape_q)
-
-            # Flash MLA dense decode kernel
-            torch.ops.sgl_kernel.flash_mla_dense_decode_kunpeng(
-                q=reshape_q,
-                kcache=k_cache.view(-1, self.page_size, self.kv_cache_dim),
-                vcache=None,
-                block_table=self.forward_metadata.block_table,
-                seqlens_kv=self.forward_metadata.seq_lens,
-                o=self.forward_metadata.o_hbw,
-                softmax_lse=self.forward_metadata.softmax_lse_hbw,
-                softmax_scale=1.0 / math.sqrt(self.kv_cache_dim),
-                is_causal=True,
-                extra_buffer=self.forward_metadata.extra_buffer_hbw,
-                meta=self.forward_metadata.flash_mla_meta,
-            )
-
-            # SDMA pipeline: swapout current layer, swapin next layer
-            if save_kv_cache:
-                self.hbw_kvbuffer.queue_async_swapout(
-                    layer.layer_id,
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                )
-            next_layer_id = layer.layer_id + 1
-            if next_layer_id < self.num_layers:
-                self.hbw_kvbuffer.queue_async_swapin(
-                    next_layer_id,
-                    forward_batch.token_to_kv_pool.get_key_buffer(next_layer_id),
-                )
-
-            # Free per-layer query HBW allocation
-            if self.enable_hbw_pool:
-                self.hbw_pool.free(reshape_q_handle)
-            else:
-                free_tensor_from_hbw(reshape_q_ptr)
-
-            return self.forward_metadata.o_hbw.view(
-                -1, self.num_q_heads * self.kv_lora_rank
-            )
-
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            o = torch.empty_like(q)
 
-            o = torch.empty(
-                (bs, self.forward_metadata.kv_len, self.num_q_heads, self.kv_lora_rank),
-                dtype=q.dtype,
-                device=q.device,
-            )
+        if layer.is_cross_attention:
+            cache_loc = forward_batch.encoder_out_cache_loc
+        else:
+            cache_loc = forward_batch.out_cache_loc
 
-            # Flash MLA dense decode kernel (non-HBW path)
-            torch.ops.sgl_kernel.flash_mla_dense_decode_kunpeng(
-                q=reshape_q,
-                kcache=k_cache.view(-1, self.page_size, self.kv_cache_dim),
-                vcache=None,
-                block_table=self.forward_metadata.block_table,
-                seqlens_kv=self.forward_metadata.seq_lens,
-                o=o,
-                softmax_lse=torch.empty(
-                    (bs, self.forward_metadata.kv_len, self.num_q_heads),
-                    dtype=torch.float32,
-                    device=k.device,
-                ),
-                softmax_scale=1.0 / math.sqrt(self.kv_cache_dim),
-                is_causal=True,
-                extra_buffer=torch.empty(
-                    self.forward_metadata.extra_bytes_sizes,
-                    dtype=torch.uint8,
-                    device=k.device,
-                ),
-                meta=self.forward_metadata.flash_mla_meta,
-            )
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-            return o.view(-1, self.num_q_heads * self.kv_lora_rank)
+        q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        kv_k = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        softmax_scale = (
+            layer.scaling
+            if layer.scaling is not None
+            else 1.0 / math.sqrt(layer.qk_head_dim)
+        )
+
+        batch_size = q_.shape[0]
+        num_q_heads = q_.shape[1]
+        head_dim = layer.qk_head_dim
+        head_dim_v = layer.v_head_dim
+        kv_cache_dim = kv_k.shape[-1]
+
+        metadata = self.forward_metadata_decode
+        seq_lens = metadata.seq_lens
+        block_table = metadata.block_table
+        page_size = metadata.page_size
+
+        q_4d = q_.unsqueeze(1)
+        o_4d = o_.unsqueeze(1)
+
+        kvcache_paged = kv_k[:, 0, :].reshape(-1, page_size, kv_cache_dim)
+
+        extra_buffer = (
+            torch.empty(metadata.extra_bytes, dtype=torch.uint8, device=q_.device)
+            if metadata.extra_bytes > 0
+            else torch.empty(0, dtype=torch.uint8, device=q_.device)
+        )
+
+        softmax_lse = torch.empty(
+            (batch_size, 1, num_q_heads), dtype=torch.float32, device=q_.device
+        )
+
+        torch.ops.sgl_kernel.flash_mla_dense_decode_kunpeng(
+            q_4d,
+            kvcache_paged,
+            None,
+            block_table,
+            seq_lens,
+            o_4d,
+            softmax_lse,
+            softmax_scale,
+            False,
+            extra_buffer,
+            self._decode_meta,
+        )
+
+        del extra_buffer
+
+        return o
 
     def pack_single_layer(
         self,
@@ -703,12 +622,12 @@ class KunpengCpuBackend(AttentionBackend):
         packed_k = torch.empty(
             (padded_seq_len, self.num_local_heads, self.qk_head_dim),
             dtype=k_cache.dtype,
-            device=k_cache.device
+            device=k_cache.device,
         )
         packed_v = torch.empty(
             (padded_seq_len, self.num_local_heads, self.v_head_dim),
             dtype=v_cache.dtype,
-            device=v_cache.device
+            device=v_cache.device,
         )
 
         # kutacc_export flash_attention_k_block_pack_kunpeng
@@ -720,7 +639,7 @@ class KunpengCpuBackend(AttentionBackend):
             input_stride0=k_cache.stride(0),
             input_stride1=k_cache.stride(1),
             input=k_cache,
-            output=packed_k
+            output=packed_k,
         )
 
         # kutacc_export flash_attention_v_block_pack_kunpeng
@@ -732,12 +651,13 @@ class KunpengCpuBackend(AttentionBackend):
             input_stride0=v_cache.stride(0),
             input_stride1=v_cache.stride(1),
             input=v_cache,
-            output=packed_v
+            output=packed_v,
         )
 
         if packed_k is None or packed_v is None:
             logger.error(
-                f"[kunpeng_attention] flash_attention_block_pack_kunpeng failed - packed KV not found")
+                f"[kunpeng_attention] flash_attention_block_pack_kunpeng failed - packed KV not found"
+            )
 
         return packed_k, packed_v
 
@@ -747,49 +667,60 @@ class KunpengCpuBackend(AttentionBackend):
         br: int,
         bc: int,
     ):
-        if (self.forward_metadata.attn_s is None or self.forward_metadata.attn_s.shape[0] < thread_num):
-            logger.debug(f"[kunpeng_attention] Allocated temp buffers for {thread_num} blocks")
+        if (
+            self.forward_metadata.attn_s is None
+            or self.forward_metadata.attn_s.shape[0] < thread_num
+        ):
+            logger.debug(
+                f"[kunpeng_attention] Allocated temp buffers for {thread_num} blocks"
+            )
 
         if self.enable_hbw_pool:
-            self.forward_metadata.attn_s, self.forward_metadata.attn_s_handle = self.hbw_pool.alloc(
-                shape = (thread_num, br * bc), dtype=torch.float32
+            self.forward_metadata.attn_s, self.forward_metadata.attn_s_handle = (
+                self.hbw_pool.alloc(shape=(thread_num, br * bc), dtype=torch.float32)
             )
-            self.forward_metadata.attn_out_block_old, self.forward_metadata.attn_out_block_old_handle = self.hbw_pool.alloc(
-                shape = (thread_num, br, self.v_head_dim), dtype=torch.float32
+            (
+                self.forward_metadata.attn_out_block_old,
+                self.forward_metadata.attn_out_block_old_handle,
+            ) = self.hbw_pool.alloc(
+                shape=(thread_num, br, self.v_head_dim), dtype=torch.float32
             )
-            self.forward_metadata.attn_out_block_new, self.forward_metadata.attn_out_block_new_handle = self.hbw_pool.alloc(
-                shape = (thread_num, br, self.v_head_dim), dtype=torch.float32
+            (
+                self.forward_metadata.attn_out_block_new,
+                self.forward_metadata.attn_out_block_new_handle,
+            ) = self.hbw_pool.alloc(
+                shape=(thread_num, br, self.v_head_dim), dtype=torch.float32
             )
-            self.forward_metadata.attn_max_block_old, self.forward_metadata.attn_max_block_old_handle = self.hbw_pool.alloc(
-                shape = (thread_num, br), dtype=torch.float32
-            )
-            self.forward_metadata.attn_max_block_new, self.forward_metadata.attn_max_block_new_handle = self.hbw_pool.alloc(
-                shape = (thread_num, br), dtype=torch.float32
-            )
-            self.forward_metadata.attn_base_block_old, self.forward_metadata.attn_base_block_old_handle = self.hbw_pool.alloc(
-                shape = (thread_num, br), dtype=torch.float32
-            )
-            self.forward_metadata.attn_base_block_new, self.forward_metadata.attn_base_block_new_handle = self.hbw_pool.alloc(
-                shape = (thread_num, br), dtype=torch.float32
-            )
+            (
+                self.forward_metadata.attn_max_block_old,
+                self.forward_metadata.attn_max_block_old_handle,
+            ) = self.hbw_pool.alloc(shape=(thread_num, br), dtype=torch.float32)
+            (
+                self.forward_metadata.attn_max_block_new,
+                self.forward_metadata.attn_max_block_new_handle,
+            ) = self.hbw_pool.alloc(shape=(thread_num, br), dtype=torch.float32)
+            (
+                self.forward_metadata.attn_base_block_old,
+                self.forward_metadata.attn_base_block_old_handle,
+            ) = self.hbw_pool.alloc(shape=(thread_num, br), dtype=torch.float32)
+            (
+                self.forward_metadata.attn_base_block_new,
+                self.forward_metadata.attn_base_block_new_handle,
+            ) = self.hbw_pool.alloc(shape=(thread_num, br), dtype=torch.float32)
         else:
             self.forward_metadata.attn_s = torch.empty(
-                (thread_num, br * bc),
-                dtype=torch.float32,
-                device=self.device
+                (thread_num, br * bc), dtype=torch.float32, device=self.device
             )
             self.forward_metadata.attn_out_block_old = torch.empty(
                 (thread_num, br, self.v_head_dim),
                 dtype=torch.float32,
-                device=self.device
+                device=self.device,
             )
             self.forward_metadata.attn_out_block_new = torch.empty_like(
                 self.forward_metadata.attn_out_block_old
             )
-            self.forward_metadata.attn_max_block_old = torch.empty( 
-                (thread_num, br),
-                dtype=torch.float32,
-                device=self.device
+            self.forward_metadata.attn_max_block_old = torch.empty(
+                (thread_num, br), dtype=torch.float32, device=self.device
             )
             self.forward_metadata.attn_max_block_new = torch.empty_like(
                 self.forward_metadata.attn_max_block_old
@@ -809,17 +740,44 @@ class KunpengCpuBackend(AttentionBackend):
         device = self.device
 
         if self.enable_hbw_pool:
-            self.forward_metadata.attn_packed_q, self.forward_metadata.attn_packed_q_handle = self.hbw_pool.alloc(
-                shape = (self.attn_thread_num, self.block_row * self.qk_head_dim), dtype=q_dtype,
+            (
+                self.forward_metadata.attn_packed_q,
+                self.forward_metadata.attn_packed_q_handle,
+            ) = self.hbw_pool.alloc(
+                shape=(self.attn_thread_num, self.block_row * self.qk_head_dim),
+                dtype=q_dtype,
             )
-            self.forward_metadata.attn_packed_k, self.forward_metadata.attn_packed_k_handle = self.hbw_pool.alloc(
-                shape = (self.attn_total_token_num, self.num_local_heads, self.qk_head_dim), dtype=self.data_type,
+            (
+                self.forward_metadata.attn_packed_k,
+                self.forward_metadata.attn_packed_k_handle,
+            ) = self.hbw_pool.alloc(
+                shape=(
+                    self.attn_total_token_num,
+                    self.num_local_heads,
+                    self.qk_head_dim,
+                ),
+                dtype=self.data_type,
             )
-            self.forward_metadata.attn_packed_v, self.forward_metadata.attn_packed_v_handle = self.hbw_pool.alloc(
-                shape = (self.attn_total_token_num, self.num_local_heads, self.v_head_dim), dtype=self.data_type,
+            (
+                self.forward_metadata.attn_packed_v,
+                self.forward_metadata.attn_packed_v_handle,
+            ) = self.hbw_pool.alloc(
+                shape=(
+                    self.attn_total_token_num,
+                    self.num_local_heads,
+                    self.v_head_dim,
+                ),
+                dtype=self.data_type,
             )
-            self.forward_metadata.attn_o, self.forward_metadata.attn_o_handle = self.hbw_pool.alloc(
-                shape = (self.attn_total_token_num, self.num_local_heads, self.v_head_dim), dtype=q_dtype,
+            self.forward_metadata.attn_o, self.forward_metadata.attn_o_handle = (
+                self.hbw_pool.alloc(
+                    shape=(
+                        self.attn_total_token_num,
+                        self.num_local_heads,
+                        self.v_head_dim,
+                    ),
+                    dtype=q_dtype,
+                )
             )
         else:
             self.forward_metadata.attn_packed_q = torch.empty(

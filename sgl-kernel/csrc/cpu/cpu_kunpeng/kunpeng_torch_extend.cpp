@@ -140,7 +140,9 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
                           bool moe_balance, int64_t v2);
 
 void moe_comm_create_kunpeng(int64_t process_group_ptr);
+
 void moe_comm_finalize_kunpeng();
+
 void moe_comm_barrier_kunpeng();
 
 void moe_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor recv_src_info, at::Tensor recv_src_info_bak,
@@ -172,11 +174,6 @@ void moe_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, at::Te
 
 void moe_combine_finalize_kunpeng();
 
-// === SHM Reduce Scatter 算子声明 ===
-void shm_reduce_scatter_init_kunpeng();
-void shm_reduce_scatter_kunpeng(int64_t height, int64_t width, at::Tensor tensor_data);
-void shm_reduce_scatter_finalize_kunpeng();
-
 // === SHM 算子声明 ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
@@ -185,6 +182,25 @@ void shm_pool_destroy_kunpeng();
 bool is_shm_tensor(at::Tensor tensor);
 
 at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t> shape);
+
+void shm_reduce_scatter_init_kunpeng();
+
+void shm_reduce_scatter_kunpeng(int64_t height, int64_t width, at::Tensor tensor_data);
+
+void shm_reduce_scatter_finalize_kunpeng();
+
+void shm_allgather_init_kunpeng();
+
+void shm_dual_allgather_kunpeng(at::Tensor src0_tensor, at::Tensor dst0_tensor, at::Tensor src1_tensor,
+                                at::Tensor dst1_tensor);
+
+void shm_allgather_finalize_kunpeng();
+
+void shm_allreduce_init_kunpeng(int64_t max_num_elements);
+
+void shm_allreduce_kunpeng(at::Tensor tensor_data);
+
+void shm_allreduce_finalize_kunpeng();
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 {
@@ -457,4 +473,26 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("shm_reduce_scatter_finalize_kunpeng() -> ()");
     m.impl("shm_reduce_scatter_finalize_kunpeng", shm_reduce_scatter_finalize_kunpeng);
+
+    // SHM Allgather operators
+    m.def("shm_allgather_init_kunpeng() -> ()");
+    m.impl("shm_allgather_init_kunpeng", shm_allgather_init_kunpeng);
+
+    m.def(
+        "shm_dual_allgather_kunpeng(Tensor src0_tensor, Tensor dst0_tensor, Tensor src1_tensor, Tensor dst1_tensor) -> "
+        "()");
+    m.impl("shm_dual_allgather_kunpeng", shm_dual_allgather_kunpeng);
+
+    m.def("shm_allgather_finalize_kunpeng() -> ()");
+    m.impl("shm_allgather_finalize_kunpeng", shm_allgather_finalize_kunpeng);
+
+    // SHM Allreduce operators
+    m.def("shm_allreduce_init_kunpeng(int max_num_elements) -> ()");
+    m.impl("shm_allreduce_init_kunpeng", shm_allreduce_init_kunpeng);
+
+    m.def("shm_allreduce_kunpeng(Tensor tensor_data) -> ()");
+    m.impl("shm_allreduce_kunpeng", shm_allreduce_kunpeng);
+
+    m.def("shm_allreduce_finalize_kunpeng() -> ()");
+    m.impl("shm_allreduce_finalize_kunpeng", shm_allreduce_finalize_kunpeng);
 }

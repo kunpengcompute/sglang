@@ -50,13 +50,14 @@ def run_server(server_args):
 
         if envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
             import psutil
+
             p = psutil.Process(os.getpid())
             # TODO (kunpeng): hard code here, should use a more elegant way.
             if envs.SGLANG_ENABLE_BINARY_LAUNCH.get():
                 attn_tp_rank = server_args.tp_rank_in_node
-                p.cpu_affinity(list(range(attn_tp_rank * 38 + 1, attn_tp_rank * 38 + 33))) # 1~32
+                p.cpu_affinity({attn_tp_rank * 38 + 17})
             else:
-                p.cpu_affinity(list(range(1, 33))) # 1~32
+                p.cpu_affinity(list(range(1, 33)))
 
         launch_server(server_args)
 

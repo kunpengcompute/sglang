@@ -212,10 +212,6 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
-from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
-    init_oob_comms,
-    init_shm_pool,
-)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -1203,10 +1199,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
-
-            if _is_cpu_920f:
-                init_oob_comms()
-                init_shm_pool()
 
             # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)

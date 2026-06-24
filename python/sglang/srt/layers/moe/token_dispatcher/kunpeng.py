@@ -316,11 +316,11 @@ def _init_buffers(state: _KunpengDispatcherState):
         torch.bfloat16, [state.dispatch_send_buf.size(0), state.hidden_size]
     )
 
-    state.topk_weights_buf = torch.zeros(
-        state.max_tokens, state.router_topk, dtype=torch.float32
+    state.topk_weights_buf = kernel.create_shm_tensor_kunpeng(
+        torch.float32, [state.max_tokens, state.router_topk]
     )
-    state.topk_ids_index_buf = torch.zeros(
-        state.max_tokens, state.router_topk * 2, dtype=torch.int16
+    state.topk_ids_index_buf = kernel.create_shm_tensor_kunpeng(
+        torch.int16, [state.max_tokens, state.router_topk * 2]
     )
 
     logger.info(
@@ -519,16 +519,20 @@ class KunpengDispatcher(BaseDispatcher):
         t_topk_allg_start = time.perf_counter()
 
         _tp_idx_slice = state.topk_ids_index_buf[_tp_offset : _tp_offset + _tp_count]
-        _tp_idx_slice.zero_()
-        _tp_idx_slice[:, 0::2] = topk_ids.to(torch.int16)
+        if _tp_count > 0:
+            _tp_idx_slice.zero_()
+            _tp_idx_slice[:, 0::2] = topk_ids.to(torch.int16)
+            _tp_weights_slice = state.topk_weights_buf[
+                _tp_offset : _tp_offset + _tp_count
+            ]
+            _tp_weights_slice.copy_(topk_weights)
 
-        get_attn_tp_group().all_gather_into_tensor(
-            state.topk_ids_index_buf[:batch_size].view(torch.int32),
-            _tp_idx_slice.view(torch.int32),
-        )
-        get_attn_tp_group().all_gather_into_tensor(
-            state.topk_weights_buf[:batch_size], topk_weights
-        )
+            kernel.shm_dual_allgather_kunpeng(
+                _tp_idx_slice,
+                state.topk_ids_index_buf[:batch_size],
+                _tp_weights_slice,
+                state.topk_weights_buf[:batch_size],
+            )
         t_topk_allg_end = time.perf_counter()
 
         # Dispatch barrier

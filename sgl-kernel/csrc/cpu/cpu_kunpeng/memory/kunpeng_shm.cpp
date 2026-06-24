@@ -138,15 +138,11 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
     std::cout << "[KuTACC] Init shared memory pool, shm_size= " << shm_available.size << std::endl;
 
     g_shm_initialized = true;
-
-    shm_reduce_scatter_init_kunpeng();
 }
 
 void shm_pool_destroy_kunpeng()
 {
     if (!g_shm_initialized) return;
-
-    shm_reduce_scatter_finalize_kunpeng();
 
     kupl_shm_win_free(kupl_win_intra_node);
     kupl_shm_win_free(kupl_win_intra_socket);

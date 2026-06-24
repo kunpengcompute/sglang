@@ -2213,13 +2213,11 @@ def _setup_and_run_http_server(
 
     if envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
         import psutil
+
         p = psutil.Process(os.getpid())
         # TODO (kunpeng): hard code here, should use a more elegant way.
-        if envs.SGLANG_ENABLE_BINARY_LAUNCH.get():
-            attn_tp_rank = server_args.tp_rank_in_node
-            p.cpu_affinity({attn_tp_rank * 38 + 34}) # 34
-        else:
-            p.cpu_affinity({34}) # 34
+        if not envs.SGLANG_ENABLE_BINARY_LAUNCH.get():
+            p.cpu_affinity({34})  # 34
 
     if is_kunpeng_binary_launch() and server_args.tp_rank_in_node >= 1:
         logger.info("HTTP server disabled.")
