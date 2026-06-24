@@ -66,12 +66,13 @@ LOG_BASE_DIR="/path-to-logs"
 CONDA_ENV_NAME="my_env"
 CONDA_SH_PATH="/path-to-conda-start-sh"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
-HPCKIT_PATH=/path-to-HPCKit
-OpenBLAS_PATH=/path-to-OpenBLAS
-KUTACC_PATH=/path-to-KUTACC
-SGLANG_PATH=/path-to-SGLang
-CONDA_ENV_PATH=/path-to-anaconda3/envs/sgl-env
-PYINSTALL_PATH=/path-to-pyinstall
+
+export HPCKIT_PATH="/path-to-HPCKit"
+export OpenBLAS_PATH=/path-to-OpenBLAS
+export KUTACC_PATH=/path-to-KUTACC
+export SGLANG_PATH=/path-to-SGLang
+export CONDA_ENV_PATH=/path-to-anaconda3/envs/sgl-env
+export PYINSTALL_PATH=/path-to-pyinstall
 
 
 # TP/EP size
