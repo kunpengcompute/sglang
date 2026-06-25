@@ -14,17 +14,9 @@
  * ==============================================================================
  */
 
-#include <ATen/ATen.h>
-#include <torch/all.h>
-#include <torch/library.h>
 #include <torch/extension.h>
-#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-#include <kutacc.h>
-#include <kupl.h>
-#include <cstdint>
 #include <cstring>
 #include <cstdlib>
-#include <vector>
 #include <iostream>
 #include <fstream>
 #include <functional>
@@ -32,7 +24,6 @@
 #include <sgl_kernel_ops.h>
 #include <arm_bf16.h>
 #include <arm_fp16.h>
-#include <arm_sve.h>
 
 #include "../matmul/tiling.h"
 #include "../utils/math.h"
@@ -398,4 +389,145 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
             token_ids_data[idx] = active_expert_data[j].index;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// igemm_fusedmoe_gateup_kunpeng
+//
+// Calls kutacc::fusedmoe_gateup to compute the gate/up projection for all
+// routed experts in one shot, using token_ids + experts_offset for indexing.
+// ---------------------------------------------------------------------------
+void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size, hidden] int8
+                                   at::Tensor scale,              // [recv_size, 1] float32
+                                   at::Tensor experts_w13,        // [num_local_experts, 2*inter, hidden] int8
+                                   at::Tensor experts_w13_scale,  // [num_local_experts, 2*inter] float
+                                   at::Tensor token_ids,          // [bs] int32
+                                   at::Tensor experts_offset,     // [num_local_experts + 1] int32
+                                   at::Tensor moe_gateup,         // [bs, 2*inter] bfloat16 (output)
+                                   at::Tensor tmpx,               // int8 workspace
+                                   at::Tensor tmpy,               // float workspace
+                                   at::Tensor tmp_scales)         // float workspace
+{
+    TORCH_CHECK(act.scalar_type() == at::kChar, "act must be int8");
+    TORCH_CHECK(act.dim() == 2, "act must be 2D");
+    TORCH_CHECK(scale.scalar_type() == at::kFloat, "scale must be float32");
+    TORCH_CHECK(experts_w13.scalar_type() == at::kChar, "experts_w13 must be int8");
+    TORCH_CHECK(experts_w13.dim() == 3, "experts_w13 must be 3D");
+    TORCH_CHECK(experts_w13_scale.scalar_type() == at::kFloat, "experts_w13_scale must be float32");
+    TORCH_CHECK(moe_gateup.scalar_type() == at::kBFloat16, "moe_gateup must be bfloat16");
+    TORCH_CHECK(token_ids.size(0) <= moe_gateup.size(0), "fusedmoe_gateup token_ids size larger than output size");
+
+    int64_t bs = token_ids.size(0);
+    int64_t K = act.size(1);           // hidden
+    int64_t N = experts_w13.size(1);   // 2 * inter_dim
+    int64_t ne = experts_w13.size(0);  // num_local_experts
+
+    if (bs == 0) return;
+
+    int8_t *acts_data = act.data_ptr<int8_t>();
+    int8_t *weights_data = experts_w13.data_ptr<int8_t>();
+    float *acts_scale_data = scale.data_ptr<float>();
+    float *weights_scale_data = experts_w13_scale.data_ptr<float>();
+    int *token_ids_data = token_ids.data_ptr<int>();
+    int *experts_offset_data = experts_offset.data_ptr<int>();
+    bfloat16_t *output_data = reinterpret_cast<bfloat16_t *>(moe_gateup.data_ptr());
+    int8_t *pbx_data = tmpx.data_ptr<int8_t>();
+    float *pby_data = tmpy.data_ptr<float>();
+    float *pbsc_data = tmp_scales.data_ptr<float>();
+
+    int64_t acts_stride = act.stride(0);
+    int64_t acts_scale_stride = scale.stride(0);
+
+    auto t = igemm_find_optimal_tiling_plan_decode(bs, N, K, kutacc::get_thread_num());
+    int64_t fusedmoe_tilebuf_size = 256;
+
+    // TODO: n_slice for 2-expert case
+    std::optional<int64_t> n_slice = std::nullopt;
+
+    kutacc::fusedmoe_gateup(bs, K, N, ne, acts_stride, acts_scale_stride, acts_data, weights_data, acts_scale_data,
+                            weights_scale_data, token_ids_data, experts_offset_data, output_data, pbx_data, pby_data,
+                            pbsc_data, t, fusedmoe_tilebuf_size, n_slice);
+}
+
+// ---------------------------------------------------------------------------
+// igemm_fusedmoe_down_kunpeng
+//
+// Calls kutacc::fusedmoe_down to compute the down projection for all routed
+// experts in one shot, using experts_offset for indexing.
+// ---------------------------------------------------------------------------
+void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, inter] int8
+                                 at::Tensor experts_w2,        // [num_local_experts, hidden, inter] int8
+                                 at::Tensor moe_silu_scale,    // [silu_total, 1] float
+                                 at::Tensor experts_w2_scale,  // [num_local_experts, hidden] float
+                                 at::Tensor token_ids,         // [bs] int32
+                                 at::Tensor experts_offset,    // [num_local_experts + 1] int32
+                                 at::Tensor moe_down,          // [bs, hidden] bfloat16 (output)
+                                 at::Tensor tmpx,              // int8 workspace
+                                 at::Tensor tmpy,              // float workspace
+                                 at::Tensor tmp_scales)        // float workspace (unused)
+{
+    TORCH_CHECK(moe_silu_int8.scalar_type() == at::kChar, "moe_silu_int8 must be int8");
+    TORCH_CHECK(moe_silu_int8.dim() == 2, "moe_silu_int8 must be 2D");
+    TORCH_CHECK(experts_w2.scalar_type() == at::kChar, "experts_w2 must be int8");
+    TORCH_CHECK(experts_w2.dim() == 3, "experts_w2 must be 3D");
+    TORCH_CHECK(experts_w2_scale.scalar_type() == at::kFloat, "experts_w2_scale must be float32");
+    TORCH_CHECK(moe_down.scalar_type() == at::kBFloat16, "moe_down must be bfloat16");
+
+    int64_t bs = token_ids.size(0);
+    int64_t K = moe_silu_int8.size(1);  // inter_dim
+    int64_t N = experts_w2.size(1);     // hidden
+    int64_t ne = experts_w2.size(0);    // num_local_experts
+
+    if (bs == 0) return;
+
+    int8_t *acts_data = moe_silu_int8.data_ptr<int8_t>();
+    int8_t *weights_data = experts_w2.data_ptr<int8_t>();
+    float *acts_scale_data = moe_silu_scale.data_ptr<float>();
+    float *weights_scale_data = experts_w2_scale.data_ptr<float>();
+    int *experts_offset_data = experts_offset.data_ptr<int>();
+    bfloat16_t *output_data = reinterpret_cast<bfloat16_t *>(moe_down.data_ptr());
+    int8_t *pbx_data = tmpx.data_ptr<int8_t>();
+    float *pby_data = tmpy.data_ptr<float>();
+
+    auto t = igemm_find_optimal_tiling_plan_decode(bs, N, K, kutacc::get_thread_num());
+    int64_t fusedmoe_tilebuf_size = 256;
+
+    // TODO: n_slice for 2-expert case
+    std::optional<int64_t> n_slice = std::nullopt;
+
+    kutacc::fusedmoe_down(bs, K, N, ne, acts_data, weights_data, acts_scale_data, weights_scale_data,
+                          experts_offset_data, output_data, pbx_data, pby_data, t, fusedmoe_tilebuf_size, n_slice);
+}
+
+// ---------------------------------------------------------------------------
+// topk_convert_kunpeng
+//
+// Converts recv_src_info (per-expert, per-rank token counts) into a flat
+// token_ids array and an experts_offset array for indexed access.
+// ---------------------------------------------------------------------------
+int64_t topk_convert_kunpeng(at::Tensor src_info,        // [num_local_experts, num_ranks*(max_tokens*2+1)] int16
+                             at::Tensor token_ids,       // [recv_dense_size] int32 (output)
+                             at::Tensor experts_offset,  // [num_local_experts + 1] int32 (output)
+                             int64_t num_ranks, int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank)
+{
+    TORCH_CHECK(experts_offset.size(0) == num_local_experts + 1, "experts_offset size must be num_local_experts + 1");
+
+    const int16_t *src_info_data = src_info.data_ptr<int16_t>();
+    int32_t *token_ids_data = token_ids.data_ptr<int32_t>();
+    int32_t *experts_offset_data = experts_offset.data_ptr<int32_t>();
+
+    int64_t ti = 0;
+    for (int64_t ei = 0; ei < num_local_experts; ei++) {
+        experts_offset_data[ei] = ti;
+        for (int64_t ri = 0; ri < num_ranks; ri++) {
+            int64_t size = src_info_data[(ei * num_ranks + ri) * (num_max_dispatch_tokens_per_rank * 2 + 1)];
+            for (int64_t i = 0; i < size; i++) {
+                token_ids_data[ti] = (ei * num_ranks + ri) * num_max_dispatch_tokens_per_rank + i;
+                ti++;
+            }
+        }
+    }
+    experts_offset_data[num_local_experts] = ti;
+    TORCH_CHECK(ti <= token_ids.size(0), "token_ids overflow: ti=", ti, " capacity=", token_ids.size(0));
+    return ti;
 }

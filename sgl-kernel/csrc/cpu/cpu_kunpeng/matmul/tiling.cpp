@@ -61,6 +61,8 @@ static const InnerTilingMap igemm_plan_decode_32 = {
     {{2048, 684}, {64, 684}},     // mlp down
     {{5632, 2048}, {352, 1024}},  // shared expert gateup
     {{2048, 2816}, {512, 352}},   // shared expert down
+    {{2816, 2048}, {352, 512}},   // fusedmoe gateup
+    {{2048, 1408}, {64, 1408}},   // fusedmoe down
 };
 
 static ThreadToPlanMap igemm_prefill_plans_by_threads = {{32, igemm_plan_prefill_32}};

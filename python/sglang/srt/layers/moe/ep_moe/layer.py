@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
@@ -682,23 +683,108 @@ class KunpengMoE(FusedMoE):
         self,
         dispatch_output: KunpengDispatchOutput,
     ) -> KunpengCombineInput:
-        """Run expert computation on received tokens.
-
-        Dequantizes received int8+scale data, applies expert computation
-        (W13 -> SwiGLU -> W2) per local_expert, and copies results into
-        combine_send_buf. Will be replaced with kutacc operator later.
-        """
         from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
             KunpengCombineInput,
         )
 
-        self.dispatcher.dequantize_and_copy_to_combine(dispatch_output, layer=self)
+        t_total_start = time.perf_counter()
+
+        recv_tokens = dispatch_output.recv_tokens
+        hidden = self.hidden_size
+        num_local_experts = self.num_local_experts
+        max_dispatch_tokens = dispatch_output.max_dispatch_tokens_per_rank
+        inter_dim = self.w13_weight.shape[1] // 2
+        recv_dense_size = max_dispatch_tokens * self.moe_ep_size * num_local_experts
+
+        # Reuse it for gateup output when inter_dim*2 <= hidden (e.g. v3);
+        moe_down = dispatch_output.combine_send_buf
+        moe_down_flat = moe_down.view(-1)
+        gateup_numel = recv_dense_size * inter_dim * 2
+        if gateup_numel <= moe_down_flat.numel():
+            moe_gateup = moe_down_flat[:gateup_numel].view(
+                recv_dense_size, inter_dim * 2
+            )
+        else:
+            moe_gateup = torch.empty(
+                recv_dense_size, inter_dim * 2, dtype=torch.bfloat16
+            )
+
+        # Workspace buffers (sizes follow C++ reference heuristic).
+        fusedmoe_fixed_size = 256
+        tmpx_gateup = torch.empty(fusedmoe_fixed_size * hidden, dtype=torch.int8)
+        tmpy_gateup = torch.empty(
+            fusedmoe_fixed_size * inter_dim * 2, dtype=torch.float32
+        )
+        tmp_scales_gateup = torch.empty(fusedmoe_fixed_size * 4, dtype=torch.float32)
+
+        # 1) gateup GEMM
+        # Split packed_recv_x [recv_size, hidden+4] uint8 into act and scale
+        packed_recv_x = dispatch_output.packed_recv_x.view(-1, hidden + 4)
+        act = packed_recv_x[:, :hidden].view(torch.int8)
+        scale = packed_recv_x[:, hidden : hidden + 4].view(torch.float32)
+
+        t_gateup_start = time.perf_counter()
+        torch.ops.sgl_kernel.igemm_fusedmoe_gateup_kunpeng(
+            act,
+            scale,
+            self.w13_weight,
+            self.w13_weight_scale,
+            dispatch_output.recv_token_ids_buf[:recv_tokens],
+            dispatch_output.recv_experts_offset,
+            moe_gateup,
+            tmpx_gateup,
+            tmpy_gateup,
+            tmp_scales_gateup,
+        )
+        t_gateup_end = time.perf_counter()
+
+        # 2) SiLU + mul + quantize
+        moe_silu_int8 = torch.empty(recv_dense_size, inter_dim, dtype=torch.int8)
+        moe_silu_scale = torch.empty(recv_dense_size, 1, dtype=torch.float32)
+
+        t_silu_start = time.perf_counter()
+        torch.ops.sgl_kernel.silu_mul_quant_kunpeng(
+            moe_gateup[:recv_tokens],
+            moe_silu_int8[:recv_tokens],
+            moe_silu_scale,
+        )
+        t_silu_end = time.perf_counter()
+
+        # 3) down GEMM
+        tmpx_down = torch.empty(fusedmoe_fixed_size * inter_dim, dtype=torch.int8)
+        tmpy_down = torch.empty(fusedmoe_fixed_size * hidden, dtype=torch.float32)
+        tmp_scales_down = torch.empty(fusedmoe_fixed_size * 4, dtype=torch.float32)
+
+        t_down_start = time.perf_counter()
+        torch.ops.sgl_kernel.igemm_fusedmoe_down_kunpeng(
+            moe_silu_int8,
+            self.w2_weight,
+            moe_silu_scale,
+            self.w2_weight_scale,
+            dispatch_output.recv_token_ids_buf[:recv_tokens],
+            dispatch_output.recv_experts_offset,
+            moe_down,
+            tmpx_down,
+            tmpy_down,
+            tmp_scales_down,
+        )
+        t_down_end = time.perf_counter()
+
+        t_total_end = time.perf_counter()
+        if envs.SGLANG_KUNPENG_PROFILE.get():
+            logger.info(
+                f"[KunpengMoE rank={self.moe_ep_rank}] run_moe_core timing (ms): "
+                f"gateup={1000*(t_gateup_end - t_gateup_start):.2f}, "
+                f"silu_mul_quant={1000*(t_silu_end - t_silu_start):.2f}, "
+                f"down={1000*(t_down_end - t_down_start):.2f}, "
+                f"total={1000*(t_total_end - t_total_start):.2f}, "
+                f"recv_tokens={recv_tokens}, "
+                f"hidden={hidden}, inter_dim={inter_dim}, "
+                f"num_local_experts={num_local_experts}"
+            )
 
         return KunpengCombineInput(
-            topk_weights=dispatch_output.topk_weights,
-            topk_ids_index=dispatch_output.topk_ids_index,
             num_tokens=dispatch_output.num_tokens,
-            batch_size=dispatch_output.batch_size,
         )
 
 
