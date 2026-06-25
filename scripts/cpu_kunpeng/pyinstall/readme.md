@@ -28,21 +28,31 @@ pyinstall/
 | `OpenBLAS_PATH` | OpenBLAS 安装路径 |
 | `KUTACC_PATH` | kutacc 安装路径 |
 | `SGLANG_PATH` | SGLang 源码根目录 |
+| `CONDA_BASE_PATH` | Conda 安装路径 |
+| `CONDA_ENV_NAME` | Conda 虚拟环境名称 |
 | `CONDA_ENV_PATH` | Conda 虚拟环境路径 |
 | `PYINSTALL_PATH` | pyinstall 脚本所在目录 |
 
 示例：
 
 ```bash
-export HPCKIT_PATH=/path/to/HPCKit_26.0.RC1/HPCKit
-export OpenBLAS_PATH=/path/to/openblas
-export KUTACC_PATH=/path/to/kutacc/kutacc-630
-export SGLANG_PATH=/path/to/sglang/sglang-0.5.11-open
-export CONDA_ENV_PATH=/path/to/anaconda3/envs/sgl-env
-export PYINSTALL_PATH=$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall
+export HPCKIT_PATH="/path/to/HPCKit_26.0.RC1/HPCKit"
+export OpenBLAS_PATH="/path/to/openblas"
+export KUTACC_PATH="/path/to/kutacc/kutacc-630"
+export SGLANG_PATH="/path/to/sglang/sglang-0.5.11-open"
+export CONDA_ENV_PATH="$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME"
+export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
 ```
 
-### 2. 执行全量打包
+### 2. 安装 PyInstaller
+
+首次执行打包前，需要通过 pip 安装 PyInstaller：
+
+```bash
+pip install pyinstaller
+```
+
+### 3. 执行全量打包
 
 ```bash
 cd scripts/cpu_kunpeng/pyinstall

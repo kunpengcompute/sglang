@@ -68,7 +68,7 @@ send_request() {
 }
 
 if [ "$NUM_REQUESTS" -eq 1 ]; then
-  send_request 1
+  time send_request 1
 else
   for i in $(seq 1 $NUM_REQUESTS); do
     send_request $i &

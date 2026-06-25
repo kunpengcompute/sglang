@@ -64,16 +64,15 @@ NATIVE_MASTER_PORT="5010"
 # Paths
 LOG_BASE_DIR="/path-to-logs"
 CONDA_ENV_NAME="my_env"
-CONDA_SH_PATH="/path-to-conda-start-sh"
+CONDA_BASE_PATH="/path-to-conda"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
 
 export HPCKIT_PATH="/path-to-HPCKit"
-export OpenBLAS_PATH=/path-to-OpenBLAS
-export KUTACC_PATH=/path-to-KUTACC
-export SGLANG_PATH=/path-to-SGLang
-export CONDA_ENV_PATH=/path-to-anaconda3/envs/sgl-env
-export PYINSTALL_PATH=/path-to-pyinstall
-
+export OpenBLAS_PATH="/path-to-OpenBLAS"
+export KUTACC_PATH="/path-to-KUTACC"
+export SGLANG_PATH="/path-to-SGLang"
+export CONDA_ENV_PATH="$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME"
+export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
 
 # TP/EP size
 export TP_SIZE=256
@@ -139,8 +138,6 @@ prefill_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="prefill"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
-    export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
 # ------------------------------------------------------------
@@ -154,8 +151,6 @@ decode_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="decode"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
-    export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
 # ------------------------------------------------------------
@@ -169,14 +164,12 @@ native_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="native"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
-    export CONDA_ACTIVATE_CMD="source ${CONDA_SH_PATH} && conda activate ${CONDA_ENV_NAME}"
 }
 
 # ------------------------------------------------------------
 # Main: dispatch based on command-line argument
 # ------------------------------------------------------------
-ACTION="$1"
+ACTION="${1:-native}"
 shift
 
 case "$ACTION" in
@@ -204,3 +197,8 @@ export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:$LD_LIBRARY_PATH
 
 export KUTACC_LIB=${KUTACC_PATH}/install/lib
 export KUTACC_INCLUDE=${KUTACC_PATH}/install/include
+
+export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
+export CONDA_ACTIVATE_CMD="eval \"\$($CONDA_BASE_PATH/bin/conda shell.bash hook)\" && conda activate $CONDA_ENV_NAME"
+
+eval "$CONDA_ACTIVATE_CMD"
