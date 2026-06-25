@@ -335,7 +335,43 @@ class DeepseekMHAKunpengForwardMixin:
 
             self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
 
-            kv = self.kv_b_proj(kv_a)[0]
+            # kv_b
+            kva_int8 = torch.empty_like(kv_a, dtype=torch.int8)
+            kva_scale = torch.empty([kv_a.shape[0], 1], dtype=torch.float32)
+            torch.ops.sgl_kernel.quant_kunpeng(kv_a, kva_int8, kva_scale)
+
+            m, n, k = (
+                batch_size,
+                self.kv_b_proj.weight.shape[0],
+                self.kv_b_proj.weight.shape[1],
+            )
+            tile_m, tile_n, tile_k = (
+                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+            )
+
+            out = torch.empty([m, n], dtype=torch.bfloat16)
+
+            pack_a = torch.empty_like(kva_int8)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(kva_int8, pack_a, tile_m, tile_k)
+
+            pack_w = torch.empty_like(self.kv_b_proj.weight)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                self.kv_b_proj.weight.contiguous(), pack_w, tile_n, tile_k
+            )
+
+            workspace_size = m * n * 32
+            workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
+
+            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
+                pack_a,
+                pack_w,
+                self.kv_b_proj.weight_scale.view(-1),
+                kva_scale.contiguous().view(-1),
+                out,
+                workspace,
+                32,
+            )
+            kv = out
 
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
