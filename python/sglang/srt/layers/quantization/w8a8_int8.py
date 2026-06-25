@@ -236,38 +236,59 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 True,  # is_vnni
             )
         if _is_cpu_920f:
-            print(
-                f"enter W8A8Int8LinearMethod.apply, x.shape={x.shape}, layer.weight.shape={layer.weight.shape}",
-                flush=True,
-            )
-            weight = layer.weight.t()
-            x_q, x_scale = per_token_quant_int8(x)
+            # quant
+            batch_size = x.shape[0]
+            dim = x.shape[1]
+            scale_size = 4  # fp32
+            row_bytes = dim + scale_size
+            total_bytes = batch_size * row_bytes
+            norm_int8_and_scale = torch.zeros((total_bytes), dtype=torch.uint8)
 
-            x_q_2d = x_q.view(-1, x_q.shape[-1])
-            x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
-            output_shape = [*x_q.shape[:-1], weight.shape[1]]
-
-            def int8_scaled_mm(x_q, w_q, x_scale, w_scale, out_dtype, bias=None):
-                # fix mlp gate_up_proj
-                output_fp32 = torch.mm(x_q.float(), w_q.float())
-                output_float = output_fp32 * x_scale * w_scale.t()
-
-                output = output_float.to(out_dtype)
-                if bias is not None:
-                    output += bias
-
-                return output
-
-            output = int8_scaled_mm(
-                x_q_2d,
-                weight,
-                x_scale_2d,
-                layer.weight_scale,
-                out_dtype=x.dtype,
-                bias=bias,
+            int8_shape = (batch_size, dim)
+            int8_strides = (row_bytes, 1)  # (7172, 1)
+            norm_int8 = norm_int8_and_scale.view(torch.int8).as_strided(
+                int8_shape, int8_strides
             )
 
-            return output.view(output_shape)
+            f32_shape = (batch_size, 1)
+            f32_strides = (row_bytes // 4, 1)
+            scale_start_offset = dim
+            norm_scale = (
+                norm_int8_and_scale[scale_start_offset:]
+                .view(torch.float32)
+                .as_strided(f32_shape, f32_strides)
+            )
+
+            torch.ops.sgl_kernel.quant_kunpeng(x, norm_int8, norm_scale)
+
+            # gemm
+            m = batch_size
+            n, k = layer.weight.shape
+            tile_m, tile_n, tile_k = (
+                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+            )
+
+            output = torch.empty([m, n], dtype=torch.bfloat16)
+
+            pack_a = torch.empty_like(norm_int8)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                norm_int8.contiguous(), pack_a, tile_m, tile_k
+            )
+
+            workspace_size = m * n * 64
+            workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
+
+            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
+                pack_a,
+                layer.weight,
+                layer.weight_scale.view(-1),
+                norm_scale.contiguous().view(-1),
+                output,
+                workspace,
+                32,
+            )
+
+            return output
 
         x_q, x_scale = per_token_quant_int8(x)
 
