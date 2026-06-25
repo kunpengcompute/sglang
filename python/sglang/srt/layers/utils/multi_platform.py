@@ -6,6 +6,7 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    is_cpu_920f,
     is_cpu,
     is_cuda,
     is_hip,
@@ -17,6 +18,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_cpu_920f = is_cpu_920f()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -122,7 +124,7 @@ class MultiPlatformOp(nn.Module):
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
-        elif _is_cpu and _is_cpu_amx_available:
+        elif _is_cpu and (_is_cpu_amx_available or _is_cpu_920f):
             return self.forward_cpu
         elif _is_npu:
             return self.forward_npu

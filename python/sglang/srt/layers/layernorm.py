@@ -29,6 +29,7 @@ from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    is_cpu_920f,
     get_bool_env_var,
     is_cpu,
     is_cuda,
@@ -46,6 +47,7 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_920f = is_cpu_920f()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
@@ -428,6 +430,19 @@ class RMSNorm(MultiPlatformOp):
             return torch.ops.sgl_kernel.rmsnorm_cpu(
                 x, self.weight.data, self.variance_epsilon
             )
+        elif _is_cpu_920f:
+            outs = torch.empty_like(x)
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                torch.ops.sgl_kernel.fused_add_rmsnorm_kunpeng(
+                    x, residual, self.weight.data, self.variance_epsilon, outs
+                )
+                return outs, residual
+            torch.ops.sgl_kernel.rmsnorm_kunpeng(
+                x, self.weight.data, self.variance_epsilon, outs
+            )
+            return outs
         else:
             return self.forward_native(x, residual, post_residual_addition)
 
