@@ -323,17 +323,12 @@ class DeepseekV2MLP(nn.Module):
                 norm_int8.contiguous(), pack_a, tile_m, tile_k
             )
 
-            pack_w = torch.empty_like(self.gate_up_proj.weight)
-            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
-                self.gate_up_proj.weight.contiguous(), pack_w, tile_n, tile_k
-            )
-
             workspace_size = m * n * 64
             workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
 
             torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
                 pack_a,
-                pack_w,
+                self.gate_up_proj.weight,
                 self.gate_up_proj.weight_scale.view(-1),
                 norm_scale.contiguous().view(-1),
                 gate_up,
@@ -361,11 +356,6 @@ class DeepseekV2MLP(nn.Module):
                 gateup_int8.contiguous(), pack_a, tile_m, tile_k
             )
 
-            pack_w = torch.empty_like(self.down_proj.weight)
-            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
-                self.down_proj.weight.contiguous(), pack_w, tile_n, tile_k
-            )
-
             workspace_size = m * n * 64
             workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
 
@@ -373,7 +363,7 @@ class DeepseekV2MLP(nn.Module):
 
             torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
                 pack_a,
-                pack_w,
+                self.down_proj.weight,
                 self.down_proj.weight_scale.view(-1),
                 gateup_scale.contiguous().view(-1),
                 out,

@@ -77,6 +77,19 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _kunpeng_prepack_igemm_weight(weight: torch.Tensor, m: int = 32) -> None:
+    """Prepack weight for Kunpeng s8 gemm decode on CPU 920f."""
+    n, k = weight.shape
+    _tile_m, tile_n, tile_k = (
+        torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+    )
+    pack_w = torch.empty_like(weight)
+    torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+        weight.contiguous(), pack_w, tile_n, tile_k
+    )
+    weight.copy_(pack_w)
+
+
 @dataclass(frozen=True)
 class NextNEnabledConfig:
     num_nextn_layers: int
@@ -446,56 +459,28 @@ class DeepseekV2WeightLoaderMixin:
             )
 
             if _is_cpu_920f:
-                # o_proj prepack
-                n, k = self_attn.o_proj.weight.shape
-                m = 32
-                tile_m, tile_n, tile_k = (
-                    torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
-                        m, n, k, 32
-                    )
-                )
+                # attention igemm prepack
+                for proj in [
+                    "fused_qkv_a_proj_with_mqa",
+                    "q_b_proj",
+                    "o_proj",
+                    # "q_proj",
+                    # "kv_a_proj_with_mqa",
+                    # "kv_b_proj",
+                ]:
+                    if hasattr(self_attn, proj):
+                        _kunpeng_prepack_igemm_weight(getattr(self_attn, proj).weight)
 
-                pack_w = torch.empty_like(self_attn.o_proj.weight)
-                torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
-                    self_attn.o_proj.weight.contiguous(), pack_w, tile_n, tile_k
-                )
-                self_attn.o_proj.weight.copy_(pack_w)
+                # mlp gate_up_proj and down_proj prepack
+                mlp = self.model.layers[layer_id].mlp
+                for mlp_module in [mlp] + (
+                    [mlp.shared_experts] if hasattr(mlp, "shared_experts") else []
+                ):
+                    if hasattr(mlp_module, "gate_up_proj"):
+                        _kunpeng_prepack_igemm_weight(mlp_module.gate_up_proj.weight)
 
-                # qkva (fused_qkv_a_proj_with_mqa) prepack
-                if hasattr(self_attn, "fused_qkv_a_proj_with_mqa"):
-                    n, k = self_attn.fused_qkv_a_proj_with_mqa.weight.shape
-                    tile_m, tile_n, tile_k = (
-                        torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
-                            m, n, k, 32
-                        )
-                    )
-                    pack_w = torch.empty_like(
-                        self_attn.fused_qkv_a_proj_with_mqa.weight
-                    )
-                    torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
-                        self_attn.fused_qkv_a_proj_with_mqa.weight.contiguous(),
-                        pack_w,
-                        tile_n,
-                        tile_k,
-                    )
-                    self_attn.fused_qkv_a_proj_with_mqa.weight.copy_(pack_w)
-
-                # q_b_proj (qb) prepack
-                if hasattr(self_attn, "q_b_proj") and self_attn.q_b_proj is not None:
-                    n, k = self_attn.q_b_proj.weight.shape
-                    tile_m, tile_n, tile_k = (
-                        torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
-                            m, n, k, 32
-                        )
-                    )
-                    pack_w = torch.empty_like(self_attn.q_b_proj.weight)
-                    torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
-                        self_attn.q_b_proj.weight.contiguous(),
-                        pack_w,
-                        tile_n,
-                        tile_k,
-                    )
-                    self_attn.q_b_proj.weight.copy_(pack_w)
+                    if hasattr(mlp_module, "down_proj"):
+                        _kunpeng_prepack_igemm_weight(mlp_module.down_proj.weight)
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
