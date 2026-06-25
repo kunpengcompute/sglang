@@ -236,29 +236,56 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 True,  # is_vnni
             )
         if _is_cpu_920f:
-            weight = layer.weight.t()
-        else:
-            weight = layer.weight
+            if isinstance(x, tuple):
+                # Pre-quantized input (e.g. from silu_mul_quant_kunpeng):
+                # x = (x_int8, x_scale), x_int8: [m, k] int8, x_scale: [m, 1] float32
+                norm_int8, norm_scale = x
+                batch_size = norm_int8.shape[0]
+            else:
+                # quant
+                batch_size = x.shape[0]
+                dim = x.shape[1]
+                norm_int8 = torch.empty((batch_size, dim), dtype=torch.int8)
+                norm_scale = torch.empty((batch_size, 1), dtype=torch.float32)
+                torch.ops.sgl_kernel.quant_kunpeng(x, norm_int8, norm_scale)
+
+            # gemm
+            n, k = layer.weight.shape
+            tile_m, tile_n, tile_k = (
+                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
+                    batch_size, n, k, 32
+                )
+            )
+
+            output = torch.empty([batch_size, n], dtype=torch.bfloat16)
+
+            pack_a = torch.empty_like(norm_int8)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(norm_int8, pack_a, tile_m, tile_k)
+
+            workspace_size = batch_size * n * 64
+            workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
+
+            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
+                pack_a,
+                layer.weight,
+                layer.weight_scale.view(-1),
+                norm_scale.view(-1),
+                output,
+                workspace,
+                32,
+            )
+
+            return output
+
         x_q, x_scale = per_token_quant_int8(x)
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
-        output_shape = [*x_q.shape[:-1], weight.shape[1]]
-
-        def int8_scaled_mm(x_q, w_q, x_scale, w_scale, out_dtype, bias=None):
-            # fix mlp gate_up_proj
-            output_fp32 = torch.mm(x_q.float(), w_q.float())
-            output_float = output_fp32 * x_scale * w_scale.t()
-            
-            output = output_float.to(out_dtype)
-            if bias is not None:
-                output += bias
-                
-            return output
+        output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
 
         output = int8_scaled_mm(
             x_q_2d,
-            weight,
+            layer.weight,
             x_scale_2d,
             layer.weight_scale,
             out_dtype=x.dtype,

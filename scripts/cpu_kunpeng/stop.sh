@@ -13,15 +13,15 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: ./stop.sh [prefill|decode|native]
+# Usage: ./stop.sh [prefill|decode|native]  (default: native)
 
 
-if [[ $# -ne 1 ]]; then
+if [[ $# -gt 1 ]]; then
     echo "Usage: $0 [prefill|decode|native]" >&2
     exit 1
 fi
 
-ROLE="$1"
+ROLE="${1:-native}"
 if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" ]]; then
     echo "Error: ROLE must be 'prefill' or 'decode' or 'native'" >&2
     exit 1
@@ -44,6 +44,10 @@ for i in "${!NODES[@]}"; do
     node="${NODES[i]}"
 
     ssh "$node" '
+        for ((i=16; i<=31; i++)); do
+            echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
+        done
+
         MAIN_PIDS=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
 
         if [ -n "$MAIN_PIDS" ]; then

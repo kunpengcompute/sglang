@@ -101,8 +101,16 @@ esac
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     echo "Launch binary server..."
     for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
+        if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" ]]; then
+            SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${ATTN_TP_RANK}/sglang_server"
+        else
+            SERVER_BIN="python -m sglang.launch_server"
+        fi
+        ON_PACKAGE_MEMORY_NODE=$((ATTN_TP_RANK +16))
+        echo 0 > /sys/devices/system/node/node${ATTN_TP_RANK}/hugepages/hugepages-2048kB/nr_hugepages
+        echo 2020 > /sys/devices/system/node/node${ON_PACKAGE_MEMORY_NODE}/hugepages/hugepages-2048kB/nr_hugepages
         taskset -c $((ATTN_TP_RANK * 38)) \
-        $PYINSTALL_PATH/dist/sglang_server_tp${ATTN_TP_RANK}/sglang_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
+        $SERVER_BIN "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
           --tp-rank-in-node ${ATTN_TP_RANK} \
           --port $((30000 + ATTN_TP_RANK)) \
           > "${LOG_PATH}/${DP_RANK}_${ATTN_TP_RANK}_$IP.log" 2>&1 &

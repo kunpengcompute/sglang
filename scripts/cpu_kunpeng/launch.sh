@@ -13,15 +13,15 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: ./launch.sh [prefill|decode|native]
+# Usage: ./launch.sh [prefill|decode|native]  (default: native)
 
 
-if [[ $# -ne 1 ]]; then
+if [[ $# -gt 1 ]]; then
     echo "Usage: $0 [prefill|decode|native]" >&2
     exit 1
 fi
 
-ROLE="$1"
+ROLE="${1:-native}"
 if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" ]]; then
     echo "Error: ROLE must be 'prefill' or 'decode' or 'native'" >&2
     exit 1
@@ -42,7 +42,7 @@ sh stop.sh "$ROLE"
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
 WORLD_SIZE=${#NODES[@]}
 
-if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
+if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" ]]; then
     echo "Update binary sglang..."
     sh ./pyinstall/updata.sh
 fi
