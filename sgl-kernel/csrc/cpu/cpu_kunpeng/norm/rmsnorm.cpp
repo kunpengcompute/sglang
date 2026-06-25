@@ -103,3 +103,30 @@ void rmsnorm_kunpeng(at::Tensor acts, at::Tensor weights, double eps, at::Tensor
     kutacc::rmsnorm<false>(height, width, acts_ptr, acts.stride(0), weights_ptr, static_cast<float>(eps), nullptr,
                            outs_ptr);
 }
+
+void fused_add_rmsnorm_kunpeng(at::Tensor acts, at::Tensor residual, at::Tensor weights, double eps, at::Tensor outs)
+{
+    TORCH_CHECK(acts.scalar_type() == at::kBFloat16, "acts must be bfloat16");
+    TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be bfloat16");
+    TORCH_CHECK(weights.scalar_type() == at::kBFloat16, "weights must be bfloat16");
+    TORCH_CHECK(outs.scalar_type() == at::kBFloat16, "outs must be bfloat16");
+
+    TORCH_CHECK(acts.dim() == 2, "acts must be 2D [height, width]");
+    TORCH_CHECK(residual.dim() == 2, "residual must be 2D [height, width]");
+    TORCH_CHECK(weights.dim() == 1, "weights must be 1D [width]");
+    TORCH_CHECK(outs.dim() == 2, "outs must be 2D [height, width]");
+
+    int64_t height = acts.size(0);
+    int64_t width = acts.size(1);
+
+    TORCH_CHECK(weights.size(0) == width, "weights size must match width");
+    TORCH_CHECK(outs.size(0) == height && outs.size(1) == width, "outs shape mismatch");
+
+    bfloat16_t *acts_ptr = reinterpret_cast<bfloat16_t *>(acts.data_ptr());
+    const bfloat16_t *weights_ptr = reinterpret_cast<const bfloat16_t *>(weights.data_ptr());
+    bfloat16_t *outs_ptr = reinterpret_cast<bfloat16_t *>(outs.data_ptr());
+    bfloat16_t *residual_ptr = reinterpret_cast<bfloat16_t *>(residual.data_ptr());
+
+    kutacc::rmsnorm<true>(height, width, acts_ptr, acts.stride(0), weights_ptr, static_cast<float>(eps), residual_ptr,
+                           outs_ptr);
+}
