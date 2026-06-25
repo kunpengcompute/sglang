@@ -462,16 +462,14 @@ class KunpengCpuBackend(AttentionBackend):
             pack_attn_k = packed_k
             pack_attn_v = packed_v
         else:
-            logger.warning(
-                f"[kunpeng_attention] attention backend start forward prefill with non packed kv is not supported"
-            )
-            pack_attn_k = self.forward_metadata.attn_packed_k
-            pack_attn_v = self.forward_metadata.attn_packed_v
             (
                 q,
                 packed_k,
                 packed_v,
                 self.forward_metadata.query_start_loc,
+                self.forward_metadata.key_start_loc,
+                self.forward_metadata.attn_seq_lens,
+                self.forward_metadata.attn_cur_lens,
                 tgt_indices,
             ) = self.pad_flash_attn_metadata(
                 q,
@@ -480,50 +478,85 @@ class KunpengCpuBackend(AttentionBackend):
                 self.forward_metadata.query_start_loc,
                 forward_batch.extend_seq_lens,
             )
+            # Reallocate attn_o to match padded token count
+            padded_token_count = q.shape[0]
+            if self.enable_hbw_pool:
+                if (
+                    hasattr(self.forward_metadata, "attn_o_handle")
+                    and self.forward_metadata.attn_o_handle is not None
+                ):
+                    self.hbw_pool.free(self.forward_metadata.attn_o_handle)
+                (
+                    self.forward_metadata.attn_o,
+                    self.forward_metadata.attn_o_handle,
+                ) = self.hbw_pool.alloc(
+                    shape=(
+                        padded_token_count,
+                        self.num_local_heads,
+                        self.v_head_dim,
+                    ),
+                    dtype=self.q_data_type,
+                )
+            else:
+                self.forward_metadata.attn_o = torch.empty(
+                    (padded_token_count, self.num_local_heads, self.v_head_dim),
+                    dtype=self.q_data_type,
+                    device=self.device,
+                )
 
         if self.enable_debug:
             logger.info(
-                f"[kunpeng_attention] start to flash_attention_kunpeng"
-                f"[kunpeng_attention] ========== Layer {layer.layer_id} Shape Debug =========="
-                f"[kunpeng_attention] bs: {forward_batch.batch_size}"
-                f"[kunpeng_attention] forward seq_len: {forward_batch.seq_lens}"
-                f"[kunpeng_attention] Original q shape: {q.shape}"
-                f"[kunpeng_attention] Packed q shape: {packed_q.shape}"
-                f"[kunpeng_attention] packed_k shape: {packed_k.shape}"
-                f"[kunpeng_attention] packed_v shape: {packed_v.shape}"
-                f"[kunpeng_attention] out o shape: {self.forward_metadata.attn_o.shape}"
-                f"[kunpeng_attention] query_start_loc : {self.forward_metadata.query_start_loc}"
-                f"[kunpeng_attention] key_start_loc : {self.forward_metadata.key_start_loc}"
-                f"[kunpeng_attention] seq_lens : {self.forward_metadata.attn_seq_lens}"
+                f"[kunpeng_attention] start to flash_attention (packed={self.attn_is_kv_packed})\n"
+                f"[kunpeng_attention] ========== Layer {layer.layer_id} Shape Debug ==========\n"
+                f"[kunpeng_attention] bs: {forward_batch.batch_size}\n"
+                f"[kunpeng_attention] forward seq_len: {forward_batch.seq_lens}\n"
+                f"[kunpeng_attention] Original q shape: {q.shape}\n"
+                f"[kunpeng_attention] Packed q shape: {packed_q.shape}\n"
+                f"[kunpeng_attention] packed_k shape: {packed_k.shape}\n"
+                f"[kunpeng_attention] packed_v shape: {packed_v.shape}\n"
+                f"[kunpeng_attention] out o shape: {self.forward_metadata.attn_o.shape}\n"
+                f"[kunpeng_attention] query_start_loc : {self.forward_metadata.query_start_loc}\n"
+                f"[kunpeng_attention] key_start_loc : {self.forward_metadata.key_start_loc}\n"
+                f"[kunpeng_attention] seq_lens : {self.forward_metadata.attn_seq_lens}\n"
             )
 
-        # kutacc_export flash_attention_kunpeng :
-        # Flash Attention with optional causal masking and variable sequence lengths
-
-        torch.ops.sgl_kernel.flash_attention_kunpeng(
-            q=q,
-            k=packed_k,
-            v=packed_v,
-            out=self.forward_metadata.attn_o,
-            pack_attn_q=packed_q,
-            pack_attn_k=pack_attn_k,
-            pack_attn_v=pack_attn_v,
-            attn_s=self.forward_metadata.attn_s,
-            attn_out_block_old=self.forward_metadata.attn_out_block_old,
-            attn_out_block_new=self.forward_metadata.attn_out_block_new,
-            attn_max_block_old=self.forward_metadata.attn_max_block_old,
-            attn_max_block_new=self.forward_metadata.attn_max_block_new,
-            attn_base_block_old=self.forward_metadata.attn_base_block_old,
-            attn_base_block_new=self.forward_metadata.attn_base_block_new,
-            causal=True,
-            softmax_scale=layer.scaling,
-            query_start_loc=self.forward_metadata.query_start_loc,
-            key_start_loc=self.forward_metadata.key_start_loc,
-            chunked_prefill_size=512,
-            seq_lens=self.forward_metadata.attn_seq_lens.tolist(),
-            cur_lens=self.forward_metadata.attn_cur_lens.tolist(),
-            is_kv_packed=self.attn_is_kv_packed,
-        )
+        if self.attn_is_kv_packed:
+            torch.ops.sgl_kernel.flash_attention_kunpeng(
+                q=q,
+                k=packed_k,
+                v=packed_v,
+                out=self.forward_metadata.attn_o,
+                pack_attn_q=packed_q,
+                pack_attn_k=pack_attn_k,
+                pack_attn_v=pack_attn_v,
+                attn_s=self.forward_metadata.attn_s,
+                attn_out_block_old=self.forward_metadata.attn_out_block_old,
+                attn_out_block_new=self.forward_metadata.attn_out_block_new,
+                attn_max_block_old=self.forward_metadata.attn_max_block_old,
+                attn_max_block_new=self.forward_metadata.attn_max_block_new,
+                attn_base_block_old=self.forward_metadata.attn_base_block_old,
+                attn_base_block_new=self.forward_metadata.attn_base_block_new,
+                causal=True,
+                softmax_scale=layer.scaling,
+                query_start_loc=self.forward_metadata.query_start_loc,
+                key_start_loc=self.forward_metadata.key_start_loc,
+                chunked_prefill_size=512,
+                seq_lens=self.forward_metadata.attn_seq_lens.tolist(),
+                cur_lens=self.forward_metadata.attn_cur_lens.tolist(),
+                is_kv_packed=True,
+            )
+        else:
+            logger.info(f"[kunpeng_attention] flash_attention bs: {forward_batch.batch_size}")
+            torch.ops.sgl_kernel.varlen_attention_kunpeng(
+                q=q,
+                k=packed_k,
+                v=packed_v,
+                out=self.forward_metadata.attn_o,
+                causal=True,
+                softmax_scale=layer.scaling,
+                query_start_loc=self.forward_metadata.query_start_loc,
+                key_start_loc=self.forward_metadata.key_start_loc,
+            )
 
         if tgt_indices is not None:
             return self.forward_metadata.attn_o[tgt_indices].reshape(
@@ -800,6 +833,70 @@ class KunpengCpuBackend(AttentionBackend):
                 dtype=q_dtype,
                 device=device,
             )
+
+    def pad_flash_attn_metadata(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        bs = seq_lens.size(0)
+        device = q.device
+        
+        # 每个序列填充到32的倍数
+        padded_seq_lens = torch.ceil(seq_lens / 32).to(torch.int32) * 32
+        
+        # 计算起始位置
+        new_query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        new_query_start_loc[1:] = torch.cumsum(padded_seq_lens, dim=0)
+        total_padded_tokens = new_query_start_loc[-1].item()
+        
+        total_tokens = q.size(0)
+
+        # seq_lens = forward_batch.extend_seq_lens, should sum to total_tokens
+        sum_seq_lens = seq_lens.sum().item()
+        if sum_seq_lens != total_tokens:
+            logger.error(
+                f"[kunpeng_attention] BUG: sum(extend_seq_lens)={sum_seq_lens} != q.size(0)={total_tokens}, "
+                f"extend_seq_lens={seq_lens.tolist()}, bs={bs}"
+            )
+
+        # query_start_loc in real server may include prefix offsets,
+        # so compute relative token positions from seq_lens instead
+        extend_start = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        extend_start[1:] = torch.cumsum(seq_lens, dim=0)
+
+        if sum_seq_lens != total_tokens:
+            # Metadata mismatch: skip padding, return raw tensors for varlen attention
+            extend_start = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            extend_start[1:] = torch.cumsum(seq_lens, dim=0)
+            return q, k, v, extend_start, extend_start.clone(), seq_lens, seq_lens, torch.arange(total_tokens, device=device)
+
+        seq_ids = torch.repeat_interleave(
+            torch.arange(bs, device=device), seq_lens, output_size=total_tokens
+        )
+        
+        src_indices = torch.arange(total_tokens, device=device)
+        token_offsets = src_indices - extend_start[seq_ids]
+        tgt_indices = new_query_start_loc[seq_ids] + token_offsets
+        
+        def pad_tensor(x):
+            padded = torch.zeros(total_padded_tokens, *x.shape[1:], dtype=x.dtype, device=device)
+            padded[tgt_indices] = x
+            return padded
+        
+        padded_q = pad_tensor(q)
+        padded_k = pad_tensor(k)
+        padded_v = pad_tensor(v)
+        
+        new_key_start_loc = new_query_start_loc.clone()
+        new_seq_lens = padded_seq_lens
+        padded_cur_lens = padded_seq_lens
+        
+        return padded_q, padded_k, padded_v, new_query_start_loc, new_key_start_loc, new_seq_lens, padded_cur_lens, tgt_indices
 
     def support_triton(self):
         return False
