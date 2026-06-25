@@ -50,17 +50,17 @@ logger = logging.getLogger(__name__)
 
 
 class KunpengDispatchOutput(NamedTuple):
-    topk_weights: torch.Tensor
-    topk_ids_index: torch.Tensor
     num_tokens: int
-    batch_size: int
+    recv_tokens: int
+    packed_recv_x: torch.Tensor
+    combine_send_buf: torch.Tensor
+    recv_token_ids_buf: torch.Tensor
+    recv_experts_offset: torch.Tensor
+    max_dispatch_tokens_per_rank: int
 
 
 class KunpengCombineInput(NamedTuple):
-    topk_weights: torch.Tensor
-    topk_ids_index: torch.Tensor
     num_tokens: int
-    batch_size: int
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +92,10 @@ class _KunpengDispatcherState:
         self.recv_src_info: Optional[torch.Tensor] = None
         self.recv_src_info_bak: Optional[torch.Tensor] = None
         self.combined_x: Optional[torch.Tensor] = None
+
+        # topk_convert outputs (filled after dispatch_recv)
+        self.recv_token_ids_buf: Optional[torch.Tensor] = None
+        self.recv_experts_offset: Optional[torch.Tensor] = None
 
         self.topk_weights_buf: Optional[torch.Tensor] = None
         self.topk_ids_index_buf: Optional[torch.Tensor] = None
@@ -312,6 +316,13 @@ def _init_buffers(state: _KunpengDispatcherState):
         f"recv_src_info_bak={state.recv_src_info_bak.shape}"
     )
 
+    state.recv_token_ids_buf = torch.zeros(
+        num_ranks * max_dispatch_tokens * state.num_local_experts, dtype=torch.int32
+    )
+    state.recv_experts_offset = torch.zeros(
+        state.num_local_experts + 1, dtype=torch.int32
+    )
+
     state.combined_x = kernel.create_shm_tensor_kunpeng(
         torch.bfloat16, [state.dispatch_send_buf.size(0), state.hidden_size]
     )
@@ -367,11 +378,6 @@ def _init_combine(state: _KunpengDispatcherState):
         f"[KunpengMoE rank={state.ep_rank}] _init_combine: "
         f"combine_send_buf={state.combine_send_buf.shape}({state.combine_send_buf.dtype}), "
         f"combined_x={state.combined_x.shape}({state.combined_x.dtype}), "
-        f"num_max_tokens={state.dispatch_send_buf.size(0)}, "
-        f"num_experts={state.num_experts}, "
-        f"num_max_dispatch_tokens_per_rank={state.num_max_dispatch_tokens_per_rank}, "
-        f"router_topk={state.router_topk}, hidden_size={state.hidden_size}, "
-        f"attn_tp_rank={state.attn_tp_rank}, attn_tp_size={state.attn_tp_size}, "
         f"combine_recv_buf={state.combine_recv_buf.shape}({state.combine_recv_buf.dtype}), "
         f"use_static_route={state.use_static_route}"
     )
@@ -492,32 +498,31 @@ class KunpengDispatcher(BaseDispatcher):
         state.dispatch_call_count += 1
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
-        num_tokens = hidden_states.shape[0]
         topk = topk_ids.shape[1]
+        num_tokens = hidden_states.shape[0]
+        batch_size = num_tokens * self.attn_tp_size
 
         # Each TP rank writes to its own slice of the shared send buffer.
         # num_tokens is the per-TP-rank count after reduce-scatter;
         # the actual batch_size = num_tokens * attn_tp_size.
         # TP rank i writes into rows [i * num_tokens : (i+1) * num_tokens].
         t_quant_and_copy_start = time.perf_counter()
-        batch_size = num_tokens * self.attn_tp_size
         norm_int8_and_scale = state.dispatch_send_buf[: self.max_tokens]
         _tp_offset = self.attn_tp_rank * num_tokens
         _tp_count = num_tokens
 
-        abs_max = hidden_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
-        scale = abs_max / 127.0
-        quantized = (hidden_states / scale).round().clamp(-128, 127).to(torch.int8)
+        norm_int8 = norm_int8_and_scale[
+            _tp_offset : _tp_offset + _tp_count, : hidden_states.shape[1]
+        ].view(torch.int8)
+        norm_scale = norm_int8_and_scale[
+            _tp_offset : _tp_offset + _tp_count, hidden_states.shape[1] :
+        ].view(torch.float32)
 
-        _tp_slice = norm_int8_and_scale[_tp_offset : _tp_offset + _tp_count]
-        _tp_slice[:, : hidden_states.shape[1]].copy_(quantized.view(torch.uint8))
-        _tp_slice[:, hidden_states.shape[1] :].view(torch.float32).copy_(scale)
-
+        torch.ops.sgl_kernel.quant_kunpeng(hidden_states, norm_int8, norm_scale)
         t_quant_and_copy_end = time.perf_counter()
 
         # Build topk_ids_index and topk_weights per TP rank, then allgather across ATTN_TP
         t_topk_allg_start = time.perf_counter()
-
         _tp_idx_slice = state.topk_ids_index_buf[_tp_offset : _tp_offset + _tp_count]
         if _tp_count > 0:
             _tp_idx_slice.zero_()
@@ -561,6 +566,22 @@ class KunpengDispatcher(BaseDispatcher):
         )
         t_recv_end = time.perf_counter()
 
+        # Build token_ids and experts_offset from recv_src_info.
+        t_convert_start = time.perf_counter()
+        if state.dispatch_call_count % 2 == 1:
+            cur_src_info = state.recv_src_info
+        else:
+            cur_src_info = state.recv_src_info_bak
+        recv_tokens = torch.ops.sgl_kernel.topk_convert_kunpeng(
+            cur_src_info,
+            state.recv_token_ids_buf,
+            state.recv_experts_offset,
+            state.ep_size,
+            state.num_local_experts,
+            state.num_max_dispatch_tokens_per_rank,
+        )
+        t_convert_end = time.perf_counter()
+
         t_total_end = time.perf_counter()
         if envs.SGLANG_KUNPENG_PROFILE.get():
             logger.info(
@@ -570,24 +591,28 @@ class KunpengDispatcher(BaseDispatcher):
                 f"barrier={1000*(t_barrier_end - t_barrier_start):.2f}, "
                 f"dispatch_send={1000*(t_send_end - t_send_start):.2f}, "
                 f"dispatch_recv={1000*(t_recv_end - t_recv_start):.2f}, "
+                f"topk_convert={1000*(t_convert_end - t_convert_start):.2f}, "
                 f"total={1000*(t_total_end - t_total_start):.2f}, "
                 f"num_tokens={num_tokens}, batch_size={batch_size}"
             )
 
         return KunpengDispatchOutput(
-            topk_weights=state.topk_weights_buf,
-            topk_ids_index=state.topk_ids_index_buf,
             num_tokens=num_tokens,
-            batch_size=batch_size,
+            recv_tokens=recv_tokens,
+            packed_recv_x=state.packed_recv_x,
+            combine_send_buf=state.combine_send_buf,
+            recv_token_ids_buf=state.recv_token_ids_buf,
+            recv_experts_offset=state.recv_experts_offset,
+            max_dispatch_tokens_per_rank=state.num_max_dispatch_tokens_per_rank,
         )
 
     @KunpengProfiler(depth=2)
     def combine(self, combine_input: KunpengCombineInput) -> torch.Tensor:
         state = self._state
-        topk_weights = combine_input.topk_weights
-        topk_ids_index = combine_input.topk_ids_index
+        topk_weights = state.topk_weights_buf
+        topk_ids_index = state.topk_ids_index_buf
         num_tokens = combine_input.num_tokens
-        batch_size = combine_input.batch_size
+        batch_size = num_tokens * self.attn_tp_size
         if state.dispatch_call_count % 2 == 1:
             recv_src_info = state.recv_src_info
         else:
@@ -648,74 +673,6 @@ class KunpengDispatcher(BaseDispatcher):
             )
 
         return result
-
-    def dequantize_and_copy_to_combine(
-        self, dispatch_output: KunpengDispatchOutput, layer=None
-    ):
-        """Dequantize received int8+scale data, run expert computation, and copy into combine_send_buf.
-
-        If layer is provided, expert computation (W13 -> SwiGLU -> W2) is applied
-        per local_expert before writing to combine_send_buf.
-        Otherwise, dequantized data is copied directly (no expert computation).
-
-        Returns a tensor of shape [total_recv_tokens, hidden_size] ordered
-        by (local_expert, src_rank).
-        """
-        state = self._state
-        packed_recv_x = state.packed_recv_x
-        if state.dispatch_call_count % 2 == 1:
-            recv_src_info = state.recv_src_info
-        else:
-            recv_src_info = state.recv_src_info_bak
-        stride_per_rank = state.num_max_dispatch_tokens_per_rank * 2 + 1
-
-        send_bias = 0
-
-        for local_expert in range(state.num_local_experts):
-            expert_tokens = []
-            for src_rank in range(self.ep_size):
-                recv_nums = recv_src_info[
-                    local_expert, src_rank * stride_per_rank
-                ].item()
-                if recv_nums > 0:
-                    for k in range(recv_nums):
-                        token_row = packed_recv_x[
-                            local_expert,
-                            src_rank * state.num_max_dispatch_tokens_per_rank + k,
-                        ]
-                        int8_data = token_row[: self.hidden_size]
-                        scale_val = token_row[self.hidden_size :].view(torch.float32)
-                        dequant = (
-                            int8_data.view(torch.int8).to(torch.float32) * scale_val
-                        )
-                        dequant_bf16 = dequant.to(torch.bfloat16)
-                        expert_tokens.append(dequant_bf16)
-
-            if len(expert_tokens) == 0:
-                continue
-
-            expert_input = torch.stack(expert_tokens, dim=0)
-
-            if layer is not None:
-                w13 = layer.w13_weight[local_expert].to(torch.bfloat16)
-                w2 = layer.w2_weight[local_expert].to(torch.bfloat16)
-                if getattr(layer, "w13_weight_scale", None) is not None:
-                    w13 = w13 * layer.w13_weight_scale[local_expert].to(torch.bfloat16)
-                if getattr(layer, "w2_weight_scale", None) is not None:
-                    w2 = w2 * layer.w2_weight_scale[local_expert].to(torch.bfloat16)
-
-                h = F.linear(expert_input, w13)
-                h_gate, h_up = h.chunk(2, dim=-1)
-                h_act = F.silu(h_gate) * h_up
-                expert_output = F.linear(h_act, w2)
-            else:
-                expert_output = expert_input
-
-            num_tokens = expert_output.shape[0]
-            state.combine_send_buf[0, send_bias : send_bias + num_tokens] = (
-                expert_output
-            )
-            send_bias += num_tokens
 
     def __del__(self):
         # Only finalize when the process is shutting down.

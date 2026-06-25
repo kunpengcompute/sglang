@@ -176,6 +176,17 @@ void moe_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, at::Te
 
 void moe_combine_finalize_kunpeng();
 
+void igemm_fusedmoe_gateup_kunpeng(at::Tensor act, at::Tensor scale, at::Tensor experts_w13,
+                                   at::Tensor experts_w13_scale, at::Tensor token_ids, at::Tensor experts_offset,
+                                   at::Tensor moe_gateup, at::Tensor tmpx, at::Tensor tmpy, at::Tensor tmp_scales);
+
+void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8, at::Tensor experts_w2, at::Tensor moe_silu_scale,
+                                 at::Tensor experts_w2_scale, at::Tensor token_ids, at::Tensor experts_offset,
+                                 at::Tensor moe_down, at::Tensor tmpx, at::Tensor tmpy, at::Tensor tmp_scales);
+
+int64_t topk_convert_kunpeng(at::Tensor src_info, at::Tensor token_ids, at::Tensor experts_offset, int64_t num_ranks,
+                             int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank);
+
 // === SHM 算子声明 ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
@@ -457,6 +468,28 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("moe_combine_finalize_kunpeng() -> ()");
     m.impl("moe_combine_finalize_kunpeng", moe_combine_finalize_kunpeng);
+
+    m.def(
+        "igemm_fusedmoe_gateup_kunpeng("
+        "Tensor act, Tensor scale, Tensor experts_w13, Tensor experts_w13_scale, "
+        "Tensor token_ids, Tensor experts_offset, "
+        "Tensor(a!) moe_gateup, "
+        "Tensor tmpx, Tensor tmpy, Tensor tmp_scales) -> ()");
+    m.impl("igemm_fusedmoe_gateup_kunpeng", igemm_fusedmoe_gateup_kunpeng);
+
+    m.def(
+        "igemm_fusedmoe_down_kunpeng("
+        "Tensor moe_silu_int8, Tensor experts_w2, Tensor moe_silu_scale, "
+        "Tensor experts_w2_scale, Tensor token_ids, Tensor experts_offset, "
+        "Tensor(a!) moe_down, "
+        "Tensor tmpx, Tensor tmpy, Tensor tmp_scales) -> ()");
+    m.impl("igemm_fusedmoe_down_kunpeng", igemm_fusedmoe_down_kunpeng);
+
+    m.def(
+        "topk_convert_kunpeng("
+        "Tensor src_info, Tensor(a!) token_ids, Tensor(b!) experts_offset, "
+        "int num_ranks, int num_local_experts, int num_max_dispatch_tokens_per_rank) -> int");
+    m.impl("topk_convert_kunpeng", topk_convert_kunpeng);
 
     // SHM operators
     m.def("shm_pool_create_kunpeng(int intra_node_pg, int intra_socket_pg, int intra_die_pg, int shm_size_mb) -> ()");
