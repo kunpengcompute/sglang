@@ -236,46 +236,35 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 True,  # is_vnni
             )
         if _is_cpu_920f:
-            # quant
-            batch_size = x.shape[0]
-            dim = x.shape[1]
-            scale_size = 4  # fp32
-            row_bytes = dim + scale_size
-            total_bytes = batch_size * row_bytes
-            norm_int8_and_scale = torch.zeros((total_bytes), dtype=torch.uint8)
-
-            int8_shape = (batch_size, dim)
-            int8_strides = (row_bytes, 1)  # (7172, 1)
-            norm_int8 = norm_int8_and_scale.view(torch.int8).as_strided(
-                int8_shape, int8_strides
-            )
-
-            f32_shape = (batch_size, 1)
-            f32_strides = (row_bytes // 4, 1)
-            scale_start_offset = dim
-            norm_scale = (
-                norm_int8_and_scale[scale_start_offset:]
-                .view(torch.float32)
-                .as_strided(f32_shape, f32_strides)
-            )
-
-            torch.ops.sgl_kernel.quant_kunpeng(x, norm_int8, norm_scale)
+            if isinstance(x, tuple):
+                # Pre-quantized input (e.g. from silu_mul_quant_kunpeng):
+                # x = (x_int8, x_scale), x_int8: [m, k] int8, x_scale: [m, 1] float32
+                norm_int8, norm_scale = x
+                batch_size = norm_int8.shape[0]
+            else:
+                # quant
+                batch_size = x.shape[0]
+                dim = x.shape[1]
+                norm_int8 = torch.empty((batch_size, dim), dtype=torch.int8)
+                norm_scale = torch.empty((batch_size, 1), dtype=torch.float32)
+                torch.ops.sgl_kernel.quant_kunpeng(x, norm_int8, norm_scale)
 
             # gemm
-            m = batch_size
             n, k = layer.weight.shape
             tile_m, tile_n, tile_k = (
-                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
+                    batch_size, n, k, 32
+                )
             )
 
-            output = torch.empty([m, n], dtype=torch.bfloat16)
+            output = torch.empty([batch_size, n], dtype=torch.bfloat16)
 
             pack_a = torch.empty_like(norm_int8)
             torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
                 norm_int8.contiguous(), pack_a, tile_m, tile_k
             )
 
-            workspace_size = m * n * 64
+            workspace_size = batch_size * n * 64
             workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
 
             torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(

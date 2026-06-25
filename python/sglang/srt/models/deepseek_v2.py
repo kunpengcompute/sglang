@@ -295,44 +295,12 @@ class DeepseekV2MLP(nn.Module):
                 gate_up, gateup_int8, gateup_scale
             )
 
-            # down proj
-            n, k = self.down_proj.weight.shape
-            tile_m, tile_n, tile_k = (
-                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+            # down proj with pre-quantized int8 input
+            x, _ = self.down_proj(
+                (gateup_int8, gateup_scale),
+                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
             )
-
-            pack_a = torch.empty_like(gateup_int8)
-            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
-                gateup_int8.contiguous(), pack_a, tile_m, tile_k
-            )
-
-            workspace_size = m * n * 64
-            workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
-
-            out = torch.empty([m, n], dtype=torch.bfloat16)
-
-            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
-                pack_a,
-                self.down_proj.weight,
-                self.down_proj.weight_scale.view(-1),
-                gateup_scale.contiguous().view(-1),
-                out,
-                workspace,
-                32,
-            )
-
-            # allreduce
-            if (
-                self.down_proj.reduce_results
-                and self.tp_size > 1
-                and not (should_allreduce_fusion or use_reduce_scatter)
-            ):
-                if self.use_dp_attention_reduce:
-                    out = get_attention_tp_group().all_reduce(out)
-                else:
-                    out = tensor_model_parallel_all_reduce(out)
-
-            return out
+            return x
 
 
 class MoEGate(nn.Module):
