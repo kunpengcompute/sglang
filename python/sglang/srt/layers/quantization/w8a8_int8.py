@@ -236,29 +236,48 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 True,  # is_vnni
             )
         if _is_cpu_920f:
+            print(
+                f"enter W8A8Int8LinearMethod.apply, x.shape={x.shape}, layer.weight.shape={layer.weight.shape}",
+                flush=True,
+            )
             weight = layer.weight.t()
-        else:
-            weight = layer.weight
+            x_q, x_scale = per_token_quant_int8(x)
+
+            x_q_2d = x_q.view(-1, x_q.shape[-1])
+            x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
+            output_shape = [*x_q.shape[:-1], weight.shape[1]]
+
+            def int8_scaled_mm(x_q, w_q, x_scale, w_scale, out_dtype, bias=None):
+                # fix mlp gate_up_proj
+                output_fp32 = torch.mm(x_q.float(), w_q.float())
+                output_float = output_fp32 * x_scale * w_scale.t()
+
+                output = output_float.to(out_dtype)
+                if bias is not None:
+                    output += bias
+
+                return output
+
+            output = int8_scaled_mm(
+                x_q_2d,
+                weight,
+                x_scale_2d,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
+
+            return output.view(output_shape)
+
         x_q, x_scale = per_token_quant_int8(x)
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
-        output_shape = [*x_q.shape[:-1], weight.shape[1]]
-
-        def int8_scaled_mm(x_q, w_q, x_scale, w_scale, out_dtype, bias=None):
-            # fix mlp gate_up_proj
-            output_fp32 = torch.mm(x_q.float(), w_q.float())
-            output_float = output_fp32 * x_scale * w_scale.t()
-            
-            output = output_float.to(out_dtype)
-            if bias is not None:
-                output += bias
-                
-            return output
+        output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
 
         output = int8_scaled_mm(
             x_q_2d,
-            weight,
+            layer.weight,
             x_scale_2d,
             layer.weight_scale,
             out_dtype=x.dtype,

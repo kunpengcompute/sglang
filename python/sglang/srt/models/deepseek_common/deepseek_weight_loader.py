@@ -458,30 +458,6 @@ class DeepseekV2WeightLoaderMixin:
                 else self.model.decoder.self_attn
             )
 
-            if _is_cpu_920f:
-                # attention igemm prepack
-                for proj in [
-                    "fused_qkv_a_proj_with_mqa",
-                    "q_b_proj",
-                    "o_proj",
-                    "q_proj",
-                    "kv_a_proj_with_mqa",
-                    # "kv_b_proj",
-                ]:
-                    if hasattr(self_attn, proj):
-                        _kunpeng_prepack_igemm_weight(getattr(self_attn, proj).weight)
-
-                # mlp gate_up_proj and down_proj prepack
-                mlp = self.model.layers[layer_id].mlp
-                for mlp_module in [mlp] + (
-                    [mlp.shared_experts] if hasattr(mlp, "shared_experts") else []
-                ):
-                    if hasattr(mlp_module, "gate_up_proj"):
-                        _kunpeng_prepack_igemm_weight(mlp_module.gate_up_proj.weight)
-
-                    if hasattr(mlp_module, "down_proj"):
-                        _kunpeng_prepack_igemm_weight(mlp_module.down_proj.weight)
-
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
                 awq_dequantize_f = awq_dequantize_func()
@@ -674,6 +650,30 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+            if _is_cpu_920f:
+                # attention igemm prepack
+                for proj in [
+                    "fused_qkv_a_proj_with_mqa",
+                    "q_b_proj",
+                    "o_proj",
+                    "q_proj",
+                    "kv_a_proj_with_mqa",
+                    "kv_b_proj",
+                ]:
+                    if hasattr(self_attn, proj):
+                        _kunpeng_prepack_igemm_weight(getattr(self_attn, proj).weight)
+
+                # mlp gate_up_proj and down_proj prepack
+                mlp = self.model.layers[layer_id].mlp
+                for mlp_module in [mlp] + (
+                    [mlp.shared_experts] if hasattr(mlp, "shared_experts") else []
+                ):
+                    if hasattr(mlp_module, "gate_up_proj"):
+                        _kunpeng_prepack_igemm_weight(mlp_module.gate_up_proj.weight)
+
+                    if hasattr(mlp_module, "down_proj"):
+                        _kunpeng_prepack_igemm_weight(mlp_module.down_proj.weight)
 
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
