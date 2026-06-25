@@ -454,7 +454,7 @@ class KunpengCpuBackend(AttentionBackend):
         tgt_indices = None
 
         if self.attn_is_kv_packed:
-            # Align to 1024 boundary (for PagedAttention block efficiency) and reserve 100 tokens for decoding length variance
+            # kv_is_packed=True: pre-pack KV into aligned buffer
             max_seq_len = int(
                 ((forward_batch.seq_lens.max().item() + 1023) // 1024) * 1024 + 100
             )
@@ -462,51 +462,48 @@ class KunpengCpuBackend(AttentionBackend):
             pack_attn_k = packed_k
             pack_attn_v = packed_v
         else:
+            # kv_is_packed=False: pad q/k/v to 32-align, use per-thread workspace buffers
             (
-                q,
-                packed_k,
-                packed_v,
+                q, packed_k, packed_v,
                 self.forward_metadata.query_start_loc,
                 self.forward_metadata.key_start_loc,
                 self.forward_metadata.attn_seq_lens,
                 self.forward_metadata.attn_cur_lens,
                 tgt_indices,
             ) = self.pad_flash_attn_metadata(
-                q,
-                k,
-                v,
+                q, k, v,
                 self.forward_metadata.query_start_loc,
                 forward_batch.extend_seq_lens,
             )
-            # Reallocate attn_o to match padded token count
             padded_token_count = q.shape[0]
             if self.enable_hbw_pool:
-                if (
-                    hasattr(self.forward_metadata, "attn_o_handle")
-                    and self.forward_metadata.attn_o_handle is not None
-                ):
+                if (hasattr(self.forward_metadata, "attn_o_handle")
+                        and self.forward_metadata.attn_o_handle is not None):
                     self.hbw_pool.free(self.forward_metadata.attn_o_handle)
-                (
-                    self.forward_metadata.attn_o,
-                    self.forward_metadata.attn_o_handle,
-                ) = self.hbw_pool.alloc(
-                    shape=(
-                        padded_token_count,
-                        self.num_local_heads,
-                        self.v_head_dim,
-                    ),
-                    dtype=self.q_data_type,
-                )
+                self.forward_metadata.attn_o, self.forward_metadata.attn_o_handle = \
+                    self.hbw_pool.alloc(
+                        shape=(padded_token_count, self.num_local_heads, self.v_head_dim),
+                        dtype=self.q_data_type,
+                    )
             else:
                 self.forward_metadata.attn_o = torch.empty(
                     (padded_token_count, self.num_local_heads, self.v_head_dim),
-                    dtype=self.q_data_type,
-                    device=self.device,
+                    dtype=self.q_data_type, device=self.device,
                 )
+            pack_k_len = ((max(self.forward_metadata.attn_seq_lens).item() + self.block_col - 1)
+                          // self.block_col * self.block_col)
+            pack_attn_k = torch.empty(
+                (self.attn_thread_num, pack_k_len, self.qk_head_dim),
+                dtype=self.data_type, device=self.device,
+            )
+            pack_attn_v = torch.empty(
+                (self.attn_thread_num, pack_k_len, self.v_head_dim),
+                dtype=self.data_type, device=self.device,
+            )
 
         if self.enable_debug:
             logger.info(
-                f"[kunpeng_attention] start to flash_attention (packed={self.attn_is_kv_packed})\n"
+                f"[kunpeng_attention] start to flash_attention_kunpeng\n"
                 f"[kunpeng_attention] ========== Layer {layer.layer_id} Shape Debug ==========\n"
                 f"[kunpeng_attention] bs: {forward_batch.batch_size}\n"
                 f"[kunpeng_attention] forward seq_len: {forward_batch.seq_lens}\n"
@@ -520,43 +517,28 @@ class KunpengCpuBackend(AttentionBackend):
                 f"[kunpeng_attention] seq_lens : {self.forward_metadata.attn_seq_lens}\n"
             )
 
-        if self.attn_is_kv_packed:
-            torch.ops.sgl_kernel.flash_attention_kunpeng(
-                q=q,
-                k=packed_k,
-                v=packed_v,
-                out=self.forward_metadata.attn_o,
-                pack_attn_q=packed_q,
-                pack_attn_k=pack_attn_k,
-                pack_attn_v=pack_attn_v,
-                attn_s=self.forward_metadata.attn_s,
-                attn_out_block_old=self.forward_metadata.attn_out_block_old,
-                attn_out_block_new=self.forward_metadata.attn_out_block_new,
-                attn_max_block_old=self.forward_metadata.attn_max_block_old,
-                attn_max_block_new=self.forward_metadata.attn_max_block_new,
-                attn_base_block_old=self.forward_metadata.attn_base_block_old,
-                attn_base_block_new=self.forward_metadata.attn_base_block_new,
-                causal=True,
-                softmax_scale=layer.scaling,
-                query_start_loc=self.forward_metadata.query_start_loc,
-                key_start_loc=self.forward_metadata.key_start_loc,
-                chunked_prefill_size=512,
-                seq_lens=self.forward_metadata.attn_seq_lens.tolist(),
-                cur_lens=self.forward_metadata.attn_cur_lens.tolist(),
-                is_kv_packed=True,
-            )
-        else:
-            logger.info(f"[kunpeng_attention] flash_attention bs: {forward_batch.batch_size}")
-            torch.ops.sgl_kernel.varlen_attention_kunpeng(
-                q=q,
-                k=packed_k,
-                v=packed_v,
-                out=self.forward_metadata.attn_o,
-                causal=True,
-                softmax_scale=layer.scaling,
-                query_start_loc=self.forward_metadata.query_start_loc,
-                key_start_loc=self.forward_metadata.key_start_loc,
-            )
+        torch.ops.sgl_kernel.flash_attention_kunpeng(
+            q=q, k=packed_k, v=packed_v,
+            out=self.forward_metadata.attn_o,
+            pack_attn_q=packed_q,
+            pack_attn_k=pack_attn_k,
+            pack_attn_v=pack_attn_v,
+            attn_s=self.forward_metadata.attn_s,
+            attn_out_block_old=self.forward_metadata.attn_out_block_old,
+            attn_out_block_new=self.forward_metadata.attn_out_block_new,
+            attn_max_block_old=self.forward_metadata.attn_max_block_old,
+            attn_max_block_new=self.forward_metadata.attn_max_block_new,
+            attn_base_block_old=self.forward_metadata.attn_base_block_old,
+            attn_base_block_new=self.forward_metadata.attn_base_block_new,
+            causal=True,
+            softmax_scale=layer.scaling,
+            query_start_loc=self.forward_metadata.query_start_loc,
+            key_start_loc=self.forward_metadata.key_start_loc,
+            chunked_prefill_size=512,
+            seq_lens=self.forward_metadata.attn_seq_lens.tolist(),
+            cur_lens=self.forward_metadata.attn_cur_lens.tolist(),
+            is_kv_packed=self.attn_is_kv_packed,
+        )
 
         if tgt_indices is not None:
             return self.forward_metadata.attn_o[tgt_indices].reshape(
@@ -845,18 +827,15 @@ class KunpengCpuBackend(AttentionBackend):
 
         bs = seq_lens.size(0)
         device = q.device
-        
-        # 每个序列填充到32的倍数
+
         padded_seq_lens = torch.ceil(seq_lens / 32).to(torch.int32) * 32
-        
-        # 计算起始位置
         new_query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=device)
         new_query_start_loc[1:] = torch.cumsum(padded_seq_lens, dim=0)
         total_padded_tokens = new_query_start_loc[-1].item()
-        
+
         total_tokens = q.size(0)
 
-        # seq_lens = forward_batch.extend_seq_lens, should sum to total_tokens
+        # seq_lens should sum to total_tokens
         sum_seq_lens = seq_lens.sum().item()
         if sum_seq_lens != total_tokens:
             logger.error(
