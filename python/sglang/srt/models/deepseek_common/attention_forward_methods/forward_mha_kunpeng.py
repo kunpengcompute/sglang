@@ -234,11 +234,88 @@ class DeepseekMHAKunpengForwardMixin:
             k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
 
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
+            # quant
+            batch_size = hidden_states.shape[0]
+            dim = hidden_states.shape[-1]
+            scale_size = 4  # fp32
+            row_bytes = dim + scale_size
+            total_bytes = batch_size * row_bytes
+            norm_int8_and_scale = torch.zeros((total_bytes), dtype=torch.uint8)
+
+            int8_shape = (batch_size, dim)
+            int8_strides = (row_bytes, 1)  # (7172, 1)
+            norm_int8 = norm_int8_and_scale.view(torch.int8).as_strided(
+                int8_shape, int8_strides
             )
 
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            f32_shape = (batch_size, 1)
+            f32_strides = (row_bytes // 4, 1)
+            scale_start_offset = dim
+            norm_scale = (
+                norm_int8_and_scale[scale_start_offset:]
+                .view(torch.float32)
+                .as_strided(f32_shape, f32_strides)
+            )
+
+            torch.ops.sgl_kernel.quant_kunpeng(hidden_states, norm_int8, norm_scale)
+
+            # qa
+            m = batch_size
+            n, k = self.q_proj.weight.shape
+
+            tile_m, tile_n, tile_k = (
+                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+            )
+
+            out = torch.empty([m, n], dtype=torch.bfloat16)
+
+            pack_a = torch.empty_like(norm_int8)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                norm_int8.contiguous(), pack_a, tile_m, tile_k
+            )
+
+            workspace_size = m * n * 32
+            workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
+
+            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
+                pack_a,
+                self.q_proj.weight,
+                self.q_proj.weight_scale.view(-1),
+                norm_scale.contiguous().view(-1),
+                out,
+                workspace,
+                32,
+            )
+
+            q = out.view(-1, self.num_local_heads, self.qk_head_dim)
+
+            # qa
+            m = batch_size
+            n, k = self.kv_a_proj_with_mqa.weight.shape
+
+            tile_m, tile_n, tile_k = (
+                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+            )
+
+            latent_cache = torch.empty([m, n], dtype=torch.bfloat16)
+
+            pack_a = torch.empty_like(norm_int8)
+            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                norm_int8.contiguous(), pack_a, tile_m, tile_k
+            )
+
+            workspace_size = m * n * 32
+            workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
+
+            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
+                pack_a,
+                self.kv_a_proj_with_mqa.weight,
+                self.kv_a_proj_with_mqa.weight_scale.view(-1),
+                norm_scale.contiguous().view(-1),
+                latent_cache,
+                workspace,
+                32,
+            )
 
             _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 

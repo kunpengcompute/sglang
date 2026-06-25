@@ -464,8 +464,8 @@ class DeepseekV2WeightLoaderMixin:
                     "fused_qkv_a_proj_with_mqa",
                     "q_b_proj",
                     "o_proj",
-                    # "q_proj",
-                    # "kv_a_proj_with_mqa",
+                    "q_proj",
+                    "kv_a_proj_with_mqa",
                     # "kv_b_proj",
                 ]:
                     if hasattr(self_attn, proj):
