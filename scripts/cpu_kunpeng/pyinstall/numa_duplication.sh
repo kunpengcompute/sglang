@@ -18,11 +18,6 @@ BASE_DIR="./dist"
 SOURCE="${BASE_DIR}/sglang_server"
 PREFIX="sglang_server_tp"
 
-if [ ! -e "$SOURCE" ]; then
-    echo "[numa_duplication] error: source file: $SOURCE not found!"
-    exit 1
-fi
-
 if [ -e "$SOURCE" ]; then
     mv "$SOURCE" "${BASE_DIR}/${PREFIX}0"
     echo "[numa_duplication] source file rename to: ${PREFIX}0"

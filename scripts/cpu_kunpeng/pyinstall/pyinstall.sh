@@ -69,7 +69,7 @@ if [ ! -f sglang_server.spec ]; then
       --hidden-import atomics \
       --hidden-import distro \
       --hidden-import partial_json_parser \
-      --hidden-import transformer \
+      --hidden-import transformers \
       --hidden-import transformers.models.ernie4_5 \
       --hidden-import transformers.models.ernie4_5_moe \
       --hidden-import msgspec \
