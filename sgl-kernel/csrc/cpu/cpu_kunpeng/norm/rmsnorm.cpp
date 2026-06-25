@@ -125,7 +125,7 @@ void fused_add_rmsnorm_kunpeng(at::Tensor acts, at::Tensor residual, at::Tensor 
     bfloat16_t *acts_ptr = reinterpret_cast<bfloat16_t *>(acts.data_ptr());
     const bfloat16_t *weights_ptr = reinterpret_cast<const bfloat16_t *>(weights.data_ptr());
     bfloat16_t *outs_ptr = reinterpret_cast<bfloat16_t *>(outs.data_ptr());
-    const bfloat16_t *residual_ptr = reinterpret_cast<const bfloat16_t *>(residual.data_ptr());
+    bfloat16_t *residual_ptr = reinterpret_cast<bfloat16_t *>(residual.data_ptr());
 
     kutacc::rmsnorm<true>(height, width, acts_ptr, acts.stride(0), weights_ptr, static_cast<float>(eps), residual_ptr,
                            outs_ptr);
