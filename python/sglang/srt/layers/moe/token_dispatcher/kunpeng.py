@@ -500,7 +500,7 @@ class KunpengDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids
         topk = topk_ids.shape[1]
         num_tokens = hidden_states.shape[0]
-        batch_size = num_tokens # * self.attn_tp_size
+        batch_size = num_tokens
 
         # Each TP rank writes to its own slice of the shared send buffer.
         # num_tokens is the per-TP-rank count after reduce-scatter;
@@ -508,7 +508,7 @@ class KunpengDispatcher(BaseDispatcher):
         # TP rank i writes into rows [i * num_tokens : (i+1) * num_tokens].
         t_quant_and_copy_start = time.perf_counter()
         norm_int8_and_scale = state.dispatch_send_buf[: self.max_tokens]
-        _tp_offset = 0 # self.attn_tp_rank * num_tokens
+        _tp_offset = 0
         _tp_count = num_tokens
 
         norm_int8 = norm_int8_and_scale[
@@ -532,12 +532,6 @@ class KunpengDispatcher(BaseDispatcher):
             ]
             _tp_weights_slice.copy_(topk_weights)
 
-            # kernel.shm_dual_allgather_kunpeng(
-            #     _tp_idx_slice,
-            #     state.topk_ids_index_buf[:batch_size],
-            #     _tp_weights_slice,
-            #     state.topk_weights_buf[:batch_size],
-            # )
         t_topk_allg_end = time.perf_counter()
 
         # Dispatch barrier
@@ -612,7 +606,7 @@ class KunpengDispatcher(BaseDispatcher):
         topk_weights = state.topk_weights_buf
         topk_ids_index = state.topk_ids_index_buf
         num_tokens = combine_input.num_tokens
-        batch_size = num_tokens # * self.attn_tp_size
+        batch_size = num_tokens
         if state.dispatch_call_count % 2 == 1:
             recv_src_info = state.recv_src_info
         else:
@@ -658,7 +652,7 @@ class KunpengDispatcher(BaseDispatcher):
         )
         t_recv_end = time.perf_counter()
 
-        _tp_offset = 0 # self.attn_tp_rank * num_tokens
+        _tp_offset = 0
         result = state.combined_x[_tp_offset : _tp_offset + num_tokens]
 
         t_total_end = time.perf_counter()
