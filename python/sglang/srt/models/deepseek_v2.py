@@ -1742,13 +1742,22 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
+        if _is_cpu_920f:
+            self.layer_scatter_modes = LayerScatterModes.init_new(
+                layer_id=layer_id,
+                num_layers=1 if is_nextn else config.num_hidden_layers,
+                is_layer_sparse=False,
+                is_previous_layer_sparse=False,
+                is_next_layer_sparse=False,
+            )
+        else:
+            self.layer_scatter_modes = LayerScatterModes.init_new(
+                layer_id=layer_id,
+                num_layers=1 if is_nextn else config.num_hidden_layers,
+                is_layer_sparse=self.is_layer_sparse,
+                is_previous_layer_sparse=is_previous_layer_sparse,
+                is_next_layer_sparse=is_next_layer_sparse,
+            )
 
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
