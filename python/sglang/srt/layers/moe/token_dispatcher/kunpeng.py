@@ -333,6 +333,7 @@ def _init_buffers(state: _KunpengDispatcherState):
     state.topk_ids_index_buf = kernel.create_shm_tensor_kunpeng(
         torch.int16, [state.max_tokens, state.router_topk * 2]
     )
+    state.topk_ids_index_buf.zero_()
 
     logger.info(
         f"[KunpengMoE rank={state.ep_rank}] _init_buffers combined_x: "
@@ -499,8 +500,8 @@ class KunpengDispatcher(BaseDispatcher):
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
         topk = topk_ids.shape[1]
-        num_tokens = hidden_states.shape[0]
-        batch_size = num_tokens
+        batch_size = hidden_states.shape[0]
+        num_tokens = batch_size / self.attn_tp_size
 
         # Each TP rank writes to its own slice of the shared send buffer.
         # num_tokens is the per-TP-rank count after reduce-scatter;
@@ -508,7 +509,7 @@ class KunpengDispatcher(BaseDispatcher):
         # TP rank i writes into rows [i * num_tokens : (i+1) * num_tokens].
         t_quant_and_copy_start = time.perf_counter()
         norm_int8_and_scale = state.dispatch_send_buf[: self.max_tokens]
-        _tp_offset = 0
+        _tp_offset = self.attn_tp_rank * num_tokens
         _tp_count = num_tokens
 
         norm_int8 = norm_int8_and_scale[
@@ -523,14 +524,9 @@ class KunpengDispatcher(BaseDispatcher):
 
         # Build topk_ids_index and topk_weights per TP rank, then allgather across ATTN_TP
         t_topk_allg_start = time.perf_counter()
-        _tp_idx_slice = state.topk_ids_index_buf[_tp_offset : _tp_offset + _tp_count]
         if _tp_count > 0:
-            _tp_idx_slice.zero_()
-            _tp_idx_slice[:, 0::2] = topk_ids.to(torch.int16)
-            _tp_weights_slice = state.topk_weights_buf[
-                _tp_offset : _tp_offset + _tp_count
-            ]
-            _tp_weights_slice.copy_(topk_weights)
+            state.topk_ids_index_buf[: batch_size, 0::2] = topk_ids.to(torch.int16)
+            state.topk_weights_buf[: batch_size].copy_(topk_weights)
 
         t_topk_allg_end = time.perf_counter()
 
@@ -606,7 +602,7 @@ class KunpengDispatcher(BaseDispatcher):
         topk_weights = state.topk_weights_buf
         topk_ids_index = state.topk_ids_index_buf
         num_tokens = combine_input.num_tokens
-        batch_size = num_tokens
+        batch_size = num_tokens * self.attn_tp_size
         if state.dispatch_call_count % 2 == 1:
             recv_src_info = state.recv_src_info
         else:
@@ -652,8 +648,7 @@ class KunpengDispatcher(BaseDispatcher):
         )
         t_recv_end = time.perf_counter()
 
-        _tp_offset = 0
-        result = state.combined_x[_tp_offset : _tp_offset + num_tokens]
+        result = state.combined_x[: batch_size]
 
         t_total_end = time.perf_counter()
         if envs.SGLANG_KUNPENG_PROFILE.get():
