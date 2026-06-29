@@ -391,6 +391,51 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
     }
 }
 
+void load_balance_padded_tokens_kunpeng(
+    at::Tensor topk_ids,
+    int64_t num_token_non_padded,
+    int64_t num_experts,
+    int64_t topk)
+{
+    TORCH_CHECK(topk_ids.scalar_type() == at::kInt, "topk_ids must be int32");
+    TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D");
+    TORCH_CHECK(topk_ids.size(1) == topk, "topk_ids.size(1) must equal topk");
+
+    int32_t *topk_ids_data = topk_ids.data_ptr<int32_t>();
+    int64_t num_total = topk_ids.size(0);
+    int64_t pad_start = num_token_non_padded;
+    int64_t num_pad = num_total - pad_start;
+
+    if (num_pad <= 0)
+        return;
+
+    SmallVector<float, 512> load_(num_experts);
+    float *load = load_.data();
+    memset(load, 0, num_experts * sizeof(float));
+
+    for (int64_t i = 0; i < pad_start; i++) {
+        for (int64_t j = 0; j < topk; j++) {
+            int32_t expert_id = topk_ids_data[i * topk + j];
+            load[expert_id] += 1.0f;
+        }
+    }
+
+    for (int64_t i = 0; i < num_pad; i++) {
+        for (int64_t j = 0; j < topk; j++) {
+            float min_val = std::numeric_limits<float>::max();
+            int32_t min_idx = 0;
+            for (int64_t e = 0; e < num_experts; e++) {
+                if (load[e] < min_val) {
+                    min_val = load[e];
+                    min_idx = static_cast<int32_t>(e);
+                }
+            }
+            topk_ids_data[(pad_start + i) * topk + j] = min_idx;
+            load[min_idx] += 1.0f;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // igemm_fusedmoe_gateup_kunpeng
 //

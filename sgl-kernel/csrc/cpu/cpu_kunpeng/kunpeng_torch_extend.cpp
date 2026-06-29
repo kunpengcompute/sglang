@@ -187,6 +187,9 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8, at::Tensor experts_w2
 int64_t topk_convert_kunpeng(at::Tensor src_info, at::Tensor token_ids, at::Tensor experts_offset, int64_t num_ranks,
                              int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank);
 
+void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, int64_t num_token_non_padded,
+                                        int64_t num_experts, int64_t topk);
+
 // === SHM 算子声明 ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
@@ -419,6 +422,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "bool renormalize=False, bool scoring_func_sigmoid=False, "
         "bool moe_balance=False, int v2=0) -> ()");
     m.impl("grouped_topk_kunpeng", grouped_topk_kunpeng);
+
+    m.def(
+        "load_balance_padded_tokens_kunpeng("
+        "Tensor(a!) topk_ids, int num_token_non_padded, "
+        "int num_experts, int topk) -> ()");
+    m.impl("load_balance_padded_tokens_kunpeng", load_balance_padded_tokens_kunpeng);
 
     m.def("moe_comm_create_kunpeng(int process_group_ptr) -> ()");
     m.impl("moe_comm_create_kunpeng", moe_comm_create_kunpeng);
