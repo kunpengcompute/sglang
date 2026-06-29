@@ -501,7 +501,7 @@ class KunpengDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids
         topk = topk_ids.shape[1]
         batch_size = hidden_states.shape[0]
-        num_tokens = batch_size / self.attn_tp_size
+        num_tokens = batch_size // self.attn_tp_size
 
         # Each TP rank writes to its own slice of the shared send buffer.
         # num_tokens is the per-TP-rank count after reduce-scatter;
@@ -519,7 +519,8 @@ class KunpengDispatcher(BaseDispatcher):
             _tp_offset : _tp_offset + _tp_count, hidden_states.shape[1] :
         ].view(torch.float32)
 
-        torch.ops.sgl_kernel.quant_kunpeng(hidden_states, norm_int8, norm_scale)
+        torch.ops.sgl_kernel.quant_kunpeng(hidden_states[
+            _tp_offset : _tp_offset + _tp_count], norm_int8, norm_scale)
         t_quant_and_copy_end = time.perf_counter()
 
         # Build topk_ids_index and topk_weights per TP rank, then allgather across ATTN_TP
