@@ -391,11 +391,8 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
     }
 }
 
-void load_balance_padded_tokens_kunpeng(
-    at::Tensor topk_ids,
-    int64_t num_token_non_padded,
-    int64_t num_experts,
-    int64_t topk)
+void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, int64_t num_token_non_padded, int64_t num_experts,
+                                        int64_t topk)
 {
     TORCH_CHECK(topk_ids.scalar_type() == at::kInt, "topk_ids must be int32");
     TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D");
@@ -406,8 +403,7 @@ void load_balance_padded_tokens_kunpeng(
     int64_t pad_start = num_token_non_padded;
     int64_t num_pad = num_total - pad_start;
 
-    if (num_pad <= 0)
-        return;
+    if (num_pad <= 0) return;
 
     SmallVector<float, 512> load_(num_experts);
     float *load = load_.data();
