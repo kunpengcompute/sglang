@@ -519,15 +519,16 @@ class KunpengDispatcher(BaseDispatcher):
             _tp_offset : _tp_offset + _tp_count, hidden_states.shape[1] :
         ].view(torch.float32)
 
-        torch.ops.sgl_kernel.quant_kunpeng(hidden_states[
-            _tp_offset : _tp_offset + _tp_count], norm_int8, norm_scale)
+        torch.ops.sgl_kernel.quant_kunpeng(
+            hidden_states[_tp_offset : _tp_offset + _tp_count], norm_int8, norm_scale
+        )
         t_quant_and_copy_end = time.perf_counter()
 
         # Build topk_ids_index and topk_weights per TP rank, then allgather across ATTN_TP
         t_topk_allg_start = time.perf_counter()
         if _tp_count > 0:
-            state.topk_ids_index_buf[: batch_size, 0::2] = topk_ids.to(torch.int16)
-            state.topk_weights_buf[: batch_size].copy_(topk_weights)
+            state.topk_ids_index_buf[:batch_size, 0::2] = topk_ids.to(torch.int16)
+            state.topk_weights_buf[:batch_size].copy_(topk_weights)
 
         t_topk_allg_end = time.perf_counter()
 
@@ -649,7 +650,7 @@ class KunpengDispatcher(BaseDispatcher):
         )
         t_recv_end = time.perf_counter()
 
-        result = state.combined_x[: batch_size]
+        result = state.combined_x[:batch_size]
 
         t_total_end = time.perf_counter()
         if envs.SGLANG_KUNPENG_PROFILE.get():
