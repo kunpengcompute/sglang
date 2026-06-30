@@ -25,19 +25,17 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_world_size,
     get_attn_tp_group,
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+    get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.moe.token_dispatcher.base import (
-    BaseDispatcher,
-)
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
-from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
+from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 
 kernel = torch.ops.sgl_kernel
 

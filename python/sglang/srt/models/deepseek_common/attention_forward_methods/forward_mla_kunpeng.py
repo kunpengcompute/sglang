@@ -46,8 +46,8 @@ class DeepseekMLAKunpengForwardMixin:
         topk_indices = None
         if self.q_lora_rank is not None:
 
-            # fused_qkv_a_proj_with_mqa
-            qkva, _ = self.fused_qkv_a_proj_with_mqa(hidden_states)
+            # fused_qkv_a_proj_with_mqa (via prepare_qkv_latent)
+            qkva = self.prepare_qkv_latent(hidden_states, forward_batch)
             q, latent_cache = qkva.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,

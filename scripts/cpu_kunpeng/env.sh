@@ -69,6 +69,7 @@ MODEL_PATH="/path-to-deepseek-r1-channel-int8"
 
 export HPCKIT_PATH="/path-to-HPCKit"
 export OpenBLAS_PATH="/path-to-OpenBLAS"
+export KUPL_PATH="/path-to-KUPL"
 export KUTACC_PATH="/path-to-KUTACC"
 export SGLANG_PATH="/path-to-SGLang"
 export CONDA_ENV_PATH="$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME"
@@ -138,6 +139,7 @@ prefill_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="prefill"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
+    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 }
 
 # ------------------------------------------------------------
@@ -151,6 +153,7 @@ decode_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="decode"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
+    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 }
 
 # ------------------------------------------------------------
@@ -164,6 +167,7 @@ native_config() {
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="native"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$(date +%H%M%S)"
+    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 }
 
 # ------------------------------------------------------------
@@ -189,16 +193,15 @@ case "$ACTION" in
 esac
 
 source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
-source ${HPCKIT_PATH}/latest/kupl/bisheng/env/setvars.sh
 
 export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
 export LD_LIBRARY_PATH=/usr/lib64/libibverbs:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${KUPL_PATH}/lib:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:$LD_LIBRARY_PATH
 
 export KUTACC_LIB=${KUTACC_PATH}/install/lib
 export KUTACC_INCLUDE=${KUTACC_PATH}/install/include
 
-export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 export CONDA_ACTIVATE_CMD="eval \"\$($CONDA_BASE_PATH/bin/conda shell.bash hook)\" && conda activate $CONDA_ENV_NAME"
 
 eval "$CONDA_ACTIVATE_CMD"
