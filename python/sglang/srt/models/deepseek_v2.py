@@ -1264,13 +1264,24 @@ class DeepseekV2AttentionMLA(
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
-            self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
-                self.hidden_size,
-                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
-            )
+            if _is_cpu_920f:
+                self.fused_qkv_a_proj_with_mqa = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                    tp_rank=attn_tp_rank,
+                    tp_size=attn_tp_size,
+                )
+            else:
+                self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
+                    self.hidden_size,
+                    self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
@@ -1654,6 +1665,12 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        if _is_cpu_920f:
+            # Sharded computation within attention TP group via sgl_kernel GEMM:
+            # each rank computes its weight shard, then all-gather the result.
+            qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+            qkv_latent = get_attention_tp_group().all_gather(qkv_latent, dim=-1)
+            return qkv_latent
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
