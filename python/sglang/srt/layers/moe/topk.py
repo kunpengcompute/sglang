@@ -1110,9 +1110,9 @@ def _load_balance_padded_tokens(
     # Greedy: for every padding slot, pick the globally least-loaded expert
     for i in range(num_pad):
         for j in range(topk):
-            e = load.argmin().item()
-            topk_ids[pad_start + i, j] = e
-            load[e] += 1
+            item = load.argmin().item()
+            topk_ids[pad_start + i, j] = item
+            load[item] += 1
 
     return topk_ids
 
@@ -1168,7 +1168,7 @@ def biased_grouped_topk_kunpeng(
     )
 
     topk_weights = token_weights
-    topk_ids = token_ids.to(torch.int32)
+    topk_ids = token_ids
 
     if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
