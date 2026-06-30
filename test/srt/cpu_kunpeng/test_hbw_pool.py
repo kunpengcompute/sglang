@@ -163,7 +163,6 @@ def test_stress():
     base_addr = pool._base_addr
     pool_size = pool.pool_size
 
-    import random
     random.seed(42)
     count = 0
     allocated = []

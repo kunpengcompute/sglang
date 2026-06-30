@@ -284,7 +284,7 @@ class _HBWPoolProxy:
         return getattr(KunpengHBWPool.get_instance(), name)
 
 
-hbw_pool = _HBWPoolProxy()  # type: ignore[assignment]
+hbw_pool = _HBWPoolProxy()
 """Global singleton proxy. Import anytime, use after pool is initialized."""
 
 
