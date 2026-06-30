@@ -25,19 +25,17 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_world_size,
     get_attn_tp_group,
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+    get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.moe.token_dispatcher.base import (
-    BaseDispatcher,
-)
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
-from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
+from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 
 kernel = torch.ops.sgl_kernel
 
@@ -527,7 +525,7 @@ class KunpengDispatcher(BaseDispatcher):
         # Build topk_ids_index and topk_weights per TP rank, then allgather across ATTN_TP
         t_topk_allg_start = time.perf_counter()
         if _tp_count > 0:
-            state.topk_ids_index_buf[:batch_size, 0::2] = topk_ids
+            state.topk_ids_index_buf[:batch_size, 0::2] = topk_ids.to(torch.int16)
             state.topk_weights_buf[:batch_size].copy_(topk_weights)
 
         t_topk_allg_end = time.perf_counter()

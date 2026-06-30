@@ -50,6 +50,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
@@ -68,7 +69,6 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
-from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -1168,7 +1168,7 @@ def biased_grouped_topk_kunpeng(
     )
 
     topk_weights = token_weights
-    topk_ids = token_ids
+    topk_ids = token_ids.to(torch.int32)
 
     if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
