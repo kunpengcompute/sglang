@@ -612,6 +612,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     rank=self.tp_rank,
                 )
             )
+        
+        # init hbw pool
+        if _is_cpu_920f and _is_kunpeng_hbw_pool:
+            self.init_hbw_pool_kunpeng()
 
         # Expert parallelism
         self.eplb_manager = (
@@ -737,8 +741,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
-        if _is_cpu_920f and _is_kunpeng_hbw_pool:
-            self.init_hbw_pool_kunpeng()
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -2300,9 +2302,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             raise ValueError(f"pool_size_mb must be positive, got {pool_size_mb}")
 
-        self.hbw_pool = KunpengHBWPool(pool_size_bytes, alignment=self.page_size)
-        logger.info(
-            f"[KunpengCpu] HBW pool created: " f"{pool_size_bytes / 1024 / 1024:.1f} MB"
+        self.hbw_pool = KunpengHBWPool.get_instance(
+            pool_size_bytes=pool_size_bytes, alignment=self.page_size
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):

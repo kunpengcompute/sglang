@@ -37,7 +37,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-logger.disabled = False
+_enable_hbw_swap = is_kunpeng_hbw_swap()
+_enable_debug = False
 
 
 def run_sdpa_forward_mha(
@@ -316,8 +317,21 @@ class KunpengCpuBackend(AttentionBackend):
         self.num_q_heads = model_config.num_attention_heads // model_runner.tp_size
         self.head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
         self.head_dim_v = model_config.v_head_dim
-
+        self.kv_cache_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
+        self.num_layers = model_runner.model_config.num_hidden_layers
+        
         self._decode_meta = torch.ops.sgl_kernel.flash_mla_meta_create_kunpeng()
+
+        # HBW swap: SDMA-based async DDR <-> HBW data movement
+        self.hbw_kvbuffer = None
+        if _enable_hbw_swap:
+            self.hbw_kvbuffer = KunpengHBWKVbuffer(
+                size=model_runner.max_total_num_tokens,
+                page_size=model_runner.page_size,
+                kv_cache_dim=self.kv_cache_dim,
+                num_layers=self.num_layers,
+            )
+            self.hbw_kvbuffer.init_hbw_swapbuffer()
 
     def __del__(self):
         if hasattr(self, "_decode_meta") and self._decode_meta is not None:
@@ -368,6 +382,9 @@ class KunpengCpuBackend(AttentionBackend):
         )
 
         self.forward_metadata = metadata
+
+        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
+            self.hbw_kvbuffer.queue_async_swapin(0, forward_batch.token_to_kv_pool.get_key_buffer(0))
 
     def _forward_extend_kutacc(
         self,
@@ -506,13 +523,32 @@ class KunpengCpuBackend(AttentionBackend):
         else:
             cache_loc = forward_batch.out_cache_loc
 
-        if save_kv_cache:
+        if save_kv_cache and not _enable_hbw_swap:
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        kv_k = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
+            swap_index = self.hbw_kvbuffer.get_safe_on_package_memory_index(
+                layer.layer_id
+            )
+
+            if _enable_debug:
+                diff = torch.abs(
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    - self.hbw_kvbuffer.kv_buffer[swap_index]
+                )
+                max_diff = diff.max().item()
+                if max_diff > 1e-5:
+                    logger.error(
+                        f"layer {layer.layer_id} swap error, max_diff={max_diff}"
+                    )
+
+            self.hbw_kvbuffer.kv_buffer[swap_index][cache_loc] = k
+            kv_k = self.hbw_kvbuffer.kv_buffer[swap_index]
+        else:
+            kv_k = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         softmax_scale = (
             layer.scaling
             if layer.scaling is not None
@@ -558,6 +594,20 @@ class KunpengCpuBackend(AttentionBackend):
             extra_buffer,
             self._decode_meta,
         )
+
+        # SDMA pipeline: swapout current layer, swapin next layer
+        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
+            if save_kv_cache:
+                self.hbw_kvbuffer.queue_async_swapout(
+                    layer.layer_id,
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                )
+            next_layer_id = layer.layer_id + 1
+            if next_layer_id < self.num_layers:
+                self.hbw_kvbuffer.queue_async_swapin(
+                    next_layer_id,
+                    forward_batch.token_to_kv_pool.get_key_buffer(next_layer_id),
+                )
 
         del extra_buffer
 
