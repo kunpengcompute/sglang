@@ -525,7 +525,7 @@ class KunpengDispatcher(BaseDispatcher):
         # Build topk_ids_index and topk_weights per TP rank, then allgather across ATTN_TP
         t_topk_allg_start = time.perf_counter()
         if _tp_count > 0:
-            state.topk_ids_index_buf[:batch_size, 0::2] = topk_ids.to(torch.int16)
+            state.topk_ids_index_buf[:batch_size, 0::2] = topk_ids
             state.topk_weights_buf[:batch_size].copy_(topk_weights)
 
         t_topk_allg_end = time.perf_counter()
