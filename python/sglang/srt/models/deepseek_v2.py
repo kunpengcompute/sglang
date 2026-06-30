@@ -541,7 +541,7 @@ class DeepseekV2MoE(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=False,
+                reduce_results=get_moe_a2a_backend().is_kunpeng_cpu(),
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
@@ -551,9 +551,16 @@ class DeepseekV2MoE(nn.Module):
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_flashinfer()
-                    or get_moe_a2a_backend().is_kunpeng_cpu()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else {}
+                    else (
+                        dict(
+                            tp_rank=get_attention_tp_rank(),
+                            tp_size=get_attention_tp_size(),
+                            use_dp_attention_reduce=True,
+                        )
+                        if get_moe_a2a_backend().is_kunpeng_cpu()
+                        else {}
+                    )
                 ),
             )
             is_packed_weight = hasattr(
