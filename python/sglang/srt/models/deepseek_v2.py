@@ -887,7 +887,11 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=(
+                    forward_batch.num_token_non_padded_cpu
+                    if _is_cpu_920f
+                    else forward_batch.num_token_non_padded
+                ),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -1742,13 +1746,22 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
+        if _is_cpu_920f:
+            self.layer_scatter_modes = LayerScatterModes.init_new(
+                layer_id=layer_id,
+                num_layers=1 if is_nextn else config.num_hidden_layers,
+                is_layer_sparse=False,
+                is_previous_layer_sparse=False,
+                is_next_layer_sparse=False,
+            )
+        else:
+            self.layer_scatter_modes = LayerScatterModes.init_new(
+                layer_id=layer_id,
+                num_layers=1 if is_nextn else config.num_hidden_layers,
+                is_layer_sparse=self.is_layer_sparse,
+                is_previous_layer_sparse=is_previous_layer_sparse,
+                is_next_layer_sparse=is_next_layer_sparse,
+            )
 
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(

@@ -660,6 +660,7 @@ def grouped_topk_cpu(
         num_token_non_padded=None,
     )
 
+
 def grouped_topk_kunpeng(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -675,8 +676,12 @@ def grouped_topk_kunpeng(
     num_token = gating_output.shape[0]
     num_experts = gating_output.shape[1]
 
-    token_weights = torch.empty(num_token, topk, dtype=torch.float32, device=gating_output.device)
-    token_ids = torch.empty(num_token, topk, dtype=torch.int16, device=gating_output.device)
+    token_weights = torch.empty(
+        num_token, topk, dtype=torch.float32, device=gating_output.device
+    )
+    token_ids = torch.empty(
+        num_token, topk, dtype=torch.int16, device=gating_output.device
+    )
 
     torch.ops.sgl_kernel.grouped_topk_kunpeng(
         router_logits=gating_output,
@@ -1063,6 +1068,67 @@ def biased_grouped_topk_cpu(
         num_token_non_padded=None,
     )
 
+
+def _load_balance_padded_tokens(
+    topk_ids: torch.Tensor,
+    num_token_non_padded: int,
+    num_experts: int,
+    topk: int,
+) -> torch.Tensor:
+    """
+    Greedy load-balancing padding for the Kunpeng MoE path.
+
+    Computes a per-expert histogram from the real tokens' top-k assignments,
+    then iterates over every padding-token slot in row-major order, always
+    choosing the expert with the current minimum load.  The load counter is
+    updated after each assignment so later picks observe the full state.
+
+    Determinism:
+    1. The real-token region topk_ids[:num_token_non_padded] is identical
+       on every attention-TP rank (same hidden_states, same deterministic
+       C++ kernel, no randomness).
+    2. scatter_add_ produces the same initial histogram everywhere.
+    3. argmin() returns the first index on ties, which is deterministic.
+    4. All ranks iterate the same number of padding slots in the same order.
+
+    Thus the final topk_ids tensor is bit-exact identical across all
+    attention-TP ranks — safe for the shared-memory topk_ids_index_buf
+    inside KunpengDispatcher.
+    """
+    pad_start = num_token_non_padded
+    num_pad = topk_ids.shape[0] - pad_start
+    if num_pad <= 0:
+        return topk_ids
+
+    # Per-expert histogram from real tokens only
+    real_ids = topk_ids[:pad_start, :].reshape(-1)
+    load = torch.zeros(num_experts, device=topk_ids.device, dtype=torch.float32)
+    load.scatter_add_(
+        0, real_ids.long(), torch.ones(real_ids.shape[0], device=topk_ids.device)
+    )
+
+    # Greedy: for every padding slot, pick the globally least-loaded expert
+    for i in range(num_pad):
+        for j in range(topk):
+            item = load.argmin().item()
+            topk_ids[pad_start + i, j] = item
+            load[item] += 1
+
+    return topk_ids
+
+
+def _load_balance_padded_tokens_kunpeng(
+    topk_ids: torch.Tensor,
+    num_token_non_padded: int,
+    num_experts: int,
+    topk: int,
+) -> torch.Tensor:
+    torch.ops.sgl_kernel.load_balance_padded_tokens_kunpeng(
+        topk_ids, num_token_non_padded, num_experts, topk
+    )
+    return topk_ids
+
+
 def biased_grouped_topk_kunpeng(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1079,8 +1145,12 @@ def biased_grouped_topk_kunpeng(
     num_token = gating_output.shape[0]
     num_experts = gating_output.shape[1]
 
-    token_weights = torch.empty(num_token, topk, dtype=torch.float32, device=gating_output.device)
-    token_ids = torch.empty(num_token, topk, dtype=torch.int16, device=gating_output.device)
+    token_weights = torch.empty(
+        num_token, topk, dtype=torch.float32, device=gating_output.device
+    )
+    token_ids = torch.empty(
+        num_token, topk, dtype=torch.int16, device=gating_output.device
+    )
 
     torch.ops.sgl_kernel.grouped_topk_kunpeng(
         router_logits=gating_output,
@@ -1098,7 +1168,7 @@ def biased_grouped_topk_kunpeng(
     )
 
     topk_weights = token_weights
-    topk_ids = token_ids.to(torch.int32)
+    topk_ids = token_ids
 
     if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
@@ -1115,6 +1185,7 @@ def biased_grouped_topk_kunpeng(
 
     return topk_weights, topk_ids
 
+
 if _is_cpu and _is_cpu_amx_available:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
@@ -1128,6 +1199,7 @@ else:
     biased_grouped_topk = biased_grouped_topk_gpu
     grouped_topk = grouped_topk_gpu
     fused_topk_native = fused_topk_torch_native
+
 
 def _remap_topk_for_deepep(
     topk_ids: torch.Tensor,
@@ -1206,6 +1278,13 @@ def _post_process_topk_ids(
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
+    elif _is_cpu_920f:
+        topk_ids = _load_balance_padded_tokens_kunpeng(
+            topk_ids=topk_ids,
+            num_token_non_padded=int(num_token_non_padded),
+            num_experts=router_logits.shape[1],
+            topk=topk_ids.shape[1],
+        )
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
