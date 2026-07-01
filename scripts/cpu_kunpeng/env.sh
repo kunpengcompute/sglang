@@ -105,8 +105,9 @@ export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
 
-# Kunpeng SHM
-export SGLANG_KUNPENG_SHM_SIZE_MB=24
+# Kunpeng SHM pool
+export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476
+export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=24
 # Kunpeng HBW pool
 export SGLANG_ENABLE_HBW_POOL=1
 export SGLANG_ENABLE_HBW_SWAP=1
@@ -114,8 +115,9 @@ export SGLANG_KUNPENG_HBW_POOL_SIZE_MB=2048
 # Kunpeng SDMA parameters
 export SGLANG_KUNPENG_SDMA_MAX_EVENTS=10
 export SGLANG_KUNPENG_SDMA_THRESHOLD=5
-# Maximum number of tokens output per decode round within dp
+# Maximum number of tokens output per round within dp
 export SGLANG_KUNPENG_DECODE_MAX_TOKENS=128
+export SGLANG_KUNPENG_PREFILL_MAX_TOKENS=4096
 # Load format (e.g. "sharded_state", leave empty for default)
 export LOAD_FORMAT=""
 
