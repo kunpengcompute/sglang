@@ -465,15 +465,7 @@ class GroupCoordinator:
 
         self.kunpeng_communicator: Optional[KunpengCommunicator] = None
         if self.use_kunpeng_communicator:
-            # TODO(kunpeng): 7168 is the hidden size of DeepSeek V3, used to
-            # pre-allocate SHM buffer for decode allreduce. This is hardcoded
-            # and should be derived from model config in the future.
-            _max_elements = (
-                int(os.environ.get("SGLANG_KUNPENG_DECODE_MAX_TOKENS", 128)) * 7168
-            )
-            self.kunpeng_communicator = KunpengCommunicator(
-                group=self.cpu_group, max_elements=_max_elements
-            )
+            self.kunpeng_communicator = KunpengCommunicator(group=self.cpu_group)
 
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
@@ -614,9 +606,8 @@ class GroupCoordinator:
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
-            elif self.use_kunpeng_communicator:
-                if input_.shape[0] > 0:
-                    self.kunpeng_communicator.shm_all_reduce(input_)
+            elif self.use_kunpeng_communicator and input_.shape[0] > 0:
+                self.kunpeng_communicator.shm_all_reduce(input_)
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
@@ -795,9 +786,8 @@ class GroupCoordinator:
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
-        elif self.use_kunpeng_communicator:
-            if input.shape[0] > 0:
-                self.kunpeng_communicator.shm_reduce_scatter_tensor(input)
+        elif self.use_kunpeng_communicator and input.shape[0] > 0:
+            self.kunpeng_communicator.shm_reduce_scatter_tensor(input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
@@ -858,13 +848,12 @@ class GroupCoordinator:
                 output, input, group=self.device_group
             )
 
+    @KunpengProfiler(depth=2)
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu or _is_xpu:
             self._all_gather_into_tensor(output, input)
-        elif _is_cpu_920f:
-            torch.distributed.all_gather_into_tensor(
-                output, input, group=self.cpu_group
-            )
+        elif self.use_kunpeng_communicator and input.shape[0] > 0:
+            self.kunpeng_communicator.shm_all_gather_into_tensor(input, output)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
@@ -883,6 +872,7 @@ class GroupCoordinator:
         else:
             pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
 
+    @KunpengProfiler(depth=2)
     def all_gather(
         self,
         input_: torch.Tensor,
@@ -942,6 +932,10 @@ class GroupCoordinator:
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
+            elif self.use_kunpeng_communicator and input_.shape[0] > 0:
+                self.kunpeng_communicator.shm_all_gather_into_tensor(
+                    input_, output_tensor
+                )
             else:
                 torch.distributed.all_gather_into_tensor(
                     output_tensor, input_, group=self.device_group

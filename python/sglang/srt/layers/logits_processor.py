@@ -26,6 +26,7 @@ from triton.language.extra import libdevice
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    get_attn_tp_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -56,11 +57,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_npu, is_cpu_920f, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cpu_920f = is_cpu_920f()
 
 
 @dataclasses.dataclass
@@ -946,7 +948,13 @@ class LogitsProcessor(nn.Module):
                 device=logits.device,
                 dtype=logits.dtype,
             )
-            attn_tp_all_gather_into_tensor(global_logits, logits)
+            if _is_cpu_920f:
+                # TODO(kunpeng): Use kutacc::shm_batch_allgather interface to replace torch in the future
+                torch.distributed.all_gather_into_tensor(
+                    global_logits, logits, group=get_attn_tp_group().cpu_group
+                )
+            else:
+                attn_tp_all_gather_into_tensor(global_logits, logits)
             global_logits = global_logits.reshape(
                 self.attn_tp_size,
                 logits.shape[0],

@@ -141,7 +141,10 @@ def init_shm_pool(group: dist.ProcessGroup):
     intra_socket_ptr = pg_helper.get_process_group_ptr(_INTRA_SOCKET)
     intra_die_ptr = pg_helper.get_process_group_ptr(_INTRA_DIE)
 
-    shm_size_mb = int(os.environ.get("SGLANG_KUNPENG_SHM_SIZE_MB", "24"))
+    if os.environ.get("IS_PREFILL", "1") == "1":
+        shm_size_mb = int(os.environ.get("SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB", "476"))
+    else:
+        shm_size_mb = int(os.environ.get("SGLANG_KUNPENG_DECODE_SHM_SIZE_MB", "24"))
     kernel.shm_pool_create_kunpeng(
         intra_node_ptr, intra_socket_ptr, intra_die_ptr, shm_size_mb
     )
@@ -152,49 +155,80 @@ def init_shm_pool(group: dist.ProcessGroup):
 
 
 class KunpengCommunicator:
-    def __init__(self, group: dist.ProcessGroup, max_elements: int):
+    def __init__(self, group: dist.ProcessGroup):
         self.group = group
         self.comm_size = group.size()
         self.comm_rank = group.rank()
-        self.world_size = dist.get_world_size()
-        self.rs_tensor: Optional[torch.Tensor] = None
-        self.ar_tensor: Optional[torch.Tensor] = None
+        self.shm_tensors: dict = {}
+        self.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
+
+        if self.is_prefill:
+            self.max_tokens = int(
+                os.environ.get("SGLANG_KUNPENG_PREFILL_MAX_TOKENS", "4096")
+            )
+        else:
+            self.max_tokens = int(
+                os.environ.get("SGLANG_KUNPENG_DECODE_MAX_TOKENS", "128")
+            )
+
+        # TODO(kunpeng): 7168 is the hidden size of DeepSeek V3, used to
+        # pre-allocate SHM buffer for allreduce. This is hardcoded
+        # and should be derived from model config in the future.
+        self.max_elements = self.max_tokens * 7168
 
         init_oob_comms()
         init_shm_pool(self.group)
 
         kernel.shm_reduce_scatter_init_kunpeng()
         kernel.shm_allgather_init_kunpeng()
-        kernel.shm_allreduce_init_kunpeng(max_elements)
+        kernel.shm_allreduce_init_kunpeng(self.max_elements)
 
-    @KunpengProfiler(depth=3)
-    def shm_reduce_scatter_tensor(self, input: torch.Tensor):
-        if (
-            self.rs_tensor is None
-            or self.rs_tensor.shape != input.shape
-            or self.rs_tensor.dtype != input.dtype
-        ):
-            self.rs_tensor = kernel.create_shm_tensor_kunpeng(
-                torch.bfloat16, input.shape
-            )
+        self.dummy_tensor = kernel.create_shm_tensor_kunpeng(
+            torch.uint8, [self.comm_size, 1]
+        )
+        self.src_dummy_tensor = self.dummy_tensor[
+            self.comm_rank : (self.comm_rank + 1), :
+        ]
+
+    def get_shm_tensor(self, dim: int, is_allg: bool = False):
+        shm_tensor = self.shm_tensors.get(dim)
+
+        if shm_tensor is None:
+            if is_allg:
+                shm_tensor = kernel.create_shm_tensor_kunpeng(
+                    torch.bfloat16, [self.max_tokens * self.comm_size, dim]
+                )
+            # reduce_scatter and allreduce use the same shm_tensor
+            else:
+                shm_tensor = kernel.create_shm_tensor_kunpeng(
+                    torch.bfloat16, [self.max_tokens, dim]
+                )
+            self.shm_tensors[dim] = shm_tensor
+
             if envs.SGLANG_KUNPENG_PROFILE.get():
                 logger.info(
                     f"[KunpengCommunicator rank {dist.get_rank()}] "
-                    f"create_shm_tensor_kunpeng OK, shape={list(self.rs_tensor.shape)}"
+                    f"create_shm_tensor_kunpeng OK, shape={list(shm_tensor.shape)}"
                 )
 
+        return shm_tensor
+
+    @KunpengProfiler(depth=3)
+    def shm_reduce_scatter_tensor(self, input: torch.Tensor):
+        dim = input.size(1)
+        batch = input.size(0)
+        shm_tensor = self.get_shm_tensor(dim)
+
         t_copy_in_start = time.perf_counter()
-        self.rs_tensor.copy_(input)
+        shm_tensor[:batch, :].copy_(input)
         t_copy_in_end = time.perf_counter()
 
         t_reduce_start = time.perf_counter()
-        kernel.shm_reduce_scatter_kunpeng(
-            self.rs_tensor.shape[0], self.rs_tensor.shape[1], self.rs_tensor
-        )
+        kernel.shm_reduce_scatter_kunpeng(batch, dim, shm_tensor)
         t_reduce_end = time.perf_counter()
 
         t_copy_out_start = time.perf_counter()
-        input.copy_(self.rs_tensor)
+        input.copy_(shm_tensor[:batch, :])
         t_copy_out_end = time.perf_counter()
 
         if envs.SGLANG_KUNPENG_PROFILE.get():
@@ -207,30 +241,20 @@ class KunpengCommunicator:
 
     @KunpengProfiler(depth=3)
     def shm_all_reduce(self, input: torch.Tensor):
-        if (
-            self.ar_tensor is None
-            or self.ar_tensor.shape != input.shape
-            or self.ar_tensor.dtype != input.dtype
-        ):
-            self.ar_tensor = kernel.create_shm_tensor_kunpeng(
-                torch.bfloat16, input.shape
-            )
-            if envs.SGLANG_KUNPENG_PROFILE.get():
-                logger.info(
-                    f"[KunpengCommunicator rank {dist.get_rank()}] "
-                    f"create_shm_tensor_kunpeng OK, shape={list(self.ar_tensor.shape)}"
-                )
+        batch = input.size(0)
+        dim = input.size(1)
+        shm_tensor = self.get_shm_tensor(dim)
 
         t_copy_in_start = time.perf_counter()
-        self.ar_tensor.copy_(input)
+        shm_tensor[:batch, :].copy_(input)
         t_copy_in_end = time.perf_counter()
 
         t_reduce_start = time.perf_counter()
-        kernel.shm_allreduce_kunpeng(self.ar_tensor)
+        kernel.shm_allreduce_kunpeng(shm_tensor[:batch, :])
         t_reduce_end = time.perf_counter()
 
         t_copy_out_start = time.perf_counter()
-        input.copy_(self.ar_tensor)
+        input.copy_(shm_tensor[:batch, :])
         t_copy_out_end = time.perf_counter()
 
         if envs.SGLANG_KUNPENG_PROFILE.get():
@@ -238,6 +262,42 @@ class KunpengCommunicator:
                 f"[KunpengCommunicator rank {dist.get_rank()}] shm_all_reduce timing (ms): "
                 f"copy_in={1000*(t_copy_in_end - t_copy_in_start):.2f}, "
                 f"all_reduce={1000*(t_reduce_end - t_reduce_start):.2f}, "
+                f"copy_out={1000*(t_copy_out_end - t_copy_out_start):.2f}"
+            )
+
+    @KunpengProfiler(depth=3)
+    def shm_all_gather_into_tensor(self, input: torch.Tensor, output: torch.Tensor):
+        local_batch = input.size(0)
+        global_batch = output.size(0)
+        dim = input.size(1)
+
+        shm_tensor = self.get_shm_tensor(dim, True)
+
+        src0 = shm_tensor[
+            self.comm_rank * local_batch : (self.comm_rank + 1) * local_batch, :
+        ]
+        dst0 = shm_tensor[:global_batch, :]
+
+        t_copy_in_start = time.perf_counter()
+        src0.copy_(input)
+        t_copy_in_end = time.perf_counter()
+
+        t_ag_start = time.perf_counter()
+        # TODO(kunpeng): use dual allgather for alternative implementation
+        kernel.shm_dual_allgather_kunpeng(
+            src0, dst0, self.src_dummy_tensor, self.dummy_tensor
+        )
+        t_ag_end = time.perf_counter()
+
+        t_copy_out_start = time.perf_counter()
+        output.copy_(dst0)
+        t_copy_out_end = time.perf_counter()
+
+        if envs.SGLANG_KUNPENG_PROFILE.get():
+            logger.info(
+                f"[KunpengCommunicator rank {dist.get_rank()}] shm_all_gather_into_tensor timing (ms): "
+                f"copy_in={1000*(t_copy_in_end - t_copy_in_start):.2f}, "
+                f"allgather={1000*(t_ag_end - t_ag_start):.2f}, "
                 f"copy_out={1000*(t_copy_out_end - t_copy_out_start):.2f}"
             )
 
