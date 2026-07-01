@@ -98,10 +98,14 @@ def _kunpeng_prepack_igemm_expert_weight(weight: torch.Tensor) -> None:
         weight: tensor of shape ``[num_local_experts, n, k]``. The packed
             result is written back in-place.
     """
-    decode_max_tokens = int(os.environ.get("SGLANG_KUNPENG_DECODE_MAX_TOKENS", 128))
     num_local_experts, n, k = weight.shape
+    # TODO(kunpeng): get fusedmoe_tilebuf with a better way
+    if os.environ.get("IS_PREFILL", "1") == "1":
+        fusedmoe_tilebuf = 2048
+    else:
+        fusedmoe_tilebuf = 256
     _, _, tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
-        decode_max_tokens, n, k, torch.get_num_threads()
+        fusedmoe_tilebuf, n, k, torch.get_num_threads()
     )
     packed = torch.empty_like(weight)
     for exp_id in range(num_local_experts):

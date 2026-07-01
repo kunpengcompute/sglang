@@ -41,7 +41,7 @@ kernel = torch.ops.sgl_kernel
 NUM_THREADS = 32
 
 # Workspace buffer size factor (matches fusedmoe_tilebuf_size in the C++ binding).
-FUSEDMOE_FIXED_SIZE = 256
+FUSEDMOE_FIXED_SIZE = 2048
 
 # Number of warmup iterations before timing.
 WARMUP_ITERS = 3
@@ -301,160 +301,230 @@ def pack_weights(
 # ---------------------------------------------------------------------------
 
 
+def silu(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.sigmoid(x)
+
+
+def quantize_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    max_abs = x.abs().amax(dim=-1, keepdim=True)
+    scale = max_abs / 127.0
+    scale = torch.clamp(scale, min=1e-10)
+    quantized = (x / scale).round().clamp(-128, 127).to(torch.int8)
+    return quantized, scale
+
+
 def test_fusedmoe(
     total_bs: int,
-    K: int,
-    N: int,
+    hidden_dim: int,
+    inter_dim: int,
     num_experts: int,
-    test_type: str,
     measure_perf: bool = True,
 ):
-    """Run a single fusedmoe test case.
+    """Run a complete fusedmoe test case: gateup -> silu -> down.
 
-    Parameters mirror the C++ test_fusedmoe() function.  When measure_perf is
-    True, also runs warmup + timed iterations and prints performance stats.
+    In real MoE computation:
+      gateup: input[total_bs, hidden_dim] -> expert[inter_dim, hidden_dim] -> up_output[total_bs, inter_dim]
+      silu: up_output -> silu(up_output)
+      down: silu_output[total_bs, inter_dim] -> expert[hidden_dim, inter_dim] -> down_output[total_bs, hidden_dim]
+
+    Parameters:
+        total_bs: total batch size across all experts
+        hidden_dim: hidden state dimension (input/output dimension)
+        inter_dim: intermediate dimension (expert internal dimension)
+        num_experts: number of experts
     """
+    K_up = hidden_dim
+    N_up = inter_dim
+    K_down = inter_dim
+    N_down = hidden_dim
     print(
-        f"\n=== Test {test_type}: total_bs={total_bs}, K={K}, N={N}, num_experts={num_experts} ==="
+        f"\n=== Test fusedmoe: total_bs={total_bs}, hidden_dim={hidden_dim}, inter_dim={inter_dim}, num_experts={num_experts} ==="
     )
 
-    total_elements = total_bs * N
-
     # --- Allocate data ---
-    acts = torch.empty(total_bs, K, dtype=torch.int8)
-    weights = torch.empty(num_experts, N, K, dtype=torch.int8)
+    acts = torch.empty(total_bs, K_up, dtype=torch.int8)
+    up_weights = torch.empty(num_experts, N_up, K_up, dtype=torch.int8)
+    down_weights = torch.empty(num_experts, N_down, K_down, dtype=torch.int8)
     acts_scale = torch.empty(total_bs, 1, dtype=torch.float32)
-    weights_scale = torch.empty(num_experts, N, dtype=torch.float32)
+    up_weights_scale = torch.empty(num_experts, N_up, dtype=torch.float32)
+    down_weights_scale = torch.empty(num_experts, N_down, dtype=torch.float32)
 
     # --- Generate random data ---
     random_fill_1(acts)
-    random_fill_1(weights)
+    random_fill_1(up_weights)
+    random_fill_1(down_weights)
     random_fill_float_range(acts_scale)
-    random_fill_float_range(weights_scale)
+    random_fill_float_range(up_weights_scale)
+    random_fill_float_range(down_weights_scale)
 
     # --- Generate experts_offset and token_ids ---
     experts_offset = generate_experts_offset(num_experts, total_bs)
-    if test_type == "GATE_UP":
-        token_ids = generate_token_ids(total_bs)
-    else:  # DOWN: token_ids not used for indexing, but still needed for bs
-        token_ids = torch.arange(total_bs, dtype=torch.int32)
+    token_ids = generate_token_ids(total_bs)
 
     # --- Compute expected output (using original unpacked weights) ---
-    expect = compute_expect_output(
+    up_expect = compute_expect_output(
         acts,
-        weights,
+        up_weights,
         acts_scale,
-        weights_scale,
+        up_weights_scale,
         experts_offset,
         token_ids,
-        K,
-        N,
+        K_up,
+        N_up,
         num_experts,
-        test_type,
+        "GATE_UP",
+    )
+    silu_expect = silu(up_expect.to(torch.float32)).to(torch.bfloat16)
+    silu_quantized, silu_scale = quantize_per_token(silu_expect.to(torch.float32))
+    down_expect = compute_expect_output(
+        silu_quantized,
+        down_weights,
+        silu_scale,
+        down_weights_scale,
+        experts_offset,
+        torch.arange(total_bs, dtype=torch.int32),
+        K_down,
+        N_down,
+        num_experts,
+        "DOWN",
     )
 
     # --- Get tiling plan for weight packing ---
-    tile_m, tile_n, tile_k = kernel.igemm_find_optimal_tiling_plan_decode(
-        total_bs, N, K, NUM_THREADS
+    tile_m_up, tile_n_up, tile_k_up = kernel.igemm_find_optimal_tiling_plan_decode(
+        FUSEDMOE_FIXED_SIZE, N_up, K_up, NUM_THREADS
+    )
+    tile_m_down, tile_n_down, tile_k_down = (
+        kernel.igemm_find_optimal_tiling_plan_decode(
+            FUSEDMOE_FIXED_SIZE, N_down, K_down, NUM_THREADS
+        )
     )
     print(
-        f"Tiling: tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}, blocks_in_k={K // tile_k}"
+        f"GateUp Tiling: tile_m={tile_m_up}, tile_n={tile_n_up}, tile_k={tile_k_up}, blocks_in_k={K_up // tile_k_up}"
+    )
+    print(
+        f"Down Tiling: tile_m={tile_m_down}, tile_n={tile_n_down}, tile_k={tile_k_down}, blocks_in_k={K_down // tile_k_down}"
     )
 
     # --- Pack weights ---
-    packed_weights = pack_weights(weights, num_experts, N, K, tile_k)
-
-    # --- Allocate output and workspace buffers ---
-    blocks_in_k = K // tile_k
-    tmpx_size = FUSEDMOE_FIXED_SIZE * K * 4
-    tmpy_size = FUSEDMOE_FIXED_SIZE * N * blocks_in_k // 2 * 4
-    tmp_scales_size = FUSEDMOE_FIXED_SIZE * 4
-
-    output = torch.empty(total_bs, N, dtype=torch.bfloat16)
-    tmpx = torch.empty(tmpx_size, dtype=torch.int8)
-    tmpy = torch.empty(tmpy_size, dtype=torch.float32)
-    tmp_scales = torch.empty(tmp_scales_size, dtype=torch.float32)
-
-    # --- Call kernel (correctness run) ---
-    if test_type == "GATE_UP":
-        kernel.igemm_fusedmoe_gateup_kunpeng(
-            acts,
-            acts_scale,
-            packed_weights,
-            weights_scale,
-            token_ids,
-            experts_offset,
-            output,
-            tmpx,
-            tmpy,
-            tmp_scales,
-        )
-    else:  # DOWN
-        kernel.igemm_fusedmoe_down_kunpeng(
-            acts,
-            packed_weights,
-            acts_scale,
-            weights_scale,
-            token_ids,
-            experts_offset,
-            output,
-            tmpx,
-            tmpy,
-            tmp_scales,
-        )
-
-    # --- Validate ---
-    print_test_results(output, expect, total_elements)
-
-    cos_diff = calculate_cosine_diff(output, expect)
-    print(
-        f"Cos diff: {cos_diff:.10f}  "
-        f"Shape: ({total_bs},{N},{K})  "
-        f"Tile: ({tile_m},{tile_n},{tile_k})"
+    packed_up_weights = pack_weights(up_weights, num_experts, N_up, K_up, tile_k_up)
+    packed_down_weights = pack_weights(
+        down_weights, num_experts, N_down, K_down, tile_k_down
     )
 
-    if cos_diff > 1e-3:
-        print(f"{test_type} Cos diff Too Big!!! Test Failed!")
-        sys.exit(1)
+    # --- Allocate output and workspace buffers ---
+    tmpx_size_up = FUSEDMOE_FIXED_SIZE * K_up
+    tmpy_size_up = FUSEDMOE_FIXED_SIZE * N_up * 2
+    tmpx_size_down = FUSEDMOE_FIXED_SIZE * K_down
+    tmpy_size_down = FUSEDMOE_FIXED_SIZE * N_down
+    tmp_scales_size = FUSEDMOE_FIXED_SIZE * 4
 
-    print(f"{test_type} FusedMoE Test Passed! Shape: ({total_bs}, {K}, {N})")
+    up_output = torch.empty(total_bs, N_up, dtype=torch.bfloat16)
+    down_output = torch.empty(total_bs, N_down, dtype=torch.bfloat16)
+    tmpx_up = torch.empty(tmpx_size_up, dtype=torch.int8)
+    tmpy_up = torch.empty(tmpy_size_up, dtype=torch.float32)
+    tmpx_down = torch.empty(tmpx_size_down, dtype=torch.int8)
+    tmpy_down = torch.empty(tmpy_size_down, dtype=torch.float32)
+    tmp_scales = torch.empty(tmp_scales_size, dtype=torch.float32)
+
+    # --- Call kernels: gateup -> silu -> down (correctness run) ---
+    kernel.igemm_fusedmoe_gateup_kunpeng(
+        acts,
+        acts_scale,
+        packed_up_weights,
+        up_weights_scale,
+        token_ids,
+        experts_offset,
+        up_output,
+        tmpx_up,
+        tmpy_up,
+        tmp_scales,
+    )
+
+    silu_output = silu(up_output.to(torch.float32)).to(torch.bfloat16)
+    silu_quantized_out, silu_scale_out = quantize_per_token(
+        silu_output.to(torch.float32)
+    )
+
+    kernel.igemm_fusedmoe_down_kunpeng(
+        silu_quantized_out,
+        packed_down_weights,
+        silu_scale_out,
+        down_weights_scale,
+        torch.arange(total_bs, dtype=torch.int32),
+        experts_offset,
+        down_output,
+        tmpx_down,
+        tmpy_down,
+        tmp_scales,
+    )
+
+    # --- Validate gateup ---
+    print("\n--- GateUp Validation ---")
+    print_test_results(up_output, up_expect, total_bs * N_up)
+    up_cos_diff = calculate_cosine_diff(up_output, up_expect)
+    print(f"GateUp Cos diff: {up_cos_diff:.10f}  " f"Shape: ({total_bs},{N_up},{K_up})")
+    if up_cos_diff > 1e-3:
+        print("GateUp Cos diff Too Big!!! Test Failed!")
+        sys.exit(1)
+    print("GateUp FusedMoE Test Passed!")
+
+    # --- Validate down ---
+    print("\n--- Down Validation ---")
+    print_test_results(down_output, down_expect, total_bs * N_down)
+    down_cos_diff = calculate_cosine_diff(down_output, down_expect)
+    print(
+        f"Down Cos diff: {down_cos_diff:.10f}  "
+        f"Shape: ({total_bs},{N_down},{K_down})"
+    )
+    if down_cos_diff > 1e-3:
+        print("Down Cos diff Too Big!!! Test Failed!")
+        sys.exit(1)
+    print("Down FusedMoE Test Passed!")
 
     # --- Performance measurement ---
     if not measure_perf:
         return
 
-    def _run_kernel():
-        if test_type == "GATE_UP":
-            kernel.igemm_fusedmoe_gateup_kunpeng(
-                acts,
-                acts_scale,
-                packed_weights,
-                weights_scale,
-                token_ids,
-                experts_offset,
-                output,
-                tmpx,
-                tmpy,
-                tmp_scales,
-            )
-        else:
-            kernel.igemm_fusedmoe_down_kunpeng(
-                acts,
-                packed_weights,
-                acts_scale,
-                weights_scale,
-                token_ids,
-                experts_offset,
-                output,
-                tmpx,
-                tmpy,
-                tmp_scales,
-            )
+    def _run_full_pipeline():
+        kernel.igemm_fusedmoe_gateup_kunpeng(
+            acts,
+            acts_scale,
+            packed_up_weights,
+            up_weights_scale,
+            token_ids,
+            experts_offset,
+            up_output,
+            tmpx_up,
+            tmpy_up,
+            tmp_scales,
+        )
+        silu_out = silu(up_output.to(torch.float32)).to(torch.bfloat16)
+        silu_q, silu_s = quantize_per_token(silu_out.to(torch.float32))
+        kernel.igemm_fusedmoe_down_kunpeng(
+            silu_q,
+            packed_down_weights,
+            silu_s,
+            down_weights_scale,
+            torch.arange(total_bs, dtype=torch.int32),
+            experts_offset,
+            down_output,
+            tmpx_down,
+            tmpy_down,
+            tmp_scales,
+        )
 
-    elapsed_ms = measure_kernel_time(_run_kernel)
+    elapsed_ms = measure_kernel_time(_run_full_pipeline)
     print(
         format_perf_table(
-            test_type, total_bs, K, N, num_experts, tile_m, tile_n, tile_k, elapsed_ms
+            "GATEUP_SILU_DOWN",
+            total_bs,
+            K_up,
+            N_up,
+            num_experts,
+            tile_m_up,
+            tile_n_up,
+            tile_k_up,
+            elapsed_ms,
         )
     )
 
@@ -465,11 +535,11 @@ def test_fusedmoe(
 
 
 def parse_test_case(s: str):
-    """Parse a comma-separated test case string: total_bs,K,N,num_experts"""
+    """Parse a comma-separated test case string: total_bs,hidden_dim,inter_dim,num_experts"""
     parts = [int(x) for x in s.split(",")]
     if len(parts) != 4:
         raise ValueError(
-            f"Expected 4 values (total_bs,K,N,num_experts), got {len(parts)}"
+            f"Expected 4 values (total_bs,hidden_dim,inter_dim,num_experts), got {len(parts)}"
         )
     return tuple(parts)
 
@@ -481,14 +551,14 @@ def main():
     p.cpu_affinity(list(range(0, 16)) + list(range(21, 37)))
 
     parser = argparse.ArgumentParser(
-        description="Single-process test for igemm_fusedmoe_gateup/down_kunpeng kernels"
+        description="Single-process test for fusedmoe gateup->silu->down pipeline on Kunpeng"
     )
     parser.add_argument(
         "--cases",
         type=str,
         default=None,
-        help="Comma-separated list of test cases. Each case is 'total_bs,K,N,num_experts'. "
-        "Multiple cases separated by ';'. e.g. '128,2048,7168,4;64,7168,4096,2'",
+        help="Comma-separated list of test cases. Each case is 'total_bs,hidden_dim,inter_dim,num_experts'. "
+        "Multiple cases separated by ';'. e.g. '1024,7168,2048,4;512,4096,7168,2'",
     )
     parser.add_argument(
         "--warmup",
@@ -513,10 +583,10 @@ def main():
     WARMUP_ITERS = args.warmup
     TIMED_ITERS = args.iters
 
-    # Default test cases (same as the C++ test, but only the 4 essential params)
+    # Default test cases
     default_cases = [
-        (128, 2048, 7168, 4),
-        (64, 7168, 4096, 2),
+        (1024, 7168, 2048, 1),
+        (1024, 2048, 1408, 1),
     ]
 
     if args.cases:
@@ -524,17 +594,15 @@ def main():
     else:
         test_cases = default_cases
 
-    for total_bs, K, N, num_experts in test_cases:
-        for test_type in ("GATE_UP", "DOWN"):
-            test_fusedmoe(
-                total_bs,
-                K,
-                N,
-                num_experts,
-                test_type,
-                measure_perf=not args.no_perf,
-            )
-            print("-----------------------------------------")
+    for total_bs, hidden_dim, inter_dim, num_experts in test_cases:
+        test_fusedmoe(
+            total_bs,
+            hidden_dim,
+            inter_dim,
+            num_experts,
+            measure_perf=not args.no_perf,
+        )
+        print("-----------------------------------------")
 
 
 if __name__ == "__main__":

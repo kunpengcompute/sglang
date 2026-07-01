@@ -91,6 +91,8 @@ fi
 
 # ---- Configuration -----------------------------------------------------------
 
+source ../../../scripts/cpu_kunpeng/env.sh native
+
 PYTHON="${PYTHON:-python3}"
 CPU_PER_RANK="${CPU_PER_RANK:-38}"
 MASTER_ADDR="127.0.0.1"
@@ -99,8 +101,6 @@ WORLD_SIZE=16
 export MASTER_ADDR
 export MASTER_PORT
 export WORLD_SIZE
-
-eval "$CONDA_ACTIVATE_CMD"
 
 echo "============================================================"
 echo " ${TEST_LABEL}"

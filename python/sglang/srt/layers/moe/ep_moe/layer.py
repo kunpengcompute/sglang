@@ -651,6 +651,8 @@ class KunpengMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
+        self.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
+        self.moe_token_multiple = 2
 
     @KunpengProfiler(depth=1)
     def forward(
@@ -694,7 +696,13 @@ class KunpengMoE(FusedMoE):
         num_local_experts = self.num_local_experts
         max_dispatch_tokens = dispatch_output.max_dispatch_tokens_per_rank
         inter_dim = self.w13_weight.shape[1] // 2
-        recv_dense_size = max_dispatch_tokens * self.moe_ep_size * num_local_experts
+
+        if self.is_prefill:
+            max_tokens = int(os.environ.get("SGLANG_KUNPENG_PREFILL_MAX_TOKENS", 4096))
+            recv_dense_size = self.moe_token_multiple * max_tokens
+        else:
+            max_tokens = int(os.environ.get("SGLANG_KUNPENG_DECODE_MAX_TOKENS", 128))
+            recv_dense_size = max_dispatch_tokens * self.moe_ep_size * num_local_experts
 
         # Reuse it for gateup output when inter_dim*2 <= hidden (e.g. v3);
         moe_down = dispatch_output.combine_send_buf
@@ -710,10 +718,15 @@ class KunpengMoE(FusedMoE):
             )
 
         # Workspace buffers (sizes follow C++ reference heuristic).
-        fusedmoe_fixed_size = 256
+        # TODO(kunpeng): get fusedmoe_fixed_size from env
+        if self.is_prefill:
+            fusedmoe_fixed_size = max(2048, max_tokens)
+        else:
+            fusedmoe_fixed_size = 256
+
         tmpx_gateup = torch.empty(fusedmoe_fixed_size * hidden, dtype=torch.int8)
         tmpy_gateup = torch.empty(
-            fusedmoe_fixed_size * inter_dim * 2, dtype=torch.float32
+            fusedmoe_fixed_size * inter_dim * 4, dtype=torch.float32
         )
         tmp_scales_gateup = torch.empty(fusedmoe_fixed_size * 4, dtype=torch.float32)
 
