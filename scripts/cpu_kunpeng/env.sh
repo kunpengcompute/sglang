@@ -142,6 +142,7 @@ prefill_config() {
     export ROLE="prefill"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
     export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
+    export IS_PREFILL="1"
 }
 
 # ------------------------------------------------------------
@@ -156,6 +157,7 @@ decode_config() {
     export ROLE="decode"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
     export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
+    export IS_PREFILL="0"
 }
 
 # ------------------------------------------------------------
@@ -170,6 +172,7 @@ native_config() {
     export ROLE="native"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$(date +%H%M%S)"
     export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
+    export IS_PREFILL="1"
 }
 
 # ------------------------------------------------------------

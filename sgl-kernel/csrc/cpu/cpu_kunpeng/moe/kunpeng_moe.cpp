@@ -31,11 +31,15 @@
 #include "../utils/kunpeng_oob.h"
 #include "../utils/kunpeng_shm.h"
 
+#define PREFILL_FUSEDMOE_TILEBUF 2048
+#define DECODE_FUSEDMOE_TILEBUF 256
+
 static kutacc::kurmcl_conn_info_h g_ds_conn_info = nullptr;
 static bool g_comm_initialized = false;
 static int g_comm_size = 0;
 static int g_comm_rank = 0;
 static c10d::ProcessGroup *g_process_group = nullptr;
+static bool g_is_prefill = true;
 
 extern void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c);
 extern void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
@@ -82,6 +86,11 @@ void moe_comm_create_kunpeng(int64_t process_group_ptr)
               << std::endl;
 
     g_comm_initialized = true;
+
+    auto str = std::getenv("IS_PREFILL");
+    if (str != nullptr) {
+        g_is_prefill = std::atol(str);
+    }
 }
 
 void moe_comm_barrier_kunpeng()
@@ -481,7 +490,7 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     int64_t acts_scale_stride = scale.stride(0);
 
     auto t = igemm_find_optimal_tiling_plan_decode(bs, N, K, kutacc::get_thread_num());
-    int64_t fusedmoe_tilebuf_size = 256;
+    int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
 
     // TODO: n_slice for 2-expert case
     std::optional<int64_t> n_slice = std::nullopt;
@@ -532,7 +541,7 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
     float *pby_data = tmpy.data_ptr<float>();
 
     auto t = igemm_find_optimal_tiling_plan_decode(bs, N, K, kutacc::get_thread_num());
-    int64_t fusedmoe_tilebuf_size = 256;
+    int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
 
     // TODO: n_slice for 2-expert case
     std::optional<int64_t> n_slice = std::nullopt;
@@ -550,7 +559,8 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
 int64_t topk_convert_kunpeng(at::Tensor src_info,        // [num_local_experts, num_ranks*(max_tokens*2+1)] int16
                              at::Tensor token_ids,       // [recv_dense_size] int32 (output)
                              at::Tensor experts_offset,  // [num_local_experts + 1] int32 (output)
-                             int64_t num_ranks, int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank)
+                             int64_t num_ranks, int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank,
+                             bool is_prefill)
 {
     TORCH_CHECK(experts_offset.size(0) == num_local_experts + 1, "experts_offset size must be num_local_experts + 1");
 
@@ -559,13 +569,34 @@ int64_t topk_convert_kunpeng(at::Tensor src_info,        // [num_local_experts, 
     int32_t *experts_offset_data = experts_offset.data_ptr<int32_t>();
 
     int64_t ti = 0;
-    for (int64_t ei = 0; ei < num_local_experts; ei++) {
-        experts_offset_data[ei] = ti;
-        for (int64_t ri = 0; ri < num_ranks; ri++) {
-            int64_t size = src_info_data[(ei * num_ranks + ri) * (num_max_dispatch_tokens_per_rank * 2 + 1)];
-            for (int64_t i = 0; i < size; i++) {
-                token_ids_data[ti] = (ei * num_ranks + ri) * num_max_dispatch_tokens_per_rank + i;
-                ti++;
+    int64_t max_tokens = num_max_dispatch_tokens_per_rank * 16;
+    if (is_prefill) {
+        for (int64_t ei = 0; ei < num_local_experts; ei++) {
+            experts_offset_data[ei] = ti;
+            int token_bias = ei * 2 * max_tokens;
+            int bias_bound = token_bias + 2 * max_tokens;
+            for (int64_t ri = 0; ri < num_ranks; ri++) {
+                int size = src_info_data[(ei * num_ranks + ri) * (num_max_dispatch_tokens_per_rank * 2 + 1)];
+                for (int64_t i = 0; i < size; i++) {
+                    token_ids_data[ti] = token_bias;
+                    token_bias++;
+                    ti++;
+                    TORCH_CHECK(token_bias <= bias_bound, "token_bias overflow: token_bias=", token_bias,
+                                " bias_bound=", bias_bound);
+                }
+            }
+        }
+    } else {
+        for (int64_t ei = 0; ei < num_local_experts; ei++) {
+            experts_offset_data[ei] = ti;
+            for (int64_t ri = 0; ri < num_ranks; ri++) {
+                // size: the num of tokens received from this rank
+                int64_t size = src_info_data[(ei * num_ranks + ri) * (num_max_dispatch_tokens_per_rank * 2 + 1)];
+                for (int64_t i = 0; i < size; i++) {
+                    // index of token received in packed_recv_x
+                    token_ids_data[ti] = (ei * num_ranks + ri) * num_max_dispatch_tokens_per_rank + i;
+                    ti++;
+                }
             }
         }
     }

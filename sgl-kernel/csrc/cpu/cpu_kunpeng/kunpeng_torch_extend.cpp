@@ -185,7 +185,7 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8, at::Tensor experts_w2
                                  at::Tensor moe_down, at::Tensor tmpx, at::Tensor tmpy, at::Tensor tmp_scales);
 
 int64_t topk_convert_kunpeng(at::Tensor src_info, at::Tensor token_ids, at::Tensor experts_offset, int64_t num_ranks,
-                             int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank);
+                             int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank, bool is_prefill);
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, int64_t num_token_non_padded, int64_t num_experts,
                                         int64_t topk);
@@ -497,7 +497,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def(
         "topk_convert_kunpeng("
         "Tensor src_info, Tensor(a!) token_ids, Tensor(b!) experts_offset, "
-        "int num_ranks, int num_local_experts, int num_max_dispatch_tokens_per_rank) -> int");
+        "int num_ranks, int num_local_experts, int num_max_dispatch_tokens_per_rank, bool is_prefill) -> int");
     m.impl("topk_convert_kunpeng", topk_convert_kunpeng);
 
     // SHM operators
