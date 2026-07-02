@@ -677,6 +677,50 @@ class DefaultModelLoader(BaseModelLoader):
 
         return model
 
+    @staticmethod
+    def _dump_weight_stats(model: nn.Module):
+        import os
+
+        from sglang.srt.distributed import get_world_rank
+
+        if get_world_rank() != 0:
+            return
+
+        dump_path = (
+            "/root/pacific_ext/psi/users/lix/sglang/workspace/model_weight_stats.txt"
+        )
+
+        os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+
+        lines = []
+        lines.append(
+            "权重\t大小\t类型\t次数\t元素个数\t大小(bytes)\t总个数\t总大小(MB)"
+        )
+        total_bytes = 0
+        total_params = 0
+
+        for name, param in model.named_parameters():
+            dtype_str = str(param.dtype).split(".")[-1]
+            shape_str = str(tuple(param.shape))
+            numel = param.numel()
+            elem_size = param.element_size()
+            mem_bytes = numel * elem_size
+            mem_mb = mem_bytes / (1024 * 1024)
+            lines.append(
+                f"{name}\t{shape_str}\t{dtype_str}\t1\t{numel}\t{mem_bytes}\t1\t{mem_mb:.4f}"
+            )
+            total_bytes += mem_bytes
+            total_params += numel
+
+        lines.append(
+            f"TOTAL\t\t\t\t{numel}\t{total_bytes}\t{len(lines)-1}\t{total_bytes / (1024 * 1024):.4f}"
+        )
+
+        with open(dump_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        logger = logging.getLogger(__name__)
+        logger.info(f"[_dump_weight_stats] saved weight stats to {dump_path}")
+
     def load_model(
         self,
         *,
@@ -707,6 +751,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         logger.info(f"[DefaultModelLoader.load_model] loading model finish")
+
+        DefaultModelLoader._dump_weight_stats(model)
+
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
@@ -1374,14 +1421,16 @@ class ShardedStateLoader(BaseModelLoader):
             # 如果是连续的，直接展平计算
             if tensor.is_contiguous():
                 return tensor.view(-1)[-1].data_ptr() + tensor.element_size()
-            
+
             # 针对 W8A8Int8LinearMethod 里的 .t() 转置导致的非连续情况：
             # 1. 把它转置回去（恢复成连续状态）
             restored_tensor = tensor.t()
-            
+
             # 2. 此时 restored_tensor 已经是连续的了，可以安全地使用 view(-1)
-            end_ptr = restored_tensor.view(-1)[-1].data_ptr() + restored_tensor.element_size()
-            
+            end_ptr = (
+                restored_tensor.view(-1)[-1].data_ptr() + restored_tensor.element_size()
+            )
+
             # 3. 返回计算好的指针（局部变量 restored_tensor 会在函数结束时自动销毁，
             #    原 tensor 在外面依然保持转置状态，实现了“转回去，做完，再转回来”）
             return end_ptr
@@ -1431,7 +1480,10 @@ class ShardedStateLoader(BaseModelLoader):
 
         from safetensors.torch import safe_open
 
-        from sglang.srt.distributed import get_tensor_model_parallel_rank, get_world_rank
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_rank,
+            get_world_rank,
+        )
 
         local_model_path = self._prepare_weights(
             model_config.model_path, model_config.revision
@@ -1450,18 +1502,25 @@ class ShardedStateLoader(BaseModelLoader):
             rank = get_tensor_model_parallel_rank()
             world_rank = get_world_rank()
             local_rank = world_rank % 16
-            print(f"[ShardedStateLoader.load_model] rank={rank}, world_rank={world_rank}")
-            pattern = os.path.join(local_model_path,f"rank_{local_rank}", "*.safetensors")
+            print(
+                f"[ShardedStateLoader.load_model] rank={rank}, world_rank={world_rank}"
+            )
+            pattern = os.path.join(
+                local_model_path, f"rank_{local_rank}", "*.safetensors"
+            )
             filepaths = list(glob.glob(pattern))
 
-            pattern = os.path.join(local_model_path, "global",f"rank_{world_rank}", "*.safetensors")
+            pattern = os.path.join(
+                local_model_path, "global", f"rank_{world_rank}", "*.safetensors"
+            )
             filepaths += list(glob.glob(pattern))
 
             filepaths += [
-                os.path.join(local_model_path, "moe", f"experts.{world_rank}.safetensors"),
+                os.path.join(
+                    local_model_path, "moe", f"experts.{world_rank}.safetensors"
+                ),
                 os.path.join(local_model_path, "lm_head", f"{world_rank}.safetensors"),
             ]
-
 
             if not filepaths:
                 # TODO: support un-sharded checkpoints too
@@ -1469,9 +1528,15 @@ class ShardedStateLoader(BaseModelLoader):
                     f"Could not find checkpoint files '{pattern}', only "
                     f"pre-sharded checkpoints are currently supported!"
                 )
-            print(f"[ShardedStateLoader.load_model] Loading from files: {filepaths}", flush=True)
+            print(
+                f"[ShardedStateLoader.load_model] Loading from files: {filepaths}",
+                flush=True,
+            )
             state_dict = self._filter_subtensors(model.state_dict())
-            print(f"[ShardedStateLoader.load_model] Model state dict {len(state_dict.keys())} keys before loading", flush=True)
+            print(
+                f"[ShardedStateLoader.load_model] Model state dict {len(state_dict.keys())} keys before loading",
+                flush=True,
+            )
             for path in filepaths:
                 with safe_open(path, framework="pt") as f:
                     # print(f"[ShardedStateLoader.load_model] Loading weights from {path} with {len(f.keys())} keys", flush=True)
@@ -1480,7 +1545,8 @@ class ShardedStateLoader(BaseModelLoader):
                         # If loading with LoRA enabled, additional padding may
                         # be added to certain parameters. We only load into a
                         # narrowed view of the parameter data.
-                        if key not in state_dict: continue
+                        if key not in state_dict:
+                            continue
                         param_data = state_dict[key].data
                         param_shape = state_dict[key].shape
                         for dim, size in enumerate(tensor.shape):
@@ -1497,7 +1563,10 @@ class ShardedStateLoader(BaseModelLoader):
                         param_data.copy_(tensor)
                         state_dict.pop(key)
             if state_dict:
-                print(f"[ShardedStateLoader.load_model] Warning: The following keys were not found in the checkpoint and were not loaded: {tuple(state_dict)}", flush=True)
+                print(
+                    f"[ShardedStateLoader.load_model] Warning: The following keys were not found in the checkpoint and were not loaded: {tuple(state_dict)}",
+                    flush=True,
+                )
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
             post_load_weights(model, model_config)
@@ -1512,7 +1581,6 @@ class ShardedStateLoader(BaseModelLoader):
             # for k,v in model.state_dict().items():
             #     print(f"  {k}: {v.shape}, dtype={v.dtype}, v={v}")
 
-
         return model.eval()
 
     @staticmethod
@@ -1522,7 +1590,10 @@ class ShardedStateLoader(BaseModelLoader):
         pattern: Optional[str] = None,
         max_size: Optional[int] = None,
     ) -> None:
-        print(f"[ShardedStateLoader.save_model] Saving model to {path} with pattern {pattern} and max_size {max_size}", flush=True)
+        print(
+            f"[ShardedStateLoader.save_model] Saving model to {path} with pattern {pattern} and max_size {max_size}",
+            flush=True,
+        )
         from safetensors.torch import save_file
 
         from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -1532,7 +1603,7 @@ class ShardedStateLoader(BaseModelLoader):
         rank = get_tensor_model_parallel_rank()
         part_idx = 0
         total_size = 0
-        
+
         # 1. 过滤掉共享内存的子张量
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
         state_dict_part: Dict[str, torch.Tensor] = {}
@@ -3319,7 +3390,9 @@ def get_model_loader(
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
-    logger.info(f"[get_model_loader]: load_format={load_config.load_format}, choosing model loader...")
+    logger.info(
+        f"[get_model_loader]: load_format={load_config.load_format}, choosing model loader..."
+    )
 
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
