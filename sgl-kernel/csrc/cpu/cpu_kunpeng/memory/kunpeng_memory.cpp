@@ -15,207 +15,52 @@
  */
 
 #include <torch/all.h>
-#include <torch/library.h>
-#include <torch/extension.h>
-#include <kupl.h>
-#include "sgl_kernel_ops.h"
-#include <fstream>
 #include <cstdint>
-#include <unistd.h>
-#include <sys/syscall.h>
 #include <chrono>
-#include "../utils/prf_memcpy.h"
-#include "../utils/sdma_util.h"
-#include "../utils/sdma_thres_util.h"
+#include <cstring>
+#include <iostream>
+#include <numa.h>
+#include <numaif.h>
+#include <sys/mman.h>
 
-constexpr bool debug = false;
-// 分块拷贝的阈值，用于将大块内存拷贝操作分割成多个小块异步拷贝任务
-const int64_t ASYNC_COPY_THRES_SIZE = 14 * 1024 * 1024;
+constexpr int64_t PAGE_SIZE = 2l * 1024 * 1024;  // 2MB huge page
+constexpr int BENCH_LOOPS = 10;
 
-inline int64_t now_ns() {
-    return std::chrono::high_resolution_clock::now().time_since_epoch().count();
-}
+at::Tensor hbw_allocator_kunpeng(int64_t size)
+{
+    int64_t aligned_size = (size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+    int64_t num_pages = aligned_size / PAGE_SIZE;
 
-at::Tensor hbw_allocator_kunpeng(int64_t size) {
-    void* ptr = kupl_hbw_malloc(size);
-    if (!ptr) {
-        throw std::runtime_error("kupl_hbw_malloc failed");
+    // Step 1: mmap with MAP_HUGETLB + MAP_POPULATE
+    auto *hbm = static_cast<uint8_t *>(mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0));
+    if (hbm == MAP_FAILED) {
+        std::cerr << "    FAILED: errno=" << errno << " (" << strerror(errno) << ")" << std::endl;
+        throw std::runtime_error("mmap with MAP_HUGETLB failed");
     }
 
-    int64_t ptr_value = reinterpret_cast<int64_t>(ptr);
-    at::Tensor ptr_tensor = at::full({1}, ptr_value, at::dtype(at::kLong).device(at::kCPU));
-    return ptr_tensor;
+    // Step 2: mbind to HBM NUMA node
+    int cpu = sched_getcpu();
+    int cpu_node = numa_node_of_cpu(cpu);
+    int hbm_node = cpu_node + 16;
+    unsigned long mask = 1UL << hbm_node;
+
+    int ret = mbind(hbm, aligned_size, MPOL_BIND, &mask, sizeof(mask) * 8, MPOL_MF_STRICT);
+    if (ret != 0) {
+        std::cerr << "    FAILED: errno=" << errno << " (" << strerror(errno) << ")" << std::endl;
+        munmap(hbm, aligned_size);
+        throw std::runtime_error("mbind to HBM NUMA node failed");
+    }
+
+    // Create a uint8 tensor that wraps the HBM memory directly (no copy)
+    at::Tensor data_tensor = at::from_blob(hbm, {aligned_size}, at::dtype(at::kByte).device(at::kCPU));
+    return data_tensor;
 }
 
-void hbw_destroy_kunpeng(at::Tensor ptr_tensor) {
-    int64_t ptr_value = ptr_tensor.item<int64_t>();
-    void* ptr = reinterpret_cast<void*>(ptr_value);
-
+void hbw_destroy_kunpeng(at::Tensor data_tensor)
+{
+    void *ptr = data_tensor.data_ptr();
     if (ptr) {
-        kupl_hbw_free(ptr);
+        munmap(ptr, data_tensor.numel());
     }
-}
-
-void sync_swap_kunpeng(at::Tensor dst, at::Tensor src, int64_t byte_size) {
-    void* dst_ptr = dst.data_ptr();
-    void* src_ptr = src.data_ptr();
-
-    utils::prf_memcpy<true, true, 3 * 1024, SV_PLDL2STRM>(dst_ptr, src_ptr, static_cast<size_t>(byte_size));
-}
-
-// on_package_memory -> ddr, 异步将数据从on_package_memory拷贝回ddr
-void queue_async_swapout_kunpeng(
-    int64_t index,
-    int64_t byte_size,
-    int64_t byte_offset,
-    at::Tensor src,                    // 源 tensor
-    at::Tensor dst,                    // 目标 tensor
-    at::Tensor ddr2swap,               // 1D tensor, shape: [BLOCK_NUM]
-    at::Tensor swapout_tables,         // 2D tensor, shape: [BLOCK_NUM, MAX_EVENTS]
-    at::Tensor swapout_lengths         // 1D tensor, shape: [BLOCK_NUM],
-) {
-    if (debug) {
-        std::cout << "queue_async_swapout: index=" << index
-                  << ", byte_size=" << byte_size
-                  << ", byte_offset=0x" << std::hex << byte_offset << std::dec << std::endl;
-    }
-    // 获取指针
-    int* ddr2swap_ptr = ddr2swap.data_ptr<int>();
-    int swap_index = ddr2swap_ptr[index];
-    TORCH_CHECK(swap_index != -1, "swap_index == -1, no swapin before");
-
-    if (byte_size == -1) {
-        // byte_size = swap_buffer_size;
-        TORCH_CHECK(false, "byte_size == -1 not supported without swap_buffer_size");
-    }
-
-    int64_t buffer_stride = src.size(1) * src.size(2) * src.size(3) * src.element_size();
-    void* src_ptr = (void*)(((int8_t*)src.data_ptr()) + swap_index * buffer_stride + byte_offset);
-    void* dst_ptr = (void*)(((int8_t*)dst.data_ptr()) + byte_offset);
-
-    int event_id = utils::kupl_get_free_event_id();
-    utils::kupl_sdma_async(event_id, dst_ptr, src_ptr, byte_size);
-
-    int* lengths_ptr = swapout_lengths.data_ptr<int>();
-    int current_len = lengths_ptr[index];
-    int64_t stride = swapout_tables.size(1);
-    int* table_ptr = swapout_tables.data_ptr<int>();
-    table_ptr[index * stride + current_len] = event_id;
-    lengths_ptr[index] = current_len + 1;
-    ddr2swap_ptr[index] = -1;
-}
-
-// ============ queue_async_swapin ============
-int64_t queue_async_swapin_kunpeng(
-    int64_t index,
-    int64_t byte_size,
-    int64_t now_buf_id,
-    at::Tensor src,
-    at::Tensor dst,
-    at::Tensor ddr2swap,
-    at::Tensor swapin_tables,
-    at::Tensor swapin_lengths,
-    int64_t num_swap_buffers
-) {
-    if (debug) {
-        std::cout << "queue_async_swapin: index=" << index
-                  << ", byte_size=" << byte_size << std::endl;
-    }
-
-    void* src_ptr = src.data_ptr();
-    int64_t buffer_stride = dst.size(1) * dst.size(2) * dst.size(3) * dst.element_size();
-    void* dst_ptr = (void*)(((int8_t*)dst.data_ptr()) + now_buf_id * buffer_stride);
-
-    int* ddr2swap_ptr = ddr2swap.data_ptr<int>();
-    ddr2swap_ptr[index] = now_buf_id;
-    // 更新 now_buf_id
-    now_buf_id = (now_buf_id + 1) % num_swap_buffers;
-
-    if (byte_size == -1) {
-        TORCH_CHECK(false, "byte_size == -1 not supported without swap_buffer_size");
-    }
-
-    int64_t send_num = (byte_size + ASYNC_COPY_THRES_SIZE - 1) / ASYNC_COPY_THRES_SIZE;
-
-    int64_t stride = swapin_tables.size(1);
-    int* table_ptr = swapin_tables.data_ptr<int>();
-    int* lengths_ptr = swapin_lengths.data_ptr<int>();
-    int current_len = lengths_ptr[index];
-
-    for (int64_t i = 0; i < send_num; i++) {
-        int event_id = utils::kupl_get_free_event_id();
-        void* src_p = (void*)(((int8_t*)src_ptr) + i * ASYNC_COPY_THRES_SIZE);
-        void* dst_p = (void*)(((int8_t*)dst_ptr) + i * ASYNC_COPY_THRES_SIZE);
-        int64_t copy_size = std::min(byte_size - i * ASYNC_COPY_THRES_SIZE, ASYNC_COPY_THRES_SIZE);
-        utils::kupl_sdma_async(event_id, dst_p, src_p, copy_size);
-        table_ptr[index * stride + current_len + i] = event_id;
-    }
-
-    lengths_ptr[index] = current_len + send_num;
-    return now_buf_id;
-}
-
-// ============ get_safe_on_package_memory_index ============
-int64_t get_safe_on_package_memory_index_kunpeng(
-    int64_t index,
-    at::Tensor ddr2swap,
-    at::Tensor swap2ddr,
-    at::Tensor swapin_tables,
-    at::Tensor swapout_tables,
-    at::Tensor swapin_lengths,
-    at::Tensor swapout_lengths
-) {
-    int* ddr2swap_ptr = ddr2swap.data_ptr<int>();
-    int* swap2ddr_ptr = swap2ddr.data_ptr<int>();
-    int* swapin_lengths_ptr = swapin_lengths.data_ptr<int>();
-    int* swapout_lengths_ptr = swapout_lengths.data_ptr<int>();
-    int swap_index = ddr2swap_ptr[index];
-    TORCH_CHECK(swap_index != -1, "swap_index == -1, no swapin before");
-
-    int ddr_index = swap2ddr_ptr[swap_index];
-    if (ddr_index == index) {
-        return swap_index;
-    }
-
-    int64_t swapout_stride = swapout_tables.size(1);
-    int* swapout_tables_ptr = swapout_tables.data_ptr<int>();
-    int64_t swapin_stride = swapin_tables.size(1);
-    int* swapin_tables_ptr = swapin_tables.data_ptr<int>();
-
-    bool need_wait0 = (ddr_index != -1 && swapout_lengths_ptr[ddr_index] > 0);
-    bool need_wait1 = (swapin_lengths_ptr[index] > 0);
-
-    if (need_wait0) {
-        int len = swapout_lengths_ptr[ddr_index];
-        for (int i = 0; i < len; i++) {
-            int eid = swapout_tables_ptr[ddr_index * swapout_stride + i];
-            utils::kupl_sdma_wait(eid);
-        }
-        swapout_lengths_ptr[ddr_index] = 0;
-    }
-
-    if (need_wait1) {
-        int len = swapin_lengths_ptr[index];
-        for (int i = 0; i < len; i++) {
-            int eid = swapin_tables_ptr[index * swapin_stride + i];
-            utils::kupl_sdma_wait(eid);
-        }
-        swapin_lengths_ptr[index] = 0;
-    }
-
-    swap2ddr_ptr[swap_index] = index;
-    return swap_index;
-}
-
-void init_sdma(int64_t sdmathreshold)
-{
-    SdmaCtlThredInit();
-    SetSdmaThreshold(sdmathreshold);
-    utils::kupl_sdma_init();
-}
-
-void finalize_sdma()
-{
-    utils::kupl_sdma_clear();
-    DevmemFdDestroy();
 }

@@ -13,9 +13,15 @@
 # ==============================================================================
 
 import sys
+import time
 
 import sgl_kernel
 import torch
+
+from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import (
+    KunpengHBWPool,
+    hbw_pool,
+)
 
 
 def _has_ops():
@@ -36,6 +42,7 @@ def compute_expected(a, b, act_scale, weight_scale):
 
 def _test_impl(m, n, k, tile_m, tile_n, tile_k):
     device = torch.device("cpu")
+    pool = KunpengHBWPool.get_instance()
 
     a = torch.randint(-8, 7, (m, k), dtype=torch.int8, device=device)
     b = torch.randint(-8, 7, (n, k), dtype=torch.int8, device=device)
@@ -96,11 +103,60 @@ def _test_impl(m, n, k, tile_m, tile_n, tile_k):
         f"  OK  [{mode}] m={m:4d}  n={n:5d}  k={k:5d}  tile=({tile_m},{tile_n},{tile_k})"
     )
 
+    iters = 1000
+    start = time.perf_counter()
+    for i in range(iters):
+        torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_kunpeng(
+            pack_a,
+            pack_b,
+            weight_scale,
+            act_scale,
+            output,
+            workspace,
+            tile_m,
+            tile_n,
+            tile_k,
+        )
+
+    end = time.perf_counter()
+    total_ms = (end - start) * 1000.0
+    avg_us = total_ms * 1000.0 / iters
+    print(f"[{iters} iters] total={total_ms:.2f} ms, avg={avg_us:.4f} us/iter")
+
+    pack_a_hbm = pool.move_to_hbw(pack_a)
+    pack_b_hbm = pool.move_to_hbw(pack_b)
+    weight_scale_hbm = pool.move_to_hbw(weight_scale)
+    act_scale_hbm = pool.move_to_hbw(act_scale)
+    output_hbm = pool.move_to_hbw(output)
+    workspace_hbm = pool.move_to_hbw(workspace)
+
+    iters = 1000
+    start = time.perf_counter()
+    for i in range(iters):
+        torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_kunpeng(
+            pack_a_hbm,
+            pack_b_hbm,
+            weight_scale_hbm,
+            act_scale_hbm,
+            output_hbm,
+            workspace_hbm,
+            tile_m,
+            tile_n,
+            tile_k,
+        )
+
+    end = time.perf_counter()
+    total_ms = (end - start) * 1000.0
+    avg_us = total_ms * 1000.0 / iters
+    print(f"[{iters} iters] total={total_ms:.2f} ms, avg={avg_us:.4f} us/iter")
+
 
 def main():
     if not _has_ops():
         print("SKIP: s8_s8_packed_gemm_bf16_dq ops not available in this build")
         return
+
+    KunpengHBWPool.get_instance(pool_size_bytes=2048 * 1024 * 1024)
 
     _test_impl(128, 264, 7168, 128, 132, 448)
 
