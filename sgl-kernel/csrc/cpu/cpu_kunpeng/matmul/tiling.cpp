@@ -46,7 +46,6 @@ static const InnerTilingMap igemm_plan_prefill_32 = {
 
 static const InnerTilingMap igemm_plan_decode_32 = {
     // deepseek v3
-    {{2112, 7168}, {1056, 448}},  // qkva
     {{264, 7168}, {132, 448}},    // qkva
     {{1536, 1536}, {768, 1536}},  // q_b
     {{2048, 512}, {256, 512}},    // kv_b
@@ -218,4 +217,22 @@ std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan_decode(int6
                                                                             int64_t num_threads)
 {
     return find_optimal_tiling_plan_impl(M, N, K, num_threads, bgemm_decode_plans_by_threads, "bgemm", "decode");
+}
+
+std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K,
+                                                                     int64_t num_threads)
+{
+    if (M > 128) {
+        return igemm_find_optimal_tiling_plan_prefill(M, N, K, num_threads);
+    }
+    return igemm_find_optimal_tiling_plan_decode(M, N, K, num_threads);
+}
+
+std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K,
+                                                                     int64_t num_threads)
+{
+    if (M > 128) {
+        return bgemm_find_optimal_tiling_plan_prefill(M, N, K, num_threads);
+    }
+    return bgemm_find_optimal_tiling_plan_decode(M, N, K, num_threads);
 }

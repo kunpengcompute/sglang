@@ -14,16 +14,15 @@
 
 import sys
 
+import sgl_kernel
 import torch
 
 
 def _has_ops():
     try:
-        torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_prefill_kunpeng
-        torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng
+        torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_kunpeng
         torch.ops.sgl_kernel.s8_gemm_pack_kunpeng
-        torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_prefill
-        torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode
+        torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan
         return True
     except (RuntimeError, AttributeError):
         return False
@@ -35,23 +34,8 @@ def compute_expected(a, b, act_scale, weight_scale):
     return ref.to(torch.bfloat16)
 
 
-def _test_impl(m, n, k, is_prefill, num_threads=32):
+def _test_impl(m, n, k, tile_m, tile_n, tile_k):
     device = torch.device("cpu")
-
-    if is_prefill:
-        tile_m, tile_n, tile_k = (
-            torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_prefill(
-                m, n, k, num_threads
-            )
-        )
-        op = torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_prefill_kunpeng
-    else:
-        tile_m, tile_n, tile_k = (
-            torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
-                m, n, k, num_threads
-            )
-        )
-        op = torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng
 
     a = torch.randint(-8, 7, (m, k), dtype=torch.int8, device=device)
     b = torch.randint(-8, 7, (n, k), dtype=torch.int8, device=device)
@@ -71,7 +55,17 @@ def _test_impl(m, n, k, is_prefill, num_threads=32):
     workspace_size = max(blocks_in_k * n * m * 2, 1)
     workspace = torch.empty(workspace_size, dtype=torch.bfloat16, device=device)
 
-    op(pack_a, pack_b, weight_scale, act_scale, output, workspace, num_threads)
+    torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_kunpeng(
+        pack_a,
+        pack_b,
+        weight_scale,
+        act_scale,
+        output,
+        workspace,
+        tile_m,
+        tile_n,
+        tile_k,
+    )
 
     if k == tile_k:
         max_diff = (output.float() - expect.float()).abs().max().item()
@@ -97,18 +91,10 @@ def _test_impl(m, n, k, is_prefill, num_threads=32):
             )
             sys.exit(1)
 
-    mode = "prefill" if is_prefill else "decode"
+    mode = "prefill" if m > 128 else "decode"
     print(
         f"  OK  [{mode}] m={m:4d}  n={n:5d}  k={k:5d}  tile=({tile_m},{tile_n},{tile_k})"
     )
-
-
-def test_prefill():
-    _test_impl(16, 264, 7168, is_prefill=True)
-
-
-def test_decode():
-    _test_impl(16, 2112, 7168, is_prefill=False)
 
 
 def main():
@@ -116,8 +102,7 @@ def main():
         print("SKIP: s8_s8_packed_gemm_bf16_dq ops not available in this build")
         return
 
-    test_prefill()
-    test_decode()
+    _test_impl(128, 264, 7168, 128, 132, 448)
 
 
 if __name__ == "__main__":

@@ -45,13 +45,9 @@ void batched_gemm_woqs8_allthreads_kunpeng(at::Tensor act, at::Tensor weight, at
 void rope_kunpeng(at::Tensor position_ids, at::Tensor q, at::Tensor k, at::Tensor q_out, at::Tensor k_out,
                   at::Tensor cos_sin_cache);
 
-void s8_s8_packed_gemm_bf16_dq_prefill_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
-                                               at::Tensor scale, at::Tensor output, at::Tensor workspace,
-                                               int64_t num_threads);
-
-void s8_s8_packed_gemm_bf16_dq_decode_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
-                                              at::Tensor scale, at::Tensor output, at::Tensor workspace,
-                                              int64_t num_threads);
+void s8_s8_packed_gemm_bf16_dq_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor weight_scale, at::Tensor scale,
+                                       at::Tensor output, at::Tensor workspace, int64_t tile_m, int64_t tile_n,
+                                       int64_t tile_k);
 
 void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c);
 
@@ -64,11 +60,17 @@ std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan_prefill(int
 std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K,
                                                                             int64_t num_threads);
 
+std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K,
+                                                                     int64_t num_threads);
+
 std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan_prefill(int64_t M, int64_t N, int64_t K,
                                                                              int64_t num_threads);
 
 std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K,
                                                                             int64_t num_threads);
+
+std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K,
+                                                                     int64_t num_threads);
 
 // === Attention 算子声明 ===
 at::Tensor flash_mla_meta_create_kunpeng();
@@ -261,6 +263,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("igemm_find_optimal_tiling_plan_decode(int M, int N, int K, int num_threads) -> (int, int, int)");
     m.impl("igemm_find_optimal_tiling_plan_decode", igemm_find_optimal_tiling_plan_decode);
 
+    m.def("igemm_find_optimal_tiling_plan(int M, int N, int K, int num_threads) -> (int, int, int)");
+    m.impl("igemm_find_optimal_tiling_plan", igemm_find_optimal_tiling_plan);
+
     // bgemm tiling plan
     m.def("bgemm_find_optimal_tiling_plan_prefill(int M, int N, int K, int num_threads) -> (int, int, int)");
     m.impl("bgemm_find_optimal_tiling_plan_prefill", bgemm_find_optimal_tiling_plan_prefill);
@@ -268,16 +273,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("bgemm_find_optimal_tiling_plan_decode(int M, int N, int K, int num_threads) -> (int, int, int)");
     m.impl("bgemm_find_optimal_tiling_plan_decode", bgemm_find_optimal_tiling_plan_decode);
 
+    m.def("bgemm_find_optimal_tiling_plan(int M, int N, int K, int num_threads) -> (int, int, int)");
+    m.impl("bgemm_find_optimal_tiling_plan", bgemm_find_optimal_tiling_plan);
+
     // s8_s8_packed_gemm_bf16_dq
     m.def(
-        "s8_s8_packed_gemm_bf16_dq_prefill_kunpeng(Tensor input, Tensor weight, Tensor weight_scale, Tensor scale, "
-        "Tensor(a!) output, Tensor workspace, int num_threads) -> ()");
-    m.impl("s8_s8_packed_gemm_bf16_dq_prefill_kunpeng", s8_s8_packed_gemm_bf16_dq_prefill_kunpeng);
-
-    m.def(
-        "s8_s8_packed_gemm_bf16_dq_decode_kunpeng(Tensor input, Tensor weight, Tensor weight_scale, Tensor scale, "
-        "Tensor(a!) output, Tensor workspace, int num_threads) -> ()");
-    m.impl("s8_s8_packed_gemm_bf16_dq_decode_kunpeng", s8_s8_packed_gemm_bf16_dq_decode_kunpeng);
+        "s8_s8_packed_gemm_bf16_dq_kunpeng(Tensor input, Tensor weight, Tensor weight_scale, Tensor scale, "
+        "Tensor(a!) output, Tensor workspace, int tile_m, int tile_n, int tile_k) -> ()");
+    m.impl("s8_s8_packed_gemm_bf16_dq_kunpeng", s8_s8_packed_gemm_bf16_dq_kunpeng);
 
     // bf16 gemm pack
     m.def("bf16_gemm_pack_kunpeng(Tensor input, Tensor(a!) out, int split_r, int split_c) -> ()");

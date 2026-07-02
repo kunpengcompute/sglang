@@ -128,12 +128,7 @@ void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor ou
     TORCH_CHECK(weight.size(1) == k, "A.k != W.k");
     TORCH_CHECK(output.size(0) == m && output.size(1) == n, "output shape mismatch");
 
-    kutacc::MatrixTilingBlock t;
-    if (is_prefill) {
-        t = bgemm_find_optimal_tiling_plan_prefill(m, n, k, num_threads);
-    } else {
-        t = bgemm_find_optimal_tiling_plan_decode(m, n, k, num_threads);
-    }
+    kutacc::MatrixTilingBlock t = bgemm_find_optimal_tiling_plan(m, n, k, num_threads);
     auto [tile_m, tile_n, tile_k] = t;
 
     TORCH_CHECK(tile_k % 2 == 0, "bf16_packed_gemm kernel only support tile_k % 2 == 0");
@@ -157,12 +152,7 @@ void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size, bool is_p
     int64_t k = weight.size(1);
     int64_t workspace_size = m * k * weight.element_size();
     auto workspace = at::empty({workspace_size}, weight.options().dtype(at::kByte));
-    kutacc::MatrixTilingBlock t;
-    if (is_prefill) {
-        t = bgemm_find_optimal_tiling_plan_prefill(batch_size, m, k, kutacc::get_thread_num());
-    } else {
-        t = bgemm_find_optimal_tiling_plan_decode(batch_size, m, k, kutacc::get_thread_num());
-    }
+    kutacc::MatrixTilingBlock t = bgemm_find_optimal_tiling_plan(batch_size, m, k, kutacc::get_thread_num());
     bfloat16_t *i_ptr = reinterpret_cast<bfloat16_t *>(weight.data_ptr());
     bfloat16_t *o_ptr = reinterpret_cast<bfloat16_t *>(workspace.data_ptr());
     TORCH_CHECK(std::get<2>(t) % 2 == 0, "bgemm_pack k%2 != 0");
