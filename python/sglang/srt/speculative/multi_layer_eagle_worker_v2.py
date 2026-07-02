@@ -321,7 +321,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                             (tree_info[2].size(0), 1),
                             i,
                             dtype=torch.long,
-                            device="cuda",
+                            device=self.device,
                         )
                     )
 

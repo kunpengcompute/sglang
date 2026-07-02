@@ -343,9 +343,14 @@ class KunpengCpuBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_decode_metadata(forward_batch)
+        elif forward_batch.forward_mode.is_draft_extend():
+            save_seq_lens = forward_batch.seq_lens
+            forward_batch.seq_lens = save_seq_lens + forward_batch.extend_seq_lens
+            self._init_decode_metadata(forward_batch, seqlen_q=2)
+            forward_batch.seq_lens = save_seq_lens
         return
 
-    def _init_decode_metadata(self, forward_batch: ForwardBatch):
+    def _init_decode_metadata(self, forward_batch: ForwardBatch, seqlen_q: int = 1):
         metadata = KunpengCpuMetadata()
 
         metadata.page_size = forward_batch.token_to_kv_pool.page_size
@@ -393,7 +398,7 @@ class KunpengCpuBackend(AttentionBackend):
         metadata.extra_bytes = (
             torch.ops.sgl_kernel.flash_mla_dense_decode_sched_kunpeng(
                 metadata.seq_lens,
-                seqlen_q=1,
+                seqlen_q=seqlen_q,
                 num_heads_q=num_heads_q,
                 head_dim=self.head_dim,
                 head_dim_v=self.head_dim_v,
@@ -447,6 +452,75 @@ class KunpengCpuBackend(AttentionBackend):
         )
 
         return o_3d.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_extend_mla_paged(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+    ):
+        cache_loc = forward_batch.out_cache_loc
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+
+        q_heads = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        ext_lens_tensor = forward_batch.extend_seq_lens.to(torch.int32)
+        max_ext_len = 2
+        bs = ext_lens_tensor.numel()
+
+        assert ext_lens_tensor.max().item() <= max_ext_len, (
+            f"MTP=1 expects max ext_len <= {max_ext_len}, got {ext_lens_tensor.max().item()}"
+        )
+
+        q_padded = torch.zeros(
+            bs, max_ext_len, layer.tp_q_head_num, layer.qk_head_dim,
+            dtype=q.dtype, device=q.device,
+        )
+        torch.ops.sgl_kernel.pad_q_left_mtp_kunpeng(
+            q_heads.contiguous(), ext_lens_tensor, max_ext_len, q_padded
+        )
+
+        meta = self.forward_metadata
+        page_size = meta.page_size
+
+        kv_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kvcache_paged = kv_buf[:, 0, :].reshape(-1, page_size, kv_buf.shape[-1])
+
+        softmax_scale = 1.0 / math.sqrt(layer.qk_head_dim)
+        o_padded = torch.zeros_like(q_padded)
+        softmax_lse = torch.empty(
+            (bs, max_ext_len, layer.tp_q_head_num),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        extra_buffer = (
+            torch.empty(meta.extra_bytes, dtype=torch.uint8, device=q.device)
+            if meta.extra_bytes > 0
+            else torch.empty(0, dtype=torch.uint8, device=q.device)
+        )
+
+        torch.ops.sgl_kernel.flash_mla_dense_decode_kunpeng(
+            q_padded,
+            kvcache_paged,
+            None,
+            meta.block_table,
+            meta.seq_lens,
+            o_padded,
+            softmax_lse,
+            softmax_scale,
+            False,
+            extra_buffer,
+            self._decode_meta,
+        )
+
+        o_flat = torch.empty_like(q_heads)
+        torch.ops.sgl_kernel.unpad_o_right_mtp_kunpeng(
+            o_padded, ext_lens_tensor, max_ext_len, o_flat
+        )
+        return o_flat.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend_native(
         self,
@@ -505,7 +579,16 @@ class KunpengCpuBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # ---- Decide which path to use ----
+        # MLA_KUNPENG with prefix — attn_mqa needs paged KV cache read
+        if (
+            layer.tp_k_head_num == 1
+            and layer.tp_q_head_num != 1
+            and forward_batch.extend_seq_lens is not None
+        ):
+            return self._forward_extend_mla_paged(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
+
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
         is_cross_attn = layer.is_cross_attention
         is_encoder_only = layer.attn_type == AttentionType.ENCODER_ONLY

@@ -266,7 +266,7 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if self.server_args.disable_cuda_graph or self.device == "cpu":
             return
 
         Device2DraftCudaGraphRunner = {
