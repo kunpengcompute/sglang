@@ -106,7 +106,7 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
         
         ON_PACKAGE_MEMORY_NODE=$((ATTN_TP_RANK +16))
         echo 0 > /sys/devices/system/node/node${ATTN_TP_RANK}/hugepages/hugepages-2048kB/nr_hugepages
-        echo 0 > /sys/devices/system/node/node${ON_PACKAGE_MEMORY_NODE}/hugepages/hugepages-2048kB/nr_hugepages
+        echo 2020 > /sys/devices/system/node/node${ON_PACKAGE_MEMORY_NODE}/hugepages/hugepages-2048kB/nr_hugepages
 
         taskset -c $((ATTN_TP_RANK * 38 + 20)) \
         $SERVER_BIN "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \

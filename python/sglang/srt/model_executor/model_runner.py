@@ -181,11 +181,11 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_cpu_920f,
     is_hip,
     is_host_cpu_arm64,
-    is_npu,
-    is_cpu_920f,
     is_kunpeng_hbw_pool,
+    is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     require_attn_tp_gather,
@@ -420,9 +420,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.eagle_aux_hidden_state_layer_ids = None
 
         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import (
-                parse_dflash_draft_config,
-            )
+            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
             # Select target layers to capture for building DFlash context features.
             draft_model_config = self._build_model_config(
@@ -612,7 +610,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     rank=self.tp_rank,
                 )
             )
-        
+
         # init hbw pool
         if _is_cpu_920f and _is_kunpeng_hbw_pool:
             self.init_hbw_pool_kunpeng()
@@ -1394,6 +1392,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
+            if _is_cpu_920f and _is_kunpeng_hbw_pool:
+                for name, param in self.model.named_parameters():
+                    if "embed_tokens" in name:
+                        continue
+                    tensor_hbw = self.weight_hbw_pool.move_to_hbw(param)
+                    param.data = tensor_hbw
+
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
@@ -2296,14 +2301,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             KunpengHBWPool,
         )
 
-        pool_size_mb = int(os.environ.get("SGLANG_KUNPENG_HBW_POOL_SIZE_MB"))
-        if pool_size_mb > 0:
-            pool_size_bytes = pool_size_mb * 1024 * 1024
-        else:
-            raise ValueError(f"pool_size_mb must be positive, got {pool_size_mb}")
-
-        self.hbw_pool = KunpengHBWPool.get_instance(
-            pool_size_bytes=pool_size_bytes, alignment=self.page_size
+        weights_pool_size_mb = int(
+            os.environ.get("SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB")
+        )
+        assert (
+            weights_pool_size_mb > 0
+        ), f"weights_pool_size_mb must be positive, got {weights_pool_size_mb}"
+        weights_pool_size_bytes = weights_pool_size_mb * 1024 * 1024
+        self.weight_hbw_pool = KunpengHBWPool.get_instance(
+            name="weights",
+            pool_size_bytes=weights_pool_size_bytes,
+            alignment=2 * 1024 * 1024,
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
@@ -2391,9 +2399,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            pre_initialize_workspaces,
-        )
+        from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
 
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
