@@ -122,6 +122,7 @@ def _make_kunpeng_backend(
     v_head_dim: int,
     kv_cache_dim: int,
     device: torch.device,
+    enable_hbw_pool: bool = False,
 ):
     from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_cpu_backend import (
         KunpengCpuBackend,
@@ -159,6 +160,8 @@ def _make_kunpeng_backend(
     backend.kv_lora_rank = 512
     backend.qk_nope_head_dim = qk_head_dim
     backend.qk_rope_head_dim = 64
+    backend.head_dim = qk_head_dim
+    backend.head_dim_v = v_head_dim
     backend.qk_head_dim = qk_head_dim
     backend.v_head_dim = v_head_dim
     backend.kv_cache_dim = kv_cache_dim
@@ -185,7 +188,13 @@ def _make_kunpeng_backend(
     backend.attn_total_token_num = 0
     backend.enable_chunked_prefill = True
     backend.enable_hbw_swap = False
-    backend.enable_hbw_pool = False
+    backend.enable_hbw_pool = enable_hbw_pool
+    if backend.enable_hbw_pool:
+        from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import (
+            KunpengHBWPool,
+        )
+        KunpengHBWPool.get_instance(pool_size_bytes=128 * 1024 * 1024)
+        backend.hbw_pool = KunpengHBWPool.get_instance()
 
     backend.attn_seq_lens = None
     backend.attn_cur_lens = None
@@ -212,6 +221,7 @@ def _run_test_case(
     dtype: torch.dtype,
     device: torch.device,
     enable_chunked_prefill: bool = True,
+    enable_hbw_pool: bool = False,
 ):
     scaling = 1.0 / math.sqrt(qk_head_dim)
     total_tokens = sum(extend_seq_lens_list)

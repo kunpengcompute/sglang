@@ -16,7 +16,9 @@ import ctypes
 import logging
 import math
 import os
-from typing import Tuple, Optional
+import threading
+import weakref
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -26,45 +28,22 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "KunpengHBWPool",
     "KunpengHBWKVbuffer",
+    "hbw_pool",
 ]
 
-def create_tensor_from_hbw(
- 	         tensor_shape: Tuple[int, ...],
- 	         tensor_dtype: torch.dtype,
- 	 ) -> Tuple[torch.Tensor, torch.Tensor]:
-     """Allocate a tensor on Kunpeng HBW memory."""
-     if not tensor_shape:
-         raise ValueError("tensor_shape cannot be empty")
+def dtype_str(dtype: torch.dtype) -> str:
+    """Convert torch.dtype to numpy dtype string.
+    
+    Note: numpy does not support bfloat16, use uint16 as base.
+    """
+    if dtype == torch.bfloat16:
+        return "uint16"
+    return {torch.float32: "float32", torch.float16: "float16",
+            torch.float64: "float64",
+            torch.int32: "int32", torch.int64: "int64",
+            torch.int8: "int8", torch.uint8: "uint8",
+            torch.bool: "bool"}.get(dtype, str(dtype).split(".")[-1])
 
-     num_elements = math.prod(tensor_shape)
-     element_size = torch.empty(1, dtype=tensor_dtype).element_size()
-     alloc_size_bytes = num_elements * element_size
-
-     # allocator HBW memory
-     hbw_ptr_tensor = torch.ops.sgl_kernel.hbw_allocator_kunpeng(alloc_size_bytes)
-     hbw_raw_ptr = hbw_ptr_tensor.item()
-
-     if hbw_raw_ptr == 0:
-         raise RuntimeError(
-             f"HBW allocation failed: shape={tensor_shape}, dtype={tensor_dtype}, "
-             f"size={alloc_size_bytes} bytes ({alloc_size_bytes / 1024 / 1024:.2f} MB)"
-         )
-
-     hbw_buffer = (ctypes.c_char * alloc_size_bytes).from_address(hbw_raw_ptr)
-     hbw_np_array = np.frombuffer(hbw_buffer, dtype=np.uint8)
-     hbw_tensor = torch.from_numpy(hbw_np_array).view(tensor_dtype).reshape(tensor_shape)
-
-     return hbw_tensor, hbw_ptr_tensor
- 	 
-def free_tensor_from_hbw(hbw_ptr_tensor: torch.Tensor) -> None:
-    """Free HBW memory."""
-    torch.ops.sgl_kernel.hbw_destroy_kunpeng(hbw_ptr_tensor)
-
-def move_tensor_to_hbw(ddr_tensor: torch.Tensor) -> torch.Tensor:
-     """Copy a DDR tensor to HBW memory."""
-     hbw_tensor, hbw_ptr_tensor = create_tensor_from_hbw(ddr_tensor.shape, ddr_tensor.dtype)
-     hbw_tensor.copy_(ddr_tensor)
-     return hbw_tensor, hbw_ptr_tensor
 
 class KunpengHBWPool:
     """Free-list based HBW memory allocator.
@@ -75,19 +54,18 @@ class KunpengHBWPool:
 
     Usage::
 
-        pool = KunpengHBWPool(pool_size_bytes=64 * 1024 * 1024)
-        tensor, handle = pool.alloc((bs, num_heads, head_dim), torch.bfloat16)
-        # ... use tensor ...
-        pool.free(handle)  # Free individual tensor
-        # or
-        pool.reset()       # Free all at once
+        from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import hbw_pool
+
+        tensor  = hbw_pool.alloc((bs, num_heads, head_dim), torch.bfloat16, auto_free=auto_free)
+
+        # ... free tensor ...
+        if not auto_free:
+            hbw_pool.free(tensor)  # Free individual tensor
     """
 
     def __init__(self, pool_size_bytes: int, alignment: int = 64):
         self.pool_size = pool_size_bytes
         self.alignment = alignment
-        self._base_ptr: Optional[torch.Tensor] = None
-        self._base_addr: int = 0
 
         # Allocate the entire pool
         self._base_ptr = torch.ops.sgl_kernel.hbw_allocator_kunpeng(pool_size_bytes)
@@ -95,126 +73,184 @@ class KunpengHBWPool:
         if self._base_addr == 0:
             raise RuntimeError(f"HBW pool allocation failed for {pool_size_bytes} bytes")
 
-        self._buffer = (ctypes.c_char * pool_size_bytes).from_address(self._base_addr)
-        self._np_array = np.frombuffer(self._buffer, dtype=np.uint8)
+        self._free_blocks: list = [(0, pool_size_bytes)]
+        self._allocated: dict = {}
+        self._pending_free: list = []
 
-        # Free list: each entry is (start_offset, size)
-        self._free_blocks = [(0, pool_size_bytes)]
-        # Allocated blocks: {handle: (start, size, tensor)}
-        self._allocated = {}
+        self._alloc_version = 0
+        self._lock = threading.Lock()
 
-    def alloc(
-        self,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, int]:
-        """Allocate a tensor from the pool."""
-        num_elements = math.prod(shape)
-        alloc_bytes = num_elements * dtype.itemsize
-
-        # Only align start offset, don't round up allocation size
-        # This reduces internal fragmentation for small tensors
-        handle = self._find_and_alloc(alloc_bytes, shape, dtype)
-        if handle is not None:
-            return self._allocated[handle][2], handle
-
-        # Retry: merge free blocks and search again
-        self._merge_free_blocks()
-        handle = self._find_and_alloc(alloc_bytes, shape, dtype)
-        if handle is not None:
-            return self._allocated[handle][2], handle
-
-        # No suitable block found after all retries
-        raise RuntimeError(
-            f"HBW pool exhausted: requested {alloc_bytes} bytes "
-            f"(alignment={self.alignment}), pool utilization: "
-            f"{self.utilization * 100:.1f}%, "
-            f"free blocks: {len(self._free_blocks)}, "
-            f"largest free: {max(s for _, s in self._free_blocks) if self._free_blocks else 0} bytes"
+        logger.info(
+            "KunpengHBWPool[%s] %d bytes (%d MB) at %#x",
+            hex(id(self)),
+            pool_size_bytes,
+            pool_size_bytes / 1024 / 1024,
+            self._base_addr,
         )
+
+    _instance = None
+    _instance_lock = threading.Lock()
+    @classmethod
+    def get_instance(cls, pool_size_bytes: Optional[int] = None, alignment: int = 64):
+        """Return the global ``KunpengHBWPool`` singleton.
+
+        The *first* call **must** provide ``pool_size_bytes``; subsequent calls
+        ignore the size argument and return the existing instance.
+        """
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    if pool_size_bytes is None:
+                        raise ValueError(
+                            "First call to get_instance() must specify pool_size_bytes"
+                        )
+                    cls._instance = cls(pool_size_bytes, alignment)
+        return cls._instance
+
+    def _process_pending_free(self) -> None:
+        """Flush handles queued by weakref finalizers.  Caller must hold ``_lock``."""
+        if not self._pending_free:
+            return
+        for h, ver in self._pending_free:
+            if h in self._allocated and self._allocated[h][2] == ver:
+                _, size, _ = self._allocated.pop(h)
+                self._free_blocks.append((h, size))
+        self._pending_free.clear()
+        self._merge_free_blocks()
+
+    def _attach_auto_free(self, tensor: torch.Tensor, handle: int, version: int) -> None:
+        """Weakref finalizer — returns (handle, version) to pool when tensor is GC'd."""
+        pool_ref = weakref.ref(self)
+
+        def _auto_free():
+            pool = pool_ref()
+            if pool is not None:
+                pool._pending_free.append((handle, version))
+
+        weakref.finalize(tensor, _auto_free)
+
+    def alloc(self, shape: Tuple[int, ...], dtype: torch.dtype, auto_free: bool = False) -> torch.Tensor:
+        """Allocate a contiguous tensor from the pool.
+
+        Args:
+            auto_free: If True, attach a weakref finalizer that returns the
+                       memory to the pool when the tensor is garbage-collected.
+                       Set to False for long-lived tensors (e.g. model weights)
+                       to prevent accidental recycling.
+        """
+        num_bytes = math.prod(shape) * dtype.itemsize
+
+        if num_bytes == 0:
+            return torch.empty(shape, dtype=dtype, device=self._buffer.device)
+
+        with self._lock:
+            self._process_pending_free()
+            tensor = self._find_and_alloc(num_bytes, shape, dtype, auto_free=auto_free)
+            if tensor is not None:
+                return tensor
+
+            self._merge_free_blocks()
+            tensor = self._find_and_alloc(num_bytes, shape, dtype, auto_free=auto_free)
+
+        if tensor is None:
+            raise RuntimeError(
+                f"HBW pool exhausted: requested {num_bytes} bytes "
+                f"(alignment={self.alignment}), "
+                f"utilization={self.utilization * 100:.1f}%, "
+                f"free blocks={len(self._free_blocks)}, "
+                f"largest free={max((s for _, s in self._free_blocks), default=0)} bytes"
+            )
+        return tensor
 
     def _find_and_alloc(
         self,
-        alloc_bytes: int,
+        num_bytes: int,
         shape: Tuple[int, ...],
         dtype: torch.dtype,
-    ) -> Optional[int]:
+        auto_free: bool = True,
+    ) -> Optional[torch.Tensor]:
         """Try to find a free block and allocate from it."""
         for i, (block_start, block_size) in enumerate(self._free_blocks):
-            # Align start offset within this block
             aligned_start = (block_start + self.alignment - 1) & ~(self.alignment - 1)
-            padding_before = aligned_start - block_start
-
-            if padding_before + alloc_bytes > block_size:
+            padding = aligned_start - block_start
+            if padding + num_bytes > block_size:
                 continue
 
-            # Create tensor view
-            tensor = (
-                torch.from_numpy(self._np_array[aligned_start:aligned_start + alloc_bytes])
-                .view(dtype)
-                .reshape(shape)
-            )
+            # Create tensor
+            chunk = (ctypes.c_char * num_bytes).from_address(self._base_addr + aligned_start)
+            np_arr = np.frombuffer(chunk, dtype=np.dtype(dtype_str(dtype)))
+            tensor = torch.from_numpy(np_arr).reshape(shape)
+            if dtype == torch.bfloat16:
+                tensor = tensor.view(torch.int16).view(torch.bfloat16)
 
-            # Update free list: remove the original block
             self._free_blocks.pop(i)
-
-            # Return unused space before the aligned start
-            if padding_before > 0:
-                self._free_blocks.append((block_start, padding_before))
-
-            # Return unused space after the allocation
-            remaining_after = block_size - padding_before - alloc_bytes
-            if remaining_after > 0:
-                self._free_blocks.append((aligned_start + alloc_bytes, remaining_after))
+            if padding > 0:
+                self._free_blocks.append((block_start, padding))
+            remaining = block_size - padding - num_bytes
+            if remaining > 0:
+                self._free_blocks.append((aligned_start + num_bytes, remaining))
 
             handle = aligned_start
-            self._allocated[handle] = (aligned_start, alloc_bytes, tensor)
-            return handle
+            self._alloc_version += 1
+            ver = self._alloc_version
+            self._allocated[handle] = (aligned_start, num_bytes, ver)
 
+            if auto_free:
+                self._attach_auto_free(tensor, handle, ver)
+
+            return tensor
         return None
 
-    def free(self, handle: int) -> None:
+    def free(self, tensor: torch.Tensor) -> None:
         """Free a previously allocated tensor."""
-        if handle not in self._allocated:
-            raise KeyError(f"Invalid allocation handle: {handle}")
+        offset = tensor.data_ptr() - self._base_addr
+        with self._lock:
+            self._process_pending_free()
+            if offset not in self._allocated:
+                raise KeyError(
+                    f"Tensor at offset {offset} is not from this pool "
+                    f"(base={self._base_addr:#x})"
+                )
+            _, size, _ = self._allocated.pop(offset)
+            self._free_blocks.append((offset, size))
+            self._merge_free_blocks()
 
-        start, size, tensor = self._allocated.pop(handle)
-
-        # Add back to free list
-        self._free_blocks.append((start, size))
+    def sweep(self) -> None:
+        """Process pending auto-freed handles."""
+        with self._lock:
+            self._process_pending_free()
 
     def move_to_hbw(
         self,
         ddr_tensor: torch.Tensor,
-    ) -> Tuple[torch.Tensor, int]:
+    ) -> torch.Tensor:
         """Copy a DDR tensor to HBW memory via the pool."""
-        hbw_tensor, handle = self.alloc(ddr_tensor.shape, ddr_tensor.dtype)
+        hbw_tensor = self.alloc(ddr_tensor.shape, ddr_tensor.dtype)
         hbw_tensor.copy_(ddr_tensor)
-        return hbw_tensor, handle
+        return hbw_tensor
 
     def _merge_free_blocks(self) -> None:
         """Merge adjacent free blocks to reduce fragmentation."""
         if len(self._free_blocks) < 2:
             return
 
-        # Sort by start offset
         self._free_blocks.sort(key=lambda x: x[0])
 
         merged = [self._free_blocks[0]]
-        for current_start, current_size in self._free_blocks[1:]:
+        for cur_start, cur_size in self._free_blocks[1:]:
             last_start, last_size = merged[-1]
-            if current_start == last_start + last_size:
-                # Adjacent, merge them
-                merged[-1] = (last_start, last_size + current_size)
+            if cur_start == last_start + last_size:
+                merged[-1] = (last_start, last_size + cur_size)
             else:
-                merged.append((current_start, current_size))
-
+                merged.append((cur_start, cur_size))
         self._free_blocks = merged
 
     def reset(self) -> None:
         """Reset the pool, freeing all allocations at once."""
-        self._free_blocks = [(0, self.pool_size)]
-        self._allocated.clear()
+        with self._lock:
+            self._free_blocks = [(0, self.pool_size)]
+            self._allocated.clear()
+            self._pending_free.clear()
 
     @property
     def used_bytes(self) -> int:
@@ -232,9 +268,25 @@ class KunpengHBWPool:
         return len(self._allocated)
 
     def __del__(self):
-        if self._base_ptr is not None:
-            torch.ops.sgl_kernel.hbw_destroy_kunpeng(self._base_ptr)
+        ptr = getattr(self, '_base_ptr', None)
+        if ptr is not None:
+            try:
+                torch.ops.sgl_kernel.hbw_destroy_kunpeng(ptr)
+            except Exception:
+                pass
             self._base_ptr = None
+
+
+class _HBWPoolProxy:
+    """Lazy proxy — delegates to KunpengHBWPool.get_instance() on first use."""
+
+    def __getattr__(self, name):
+        return getattr(KunpengHBWPool.get_instance(), name)
+
+
+hbw_pool = _HBWPoolProxy()
+"""Global singleton proxy. Import anytime, use after pool is initialized."""
+
 
 class KunpengHBWKVbuffer:
     """SDMA-based async KV Cache HBW buffer manager.
@@ -308,7 +360,7 @@ class KunpengHBWKVbuffer:
         self.kv_buffer_size = self.swap_buff_num * self.kv_buffer_size_per_buffer
 
         # Allocate HBW KV buffer
-        self.kv_buffer, self.kv_buffer_ptr = create_tensor_from_hbw(
+        self.kv_buffer = hbw_pool.alloc(
             shape, self.store_dtype
         )
         self.kv_buffer.zero_()
