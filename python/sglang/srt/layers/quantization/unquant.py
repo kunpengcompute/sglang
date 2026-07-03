@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
+    is_cpu_920f,
     is_hip,
     is_npu,
     next_power_of_2,
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_cpu_920f = is_cpu_920f()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -100,7 +102,27 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         return F.linear(x, layer.weight, bias)
 
-    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+    def embedding(
+        self,
+        layer: torch.nn.Module,
+        input_: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        if _is_cpu_920f:
+            output = torch.empty(
+                (input_.shape[0], layer.weight.shape[1]), dtype=layer.weight.dtype
+            )
+            torch.ops.sgl_kernel.embedding_kunpeng(
+                input_,
+                layer.weight,
+                output,
+                kwargs.get("org_vocab_start", 0),
+                kwargs.get("org_vocab_end", 0),
+                kwargs.get("num_org_vocab_padding", 0),
+                kwargs.get("added_vocab_start", 0),
+                kwargs.get("added_vocab_end", 0),
+            )
+            return output
         return F.embedding(input_, layer.weight)
 
 

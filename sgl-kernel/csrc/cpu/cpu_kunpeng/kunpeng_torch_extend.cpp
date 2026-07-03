@@ -218,6 +218,11 @@ void shm_allreduce_kunpeng(at::Tensor tensor_data);
 
 void shm_allreduce_finalize_kunpeng();
 
+// === Embedding 算子声明 ===
+at::Tensor embedding_kunpeng(at::Tensor indices, at::Tensor weight, at::Tensor output, int64_t org_vocab_start,
+                             int64_t org_vocab_end, int64_t num_org_vocab_padding, int64_t added_vocab_start,
+                             int64_t added_vocab_end);
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 {
     // quant
@@ -544,4 +549,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("shm_allreduce_finalize_kunpeng() -> ()");
     m.impl("shm_allreduce_finalize_kunpeng", shm_allreduce_finalize_kunpeng);
+
+    // embedding
+    m.def(
+        "embedding_kunpeng("
+        "Tensor indices, Tensor weight, Tensor output, "
+        "int org_vocab_start, int org_vocab_end, "
+        "int num_org_vocab_padding, "
+        "int added_vocab_start, int added_vocab_end"
+        ") -> Tensor");
+    m.impl("embedding_kunpeng", embedding_kunpeng);
 }
