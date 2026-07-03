@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
     is_cpu,
+    is_cpu_920f,
     is_npu,
     set_weight_attrs,
 )
@@ -44,6 +45,7 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_cpu_920f = is_cpu_920f()
 _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
@@ -469,6 +471,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def forward(self, input_):
+        if _is_cpu_920f:
+            return self._forward_kunpeng(input_)
+
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
@@ -497,6 +502,47 @@ class VocabParallelEmbedding(torch.nn.Module):
                 else:
                     # Reduce across all the model parallel GPUs.
                     output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
+
+    def _forward_kunpeng(self, input_):
+        """Kunpeng CPU fast path: fused mask + embedding lookup.
+
+        The C++ kernel internally handles:
+          1) token ID -> local shard index mapping (with org+added vocab ranges)
+          2) embedding lookup for in-shard tokens
+          3) zero-fill for out-of-shard tokens
+        This replaces get_masked_input_and_mask() + F.embedding() + masked_fill_().
+        """
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            if self.tp_size > 1:
+                output_parallel = self.quant_method.embedding(
+                    self,
+                    input_.long(),
+                    org_vocab_start=self.shard_indices.org_vocab_start_index,
+                    org_vocab_end=self.shard_indices.org_vocab_end_index,
+                    num_org_vocab_padding=self.shard_indices.num_org_vocab_padding,
+                    added_vocab_start=self.shard_indices.added_vocab_start_index,
+                    added_vocab_end=self.shard_indices.added_vocab_end_index,
+                )
+                if not get_attn_tp_context().input_scattered:
+                    if self.use_attn_tp_group:
+                        output_parallel = attn_tp_all_reduce(output_parallel)
+                    else:
+                        output_parallel = tensor_model_parallel_all_reduce(
+                            output_parallel
+                        )
+            else:
+                output_parallel = self.quant_method.embedding(
+                    self,
+                    input_.long(),
+                    org_vocab_start=0,
+                    org_vocab_end=self.num_embeddings_per_partition,
+                    num_org_vocab_padding=0,
+                    added_vocab_start=0,
+                    added_vocab_end=0,
+                )
         return output_parallel
 
     def extra_repr(self) -> str:
