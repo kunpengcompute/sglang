@@ -1412,8 +1412,6 @@ class ShardedStateLoader(BaseModelLoader):
     ) -> nn.Module:
         from safetensors.torch import safe_open
 
-        from sglang.srt.distributed import get_tensor_model_parallel_rank
-
         local_model_path = self._prepare_weights(
             model_config.model_path, model_config.revision
         )
@@ -1440,6 +1438,8 @@ class ShardedStateLoader(BaseModelLoader):
             for path in filepaths:
                 with safe_open(path, framework="pt") as f:
                     for key in f.keys():  # noqa: SIM118
+                        if key not in state_dict:
+                            continue
                         tensor = f.get_tensor(key)
                         # If loading with LoRA enabled, additional padding may
                         # be added to certain parameters. We only load into a

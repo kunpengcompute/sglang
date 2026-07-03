@@ -2311,7 +2311,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.weight_hbw_pool = KunpengHBWPool.get_instance(
             name="weights",
             pool_size_bytes=weights_pool_size_bytes,
-            alignment=2 * 1024 * 1024,
+            alignment=1024,
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):

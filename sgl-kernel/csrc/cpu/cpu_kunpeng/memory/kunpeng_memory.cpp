@@ -23,7 +23,7 @@
 #include <numaif.h>
 #include <sys/mman.h>
 
-constexpr int64_t PAGE_SIZE = 2l * 1024 * 1024;  // 2MB huge page
+constexpr int64_t PAGE_SIZE = 2 * 1024 * 1024;  // 2MB huge page
 constexpr int BENCH_LOOPS = 10;
 
 at::Tensor hbw_allocator_kunpeng(int64_t size)
