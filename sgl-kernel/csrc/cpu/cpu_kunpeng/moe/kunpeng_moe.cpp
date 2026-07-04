@@ -599,3 +599,21 @@ int64_t topk_convert_kunpeng(at::Tensor src_info,        // [num_local_experts, 
     TORCH_CHECK(ti <= token_ids.size(0), "token_ids overflow: ti=", ti, " capacity=", token_ids.size(0));
     return ti;
 }
+
+// Computes out = out + alpha * input, in-place on out.
+// Mirrors kutacc::mul_scalar_add with load_output=true, matching the semantics
+// of torch Tensor.add_(other, alpha=...) used in the MoE combine step.
+void mul_scalar_add_kunpeng(at::Tensor input, at::Tensor out, double alpha)
+{
+    TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
+    TORCH_CHECK(out.scalar_type() == at::kBFloat16, "out must be bfloat16");
+    TORCH_CHECK(input.sizes() == out.sizes(), "input and out must have the same shape");
+
+    int64_t num = input.numel();
+    if (num == 0) return;
+
+    bfloat16_t *i_ptr = reinterpret_cast<bfloat16_t *>(input.data_ptr());
+    bfloat16_t *o_ptr = reinterpret_cast<bfloat16_t *>(out.data_ptr());
+
+    kutacc::mul_scalar_add(i_ptr, o_ptr, num, static_cast<float>(alpha), /*load_output=*/true);
+}
