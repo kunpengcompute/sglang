@@ -1083,6 +1083,10 @@ class DeepseekV2MoE(nn.Module):
             # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
             if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
                 x.add_(final_hidden_states)
+            elif get_moe_a2a_backend().is_kunpeng_cpu():
+                torch.ops.sgl_kernel.mul_scalar_add_kunpeng(
+                    final_hidden_states, x, self.routed_scaling_factor
+                )
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
