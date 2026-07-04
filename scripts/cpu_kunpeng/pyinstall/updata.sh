@@ -17,6 +17,7 @@ SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_path('purelib')
 
 UPDATE_SGLANG=false
 UPDATE_KERNEL=false
+UPDATE_KUTACC=false
 
 case "$1" in
     sglang)
@@ -25,12 +26,16 @@ case "$1" in
     kernel)
         UPDATE_KERNEL=true
         ;;
+    kutacc)
+        UPDATE_KUTACC=true
+        ;;
     ""|all)
         UPDATE_SGLANG=true
         UPDATE_KERNEL=true
+        UPDATE_KUTACC=true
         ;;
     *)
-        echo "Usage: $0 [sglang|kernel|all] (default: all)"
+        echo "Usage: $0 [sglang|kernel|kutacc|all] (default: all)"
         exit 1
         ;;
 esac
@@ -44,6 +49,10 @@ for i in $(seq 0 15); do
         if [ "${UPDATE_KERNEL}" = "true" ]; then
             rm -rf "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/sgl_kernel"
             cp -rf "$SITE_PACKAGES/sgl_kernel" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/sgl_kernel"
+        fi
+        if [ "${UPDATE_KUTACC}" = "true" ]; then
+            rm -f "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/libkutacc.so.25.1.RC1"
+            cp -f "$KUTACC_PATH/install/lib/libkutacc.so.25.1.RC1" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/"
         fi
     ) &
 done
