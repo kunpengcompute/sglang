@@ -607,7 +607,7 @@ class GroupCoordinator:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
             elif self.use_kunpeng_communicator and input_.shape[0] > 0:
-                self.kunpeng_communicator.shm_all_reduce(input_)
+                torch.ops.sgl_kernel.shm_allreduce_kunpeng(input_)
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
@@ -787,7 +787,7 @@ class GroupCoordinator:
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
         elif self.use_kunpeng_communicator and input.shape[0] > 0:
-            self.kunpeng_communicator.shm_reduce_scatter_tensor(input)
+            torch.ops.sgl_kernel.shm_reduce_scatter_kunpeng(input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
@@ -856,6 +856,34 @@ class GroupCoordinator:
             self.kunpeng_communicator.shm_all_gather_into_tensor(input, output)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
+
+    @KunpengProfiler(depth=2)
+    def batch_all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Batch all-gather that concatenates along *dim* (default last dim).
+
+        Uses the kutacc shm_batched_allgather kernel which gathers on the
+        column dimension, producing ``[batch, dim * world_size]`` directly.
+        This matches the natural output layout of the kernel — no permute
+        or reshape is needed.
+        """
+        if not self.use_kunpeng_communicator:
+            raise ValueError(
+                "batch_all_gather is not supported without kunpeng_communicator"
+            )
+
+        if dim < 0:
+            dim += input_.dim()
+
+        input_size = list(input_.size())
+        input_size[dim] *= self.world_size
+        output = torch.empty(input_size, dtype=input_.dtype, device=input_.device)
+
+        if input_.shape[0] > 0:
+            torch.ops.sgl_kernel.shm_batched_allgather_kunpeng(
+                input_, output, self.world_size
+            )
+
+        return output
 
     def cp_all_gather_into_tensor_async(
         self, output: torch.Tensor, input: torch.Tensor, stream: torch.cuda.Stream

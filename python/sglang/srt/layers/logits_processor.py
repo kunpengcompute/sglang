@@ -940,29 +940,28 @@ class LogitsProcessor(nn.Module):
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
         if self.vocab_size % self.attn_tp_size == 0:
-            global_logits = torch.empty(
-                (
-                    self.attn_tp_size * logits.shape[0],
-                    self.vocab_size // self.attn_tp_size,
-                ),
-                device=logits.device,
-                dtype=logits.dtype,
-            )
             if _is_cpu_920f:
-                # TODO(kunpeng): Use kutacc::shm_batch_allgather interface to replace torch in the future
-                torch.distributed.all_gather_into_tensor(
-                    global_logits, logits, group=get_attn_tp_group().cpu_group
-                )
+                # batch_all_gather gathers on dim=-1, directly producing
+                # [batch, vocab_size] matching the kernel's natural layout.
+                global_logits = get_attn_tp_group().batch_all_gather(logits, dim=-1)
             else:
+                global_logits = torch.empty(
+                    (
+                        self.attn_tp_size * logits.shape[0],
+                        self.vocab_size // self.attn_tp_size,
+                    ),
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
                 attn_tp_all_gather_into_tensor(global_logits, logits)
-            global_logits = global_logits.reshape(
-                self.attn_tp_size,
-                logits.shape[0],
-                self.vocab_size // self.attn_tp_size,
-            )
-            global_logits = global_logits.permute(1, 0, 2).reshape(
-                logits.shape[0], self.vocab_size
-            )
+                global_logits = global_logits.reshape(
+                    self.attn_tp_size,
+                    logits.shape[0],
+                    self.vocab_size // self.attn_tp_size,
+                )
+                global_logits = global_logits.permute(1, 0, 2).reshape(
+                    logits.shape[0], self.vocab_size
+                )
         else:
             global_logits = torch.empty(
                 (self.vocab_size, logits.shape[0]),
