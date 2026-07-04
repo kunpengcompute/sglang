@@ -40,10 +40,10 @@ extern kupl_shm_comm_h kupl_intra_socket_comm;
 extern kupl_shm_comm_h kupl_intra_die_comm;
 
 // Shared memory base pointers
-extern void* kupl_shm_baseptr;
-extern void* kupl_intra_socketfence_baseptr;
-extern void* kupl_intra_diefence_baseptr;
-extern std::vector<void*> kupl_shm_group_baseptr;
+extern void *kupl_shm_baseptr;
+extern void *kupl_intra_socketfence_baseptr;
+extern void *kupl_intra_diefence_baseptr;
+extern std::vector<void *> kupl_shm_group_baseptr;
 
 /**
  * Check whether a pointer falls within the shared memory region.
@@ -76,6 +76,15 @@ void get_peer_shm_baseptr(int64_t peer_rank, void *local_base_ptr, void **remote
 at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t> shape);
 
 /**
+ * Get or create a cached SHM tensor of shape [max_tokens, dim] in bfloat16.
+ * Cached by dim so varying batch sizes reuse the same buffer.
+ * Shared across allreduce, reduce_scatter, all_gather, and batch_allgather
+ * operators. For batch_allgather, the sendbuf uses key=dim and the recvbuf
+ * uses key=dim*comm_size, ensuring both are at consistent offsets across ranks.
+ */
+at::Tensor get_or_create_shm_tensor(int64_t dim);
+
+/**
  * Get the intra-node rank of the current process.
  */
 int get_intra_node_rank();
@@ -96,7 +105,7 @@ bool is_shm_initialized();
  * @param bytes  Number of bytes to allocate.
  * @return       Pointer to the allocated shared memory.
  */
-void* alloc_shm_raw(size_t bytes);
+void *alloc_shm_raw(size_t bytes);
 
 /**
  * Initialize the SHM reduce-scatter request.

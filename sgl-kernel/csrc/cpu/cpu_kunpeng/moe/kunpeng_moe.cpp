@@ -29,7 +29,7 @@
 #include "../matmul/tiling.h"
 #include "../utils/math.h"
 #include "../utils/kunpeng_oob.h"
-#include "../utils/kunpeng_shm.h"
+#include "../memory/kunpeng_shm.h"
 
 #define PREFILL_FUSEDMOE_TILEBUF 2048
 #define DECODE_FUSEDMOE_TILEBUF 256

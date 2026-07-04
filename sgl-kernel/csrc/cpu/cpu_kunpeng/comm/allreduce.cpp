@@ -20,11 +20,13 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <arm_bf16.h>
 
 #include "sgl_kernel_ops.h"
-#include "../utils/kunpeng_shm.h"
+#include "../memory/kunpeng_shm.h"
 #include <kutacc.h>
 
 static kutacc::shm_allreduce_request_h g_ar_request = nullptr;
@@ -56,27 +58,39 @@ void shm_allreduce_init_kunpeng(int64_t max_num_elements)
         }
     }
 
-    kutacc::shm_allreduce_request_init((void **)extra_buffers.data(), kupl_win_intra_node, kupl_win_intra_die, kupl_win_intra_socket,
-                                       kupl_win_intra_node, g_ar_request);
+    kutacc::shm_allreduce_request_init((void **)extra_buffers.data(), kupl_win_intra_node, kupl_win_intra_die,
+                                       kupl_win_intra_socket, kupl_win_intra_node, g_ar_request);
 
     g_ar_initialized = true;
     std::cout << "[KuTACC] AllReduce initialized, rank=" << intra_node_rank << ", size=" << intra_node_size
               << std::endl;
 }
 
-void shm_allreduce_kunpeng(at::Tensor tensor_data)
+void shm_allreduce_kunpeng(at::Tensor input)
 {
     TORCH_CHECK(g_ar_initialized, "shm_allreduce_kunpeng called before shm_allreduce_init_kunpeng");
 
-    bfloat16_t *local_buffer_ptr = reinterpret_cast<bfloat16_t *>(tensor_data.data_ptr());
+    int64_t dim = input.size(1);
+    size_t total_bytes = static_cast<size_t>(input.numel()) * sizeof(bfloat16_t);
+    at::Tensor shm_tensor = get_or_create_shm_tensor(dim);
+
+    // copy in: user input -> SHM buffer
+    std::memcpy(shm_tensor.data_ptr(), input.data_ptr(), total_bytes);
+
+    // build remote peer pointers for the SHM buffer
+    bfloat16_t *local_buffer_ptr = reinterpret_cast<bfloat16_t *>(shm_tensor.data_ptr());
     bfloat16_t *remote_buffers_ptr[intra_node_size];
 
     for (int i = 0; i < intra_node_size; ++i) {
         get_peer_shm_baseptr(i, local_buffer_ptr, (void **)&remote_buffers_ptr[i]);
     }
 
-    size_t num_elements = tensor_data.numel();
+    // allreduce in-place on the SHM buffer
+    size_t num_elements = input.numel();
     kutacc::shm_allreduce((void **)remote_buffers_ptr, num_elements, g_ar_request);
+
+    // copy out: SHM buffer -> user input
+    std::memcpy(input.data_ptr(), shm_tensor.data_ptr(), total_bytes);
 }
 
 void shm_allreduce_finalize_kunpeng()
