@@ -390,12 +390,12 @@ def test_fusedmoe(
     )
 
     # --- Get tiling plan for weight packing ---
-    tile_m_up, tile_n_up, tile_k_up = kernel.igemm_find_optimal_tiling_plan_decode(
-        FUSEDMOE_FIXED_SIZE, N_up, K_up, NUM_THREADS
+    tile_m_up, tile_n_up, tile_k_up = kernel.igemm_find_optimal_tiling_plan(
+        FUSEDMOE_FIXED_SIZE, N_up, K_up
     )
     tile_m_down, tile_n_down, tile_k_down = (
-        kernel.igemm_find_optimal_tiling_plan_decode(
-            FUSEDMOE_FIXED_SIZE, N_down, K_down, NUM_THREADS
+        kernel.igemm_find_optimal_tiling_plan(
+            FUSEDMOE_FIXED_SIZE, N_down, K_down
         )
     )
     print(

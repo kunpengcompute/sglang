@@ -81,8 +81,8 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
 def _kunpeng_prepack_igemm_weight(weight: torch.Tensor, m: int = 32) -> None:
     """Prepack weight for Kunpeng s8 gemm decode on CPU 920f."""
     n, k = weight.shape
-    _tile_m, tile_n, tile_k = (
-        torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(m, n, k, 32)
+    _tile_m, tile_n, tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(
+        m, n, k
     )
     pack_w = torch.empty_like(weight)
     torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
@@ -104,8 +104,8 @@ def _kunpeng_prepack_igemm_expert_weight(weight: torch.Tensor) -> None:
         fusedmoe_tilebuf = 2048
     else:
         fusedmoe_tilebuf = 256
-    _, _, tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
-        fusedmoe_tilebuf, n, k, torch.get_num_threads()
+    _, _, tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(
+        fusedmoe_tilebuf, n, k
     )
     packed = torch.empty_like(weight)
     for exp_id in range(num_local_experts):
