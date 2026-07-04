@@ -63,13 +63,16 @@ class KunpengHBWPool:
             hbw_pool.free(tensor)  # Free individual tensor
     """
 
-    def __init__(self, pool_size_bytes: int, alignment: int = 64):
+    def __init__(
+        self, pool_size_bytes: int, alignment: int = 64, name: str = "default"
+    ):
+        self.name = name
         self.pool_size = pool_size_bytes
         self.alignment = alignment
 
-        # Allocate the entire pool
-        self._base_ptr = torch.ops.sgl_kernel.hbw_allocator_kunpeng(pool_size_bytes)
-        self._base_addr = self._base_ptr.item()
+        # Allocate the entire pool (returns a uint8 tensor wrapping the HBM memory)
+        self._base_tensor = torch.ops.sgl_kernel.hbw_allocator_kunpeng(pool_size_bytes)
+        self._base_addr = self._base_tensor.data_ptr()
         if self._base_addr == 0:
             raise RuntimeError(f"HBW pool allocation failed for {pool_size_bytes} bytes")
 
@@ -81,31 +84,39 @@ class KunpengHBWPool:
         self._lock = threading.Lock()
 
         logger.info(
-            "KunpengHBWPool[%s] %d bytes (%d MB) at %#x",
+            "KunpengHBWPool[%s] name=%s %d bytes (%d MB) at %#x",
             hex(id(self)),
+            name,
             pool_size_bytes,
             pool_size_bytes / 1024 / 1024,
             self._base_addr,
         )
 
-    _instance = None
-    _instance_lock = threading.Lock()
-    @classmethod
-    def get_instance(cls, pool_size_bytes: Optional[int] = None, alignment: int = 64):
-        """Return the global ``KunpengHBWPool`` singleton.
+    _instances: dict = {}
+    _instances_lock = threading.Lock()
 
-        The *first* call **must** provide ``pool_size_bytes``; subsequent calls
-        ignore the size argument and return the existing instance.
+    @classmethod
+    def get_instance(
+        cls,
+        name: str = "default",
+        pool_size_bytes: Optional[int] = None,
+        alignment: int = 64,
+    ):
+        """Return (or create) a named ``KunpengHBWPool`` instance.
+
+        The *first* call for a given ``name`` **must** provide ``pool_size_bytes``;
+        subsequent calls with the same name ignore the size argument and return
+        the existing instance.
         """
-        if cls._instance is None:
-            with cls._instance_lock:
-                if cls._instance is None:
+        if name not in cls._instances:
+            with cls._instances_lock:
+                if name not in cls._instances:
                     if pool_size_bytes is None:
                         raise ValueError(
-                            "First call to get_instance() must specify pool_size_bytes"
+                            f"First call to get_instance(name='{name}') must specify pool_size_bytes"
                         )
-                    cls._instance = cls(pool_size_bytes, alignment)
-        return cls._instance
+                    cls._instances[name] = cls(pool_size_bytes, alignment, name=name)
+        return cls._instances[name]
 
     def _process_pending_free(self) -> None:
         """Flush handles queued by weakref finalizers.  Caller must hold ``_lock``."""
@@ -268,20 +279,31 @@ class KunpengHBWPool:
         return len(self._allocated)
 
     def __del__(self):
-        ptr = getattr(self, '_base_ptr', None)
-        if ptr is not None:
+        tensor = getattr(self, "_base_tensor", None)
+        if tensor is not None:
             try:
-                torch.ops.sgl_kernel.hbw_destroy_kunpeng(ptr)
+                torch.ops.sgl_kernel.hbw_destroy_kunpeng(tensor)
             except Exception:
                 pass
-            self._base_ptr = None
+            self._base_tensor = None
 
 
 class _HBWPoolProxy:
-    """Lazy proxy — delegates to KunpengHBWPool.get_instance() on first use."""
+    """Lazy proxy — delegates to KunpengHBWPool.get_instance() on first use.
 
-    def __getattr__(self, name):
-        return getattr(KunpengHBWPool.get_instance(), name)
+    Can be used with a named pool::
+
+        pool_a = _HBWPoolProxy("pool_a")
+        pool_a.alloc(...)
+
+    The module-level ``hbw_pool`` uses the default name ``"default"``.
+    """
+
+    def __init__(self, name: str = "default"):
+        self._name = name
+
+    def __getattr__(self, attr):
+        return getattr(KunpengHBWPool.get_instance(self._name), attr)
 
 
 hbw_pool = _HBWPoolProxy()

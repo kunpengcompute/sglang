@@ -23,6 +23,10 @@ kutacc::MatrixTilingBlock igemm_find_optimal_tiling_plan_prefill(int64_t M, int6
 
 kutacc::MatrixTilingBlock igemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K, int64_t num_threads);
 
+kutacc::MatrixTilingBlock igemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K, int64_t num_threads);
+
 kutacc::MatrixTilingBlock bgemm_find_optimal_tiling_plan_prefill(int64_t M, int64_t N, int64_t K, int64_t num_threads);
 
 kutacc::MatrixTilingBlock bgemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K, int64_t num_threads);
+
+kutacc::MatrixTilingBlock bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K, int64_t num_threads);

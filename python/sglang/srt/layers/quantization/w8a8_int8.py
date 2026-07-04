@@ -265,14 +265,16 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             workspace_size = batch_size * n * 64
             workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
 
-            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_decode_kunpeng(
+            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_kunpeng(
                 pack_a,
                 layer.weight,
                 layer.weight_scale.view(-1),
                 norm_scale.view(-1),
                 output,
                 workspace,
-                32,
+                tile_m,
+                tile_n,
+                tile_k,
             )
 
             return output

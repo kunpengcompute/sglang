@@ -48,11 +48,9 @@ void s8_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int
     kutacc::s8_gemm_pack(r, c, split_r, split_c, input_ptr, out_ptr, ldc, with_idx, idx_ptr);
 }
 
-namespace {
-
-template <bool is_prefill>
-void s8_s8_packed_gemm_bf16_dq_impl(at::Tensor input, at::Tensor weight, at::Tensor weight_scale, at::Tensor scale,
-                                    at::Tensor output, at::Tensor workspace, int64_t num_threads)
+void s8_s8_packed_gemm_bf16_dq_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor weight_scale, at::Tensor scale,
+                                       at::Tensor output, at::Tensor workspace, int64_t tile_m, int64_t tile_n,
+                                       int64_t tile_k)
 {
     TORCH_CHECK(input.scalar_type() == at::kChar, "input must be int8");
     TORCH_CHECK(weight.scalar_type() == at::kChar, "weight must be int8");
@@ -75,14 +73,6 @@ void s8_s8_packed_gemm_bf16_dq_impl(at::Tensor input, at::Tensor weight, at::Ten
     TORCH_CHECK(weight_scale.size(0) == n, "weight_scale size must equal n");
     TORCH_CHECK(scale.size(0) == m, "scale size must equal m");
 
-    kutacc::MatrixTilingBlock t;
-    if constexpr (is_prefill) {
-        t = igemm_find_optimal_tiling_plan_prefill(m, n, k, num_threads);
-    } else {
-        t = igemm_find_optimal_tiling_plan_decode(m, n, k, num_threads);
-    }
-
-    auto tile_k = std::get<2>(t);
     TORCH_CHECK(tile_k % 4 == 0, "igemm kernel only support tile_k % 4 == 0");
 
     int64_t blocks_in_k = k / tile_k;
@@ -90,6 +80,7 @@ void s8_s8_packed_gemm_bf16_dq_impl(at::Tensor input, at::Tensor weight, at::Ten
         TORCH_CHECK(workspace.numel() >= blocks_in_k * n * m * 2, "workspace is out of memory");
     }
 
+    kutacc::MatrixTilingBlock t = std::make_tuple(tile_m, tile_n, tile_k);
     bfloat16_t *tmpc = reinterpret_cast<bfloat16_t *>(workspace.data_ptr());
     bfloat16_t *output_ptr = reinterpret_cast<bfloat16_t *>(output.data_ptr());
 
@@ -103,20 +94,4 @@ void s8_s8_packed_gemm_bf16_dq_impl(at::Tensor input, at::Tensor weight, at::Ten
         kutacc::s8_s8_packed_gemm_bf16_dq(m, n, k, t, input.data_ptr<int8_t>(), weight.data_ptr<int8_t>(),
                                           scale.data_ptr<float>(), weight_scale.data_ptr<float>(), output_ptr, tmpc);
     }
-}
-
-}  // namespace
-
-void s8_s8_packed_gemm_bf16_dq_prefill_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
-                                               at::Tensor scale, at::Tensor output, at::Tensor workspace,
-                                               int64_t num_threads)
-{
-    s8_s8_packed_gemm_bf16_dq_impl<true>(input, weight, weight_scale, scale, output, workspace, num_threads);
-}
-
-void s8_s8_packed_gemm_bf16_dq_decode_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
-                                              at::Tensor scale, at::Tensor output, at::Tensor workspace,
-                                              int64_t num_threads)
-{
-    s8_s8_packed_gemm_bf16_dq_impl<false>(input, weight, weight_scale, scale, output, workspace, num_threads);
 }

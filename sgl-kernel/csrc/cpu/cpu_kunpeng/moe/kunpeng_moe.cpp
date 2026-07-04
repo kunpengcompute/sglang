@@ -238,12 +238,7 @@ at::Tensor linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, con
     int64_t k = input.size(1);
     TORCH_CHECK(weight.size(1) == k, "input.k != weight.k");
 
-    kutacc::MatrixTilingBlock t;
-    if (is_prefill) {
-        t = bgemm_find_optimal_tiling_plan_prefill(m, n, k, kutacc::get_thread_num());
-    } else {
-        t = bgemm_find_optimal_tiling_plan_decode(m, n, k, kutacc::get_thread_num());
-    }
+    kutacc::MatrixTilingBlock t = bgemm_find_optimal_tiling_plan(m, n, k, kutacc::get_thread_num());
     auto [tile_m, tile_n, tile_k] = t;
 
     auto pack_bf16 = at::empty({m, k}, input.options());
@@ -489,7 +484,7 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     int64_t acts_stride = act.stride(0);
     int64_t acts_scale_stride = scale.stride(0);
 
-    auto t = igemm_find_optimal_tiling_plan_decode(bs, N, K, kutacc::get_thread_num());
+    auto t = igemm_find_optimal_tiling_plan(bs, N, K, kutacc::get_thread_num());
     int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
 
     // TODO: n_slice for 2-expert case
@@ -540,7 +535,7 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
     int8_t *pbx_data = tmpx.data_ptr<int8_t>();
     float *pby_data = tmpy.data_ptr<float>();
 
-    auto t = igemm_find_optimal_tiling_plan_decode(bs, N, K, kutacc::get_thread_num());
+    auto t = igemm_find_optimal_tiling_plan(bs, N, K, kutacc::get_thread_num());
     int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
 
     // TODO: n_slice for 2-expert case
