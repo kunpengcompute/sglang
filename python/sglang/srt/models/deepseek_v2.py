@@ -1673,7 +1673,7 @@ class DeepseekV2AttentionMLA(
             # Sharded computation within attention TP group via sgl_kernel GEMM:
             # each rank computes its weight shard, then all-gather the result.
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            qkv_latent = get_attention_tp_group().all_gather(qkv_latent, dim=-1)
+            qkv_latent = get_attention_tp_group().batch_all_gather(qkv_latent, dim=-1)
             return qkv_latent
         if (
             (not isinstance(hidden_states, tuple))

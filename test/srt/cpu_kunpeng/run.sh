@@ -27,23 +27,22 @@
 #   bash run.sh <test_name>
 #
 # Available tests:
-#   moe             -- RDMA MoE communication create/finalize smoke test
-#   shm             -- Shared memory pool create/destroy smoke test
-#   reduce_scatter  -- SHM reduce_scatter benchmark vs torch.distributed
-#   allgather       -- SHM dual_allgather benchmark vs torch.distributed
-#   allreduce       -- SHM allreduce benchmark vs torch.distributed
+#   moe              -- RDMA MoE communication create/finalize smoke test
+#   shm              -- Shared memory pool create/destroy smoke test
+#   reduce_scatter   -- SHM reduce_scatter benchmark vs torch.distributed
+#   dual_allgather   -- SHM dual_allgather benchmark vs torch.distributed
+#   batch_allgather  -- SHM batched_allgather benchmark vs torch.distributed
+#   allreduce        -- SHM allreduce benchmark vs torch.distributed
 #
 # Options (environment variables):
 #   PYTHON        -- python interpreter       (default: python3)
 #   CPU_PER_RANK  -- cores per rank           (default: 38)
 
-set -euo pipefail
-
 # ---- Parse argument ----------------------------------------------------------
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: bash run.sh <test_name>" >&2
-    echo "Available tests: moe, shm, reduce_scatter, allgather, allreduce" >&2
+    echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce" >&2
     exit 1
 fi
 
@@ -67,10 +66,15 @@ case "${TEST_NAME}" in
         MASTER_PORT=5002
         TEST_LABEL="SHM reduce_scatter benchmark"
         ;;
-    allgather)
-        TEST_FILE="${SCRIPT_DIR}/test_allgather.py"
+    dual_allgather)
+        TEST_FILE="${SCRIPT_DIR}/test_dual_allgather.py"
         MASTER_PORT=5003
         TEST_LABEL="SHM dual_allgather benchmark"
+        ;;
+    batch_allgather)
+        TEST_FILE="${SCRIPT_DIR}/test_batch_allgather.py"
+        MASTER_PORT=5005
+        TEST_LABEL="SHM batched_allgather benchmark"
         ;;
     allreduce)
         TEST_FILE="${SCRIPT_DIR}/test_allreduce.py"
@@ -79,7 +83,7 @@ case "${TEST_NAME}" in
         ;;
     *)
         echo "ERROR: unknown test '${TEST_NAME}'" >&2
-        echo "Available tests: moe, shm, reduce_scatter, allgather, allreduce" >&2
+        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce" >&2
         exit 1
         ;;
 esac
@@ -92,15 +96,23 @@ fi
 # ---- Configuration -----------------------------------------------------------
 
 source ../../../scripts/cpu_kunpeng/env.sh native
+source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
+
+export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/usr/lib64/libibverbs:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${KUPL_PATH}/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:$LD_LIBRARY_PATH
 
 PYTHON="${PYTHON:-python3}"
 CPU_PER_RANK="${CPU_PER_RANK:-38}"
 MASTER_ADDR="127.0.0.1"
 WORLD_SIZE=16
+IS_PRFILL="0"
 
 export MASTER_ADDR
 export MASTER_PORT
 export WORLD_SIZE
+export IS_PRFILL
 
 echo "============================================================"
 echo " ${TEST_LABEL}"

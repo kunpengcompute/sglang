@@ -20,11 +20,13 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <arm_bf16.h>
 
 #include "sgl_kernel_ops.h"
-#include "../utils/kunpeng_shm.h"
+#include "../memory/kunpeng_shm.h"
 #include <kutacc.h>
 
 static kutacc::shm_reduce_scatter_request_h g_rs_request = nullptr;
@@ -65,18 +67,31 @@ void shm_reduce_scatter_init_kunpeng()
               << std::endl;
 }
 
-void shm_reduce_scatter_kunpeng(int64_t height, int64_t width, at::Tensor tensor_data)
+void shm_reduce_scatter_kunpeng(at::Tensor input)
 {
     TORCH_CHECK(g_rs_initialized, "shm_reduce_scatter_kunpeng called before shm_reduce_scatter_init_kunpeng");
 
-    bfloat16_t *local_buffer_ptr = reinterpret_cast<bfloat16_t *>(tensor_data.data_ptr());
+    int64_t batch = input.size(0);
+    int64_t dim = input.size(1);
+    size_t total_bytes = static_cast<size_t>(input.numel()) * sizeof(bfloat16_t);
+    at::Tensor shm_tensor = get_or_create_shm_tensor(dim);
+
+    // copy in: user input -> SHM buffer
+    std::memcpy(shm_tensor.data_ptr(), input.data_ptr(), total_bytes);
+
+    // build remote peer pointers for the SHM buffer
+    bfloat16_t *local_buffer_ptr = reinterpret_cast<bfloat16_t *>(shm_tensor.data_ptr());
     bfloat16_t *remote_buffers_ptr[intra_node_size];
 
     for (int i = 0; i < intra_node_size; ++i) {
         get_peer_shm_baseptr(i, local_buffer_ptr, (void **)&remote_buffers_ptr[i]);
     }
 
-    kutacc::shm_reduce_scatter((void **)remote_buffers_ptr, height, width, g_rs_request);
+    // reduce_scatter in-place on the SHM buffer
+    kutacc::shm_reduce_scatter((void **)remote_buffers_ptr, batch, dim, g_rs_request);
+
+    // copy out: SHM buffer -> user input
+    std::memcpy(input.data_ptr(), shm_tensor.data_ptr(), total_bytes);
 }
 
 void shm_reduce_scatter_finalize_kunpeng()

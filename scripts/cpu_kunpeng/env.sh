@@ -120,6 +120,8 @@ export SGLANG_KUNPENG_DECODE_MAX_TOKENS=128
 export SGLANG_KUNPENG_PREFILL_MAX_TOKENS=4096
 # Load format (e.g. "sharded_state", leave empty for default)
 export LOAD_FORMAT=""
+# PD disaggregation mode
+export IS_PREFILL="1"
 
 # ------------------------------------------------------------
 # load local config
@@ -172,7 +174,6 @@ native_config() {
     export ROLE="native"
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$(date +%H%M%S)"
     export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
-    export IS_PREFILL="1"
 }
 
 # ------------------------------------------------------------
@@ -197,12 +198,14 @@ case "$ACTION" in
         ;;
 esac
 
-source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
+if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]]; then
+    source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 
-export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
-export LD_LIBRARY_PATH=/usr/lib64/libibverbs:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=${KUPL_PATH}/lib:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:$LD_LIBRARY_PATH
+    export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
+    export LD_LIBRARY_PATH=/usr/lib64/libibverbs:$LD_LIBRARY_PATH
+    export LD_LIBRARY_PATH=${KUPL_PATH}/lib:$LD_LIBRARY_PATH
+    export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:$LD_LIBRARY_PATH
+fi
 
 export KUTACC_LIB=${KUTACC_PATH}/install/lib
 export KUTACC_INCLUDE=${KUTACC_PATH}/install/include

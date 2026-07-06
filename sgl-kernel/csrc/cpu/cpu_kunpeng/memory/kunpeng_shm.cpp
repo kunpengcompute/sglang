@@ -22,13 +22,16 @@
 
 #include <fstream>
 #include <cstdint>
+#include <cstring>
+#include <unordered_map>
 #include <unistd.h>
 #include <arm_bf16.h>
 #include <arm_fp16.h>
 
 #include "sgl_kernel_ops.h"
 #include "../utils/kunpeng_oob.h"
-#include "../utils/kunpeng_shm.h"
+#include "../memory/kunpeng_shm.h"
+#include <kutacc.h>
 
 // The shm size must be aligned to 2MB
 constexpr int64_t SHM_ALIGNMENT = 2 * 1024 * 1024;
@@ -59,6 +62,9 @@ static c10d::ProcessGroup *g_intra_die_group = nullptr;
 static c10d::ProcessGroup *g_intra_socket_group = nullptr;
 
 static bool g_shm_initialized = false;
+
+static int64_t g_max_tokens = 4096;
+static bool g_is_prefill = true;
 
 template <typename T>
 struct span {
@@ -127,6 +133,11 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
     kupl_shm_win_alloc(64, kupl_intra_die_comm, (void **)&kupl_intra_diefence_baseptr, &kupl_win_intra_die);
     kupl_shm_win_alloc(g_shm_size, kupl_intra_node_comm, (void **)&kupl_shm_baseptr, &kupl_win_intra_node);
 
+    memset(kupl_shm_baseptr, 0, g_shm_size);
+
+    auto work = g_intra_node_group->barrier();
+    work->wait();
+
     kupl_shm_group_baseptr.resize(intra_node_size, nullptr);
     for (int i = 0; i < intra_node_size; ++i) {
         kupl_shm_win_query(kupl_win_intra_node, i, (void **)&kupl_shm_group_baseptr[i]);
@@ -138,6 +149,23 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
     std::cout << "[KuTACC] Init shared memory pool, shm_size= " << shm_available.size << std::endl;
 
     g_shm_initialized = true;
+
+    auto str = std::getenv("IS_PREFILL");
+    if (str != nullptr) {
+        g_is_prefill = std::atol(str);
+    }
+
+    if (g_is_prefill) {
+        str = std::getenv("SGLANG_KUNPENG_PREFILL_MAX_TOKENS");
+        if (str != nullptr) {
+            g_max_tokens = std::atoll(str);
+        }
+    } else {
+        str = std::getenv("SGLANG_KUNPENG_DECODE_MAX_TOKENS");
+        if (str != nullptr) {
+            g_max_tokens = std::atoll(str);
+        }
+    }
 }
 
 void shm_pool_destroy_kunpeng()
@@ -208,6 +236,24 @@ at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t
     torch_tensor.set_requires_grad(false);
 
     return torch_tensor;
+}
+
+static std::unordered_map<int64_t, at::Tensor> g_shm_tensor_cache;
+
+at::Tensor get_or_create_shm_tensor(int64_t dim)
+{
+    TORCH_CHECK(g_shm_initialized, "get_or_create_shm_tensor called before shm_pool_create_kunpeng");
+    TORCH_CHECK(g_max_tokens > 0, "set_shm_max_tokens must be called before get_or_create_shm_tensor");
+
+    auto it = g_shm_tensor_cache.find(dim);
+    if (it != g_shm_tensor_cache.end()) {
+        return it->second;
+    }
+
+    int64_t shape[2] = {g_max_tokens, dim};
+    at::Tensor tensor = create_shm_tensor_kunpeng(at::kBFloat16, c10::ArrayRef<int64_t>(shape, 2));
+    g_shm_tensor_cache[dim] = tensor;
+    return tensor;
 }
 
 int get_intra_node_rank()

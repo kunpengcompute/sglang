@@ -203,9 +203,11 @@ bool is_shm_tensor(at::Tensor tensor);
 
 at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t> shape);
 
+at::Tensor get_or_create_shm_tensor(int64_t dim);
+
 void shm_reduce_scatter_init_kunpeng();
 
-void shm_reduce_scatter_kunpeng(int64_t height, int64_t width, at::Tensor tensor_data);
+void shm_reduce_scatter_kunpeng(at::Tensor input);
 
 void shm_reduce_scatter_finalize_kunpeng();
 
@@ -214,11 +216,13 @@ void shm_allgather_init_kunpeng();
 void shm_dual_allgather_kunpeng(at::Tensor src0_tensor, at::Tensor dst0_tensor, at::Tensor src1_tensor,
                                 at::Tensor dst1_tensor);
 
+void shm_batched_allgather_kunpeng(at::Tensor input, at::Tensor output, int64_t comm_size);
+
 void shm_allgather_finalize_kunpeng();
 
 void shm_allreduce_init_kunpeng(int64_t max_num_elements);
 
-void shm_allreduce_kunpeng(at::Tensor tensor_data);
+void shm_allreduce_kunpeng(at::Tensor input);
 
 void shm_allreduce_finalize_kunpeng();
 
@@ -526,11 +530,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("create_shm_tensor_kunpeng(ScalarType dtype, int[] shape) -> Tensor");
     m.impl("create_shm_tensor_kunpeng", create_shm_tensor_kunpeng);
 
+    m.def("get_or_create_shm_tensor(int dim) -> Tensor");
+    m.impl("get_or_create_shm_tensor", get_or_create_shm_tensor);
+
     // SHM Reduce Scatter operators
     m.def("shm_reduce_scatter_init_kunpeng() -> ()");
     m.impl("shm_reduce_scatter_init_kunpeng", shm_reduce_scatter_init_kunpeng);
 
-    m.def("shm_reduce_scatter_kunpeng(int height, int width, Tensor tensor_data) -> ()");
+    m.def("shm_reduce_scatter_kunpeng(Tensor(a!) input) -> ()");
     m.impl("shm_reduce_scatter_kunpeng", shm_reduce_scatter_kunpeng);
 
     m.def("shm_reduce_scatter_finalize_kunpeng() -> ()");
@@ -545,6 +552,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "()");
     m.impl("shm_dual_allgather_kunpeng", shm_dual_allgather_kunpeng);
 
+    m.def("shm_batched_allgather_kunpeng(Tensor(a!) input, Tensor(b!) output, int comm_size) -> ()");
+    m.impl("shm_batched_allgather_kunpeng", shm_batched_allgather_kunpeng);
+
     m.def("shm_allgather_finalize_kunpeng() -> ()");
     m.impl("shm_allgather_finalize_kunpeng", shm_allgather_finalize_kunpeng);
 
@@ -552,7 +562,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("shm_allreduce_init_kunpeng(int max_num_elements) -> ()");
     m.impl("shm_allreduce_init_kunpeng", shm_allreduce_init_kunpeng);
 
-    m.def("shm_allreduce_kunpeng(Tensor tensor_data) -> ()");
+    m.def("shm_allreduce_kunpeng(Tensor(a!) input) -> ()");
     m.impl("shm_allreduce_kunpeng", shm_allreduce_kunpeng);
 
     m.def("shm_allreduce_finalize_kunpeng() -> ()");

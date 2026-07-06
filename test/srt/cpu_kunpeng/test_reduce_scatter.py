@@ -101,10 +101,7 @@ def worker_main() -> None:
 
     dist.barrier()
 
-    shm_tensor = kernel.create_shm_tensor_kunpeng(torch.bfloat16, [HEIGHT, WIDTH])
-    _rank_log(rank, "create_shm_tensor_kunpeng OK, shape=%s", list(shm_tensor.shape))
-
-    shm_tensor.fill_(float(rank + 1))
+    input_tensor = torch.empty((HEIGHT, WIDTH), dtype=torch.bfloat16)
 
     kernel.shm_reduce_scatter_init_kunpeng()
     _rank_log(rank, "shm_reduce_scatter_init_kunpeng OK")
@@ -115,11 +112,11 @@ def worker_main() -> None:
 
     kutacc_times = []
     for i in range(WARMUP_ITERS + BENCH_ITERS):
-        shm_tensor.fill_(float(rank + 1))
+        input_tensor.fill_(float(rank + 1))
         dist.barrier()
 
         t0 = time.perf_counter()
-        kernel.shm_reduce_scatter_kunpeng(HEIGHT, WIDTH, shm_tensor)
+        kernel.shm_reduce_scatter_kunpeng(input_tensor)
         t1 = time.perf_counter()
 
         if i >= WARMUP_ITERS:
@@ -127,7 +124,9 @@ def worker_main() -> None:
 
         dist.barrier()
 
-    kutacc_result = shm_tensor[rank * chunk_height : (rank + 1) * chunk_height].clone()
+    kutacc_result = input_tensor[
+        rank * chunk_height : (rank + 1) * chunk_height
+    ].clone()
 
     avg_kutacc = sum(kutacc_times) / len(kutacc_times)
     _rank_log(
