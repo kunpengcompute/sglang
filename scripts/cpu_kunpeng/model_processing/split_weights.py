@@ -15,6 +15,7 @@ def split_tensor_by_rank(
     rank: int,
     attention_tp_size: int,
     global_tp_size: int,
+    socket_tp_size: int = 8,
 ) -> torch.Tensor:
     """
     根据切分方式和维度对 tensor 进行切分，返回当前 rank 对应的切片。
@@ -25,10 +26,12 @@ def split_tensor_by_rank(
             "none"         - 不切分，返回完整副本
             "attention_tp" - 按 attention_tp_size 切分 (实际 rank = rank % attention_tp_size)
             "global_tp"    - 按 global_tp_size 切分 (实际 rank = rank)
+            "socket_tp"    - 按 socket_tp_size 切分 (实际 rank = rank % socket_tp_size)
         dim: 切分维度 (0 或 1)；split_mode 为 "none" 时忽略
         rank: 当前全局 rank
         attention_tp_size: attention 张量并行大小
         global_tp_size: 全局张量并行大小
+        socket_tp_size: socket 张量并行大小
 
     Returns:
         切分后 (或完整副本) 的 tensor
@@ -40,6 +43,8 @@ def split_tensor_by_rank(
         tp_size, tp_rank = attention_tp_size, rank % attention_tp_size
     elif split_mode == "global_tp":
         tp_size, tp_rank = global_tp_size, rank
+    elif split_mode == "socket_tp":
+        tp_size, tp_rank = socket_tp_size, rank % socket_tp_size
     else:
         raise ValueError(f"Unknown split_mode: {split_mode!r}")
 
@@ -61,6 +66,7 @@ def split_and_concat_by_rank(
     rank: int,
     attention_tp_size: int,
     global_tp_size: int,
+    socket_tp_size: int = 8,
 ) -> torch.Tensor:
     """
     对多个 tensor 分别按相同切分方式和维度切分，再在 dim 上 cat 起来。
@@ -78,7 +84,7 @@ def split_and_concat_by_rank(
     """
     chunks = [
         split_tensor_by_rank(
-            t, split_mode, dim, rank, attention_tp_size, global_tp_size
+            t, split_mode, dim, rank, attention_tp_size, global_tp_size, socket_tp_size
         )
         for t in tensors
     ]
@@ -185,6 +191,7 @@ def split_non_moe_weights(
     output_dir: str,
     attention_tp_size: int = 16,
     global_tp_size=64,
+    socket_tp_size=8,
     dp_lm_head=True,
     dp_mlp=True,
     ranks=None,
@@ -222,13 +229,25 @@ def split_non_moe_weights(
     def split_for_rank(tensor, split_mode, dim, rank):
         """对指定 rank 切分 tensor。"""
         return split_tensor_by_rank(
-            tensor, split_mode, dim, rank, attention_tp_size, global_tp_size
+            tensor,
+            split_mode,
+            dim,
+            rank,
+            attention_tp_size,
+            global_tp_size,
+            socket_tp_size,
         )
 
     def split_and_concat_for_rank(tensors, split_mode, dim, rank):
         """对指定 rank 分别切分多个 tensor 后 cat。"""
         return split_and_concat_by_rank(
-            tensors, split_mode, dim, rank, attention_tp_size, global_tp_size
+            tensors,
+            split_mode,
+            dim,
+            rank,
+            attention_tp_size,
+            global_tp_size,
+            socket_tp_size,
         )
 
     for rank in tqdm(ranks, desc="处理rank"):
@@ -247,8 +266,6 @@ def split_non_moe_weights(
 
         for key in tqdm(layer_keys, desc=f"处理keys(rank={rank})", leave=False):
             if "_scale" in key:
-                continue
-            if "q_a_proj" in key:
                 continue
 
             # shared experts
@@ -336,6 +353,16 @@ def split_non_moe_weights(
                     scale_tensor, "none", 0, rank
                 )
 
+            elif "self_attn.q_a_proj.weight" in key:
+                if fused_qkva:
+                    continue
+                tensor = all_weights[key]
+                scale_tensor = all_weights[key + "_scale"]
+                rank_weights[key] = split_for_rank(tensor, "none", 0, rank)
+                rank_weights[key + "_scale"] = split_for_rank(
+                    scale_tensor, "none", 0, rank
+                )
+
             elif "self_attn.kv_a_proj_with_mqa.weight" in key:
                 if not fused_qkva:
                     tensor = all_weights[key]
@@ -359,10 +386,10 @@ def split_non_moe_weights(
                     fused_tensor = torch.cat([qa_tensor, tensor], dim=0)
                     fused_scale = torch.cat([qa_scale_tensor, scale_tensor], dim=0)
                     rank_weights[new_key] = split_for_rank(
-                        fused_tensor, "attention_tp", 0, rank
+                        fused_tensor, "socket_tp", 0, rank
                     )
                     rank_weights[new_key + "_scale"] = split_for_rank(
-                        fused_scale, "attention_tp", 0, rank
+                        fused_scale, "socket_tp", 0, rank
                     )
 
             else:
@@ -410,6 +437,12 @@ if __name__ == "__main__":
         default=False,
         help="禁用 dp_mlp 模式 (默认启用)",
     )
+    parser.add_argument(
+        "--socket_tp_size",
+        type=int,
+        default=8,
+        help="Socket 张量并行大小 (用于 qkva 切分)",
+    )
 
     args = parser.parse_args()
     args.dp_lm_head = not args.disable_dp_lm_head
@@ -421,6 +454,7 @@ if __name__ == "__main__":
     print(f"总计 Rank 数量 (Total)    : {args.global_tp_size}")
     print(f"Attention TP 大小 (Attention TP Size) : {args.attention_tp_size}")
     print(f"Global TP 大小 (Global TP Size)       : {args.global_tp_size}")
+    print(f"Socket TP 大小 (Socket TP Size)       : {args.socket_tp_size}")
     print(f"DP LM Head 模式 (DP LM Head)         : {args.dp_lm_head}")
     print(f"DP MLP 模式 (DP MLP)                 : {args.dp_mlp}")
     print("========================================================\n")
@@ -438,6 +472,7 @@ if __name__ == "__main__":
         args.output_dir,
         args.attention_tp_size,
         args.global_tp_size,
+        args.socket_tp_size,
         args.dp_lm_head,
         args.dp_mlp,
     )

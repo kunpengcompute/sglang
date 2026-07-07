@@ -58,21 +58,21 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
+    is_cpu_920f,
     is_cuda_alike,
     is_hip,
     is_musa,
     is_npu,
     is_shm_available,
     is_xpu,
-    is_cpu_920f,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
-from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -441,14 +441,14 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
+            KunpengCommunicator,
+        )
         from sglang.srt.distributed.device_communicators.npu_communicator import (
             NpuCommunicator,
         )
         from sglang.srt.distributed.device_communicators.xpu_communicator import (
             XpuCommunicator,
-        )
-        from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
-            KunpengCommunicator,
         )
 
         self.hpu_communicator: Optional[HpuCommunicator] = None
@@ -1532,6 +1532,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_SOCKET_TP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
@@ -1566,6 +1567,13 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_socket_tp_group() -> GroupCoordinator:
+    assert (
+        _SOCKET_TP is not None
+    ), "socket tensor model parallel group is not initialized"
+    return _SOCKET_TP
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -1827,6 +1835,7 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    socket_tp_size: int = 8,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
@@ -1998,6 +2007,29 @@ def initialize_model_parallel(
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
+            recovered_rank=recovered_rank,
+        )
+
+    global _SOCKET_TP
+    assert (
+        _SOCKET_TP is None
+    ), "socket tensor model parallel group is already initialized"
+    if socket_tp_size <= 1 or socket_tp_size == tensor_model_parallel_size:
+        _SOCKET_TP = _TP
+    else:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for socket_offset in range(0, tensor_model_parallel_size, socket_tp_size):
+                st = tp_group_idx * tensor_model_parallel_size + socket_offset
+                en = st + socket_tp_size
+                ranks = list(range(st, en))
+                group_ranks.append(ranks)
+        _SOCKET_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            group_name="socket_tp",
             recovered_rank=recovered_rank,
         )
 
@@ -2254,6 +2286,17 @@ def get_attn_tensor_model_parallel_rank():
     return get_attn_tp_group().rank_in_group
 
 
+# SOCKET_TP
+def get_socket_tensor_model_parallel_world_size():
+    """Return world size for the socket tensor model parallel group."""
+    return get_socket_tp_group().world_size
+
+
+def get_socket_tensor_model_parallel_rank():
+    """Return my rank for the socket tensor model parallel group."""
+    return get_socket_tp_group().rank_in_group
+
+
 # ATTN_CP
 def get_attn_context_model_parallel_world_size():
     """Return world size for the attention context model parallel group."""
@@ -2345,6 +2388,11 @@ def destroy_model_parallel():
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
+
+    global _SOCKET_TP
+    if _SOCKET_TP and _SOCKET_TP is not _TP:
+        _SOCKET_TP.destroy()
+    _SOCKET_TP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
