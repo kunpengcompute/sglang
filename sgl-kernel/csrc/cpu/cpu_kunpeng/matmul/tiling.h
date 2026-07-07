@@ -19,14 +19,8 @@
 #include <cstdint>
 #include <kutacc.h>
 
-kutacc::MatrixTilingBlock igemm_find_optimal_tiling_plan_prefill(int64_t M, int64_t N, int64_t K, int64_t num_threads);
+void init_tiling();
 
-kutacc::MatrixTilingBlock igemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K, int64_t num_threads);
+std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K);
 
-kutacc::MatrixTilingBlock igemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K, int64_t num_threads);
-
-kutacc::MatrixTilingBlock bgemm_find_optimal_tiling_plan_prefill(int64_t M, int64_t N, int64_t K, int64_t num_threads);
-
-kutacc::MatrixTilingBlock bgemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K, int64_t num_threads);
-
-kutacc::MatrixTilingBlock bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K, int64_t num_threads);
+std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K);

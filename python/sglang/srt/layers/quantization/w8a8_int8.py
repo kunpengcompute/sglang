@@ -252,9 +252,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             # gemm
             n, k = layer.weight.shape
             tile_m, tile_n, tile_k = (
-                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan_decode(
-                    batch_size, n, k, 32
-                )
+                torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(batch_size, n, k)
             )
 
             output = torch.empty([batch_size, n], dtype=torch.bfloat16)

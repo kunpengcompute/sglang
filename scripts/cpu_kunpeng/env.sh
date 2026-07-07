@@ -75,6 +75,8 @@ export SGLANG_PATH="/path-to-SGLang"
 export CONDA_ENV_PATH="$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME"
 export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
 
+export GEMM_TILING_PLAN_FILE="/path-to-tiling"
+
 # TP/EP size
 export TP_SIZE=256
 export EP_SIZE=${TP_SIZE}

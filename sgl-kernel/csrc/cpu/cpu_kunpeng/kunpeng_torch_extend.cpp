@@ -56,23 +56,11 @@ void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, i
 void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
                               int64_t num_threads, bool is_prefill = true);
 
-std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan_prefill(int64_t M, int64_t N, int64_t K,
-                                                                             int64_t num_threads);
+void init_tiling();
 
-std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K,
-                                                                            int64_t num_threads);
+std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K);
 
-std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K,
-                                                                     int64_t num_threads);
-
-std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan_prefill(int64_t M, int64_t N, int64_t K,
-                                                                             int64_t num_threads);
-
-std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K,
-                                                                            int64_t num_threads);
-
-std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K,
-                                                                     int64_t num_threads);
+std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K);
 
 // === Attention 算子声明 ===
 at::Tensor flash_mla_meta_create_kunpeng();
@@ -271,23 +259,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("s8_gemm_pack_kunpeng", s8_gemm_pack_kunpeng);
 
     // igemm tiling plan
-    m.def("igemm_find_optimal_tiling_plan_prefill(int M, int N, int K, int num_threads) -> (int, int, int)");
-    m.impl("igemm_find_optimal_tiling_plan_prefill", igemm_find_optimal_tiling_plan_prefill);
+    m.def("init_tiling() -> ()");
+    m.impl("init_tiling", init_tiling);
 
-    m.def("igemm_find_optimal_tiling_plan_decode(int M, int N, int K, int num_threads) -> (int, int, int)");
-    m.impl("igemm_find_optimal_tiling_plan_decode", igemm_find_optimal_tiling_plan_decode);
-
-    m.def("igemm_find_optimal_tiling_plan(int M, int N, int K, int num_threads) -> (int, int, int)");
+    m.def("igemm_find_optimal_tiling_plan(int M, int N, int K) -> (int, int, int)");
     m.impl("igemm_find_optimal_tiling_plan", igemm_find_optimal_tiling_plan);
 
     // bgemm tiling plan
-    m.def("bgemm_find_optimal_tiling_plan_prefill(int M, int N, int K, int num_threads) -> (int, int, int)");
-    m.impl("bgemm_find_optimal_tiling_plan_prefill", bgemm_find_optimal_tiling_plan_prefill);
-
-    m.def("bgemm_find_optimal_tiling_plan_decode(int M, int N, int K, int num_threads) -> (int, int, int)");
-    m.impl("bgemm_find_optimal_tiling_plan_decode", bgemm_find_optimal_tiling_plan_decode);
-
-    m.def("bgemm_find_optimal_tiling_plan(int M, int N, int K, int num_threads) -> (int, int, int)");
+    m.def("bgemm_find_optimal_tiling_plan(int M, int N, int K) -> (int, int, int)");
     m.impl("bgemm_find_optimal_tiling_plan", bgemm_find_optimal_tiling_plan);
 
     // s8_s8_packed_gemm_bf16_dq

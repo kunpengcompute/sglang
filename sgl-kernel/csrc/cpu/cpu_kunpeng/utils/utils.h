@@ -17,6 +17,9 @@
 #include <torch/extension.h>
 #include <kutacc.h>
 
+#include <cstdlib>
+#include <string>
+
 template <typename T, int Dims>
 kutacc::Tensor<T, Dims> to_kutacc(at::Tensor t)
 {
@@ -27,4 +30,13 @@ kutacc::Tensor<T, Dims> to_kutacc(at::Tensor t)
         TORCH_CHECK(t.scalar_type() == c10::CppTypeToScalarType<T>::value);
     }
     return kutacc::Tensor<T, Dims>(reinterpret_cast<T *>(t.data_ptr()), t.sizes().data(), t.strides().data());
+}
+
+// Read IS_PREFILL env var; returns true if set to 1/true/TRUE/True.
+static inline bool read_is_prefill_env()
+{
+    const char *env = std::getenv("IS_PREFILL");
+    if (env == nullptr) return false;
+    std::string s(env);
+    return s == "1" || s == "true" || s == "TRUE" || s == "True";
 }

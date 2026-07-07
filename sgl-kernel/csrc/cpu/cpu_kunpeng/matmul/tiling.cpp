@@ -15,13 +15,20 @@
  */
 
 #include "tiling.h"
+#include "../utils/utils.h"
 
 #include <kutacc.h>
 #include <torch/extension.h>
 
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -37,202 +44,204 @@ struct tiling_block_hash {
 };
 
 using InnerTilingMap = std::unordered_map<DimPair, DimPair, tiling_block_hash>;
-using ThreadToPlanMap = std::unordered_map<int64_t, InnerTilingMap>;
 
-static const InnerTilingMap igemm_plan_prefill_32 = {
-    // deepseek v3
-    {{264, 7168}, {132, 448}},
-};
+static InnerTilingMap igemm_plans;
+static InnerTilingMap bgemm_plans;
 
-static const InnerTilingMap igemm_plan_decode_32 = {
-    // deepseek v3
-    {{264, 7168}, {132, 448}},    // qkva
-    {{1536, 1536}, {768, 1536}},  // q_b
-    {{2048, 512}, {256, 512}},    // kv_b
-    {{7168, 1024}, {224, 1024}},  // o_proj
-    {{2304, 7168}, {576, 896}},   // mlp gateup, kpinfer use tp=8
-    {{7168, 1152}, {224, 1152}},  // mlp down
-    {{4096, 7168}, {2048, 448}},  // shared expert gateup
-    {{7168, 2048}, {448, 1024}},  // shared expert down
-    // deepseek v2
-    {{2048, 128}, {64, 128}},     // o_proj
-    {{1368, 2048}, {342, 256}},   // mlp gateup
-    {{2048, 684}, {64, 684}},     // mlp down
-    {{5632, 2048}, {352, 1024}},  // shared expert gateup
-    {{2048, 2816}, {512, 352}},   // shared expert down
-    {{2816, 2048}, {352, 512}},   // fusedmoe gateup
-    {{2048, 1408}, {64, 1408}},   // fusedmoe down
-};
+// init_tiling one-shot guard
+static std::once_flag g_init_tiling_once;
 
-static ThreadToPlanMap igemm_prefill_plans_by_threads = {{32, igemm_plan_prefill_32}};
-static ThreadToPlanMap igemm_decode_plans_by_threads = {{32, igemm_plan_decode_32}};
+// ---- default tiling heuristic parameters ----
+constexpr int64_t kDefaultMinTileN = 32;       // tile_n lower bound
+constexpr int64_t kDefaultTargetTileK = 2048;  // target tile_k
+constexpr int64_t kDefaultAlign = 4;           // tile_n / tile_k alignment constraint
 
-static const InnerTilingMap bgemm_plan_prefill_32 = {
-    // deepseek v3
-    {{256, 7168}, {128, 448}},
-    {{8080, 7168}, {2020, 896}},
-    {{16160, 7168}, {4040, 896}},
-    {{448, 14336}, {224, 896}},
-    {{896, 14336}, {448, 896}},
-    // deepseek v2
-    {{64, 2048}, {64, 64}},
-};
+// Print a tiling plan.
+void print_tiling_plan(const char *name, const InnerTilingMap &plan)
+{
+    printf("[tiling][%s] plan entries: %zu\n", name, plan.size());
+    for (const auto &kv : plan) {
+        auto [n, k] = kv.first;
+        auto [tn, tk] = kv.second;
+        printf("  N=%lld K=%lld -> tile_n=%lld tile_k=%lld\n", static_cast<long long>(n), static_cast<long long>(k),
+               static_cast<long long>(tn), static_cast<long long>(tk));
+    }
+    fflush(stdout);
+}
 
-static const InnerTilingMap bgemm_plan_decode_32 = {
-    // deepseek v3
-    {{256, 7168}, {256, 224}},
-    {{8080, 7168}, {2020, 896}},
-    {{16160, 7168}, {4040, 896}},
-    {{448, 14336}, {448, 448}},
-    {{896, 14336}, {448, 896}},
-    // deepseek v2
-    {{64, 2048}, {64, 64}},
-};
+// Get all divisors of x that are multiples of align.
+std::vector<int64_t> get_divisors(int64_t x, int64_t align)
+{
+    std::vector<int64_t> result;
+    for (int64_t d = align; d <= x; d += align) {
+        if (x % d == 0) result.push_back(d);
+    }
+    return result;
+}
 
-static ThreadToPlanMap bgemm_prefill_plans_by_threads = {{32, bgemm_plan_prefill_32}};
-static ThreadToPlanMap bgemm_decode_plans_by_threads = {{32, bgemm_plan_decode_32}};
-// ====== 静态表结束 ======
+// One-shot init: load plans from file specified by GEMM_TILING_PLAN_FILE env var.
+// CSV format: is_prefill,gemm_type,n,k,tile_n,tile_k
+void init_tiling_impl()
+{
+    std::call_once(g_init_tiling_once, []() {
+        bool is_prefill = read_is_prefill_env();
+        printf("[tiling][init] IS_PREFILL=%s\n", is_prefill ? "1" : "0");
 
-// ---- 默认切分启发式参数 ----
-constexpr int64_t kDefaultMinTileN = 32;       // tile_n 下限
-constexpr int64_t kDefaultTargetTileK = 2048;  // 切 K 时的目标 tile_k
-constexpr int64_t kDefaultAlign = 4;           // tile_n / tile_k 对齐约束
+        const char *path = std::getenv("GEMM_TILING_PLAN_FILE");
+        if (path == nullptr || path[0] == '\0') {
+            printf("[tiling][init] GEMM_TILING_PLAN_FILE not set, using empty plans\n");
+        } else {
+            printf("[tiling][init] loading from %s\n", path);
+            std::ifstream file(path);
+            if (!file.is_open()) {
+                printf("[tiling][init] WARNING: cannot open plan file %s\n", path);
+            } else {
+                int line_no = 0;
+                std::string line;
+                while (std::getline(file, line)) {
+                    ++line_no;
+                    while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                        line.pop_back();
+                    if (line.empty() || line[0] == '#') continue;
 
-// 查表失败时的默认切分策略。
-//
-// 算法:
-//   1. num_threads 必须为 2 的幂。
-//   2. 遍历所有 2 的幂 split_k (1,2,4,...,num_threads), 在满足 N%split_n==0
-//      且 K%split_k==0 的候选中, 选 tile_k = K/split_k 最接近 2048 的作为
-//      起始点 (K<=2048 时自然 split_k=1 最接近)。
-//   3. 从起始 split_k 向增大方向逐档遍历 (split_k *= 2), 每增大一档:
-//        tile_n = N/split_n 恢复一倍 (变大),
-//        tile_k = K/split_k 缩小一倍。
-//      检查三个硬约束: tile_n >= 32, tile_n % 4 == 0, tile_k % 4 == 0。
-//      首个满足全部约束的方案即为结果。
-//   4. 遍历完毕仍无解则报错, 提示注册自定义 plan。
-std::tuple<int64_t, int64_t, int64_t> compute_default_tiling(int64_t M, int64_t N, int64_t K, int64_t num_threads,
+                    std::stringstream ss(line);
+                    std::string token;
+                    std::vector<int64_t> vals;
+                    while (std::getline(ss, token, ',')) {
+                        vals.push_back(std::stoll(token));
+                    }
+
+                    if (vals.size() != 6) {
+                        printf("[tiling][init] WARNING: line %d has %zu fields, expected 6, skipping\n", line_no,
+                               vals.size());
+                        continue;
+                    }
+
+                    int64_t csv_is_prefill = vals[0];
+                    // Only load plans matching the current IS_PREFILL mode
+                    if ((csv_is_prefill != 0) != is_prefill) continue;
+
+                    int64_t gemm_type = vals[1];
+                    int64_t n = vals[2], k = vals[3], tile_n = vals[4], tile_k = vals[5];
+
+                    InnerTilingMap *target = nullptr;
+                    const char *name = "";
+                    if (gemm_type == 0) {
+                        target = &igemm_plans;
+                        name = "igemm";
+                    } else if (gemm_type == 1) {
+                        target = &bgemm_plans;
+                        name = "bgemm";
+                    }
+
+                    if (target) {
+                        (*target)[{n, k}] = {tile_n, tile_k};
+                        printf("[tiling][init][%s] N=%lld K=%lld -> tile_n=%lld tile_k=%lld\n", name,
+                               static_cast<long long>(n), static_cast<long long>(k), static_cast<long long>(tile_n),
+                               static_cast<long long>(tile_k));
+                    }
+                }
+            }
+        }
+        print_tiling_plan("igemm", igemm_plans);
+        print_tiling_plan("bgemm", bgemm_plans);
+        fflush(stdout);
+    });
+}
+
+// Default tiling when no plan is found in the table.
+// Algorithm: enumerate valid (tile_n, tile_k) pairs satisfying:
+//   - N % tile_n == 0, K % tile_k == 0
+//   - tile_n >= 32, tile_n % 4 == 0, tile_k % 4 == 0
+//   - (N / tile_n) * (K / tile_k) == 32
+// Pick tile_k closest to 2048 and the largest tile_n among those.
+std::tuple<int64_t, int64_t, int64_t> compute_default_tiling(int64_t M, int64_t N, int64_t K,
                                                              const std::string &gemm_type,
                                                              const std::string &stage_type)
 {
-    // (1) num_threads 必须是 2 的幂
-    TORCH_CHECK(num_threads > 0 && (num_threads & (num_threads - 1)) == 0, "Default ", stage_type, " tiling for ",
-                gemm_type, " requires num_threads to be a power of 2, got ", num_threads,
-                ". Either register a custom plan or use a power-of-2 thread count.");
-
     auto abs_diff = [](int64_t a, int64_t b) -> int64_t { return a > b ? (a - b) : (b - a); };
 
-    // (2) 在满足整除的候选中, 找 tile_k 最接近 2048 的 split_k 作为起点
-    //     K <= 2048 时 split_k=1 自然最接近; K > 2048 时可能 split_k>1 更接近
-    int64_t initial_split_k = 0;
-    int64_t best_diff = INT64_MAX;
+    auto tk_candidates = get_divisors(K, kDefaultAlign);
+    auto tn_candidates = get_divisors(N, kDefaultAlign);
+    tn_candidates.erase(
+        std::remove_if(tn_candidates.begin(), tn_candidates.end(), [](int64_t v) { return v < kDefaultMinTileN; }),
+        tn_candidates.end());
 
-    for (int64_t split_k = 1; split_k <= num_threads; split_k *= 2) {
-        int64_t split_n = num_threads / split_k;
-        if (K % split_k != 0 || N % split_n != 0) continue;
-        int64_t tile_k = K / split_k;
-        int64_t diff = abs_diff(tile_k, kDefaultTargetTileK);
-        if (diff < best_diff) {
-            best_diff = diff;
-            initial_split_k = split_k;
+    TORCH_CHECK(!tn_candidates.empty(), "Cannot derive a valid default ", stage_type, " tiling for ", gemm_type,
+                " with shape [", M, ", ", N, ", ", K,
+                "] (N has no divisor >= 32 that is multiple of 4). Please add a custom plan.");
+
+    // Collect all valid (tile_n, tile_k) pairs satisfying split_n * split_k == 32
+    struct Candidate {
+        int64_t tile_n;
+        int64_t tile_k;
+    };
+    std::vector<Candidate> valid;
+    for (auto tile_k : tk_candidates) {
+        for (auto tile_n : tn_candidates) {
+            int64_t split_n = N / tile_n;
+            int64_t split_k = K / tile_k;
+            if (split_n * split_k == 32) {
+                valid.push_back({tile_n, tile_k});
+            }
         }
     }
 
-    TORCH_CHECK(initial_split_k > 0, "Cannot find any valid power-of-2 split for ", gemm_type, " ", stage_type,
-                " with shape [", M, ", ", N, ", ", K, "] under num_threads = ", num_threads,
-                " (N or K not divisible by any split). Please register a custom plan.");
+    TORCH_CHECK(!valid.empty(), "Cannot derive a valid default ", stage_type, " tiling for ", gemm_type,
+                " with shape [", M, ", ", N, ", ", K,
+                "] (no pair satisfies (N/tn)*(K/tk)==32). Please add a custom plan.");
 
-    // (3) 从初始 split_k 开始, 向增大方向逐档遍历
-    //     每增大 split_k 一档: tile_n 恢复变大, tile_k 缩小
-    //     直到 tile_n >= 32 且 tile_n % 4 == 0 且 tile_k % 4 == 0
-    for (int64_t split_k = initial_split_k; split_k <= num_threads; split_k *= 2) {
-        int64_t split_n = num_threads / split_k;
-        if (K % split_k != 0 || N % split_n != 0) continue;
-        int64_t tile_n = N / split_n;
-        int64_t tile_k = K / split_k;
-        if (tile_n >= kDefaultMinTileN && tile_n % kDefaultAlign == 0 && tile_k % kDefaultAlign == 0) {
-            return {M, tile_n, tile_k};
-        }
-    }
+    // Pick tile_k closest to 2048; tie-break by largest tile_n
+    std::sort(valid.begin(), valid.end(), [&](const Candidate &a, const Candidate &b) {
+        int64_t da = abs_diff(a.tile_k, kDefaultTargetTileK);
+        int64_t db = abs_diff(b.tile_k, kDefaultTargetTileK);
+        if (da != db) return da < db;
+        return a.tile_n > b.tile_n;
+    });
 
-    // (4) 无法满足所有约束, 报错
-    TORCH_CHECK(false, "Cannot derive a valid default ", stage_type, " tiling for ", gemm_type, " with shape [", M,
-                ", ", N, ", ", K, "] under num_threads = ", num_threads,
-                " (no split satisfies tile_n >= 32, tile_n % 4 == 0 and tile_k % 4 == 0). "
-                "Please register a custom tiling plan for this shape.");
+    return {M, valid[0].tile_n, valid[0].tile_k};
 }
 
 std::tuple<int64_t, int64_t, int64_t> find_optimal_tiling_plan_impl(int64_t M, int64_t N, int64_t K,
-                                                                    int64_t num_threads,
-                                                                    ThreadToPlanMap &plans_by_threads,
-                                                                    const std::string &gemm_type,
+                                                                    InnerTilingMap &plans, const std::string &gemm_type,
                                                                     const std::string &stage_type)
 {
-    // 1. 根据线程数查找 Map
-    auto map_it = plans_by_threads.find(num_threads);
-    if (map_it != plans_by_threads.end()) {
-        auto &target_map = map_it->second;
-
-        // 2. 用 {N, K} 查找
-        auto it = target_map.find({N, K});
-        if (it != target_map.end()) {
-            // 结构化绑定直接解包出二维的 tn 和 tk
-            auto [tn, tk] = it->second;
-            // 计算 M 维度的 tiling 大小
-            int64_t tm = M / (num_threads * tn / N * tk / K);
-            return {tm, tn, tk};
-        }
+    // 1. Look up by {N, K}
+    auto it = plans.find({N, K});
+    if (it != plans.end()) {
+        auto [tn, tk] = it->second;
+        return {M, tn, tk};
     }
 
-    // 3. 查表 (线程数 或 {N,K}) 失败 -> 使用默认切分
-    auto [tm, tn, tk] = compute_default_tiling(M, N, K, num_threads, gemm_type, stage_type);
+    // 2. Table miss -> compute default tiling
+    auto [tm, tn, tk] = compute_default_tiling(M, N, K, gemm_type, stage_type);
 
-    // 4. 将默认切分结果加入 plan, 方便下次查找
-    plans_by_threads[num_threads][{N, K}] = {tn, tk};
+    // 3. Cache and print
+    plans[{N, K}] = {tn, tk};
+    printf("[tiling][new] %s %s M=%lld N=%lld K=%lld -> tile_m=%lld tile_n=%lld tile_k=%lld\n", gemm_type.c_str(),
+           stage_type.c_str(), static_cast<long long>(M), static_cast<long long>(N), static_cast<long long>(K),
+           static_cast<long long>(tm), static_cast<long long>(tn), static_cast<long long>(tk));
+    fflush(stdout);
 
     return {tm, tn, tk};
 }
 
 }  // namespace
 
-std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan_prefill(int64_t M, int64_t N, int64_t K,
-                                                                             int64_t num_threads)
+// Public APIs.
+void init_tiling()
 {
-    return find_optimal_tiling_plan_impl(M, N, K, num_threads, igemm_prefill_plans_by_threads, "igemm", "prefill");
+    init_tiling_impl();
 }
 
-std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K,
-                                                                            int64_t num_threads)
+std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K)
 {
-    return find_optimal_tiling_plan_impl(M, N, K, num_threads, igemm_decode_plans_by_threads, "igemm", "decode");
+    init_tiling_impl();
+    return find_optimal_tiling_plan_impl(M, N, K, igemm_plans, "igemm", "");
 }
 
-std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan_prefill(int64_t M, int64_t N, int64_t K,
-                                                                             int64_t num_threads)
+std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K)
 {
-    return find_optimal_tiling_plan_impl(M, N, K, num_threads, bgemm_prefill_plans_by_threads, "bgemm", "prefill");
-}
-
-std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan_decode(int64_t M, int64_t N, int64_t K,
-                                                                            int64_t num_threads)
-{
-    return find_optimal_tiling_plan_impl(M, N, K, num_threads, bgemm_decode_plans_by_threads, "bgemm", "decode");
-}
-
-std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K,
-                                                                     int64_t num_threads)
-{
-    if (M > 128) {
-        return igemm_find_optimal_tiling_plan_prefill(M, N, K, num_threads);
-    }
-    return igemm_find_optimal_tiling_plan_decode(M, N, K, num_threads);
-}
-
-std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K,
-                                                                     int64_t num_threads)
-{
-    if (M > 128) {
-        return bgemm_find_optimal_tiling_plan_prefill(M, N, K, num_threads);
-    }
-    return bgemm_find_optimal_tiling_plan_decode(M, N, K, num_threads);
+    init_tiling_impl();
+    return find_optimal_tiling_plan_impl(M, N, K, bgemm_plans, "bgemm", "");
 }
