@@ -393,7 +393,7 @@ class MoEGate(nn.Module):
                         self.weight, hidden_states.shape[0], is_prefill
                     )
                     self.is_pack_weight = True
-                logits = torch.ops.sgl_kernel.linear_kunpeng(
+                logits = torch.ops.sgl_kernel.bf16_linear_kunpeng(
                     hidden_states, self.weight, None, is_prefill
                 )
             else:

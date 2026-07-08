@@ -19,6 +19,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
     crash_on_warnings,
     get_bool_env_var,
+    is_cpu_920f,
     is_cuda,
     is_npu,
 )
@@ -35,7 +36,7 @@ if is_cuda():
 
 if is_npu():
     import torch_npu
-
+_is_cpu_920f = is_cpu_920f()
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
@@ -605,7 +606,10 @@ def sampling_from_probs_torch(
     Note: For deterministic sampling from logprobs, use Sampler._sample_from_logprobs instead.
     """
     if sampling_seed is None:
-        sampled_index = torch.multinomial(probs, num_samples=1)
+        if _is_cpu_920f:
+            sampled_index = torch.ops.sgl_kernel.multinomial_kunpeng(probs, 1, True)
+        else:
+            sampled_index = torch.multinomial(probs, num_samples=1, replacement=True)
     else:
         # Deterministic sampling: convert probs to logprobs and use gumbel trick
         sampled_index = multinomial_with_seed(

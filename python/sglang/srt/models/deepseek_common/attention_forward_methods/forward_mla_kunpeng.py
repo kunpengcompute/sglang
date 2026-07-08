@@ -45,49 +45,53 @@ class DeepseekMLAKunpengForwardMixin:
 
         topk_indices = None
         if self.q_lora_rank is not None:
-
-            # fused_qkv_a_proj_with_mqa (via prepare_qkv_latent)
             qkva = self.prepare_qkv_latent(hidden_states, forward_batch)
             q, latent_cache = qkva.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-
-            # q_norm + q_b_proj
             q_normed = self.q_a_layernorm(q)
             out, _ = self.q_b_proj(q_normed)
             q = out.view(-1, self.num_local_heads, self.qk_head_dim)
+        else:
+            out, _ = self.q_proj(hidden_states)
+            q = out.view(-1, self.num_local_heads, self.qk_head_dim)
+            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
 
-            # kv_norm
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+        k_nope = latent_cache[..., : self.kv_lora_rank]
+        k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
-            q_nope, q_pe = q.split(
-                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
-            k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        q_nope, q_pe = q.split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-            # uk
-            bs, m, n, k = 8, 16, 512, 128
-            a_3d = q_nope.transpose(0, 1).contiguous()
-            b_3d = self.w_kc_int8.transpose(1, 2).contiguous()
+        bs = q_nope.size(1)
+        m = q_nope.size(0)
+        k = q_nope.size(2)
+        n = self.w_kc_int8.size(2)
 
-            scale_shape = (bs, k, 1)
-            scale_3d = self.w_kc_scale.view(scale_shape)
+        a_3d = q_nope.transpose(0, 1).contiguous()
+        b_3d = self.w_kc_int8.transpose(1, 2).contiguous()
 
-            c_tensor_3d = torch.empty((bs, m, n), dtype=torch.bfloat16)
-            pa_3d = torch.empty_like(a_3d)
-            pb_3d = torch.empty_like(b_3d)
+        scale_3d = self.w_kc_scale.view(bs, k, 1)
 
-            torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(a_3d, pa_3d)
-            torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(b_3d, pb_3d)
-            torch.ops.sgl_kernel.batched_gemm_woqs8_allthreads_kunpeng(
-                pa_3d, pb_3d, None, scale_3d, c_tensor_3d
-            )
+        c_tensor_3d = torch.empty(
+            (bs, m, n), dtype=torch.bfloat16, device=q_nope.device
+        )
+        pa_3d = torch.empty(a_3d.shape, dtype=a_3d.dtype, device=a_3d.device)
+        pb_3d = torch.empty(b_3d.shape, dtype=b_3d.dtype, device=b_3d.device)
 
-            q_nope_out = c_tensor_3d.transpose(0, 1)
+        torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(a_3d, pa_3d)
+        torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(b_3d, pb_3d)
+        torch.ops.sgl_kernel.batched_gemm_woqs8_allthreads_kunpeng(
+            pa_3d, pb_3d, None, scale_3d, c_tensor_3d
+        )
 
-            if self.rotary_emb is not None:
+        q_nope_out = c_tensor_3d.transpose(0, 1)
+
+        if self.rotary_emb is not None:
+            if self.q_lora_rank is not None:
                 q_out_kp = torch.empty_like(q_pe)
                 k_out_kp = torch.empty_like(k_pe)
                 torch.ops.sgl_kernel.rope_kunpeng(
@@ -100,27 +104,7 @@ class DeepseekMLAKunpengForwardMixin:
                 )
                 q_pe = q_out_kp
                 k_pe = k_out_kp
-
-        else:
-            # q_proj
-            out, _ = self.q_proj(hidden_states)
-            q = out.view(-1, self.num_local_heads, self.qk_head_dim)
-
-            # kv_a_proj_with_mqa
-            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-
-            q_nope, q_pe = q.split(
-                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
-            k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
-
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            if self.rotary_emb is not None:
+            else:
                 q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return (
@@ -166,17 +150,30 @@ class DeepseekMLAKunpengForwardMixin:
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
+        bs = attn_output.size(1)
+        m = attn_output.size(0)
+        k = attn_output.size(2)
+        n = self.w_vc_int8.size(1)
+
+        a_3d = attn_output.transpose(0, 1).contiguous()
+        b_3d = self.w_vc_int8.contiguous()
+
+        rscale_3d = self.w_vc_scale.view(bs, n, 1)
+
+        c_tensor_3d = torch.empty(
+            (bs, m, n), dtype=torch.bfloat16, device=attn_output.device
         )
-        torch.bmm(
-            attn_output.transpose(0, 1),
-            self.w_vc,
-            out=attn_bmm_output.view(
-                -1, self.num_local_heads, self.v_head_dim
-            ).transpose(0, 1),
+        pa_3d = torch.empty(a_3d.shape, dtype=a_3d.dtype, device=a_3d.device)
+        pb_3d = torch.empty(b_3d.shape, dtype=b_3d.dtype, device=b_3d.device)
+
+        torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(a_3d, pa_3d)
+        torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(b_3d, pb_3d)
+        torch.ops.sgl_kernel.batched_gemm_woqs8_allthreads_kunpeng(
+            pa_3d, pb_3d, rscale_3d, None, c_tensor_3d
+        )
+
+        attn_bmm_output = c_tensor_3d.transpose(0, 1).reshape(
+            -1, self.num_local_heads * self.v_head_dim
         )
 
         # o_proj

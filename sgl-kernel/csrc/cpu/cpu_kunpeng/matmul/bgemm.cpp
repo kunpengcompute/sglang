@@ -18,6 +18,7 @@
 #include <kutacc.h>
 #include <torch/extension.h>
 
+#include "common.h"
 #include "sgl_kernel_ops.h"
 #include "tiling.h"
 
@@ -158,4 +159,36 @@ void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size, bool is_p
     TORCH_CHECK(std::get<2>(t) % 2 == 0, "bgemm_pack k%2 != 0");
     kutacc::bf16_gemm_pack(m, k, std::get<1>(t), std::get<2>(t), i_ptr, o_ptr);
     memcpy(i_ptr, o_ptr, m * k * weight.element_size());
+}
+
+at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias,
+                               bool is_prefill)
+{
+    TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be BF16");
+    TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
+
+    int64_t m = input.size(0);
+    int64_t n = weight.size(0);
+    int64_t k = input.size(1);
+    TORCH_CHECK(weight.size(1) == k, "input.k != weight.k");
+
+    kutacc::MatrixTilingBlock t=bgemm_find_optimal_tiling_plan(m, n,k);
+    auto [tile_m, tile_n, tile_k] = t;
+
+    auto pack_bf16 = at::empty({m, k}, input.options());
+    bf16_gemm_pack_kunpeng(input, pack_bf16, tile_m, tile_k);
+
+    auto output = at::empty({m, n}, input.options());
+
+    int64_t blocks_in_k = k / tile_k;
+    int64_t workspace_size = blocks_in_k * n * m * 2;
+    auto workspace = at::empty({workspace_size}, input.options());
+
+    bf16_packed_gemm_kunpeng(pack_bf16, weight, output, workspace, kutacc::get_thread_num(), is_prefill);
+
+    if (bias.defined() && bias.numel() > 0) {
+        output.add_(bias);
+    }
+
+    return output;
 }
