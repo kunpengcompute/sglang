@@ -76,13 +76,17 @@ void get_peer_shm_baseptr(int64_t peer_rank, void *local_base_ptr, void **remote
 at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t> shape);
 
 /**
- * Get or create a cached SHM tensor of shape [max_tokens, dim] in bfloat16.
- * Cached by dim so varying batch sizes reuse the same buffer.
- * Shared across allreduce, reduce_scatter, all_gather, and batch_allgather
- * operators. For batch_allgather, the sendbuf uses key=dim and the recvbuf
- * uses key=dim*comm_size, ensuring both are at consistent offsets across ranks.
+ * Get or create a cached SHM tensor in bfloat16, sized by bs.
+ *
+ * If bs < g_max_seq_num, the tensor shape is [g_max_seq_num, dim] and is
+ * cached for reuse. Otherwise the tensor shape is [g_max_tokens, dim]
+ * where g_max_tokens = g_max_seq_num * g_max_cur_len.
+ *
+ * @param dim  Second dimension of the tensor.
+ * @param bs   Batch size (mandatory). Determines which cached buffer to use.
+ * @return     A cached or newly created tensor backed by shared memory.
  */
-at::Tensor get_or_create_shm_tensor(int64_t dim);
+at::Tensor get_or_create_shm_tensor(int64_t dim, int64_t bs);
 
 /**
  * Get the intra-node rank of the current process.

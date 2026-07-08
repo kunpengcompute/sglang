@@ -696,13 +696,14 @@ class KunpengMoE(FusedMoE):
         num_local_experts = self.num_local_experts
         max_dispatch_tokens = dispatch_output.max_dispatch_tokens_per_rank
         inter_dim = self.w13_weight.shape[1] // 2
-
-        if self.is_prefill:
-            max_tokens = int(os.environ.get("SGLANG_KUNPENG_PREFILL_MAX_TOKENS", 4096))
-            recv_dense_size = self.moe_token_multiple * max_tokens
-        else:
-            max_tokens = int(os.environ.get("SGLANG_KUNPENG_DECODE_MAX_TOKENS", 128))
-            recv_dense_size = max_dispatch_tokens * self.moe_ep_size * num_local_experts
+        max_tokens = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")) * int(
+            os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024")
+        )
+        recv_dense_size = (
+            self.moe_token_multiple * max_tokens
+            if self.is_prefill
+            else max_dispatch_tokens * self.moe_ep_size * num_local_experts
+        )
 
         # Reuse it for gateup output when inter_dim*2 <= hidden (e.g. v3);
         moe_down = dispatch_output.combine_send_buf

@@ -160,16 +160,9 @@ class KunpengCommunicator:
         self.comm_size = group.size()
         self.comm_rank = group.rank()
         self.shm_tensors: dict = {}
-        self.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
-
-        if self.is_prefill:
-            self.max_tokens = int(
-                os.environ.get("SGLANG_KUNPENG_PREFILL_MAX_TOKENS", "4096")
-            )
-        else:
-            self.max_tokens = int(
-                os.environ.get("SGLANG_KUNPENG_DECODE_MAX_TOKENS", "128")
-            )
+        self.max_tokens = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")) * int(
+            os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024")
+        )
 
         # TODO(kunpeng): 7168 is the hidden size of DeepSeek V3, used to
         # pre-allocate SHM buffer for allreduce. This is hardcoded

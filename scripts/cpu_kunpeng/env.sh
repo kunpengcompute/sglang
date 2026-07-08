@@ -106,20 +106,16 @@ export SGLANG_USE_CPU_920F=1
 export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
-
 # Kunpeng SHM pool
 export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476
-export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=24
+export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=50
 # Kunpeng HBW pool
 export SGLANG_ENABLE_HBW_POOL=1
-export SGLANG_ENABLE_HBW_SWAP=1
+export SGLANG_ENABLE_HBW_SWAP=0
 export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=3662
 # Kunpeng SDMA parameters
 export SGLANG_KUNPENG_SDMA_MAX_EVENTS=10
 export SGLANG_KUNPENG_SDMA_THRESHOLD=5
-# Maximum number of tokens output per round within dp
-export SGLANG_KUNPENG_DECODE_MAX_TOKENS=128
-export SGLANG_KUNPENG_PREFILL_MAX_TOKENS=4096
 # Load format (e.g. "sharded_state", leave empty for default)
 export LOAD_FORMAT=""
 # PD disaggregation mode
@@ -200,6 +196,14 @@ case "$ACTION" in
         ;;
 esac
 
+if [[ "$IS_PREFILL" == "1" ]]; then
+    export SGLANG_KUNPENG_MAX_SEQ_NUM=4
+    export SGLANG_KUNPENG_MAX_CUR_LEN=1024
+else
+    export SGLANG_KUNPENG_MAX_SEQ_NUM=128
+    export SGLANG_KUNPENG_MAX_CUR_LEN=1
+fi
+
 if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]]; then
     source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 
@@ -217,5 +221,4 @@ export INCLUDE=${KUPL_PATH}/include:$INCLUDE
 export LIBRARY_PATH=${KUPL_PATH}/lib:$LIBRARY_PATH
 
 export CONDA_ACTIVATE_CMD="eval \"\$($CONDA_BASE_PATH/bin/conda shell.bash hook)\" && conda activate $CONDA_ENV_NAME"
-
 eval "$CONDA_ACTIVATE_CMD"
