@@ -283,6 +283,7 @@ class LogitsProcessor(nn.Module):
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        self.is_lmhead_weitht_packed = False
 
     def forward(
         self,
@@ -908,6 +909,15 @@ class LogitsProcessor(nn.Module):
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                )
+            elif _is_cpu_920f:
+                if not self.is_lmhead_weitht_packed:
+                    torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                        lm_head.weight, hidden_states.shape[0], False
+                    )
+                    self.is_lmhead_weitht_packed = True
+                logits = torch.ops.sgl_kernel.bf16_linear_kunpeng(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight, None, False
                 )
             else:
                 logits = torch.matmul(

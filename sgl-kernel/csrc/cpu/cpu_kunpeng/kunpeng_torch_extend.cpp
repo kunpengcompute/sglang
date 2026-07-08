@@ -124,7 +124,7 @@ void init_sdma(int64_t sdmathreshold);
 void finalize_sdma();
 
 // === MOE 算子声明 ===
-at::Tensor linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias, bool is_prefill);
+at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias, bool is_prefill);
 
 void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size, bool is_prefill);
 
@@ -181,6 +181,8 @@ int64_t topk_convert_kunpeng(at::Tensor src_info, at::Tensor token_ids, at::Tens
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, int64_t num_token_non_padded, int64_t num_experts,
                                         int64_t topk);
+
+at::Tensor multinomial_kunpeng(const at::Tensor &probs, int64_t num_samples, bool replacement);
 
 // === SHM 算子声明 ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
@@ -404,8 +406,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("finalize_sdma", finalize_sdma);
 
     // === MOE 算子声明 ===
-    m.def("linear_kunpeng(Tensor input, Tensor weight, Tensor bias, bool is_prefill) -> Tensor");
-    m.impl("linear_kunpeng", linear_kunpeng);
+    m.def("bf16_linear_kunpeng(Tensor input, Tensor weight, Tensor bias, bool is_prefill) -> Tensor");
+    m.impl("bf16_linear_kunpeng", bf16_linear_kunpeng);
 
     m.def("bf16_gemm_prepack_kunpeng(Tensor(a!) weight, int batch_size, bool is_prefill) -> ()");
     m.impl("bf16_gemm_prepack_kunpeng", bf16_gemm_prepack_kunpeng);
@@ -495,6 +497,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor src_info, Tensor(a!) token_ids, Tensor(b!) experts_offset, "
         "int num_ranks, int num_local_experts, int num_max_dispatch_tokens_per_rank, bool is_prefill) -> int");
     m.impl("topk_convert_kunpeng", topk_convert_kunpeng);
+
+    // multinomial sampling
+    m.def("multinomial_kunpeng(Tensor probs, int num_samples, bool replacement) -> Tensor");
+    m.impl("multinomial_kunpeng", multinomial_kunpeng);
 
     // SHM operators
     m.def("shm_pool_create_kunpeng(int intra_node_pg, int intra_socket_pg, int intra_die_pg, int shm_size_mb) -> ()");
