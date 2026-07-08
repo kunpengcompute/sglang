@@ -25,7 +25,7 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import *
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -314,12 +314,12 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata = None
 
         model_config = model_runner.model_config
-        self.num_q_heads = model_config.num_attention_heads // model_runner.tp_size
+        self.num_q_heads = model_config.num_attention_heads
         self.head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
         self.head_dim_v = model_config.v_head_dim
         self.kv_cache_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
         self.num_layers = model_runner.model_config.num_hidden_layers
-        
+
         self._decode_meta = torch.ops.sgl_kernel.flash_mla_meta_create_kunpeng()
 
         # HBW swap: SDMA-based async DDR <-> HBW data movement
@@ -346,9 +346,19 @@ class KunpengCpuBackend(AttentionBackend):
         metadata = KunpengCpuMetadata()
 
         metadata.page_size = forward_batch.token_to_kv_pool.page_size
-        metadata.seq_lens = forward_batch.seq_lens.to(torch.int32)
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
         req_to_token = forward_batch.req_to_token_pool.req_to_token.to(torch.int32)
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+
+        tp_size = get_attention_tp_size()
+        if tp_size > 1:
+            tp_rank = get_attention_tp_rank()
+            B = seq_lens.shape[0]
+            Btp = B // tp_size
+            seq_lens = seq_lens[tp_rank * Btp : (tp_rank + 1) * Btp]
+            req_pool_indices = req_pool_indices[tp_rank * Btp : (tp_rank + 1) * Btp]
+
+        metadata.seq_lens = seq_lens
 
         batch_size = metadata.seq_lens.shape[0]
         max_seq_len = metadata.seq_lens.max().item()
@@ -384,7 +394,9 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata = metadata
 
         if _enable_hbw_swap and self.hbw_kvbuffer is not None:
-            self.hbw_kvbuffer.queue_async_swapin(0, forward_batch.token_to_kv_pool.get_key_buffer(0))
+            self.hbw_kvbuffer.queue_async_swapin(
+                0, forward_batch.token_to_kv_pool.get_key_buffer(0)
+            )
 
     def _forward_extend_kutacc(
         self,
@@ -511,6 +523,7 @@ class KunpengCpuBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:

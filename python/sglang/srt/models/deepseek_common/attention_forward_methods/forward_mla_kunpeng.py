@@ -17,7 +17,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.distributed as dist
 
+from sglang.srt.layers.dp_attention import get_attention_tp_group, get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
@@ -34,6 +36,56 @@ class DeepseekMLAKunpengForwardMixin:
         )
         self.w_kc_packed = None  # lazily initialized for kunpeng bmm
         self.w_vc_packed = None
+
+    # ------------------------------------------------------------------
+    # All2All helpers for token-split flash_mla
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _all2all_token_to_head(
+        q: torch.Tensor, tp_size: int, group: dist.ProcessGroup
+    ) -> torch.Tensor:
+        """
+        All2All #1: redistribute Q from token-parallel to head-parallel.
+
+        Input:  (B, Nh_local, D)   — all tokens, local heads on each rank
+        Output: (B/tp, Nh, D)      — local tokens, all heads on each rank
+        """
+        B, Nh_local, D = q.shape
+        Btp = B // tp_size
+        Nh = Nh_local * tp_size
+
+        q_reshaped = q.reshape(tp_size, Btp, Nh_local, D)
+        q_permuted = q_reshaped.permute(0, 2, 1, 3).contiguous()
+        q_flat = q_permuted.reshape(Nh, Btp, D)
+
+        out_flat = torch.empty_like(q_flat)
+        dist.all_to_all_single(out_flat, q_flat, group=group)
+
+        return out_flat.permute(1, 0, 2).contiguous()  # (B/tp, Nh, D)
+
+    @staticmethod
+    def _all2all_head_to_token(
+        o: torch.Tensor, tp_size: int, group: dist.ProcessGroup
+    ) -> torch.Tensor:
+        """
+        All2All #2: redistribute flash_mla output from head-parallel to token-parallel.
+
+        Input:  (B/tp, Nh, D)      — local tokens, all heads on each rank
+        Output: (B, Nh_local, D)    — all tokens, local heads on each rank
+        """
+        Btp, Nh, D = o.shape
+        Nh_local = Nh // tp_size
+        B = Btp * tp_size
+
+        o_flat = o.permute(1, 0, 2).contiguous()  # (Nh, B/tp, D)
+
+        out_flat = torch.empty_like(o_flat)
+        dist.all_to_all_single(out_flat, o_flat, group=group)
+
+        o_reshaped = out_flat.reshape(tp_size, Nh_local, Btp, D)
+        o_permuted = o_reshaped.permute(0, 2, 1, 3).contiguous()
+        return o_permuted.reshape(B, Nh_local, D)
 
     def forward_absorb_prepare_kunpeng(
         self: DeepseekV2AttentionMLA,
@@ -78,7 +130,7 @@ class DeepseekMLAKunpengForwardMixin:
             a_3d = q_nope.transpose(0, 1).contiguous()  # (bs, m, k)
             b_3d = self.w_kc_int8.transpose(1, 2).contiguous()  # (bs, k, N)
 
-            scale_shape = (bs, k, 1)
+            scale_shape = (Nh_local, K_dim, 1)
             scale_3d = self.w_kc_scale.view(scale_shape)
 
             q_nope_out = torch.empty(
@@ -119,7 +171,7 @@ class DeepseekMLAKunpengForwardMixin:
             q_pe = q_out_kp
             k_pe = k_out_kp
 
-        q_combined = torch.cat([q_nope_out, q_pe], dim=-1)  # (B, num_local_heads, D_qk)
+        q_combined = torch.cat([q_nope_out, q_pe], dim=-1)  # (B, Nh_local, D_qk)
         k_combined = torch.cat([k_nope, k_pe], dim=-1)  # (B, 1, D_kv+D_rope)
 
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -150,18 +202,41 @@ class DeepseekMLAKunpengForwardMixin:
     ):
 
         if llama_4_scaling is not None:
-            q *= llama_4_scaling
+            q = q * llama_4_scaling
 
-        attn_output = self.attn_mqa(
-            q,
-            k,
-            k_nope,
-            forward_batch,
-            save_kv_cache=False,
-            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-        )
+        tp_size = get_attention_tp_size()
+        if tp_size > 1:
+            group = get_attention_tp_group().device_group
 
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+            # All2All #1: (B, Nh_local, D_qk) → (B/tp, Nh, D_qk)
+            q = self._all2all_token_to_head(q, tp_size, group)
+
+            attn_output = self.attn_mqa(
+                q,
+                k,
+                k_nope,
+                forward_batch,
+                save_kv_cache=False,
+                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+            )
+
+            # All2All #2: (B/tp, Nh, D_kv) → (B, Nh_local, D_kv)
+            Btp = q.shape[0]
+            attn_output = attn_output.view(Btp, self.num_heads, self.kv_lora_rank)
+            attn_output = self._all2all_head_to_token(attn_output, tp_size, group)
+            # reshape back to flattened for w_vc
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        else:
+            attn_output = self.attn_mqa(
+                q,
+                k,
+                k_nope,
+                forward_batch,
+                save_kv_cache=False,
+                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+            )
+
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.q_lora_rank is not None:
             bs = attn_output.size(1)
