@@ -193,8 +193,6 @@ bool is_shm_tensor(at::Tensor tensor);
 
 at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t> shape);
 
-at::Tensor get_or_create_shm_tensor(int64_t dim);
-
 void shm_reduce_scatter_init_kunpeng();
 
 void shm_reduce_scatter_kunpeng(at::Tensor input);
@@ -514,9 +512,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("create_shm_tensor_kunpeng(ScalarType dtype, int[] shape) -> Tensor");
     m.impl("create_shm_tensor_kunpeng", create_shm_tensor_kunpeng);
-
-    m.def("get_or_create_shm_tensor(int dim) -> Tensor");
-    m.impl("get_or_create_shm_tensor", get_or_create_shm_tensor);
 
     // SHM Reduce Scatter operators
     m.def("shm_reduce_scatter_init_kunpeng() -> ()");

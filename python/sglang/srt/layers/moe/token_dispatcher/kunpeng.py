@@ -118,7 +118,6 @@ class _KunpengDispatcherState:
         self.attn_tp_rank: int = 0
         self.use_static_route: bool = False
         self.parallel_policy: Optional[torch.Tensor] = None
-        self.is_prefill: bool = False
 
     @classmethod
     def get(cls) -> "_KunpengDispatcherState":
@@ -143,7 +142,6 @@ def _ensure_rdma_initialized(
     max_tokens: int,
     num_max_dispatch_tokens_per_rank: int,
     use_static_route: bool,
-    is_prefill: bool,
 ) -> _KunpengDispatcherState:
     """Initialize the process-level RDMA state exactly once.
 
@@ -168,7 +166,7 @@ def _ensure_rdma_initialized(
         state.attn_tp_rank = get_attn_tensor_model_parallel_rank()
         state.use_static_route = use_static_route
         state.moe_token_multiple = 2
-        state.is_prefill = is_prefill
+        state.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
 
         state.parallel_policy = torch.empty(3, dtype=torch.int16)
         state.parallel_policy[0] = state.ep_size  # moe_ep
@@ -429,15 +427,9 @@ class KunpengDispatcher(BaseDispatcher):
         self.ep_size = get_moe_expert_parallel_world_size()
         self.ep_rank = get_moe_expert_parallel_rank()
         self.expert_per_rank = self.num_experts // self.ep_size
-        self.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
-        if self.is_prefill:
-            self.max_tokens = int(
-                os.environ.get("SGLANG_KUNPENG_PREFILL_MAX_TOKENS", 4096)
-            )
-        else:
-            self.max_tokens = int(
-                os.environ.get("SGLANG_KUNPENG_DECODE_MAX_TOKENS", 128)
-            )
+        self.max_tokens = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")) * int(
+            os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024")
+        )
         self.attn_tp_size = get_attn_tensor_model_parallel_world_size()
         self.attn_tp_rank = get_attn_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -461,7 +453,6 @@ class KunpengDispatcher(BaseDispatcher):
             max_tokens=self.max_tokens,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             use_static_route=self.use_static_route,
-            is_prefill=self.is_prefill,
         )
 
     @KunpengProfiler(depth=2)

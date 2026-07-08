@@ -20,6 +20,7 @@
 #include <torch/extension.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <cstdint>
 #include <cstring>
@@ -63,8 +64,9 @@ static c10d::ProcessGroup *g_intra_socket_group = nullptr;
 
 static bool g_shm_initialized = false;
 
-static int64_t g_max_tokens = 4096;
-static bool g_is_prefill = true;
+static int64_t g_max_seq_num = 0;
+static int64_t g_max_cur_len = 0;
+static int64_t g_max_tokens = 0;
 
 template <typename T>
 struct span {
@@ -150,22 +152,17 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
 
     g_shm_initialized = true;
 
-    auto str = std::getenv("IS_PREFILL");
+    auto str = std::getenv("SGLANG_KUNPENG_MAX_SEQ_NUM");
     if (str != nullptr) {
-        g_is_prefill = std::atol(str);
+        g_max_seq_num = std::atoll(str);
     }
-
-    if (g_is_prefill) {
-        str = std::getenv("SGLANG_KUNPENG_PREFILL_MAX_TOKENS");
-        if (str != nullptr) {
-            g_max_tokens = std::atoll(str);
-        }
-    } else {
-        str = std::getenv("SGLANG_KUNPENG_DECODE_MAX_TOKENS");
-        if (str != nullptr) {
-            g_max_tokens = std::atoll(str);
-        }
+    str = std::getenv("SGLANG_KUNPENG_MAX_CUR_LEN");
+    if (str != nullptr) {
+        g_max_cur_len = std::atoll(str);
     }
+    TORCH_CHECK(g_max_seq_num > 0, "SGLANG_KUNPENG_MAX_SEQ_NUM must be set to a positive value");
+    TORCH_CHECK(g_max_cur_len > 0, "SGLANG_KUNPENG_MAX_CUR_LEN must be set to a positive value");
+    g_max_tokens = g_max_seq_num * g_max_cur_len;
 }
 
 void shm_pool_destroy_kunpeng()
@@ -238,21 +235,34 @@ at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t
     return torch_tensor;
 }
 
-static std::unordered_map<int64_t, at::Tensor> g_shm_tensor_cache;
+static std::unordered_map<int64_t, at::Tensor> g_shm_tensor_cache_small;
+static std::unordered_map<int64_t, at::Tensor> g_shm_tensor_cache_large;
 
-at::Tensor get_or_create_shm_tensor(int64_t dim)
+at::Tensor get_or_create_shm_tensor(int64_t dim, int64_t bs)
 {
     TORCH_CHECK(g_shm_initialized, "get_or_create_shm_tensor called before shm_pool_create_kunpeng");
     TORCH_CHECK(g_max_tokens > 0, "set_shm_max_tokens must be called before get_or_create_shm_tensor");
+    TORCH_CHECK(bs > 0, "bs must be a positive value, got ", bs);
 
-    auto it = g_shm_tensor_cache.find(dim);
-    if (it != g_shm_tensor_cache.end()) {
-        return it->second;
+    int64_t batch_size = std::max(g_max_seq_num, static_cast<int64_t>(intra_node_size));
+    if (bs <= batch_size) {
+        auto it = g_shm_tensor_cache_small.find(dim);
+        if (it != g_shm_tensor_cache_small.end()) {
+            return it->second;
+        }
+        int64_t shape[2] = {batch_size, dim};
+        at::Tensor tensor = create_shm_tensor_kunpeng(at::kBFloat16, c10::ArrayRef<int64_t>(shape, 2));
+        g_shm_tensor_cache_small[dim] = tensor;
+        return tensor;
     }
 
+    auto it = g_shm_tensor_cache_large.find(dim);
+    if (it != g_shm_tensor_cache_large.end()) {
+        return it->second;
+    }
     int64_t shape[2] = {g_max_tokens, dim};
     at::Tensor tensor = create_shm_tensor_kunpeng(at::kBFloat16, c10::ArrayRef<int64_t>(shape, 2));
-    g_shm_tensor_cache[dim] = tensor;
+    g_shm_tensor_cache_large[dim] = tensor;
     return tensor;
 }
 

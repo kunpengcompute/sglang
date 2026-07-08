@@ -63,7 +63,7 @@ void shm_allgather_init_kunpeng()
  * Perform batched shared memory allgather.
  *
  * Copy in, allgather, and copy out are all done inside C++.
- * SHM send/recv buffers are cached by dim and pre-allocated to max_tokens.
+ * SHM send/recv buffers are cached by dim and sized by batch (see get_or_create_shm_tensor).
  *
  * @param input      2D regular tensor [batch, dim] (bfloat16).
  * @param output     2D regular tensor [batch, dim * comm_size] (bfloat16).
@@ -77,8 +77,8 @@ void shm_batched_allgather_kunpeng(at::Tensor input, at::Tensor output, int64_t 
     int64_t batch = input.size(0);
     int64_t dim = input.size(1);
 
-    at::Tensor sendbuf_tensor = get_or_create_shm_tensor(dim);
-    at::Tensor recvbuf_tensor = get_or_create_shm_tensor(dim * comm_size);
+    at::Tensor sendbuf_tensor = get_or_create_shm_tensor(dim, batch);
+    at::Tensor recvbuf_tensor = get_or_create_shm_tensor(dim * comm_size, batch);
 
     size_t send_total_bytes = static_cast<size_t>(input.numel()) * sizeof(bfloat16_t);
     size_t recv_total_bytes = static_cast<size_t>(output.numel()) * sizeof(bfloat16_t);
