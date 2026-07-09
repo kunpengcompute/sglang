@@ -12,10 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
+
+import sgl_kernel
 import torch
 import torch.nn.functional as F
-import sgl_kernel
-import logging
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -34,14 +36,10 @@ def test_linear_kunpeng():
     ref = F.linear(input, weight, None)
     print(f"F.linear output: min={ref.float().min().item():.6f}, max={ref.float().max().item():.6f}, mean={ref.float().mean().item():.6f}")
 
-    torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
-        weight, input.shape[0], True
-    )
+    torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(weight, input.shape[0])
 
     try:
-        kunpeng = torch.ops.sgl_kernel.linear_kunpeng(
-            input, weight, None, True
-        )
+        kunpeng = torch.ops.sgl_kernel.linear_kunpeng(input, weight, None)
         print(f"linear_kunpeng output: min={kunpeng.float().min().item():.6f}, max={kunpeng.float().max().item():.6f}, mean={kunpeng.float().mean().item():.6f}")
 
         diff = (ref.float() - kunpeng.float()).abs()

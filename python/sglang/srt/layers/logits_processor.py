@@ -24,9 +24,9 @@ from torch import nn
 from triton.language.extra import libdevice
 
 from sglang.srt.distributed import (
+    get_attn_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
-    get_attn_tp_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -57,7 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, is_cpu_920f, use_intel_amx_backend
+from sglang.srt.utils.common import is_cpu_920f, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -913,11 +913,11 @@ class LogitsProcessor(nn.Module):
             elif _is_cpu_920f:
                 if not self.is_lmhead_weitht_packed:
                     torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
-                        lm_head.weight, hidden_states.shape[0], False
+                        lm_head.weight, hidden_states.shape[0]
                     )
                     self.is_lmhead_weitht_packed = True
                 logits = torch.ops.sgl_kernel.bf16_linear_kunpeng(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight, None, False
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight, None
                 )
             else:
                 logits = torch.matmul(
