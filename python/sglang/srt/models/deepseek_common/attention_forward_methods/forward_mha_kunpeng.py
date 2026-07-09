@@ -46,98 +46,54 @@ class DeepseekMHAKunpengForwardMixin:
         zero_allocator: BumpAllocator,
     ):
         if self.q_lora_rank is not None:
-
             # fused_qkv_a_proj_with_mqa (via prepare_qkv_latent)
             qkva = self.prepare_qkv_latent(hidden_states, forward_batch)
             q, latent_cache = qkva.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-
             # q_norm + q_b_proj
             q_normed = self.q_a_layernorm(q)
             out, _ = self.q_b_proj(q_normed)
             q = out.view(-1, self.num_local_heads, self.qk_head_dim)
-
-            _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-            kv_a, _ = latent_cache.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            kv_a = self.kv_a_layernorm(kv_a)
-
-            latent_cache = latent_cache.unsqueeze(1)
-            k_pe = latent_cache[:, :, self.kv_lora_rank :]
-
-            if self.rotary_emb is not None:
-                q_out_kp = torch.empty_like(q_pe)
-                k_out_kp = torch.empty_like(k_pe)
-                torch.ops.sgl_kernel.rope_kunpeng(
-                    positions,
-                    q_pe,
-                    k_pe,
-                    q_out_kp,
-                    k_out_kp,
-                    self.rotary_emb.cos_sin_cache,
-                )
-                q_pe = q_out_kp
-                k_pe = k_out_kp
-            q[..., self.qk_nope_head_dim :] = q_pe
-
-            self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
-
-            # kv_b
-            out, _ = self.kv_b_proj(kv_a)
-            kv = out
-            kv = kv.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-
-            k_nope = kv[..., : self.qk_nope_head_dim]
-
-            v = kv[..., self.qk_nope_head_dim :]
-
-            k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
-
         else:
             # q_proj
             out, _ = self.q_proj(hidden_states)
             q = out.view(-1, self.num_local_heads, self.qk_head_dim)
-
             # kv_a_proj_with_mqa
             latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
 
-            _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # Common kv_a / k_pe processing
+        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_a = self.kv_a_layernorm(kv_a)
+        latent_cache = latent_cache.unsqueeze(1)
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
-            kv_a, _ = latent_cache.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        # Apply RoPE (kunpeng vs standard path)
+        if self.rotary_emb is not None:
+            q_out_kp = torch.empty_like(q_pe)
+            k_out_kp = torch.empty_like(k_pe)
+            torch.ops.sgl_kernel.rope_kunpeng(
+                positions,
+                q_pe,
+                k_pe,
+                q_out_kp,
+                k_out_kp,
+                self.rotary_emb.cos_sin_cache,
             )
+            q_pe = q_out_kp
+            k_pe = k_out_kp
 
-            latent_cache = latent_cache.unsqueeze(1)
+        q[..., self.qk_nope_head_dim :] = q_pe
+        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
 
-            kv_a = self.kv_a_layernorm(kv_a)
-
-            k_pe = latent_cache[:, :, self.kv_lora_rank :]
-
-            if self.rotary_emb is not None:
-                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-            q[..., self.qk_nope_head_dim :] = q_pe
-
-            self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
-
-            # kv_b
-            out, _ = self.kv_b_proj(kv_a)
-            kv = out
-
-            kv = kv.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-
-            k_nope = kv[..., : self.qk_nope_head_dim]
-
-            v = kv[..., self.qk_nope_head_dim :]
-
-            k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        # kv_b
+        out, _ = self.kv_b_proj(kv_a)
+        kv = out.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope = kv[..., : self.qk_nope_head_dim]
+        v = kv[..., self.qk_nope_head_dim :]
+        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
 
         return q, k, v, forward_batch
 
