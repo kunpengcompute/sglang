@@ -390,11 +390,11 @@ class MoEGate(nn.Module):
                 is_prefill = False
                 if not self.is_pack_weight:
                     torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
-                        self.weight, hidden_states.shape[0], is_prefill
+                        self.weight, hidden_states.shape[0]
                     )
                     self.is_pack_weight = True
                 logits = torch.ops.sgl_kernel.bf16_linear_kunpeng(
-                    hidden_states, self.weight, None, is_prefill
+                    hidden_states, self.weight, None
                 )
             else:
                 logits = F.linear(hidden_states, self.weight, None)

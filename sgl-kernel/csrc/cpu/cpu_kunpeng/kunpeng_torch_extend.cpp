@@ -54,7 +54,11 @@ void s8_s8_packed_gemm_bf16_dq_kunpeng(at::Tensor input, at::Tensor weight, at::
 void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c);
 
 void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
-                              int64_t num_threads, bool is_prefill = true);
+                              int64_t num_threads);
+
+at::Tensor bf16_bmm_prepack_kunpeng(const at::Tensor &weight, int64_t batch_size);
+
+at::Tensor bmm_kunpeng(const at::Tensor &input, const at::Tensor &weight);
 
 void init_tiling();
 
@@ -124,9 +128,9 @@ void init_sdma(int64_t sdmathreshold);
 void finalize_sdma();
 
 // === MOE 算子声明 ===
-at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias, bool is_prefill);
+at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias);
 
-void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size, bool is_prefill);
+void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size);
 
 void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at::Tensor token_ids, int64_t topk,
                           int64_t num_expert_group, int64_t topk_group, const c10::optional<at::Tensor> bias,
@@ -281,10 +285,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     // bgemm
     m.def(
-        "bf16_packed_gemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output, Tensor workspace, int num_threads, "
-        "bool is_prefill) "
+        "bf16_packed_gemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output, Tensor workspace, int num_threads) "
         "-> ()");
     m.impl("bf16_packed_gemm_kunpeng", bf16_packed_gemm_kunpeng);
+
+    // bmm prepack
+    m.def("bf16_bmm_prepack_kunpeng(Tensor weight, int batch_size) -> Tensor");
+    m.impl("bf16_bmm_prepack_kunpeng", bf16_bmm_prepack_kunpeng);
+
+    // bmm compute
+    m.def("bmm_kunpeng(Tensor input, Tensor weight) -> Tensor");
+    m.impl("bmm_kunpeng", bmm_kunpeng);
 
     // batched gemm pack
     m.def("batched_gemm_pack_allthreads_kunpeng(Tensor input, Tensor(a!) out) -> ()");
@@ -404,10 +415,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("finalize_sdma", finalize_sdma);
 
     // === MOE 算子声明 ===
-    m.def("bf16_linear_kunpeng(Tensor input, Tensor weight, Tensor bias, bool is_prefill) -> Tensor");
+    m.def("bf16_linear_kunpeng(Tensor input, Tensor weight, Tensor bias) -> Tensor");
     m.impl("bf16_linear_kunpeng", bf16_linear_kunpeng);
 
-    m.def("bf16_gemm_prepack_kunpeng(Tensor(a!) weight, int batch_size, bool is_prefill) -> ()");
+    m.def("bf16_gemm_prepack_kunpeng(Tensor(a!) weight, int batch_size) -> ()");
     m.impl("bf16_gemm_prepack_kunpeng", bf16_gemm_prepack_kunpeng);
 
     m.def(

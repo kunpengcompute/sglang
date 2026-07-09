@@ -111,7 +111,7 @@ void batched_gemm_pack_allthreads_kunpeng(at::Tensor input, at::Tensor out)
 }
 
 void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
-                              int64_t num_threads, bool is_prefill = true)
+                              int64_t num_threads)
 {
     TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
     TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be bfloat16");
@@ -147,7 +147,7 @@ void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor ou
                              reinterpret_cast<bfloat16_t *>(output.data_ptr()), tmpc);
 }
 
-void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size, bool is_prefill = true)
+void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size)
 {
     int64_t m = weight.size(0);
     int64_t k = weight.size(1);
@@ -161,8 +161,7 @@ void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size, bool is_p
     memcpy(i_ptr, o_ptr, m * k * weight.element_size());
 }
 
-at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias,
-                               bool is_prefill)
+at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias)
 {
     TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be BF16");
     TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
@@ -184,11 +183,88 @@ at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight
     int64_t workspace_size = blocks_in_k * n * m * 2;
     auto workspace = at::empty({workspace_size}, input.options());
 
-    bf16_packed_gemm_kunpeng(pack_bf16, weight, output, workspace, kutacc::get_thread_num(), is_prefill);
+    bf16_packed_gemm_kunpeng(pack_bf16, weight, output, workspace, kutacc::get_thread_num());
 
     if (bias.defined() && bias.numel() > 0) {
         output.add_(bias);
     }
+
+    return output;
+}
+
+at::Tensor bf16_bmm_prepack_kunpeng(const at::Tensor &weight, int64_t batch_size)
+{
+    TORCH_CHECK(weight.dim() == 3, "weight must be 3D [B, K, N]");
+    TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
+
+    int64_t B = weight.size(0);
+    int64_t K = weight.size(1);
+    int64_t N = weight.size(2);
+
+    // Compute tiling using batch_size as M for optimal performance
+    kutacc::MatrixTilingBlock t = bgemm_find_optimal_tiling_plan(batch_size, N, K);
+
+    auto [tile_m, tile_n, tile_k] = t;
+    TORCH_CHECK(tile_k % 2 == 0, "bmm_bf16_prepack: tile_k % 2 != 0");
+
+    // Create output tensor [B, N, K] (transposed + packed per head)
+    auto packed_weight = at::empty({B, N, K}, weight.options());
+
+    for (int64_t b = 0; b < B; b++) {
+        auto w_slice = weight[b];          // [K, N]
+        auto pw_slice = packed_weight[b];  // [N, K]
+
+        // Transpose [K, N] → [N, K], then pack in-place
+        auto w_t = w_slice.t().contiguous();
+
+        bfloat16_t *i_ptr = reinterpret_cast<bfloat16_t *>(w_t.data_ptr());
+        bfloat16_t *o_ptr = reinterpret_cast<bfloat16_t *>(pw_slice.data_ptr());
+        kutacc::bf16_gemm_pack(N, K, tile_n, tile_k, i_ptr, o_ptr);
+    }
+
+    return packed_weight;
+}
+
+at::Tensor bmm_kunpeng(const at::Tensor &input, const at::Tensor &weight)
+{
+    TORCH_CHECK(input.dim() == 3, "input must be 3D [B, M, K]");
+    TORCH_CHECK(weight.dim() == 3, "weight must be 3D [B, N, K]");
+    TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be BF16");
+    TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
+    TORCH_CHECK(input.stride(2) == 1, "input last dim must be contiguous");
+
+    int64_t B = input.size(0);
+    int64_t M = input.size(1);
+    int64_t K = input.size(2);
+    int64_t N = weight.size(1);
+
+    TORCH_CHECK(weight.size(0) == B && weight.size(2) == K, "weight shape mismatch");
+
+    // Compute tiling once, reuse across all heads
+    kutacc::MatrixTilingBlock t = bgemm_find_optimal_tiling_plan(M, N, K);
+
+    auto [tile_m, tile_n, tile_k] = t;
+    TORCH_CHECK(tile_k % 2 == 0, "bmm_kunpeng: tile_k % 2 != 0");
+
+    int64_t blocks_in_k = K / tile_k;
+
+    auto output = at::empty({B, M, N}, input.options());
+    int64_t workspace_size = blocks_in_k * N * M * 2;
+
+    int64_t grain = std::max(int64_t(1), B / at::get_num_threads());
+    at::parallel_for(0, B, grain, [&](int64_t start, int64_t end) {
+        auto local_packed = at::empty({M, K}, input.options());
+        auto local_ws = at::empty({workspace_size}, input.options());
+        bfloat16_t *local_tmpc = reinterpret_cast<bfloat16_t *>(local_ws.data_ptr());
+
+        for (int64_t b = start; b < end; b++) {
+            bf16_gemm_pack_kunpeng(input[b], local_packed, tile_m, tile_k);
+
+            kutacc::bf16_packed_gemm(M, N, K, t, reinterpret_cast<bfloat16_t *>(local_packed.data_ptr()),
+                                     reinterpret_cast<bfloat16_t *>(weight[b].data_ptr()),
+                                     reinterpret_cast<bfloat16_t *>(output[b].data_ptr()), local_tmpc);
+        }
+    });
 
     return output;
 }

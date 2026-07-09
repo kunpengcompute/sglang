@@ -32,6 +32,8 @@ class DeepseekMLAKunpengForwardMixin:
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
+        self.w_kc_packed = None  # lazily initialized for kunpeng bmm
+        self.w_vc_packed = None
 
     def forward_absorb_prepare_kunpeng(
         self: DeepseekV2AttentionMLA,
@@ -92,7 +94,14 @@ class DeepseekMLAKunpengForwardMixin:
             )
 
         else:
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+            q_nope_input = q_nope.transpose(0, 1).contiguous()
+            if self.w_kc_packed is None:
+                self.w_kc_packed = torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
+                    self.w_kc, q_nope_input.size(1)
+                )
+            q_nope_out = torch.ops.sgl_kernel.bmm_kunpeng(
+                q_nope_input, self.w_kc_packed
+            )
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
@@ -181,17 +190,15 @@ class DeepseekMLAKunpengForwardMixin:
                 -1, self.num_local_heads * self.v_head_dim
             )
         else:
-            attn_bmm_output = torch.empty(
-                (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
-                dtype=attn_output.dtype,
-                device=attn_output.device,
-            )
-            torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=attn_bmm_output.view(
-                    -1, self.num_local_heads, self.v_head_dim
-                ).transpose(0, 1),
+            attn_bmm_input = attn_output.transpose(0, 1).contiguous()
+            if self.w_vc_packed is None:
+                self.w_vc_packed = torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
+                    self.w_vc, attn_bmm_input.size(1)
+                )
+            attn_bmm_output = (
+                torch.ops.sgl_kernel.bmm_kunpeng(attn_bmm_input, self.w_vc_packed)
+                .transpose(0, 1)
+                .reshape(-1, self.num_local_heads * self.v_head_dim)
             )
 
         # o_proj
