@@ -40,6 +40,36 @@ case "$1" in
         ;;
 esac
 
+MARKER_FILE="$PYINSTALL_PATH/dist/.updated_marker"
+
+mkdir -p "$PYINSTALL_PATH/dist"
+
+# Skip if no source files are newer than the marker
+if [ -f "$MARKER_FILE" ]; then
+    need_update=false
+    if [ "${UPDATE_SGLANG}" = "true" ]; then
+        if [ -n "$(find "$SGLANG_PATH/python/sglang" -newer "$MARKER_FILE" -print -quit 2>/dev/null)" ]; then
+            need_update=true
+        fi
+    fi
+    if [ "${UPDATE_KERNEL}" = "true" ]; then
+        if [ -n "$(find "$SITE_PACKAGES/sgl_kernel" -newer "$MARKER_FILE" -print -quit 2>/dev/null)" ]; then
+            need_update=true
+        fi
+    fi
+    if [ "${UPDATE_KUTACC}" = "true" ]; then
+        if [ "$KUTACC_PATH/install/lib/libkutacc.so.25.1.RC1" -nt "$MARKER_FILE" ]; then
+            need_update=true
+        fi
+    fi
+
+    if [ "$need_update" = "false" ]; then
+        echo "[updata] All sources unchanged since last update, skipping."
+        exit 0
+    fi
+fi
+
+echo "[updata] Updating NUMA copies..."
 for i in $(seq 0 15); do
     (
         if [ "${UPDATE_SGLANG}" = "true" ]; then
@@ -57,3 +87,6 @@ for i in $(seq 0 15); do
     ) &
 done
 wait
+
+touch "$MARKER_FILE"
+echo "[updata] Update complete."

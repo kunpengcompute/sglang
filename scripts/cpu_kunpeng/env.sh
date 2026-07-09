@@ -61,6 +61,9 @@ NATIVE_IP_SPEC="xxx.xxx.xxx. | 17-32"
 NATIVE_MASTER_ADDR="xxx.xxx.xxx.1"
 NATIVE_MASTER_PORT="5010"
 
+# Router node IP (single IP for PD disaggregation router)
+ROUTER_IP="xxx.xxx.xxx.1"
+
 # Paths
 LOG_BASE_DIR="/path-to-logs"
 CONDA_ENV_NAME="my_env"
@@ -100,6 +103,7 @@ export SGLANG_USE_CPU_ENGINE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_WARMUP_TIMEOUT=1600
+export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
@@ -120,6 +124,8 @@ export SGLANG_KUNPENG_SDMA_THRESHOLD=5
 export LOAD_FORMAT=""
 # PD disaggregation mode
 export IS_PREFILL="1"
+# Other options
+export DROP_CACHES=0
 
 # ------------------------------------------------------------
 # load local config
@@ -175,6 +181,17 @@ native_config() {
 }
 
 # ------------------------------------------------------------
+# Function: router_config
+# ------------------------------------------------------------
+router_config() {
+    export ROLE="router"
+    export NODE_IPS_LIST="$ROUTER_IP"
+    export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
+    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
+    export IS_PREFILL="0"
+}
+
+# ------------------------------------------------------------
 # Main: dispatch based on command-line argument
 # ------------------------------------------------------------
 ACTION="${1:-native}"
@@ -190,8 +207,11 @@ case "$ACTION" in
     native)
         native_config
         ;;
+    router)
+        router_config
+        ;;
     *)
-        echo "Usage: source env.sh [prefill|decode|native]" >&2
+        echo "Usage: source env.sh [prefill|decode|native|router]" >&2
         return 1
         ;;
 esac

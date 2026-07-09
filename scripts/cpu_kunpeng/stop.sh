@@ -13,17 +13,17 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: ./stop.sh [prefill|decode|native]  (default: native)
+# Usage: ./stop.sh [prefill|decode|native|router]  (default: native)
 
 
 if [[ $# -gt 1 ]]; then
-    echo "Usage: $0 [prefill|decode|native]" >&2
+    echo "Usage: $0 [prefill|decode|native|router]" >&2
     exit 1
 fi
 
 ROLE="${1:-native}"
-if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" ]]; then
-    echo "Error: ROLE must be 'prefill' or 'decode' or 'native'" >&2
+if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" && "$ROLE" != "router" ]]; then
+    echo "Error: ROLE must be 'prefill', 'decode', 'native', or 'router'" >&2
     exit 1
 fi
 
@@ -33,6 +33,28 @@ cd "$SCRIPT_DIR"
 # Source config for the specified role
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
 source ./env.sh "$ROLE"
+
+# Router mode: kill router process on the configured router node
+if [[ "$ROLE" == "router" ]]; then
+    echo "Killing router on $ROUTER_IP"
+    ssh "root@$ROUTER_IP" '
+        PIDS=$(pgrep -f "sglang::router")
+        if [ -n "$PIDS" ]; then
+            echo "Killing router process(es): $PIDS"
+            kill -15 $PIDS 2>/dev/null
+            sleep 3
+            REMAINING=$(pgrep -f "sglang::router")
+            if [ -n "$REMAINING" ]; then
+                echo "Sending SIGKILL to: $REMAINING"
+                kill -9 $REMAINING 2>/dev/null
+            fi
+            echo "Router stopped."
+        else
+            echo "No router process found."
+        fi
+    '
+    exit 0
+fi
 
 # Convert space-separated IP list to array
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
@@ -44,17 +66,12 @@ for i in "${!NODES[@]}"; do
     node="${NODES[i]}"
 
     ssh "$node" '
-        for ((i=16; i<=31; i++)); do
-            echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
-        done
-
         MAIN_PIDS=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
 
         if [ -n "$MAIN_PIDS" ]; then
-            echo "Found SGLang processes on '"$node"': $MAIN_PIDS"
+            echo "Found SGLang processes on '"$node"'"
 
             for pid in $MAIN_PIDS; do
-                echo "Sending SIGTERM to $pid on '"$node"'"
                 kill -15 $pid 2>/dev/null
             done
 
@@ -84,6 +101,16 @@ for i in "${!NODES[@]}"; do
                     echo "Killing parent process $parent_pid of zombie $zpid on '$node'"
                     kill -9 $parent_pid 2>/dev/null
                 fi
+            done
+        fi
+
+        # Drop caches if configured
+        if [ "'"${DROP_CACHES:-0}"'" = "1" ]; then
+            echo "Dropping caches on '"$node"'..."
+            echo 3 > /proc/sys/vm/drop_caches
+            rm -rf /dev/shm/shm_mmap_*
+            for i in $(seq 0 31); do
+                echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
             done
         fi
     ' &
