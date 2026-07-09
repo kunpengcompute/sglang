@@ -43,6 +43,7 @@ from sglang.srt.distributed import (
     divide,
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_socket_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -1247,6 +1248,8 @@ class DeepseekV2AttentionMLA(
         self.quant_config = quant_config
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        socket_tp_rank = get_socket_tp_group().rank_in_group
+        socket_tp_size = get_socket_tp_group().world_size
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -1275,8 +1278,8 @@ class DeepseekV2AttentionMLA(
                     bias=False,
                     quant_config=quant_config,
                     prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
-                    tp_rank=attn_tp_rank,
-                    tp_size=attn_tp_size,
+                    tp_rank=socket_tp_rank,
+                    tp_size=socket_tp_size,
                 )
             else:
                 self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
@@ -1670,10 +1673,10 @@ class DeepseekV2AttentionMLA(
     ):
         assert self.q_lora_rank is not None
         if _is_cpu_920f:
-            # Sharded computation within attention TP group via sgl_kernel GEMM:
+            # Sharded computation within socket TP group via sgl_kernel GEMM:
             # each rank computes its weight shard, then all-gather the result.
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            qkv_latent = get_attention_tp_group().batch_all_gather(qkv_latent, dim=-1)
+            qkv_latent = get_socket_tp_group().batch_all_gather(qkv_latent, dim=-1)
             return qkv_latent
         if (
             (not isinstance(hidden_states, tuple))
