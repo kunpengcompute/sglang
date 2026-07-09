@@ -15,12 +15,12 @@
 #!/bin/bash
 
 usage() {
-  echo "Usage: $0 [-p] [-s] [-d] [-n NUM] [-m TOKENS] [-f FILE] [-h]"
+  echo "Usage: $0 [-p] [-s] [-d RANK] [-n NUM] [-m TOKENS] [-f FILE] [-h]"
   echo ""
   echo "Options:"
   echo "  -p          Enable profiling (start/stop profile)"
   echo "  -s          Enable streaming mode"
-  echo "  -d          Route to DP rank 0"
+  echo "  -d RANK     Route to specific DP rank"
   echo "  -n NUM      Number of requests / prompt entries (default: all lines from file)"
   echo "  -m TOKENS   Max tokens per request (default: 10)"
   echo "  -f FILE     Prompt file with one prompt per line (default: prompts/5.txt)"
@@ -32,15 +32,16 @@ PROFILE=false
 MAX_TOKENS=10
 NUM_REQUESTS=0
 STREAM=false
-DP0=false
+DP_ENABLED=false
+DP_RANK=0
 PROMPT_FILE="prompts/5.txt"
 
-while getopts "dhpsn:m:f:" opt; do
+while getopts "d:hpsn:m:f:" opt; do
   case $opt in
     h) usage ;;
     p) PROFILE=true ;;
     s) STREAM=true ;;
-    d) DP0=true ;;
+    d) DP_ENABLED=true; DP_RANK=$OPTARG ;;
     n) NUM_REQUESTS=$OPTARG ;;
     m) MAX_TOKENS=$OPTARG ;;
     f) PROMPT_FILE=$OPTARG ;;
@@ -102,10 +103,10 @@ if [ "$PROFILE" = true ]; then
   curl --noproxy "*" http://${IP}:${PORT}/start_profile
 fi
 
-if [ "$DP0" = true ]; then
-  DP0_LINE=",\"routed_dp_rank\": 0"
+if [ "$DP_ENABLED" = true ]; then
+  DP_LINE=",\"routed_dp_rank\": $DP_RANK"
 else
-  DP0_LINE=""
+  DP_LINE=""
 fi
 
 BODY="{
@@ -113,7 +114,7 @@ BODY="{
     \"prompt\": $PROMPT_JSON,
     \"stream\": $STREAM,
     \"max_tokens\": $MAX_TOKENS,
-    \"temperature\": 0.01$DP0_LINE
+    \"temperature\": 0.01$DP_LINE
   }"
 
 time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \

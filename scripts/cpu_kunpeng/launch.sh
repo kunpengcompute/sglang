@@ -13,17 +13,17 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: ./launch.sh [prefill|decode|native]  (default: native)
+# Usage: ./launch.sh [prefill|decode|native|router]  (default: native)
 
 
 if [[ $# -gt 1 ]]; then
-    echo "Usage: $0 [prefill|decode|native]" >&2
+    echo "Usage: $0 [prefill|decode|native|router]" >&2
     exit 1
 fi
 
 ROLE="${1:-native}"
-if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" ]]; then
-    echo "Error: ROLE must be 'prefill' or 'decode' or 'native'" >&2
+if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" && "$ROLE" != "router" ]]; then
+    echo "Error: ROLE must be 'prefill', 'decode', 'native', or 'router'" >&2
     exit 1
 fi
 
@@ -42,9 +42,9 @@ sh stop.sh "$ROLE"
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
 WORLD_SIZE=${#NODES[@]}
 
-if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" ]]; then
+if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" && "$ROLE" != "router" ]]; then
     echo "Update binary sglang..."
-    sh ./pyinstall/updata.sh
+    bash ./pyinstall/updata.sh
 fi
 
 echo "Launching $ROLE on $WORLD_SIZE node(s)"
@@ -61,7 +61,9 @@ done
 echo "All $ROLE nodes launched."
 echo "Logs: $LOG_DIR"
 
-if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
+if [[ "$ROLE" == "router" ]]; then
+    log_file="$LOG_DIR/router_${NODES[0]}.log"
+elif [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     log_file="$LOG_DIR/0_0_${NODES[0]}.log"
 else
     log_file="$LOG_DIR/0_${NODES[0]}.log"

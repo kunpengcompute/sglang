@@ -88,6 +88,21 @@ case "$ROLE" in
             --load-balance-method round_robin
         )
         ;;
+    router)
+        SPECIFIC_ARGS=(
+            --model-path "$MODEL_PATH"
+            --pd-disaggregation
+            --prefill "http://${PREFILL_MASTER_ADDR}:30000" 9001
+            --decode "http://${DECODE_MASTER_ADDR}:30000"
+            --policy cache_aware
+            --prefill-policy cache_aware
+            --health-check-interval-secs 10000
+            --queue-timeout-secs 10000
+            --request-timeout-secs 10000
+            --health-check-timeout-secs 10000
+            --host "$IP"
+        )
+        ;;
     *)
         echo "Error: unknown role '$ROLE'" >&2
         exit 1
@@ -95,6 +110,13 @@ case "$ROLE" in
 esac
 
 # Combine and execute
+if [[ "$ROLE" == "router" ]]; then
+    echo "Launching PD disaggregation router..."
+    python -m sglang_router.launch_router "${SPECIFIC_ARGS[@]}" \
+        > "$LOG_PATH/router_$IP.log" 2>&1
+    exit 0
+fi
+
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     echo "Launch binary server..."
     for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
