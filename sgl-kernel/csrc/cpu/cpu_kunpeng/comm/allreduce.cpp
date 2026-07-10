@@ -40,6 +40,8 @@ void shm_allreduce_init_kunpeng(int64_t max_num_elements)
 {
     TORCH_CHECK(is_shm_initialized(), "shm_allreduce_init_kunpeng called before shm_pool_create_kunpeng");
 
+    if (g_ar_initialized) return;
+
     intra_node_rank = get_intra_node_rank();
     intra_node_size = get_intra_node_size();
 

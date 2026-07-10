@@ -353,10 +353,19 @@ class KunpengCpuBackend(AttentionBackend):
         tp_size = get_attention_tp_size()
         if tp_size > 1:
             tp_rank = get_attention_tp_rank()
+            # Per-socket all2all with group_size=8 instead of tp_size.
+            # The metadata slicing must match the all2all group structure.
+            all2all_size = 8 if tp_size == 16 else tp_size
             B = seq_lens.shape[0]
-            Btp = B // tp_size
-            seq_lens = seq_lens[tp_rank * Btp : (tp_rank + 1) * Btp]
-            req_pool_indices = req_pool_indices[tp_rank * Btp : (tp_rank + 1) * Btp]
+            Btp = B // all2all_size
+            group_rank = tp_rank % all2all_size
+            seq_lens = seq_lens[group_rank * Btp : (group_rank + 1) * Btp]
+            req_pool_indices = req_pool_indices[group_rank * Btp : (group_rank + 1) * Btp]
+            # After all2all, each rank in the all2all group sees all heads.
+            # For tp=16 with all2all=8: 128 * 8 / 16 = 64 heads.
+            num_heads_q = self.num_q_heads * all2all_size // tp_size
+        else:
+            num_heads_q = self.num_q_heads
 
         metadata.seq_lens = seq_lens
 
@@ -382,7 +391,7 @@ class KunpengCpuBackend(AttentionBackend):
             torch.ops.sgl_kernel.flash_mla_dense_decode_sched_kunpeng(
                 metadata.seq_lens,
                 seqlen_q=1,
-                num_heads_q=self.num_q_heads,
+                num_heads_q=num_heads_q,
                 head_dim=self.head_dim,
                 head_dim_v=self.head_dim_v,
                 page_block_size=metadata.page_size,
