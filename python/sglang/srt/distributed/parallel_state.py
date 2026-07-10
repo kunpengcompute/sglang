@@ -611,15 +611,12 @@ class GroupCoordinator:
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
-            elif self.use_kunpeng_communicator and input_.shape[0] > 0:
-                torch.ops.sgl_kernel.shm_allreduce_kunpeng(input_)
             elif (
                 self.use_kunpeng_communicator
                 and input_.shape[0] > 0
-                and input_.shape[0]
-                <= self.kunpeng_communicator.max_tokens
+                and input_.shape[0] <= self.kunpeng_communicator.max_tokens
             ):
-                self.kunpeng_communicator.shm_all_reduce(input_)
+                torch.ops.sgl_kernel.shm_allreduce_kunpeng(input_)
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
@@ -798,14 +795,12 @@ class GroupCoordinator:
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
-        elif self.use_kunpeng_communicator and input.shape[0] > 0:
-            torch.ops.sgl_kernel.shm_reduce_scatter_kunpeng(input)
         elif (
             self.use_kunpeng_communicator
             and input.shape[0] > 0
             and input.shape[0] <= self.kunpeng_communicator.max_tokens
         ):
-            self.kunpeng_communicator.shm_reduce_scatter_tensor(input)
+            torch.ops.sgl_kernel.shm_reduce_scatter_kunpeng(input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
