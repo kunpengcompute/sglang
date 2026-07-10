@@ -204,7 +204,7 @@ class KunpengCommunicator:
     def shm_all_gather_into_tensor(self, input: torch.Tensor, output: torch.Tensor):
         local_batch = input.size(0)
         global_batch = output.size(0)
-        dim = input.size(1)
+        dim = input.size(1) if input.dim() > 1 else 1
 
         shm_tensor = self.get_shm_tensor(dim)
 
@@ -213,8 +213,10 @@ class KunpengCommunicator:
         ]
         dst0 = shm_tensor[:global_batch, :]
 
+        input_2d = input.unsqueeze(1) if input.dim() == 1 else input
+
         t_copy_in_start = time.perf_counter()
-        src0.copy_(input)
+        src0.copy_(input_2d)
         t_copy_in_end = time.perf_counter()
 
         t_ag_start = time.perf_counter()
@@ -225,7 +227,10 @@ class KunpengCommunicator:
         t_ag_end = time.perf_counter()
 
         t_copy_out_start = time.perf_counter()
-        output.copy_(dst0)
+        if output.dim() == 1:
+            output.copy_(dst0.view(-1))
+        else:
+            output.copy_(dst0)
         t_copy_out_end = time.perf_counter()
 
         if envs.SGLANG_KUNPENG_PROFILE.get():

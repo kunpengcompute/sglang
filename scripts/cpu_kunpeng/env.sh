@@ -84,6 +84,10 @@ export GEMM_TILING_PLAN_FILE="/path-to-tiling"
 export TP_SIZE=256
 export EP_SIZE=${TP_SIZE}
 
+# PP size and chunked prefill size can be configured independently
+export PP_SIZE=1 # >1 enable pp  eg: 2
+export CHUNKED_PREFILL_SIZE=-1  # eg: 512
+
 # Communication
 export GLOO_SOCKET_IFNAME=enp26s0f0
 export MV2_COMM_WORLD_LOCAL_SIZE=16

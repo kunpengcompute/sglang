@@ -42,12 +42,13 @@ BASE_ARGS=(
     --node-rank "$DP_RANK"
     --dist-timeout 600
     --enable-dp-attention
-    --dp-size "$WORLD_SIZE"
+    --dp-size "$((WORLD_SIZE / PP_SIZE))"
     --tp-size "$TP_SIZE"
     --ep-size "$EP_SIZE"
+    --pp-size "$PP_SIZE"
     --page-size 64
     --mem-fraction-static 0.88
-    --chunked-prefill-size -1
+    --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --skip-server-warmup
     --disable-custom-all-reduce
     --disable-radix-cache
@@ -83,8 +84,9 @@ case "$ROLE" in
     native)
         SPECIFIC_ARGS=(
             --disaggregation-bootstrap-port 9001
-            --max-prefill-tokens 4096
-            --max-total-tokens 18496
+            --max-prefill-tokens 4096   # long prompt -> 131072
+            --max-total-tokens 18496 # long prompt -> 131072
+            # --context-length 131072 # long prompt
             --load-balance-method round_robin
         )
         ;;
@@ -119,7 +121,7 @@ fi
 
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     echo "Launch binary server..."
-    for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
+    for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE * PP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
         if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" ]]; then
             SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${ATTN_TP_RANK}/sglang_server"
         else

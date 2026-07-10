@@ -1303,13 +1303,21 @@ class Scheduler(
             self.result_queue: Deque = deque()
             return
 
-        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.forward_stream
-        )
-        self.copy_stream: CudaStream = self.device_module.Stream()
-        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.copy_stream
-        )
+        if _is_cpu_920f:
+            # CPU: streams are no-op, use nullcontext to avoid stream operations
+            self.forward_stream_ctx = nullcontext()
+            self.copy_stream = self.device_module.Stream()
+            self.copy_stream.synchronize = lambda: None
+            self.copy_stream.wait_stream = lambda other: None
+            self.copy_stream_ctx = nullcontext()
+        else:
+            self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
+                self.forward_stream
+            )
+            self.copy_stream: CudaStream = self.device_module.Stream()
+            self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
+                self.copy_stream
+            )
 
         if not self.enable_overlap:
             self.future_map = None
@@ -1500,8 +1508,10 @@ class Scheduler(
             return
 
         self.schedule_stream = self.device_module.Stream(priority=0)
-        if self.device == "cpu":
+        if _is_cpu_920f:
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+            self.schedule_stream.wait_stream = lambda other: None  # No-op for CPU
+            self.schedule_stream.wait_event = lambda event: None  # No-op for CPU
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 

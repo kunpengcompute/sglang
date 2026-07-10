@@ -32,9 +32,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module, is_xpu, is_cpu_920f
 
 logger = logging.getLogger(__name__)
+
+_is_cpu_920f = is_cpu_920f()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -122,7 +124,8 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    if not _is_cpu_920f:
+                        d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
@@ -131,9 +134,10 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
+                        if not _is_cpu_920f:
+                            self.device_module.current_stream().wait_event(
+                                self.launch_event
+                            )
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
@@ -288,7 +292,8 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    if not _is_cpu_920f:
+                        d2h_event.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -308,9 +313,10 @@ class SchedulerPPMixin:
                         transferred_rids, async_send=True
                     )
                     if self.cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
+                        if not _is_cpu_920f:
+                            self.device_module.current_stream().wait_event(
+                                self.launch_event
+                            )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
@@ -470,7 +476,8 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
-                        d2h_event.synchronize()
+                        if not _is_cpu_920f:
+                            d2h_event.synchronize()
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
@@ -491,9 +498,10 @@ class SchedulerPPMixin:
                         transferred_rids, async_send=True
                     )
                     if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
+                        if not _is_cpu_920f:
+                            self.device_module.current_stream().wait_event(
+                                self.launch_event
+                            )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
@@ -1072,7 +1080,8 @@ class SchedulerPPMixin:
             if mbs[next_first_rank_mb_id] is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not mbs[next_first_rank_mb_id].forward_mode.is_prebuilt():
-                    self.device_module.current_stream().wait_event(q_event)
+                    if not _is_cpu_920f:
+                        self.device_module.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
@@ -1120,7 +1129,11 @@ class SchedulerPPMixin:
 
         # CUDA: send first
         # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.pp_rank % 2) == 0)
+        # CPU (gloo): isend may be blocking, use parity-based ordering to avoid deadlock.
+        if _is_cpu_920f:
+            send_first = (self.pp_rank % 2) == 0
+        else:
+            send_first = (not is_xpu()) or ((self.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
@@ -1137,12 +1150,15 @@ class SchedulerPPMixin:
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
             with self.copy_stream_ctx:
-                self.copy_stream.wait_stream(self.schedule_stream)
+                if not _is_cpu_920f:
+                    self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(
                     mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
                 )
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
+                if _is_cpu_920f:
+                    d2h_event.synchronize = lambda: None
 
         if send_first:
             send_output_work = _do_send()
@@ -1162,7 +1178,8 @@ class SchedulerPPMixin:
     ):
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
-                self.forward_stream.wait_stream(self.schedule_stream)
+                if not _is_cpu_920f:
+                    self.forward_stream.wait_stream(self.schedule_stream)
                 set_time_batch(
                     self.cur_batch.reqs,
                     "set_run_batch_cpu_start_time",
@@ -1180,6 +1197,8 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if _is_cpu_920f:
+                    event.synchronize = lambda: None
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
