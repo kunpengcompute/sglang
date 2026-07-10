@@ -117,9 +117,14 @@ BODY="{
     \"temperature\": 0.01$DP_LINE
   }"
 
+BODY_FILE=$(mktemp)
+printf '%s' "$BODY" > "$BODY_FILE"
+
 time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
   -H "Content-Type: application/json" \
-  -d "$BODY"
+  -d @"$BODY_FILE"
+
+rm -f "$BODY_FILE"
 
 if [ "$PROFILE" = true ]; then
   curl --noproxy "*" http://${IP}:${PORT}/stop_profile
