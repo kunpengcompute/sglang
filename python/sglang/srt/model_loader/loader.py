@@ -81,6 +81,7 @@ from sglang.srt.model_loader.utils import (
     post_load_weights,
     set_default_torch_dtype,
 )
+from sglang.srt.utils.common import is_cpu_920f
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -722,6 +723,30 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+
+        logger.info("Prepacking lm_head.weight for Kunpeng 920F CPU")
+        # Prepack lm_head.weight for Kunpeng 920F CPU
+        if is_cpu_920f() and hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
+            logger.info(f"comming to lm_head prepack")
+            lm_head = model.lm_head
+            if not getattr(lm_head, "packed_weight", None):
+                torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                    lm_head.weight,
+                    get_global_server_args().max_prefill_tokens,
+                )
+                lm_head.packed_weight = lm_head.weight
+
+        # Prepack MoEGate weights for Kunpeng 920F CPU (DeepSeek models)
+        if is_cpu_920f():
+            from sglang.srt.models.deepseek_v2 import MoEGate as _DeepSeekMoEGate
+
+            for _, module in model.named_modules():
+                if isinstance(module, _DeepSeekMoEGate) and hasattr(module, "weight"):
+                    torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                        module.weight,
+                        get_global_server_args().max_prefill_tokens,
+                    )
+                    module.packed_weight = module.weight
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -1469,6 +1494,28 @@ class ShardedStateLoader(BaseModelLoader):
                 if quant_method is not None:
                     # print(f"[ShardedStateLoader.load_model] Processing quant method {quant_method} for module {module} before loading weights", flush=True)
                     quant_method.process_weights_after_loading(module)
+
+        # Prepack lm_head.weight for Kunpeng 920F CPU
+        if is_cpu_920f() and hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
+            lm_head = model.lm_head
+            if not getattr(lm_head, "packed_weight", None):
+                torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                    lm_head.weight,
+                    get_global_server_args().max_prefill_tokens,
+                )
+                lm_head.packed_weight = lm_head.weight
+
+        # Prepack MoEGate weights for Kunpeng 920F CPU (DeepSeek models)
+        if is_cpu_920f():
+            from sglang.srt.models.deepseek_v2 import MoEGate as _DeepSeekMoEGate
+
+            for _, module in model.named_modules():
+                if isinstance(module, _DeepSeekMoEGate) and hasattr(module, "weight"):
+                    torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                        module.weight,
+                        get_global_server_args().max_prefill_tokens,
+                    )
+                    module.packed_weight = module.weight
 
         return model.eval()
 
