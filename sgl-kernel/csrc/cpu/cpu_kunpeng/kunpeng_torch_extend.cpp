@@ -218,6 +218,16 @@ void shm_allreduce_kunpeng(at::Tensor input);
 
 void shm_allreduce_finalize_kunpeng();
 
+// SHM MLA Alltoall operators
+void shm_mla_alltoall_init_kunpeng(int64_t group_size, int64_t max_tokens, int64_t qk_head_dim, int64_t kv_lora_rank,
+                                   int64_t num_local_heads, int64_t num_heads);
+
+void shm_mla_q_alltoall_kunpeng(at::Tensor q_tensor, at::Tensor out_tensor);
+
+void shm_mla_o_alltoall_kunpeng(at::Tensor o_tensor, at::Tensor out_tensor);
+
+void shm_mla_alltoall_finalize_kunpeng();
+
 // === Embedding 算子声明 ===
 at::Tensor embedding_kunpeng(at::Tensor indices, at::Tensor weight, at::Tensor output, int64_t org_vocab_start,
                              int64_t org_vocab_end, int64_t num_org_vocab_padding, int64_t added_vocab_start,
@@ -558,6 +568,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("shm_allreduce_finalize_kunpeng() -> ()");
     m.impl("shm_allreduce_finalize_kunpeng", shm_allreduce_finalize_kunpeng);
+
+    // SHM MLA Alltoall operators
+    m.def(
+        "shm_mla_alltoall_init_kunpeng(int group_size, int max_tokens, "
+        "int qk_head_dim, int kv_lora_rank, int num_local_heads, int num_heads) -> ()");
+    m.impl("shm_mla_alltoall_init_kunpeng", shm_mla_alltoall_init_kunpeng);
+
+    m.def("shm_mla_q_alltoall_kunpeng(Tensor q, Tensor(a!) out) -> ()");
+    m.impl("shm_mla_q_alltoall_kunpeng", shm_mla_q_alltoall_kunpeng);
+
+    m.def("shm_mla_o_alltoall_kunpeng(Tensor o, Tensor(a!) out) -> ()");
+    m.impl("shm_mla_o_alltoall_kunpeng", shm_mla_o_alltoall_kunpeng);
+
+    m.def("shm_mla_alltoall_finalize_kunpeng() -> ()");
+    m.impl("shm_mla_alltoall_finalize_kunpeng", shm_mla_alltoall_finalize_kunpeng);
 
     // embedding
     m.def(

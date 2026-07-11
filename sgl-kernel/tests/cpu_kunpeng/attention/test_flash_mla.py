@@ -15,6 +15,7 @@
 import math
 import sys
 
+import sgl_kernel
 import torch
 import torch.nn.functional as F
 

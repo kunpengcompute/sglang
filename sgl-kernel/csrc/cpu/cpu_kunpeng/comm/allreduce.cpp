@@ -26,6 +26,7 @@
 #include <arm_bf16.h>
 
 #include "sgl_kernel_ops.h"
+#include "kunpeng_comm.h"
 #include "../memory/kunpeng_shm.h"
 #include <kutacc.h>
 
@@ -39,6 +40,8 @@ static int intra_node_size;
 void shm_allreduce_init_kunpeng(int64_t max_num_elements)
 {
     TORCH_CHECK(is_shm_initialized(), "shm_allreduce_init_kunpeng called before shm_pool_create_kunpeng");
+
+    if (g_ar_initialized) return;
 
     intra_node_rank = get_intra_node_rank();
     intra_node_size = get_intra_node_size();

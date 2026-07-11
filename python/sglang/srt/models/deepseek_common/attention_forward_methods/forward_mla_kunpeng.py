@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
@@ -32,6 +33,47 @@ class DeepseekMLAKunpengForwardMixin:
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
+        self.w_kc_packed = None  # lazily initialized for kunpeng bmm
+        self.w_vc_packed = None
+
+    # ------------------------------------------------------------------
+    # All2All helpers for token-split flash_mla
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _all2all_token_to_head(q: torch.Tensor, tp_size: int) -> torch.Tensor:
+        """
+        All2All #1: redistribute Q from token-parallel to head-parallel.
+
+        Input:  (B, Nh_local, D)   — all tokens, local heads on each rank
+        Output: (B/tp, Nh, D)      — local tokens, all heads on each rank
+        """
+        B, Nh_local, D = q.shape
+        Btp = B // tp_size
+        Nh = Nh_local * tp_size
+
+        out = torch.empty((Btp, Nh, D), dtype=q.dtype, device=q.device)
+        kernel = torch.ops.sgl_kernel
+        kernel.shm_mla_q_alltoall_kunpeng(q, out)
+        return out.contiguous()
+
+    @staticmethod
+    def _all2all_head_to_token(o: torch.Tensor, tp_size: int) -> torch.Tensor:
+        """
+        All2All #2: redistribute flash_mla output from head-parallel to token-parallel.
+
+        Input:  (B/tp, Nh, D)      — local tokens, all heads on each rank
+        Output: (B, Nh_local, D)    — all tokens, local heads on each rank
+        """
+        Btp, Nh, D = o.shape
+        Nh_local = Nh // tp_size
+        B = Btp * tp_size
+
+        out = torch.empty((B, Nh_local, D), dtype=o.dtype, device=o.device)
+        kernel = torch.ops.sgl_kernel
+        kernel.shm_mla_o_alltoall_kunpeng(o, out)
+        return out.contiguous()
+
     def forward_absorb_prepare_kunpeng(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -60,9 +102,7 @@ class DeepseekMLAKunpengForwardMixin:
         k_nope = latent_cache[..., : self.kv_lora_rank]
         k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
-        q_nope, q_pe = q.split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self.q_lora_rank is not None:
@@ -109,7 +149,7 @@ class DeepseekMLAKunpengForwardMixin:
             q_pe = q_out_kp
             k_pe = k_out_kp
 
-        q_combined = torch.cat([q_nope_out, q_pe], dim=-1)  # (B, num_local_heads, D_qk)
+        q_combined = torch.cat([q_nope_out, q_pe], dim=-1)  # (B, Nh_local, D_qk)
         k_combined = torch.cat([k_nope, k_pe], dim=-1)  # (B, 1, D_kv+D_rope)
 
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -140,18 +180,61 @@ class DeepseekMLAKunpengForwardMixin:
     ):
 
         if llama_4_scaling is not None:
-            q *= llama_4_scaling
+            q = q * llama_4_scaling
 
-        attn_output = self.attn_mqa(
-            q,
-            k,
-            k_nope,
-            forward_batch,
-            save_kv_cache=False,
-            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-        )
+        tp_size = get_attention_tp_size()
+        if tp_size in [8, 16]:
+            # Per-socket all2all with group_size=8 instead of tp_size.
+            # When tp=16, this splits into two 8-rank socket-local
+            # all2all groups, avoiding cross-socket SHM traffic.
+            # The cross-group merge is handled by the allreduce inside
+            # RowParallelLinear (o_proj), which operates on the full
+            # 16-rank attention-tp group.
+            all2all_size = 8
 
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+            # All2All #1: (B, Nh_local, D_qk) → (B/all2all_size, Nh_local*all2all_size, D_qk)
+            q = self._all2all_token_to_head(q, all2all_size)
+
+            # attn_mqa (RadixAttention) has tp_q_head_num=128 (model total heads).
+            # When tp=16, Q has only 64 heads after per-socket all2all.
+            # Temporarily override tp_q_head_num so KunpengCpuBackend.forward_decode
+            # reshapes Q correctly.
+            saved_tp_q_head_num = self.attn_mqa.tp_q_head_num
+            self.attn_mqa.tp_q_head_num = self.num_local_heads * all2all_size
+            try:
+                attn_output = self.attn_mqa(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=False,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            finally:
+                self.attn_mqa.tp_q_head_num = saved_tp_q_head_num
+
+            # All2All #2: (B/all2all_size, all_heads, D_kv) → (B, Nh_local, D_kv)
+            Btp = q.shape[0]
+            all_heads = self.num_local_heads * all2all_size
+            attn_output = attn_output.view(Btp, all_heads, self.kv_lora_rank)
+            attn_output = self._all2all_head_to_token(attn_output, all2all_size)
+            # reshape back to flattened for w_vc
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        else:
+            attn_output = self.attn_mqa(
+                q,
+                k,
+                k_nope,
+                forward_batch,
+                save_kv_cache=False,
+                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+            )
+
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.q_lora_rank is not None:
             bs = attn_output.size(1)

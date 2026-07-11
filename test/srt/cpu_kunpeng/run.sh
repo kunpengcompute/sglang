@@ -33,6 +33,7 @@
 #   dual_allgather   -- SHM dual_allgather benchmark vs torch.distributed
 #   batch_allgather  -- SHM batched_allgather benchmark vs torch.distributed
 #   allreduce        -- SHM allreduce benchmark vs torch.distributed
+#   mla_alltoall     -- SHM MLA alltoall correctness + benchmark vs torch.distributed
 #
 # Options (environment variables):
 #   PYTHON        -- python interpreter       (default: python3)
@@ -81,9 +82,14 @@ case "${TEST_NAME}" in
         MASTER_PORT=5004
         TEST_LABEL="SHM allreduce benchmark"
         ;;
+    mla_alltoall)
+        TEST_FILE="${SCRIPT_DIR}/test_mla_alltoall.py"
+        MASTER_PORT=8006
+        TEST_LABEL="MLA alltoall correctness + benchmark"
+        ;;
     *)
         echo "ERROR: unknown test '${TEST_NAME}'" >&2
-        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce" >&2
+        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, mla_alltoall" >&2
         exit 1
         ;;
 esac
