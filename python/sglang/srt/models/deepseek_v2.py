@@ -1400,28 +1400,16 @@ class DeepseekV2AttentionMLA(
             self.rotary_emb = None
         self.use_deepseek_yarn_rope = rope_scaling is not None
 
-        if _is_cpu_920f:
-            self.attn_mqa = RadixAttention(
-                self.num_heads,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-                self.scaling,
-                num_kv_heads=1,
-                layer_id=layer_id,
-                v_head_dim=self.kv_lora_rank,
-                quant_config=quant_config,
-                prefix=add_prefix("attn_mqa", prefix),
-            )
-        else:
-            self.attn_mqa = RadixAttention(
-                self.num_local_heads,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-                self.scaling,
-                num_kv_heads=1,
-                layer_id=layer_id,
-                v_head_dim=self.kv_lora_rank,
-                quant_config=quant_config,
-                prefix=add_prefix("attn_mqa", prefix),
-            )
+        self.attn_mqa = RadixAttention(
+            self.num_heads if _is_cpu_920f else self.num_local_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.scaling,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            v_head_dim=self.kv_lora_rank,
+            quant_config=quant_config,
+            prefix=add_prefix("attn_mqa", prefix),
+        )
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,

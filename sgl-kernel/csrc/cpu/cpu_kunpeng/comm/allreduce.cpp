@@ -26,6 +26,7 @@
 #include <arm_bf16.h>
 
 #include "sgl_kernel_ops.h"
+#include "kunpeng_comm.h"
 #include "../memory/kunpeng_shm.h"
 #include <kutacc.h>
 

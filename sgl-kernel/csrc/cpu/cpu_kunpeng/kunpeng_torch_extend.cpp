@@ -222,14 +222,6 @@ void shm_allreduce_finalize_kunpeng();
 void shm_mla_alltoall_init_kunpeng(int64_t group_size, int64_t max_tokens, int64_t qk_head_dim, int64_t kv_lora_rank,
                                    int64_t num_local_heads, int64_t num_heads);
 
-void shm_mla_q_copy_in_kunpeng(at::Tensor q_tensor);
-
-void shm_mla_o_copy_in_kunpeng(at::Tensor o_tensor);
-
-void shm_mla_q_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor);
-
-void shm_mla_o_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor);
-
 void shm_mla_q_alltoall_kunpeng(at::Tensor q_tensor, at::Tensor out_tensor);
 
 void shm_mla_o_alltoall_kunpeng(at::Tensor o_tensor, at::Tensor out_tensor);
@@ -582,18 +574,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "shm_mla_alltoall_init_kunpeng(int group_size, int max_tokens, "
         "int qk_head_dim, int kv_lora_rank, int num_local_heads, int num_heads) -> ()");
     m.impl("shm_mla_alltoall_init_kunpeng", shm_mla_alltoall_init_kunpeng);
-
-    m.def("shm_mla_q_copy_in_kunpeng(Tensor q) -> ()");
-    m.impl("shm_mla_q_copy_in_kunpeng", shm_mla_q_copy_in_kunpeng);
-
-    m.def("shm_mla_o_copy_in_kunpeng(Tensor o) -> ()");
-    m.impl("shm_mla_o_copy_in_kunpeng", shm_mla_o_copy_in_kunpeng);
-
-    m.def("shm_mla_q_alltoall_exec_kunpeng(Tensor shape_ref, Tensor(a!) out) -> ()");
-    m.impl("shm_mla_q_alltoall_exec_kunpeng", shm_mla_q_alltoall_exec_kunpeng);
-
-    m.def("shm_mla_o_alltoall_exec_kunpeng(Tensor shape_ref, Tensor(a!) out) -> ()");
-    m.impl("shm_mla_o_alltoall_exec_kunpeng", shm_mla_o_alltoall_exec_kunpeng);
 
     m.def("shm_mla_q_alltoall_kunpeng(Tensor q, Tensor(a!) out) -> ()");
     m.impl("shm_mla_q_alltoall_kunpeng", shm_mla_q_alltoall_kunpeng);

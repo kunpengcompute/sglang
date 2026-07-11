@@ -115,7 +115,7 @@ class DeepseekMLAKunpengForwardMixin:
             a_3d = q_nope.transpose(0, 1).contiguous()  # (bs, m, k)
             b_3d = self.w_kc_int8.transpose(1, 2).contiguous()  # (bs, k, N)
 
-            scale_shape = (Nh_local, K_dim, 1)
+            scale_shape = (bs, k, 1)
             scale_3d = self.w_kc_scale.view(scale_shape)
 
             q_nope_out = torch.empty(
