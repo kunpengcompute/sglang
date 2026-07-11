@@ -179,7 +179,7 @@ def split_moe_experts(model_dir: str, output_dir: str, global_tp_size: int = 64)
 
         out_file_path = os.path.join(
             output_dir,
-            f"model-rank-{expert.split('.')[1]}-part-1.safetensors.safetensors",
+            f"model-rank-{expert.split('.')[1]}-part-1.safetensors",
         )
         save_file(experts_state_dict, out_file_path)
 
@@ -397,7 +397,7 @@ def split_non_moe_weights(
                 rank_weights[key] = split_for_rank(tensor, "none", 0, rank)
 
         out_layer_path = os.path.join(
-            output_dir, f"model-rank-{rank}-part-0.safetensors.safetensors"
+            output_dir, f"model-rank-{rank}-part-0.safetensors"
         )
         save_file(rank_weights, out_layer_path)
         del rank_weights

@@ -1401,7 +1401,7 @@ class DeepseekV2AttentionMLA(
         self.use_deepseek_yarn_rope = rope_scaling is not None
 
         self.attn_mqa = RadixAttention(
-            self.num_local_heads,
+            self.num_heads if _is_cpu_920f else self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
