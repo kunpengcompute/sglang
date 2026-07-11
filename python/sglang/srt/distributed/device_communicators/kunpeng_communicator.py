@@ -179,16 +179,15 @@ class KunpengCommunicator:
         # Initialize SHM MLA alltoall with DeepSeek V3 parameters.
         # qk_head_dim = 192 (128 nope + 64 rope), kv_lora_rank = 512,
         # num_heads = 128, num_local_heads = num_heads / comm_size.
-        if self.comm_size in (8, 16):
-            num_heads = 128
-            kernel.shm_mla_alltoall_init_kunpeng(
-                self.comm_size,
-                self.max_tokens,
-                192,   # qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-                512,   # kv_lora_rank
-                num_heads // self.comm_size,  # num_local_heads
-                num_heads,
-            )
+        num_heads = 128
+        kernel.shm_mla_alltoall_init_kunpeng(
+            self.comm_size,
+            self.max_tokens,
+            192,   # qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+            512,   # kv_lora_rank
+            num_heads // self.comm_size,  # num_local_heads
+            num_heads,
+        )
 
         self.dummy_tensor = kernel.create_shm_tensor_kunpeng(
             torch.uint8, [self.comm_size, 1]
