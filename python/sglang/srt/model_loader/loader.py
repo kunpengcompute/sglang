@@ -81,6 +81,7 @@ from sglang.srt.model_loader.utils import (
     post_load_weights,
     set_default_torch_dtype,
 )
+from sglang.srt.utils.common import is_cpu_920f
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -722,7 +723,6 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
-
 
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a

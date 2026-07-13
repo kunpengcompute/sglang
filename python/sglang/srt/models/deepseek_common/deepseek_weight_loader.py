@@ -26,6 +26,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -723,6 +724,55 @@ class DeepseekV2WeightLoaderMixin:
                     if hasattr(experts, "w13_weight") and hasattr(experts, "w2_weight"):
                         _kunpeng_prepack_igemm_expert_weight(experts.w13_weight)
                         _kunpeng_prepack_igemm_expert_weight(experts.w2_weight)
+
+                # Prepack MLA bmm/int8 weights for Kunpeng
+                if self_attn.q_lora_rank is None and self_attn.w_kc is not None:
+                    batch_size = get_global_server_args().max_prefill_tokens
+                    self_attn.w_kc_packed = (
+                        torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
+                            self_attn.w_kc, batch_size
+                        )
+                    )
+                    self_attn.w_vc_packed = (
+                        torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
+                            self_attn.w_vc, batch_size
+                        )
+                    )
+                if self_attn.w_kc_int8 is not None:
+                    w_kc_t = self_attn.w_kc_int8.transpose(1, 2).contiguous()
+                    self_attn.w_kc_int8_packed = torch.empty_like(w_kc_t)
+                    torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(
+                        w_kc_t, self_attn.w_kc_int8_packed
+                    )
+
+                    w_vc_t = self_attn.w_vc_int8.contiguous()
+                    self_attn.w_vc_int8_packed = torch.empty_like(w_vc_t)
+                    torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(
+                        w_vc_t, self_attn.w_vc_int8_packed
+                    )
+
+        # Prepack lm_head.weight for Kunpeng 920F CPU
+        if _is_cpu_920f and hasattr(self, "lm_head") and hasattr(self.lm_head, "weight"):
+            lm_head = self.lm_head
+            if getattr(lm_head, "packed_weight", None) is None:
+                torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                    lm_head.weight,
+                    get_global_server_args().max_prefill_tokens,
+                )
+                lm_head.packed_weight = lm_head.weight
+
+        # Prepack MoEGate weights for Kunpeng 920F CPU (DeepSeek models)
+        if _is_cpu_920f:
+            from sglang.srt.models.deepseek_v2 import MoEGate as _DeepSeekMoEGate
+
+            for _, module in self.model.named_modules():
+                if isinstance(module, _DeepSeekMoEGate) and hasattr(module, "weight"):
+                    if getattr(module, "packed_weight", None) is None:
+                        torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                            module.weight,
+                            get_global_server_args().max_prefill_tokens,
+                        )
+                        module.packed_weight = module.weight
 
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):

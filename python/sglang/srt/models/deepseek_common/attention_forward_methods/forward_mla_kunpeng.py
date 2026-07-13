@@ -33,8 +33,6 @@ class DeepseekMLAKunpengForwardMixin:
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
-        self.w_kc_packed = None  # lazily initialized for kunpeng bmm
-        self.w_vc_packed = None
 
     # ------------------------------------------------------------------
     # All2All helpers for token-split flash_mla
@@ -113,7 +111,6 @@ class DeepseekMLAKunpengForwardMixin:
             n = self.w_kc_int8.size(2)  # kv_lora_rank
 
             a_3d = q_nope.transpose(0, 1).contiguous()  # (bs, m, k)
-            b_3d = self.w_kc_int8.transpose(1, 2).contiguous()  # (bs, k, N)
 
             scale_shape = (bs, k, 1)
             scale_3d = self.w_kc_scale.view(scale_shape)
@@ -122,20 +119,14 @@ class DeepseekMLAKunpengForwardMixin:
                 (bs, m, n), dtype=torch.bfloat16, device=q_nope.device
             )
             pa_3d = torch.empty_like(a_3d)
-            pb_3d = torch.empty_like(b_3d)
 
             torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(a_3d, pa_3d)
-            torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(b_3d, pb_3d)
             torch.ops.sgl_kernel.batched_gemm_woqs8_allthreads_kunpeng(
-                pa_3d, pb_3d, None, scale_3d, q_nope_out
+                pa_3d, self.w_kc_int8_packed, None, scale_3d, q_nope_out
             )
 
         else:
             q_nope_input = q_nope.transpose(0, 1).contiguous()
-            if self.w_kc_packed is None:
-                self.w_kc_packed = torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
-                    self.w_kc, q_nope_input.size(1)
-                )
             q_nope_out = torch.ops.sgl_kernel.bmm_kunpeng(
                 q_nope_input, self.w_kc_packed
             )
@@ -250,7 +241,6 @@ class DeepseekMLAKunpengForwardMixin:
             n = self.w_vc_int8.size(1)
 
             a_3d = attn_output.transpose(0, 1).contiguous()
-            b_3d = self.w_vc_int8.contiguous()
 
             rscale_3d = self.w_vc_scale.view(bs, n, 1)
 
@@ -258,12 +248,10 @@ class DeepseekMLAKunpengForwardMixin:
                 (bs, m, n), dtype=torch.bfloat16, device=attn_output.device
             )
             pa_3d = torch.empty(a_3d.shape, dtype=a_3d.dtype, device=a_3d.device)
-            pb_3d = torch.empty(b_3d.shape, dtype=b_3d.dtype, device=b_3d.device)
 
             torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(a_3d, pa_3d)
-            torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(b_3d, pb_3d)
             torch.ops.sgl_kernel.batched_gemm_woqs8_allthreads_kunpeng(
-                pa_3d, pb_3d, rscale_3d, None, c_tensor_3d
+                pa_3d, self.w_vc_int8_packed, rscale_3d, None, c_tensor_3d
             )
 
             attn_bmm_output = c_tensor_3d.transpose(0, 1).reshape(
@@ -271,10 +259,6 @@ class DeepseekMLAKunpengForwardMixin:
             )
         else:
             attn_bmm_input = attn_output.transpose(0, 1).contiguous()
-            if self.w_vc_packed is None:
-                self.w_vc_packed = torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
-                    self.w_vc, attn_bmm_input.size(1)
-                )
             attn_bmm_output = (
                 torch.ops.sgl_kernel.bmm_kunpeng(attn_bmm_input, self.w_vc_packed)
                 .transpose(0, 1)
