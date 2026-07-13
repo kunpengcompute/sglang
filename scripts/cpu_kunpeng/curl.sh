@@ -114,7 +114,7 @@ BODY="{
     \"prompt\": $PROMPT_JSON,
     \"stream\": $STREAM,
     \"max_tokens\": $MAX_TOKENS,
-    \"temperature\": 0.01$DP_LINE
+    \"temperature\": 0$DP_LINE
   }"
 
 BODY_FILE=$(mktemp)

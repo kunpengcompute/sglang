@@ -188,6 +188,9 @@ void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, int64_t num_token_n
 
 at::Tensor multinomial_kunpeng(const at::Tensor &probs, int64_t num_samples, bool replacement);
 
+void argmax_kunpeng(const at::Tensor prob_distribution, at::Tensor token_ids, at::Tensor token_probs, int64_t height,
+                    int64_t width);
+
 // === SHM 算子声明 ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
@@ -520,6 +523,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     // multinomial sampling
     m.def("multinomial_kunpeng(Tensor probs, int num_samples, bool replacement) -> Tensor");
     m.impl("multinomial_kunpeng", multinomial_kunpeng);
+
+    // argmax
+    m.def(
+        "argmax_kunpeng(Tensor prob_distribution, Tensor(a!) token_ids, Tensor(b!) token_probs, "
+        "int height, int width) -> ()");
+    m.impl("argmax_kunpeng", argmax_kunpeng);
 
     // SHM operators
     m.def("shm_pool_create_kunpeng(int intra_node_pg, int intra_socket_pg, int intra_die_pg, int shm_size_mb) -> ()");

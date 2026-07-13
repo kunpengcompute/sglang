@@ -871,7 +871,8 @@ class LogitsProcessor(nn.Module):
             logits, local_hidden_states, logits_metadata
         )
 
-        logits = self._copy_logits_to_buffer(logits, logits_metadata)
+        if not is_cpu_920f:
+            logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
         if self.final_logit_softcapping:
             if not _is_npu:

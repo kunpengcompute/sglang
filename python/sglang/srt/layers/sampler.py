@@ -111,7 +111,19 @@ class Sampler(nn.Module):
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            batch_next_token_ids = torch.argmax(logits, -1)
+            if _is_cpu_920f:
+                height, width = logits.shape
+                batch_next_token_ids = torch.empty(
+                    height, dtype=torch.int64, device=logits.device
+                )
+                token_probs = torch.empty(
+                    height, dtype=torch.float32, device=logits.device
+                )
+                torch.ops.sgl_kernel.argmax_kunpeng(
+                    logits, batch_next_token_ids, token_probs, height, width
+                )
+            else:
+                batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1
