@@ -56,6 +56,10 @@ BASE_ARGS=(
     --enable-dp-lm-head
     --enable-dp-mlp
     --quantization w8a8_int8
+    --speculative-draft-model-path "$MODEL_PATH"
+    --speculative-algorithm NEXTN
+    --speculative-num-steps 1
+    --speculative-eagle-topk 1
     ${LOAD_FORMAT:+--load-format "$LOAD_FORMAT"}
 )
 

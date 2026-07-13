@@ -36,15 +36,17 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
     align_evict_mask_to_page_size,
+    align_evict_mask_to_page_size_native,
     assign_req_to_token_pool_func,
     create_extend_after_decode_spec_info,
+    create_extend_after_decode_spec_info_native,
     create_num_accepted_drafts_filter,
     filter_finished_cache_loc_kernel,
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils import is_cuda, is_cpu_920f, is_musa, next_power_of_2
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -85,19 +87,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         return self.draft_token_num, self.draft_token_num
 
     @classmethod
-    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+    def create_idle_input(
+        cls, topk: int, spec_steps: int, num_verify_tokens: int, device: str = "cuda"
+    ):
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
             retrieve_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_cum_len=None,
             topk=topk,
@@ -481,13 +485,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
-                align_evict_mask_to_page_size[len(batch.seq_lens),](
-                    batch.seq_lens,
-                    evict_mask,
-                    page_size,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                )
+                if is_cpu_920f():
+                    align_evict_mask_to_page_size_native(
+                        batch.seq_lens,
+                        evict_mask,
+                        page_size,
+                        self.draft_token_num,
+                    )
+                else:
+                    align_evict_mask_to_page_size[len(batch.seq_lens),](
+                        batch.seq_lens,
+                        evict_mask,
+                        page_size,
+                        self.draft_token_num,
+                        next_power_of_2(self.draft_token_num),
+                    )
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             else:
                 # Shift the accepted tokens to the beginning.
@@ -761,14 +773,23 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
         self.verified_id = torch.empty_like(self.num_accepted_tokens, dtype=torch.int32)
 
-        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
-            batch.input_ids,
-            batch.seq_lens,
-            self.num_accepted_tokens,
-            self.positions,
-            self.verified_id,
-            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
-        )
+        if is_cpu_920f():
+            create_extend_after_decode_spec_info_native(
+                batch.input_ids,
+                batch.seq_lens,
+                self.num_accepted_tokens,
+                self.positions,
+                self.verified_id,
+            )
+        else:
+            create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
+                batch.input_ids,
+                batch.seq_lens,
+                self.num_accepted_tokens,
+                self.positions,
+                self.verified_id,
+                next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
+            )
 
     def generate_attn_arg_prefill(
         self,

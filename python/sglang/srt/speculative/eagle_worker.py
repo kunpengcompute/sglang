@@ -3,6 +3,7 @@ import time
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
+from sglang.python.sglang.srt.utils.common import is_cpu_920f
 import torch
 
 from sglang.srt.distributed import get_tp_group
@@ -57,6 +58,7 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
+    assign_draft_cache_locs_native,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
@@ -70,6 +72,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
     get_available_gpu_memory,
+    is_cpu_920f,
     is_cuda,
     is_musa,
     is_npu,
@@ -77,6 +80,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
+_is_cpu_920f = is_cpu_920f()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
@@ -672,24 +676,39 @@ class EAGLEWorker(TpModelWorker):
             duplicate_cache_len = 0
             source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
 
-        assign_draft_cache_locs[(num_seqs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            self.extend_lens,
-            self.num_new_pages_per_topk,
-            out_cache_loc,
-            source_cache_loc,
-            target_cache_loc,
-            last_page_lens_cumsum,
-            duplicate_cache_len,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            self.topk,
-            self.speculative_num_steps,
-            self.page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps + self.page_size),
-        )
+        if _is_cpu_920f:
+            assign_draft_cache_locs_native(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                self.extend_lens,
+                self.num_new_pages_per_topk,
+                out_cache_loc,
+                source_cache_loc,
+                target_cache_loc,
+                last_page_lens_cumsum,
+                speculative_num_steps=self.speculative_num_steps,
+                topk=self.topk,
+            )
+        else:
+            assign_draft_cache_locs[(num_seqs,)](
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                self.extend_lens,
+                self.num_new_pages_per_topk,
+                out_cache_loc,
+                source_cache_loc,
+                target_cache_loc,
+                last_page_lens_cumsum,
+                duplicate_cache_len,
+                batch.req_to_token_pool.req_to_token.shape[1],
+                self.topk,
+                self.speculative_num_steps,
+                self.page_size,
+                next_power_of_2(num_seqs),
+                next_power_of_2(self.speculative_num_steps + self.page_size),
+            )
 
         if self.page_size > 1 and self.topk > 1:
             if duplicate_cache_len > 0:
@@ -763,6 +782,7 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                device=self.device,
             )
 
         (
@@ -1112,6 +1132,8 @@ class EAGLEWorker(TpModelWorker):
 
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
             batch = batch.copy()
+            if _is_cpu_920f:
+                batch.device = "cpu"
             batch.prepare_for_idle()
             hidden_size = (
                 self.model_config.hidden_size * 3
@@ -1166,16 +1188,21 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
         else:
             forward_batch.can_run_dp_cuda_graph = False
-            if not forward_batch.forward_mode.is_idle():
-                attn_backend = (
-                    self.draft_extend_attn_backend
-                    or self.draft_model_runner.attn_backend
-                )
-                attn_backend.init_forward_metadata(forward_batch)
-                forward_batch.attn_backend = attn_backend
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            if _is_cpu_920f:
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=False
+                ).logits_output
+            else:
+                if not forward_batch.forward_mode.is_idle():
+                    attn_backend = (
+                        self.draft_extend_attn_backend
+                        or self.draft_model_runner.attn_backend
+                    )
+                    attn_backend.init_forward_metadata(forward_batch)
+                    forward_batch.attn_backend = attn_backend
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         maybe_detect_nan(

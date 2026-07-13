@@ -703,12 +703,14 @@ class DeepseekV2WeightLoaderMixin:
                     "kv_b_proj",
                 ]:
                     if hasattr(self_attn, proj):
-                        _kunpeng_prepack_igemm_weight(
-                            getattr(self_attn, proj).weight
-                        )
+                        _kunpeng_prepack_igemm_weight(getattr(self_attn, proj).weight)
 
                 # mlp gate_up_proj and down_proj prepack
-                mlp = self.model.layers[layer_id].mlp
+                mlp = (
+                    self.model.layers[layer_id].mlp
+                    if layer_id < 61
+                    else self.model.decoder.mlp
+                )
                 for mlp_module in [mlp] + (
                     [mlp.shared_experts] if hasattr(mlp, "shared_experts") else []
                 ):

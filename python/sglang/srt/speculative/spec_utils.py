@@ -20,8 +20,16 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    is_cpu_920f,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    next_power_of_2,
+)
 
+_is_cpu_920f = is_cpu_920f()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -87,6 +95,35 @@ def create_extend_after_decode_spec_info(
     tl.store(new_verified_id + pid, verified_id_data)
 
 
+def create_extend_after_decode_spec_info_native(
+    verified_id: torch.Tensor,  # (total_accepted,)
+    seq_lens: torch.Tensor,  # (batch_size,)
+    accept_lens: torch.Tensor,  # (batch_size,)
+    positions: torch.Tensor,  # (total_accepted,)
+    new_verified_id: torch.Tensor,  # (batch_size,)
+):
+    B = seq_lens.size(0)
+    device = accept_lens.device
+
+    cumsum_before = torch.cumsum(accept_lens, dim=0) - accept_lens
+
+    max_len = accept_lens.max().item()
+    offsets = torch.arange(max_len, device=device).unsqueeze(0)
+    mask = offsets < accept_lens.unsqueeze(1)
+    vals = seq_lens.unsqueeze(1) - accept_lens.unsqueeze(1) + offsets
+
+    flat_idx = cumsum_before.unsqueeze(1) + offsets
+    flat_idx = flat_idx[mask]
+    vals = vals[mask]
+
+    positions[flat_idx] = vals
+
+    last_idx = cumsum_before + accept_lens - 1
+    new_verified_id.copy_(verified_id[last_idx])
+
+    return positions, new_verified_id
+
+
 @triton.jit
 def assign_req_to_token_pool(
     req_pool_indices,
@@ -122,6 +159,31 @@ def assign_req_to_token_pool(
         load_offset += BLOCK_SIZE
 
 
+def assign_req_to_token_pool_native(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+) -> None:
+    device = req_pool_indices.device
+    lens = end_offset - start_offset
+
+    out_start = torch.zeros(batch_size, dtype=torch.long, device=device)
+    if batch_size > 1:
+        out_start[1:] = torch.cumsum(lens[:-1], dim=0)
+
+    for i in range(batch_size):
+        row = req_pool_indices[i].item()
+        s = start_offset[i].item()
+        e = end_offset[i].item()
+        if e > s:
+            req_to_token[row, s:e] = out_cache_loc[
+                out_start[i] : out_start[i] + lens[i]
+            ].to(torch.int32)
+
+
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -130,16 +192,49 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    assign_req_to_token_pool[(batch_size,)](
-        req_pool_indices,
-        req_to_token,
-        start_offset,
-        end_offset,
-        out_cache_loc,
-        req_to_token.shape[1],
-        next_power_of_2(batch_size),
-    )
+    if _is_cpu_920f:
+        assign_req_to_token_pool_native(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            batch_size,
+        )
+    else:
+        assign_req_to_token_pool[(batch_size,)](
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+            next_power_of_2(batch_size),
+        )
 
+
+def assign_draft_cache_locs_native(
+    req_pool_indices,
+    req_to_token,
+    seq_lens,
+    extend_lens,
+    num_new_pages_per_topk,
+    out_cache_loc,
+    source_cache_loc,
+    target_cache_loc,
+    last_page_lens_cumsum,
+    speculative_num_steps: int = 0,
+    topk: int = 1,
+):
+    if topk ==1:
+        B = req_pool_indices.shape[0]
+
+        row_idx = req_pool_indices.unsqueeze(1).expand(B, speculative_num_steps)
+        col_idx = seq_lens.unsqueeze(1) + torch.arange(speculative_num_steps).unsqueeze(0)
+
+        req_to_token[row_idx, col_idx] = out_cache_loc.view(B, speculative_num_steps).to(torch.int32)
+    else:
+        raise NotImplementedError("assign_draft_cache_locs_native is not implemented for topk > 1")
 
 @triton.jit
 def assign_draft_cache_locs(
@@ -355,6 +450,45 @@ def align_evict_mask_to_page_size(
     start = (seq_len + num_false - 1) // page_size * page_size - seq_len
     for i in range(max(start, 0), min(start + page_size, num_draft_tokens)):
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
+
+
+def align_evict_mask_to_page_size_native(
+    seq_lens: torch.Tensor,
+    evict_mask: torch.Tensor,
+    page_size: int,
+    num_draft_tokens: int,
+):
+    original_shape = evict_mask.shape
+    if evict_mask.dim() == 1:
+        evict_mask = evict_mask.unsqueeze(0)
+        if not isinstance(seq_lens, torch.Tensor):
+            seq_lens = torch.tensor([seq_lens], device=evict_mask.device)
+        elif seq_lens.dim() == 0:
+            seq_lens = seq_lens.unsqueeze(0)
+    else:
+        if seq_lens.dim() == 0:
+            seq_lens = seq_lens.unsqueeze(0)
+    
+    B, L = evict_mask.shape
+    device = evict_mask.device
+
+    sum_true = evict_mask.sum(dim=1, dtype=torch.int64)
+    num_false = num_draft_tokens - sum_true
+    start_raw = ((seq_lens + num_false - 1) // page_size) * page_size - seq_lens
+    start = torch.clamp(start_raw, min=0, max=num_draft_tokens)
+    end = torch.clamp(start + page_size, min=0, max=num_draft_tokens)
+
+    cols = torch.arange(L, device=device).unsqueeze(0)
+    mask = (cols >= start.unsqueeze(1)) & (cols < end.unsqueeze(1))
+
+    if evict_mask.dtype == torch.bool:
+        evict_mask.masked_fill_(mask, False)
+    else:
+        evict_mask.masked_fill_(mask, 0)
+    
+    if len(original_shape) == 1:
+        return evict_mask.squeeze(0)
+    return evict_mask
 
 
 @triton.jit

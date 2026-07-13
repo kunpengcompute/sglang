@@ -133,7 +133,7 @@ def build_tree_kernel_efficient(
             topk,
             spec_steps,
             num_verify_tokens,
-            int(tree_mask_mode),
+            tree_mask_mode,
         )
     elif _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(
