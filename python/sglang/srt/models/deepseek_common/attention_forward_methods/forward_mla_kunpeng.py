@@ -33,8 +33,6 @@ class DeepseekMLAKunpengForwardMixin:
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
-        self.w_kc_packed = None  # lazily initialized for kunpeng bmm
-        self.w_vc_packed = None
 
     # ------------------------------------------------------------------
     # All2All helpers for token-split flash_mla
