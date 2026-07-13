@@ -323,7 +323,7 @@ class KunpengCpuBackend(AttentionBackend):
         self.kv_cache_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
         self.num_layers = model_runner.model_config.num_hidden_layers
         self.speculative_num_draft_tokens = (
-            model_runner.model_config.speculative_num_draft_tokens
+            model_runner.server_args.speculative_num_draft_tokens
         )
         self.mla_padding_enable = True
 
@@ -347,7 +347,10 @@ class KunpengCpuBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_decode_metadata(forward_batch)
-        elif forward_batch.forward_mode.is_extend():
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_verify()
+        ):
             save_seq_lens = forward_batch.seq_lens
             if forward_batch.forward_mode.is_target_verify():
                 self.mla_padding_enable = False
@@ -380,7 +383,9 @@ class KunpengCpuBackend(AttentionBackend):
             Btp = B // all2all_size
             group_rank = tp_rank % all2all_size
             seq_lens = seq_lens[group_rank * Btp : (group_rank + 1) * Btp]
-            req_pool_indices = req_pool_indices[group_rank * Btp : (group_rank + 1) * Btp]
+            req_pool_indices = req_pool_indices[
+                group_rank * Btp : (group_rank + 1) * Btp
+            ]
             # After all2all, each rank in the all2all group sees all heads.
             # For tp=16 with all2all=8: 128 * 8 / 16 = 64 heads.
             num_heads_q = self.num_q_heads * all2all_size // tp_size
@@ -392,6 +397,9 @@ class KunpengCpuBackend(AttentionBackend):
         batch_size = metadata.seq_lens.shape[0]
         max_seq_len = metadata.seq_lens.max().item()
         max_blocks = (max_seq_len + metadata.page_size - 1) // metadata.page_size
+        metadata.extend_seq_lens = torch.full(
+            (batch_size,), max_seq_len, dtype=torch.int32
+        )
         metadata.block_table = torch.zeros(
             (batch_size, max_blocks),
             dtype=torch.int32,
@@ -472,14 +480,16 @@ class KunpengCpuBackend(AttentionBackend):
         v,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache: bool,
+        save_kv_cache=True,
     ):
         cache_loc = forward_batch.out_cache_loc
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
+        meta = self.forward_metadata
+        page_size = meta.page_size
         q_heads = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        bs = forward_batch.seq_lens_cpu.shape[0]
+        bs = meta.seq_lens.shape[0]
         max_ext_len = self.speculative_num_draft_tokens
 
         if self.mla_padding_enable:
@@ -493,7 +503,7 @@ class KunpengCpuBackend(AttentionBackend):
             )
             torch.ops.sgl_kernel.pad_q_left_mtp_kunpeng(
                 q_heads.contiguous(),
-                forward_batch.extend_seq_lens,
+                meta.extend_seq_lens,
                 max_ext_len,
                 q_padded,
             )
@@ -541,12 +551,12 @@ class KunpengCpuBackend(AttentionBackend):
 
         if self.mla_padding_enable:
             o_flat = torch.zeros(
-                (q_heads.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                (q_heads.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                 dtype=q.dtype,
                 device=q.device,
             )
             torch.ops.sgl_kernel.unpad_o_right_mtp_kunpeng(
-                o_padded, forward_batch.extend_seq_lens, max_ext_len, o_flat
+                o_padded, meta.extend_seq_lens, max_ext_len, o_flat
             )
         else:
             o_flat = o_padded

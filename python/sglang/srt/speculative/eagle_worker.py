@@ -3,7 +3,6 @@ import time
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
-from sglang.python.sglang.srt.utils.common import is_cpu_920f
 import torch
 
 from sglang.srt.distributed import get_tp_group
