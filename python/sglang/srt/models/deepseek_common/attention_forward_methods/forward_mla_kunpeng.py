@@ -21,10 +21,12 @@ import torch
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+_DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
 
 
 class DeepseekMLAKunpengForwardMixin:
@@ -181,7 +183,7 @@ class DeepseekMLAKunpengForwardMixin:
             q = q * llama_4_scaling
 
         tp_size = get_attention_tp_size()
-        if tp_size in [8, 16]:
+        if tp_size in [8, 16] and not _DISABLE_MLA_ALL2ALL:
             # Per-socket all2all with group_size=8 instead of tp_size.
             # When tp=16, this splits into two 8-rank socket-local
             # all2all groups, avoiding cross-socket SHM traffic.
