@@ -29,6 +29,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_kunpeng_hbw_pool, is_kunpeng_hbw_swap
 
 if TYPE_CHECKING:
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
 _enable_hbw_swap = is_kunpeng_hbw_swap()
 _enable_debug = False
 
@@ -351,7 +354,7 @@ class KunpengCpuBackend(AttentionBackend):
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
 
         tp_size = get_attention_tp_size()
-        if tp_size > 1:
+        if tp_size > 1 and not _DISABLE_MLA_ALL2ALL:
             tp_rank = get_attention_tp_rank()
             # Per-socket all2all with group_size=8 instead of tp_size.
             # The metadata slicing must match the all2all group structure.
