@@ -119,6 +119,9 @@ if [[ "$ROLE" == "router" ]]; then
     exit 0
 fi
 
+# Build IB device args based on role.
+IB_DEVICE_ALL="roceroh0,roceroh1,roceroh2,roceroh3,roceroh4,roceroh5,roceroh6,roceroh7"
+
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     echo "Launch binary server..."
     for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE * PP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
@@ -127,19 +130,38 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
         else
             SERVER_BIN="python -m sglang.launch_server"
         fi
-        
+
         ON_PACKAGE_MEMORY_NODE=$((ATTN_TP_RANK +16))
         echo 0 > /sys/devices/system/node/node${ATTN_TP_RANK}/hugepages/hugepages-2048kB/nr_hugepages
         echo 2020 > /sys/devices/system/node/node${ON_PACKAGE_MEMORY_NODE}/hugepages/hugepages-2048kB/nr_hugepages
 
+        # Per-rank IB device: map ATTN_TP_RANK to an index in IB_DEVICE_ALL.
+        # With N configured devices, each device serves (attn_tp_size / N) ranks.
+        if [[ "$ROLE" == "prefill" || "$ROLE" == "decode" ]]; then
+            IFS=',' read -ra _IB_DEVS <<< "$IB_DEVICE_ALL"
+            _IB_COUNT=${#_IB_DEVS[@]}
+            _IB_IDX=$((ATTN_TP_RANK * _IB_COUNT / (TP_SIZE * PP_SIZE / WORLD_SIZE)))
+            IB_ARGS=(--disaggregation-ib-device "${_IB_DEVS[$_IB_IDX]}")
+        else
+            IB_ARGS=()
+        fi
+
         taskset -c $((ATTN_TP_RANK * 38 + 20)) \
-        $SERVER_BIN "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
+        $SERVER_BIN "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
           --tp-rank-in-node ${ATTN_TP_RANK} \
           --port $((30000 + ATTN_TP_RANK)) \
           > "${LOG_PATH}/${DP_RANK}_${ATTN_TP_RANK}_$IP.log" 2>&1 &
     done
 else
-    python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" \
+    # Non-binary launch: sglang forks workers internally, so pass all devices
+    # as comma-separated string (per-rank JSON not supported by _validate_ib_devices).
+    if [[ "$ROLE" == "prefill" || "$ROLE" == "decode" ]]; then
+        IB_ARGS=(--disaggregation-ib-device "$IB_DEVICE_ALL")
+    else
+        IB_ARGS=()
+    fi
+
+    python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
       --port 30000 \
       > "$LOG_PATH/${DP_RANK}_$IP.log" 2>&1
 fi
