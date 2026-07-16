@@ -135,7 +135,7 @@ if [[ "$ROLE" == "router" ]]; then
             --max-total-tokens 64
             --skip-server-warmup
         )
-        LD_PRELOAD="/path/to/libpthread_hook.so"" \
+        LD_PRELOAD="/path/to/libpthread_hook.so" \
         python -m sglang.launch_server "${HTTP_PREFILL_ARGS[@]}" \
             > "$LOG_PATH/router_prefill_http.log" 2>&1 &
         PREFILL_HTTP_PID=$!
