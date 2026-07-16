@@ -100,7 +100,9 @@ from sglang.srt.utils import (
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
-    is_kunpeng_binary_launch
+    is_http_only,
+    is_kunpeng_binary_launch,
+    is_skip_http,
 )
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -112,6 +114,8 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
+_is_http_only = is_http_only()
+_is_skip_http = is_skip_http()
 _is_kunpeng_binary_launch = is_kunpeng_binary_launch()
 
 @dataclasses.dataclass
@@ -705,12 +709,21 @@ class Engine(EngineScoreMixin, EngineBase):
             )
 
         # Launch scheduler processes
-        scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func
-        )
-        scheduler_init_result.engine_info_bootstrap_server = (
-            engine_info_bootstrap_server
-        )
+        if _is_http_only:
+            scheduler_init_result = SchedulerInitResult(
+                scheduler_infos=[{"max_req_input_len": 0}],
+                wait_for_ready=lambda: None,
+                wait_for_completion=lambda: None,
+                engine_info_bootstrap_server=engine_info_bootstrap_server,
+            )
+            scheduler_procs = []
+        else:
+            scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
+                server_args, port_args, run_scheduler_process_func
+            )
+            scheduler_init_result.engine_info_bootstrap_server = (
+                engine_info_bootstrap_server
+            )
 
         if (
             server_args.enable_elastic_expert_backup
@@ -718,7 +731,11 @@ class Engine(EngineScoreMixin, EngineBase):
         ):
             run_expert_backup_manager(server_args, port_args)
 
-        if server_args.node_rank >= 1:
+        start_node = 1
+        if _is_skip_http:
+            start_node = 0
+
+        if server_args.node_rank >= start_node:
             # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
             # so they can just wait here.
             if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
@@ -785,8 +802,9 @@ class Engine(EngineScoreMixin, EngineBase):
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
         processes = list(scheduler_procs or [])
         names = [f"scheduler_{i}" for i in range(len(processes))]
-        processes.append(detoken_proc)
-        names.append("detokenizer")
+        if detoken_proc is not None:
+            processes.append(detoken_proc)
+            names.append("detokenizer")
         subprocess_watchdog = SubprocessWatchdog(
             processes=processes, process_names=names
         )

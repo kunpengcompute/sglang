@@ -55,6 +55,7 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
     is_cpu_920f,
     is_kunpeng_binary_launch,
+    is_skip_http,
 )
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -72,6 +73,7 @@ SCHEDULER_PIDS_ARG = "scheduler_pids"
 
 _is_cpu_920f = is_cpu_920f()
 _is_kunpeng_binary_launch = is_kunpeng_binary_launch()
+_is_skip_http = is_skip_http()
 
 
 class LoadBalanceMethod(Enum):
@@ -148,6 +150,10 @@ class DataParallelController:
         if server_args.node_rank == 0:
             if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
                 pass
+            elif _is_skip_http:
+                self.recv_from_tokenizer = get_zmq_socket(
+                    self.context, zmq.PULL, port_args.scheduler_input_ipc_name, True
+                )
             else:
                 self.recv_from_tokenizer = get_zmq_socket(
                     self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False

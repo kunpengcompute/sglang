@@ -112,6 +112,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.common import is_http_only
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
@@ -346,9 +347,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         if self.server_args.tokenizer_worker_num == 1:
-            self.send_to_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-            )
+            if is_http_only():
+                self.send_to_scheduler = get_zmq_socket(
+                    context, zmq.PUSH, port_args.scheduler_input_ipc_name, False
+                )
+            else:
+                self.send_to_scheduler = get_zmq_socket(
+                    context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+                )
         else:
             from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
 

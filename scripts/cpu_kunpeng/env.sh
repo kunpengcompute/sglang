@@ -21,27 +21,51 @@
 # ------------------------------------------------------------
 expand_ip_range() {
     local spec="$1"
-    local base="${spec%%|*}"            # part before '|'
-    local ranges="${spec#*|}"           # part after '|'
-    base="${base// /}"                  # trim spaces
-    ranges="${ranges// /}"              # trim spaces
-
-    IFS=',' read -ra parts <<< "$ranges"
     local ips=()
-    for part in "${parts[@]}"; do
-        if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            # range: start-end
-            for ((i=${BASH_REMATCH[1]}; i<=${BASH_REMATCH[2]}; i++)); do
-                ips+=("${base}${i}")
-            done
-        elif [[ "$part" =~ ^[0-9]+$ ]]; then
-            # single number
-            ips+=("${base}${part}")
-        else
-            echo "Error: invalid IP range part '$part'" >&2
-            return 1
-        fi
+
+    # Collect all IP-base prefixes (e.g. "10.36.182.") in order
+    local bases=() temp="$spec"
+    while [[ "$temp" =~ ([0-9]+\.[0-9]+\.[0-9]+\.) ]]; do
+        bases+=("${BASH_REMATCH[1]}")
+        temp="${temp#*"${BASH_REMATCH[1]}"}"
     done
+
+    for ((idx=0; idx<${#bases[@]}; idx++)); do
+        local base="${bases[idx]}"
+
+        # Extract substring between this base and the next base (or end of string)
+        local sub="${spec#*"$base"}"
+        sub="${sub#"${sub%%[![:space:]]*}"}"  # trim leading spaces
+        sub="${sub#|}"
+        sub="${sub#"${sub%%[![:space:]]*}"}"  # trim leading spaces
+
+        if ((idx+1 < ${#bases[@]})); then
+            local next_base="${bases[idx+1]}"
+            sub="${sub%%"$next_base"*}"
+        fi
+
+        # Trim trailing spaces / commas
+        sub="${sub%"${sub##*[![:space:]]}"}"
+
+        IFS=',' read -ra parts <<< "$sub"
+        for part in "${parts[@]}"; do
+            part="${part// /}"
+            [[ -z "$part" ]] && continue
+            if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            # range: start-end
+                for ((i=${BASH_REMATCH[1]}; i<=${BASH_REMATCH[2]}; i++)); do
+                    ips+=("${base}${i}")
+                done
+            elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            # single number
+                ips+=("${base}${part}")
+            else
+                echo "Error: invalid IP range part '$part'" >&2
+                return 1
+            fi
+        done
+    done
+
     echo "${ips[@]}"
 }
 
@@ -62,7 +86,7 @@ NATIVE_MASTER_ADDR="xxx.xxx.xxx.1"
 NATIVE_MASTER_PORT="5010"
 
 # Router node IP (single IP for PD disaggregation router)
-ROUTER_IP="xxx.xxx.xxx.1"
+export ROUTER_IP="xxx.xxx.xxx.1"
 
 # Paths
 LOG_BASE_DIR="/path-to-logs"
@@ -76,9 +100,9 @@ export KUPL_PATH="/path-to-KUPL"
 export KUTACC_PATH="/path-to-KUTACC"
 export SGLANG_PATH="/path-to-SGLang"
 export CONDA_ENV_PATH="$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME"
-export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
+export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"  
 
-export GEMM_TILING_PLAN_FILE="/path-to-tiling"
+export GEMM_TILING_PLAN_FILE="$SGLANG_PATH/scripts/cpu_kunpeng/configs"
 
 # TP/EP size
 export TP_SIZE=256
@@ -86,7 +110,7 @@ export EP_SIZE=${TP_SIZE}
 
 # PP size and chunked prefill size can be configured independently
 export PP_SIZE=1 # >1 enable pp  eg: 2
-export CHUNKED_PREFILL_SIZE=-1  # eg: 512
+export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size
 
 # Communication
 export GLOO_SOCKET_IFNAME=enp26s0f0
@@ -107,10 +131,12 @@ export SGLANG_USE_CPU_ENGINE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_WARMUP_TIMEOUT=1600
+# Force query prefill DP rank, when disaggregation and curl -d is needed
 export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
+export SGLANG_ENABLE_TOKENIZER_SEPERATE=0
 export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
@@ -154,6 +180,7 @@ prefill_config() {
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
     export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="1"
+    export SGLANG_SKIP_HTTP=1
 }
 
 # ------------------------------------------------------------
@@ -169,6 +196,7 @@ decode_config() {
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
     export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="0"
+    export SGLANG_SKIP_HTTP=1
 }
 
 # ------------------------------------------------------------
@@ -194,6 +222,7 @@ router_config() {
     export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
     export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="0"
+    export SGLANG_LAUNCH_HTTP_ONLY=1
 }
 
 # ------------------------------------------------------------
@@ -229,7 +258,7 @@ else
     export SGLANG_KUNPENG_MAX_CUR_LEN=1
 fi
 
-if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]]; then
+if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ROLE" == "router" ]]; then
     source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 
     export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}

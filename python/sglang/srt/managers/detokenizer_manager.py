@@ -50,7 +50,7 @@ from sglang.utils import (
     find_printable_text,
     get_exception_traceback,
 )
-from sglang.srt.utils.common import is_cpu_920f
+from sglang.srt.utils.common import is_cpu_920f, is_http_only
 
 logger = logging.getLogger(__name__)
 
@@ -424,9 +424,16 @@ def run_detokenizer_process(
             import os
 
             p = psutil.Process(os.getpid())
-            # TODO (kunpeng): hard code here, should use a more elegant way.
-            p.cpu_affinity({96})  # 20
-            logger.info(os.sched_getaffinity(os.getpid()))
+            if is_http_only():
+                # Bind CPU for HTTP-only (tokenizer) processes
+                if server_args.disaggregation_mode == "prefill":
+                    p.cpu_affinity(list(range(152, 189)))
+                elif server_args.disaggregation_mode == "decode":
+                    p.cpu_affinity(list(range(190, 227)))
+            else:
+                # TODO (kunpeng): hard code here, should use a more elegant way.
+                p.cpu_affinity({96})  # 20
+                logger.info(os.sched_getaffinity(os.getpid()))
 
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")

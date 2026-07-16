@@ -91,11 +91,18 @@ case "$ROLE" in
         )
         ;;
     router)
+        if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
+            _router_prefill_url="http://${ROUTER_IP}:30001"
+            _router_decode_url="http://${ROUTER_IP}:30002"
+        else
+            _router_prefill_url="http://${PREFILL_MASTER_ADDR}:30000"
+            _router_decode_url="http://${DECODE_MASTER_ADDR}:30000"
+        fi
         SPECIFIC_ARGS=(
             --model-path "$MODEL_PATH"
             --pd-disaggregation
-            --prefill "http://${PREFILL_MASTER_ADDR}:30000" 9001
-            --decode "http://${DECODE_MASTER_ADDR}:30000"
+            --prefill "$_router_prefill_url" 9001
+            --decode "$_router_decode_url"
             --policy cache_aware
             --prefill-policy cache_aware
             --health-check-interval-secs 10000
@@ -113,9 +120,68 @@ esac
 
 # Combine and execute
 if [[ "$ROLE" == "router" ]]; then
+    if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
+        # 启动 prefill HTTP server（tokenizer 侧）
+        echo "Launching prefill HTTP server..."
+        HTTP_PREFILL_ARGS=(
+            --model "$MODEL_PATH"
+            --device cpu --trust-remote-code
+            --host "$ROUTER_IP" --port 30001
+            --dist-init-addr "$PREFILL_MASTER_ADDR:$PREFILL_MASTER_PORT"
+            --disaggregation-mode prefill
+            --disaggregation-bootstrap-port 9001
+            --nnodes 1 --node-rank 0 --dist-timeout 600
+            --enable-dp-attention --dp 1 --tp-size 1
+            --max-total-tokens 64
+            --skip-server-warmup
+        )
+        LD_PRELOAD="/path/to/libpthread_hook.so" \
+        python -m sglang.launch_server "${HTTP_PREFILL_ARGS[@]}" \
+            > "$LOG_PATH/router_prefill_http.log" 2>&1 &
+        PREFILL_HTTP_PID=$!
+
+        # 启动 decode HTTP server（tokenizer 侧）
+        echo "Launching decode HTTP server..."
+        HTTP_DECODE_ARGS=(
+            --model "$MODEL_PATH"
+            --device cpu --trust-remote-code
+            --host "$ROUTER_IP" --port 30002
+            --dist-init-addr "$DECODE_MASTER_ADDR:$DECODE_MASTER_PORT"
+            --disaggregation-mode decode
+            --disaggregation-bootstrap-port 9001
+            --nnodes 1 --node-rank 0 --dist-timeout 600
+            --enable-dp-attention --dp 1 --tp-size 1
+            --max-total-tokens 64
+            --skip-server-warmup
+        )
+        LD_PRELOAD="/path/to/libpthread_hook.so" \
+        python -m sglang.launch_server "${HTTP_DECODE_ARGS[@]}" \
+            > "$LOG_PATH/router_decode_http.log" 2>&1 &
+        DECODE_HTTP_PID=$!
+
+        # 轮询等待两个 HTTP server 就绪
+        for port in 30001 30002; do
+            echo "Waiting for HTTP server on port $port..."
+            _ready=0
+            for i in $(seq 1 60); do
+                if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+                    echo "HTTP server on port $port ready"
+                    _ready=1
+                    break
+                fi
+                sleep 2
+            done
+            if [[ "$_ready" -eq 0 ]]; then
+                echo "ERROR: HTTP server on port $port failed to start within 120 seconds"
+                exit 1
+            fi
+        done
+    fi
+    # 启动 sglang_router ----
     echo "Launching PD disaggregation router..."
-    python -m sglang_router.launch_router "${SPECIFIC_ARGS[@]}" \
-        > "$LOG_PATH/router_$IP.log" 2>&1
+        python -m sglang_router.launch_router "${SPECIFIC_ARGS[@]}" \
+        > "$LOG_PATH/router_$IP.log" 2>&1 &
+
     exit 0
 fi
 

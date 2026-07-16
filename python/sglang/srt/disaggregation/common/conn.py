@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -35,6 +36,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import is_tokenizer_separate
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -43,6 +45,7 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+_is_tokenizer_separate = is_tokenizer_separate()
 
 @dataclasses.dataclass
 class PrefillServerInfo:
@@ -341,6 +344,9 @@ class CommonKVManager(BaseKVManager):
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
 
+        if _is_tokenizer_separate:
+            host = os.environ["ROUTER_IP"]
+
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
         payload = {
@@ -365,14 +371,24 @@ class CommonKVManager(BaseKVManager):
             response = requests.put(url, json=payload, timeout=5)
             if response.status_code == 200:
                 logger.debug("Prefill successfully registered to bootstrap server.")
-            else:
-                logger.error(
-                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
-                )
-        except Exception as e:
-            logger.error(
-                f"Prefill instance failed to register to bootstrap server: {e}"
-            )
+                return
+        except Exception:
+            pass
+
+        # Retry in background thread (bootstrap server may not be ready yet)
+        def _retry_register():
+            while True:
+                time.sleep(1)
+                try:
+                    r = requests.put(url, json=payload, timeout=5)
+                    if r.status_code == 200:
+                        logger.info(f"Prefill registered to bootstrap server at {url}.")
+                        return
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_retry_register, daemon=True)
+        t.start()
 
     @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):

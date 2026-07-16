@@ -7,7 +7,7 @@ import warnings
 
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import suppress_noisy_warnings
+from sglang.srt.utils.common import is_http_only, suppress_noisy_warnings
 from sglang.srt.environ import envs
 
 suppress_noisy_warnings()
@@ -47,10 +47,16 @@ def run_server(server_args):
     else:
         # Default mode: HTTP mode.
         from sglang.srt.entrypoints.http_server import launch_server
+        import psutil
 
-        if envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
-            import psutil
-
+        # Bind CPU for HTTP-only (tokenizer) processes
+        if is_http_only():
+            p = psutil.Process(os.getpid())
+            if server_args.disaggregation_mode == "decode":
+                p.cpu_affinity(list(range(76, 151)))
+            else:
+                p.cpu_affinity(list(range(0, 75)))
+        elif envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
             p = psutil.Process(os.getpid())
             # TODO (kunpeng): hard code here, should use a more elegant way.
             if envs.SGLANG_ENABLE_BINARY_LAUNCH.get():
