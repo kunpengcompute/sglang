@@ -34,16 +34,16 @@ cd "$SCRIPT_DIR"
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
 source ./env.sh "$ROLE"
 
-# Router mode: kill router process on the configured router node
+# Router mode: kill router and HTTP server processes on the configured router node
 if [[ "$ROLE" == "router" ]]; then
     echo "Killing router on $ROUTER_IP"
     ssh "root@$ROUTER_IP" '
-        PIDS=$(pgrep -f "sglang::router")
-        if [ -n "$PIDS" ]; then
-            echo "Killing router process(es): $PIDS"
-            kill -15 $PIDS 2>/dev/null
+        MAIN_PIDS=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
+        if [ -n "$MAIN_PIDS" ]; then
+            echo "Killing process(es): $MAIN_PIDS"
+            kill -15 $MAIN_PIDS 2>/dev/null
             sleep 3
-            REMAINING=$(pgrep -f "sglang::router")
+            REMAINING=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
             if [ -n "$REMAINING" ]; then
                 echo "Sending SIGKILL to: $REMAINING"
                 kill -9 $REMAINING 2>/dev/null

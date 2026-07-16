@@ -168,6 +168,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     set_uvicorn_logging_configs,
     is_kunpeng_binary_launch,
+    is_tokenizer_separate,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.json_response import (
@@ -386,6 +387,11 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")
+
+    # Mark server as Up before warmup thread starts (fixes health check deadlock on ROUTER)
+    if is_tokenizer_separate():
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        logger.info("Pre-warmup: server status set to Up (tokenizer_separate mode)")
 
     # Execute the general warmup
     warmup_thread = threading.Thread(
@@ -1974,7 +1980,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": [
+                "bootstrap_room": 0 if is_tokenizer_separate() else [
                     i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
                     for i in range(server_args.dp_size)
                 ],

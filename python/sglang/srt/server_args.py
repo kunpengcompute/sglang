@@ -59,6 +59,7 @@ from sglang.srt.utils.common import (
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
+    is_tokenizer_separate,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -79,6 +80,7 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 _is_kunpeng_binary_launch = is_kunpeng_binary_launch()
+_is_tokenizer_separate = is_tokenizer_separate()
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -7374,7 +7376,7 @@ class PortArgs:
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
-        if not server_args.enable_dp_attention:
+        if not server_args.enable_dp_attention and not _is_tokenizer_separate:
             # Normal case, use IPC within a single node
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -7431,15 +7433,14 @@ class PortArgs:
                     f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"
                 )
                 raise
-
+            # Bind TCP ports for HTTP-only (tokenizer) processes
+            http_host = os.environ.get("ROUTER_IP") if _is_tokenizer_separate else dist_init_host
             return PortArgs(
-                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                tokenizer_ipc_name=NetworkAddress(http_host, port_base).to_tcp(),
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),
-                detokenizer_ipc_name=NetworkAddress(
-                    dist_init_host, detokenizer_port
-                ).to_tcp(),
+                detokenizer_ipc_name=NetworkAddress(http_host, detokenizer_port).to_tcp(),
                 nccl_port=nccl_port,
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),

@@ -180,6 +180,15 @@ def is_host_cpu_arm64() -> bool:
 def is_cpu_920f() -> bool:
     return is_host_cpu_arm64() and os.environ.get("SGLANG_USE_CPU_920F", "0") == "1"
 
+def is_tokenizer_separate() -> bool:
+    return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_TOKENIZER_SEPERATE", "0") == "1"
+
+def is_http_only() -> bool:
+    return is_tokenizer_separate() and os.environ.get("SGLANG_LAUNCH_HTTP_ONLY", "0") == "1"
+
+def is_skip_http() -> bool:
+    return is_tokenizer_separate() and os.environ.get("SGLANG_SKIP_HTTP", "0") == "1"
+
 def is_kunpeng_binary_launch() -> bool:
     return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_BINARY_LAUNCH") == "1"
 
