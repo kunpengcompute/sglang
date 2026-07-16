@@ -166,7 +166,6 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    get_bool_env_var,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -203,8 +202,6 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
-
-_DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1398,11 +1395,7 @@ class DeepseekV2AttentionMLA(
         self.use_deepseek_yarn_rope = rope_scaling is not None
 
         self.attn_mqa = RadixAttention(
-            (
-                self.num_heads
-                if (_is_cpu_920f and not _DISABLE_MLA_ALL2ALL)
-                else self.num_local_heads
-            ),
+            self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,

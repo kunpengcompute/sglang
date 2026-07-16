@@ -23,9 +23,10 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
+from sglang.srt.distributed import get_socket_tp_group
 from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import *
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -317,7 +318,7 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata = None
 
         model_config = model_runner.model_config
-        self.num_q_heads = model_config.num_attention_heads
+        self.num_q_heads = model_config.num_attention_heads // model_runner.tp_size
         self.head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
         self.head_dim_v = model_config.v_head_dim
         self.kv_cache_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
@@ -375,20 +376,20 @@ class KunpengCpuBackend(AttentionBackend):
 
         tp_size = get_attention_tp_size()
         if tp_size > 1 and not _DISABLE_MLA_ALL2ALL:
-            tp_rank = get_attention_tp_rank()
-            # Per-socket all2all with group_size=8 instead of tp_size.
-            # The metadata slicing must match the all2all group structure.
-            all2all_size = 8 if tp_size == 16 else tp_size
+            # All2All over per-socket sub-group (e.g. 8 ranks per socket).
+            # The socket group is [0..7] / [8..15] for tp=16; for tp=8 the
+            # socket group equals the full attention-tp group.
+            socket_group = get_socket_tp_group()
+            all2all_size = socket_group.world_size
+            group_rank = socket_group.rank_in_group
             B = seq_lens.shape[0]
-            Btp = B // all2all_size
-            group_rank = tp_rank % all2all_size
-            seq_lens = seq_lens[group_rank * Btp : (group_rank + 1) * Btp]
+            batchsize_per_tp = B // all2all_size
+            seq_lens = seq_lens[group_rank * batchsize_per_tp : (group_rank + 1) * batchsize_per_tp]
             req_pool_indices = req_pool_indices[
-                group_rank * Btp : (group_rank + 1) * Btp
+                group_rank * batchsize_per_tp : (group_rank + 1) * batchsize_per_tp
             ]
-            # After all2all, each rank in the all2all group sees all heads.
-            # For tp=16 with all2all=8: 128 * 8 / 16 = 64 heads.
-            num_heads_q = self.num_q_heads * all2all_size // tp_size
+            # After all2all each rank sees all heads in its socket group.
+            num_heads_q = self.num_q_heads * all2all_size
         else:
             num_heads_q = self.num_q_heads
 
