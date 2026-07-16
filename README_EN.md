@@ -67,7 +67,7 @@ git submodule update --init --recursive
 git apply pytorch-v2.9.0-kupl.patch
 ```
 
-## 3. Non-PD Disaggregated Startup
+## 3. SGLang Deployment & Startup
 
 ### 3.1 Using DeepSeek Models
 
@@ -75,11 +75,17 @@ Taking the DeepSeek V3 int8 quantized version as an example, the recommended con
 
 Since loading the V3 quantized weights is relatively slow, you can add `--load-format sharded_state` to the startup parameters to enable sharded weight loading for faster startup. Before the first use, preprocess the original weights using the `scripts/cpu_kunpeng/split_weights.py` script.
 
-The startup and shutdown commands are as follows:
+Startup and shutdown commands:
 
 ```shell
+# native mode (non-PD disaggregated)
 sh launch.sh native
 sh stop.sh native
+
+# PD disaggregated mode (run on prefill, decode, and router nodes respectively)
+sh launch.sh prefill
+sh launch.sh decode
+sh launch.sh router
 ```
 
 ### 3.2 Using Non-DeepSeek Models

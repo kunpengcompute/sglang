@@ -72,7 +72,7 @@ git submodule update --init --recursive
 git apply pytorch-v2.9.0-kupl.patch
 ```
 
-## 3. 非PD分离场景启动过程
+## 3. SGLang部署和启动
 
 ### 3.1 DeepSeek模型使用
 
@@ -83,8 +83,14 @@ git apply pytorch-v2.9.0-kupl.patch
 启动和终止命令如下：
 
 ```shell
+# native模式（非PD分离）
 sh launch.sh native
 sh stop.sh native
+
+# PD分离模式（分别在prefill、decode、router节点执行）
+sh launch.sh prefill
+sh launch.sh decode
+sh launch.sh router
 ```
 
 ### 3.2 非DeepSeek模型使用
