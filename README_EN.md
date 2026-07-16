@@ -86,31 +86,152 @@ sh stop.sh native
 
 When using non-DeepSeek models, you need to comment out lines 98~99 in `srt/models/registry.py`. These two lines skip loading non-DeepSeek model dependencies to improve startup speed. Alternatively, you can change the condition value to the corresponding value of the specific model being used, for example, `sglang.srt.models.qwen3`.
 
-### 3.3 Environment Variables
+### 3.3 Deployment Modes
 
-- **KUPL_EXECUTOR_BACKEND** / **KUPL_EXECUTOR_COUNT**: Only effective when `TORCH_USE_KUPL` is set to `1`. Requires a PyTorch build that uses kupl as the multi-threading backend. The standard PyTorch installation only supports the omp multi-threading backend.
-- **SGLANG_ENABLE_BINARY_LAUNCH**: Used to optimize startup and multi-thread core binding. Enabled by default. When enabled, each scheduler process starts independently, distinguished by the `--tp-rank-in-node` parameter.
-- **SGLANG_KUNPENG_PROFILE**: Enables function call overhead logging. Disabled by default. When enabled, the call time of each function is printed to stdout to help identify performance bottlenecks.
+Four deployment modes are available via `source env.sh [mode]`:
+
+- **native** (default): Non-PD disaggregated, single-cluster full serving. Nodes read from `NATIVE_IP_SPEC`, load balancing via `round_robin`.
+- **prefill**: PD disaggregation prefill role. Nodes read from `PREFILL_IP_SPEC`, `SGLANG_SKIP_HTTP=1`.
+- **decode**: PD disaggregation decode role. Nodes read from `DECODE_IP_SPEC`, `SGLANG_SKIP_HTTP=1`.
+- **router**: PD disaggregation router node, single-node running `sglang_router.launch_router`, `SGLANG_LAUNCH_HTTP_ONLY=1`.
+
+When `IS_PREFILL=1` (prefill mode), `SGLANG_KUNPENG_MAX_SEQ_NUM=4` and `SGLANG_KUNPENG_MAX_CUR_LEN=1024` are set automatically; when `IS_PREFILL=0` (decode/native), `SGLANG_KUNPENG_MAX_SEQ_NUM=128` and `SGLANG_KUNPENG_MAX_CUR_LEN=1` are set.
+
+### 3.4 Environment Variables
+
+#### 3.4.1 Functional
+
+**1. SGLANG\_ENABLE\_BINARY\_LAUNCH / SGLANG\_ENABLE\_NUMA\_DUPLICATION — Binary Launch Mode**
+
+```
+export SGLANG_ENABLE_BINARY_LAUNCH=1      # default on
+export SGLANG_ENABLE_NUMA_DUPLICATION=1   # default on
+```
+
+- **Effect**: Each scheduler process starts independently using `--tp-rank-in-node` to distinguish ranks. `server.sh` iterates `ATTN_TP_RANK` to launch processes one by one, pinning CPU cores (`taskset -c`) and configuring huge pages. When disabled, only a single `python -m sglang.launch_server` process is used.
+- **SGLANG\_ENABLE\_NUMA\_DUPLICATION**: On top of the above, each NUMA node uses its own pre-built binary from `PYINSTALL_PATH/dist/sglang_server_tp{rank}/` (requires `SGLANG_ENABLE_BINARY_LAUNCH`), achieving per-NUMA memory locality and reducing cross-NUMA access. When disabled, all ranks share one binary and the `LD_LIBRARY_PATH` setup logic changes.
+
+**2. SGLANG\_ENABLE\_TOKENIZER\_SEPERATE — Separate Tokenizer**
+
+```
+export SGLANG_ENABLE_TOKENIZER_SEPERATE=0  # default off
+```
+
+- **Effect**: Splits the tokenizer out of the inference process. When =1, triggers three sub-functions:
+
+| Sub-mode | Condition |
+|---|---|
+| `is_tokenizer_separate()` | `=1` |
+| `is_http_only()` | and `SGLANG_LAUNCH_HTTP_ONLY=1` |
+| `is_skip_http()` | and `SGLANG_SKIP_HTTP=1` |
+
+- **Related settings**: `SGLANG_LAUNCH_HTTP_ONLY=1` (router node runs HTTP only), `SGLANG_SKIP_HTTP=1` (inference nodes skip HTTP), `ROUTER_IP` (HTTP server binds to router IP instead of local IP).
+- **Effect**: In PD disaggregation, the router node handles tokenize/detokenize centrally while inference nodes focus on forward. Not needed in non-PD (native) mode.
+
+**3. SGLANG\_KUNPENG\_DISABLE\_MLA\_ALL2ALL — Disable MLA All2All**
+
+```
+export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=1  # default on
+```
+
+- **Effect**: Controls the MLA attention communication strategy.
+  - `=0` (not disabled): When TP=8 or 16, Q and attention_output use per-socket all2all (group_size=8), cross-socket merging via o_proj allreduce, reducing cross-socket SHM traffic.
+  - `=1` (disabled): No per-socket all2all; attn_mqa computes on the full TP group, communication handled entirely by RowParallelLinear's allreduce.
+
+**4. SGLANG\_ENABLE\_HBW\_POOL / SGLANG\_ENABLE\_HBW\_SWAP — HBW Memory Management**
+
+```
+export SGLANG_ENABLE_HBW_POOL=1   # enable HBW KV cache allocation
+export SGLANG_ENABLE_HBW_SWAP=0   # disable HBW↔DRAM swap
+```
+
+- **SGLANG\_ENABLE\_HBW\_POOL=1**: KV cache allocated from High Bandwidth Memory first, reducing DRAM access latency.
+- **SGLANG\_ENABLE\_HBW\_SWAP=1**: Enables asynchronous SDMA migration between HBW pages and DRAM, swapping out cold data under memory pressure.
+- **Related settings**: `SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB`, `SGLANG_KUNPENG_SDMA_MAX_EVENTS`, `SGLANG_KUNPENG_SDMA_THRESHOLD`.
+
+**5. SGLANG\_ENABLE\_MTP — Multi-Token Prediction**
+
+```
+export SGLANG_ENABLE_MTP=0  # default off
+```
+
+- **Effect**: Enables DeepSeek model Multi-Token Prediction speculative decoding. When =1, enables multi-token prediction to accelerate inference.
+
+#### 3.4.2 Other Toggles
+
+- **SGLANG\_USE\_CPU\_920F**: Identifies Kunpeng 920F platform, triggering fork startup, loading only deepseek_v2 model, CPU affinity, etc.
+- **SGLANG\_USE\_CPU\_ENGINE**: Forces CPU inference engine.
+- **SGLANG\_SET\_CPU\_AFFINITY**: Enables CPU core binding.
+- **SGLANG\_LAUNCH\_HTTP\_ONLY**: Starts HTTP server only (no inference), used by router node. Requires `SGLANG_ENABLE_TOKENIZER_SEPERATE`.
+- **SGLANG\_SKIP\_HTTP**: Skips HTTP server startup, used by prefill/decode nodes. Requires `SGLANG_ENABLE_TOKENIZER_SEPERATE`.
+- **SGLANG\_DISAGGREGATION\_FORCE\_QUERY\_PREFILL\_DP\_RANK**: Forces query prefill DP rank in PD disaggregation, bypassing `follow_bootstrap_room` routing.
+- **SGLANG\_ENABLE\_TORCH\_COMPILE** / **TORCH\_COMPILE\_DISABLE**: Enables torch.compile (disabled in this version).
+- **SGLANG\_LOG\_MS**: Adds millisecond timestamps to logs.
+- **SGLANG\_KUNPENG\_PROFILE**: Prints function call durations to identify performance bottlenecks.
+- **SGLANG\_ENABLE\_TP\_MEMORY\_INBALANCE\_CHECK**: TP memory capacity imbalance check (set to 0 to disable).
+
+#### 3.4.3 Size / Threshold
+
+**Shared Memory Pool**
+- **SGLANG\_KUNPENG\_PREFILL\_SHM\_SIZE\_MB**: Prefill shared memory pool size, default 476MB.
+- **SGLANG\_KUNPENG\_DECODE\_SHM\_SIZE\_MB**: Decode shared memory pool size, default 100MB.
+
+**HBW Memory Pool**
+- **SGLANG\_KUNPENG\_WEIGTHS\_HBW\_POOL\_SIZE\_MB**: Weight cache pre-allocation in HBW, default 3800MB.
+
+**SHM Batch Capacity**
+- **SGLANG\_KUNPENG\_MAX\_SEQ\_NUM**: Max sequences for SHM pre-allocation. Prefill default 4, decode default 128.
+- **SGLANG\_KUNPENG\_MAX\_CUR\_LEN**: Max sequence length for SHM pre-allocation. Prefill default 1024, decode default 1.
+
+**SDMA Transfer**
+- **SGLANG\_KUNPENG\_SDMA\_MAX\_EVENTS**: Max SDMA concurrent events, default 10.
+- **SGLANG\_KUNPENG\_SDMA\_THRESHOLD**: SDMA transfer threshold; above this size use hardware DMA instead of CPU memcpy, default 5.
+
+**Timeout**
+- **SGLANG\_WARMUP\_TIMEOUT**: Warmup timeout in seconds, default 1600.
+
+**Model Loading**
+- **LOAD\_FORMAT**: Weight loading format. Set to `sharded_state` for sharded loading to accelerate startup (recommended for DeepSeek V3 INT8).
+
+**Multi-Thread Backend**
+- **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**: Only effective when `TORCH_USE_KUPL` is set to 1. Specifies kupl multi-threading backend. Standard PyTorch only supports omp. `KUPL_EXECUTOR_COUNT` defaults to 32.
 
 ## 4. Correctness Verification
 
-In non-PD disaggregated scenarios, correctness can be verified by sending a curl request to the specified port on the master node. An example verification script `scripts/cpu_kunpeng/curl.sh` is as follows:
+The verification script `scripts/cpu_kunpeng/curl.sh` supports multiple features. Common usage examples:
+
+### 4.1 Basic Usage
 
 ```shell
-IP=$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-PORT=30000
-
-time curl -s http://${IP}:${PORT}/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-v2",
-    "prompt": [
-        "Once upon a time"
-    ],
-    "stream": true,
-    "max_tokens": 10,
-    "temperature": 0.01
-  }'
+sh curl.sh                    # basic inference
+sh curl.sh -s -m 50           # streaming, 50 tokens
+sh curl.sh -n 10 -m 20        # 10 requests
+sh curl.sh -s -f prompts/1k.txt  # long prompt
 ```
+
+### 4.2 Routing Test
+
+```shell
+# Route to a specific DP rank
+sh curl.sh -d 3 -n 10 -m 20
+```
+
+### 4.3 Profiling
+
+```shell
+# Profile mode (automatically calls start_profile / stop_profile)
+sh curl.sh -p -s -f prompts/ragged.txt
+```
+
+### 4.4 Options
+
+| Option | Description | Default |
+|---|---|---|
+| `-p` | Enable profiling (start/stop) | off |
+| `-s` | Enable streaming | off |
+| `-d RANK` | Route to specific DP rank | - |
+| `-n NUM` | Number of requests | all lines in file |
+| `-m TOKENS` | Max tokens per request | 10 |
+| `-f FILE` | Prompt file | prompts/5.txt |
 
 Verify correctness based on the response returned by the request.
