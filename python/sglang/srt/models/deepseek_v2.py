@@ -390,7 +390,7 @@ class MoEGate(nn.Module):
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif _is_cpu_920f:
                 logits = torch.ops.sgl_kernel.bf16_linear_kunpeng(
-                    hidden_states, self.packed_weight, None
+                    hidden_states, self.weight, None
                 )
             else:
                 logits = F.linear(hidden_states, self.weight, None)

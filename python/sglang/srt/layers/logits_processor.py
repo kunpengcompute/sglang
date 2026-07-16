@@ -911,10 +911,8 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             elif _is_cpu_920f:
-                if lm_head.packed_weight is None:
-                    raise RuntimeError("[logits_processor] lm_head.packed_weight is None")
                 logits = torch.ops.sgl_kernel.bf16_linear_kunpeng(
-                    hidden_states.to(lm_head.packed_weight.dtype), lm_head.packed_weight, None
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight, None
                 )
             else:
                 logits = torch.matmul(

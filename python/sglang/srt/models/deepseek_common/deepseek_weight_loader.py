@@ -760,14 +760,18 @@ class DeepseekV2WeightLoaderMixin:
                     )
 
         # Prepack lm_head.weight for Kunpeng 920F CPU
-        if _is_cpu_920f and hasattr(self, "lm_head") and hasattr(self.lm_head, "weight"):
-            lm_head = self.lm_head
-            if getattr(lm_head, "packed_weight", None) is None:
-                torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
-                    lm_head.weight,
-                    get_global_server_args().max_prefill_tokens,
-                )
-                lm_head.packed_weight = lm_head.weight
+        # Skip for MTP (is_nextn): lm_head will be replaced by set_embed_and_head()
+        # from the target model, so prepack happens there instead.
+        if (
+            not is_nextn
+            and _is_cpu_920f
+            and hasattr(self, "lm_head")
+            and hasattr(self.lm_head, "weight")
+        ):
+            torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                self.lm_head.weight,
+                get_global_server_args().max_prefill_tokens,
+            )
 
         # Prepack MoEGate weights for Kunpeng 920F CPU (DeepSeek models)
         if _is_cpu_920f:
@@ -775,12 +779,10 @@ class DeepseekV2WeightLoaderMixin:
 
             for _, module in self.model.named_modules():
                 if isinstance(module, _DeepSeekMoEGate) and hasattr(module, "weight"):
-                    if getattr(module, "packed_weight", None) is None:
-                        torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
-                            module.weight,
-                            get_global_server_args().max_prefill_tokens,
-                        )
-                        module.packed_weight = module.weight
+                    torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                        module.weight,
+                        get_global_server_args().max_prefill_tokens,
+                    )
 
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
