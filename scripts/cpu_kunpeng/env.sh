@@ -133,6 +133,7 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_WARMUP_TIMEOUT=1600
 # Force query prefill DP rank, when disaggregation and curl -d is needed
 export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0
+export SGLANG_ENABLE_MTP=0
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1

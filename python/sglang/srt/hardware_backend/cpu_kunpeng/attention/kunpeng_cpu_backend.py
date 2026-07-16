@@ -349,7 +349,7 @@ class KunpengCpuBackend(AttentionBackend):
             self._init_decode_metadata(forward_batch)
         elif (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_verify()
+            or forward_batch.forward_mode.is_draft_extend()
         ):
             save_seq_lens = forward_batch.seq_lens
             if forward_batch.forward_mode.is_target_verify():
@@ -398,7 +398,7 @@ class KunpengCpuBackend(AttentionBackend):
         max_seq_len = metadata.seq_lens.max().item()
         max_blocks = (max_seq_len + metadata.page_size - 1) // metadata.page_size
         metadata.extend_seq_lens = torch.full(
-            (batch_size,), max_seq_len, dtype=torch.int32
+            (batch_size,), seqlen_q, dtype=torch.int32
         )
         metadata.block_table = torch.zeros(
             (batch_size, max_blocks),
@@ -511,9 +511,6 @@ class KunpengCpuBackend(AttentionBackend):
             q_padded = q_heads.view(
                 bs, max_ext_len, layer.tp_q_head_num, layer.qk_head_dim
             )
-
-        meta = self.forward_metadata
-        page_size = meta.page_size
 
         kv_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kvcache_paged = kv_buf[:, 0, :].reshape(-1, page_size, kv_buf.shape[-1])

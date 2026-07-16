@@ -708,7 +708,7 @@ class DeepseekV2WeightLoaderMixin:
                 # mlp gate_up_proj and down_proj prepack
                 mlp = (
                     self.model.layers[layer_id].mlp
-                    if layer_id < 61
+                    if not is_nextn
                     else self.model.decoder.mlp
                 )
                 for mlp_module in [mlp] + (

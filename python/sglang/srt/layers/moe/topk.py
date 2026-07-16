@@ -1119,14 +1119,15 @@ def _load_balance_padded_tokens(
 
 def _load_balance_padded_tokens_kunpeng(
     topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
     num_token_non_padded: int,
     num_experts: int,
     topk: int,
 ) -> torch.Tensor:
     torch.ops.sgl_kernel.load_balance_padded_tokens_kunpeng(
-        topk_ids, num_token_non_padded, num_experts, topk
+        topk_ids, topk_weights, num_token_non_padded, num_experts, topk
     )
-    return topk_ids
+    return topk_ids, topk_weights
 
 
 def biased_grouped_topk_kunpeng(
@@ -1279,8 +1280,9 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_cpu_920f:
-        topk_ids = _load_balance_padded_tokens_kunpeng(
+        topk_ids, topk_weights = _load_balance_padded_tokens_kunpeng(
             topk_ids=topk_ids,
+            topk_weights=topk_weights,
             num_token_non_padded=int(num_token_non_padded),
             num_experts=router_logits.shape[1],
             topk=topk_ids.shape[1],

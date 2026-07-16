@@ -364,14 +364,15 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
     }
 }
 
-void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, int64_t num_token_non_padded, int64_t num_experts,
-                                        int64_t topk)
+void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, int64_t num_token_non_padded,
+                                        int64_t num_experts, int64_t topk)
 {
     TORCH_CHECK(topk_ids.scalar_type() == at::kShort, "topk_ids must be int16");
     TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D");
     TORCH_CHECK(topk_ids.size(1) == topk, "topk_ids.size(1) must equal topk");
 
     int16_t *topk_ids_data = topk_ids.data_ptr<int16_t>();
+    float *topk_weights_data = topk_weights.data_ptr<float>();
     int64_t num_total = topk_ids.size(0);
     int64_t pad_start = num_token_non_padded;
     int64_t num_pad = num_total - pad_start;
@@ -400,6 +401,7 @@ void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, int64_t num_token_n
                 }
             }
             topk_ids_data[(pad_start + i) * topk + j] = min_idx;
+            topk_weights_data[(pad_start + i) * topk + j] = 0;
             load[min_idx] += 1.0f;
         }
     }
