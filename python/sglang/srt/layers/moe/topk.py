@@ -1,4 +1,6 @@
 # Copyright 2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -1119,14 +1121,15 @@ def _load_balance_padded_tokens(
 
 def _load_balance_padded_tokens_kunpeng(
     topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
     num_token_non_padded: int,
     num_experts: int,
     topk: int,
 ) -> torch.Tensor:
     torch.ops.sgl_kernel.load_balance_padded_tokens_kunpeng(
-        topk_ids, num_token_non_padded, num_experts, topk
+        topk_ids, topk_weights, num_token_non_padded, num_experts, topk
     )
-    return topk_ids
+    return topk_ids, topk_weights
 
 
 def biased_grouped_topk_kunpeng(
@@ -1279,8 +1282,9 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_cpu_920f:
-        topk_ids = _load_balance_padded_tokens_kunpeng(
+        topk_ids, topk_weights = _load_balance_padded_tokens_kunpeng(
             topk_ids=topk_ids,
+            topk_weights=topk_weights,
             num_token_non_padded=int(num_token_non_padded),
             num_experts=router_logits.shape[1],
             topk=topk_ids.shape[1],

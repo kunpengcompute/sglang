@@ -59,8 +59,13 @@ def alloc_extend_kernel_kunpeng(
             )
 
         num2 = (
-            seq_lens[i] // page_size - (prefix_lens[i] + page_size - 1) // page_size
-        ) * page_size
+            max(
+                0,
+                seq_lens[i] // page_size
+                - (prefix_lens[i] + page_size - 1) // page_size,
+            )
+            * page_size
+        )
         if num2:
             pages = (
                 free_pages[start_new_pages[i] : end_new_pages[i] - need_page[i]]
@@ -70,7 +75,14 @@ def alloc_extend_kernel_kunpeng(
                 pages.view(-1, 1) + pos_in_page.view(1, -1)
             ).view(-1)
 
-        num3 = seq_lens[i] - seq_lens[i] // page_size * page_size
+        num3 = max(
+            0,
+            seq_lens[i]
+            - max(
+                seq_lens[i] // page_size, (prefix_lens[i] + page_size - 1) // page_size
+            )
+            * page_size,
+        )
         if num3:
             out_indices[end_pos[i] - num3 : end_pos[i]] = (
                 free_pages[end_new_pages[i] - 1] * page_size + pos_in_page[:num3]
@@ -146,7 +158,9 @@ class KunpengPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
     ):
         if self.debug_mode:
-            if not torch.all((last_loc + 2) % self.page_size == seq_lens % self.page_size):
+            if not torch.all(
+                (last_loc + 2) % self.page_size == seq_lens % self.page_size
+            ):
                 raise RuntimeError(
                     f"Page alignment check failed: "
                     f"(last_loc+2)%page_size={(last_loc + 2) % self.page_size}, "
@@ -182,4 +196,3 @@ class KunpengPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices.int()
-

@@ -4,8 +4,9 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_musa, is_npu
 
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -119,7 +120,22 @@ def build_tree_kernel_efficient(
             (bs * num_verify_tokens,), device=device, dtype=torch.long
         )
 
-    if _is_npu:
+    if _is_cpu:
+        torch.ops.sgl_kernel.build_tree_kernel_kunpeng(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+    elif _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(
             parent_list.to(dtype=torch.int64),
             top_scores_index,
@@ -198,5 +214,16 @@ def verify_tree_greedy_func(
             retrive_next_token=retrieve_next_token,
             retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
+        )
+    elif _is_cpu:
+        torch.ops.sgl_kernel.verify_tree_greedy_kunpeng(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
         )
     return predicts, accept_index, accept_token_num

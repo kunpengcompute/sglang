@@ -56,6 +56,7 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_decode_backend,
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
+            "kunpeng_cpu": lambda: None,
         }
 
         return self._create_backend(
@@ -81,6 +82,7 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_prefill_backend,
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
+            "kunpeng_cpu": self._create_kunpeng_cpu_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -275,3 +277,10 @@ class DraftBackendFactory:
             "flashmla prefill backend is not yet supported for draft extend."
         )
         return None
+
+    def _create_kunpeng_cpu_prefill_backend(self):
+        from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_cpu_backend import (
+            KunpengCpuBackend,
+        )
+
+        return KunpengCpuBackend(self.draft_model_runner)

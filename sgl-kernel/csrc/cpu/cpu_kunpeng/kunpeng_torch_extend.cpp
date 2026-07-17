@@ -183,8 +183,8 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8, at::Tensor experts_w2
 int64_t topk_convert_kunpeng(at::Tensor src_info, at::Tensor token_ids, at::Tensor experts_offset, int64_t num_ranks,
                              int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank, bool is_prefill);
 
-void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, int64_t num_token_non_padded, int64_t num_experts,
-                                        int64_t topk);
+void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, int64_t num_token_non_padded,
+                                        int64_t num_experts, int64_t topk);
 
 at::Tensor multinomial_kunpeng(const at::Tensor &probs, int64_t num_samples, bool replacement);
 
@@ -235,6 +235,19 @@ void shm_mla_alltoall_finalize_kunpeng();
 at::Tensor embedding_kunpeng(at::Tensor indices, at::Tensor weight, at::Tensor output, int64_t org_vocab_start,
                              int64_t org_vocab_end, int64_t num_org_vocab_padding, int64_t added_vocab_start,
                              int64_t added_vocab_end);
+
+void build_tree_kernel_kunpeng(at::Tensor parent_list, at::Tensor top_scores_index, at::Tensor seq_lens,
+                               at::Tensor tree_mask, at::Tensor positions, at::Tensor retrieve_index,
+                               at::Tensor retrieve_next_token, at::Tensor retrieve_next_sibling, int64_t topk,
+                               int64_t spec_steps, int64_t num_verify_tokens, int64_t tree_mask_mode);
+
+void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at::Tensor accept_token_num,
+                                at::Tensor candidates, at::Tensor retrieve_index, at::Tensor retrieve_next_token,
+                                at::Tensor retrieve_next_sibling, at::Tensor target_predict);
+
+void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, int64_t max_ext_len, at::Tensor q_padded);
+
+void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, int64_t max_ext_len, at::Tensor o_flat);
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 {
@@ -445,7 +458,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def(
         "load_balance_padded_tokens_kunpeng("
-        "Tensor(a!) topk_ids, int num_token_non_padded, "
+        "Tensor(a!) topk_ids, Tensor(b!) topk_weights, int num_token_non_padded, "
         "int num_experts, int topk) -> ()");
     m.impl("load_balance_padded_tokens_kunpeng", load_balance_padded_tokens_kunpeng);
 
@@ -602,4 +615,30 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int added_vocab_start, int added_vocab_end"
         ") -> Tensor");
     m.impl("embedding_kunpeng", embedding_kunpeng);
+
+    // Speculative decoding
+    m.def(
+        "build_tree_kernel_kunpeng("
+        "Tensor parent_list, Tensor top_scores_index, Tensor seq_lens, "
+        "Tensor tree_mask, Tensor positions, Tensor retrieve_index, "
+        "Tensor retrieve_next_token, Tensor retrieve_next_sibling, "
+        "int topk, int spec_steps, int num_verify_tokens, int tree_mask_mode) -> ()");
+    m.impl("build_tree_kernel_kunpeng", build_tree_kernel_kunpeng);
+
+    m.def(
+        "verify_tree_greedy_kunpeng("
+        "Tensor predicts, Tensor! accept_index, Tensor! accept_token_num, "
+        "Tensor candidates, Tensor retrieve_index, Tensor retrieve_next_token, "
+        "Tensor retrieve_next_sibling, Tensor target_predict) -> ()");
+    m.impl("verify_tree_greedy_kunpeng", verify_tree_greedy_kunpeng);
+
+    m.def(
+        "pad_q_left_mtp_kunpeng("
+        "Tensor q_heads, Tensor ext_lens, int max_ext_len, Tensor q_padded) -> ()");
+    m.impl("pad_q_left_mtp_kunpeng", pad_q_left_mtp_kunpeng);
+
+    m.def(
+        "unpad_o_right_mtp_kunpeng("
+        "Tensor o_padded, Tensor ext_lens, int max_ext_len, Tensor o_flat) -> ()");
+    m.impl("unpad_o_right_mtp_kunpeng", unpad_o_right_mtp_kunpeng);
 }

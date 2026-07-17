@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+# Modifications Copyright 2026 Huawei Technologies Co., Ltd.
+# This file has been modified from the original version by Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -172,7 +174,7 @@ class ForwardMode(IntEnum):
         )
 
     def is_cpu_graph(self):
-        return self == ForwardMode.DECODE
+        return self in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY, ForwardMode.IDLE)
 
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
