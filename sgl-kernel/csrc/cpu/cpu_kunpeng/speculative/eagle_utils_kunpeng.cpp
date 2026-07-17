@@ -118,7 +118,7 @@ static void _copy_mtp_strided(scalar_t *src, scalar_t *dst, int64_t *offsets, in
 {
     int64_t nh = num_heads * head_dim;
     size_t elem_size = sizeof(scalar_t);
-    at::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
         for (int64_t b = start; b < end; b++) {
             int64_t ext_len = ext_lens[b];
             int64_t flat_idx = offsets[b] * nh;

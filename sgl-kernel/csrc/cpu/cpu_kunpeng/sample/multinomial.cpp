@@ -17,6 +17,7 @@
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <torch/extension.h>
+#include <kutacc.h>
 
 #include <algorithm>
 #include <random>
@@ -31,8 +32,8 @@ at::Tensor multinomial_kunpeng(const at::Tensor &probs, int64_t num_samples, boo
     TORCH_CHECK(probs.scalar_type() == at::kFloat, "probs must be float32, got ", probs.scalar_type());
     TORCH_CHECK(num_samples >= 1, "num_samples must be >= 1, got ", num_samples);
     if (!replacement) {
-        TORCH_CHECK(num_samples <= probs.size(1),
-                    "num_samples must be <= vocab_size when replacement=False, got ", num_samples, " vs ", probs.size(1));
+        TORCH_CHECK(num_samples <= probs.size(1), "num_samples must be <= vocab_size when replacement=False, got ",
+                    num_samples, " vs ", probs.size(1));
     }
 
     if (num_samples == 1) {
@@ -52,7 +53,7 @@ at::Tensor multinomial_kunpeng(const at::Tensor &probs, int64_t num_samples, boo
     int64_t *result_data = result.data_ptr<int64_t>();
     int64_t stride = probs.stride(0);
 
-    at::parallel_for(0, batch, 1, [&](int64_t start, int64_t end) {
+    kutacc::parallel_for(0, batch, 1, [&](int64_t start, int64_t end) {
         std::mt19937 rng(std::random_device{}());
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         std::vector<float> cumsum(vocab);
