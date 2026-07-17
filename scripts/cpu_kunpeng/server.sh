@@ -61,11 +61,15 @@ BASE_ARGS=(
 
 if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
     BASE_ARGS+=(
-        --speculative-draft-model-path "$MODEL_PATH"
         --speculative-algorithm NEXTN
         --speculative-num-steps 1
         --speculative-eagle-topk 1
     )
+    # Use explicit draft model path if set; otherwise omit the argument
+    # (DeepSeek MTP falls back to MODEL_PATH automatically).
+    if [[ -n "$SPECULATIVE_DRAFT_MODEL_PATH" ]]; then
+        BASE_ARGS+=(--speculative-draft-model-path "$SPECULATIVE_DRAFT_MODEL_PATH")
+    fi
 fi
 
 # Role-specific arguments

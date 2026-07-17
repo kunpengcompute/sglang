@@ -93,6 +93,7 @@ LOG_BASE_DIR="/path-to-logs"
 CONDA_ENV_NAME="my_env"
 CONDA_BASE_PATH="/path-to-conda"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
+SPECULATIVE_DRAFT_MODEL_PATH=""
 
 export HPCKIT_PATH="/path-to-HPCKit"
 export OpenBLAS_PATH="/path-to-OpenBLAS"
