@@ -171,7 +171,7 @@ at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight
     int64_t k = input.size(1);
     TORCH_CHECK(weight.size(1) == k, "input.k != weight.k");
 
-    kutacc::MatrixTilingBlock t=bgemm_find_optimal_tiling_plan(m, n,k);
+    kutacc::MatrixTilingBlock t = bgemm_find_optimal_tiling_plan(m, n, k);
     auto [tile_m, tile_n, tile_k] = t;
 
     auto pack_bf16 = at::empty({m, k}, input.options());
@@ -252,7 +252,7 @@ at::Tensor bmm_kunpeng(const at::Tensor &input, const at::Tensor &weight)
     int64_t workspace_size = blocks_in_k * N * M * 2;
 
     int64_t grain = std::max(int64_t(1), B / at::get_num_threads());
-    at::parallel_for(0, B, grain, [&](int64_t start, int64_t end) {
+    kutacc::parallel_for(0, B, grain, [&](int64_t start, int64_t end) {
         auto local_packed = at::empty({M, K}, input.options());
         auto local_ws = at::empty({workspace_size}, input.options());
         bfloat16_t *local_tmpc = reinterpret_cast<bfloat16_t *>(local_ws.data_ptr());
