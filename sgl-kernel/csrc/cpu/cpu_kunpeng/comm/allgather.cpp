@@ -150,3 +150,43 @@ void shm_allgather_finalize_kunpeng()
     g_ag_initialized = false;
     std::cout << "[KuTACC] AllGather finalized" << std::endl;
 }
+
+// ---------------------------------------------------------------------------
+// RDMA full-mesh allgather wrappers
+//
+// These wrap kutacc::kurmcl_allgather_full_{init,finalize} and
+// kutacc::kurmcl_allgather_full.  They reuse the g_ds_conn_info created by
+// moe_comm_create_kunpeng (defined in kunpeng_moe.cpp), so
+// moe_comm_create_kunpeng must be called first.
+// ---------------------------------------------------------------------------
+
+void rdma_allgather_full_init_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size)
+{
+    TORCH_CHECK(g_comm_initialized, "RDMA communication domain not initialized");
+    TORCH_CHECK(g_ds_conn_info != nullptr, "g_ds_conn_info is null");
+
+    void *send_buf_ptr = reinterpret_cast<void *>(send_buf.data_ptr());
+    void *recv_buf_ptr = reinterpret_cast<void *>(recv_buf.data_ptr());
+
+    kutacc::kurmcl_allgather_full_init(send_buf_ptr, static_cast<int>(send_size), recv_buf_ptr,
+                                       static_cast<int>(recv_size), g_ds_conn_info);
+}
+
+void rdma_allgather_full_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size)
+{
+    TORCH_CHECK(g_comm_initialized, "RDMA communication domain not initialized");
+    TORCH_CHECK(g_ds_conn_info != nullptr, "g_ds_conn_info is null");
+
+    void *send_buf_ptr = reinterpret_cast<void *>(send_buf.data_ptr());
+    void *recv_buf_ptr = reinterpret_cast<void *>(recv_buf.data_ptr());
+
+    int ret = kutacc::kurmcl_allgather_full(send_buf_ptr, static_cast<int>(send_size), recv_buf_ptr,
+                                            static_cast<int>(recv_size), g_ds_conn_info);
+    TORCH_CHECK(ret == 0, "kurmcl_allgather_full failed with code ", ret);
+}
+
+void rdma_allgather_full_finalize_kunpeng()
+{
+    TORCH_CHECK(g_comm_initialized, "RDMA communication domain not initialized");
+    kutacc::kurmcl_allgather_full_finalize();
+}

@@ -143,6 +143,12 @@ void moe_comm_finalize_kunpeng();
 
 void moe_comm_barrier_kunpeng();
 
+void rdma_allgather_full_init_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size);
+
+void rdma_allgather_full_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size);
+
+void rdma_allgather_full_finalize_kunpeng();
+
 void moe_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor recv_src_info, at::Tensor recv_src_info_bak,
                                int64_t num_experts, int64_t num_max_dispatch_tokens_per_rank, int64_t hidden,
                                int64_t num_tokens, int64_t recv_src_info_count, int64_t dtp,
@@ -470,6 +476,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("moe_comm_barrier_kunpeng() -> ()");
     m.impl("moe_comm_barrier_kunpeng", moe_comm_barrier_kunpeng);
+
+    // RDMA full-mesh allgather (reuses the comm created by moe_comm_create_kunpeng)
+    m.def("rdma_allgather_full_init_kunpeng(Tensor send_buf, int send_size, Tensor recv_buf, int recv_size) -> ()");
+    m.impl("rdma_allgather_full_init_kunpeng", rdma_allgather_full_init_kunpeng);
+
+    m.def("rdma_allgather_full_kunpeng(Tensor send_buf, int send_size, Tensor recv_buf, int recv_size) -> ()");
+    m.impl("rdma_allgather_full_kunpeng", rdma_allgather_full_kunpeng);
+
+    m.def("rdma_allgather_full_finalize_kunpeng() -> ()");
+    m.impl("rdma_allgather_full_finalize_kunpeng", rdma_allgather_full_finalize_kunpeng);
 
     m.def(
         "moe_dispatch_init_kunpeng(Tensor dispatch_send_buf, Tensor recv_src_info, Tensor recv_src_info_bak, "

@@ -72,9 +72,25 @@ static c10d::ProcessGroup *get_process_group(void *group_ptr)
 
 static int do_allgather(c10d::ProcessGroup *pg, const void *sendbuf, void *recvbuf, int count, at::ScalarType dtype)
 {
+    int rank = pg->getRank();
+    int size = pg->getSize();
+    int64_t element_size = at::elementSize(dtype);
+
     auto opts = at::TensorOptions().device(at::kCPU).dtype(dtype);
+
+    // SLS/XPMEM pass sendbuf=nullptr for in-place allgather. Copy the local
+    // contribution to a temp buffer since c10d lacks MPI_IN_PLACE and aliasing
+    // recvbuf[rank] as sendbuf would overlap send/recv tensors.
+    std::vector<char> temp_send;
+    if (sendbuf == nullptr) {
+        size_t send_bytes = static_cast<size_t>(count) * element_size;
+        const char *local_src = static_cast<const char *>(recvbuf) + static_cast<size_t>(rank) * count * element_size;
+        temp_send.assign(local_src, local_src + send_bytes);
+        sendbuf = temp_send.data();
+    }
+
     auto send_tensor = at::from_blob(const_cast<void *>(sendbuf), {count}, opts);
-    auto recv_tensor = at::from_blob(recvbuf, {pg->getSize() * count}, opts);
+    auto recv_tensor = at::from_blob(recvbuf, {static_cast<int64_t>(size) * count}, opts);
 
     auto work = pg->_allgather_base(recv_tensor, send_tensor);
     if (!work) return -1;

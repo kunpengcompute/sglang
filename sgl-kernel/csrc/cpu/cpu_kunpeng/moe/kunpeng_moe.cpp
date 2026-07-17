@@ -34,8 +34,8 @@
 #define PREFILL_FUSEDMOE_TILEBUF 2048
 #define DECODE_FUSEDMOE_TILEBUF 256
 
-static kutacc::kurmcl_conn_info_h g_ds_conn_info = nullptr;
-static bool g_comm_initialized = false;
+kutacc::kurmcl_conn_info_h g_ds_conn_info = nullptr;
+bool g_comm_initialized = false;
 static int g_comm_size = 0;
 static int g_comm_rank = 0;
 static c10d::ProcessGroup *g_process_group = nullptr;

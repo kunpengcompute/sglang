@@ -49,9 +49,15 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detection = get_global_server_args().enable_nan_detection
-        self.tp_sync_group = get_tp_group().device_group
+        self.tp_sync_group = (
+            get_tp_group().cpu_group if _is_cpu_920f else get_tp_group().device_group
+        )
         if is_dp_attention_enabled():
-            self.tp_sync_group = get_attention_tp_group().device_group
+            self.tp_sync_group = (
+                get_attention_tp_group().cpu_group
+                if _is_cpu_920f
+                else get_attention_tp_group().device_group
+            )
 
         self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.

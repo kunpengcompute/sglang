@@ -134,7 +134,6 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_WARMUP_TIMEOUT=1600
 # Force query prefill DP rank, when disaggregation and curl -d is needed
 export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0
-export SGLANG_ENABLE_MTP=0
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
@@ -143,6 +142,8 @@ export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
 export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=1
+export SGLANG_KUNPENG_RDMA_ALLGATHER=0
+export SGLANG_ENABLE_MTP=0
 # Kunpeng SHM pool
 export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476
 export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=50
@@ -164,8 +165,9 @@ export DROP_CACHES=0
 # load local config
 # ------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USER_ENV_ROLE="${1:-native}"
 if [[ -f "$SCRIPT_DIR/.user_env.sh" ]]; then
-    source "$SCRIPT_DIR/.user_env.sh"
+    source "$SCRIPT_DIR/.user_env.sh" "$USER_ENV_ROLE"
 fi
 
 # ------------------------------------------------------------

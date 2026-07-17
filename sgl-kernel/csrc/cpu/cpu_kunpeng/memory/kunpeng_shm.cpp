@@ -131,9 +131,12 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
                          &kupl_intra_socket_comm);
     kupl_shm_comm_create(intra_die_size, intra_die_rank, pid, oob_cbs_h, g_intra_die_group, &kupl_intra_die_comm);
 
-    kupl_shm_win_alloc(64, kupl_intra_socket_comm, (void **)&kupl_intra_socketfence_baseptr, &kupl_win_intra_socket);
-    kupl_shm_win_alloc(64, kupl_intra_die_comm, (void **)&kupl_intra_diefence_baseptr, &kupl_win_intra_die);
-    kupl_shm_win_alloc(g_shm_size, kupl_intra_node_comm, (void **)&kupl_shm_baseptr, &kupl_win_intra_node);
+    int success = kupl_shm_win_alloc(64, kupl_intra_socket_comm, (void **)&kupl_intra_socketfence_baseptr,
+                                     &kupl_win_intra_socket);
+    success = kupl_shm_win_alloc(64, kupl_intra_die_comm, (void **)&kupl_intra_diefence_baseptr, &kupl_win_intra_die);
+    success = kupl_shm_win_alloc(g_shm_size, kupl_intra_node_comm, (void **)&kupl_shm_baseptr, &kupl_win_intra_node);
+
+    TORCH_CHECK(success == 0, "kupl_shm_win_alloc failed");
 
     memset(kupl_shm_baseptr, 0, g_shm_size);
 
