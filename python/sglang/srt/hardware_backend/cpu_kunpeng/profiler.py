@@ -84,5 +84,5 @@ class KunpengProfiler:
         return bound_method
 
 
-if envs.SGLANG_KUNPENG_PROFILE.get():
+if envs.SGLANG_USE_CPU_920F.get() and envs.SGLANG_KUNPENG_PROFILE.get():
     KunpengProfiler.enabled = True

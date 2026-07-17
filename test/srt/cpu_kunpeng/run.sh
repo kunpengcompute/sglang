@@ -34,6 +34,7 @@
 #   batch_allgather  -- SHM batched_allgather benchmark vs torch.distributed
 #   allreduce        -- SHM allreduce benchmark vs torch.distributed
 #   mla_alltoall     -- SHM MLA alltoall correctness + benchmark vs torch.distributed
+#   rdma_allgather   -- RDMA full-mesh allgather correctness + benchmark vs torch.distributed
 #
 # Options (environment variables):
 #   PYTHON        -- python interpreter       (default: python3)
@@ -87,9 +88,14 @@ case "${TEST_NAME}" in
         MASTER_PORT=8006
         TEST_LABEL="MLA alltoall correctness + benchmark"
         ;;
+    rdma_allgather)
+        TEST_FILE="${SCRIPT_DIR}/test_rdma_allgather.py"
+        MASTER_PORT=8007
+        TEST_LABEL="RDMA full-mesh allgather correctness + benchmark"
+        ;;
     *)
         echo "ERROR: unknown test '${TEST_NAME}'" >&2
-        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, mla_alltoall" >&2
+        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, mla_alltoall, rdma_allgather" >&2
         exit 1
         ;;
 esac
@@ -105,9 +111,9 @@ source ../../../scripts/cpu_kunpeng/env.sh native
 source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 
 export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
-export LD_LIBRARY_PATH=/usr/lib64/libibverbs:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=${KUPL_PATH}/lib:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/usr/lib64/libibverbs:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=${KUPL_PATH}/lib:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:${LD_LIBRARY_PATH}
 
 PYTHON="${PYTHON:-python3}"
 CPU_PER_RANK="${CPU_PER_RANK:-38}"

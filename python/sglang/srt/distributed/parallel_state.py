@@ -58,21 +58,21 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
-    is_cpu_920f,
     is_cuda_alike,
     is_hip,
     is_musa,
     is_npu,
     is_shm_available,
     is_xpu,
+    is_cpu_920f,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -300,15 +300,17 @@ class GroupCoordinator:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
             active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
+            device_group = None
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
-                device_group = torch.distributed.new_group(
-                    ranks,
-                    backend="mooncake",
-                    pg_options=MooncakeBackendOptions(active_ranks, recovered_rank),
-                    timeout=subgroup_timeout,
-                )
+                if not _is_cpu_920f:
+                    device_group = torch.distributed.new_group(
+                        ranks,
+                        backend="mooncake",
+                        pg_options=MooncakeBackendOptions(active_ranks, recovered_rank),
+                        timeout=subgroup_timeout,
+                    )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
@@ -317,12 +319,13 @@ class GroupCoordinator:
                 )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
-                device_group = torch.distributed.new_group(
-                    ranks,
-                    backend=torch_distributed_backend,
-                    pg_options=pg_options,
-                    timeout=subgroup_timeout,
-                )
+                if not _is_cpu_920f:
+                    device_group = torch.distributed.new_group(
+                        ranks,
+                        backend=torch_distributed_backend,
+                        pg_options=pg_options,
+                        timeout=subgroup_timeout,
+                    )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
@@ -338,7 +341,8 @@ class GroupCoordinator:
                 self.active_ranks_cpu = active_ranks_cpu
 
         assert self.cpu_group is not None
-        assert self.device_group is not None
+        if not _is_cpu_920f:
+            assert self.device_group is not None
 
         # Import communicators
         self.use_pynccl = use_pynccl
@@ -353,7 +357,8 @@ class GroupCoordinator:
             _is_cpu_920f
             and self.world_size < torch.distributed.get_world_size()  # attn_tp_group
             and self.world_size % 8 == 0  # attn_tp_size must be divisible by 8
-            and self.world_size <= 16  # only for attn_tp_group (size=16), not TP group (size=64)
+            and self.world_size
+            <= 16  # only for attn_tp_group (size=16), not TP group (size=64)
         )
 
         # Lazy import to avoid documentation build error
@@ -468,10 +473,17 @@ class GroupCoordinator:
         if self.use_kunpeng_communicator:
             self.kunpeng_communicator = KunpengCommunicator(group=self.cpu_group)
 
-        logger.debug(f"[DEBUG] [Communicator] group={group_name}"
-                    f"(cpu_group_size={self.cpu_group.size()}, device_group_size={self.device_group.size()}, "
-                    f"world_size={self.world_size}, backend={torch_distributed_backend}, "
-                    f"kunpeng_enabled={self.use_kunpeng_communicator})")
+        logger.debug(
+            "[DEBUG] [Communicator] group=%s"
+            "(cpu_group_size=%s, "
+            "world_size=%s, backend=%s, "
+            "kunpeng_enabled=%s)",
+            group_name,
+            self.cpu_group.size(),
+            self.world_size,
+            torch_distributed_backend,
+            self.use_kunpeng_communicator,
+        )
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
@@ -618,7 +630,10 @@ class GroupCoordinator:
             ):
                 torch.ops.sgl_kernel.shm_allreduce_kunpeng(input_)
             else:
-                torch.distributed.all_reduce(input_, group=self.device_group)
+                torch.distributed.all_reduce(
+                    input_,
+                    group=self.cpu_group if _is_cpu_920f else self.device_group,
+                )
             return input_
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
@@ -769,7 +784,10 @@ class GroupCoordinator:
         elif torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
             torch_symm_mem_comm.all_reduce(input_)
         else:
-            torch.distributed.all_reduce(input_, group=self.device_group)
+            torch.distributed.all_reduce(
+                input_,
+                group=self.cpu_group if _is_cpu_920f else self.device_group,
+            )
 
     def _reduce_scatter_tensor(
         self,
@@ -787,7 +805,9 @@ class GroupCoordinator:
                 pynccl_comm.reduce_scatter(output, input)
         else:
             torch.distributed.reduce_scatter_tensor(
-                output, input, group=self.device_group
+                output,
+                input,
+                group=self.cpu_group if _is_cpu_920f else self.device_group,
             )
         return output
 
@@ -810,7 +830,11 @@ class GroupCoordinator:
         input_list: List[torch.Tensor],
     ) -> None:
         # TODO(ch-wan): support other backends
-        torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
+        torch.distributed.reduce_scatter(
+            output,
+            input_list,
+            group=self.cpu_group if _is_cpu_920f else self.device_group,
+        )
         return output
 
     def reduce_scatterv(
@@ -858,7 +882,9 @@ class GroupCoordinator:
                 pynccl_comm.all_gather(output, input)
         else:
             torch.distributed.all_gather_into_tensor(
-                output, input, group=self.device_group
+                output,
+                input,
+                group=self.cpu_group if _is_cpu_920f else self.device_group,
             )
 
     @KunpengProfiler(depth=2)
@@ -912,7 +938,11 @@ class GroupCoordinator:
                 flat_output = flat_output.reshape(
                     [self.world_size, input_.shape[0]] + list(input_.size()[1:])
                 )
-                output.copy_(flat_output.permute(1, 0, *range(2, flat_output.dim())).reshape(output.shape))
+                output.copy_(
+                    flat_output.permute(1, 0, *range(2, flat_output.dim())).reshape(
+                        output.shape
+                    )
+                )
 
         return output
 
@@ -954,7 +984,9 @@ class GroupCoordinator:
         if output_tensor_list is not None:
             # TODO(ch-wan): support other backends
             return torch.distributed.all_gather(
-                output_tensor_list, input_, group=self.device_group
+                output_tensor_list,
+                input_,
+                group=self.cpu_group if _is_cpu_920f else self.device_group,
             )
 
         assert (
@@ -994,15 +1026,16 @@ class GroupCoordinator:
             elif (
                 self.use_kunpeng_communicator
                 and input_.shape[0] > 0
-                and input_.shape[0]
-                <= self.kunpeng_communicator.max_tokens
+                and input_.shape[0] <= self.kunpeng_communicator.max_tokens
             ):
                 self.kunpeng_communicator.shm_all_gather_into_tensor(
                     input_, output_tensor
                 )
             else:
                 torch.distributed.all_gather_into_tensor(
-                    output_tensor, input_, group=self.device_group
+                    output_tensor,
+                    input_,
+                    group=self.cpu_group if _is_cpu_920f else self.device_group,
                 )
         else:
             self.all_gather_into_tensor(output_tensor, input_)
@@ -1096,7 +1129,10 @@ class GroupCoordinator:
             gather_list = None
         # Gather.
         torch.distributed.gather(
-            input_, gather_list, dst=self.ranks[dst], group=self.device_group
+            input_,
+            gather_list,
+            dst=self.ranks[dst],
+            group=self.cpu_group if _is_cpu_920f else self.device_group,
         )
         if self.rank_in_group == dst:
             output_tensor = torch.cat(gather_list, dim=dim)
@@ -1115,7 +1151,9 @@ class GroupCoordinator:
             return input_
         # Broadcast.
         torch.distributed.broadcast(
-            input_, src=self.ranks[src], group=self.device_group
+            input_,
+            src=self.ranks[src],
+            group=self.cpu_group if _is_cpu_920f else self.device_group,
         )
         return input_
 
@@ -1156,7 +1194,9 @@ class GroupCoordinator:
             return obj_list
         # Broadcast.
         torch.distributed.broadcast_object_list(
-            obj_list, src=self.ranks[src], group=self.device_group
+            obj_list,
+            src=self.ranks[src],
+            group=self.cpu_group if _is_cpu_920f else self.device_group,
         )
         return obj_list
 
@@ -1264,7 +1304,7 @@ class GroupCoordinator:
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return tensor_dict
 
-        group = self.device_group
+        group = self.cpu_group if _is_cpu_920f else self.device_group
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
 
@@ -1351,7 +1391,7 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        group = self.device_group
+        group = self.cpu_group if _is_cpu_920f else self.device_group
         metadata_group = self.cpu_group
 
         if dst is None:
@@ -1404,7 +1444,7 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        group = self.device_group
+        group = self.cpu_group if _is_cpu_920f else self.device_group
         metadata_group = self.cpu_group
 
         if src is None:
@@ -1466,7 +1506,11 @@ class GroupCoordinator:
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.send(tensor, dst)
         else:
-            torch.distributed.send(tensor, self.ranks[dst], self.device_group)
+            torch.distributed.send(
+                tensor,
+                self.ranks[dst],
+                self.cpu_group if _is_cpu_920f else self.device_group,
+            )
 
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
@@ -1481,7 +1525,11 @@ class GroupCoordinator:
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.recv(tensor, src)
         else:
-            torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+            torch.distributed.recv(
+                tensor,
+                self.ranks[src],
+                self.cpu_group if _is_cpu_920f else self.device_group,
+            )
         return tensor
 
     def destroy(self):
@@ -1924,7 +1972,10 @@ def initialize_model_parallel(
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    _world_group = get_world_group()
+    backend = backend or torch.distributed.get_backend(
+        _world_group.cpu_group if _is_cpu_920f else _world_group.device_group
+    )
 
     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
         raise RuntimeError(
@@ -1948,8 +1999,15 @@ def initialize_model_parallel(
         group_ranks.append(ranks)
 
     # message queue broadcaster is only used in tensor model parallel group
-    logger.debug(f"[DEBUG] [TP Group] world_size={world_size}, tp_size={tensor_model_parallel_size}, "
-                f"num_tp_groups={num_tensor_model_parallel_groups}, backend={backend}, group_ranks={group_ranks}")
+    logger.debug(
+        "[DEBUG] [TP Group] world_size=%s, tp_size=%s, "
+        "num_tp_groups=%s, backend=%s, group_ranks=%s",
+        world_size,
+        tensor_model_parallel_size,
+        num_tensor_model_parallel_groups,
+        backend,
+        group_ranks,
+    )
     _TP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -1985,7 +2043,11 @@ def initialize_model_parallel(
         _ATTN_CP is None
     ), "attention context model parallel group is already initialized"
     if attn_cp_size == tensor_model_parallel_size:
-        logger.debug(f"[DEBUG] [ATTN_CP Group] reuse TP group (attn_cp_size==tp_size={attn_cp_size}), backend={backend}")
+        logger.debug(
+            "[DEBUG] [ATTN_CP Group] reuse TP group (attn_cp_size==tp_size=%s), backend=%s",
+            attn_cp_size,
+            backend,
+        )
         _ATTN_CP = _TP
     else:
         group_ranks = []
@@ -2004,8 +2066,15 @@ def initialize_model_parallel(
                     )
                     ranks = list(range(st, en, attn_tp_size))
                     group_ranks.append(ranks)
-        logger.debug(f"[DEBUG] [ATTN_CP Group] world_size={world_size}, attn_cp_size={attn_cp_size}, "
-                    f"num_attn_cp_groups={len(group_ranks)}, backend={backend}, group_ranks={group_ranks}")
+        logger.debug(
+            "[DEBUG] [ATTN_CP Group] world_size=%s, attn_cp_size=%s, "
+            "num_attn_cp_groups=%s, backend=%s, group_ranks=%s",
+            world_size,
+            attn_cp_size,
+            len(group_ranks),
+            backend,
+            group_ranks,
+        )
         _ATTN_CP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2022,7 +2091,11 @@ def initialize_model_parallel(
         _ATTN_TP is None
     ), "attention tensor model parallel group is already initialized"
     if attn_tp_size == tensor_model_parallel_size:
-        logger.debug(f"[DEBUG] [ATTN_TP Group] reuse TP group (attn_tp_size==tp_size={attn_tp_size}), backend={backend}")
+        logger.debug(
+            "[DEBUG] [ATTN_TP Group] reuse TP group (attn_tp_size==tp_size=%s), backend=%s",
+            attn_tp_size,
+            backend,
+        )
         _ATTN_TP = _TP
     else:
         group_ranks = []
@@ -2039,8 +2112,15 @@ def initialize_model_parallel(
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
 
-        logger.debug(f"[DEBUG] [ATTN_TP Group] world_size={world_size}, attn_tp_size={attn_tp_size}, "
-                    f"num_attn_tp_groups={len(group_ranks)}, backend={backend}, group_ranks={group_ranks}")
+        logger.debug(
+            "[DEBUG] [ATTN_TP Group] world_size=%s, attn_tp_size=%s, "
+            "num_attn_tp_groups=%s, backend=%s, group_ranks=%s",
+            world_size,
+            attn_tp_size,
+            len(group_ranks),
+            backend,
+            group_ranks,
+        )
         _ATTN_TP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2087,10 +2167,19 @@ def initialize_model_parallel(
         # When moe_dp_size < attn_cp_size, CP ranks must share tokens before MoE.
         # The MOE_DP group includes these CP partners, so the existing DP
         # allgather/scatter handles the token sharing.
-        logger.debug(f"[DEBUG] [MOE_DP Group] reuse ATTN_CP group (attn_cp_size={attn_cp_size} > moe_dp_size={moe_dp_size}), backend={backend}")
+        logger.debug(
+            "[DEBUG] [MOE_DP Group] reuse ATTN_CP group (attn_cp_size=%s > moe_dp_size=%s), backend=%s",
+            attn_cp_size,
+            moe_dp_size,
+            backend,
+        )
         _MOE_DP = _ATTN_CP
     elif moe_dp_size == tensor_model_parallel_size:
-        logger.debug(f"[DEBUG] [MOE_DP Group] reuse TP group (moe_dp_size==tp_size={moe_dp_size}), backend={backend}")
+        logger.debug(
+            "[DEBUG] [MOE_DP Group] reuse TP group (moe_dp_size==tp_size=%s), backend=%s",
+            moe_dp_size,
+            backend,
+        )
         _MOE_DP = _TP
     else:
         group_ranks = []
@@ -2102,8 +2191,15 @@ def initialize_model_parallel(
                 ) * tensor_model_parallel_size + tp_ep_combined_idx
                 ranks = list(range(st, en, moe_tp_size * moe_ep_size))
                 group_ranks.append(ranks)
-        logger.debug(f"[DEBUG] [MOE_DP Group] world_size={world_size}, moe_dp_size={moe_dp_size}, "
-                    f"num_moe_dp_groups={len(group_ranks)}, backend={backend}, group_ranks={group_ranks}")
+        logger.debug(
+            "[DEBUG] [MOE_DP Group] world_size=%s, moe_dp_size=%s, "
+            "num_moe_dp_groups=%s, backend=%s, group_ranks=%s",
+            world_size,
+            moe_dp_size,
+            len(group_ranks),
+            backend,
+            group_ranks,
+        )
         _MOE_DP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2115,7 +2211,11 @@ def initialize_model_parallel(
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
     if moe_ep_size == tensor_model_parallel_size:
-        logger.debug(f"[DEBUG] [MOE_EP Group] reuse TP group (moe_ep_size==tp_size={moe_ep_size}), backend={backend}")
+        logger.debug(
+            "[DEBUG] [MOE_EP Group] reuse TP group (moe_ep_size==tp_size=%s), backend=%s",
+            moe_ep_size,
+            backend,
+        )
         _MOE_EP = _TP
     else:
         group_ranks = []
@@ -2130,8 +2230,15 @@ def initialize_model_parallel(
                     en = st + moe_ep_size * moe_tp_size
                     ranks = list(range(st, en, moe_tp_size))
                     group_ranks.append(ranks)
-        logger.debug(f"[DEBUG] [MOE_EP Group] world_size={world_size}, moe_ep_size={moe_ep_size}, "
-                    f"num_moe_ep_groups={len(group_ranks)}, backend={backend}, group_ranks={group_ranks}")
+        logger.debug(
+            "[DEBUG] [MOE_EP Group] world_size=%s, moe_ep_size=%s, "
+            "num_moe_ep_groups=%s, backend=%s, group_ranks=%s",
+            world_size,
+            moe_ep_size,
+            len(group_ranks),
+            backend,
+            group_ranks,
+        )
         _MOE_EP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2145,7 +2252,11 @@ def initialize_model_parallel(
     global _MOE_TP
     assert _MOE_TP is None, "expert model parallel group is already initialized"
     if moe_tp_size == tensor_model_parallel_size:
-        logger.debug(f"[DEBUG] [MOE_TP Group] reuse TP group (moe_tp_size==tp_size={moe_tp_size}), backend={backend}")
+        logger.debug(
+            "[DEBUG] [MOE_TP Group] reuse TP group (moe_tp_size==tp_size=%s), backend=%s",
+            moe_tp_size,
+            backend,
+        )
         _MOE_TP = _TP
     else:
         group_ranks = []
@@ -2161,8 +2272,15 @@ def initialize_model_parallel(
                 )
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
-        logger.debug(f"[DEBUG] [MOE_TP Group] world_size={world_size}, moe_tp_size={moe_tp_size}, "
-                    f"num_moe_tp_groups={len(group_ranks)}, backend={backend}, group_ranks={group_ranks}")
+        logger.debug(
+            "[DEBUG] [MOE_TP Group] world_size=%s, moe_tp_size=%s, "
+            "num_moe_tp_groups=%s, backend=%s, group_ranks=%s",
+            world_size,
+            moe_tp_size,
+            len(group_ranks),
+            backend,
+            group_ranks,
+        )
         _MOE_TP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2184,8 +2302,15 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
     # pipeline parallel does not need custom allreduce
-    logger.debug(f"[DEBUG] [PP Group] world_size={world_size}, pp_size={pipeline_model_parallel_size}, "
-                f"num_pp_groups={num_pipeline_model_parallel_groups}, backend={backend}, group_ranks={group_ranks}")
+    logger.debug(
+        "[DEBUG] [PP Group] world_size=%s, pp_size=%s, "
+        "num_pp_groups=%s, backend=%s, group_ranks=%s",
+        world_size,
+        pipeline_model_parallel_size,
+        num_pipeline_model_parallel_groups,
+        backend,
+        group_ranks,
+    )
     _PP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -2255,7 +2380,10 @@ def ensure_model_parallel_initialized(
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
     values if the model parallel groups are initialized.
     """
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    _world_group = get_world_group()
+    backend = backend or torch.distributed.get_backend(
+        _world_group.cpu_group if _is_cpu_920f else _world_group.device_group
+    )
     if not model_parallel_is_initialized():
         initialize_model_parallel(
             tensor_model_parallel_size,

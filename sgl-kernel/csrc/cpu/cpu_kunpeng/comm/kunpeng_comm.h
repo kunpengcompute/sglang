@@ -23,6 +23,45 @@
 #include <ATen/ATen.h>
 #include <cstdint>
 
+#include <kutacc.h>
+
+/**
+ * Global RDMA communication domain state.
+ *
+ * Defined in kunpeng_moe.cpp and initialized by moe_comm_create_kunpeng().
+ * Accessed by the RDMA allgather wrappers in allgather.cpp.
+ */
+extern kutacc::kurmcl_conn_info_h g_ds_conn_info;
+extern bool g_comm_initialized;
+
+/**
+ * Initialize the persistent RDMA full-mesh allgather resources (register MR
+ * and exchange remote addresses via OOB).  Must be called after
+ * moe_comm_create_kunpeng().  Reuses g_ds_conn_info.
+ *
+ * @param send_buf  Per-rank send buffer (registered with the NIC).
+ * @param send_size Per-rank send size in bytes.
+ * @param recv_buf  Receive buffer (comm_size * send_size bytes, registered with the NIC).
+ * @param recv_size Per-rank recv size in bytes (must equal send_size).
+ */
+void rdma_allgather_full_init_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size);
+
+/**
+ * Execute one RDMA full-mesh allgather round.  Buffers must have been
+ * registered via rdma_allgather_full_init_kunpeng().
+ *
+ * @param send_buf  Per-rank send buffer (same one passed to _init).
+ * @param send_size Per-rank send size in bytes.
+ * @param recv_buf  Receive buffer (same one passed to _init).
+ * @param recv_size Per-rank recv size in bytes.
+ */
+void rdma_allgather_full_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size);
+
+/**
+ * Release the RDMA allgather resources (deregister MR, free remote buf).
+ */
+void rdma_allgather_full_finalize_kunpeng();
+
 /**
  * Initialize the SHM reduce-scatter request.
  * Called automatically at the end of shm_pool_create_kunpeng().
@@ -73,8 +112,8 @@ void shm_allreduce_finalize_kunpeng();
  * @param num_local_heads Number of attention heads per rank (= total_heads / group_size).
  * @param num_heads       Total number of attention heads.
  */
-void shm_mla_alltoall_init_kunpeng(int64_t group_size, int64_t max_tokens, int64_t qk_head_dim,
-                                   int64_t kv_lora_rank, int64_t num_local_heads, int64_t num_heads);
+void shm_mla_alltoall_init_kunpeng(int64_t group_size, int64_t max_tokens, int64_t qk_head_dim, int64_t kv_lora_rank,
+                                   int64_t num_local_heads, int64_t num_heads);
 
 /**
  * Phase 1: copy Q data into the SHM buffer and issue a fence.

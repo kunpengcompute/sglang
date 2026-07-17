@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -8,10 +9,11 @@ import torch
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.common import is_cpu_920f, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -19,6 +21,74 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_is_cpu_920f = is_cpu_920f()
+_use_rdma_allgather = envs.SGLANG_KUNPENG_RDMA_ALLGATHER.get()
+
+# ---------------------------------------------------------------------------
+# Persistent RDMA allgather buffers for the DP-attention sync info tensor.
+#
+# `rdma_allgather_full_kunpeng` requires its send/recv buffers to be registered
+# with the RDMA NIC via `rdma_allgather_full_init_kunpeng`.  Re-registering on
+# every forward would be expensive, so we keep a pair of persistent buffers per
+# (device, comm_size, per_rank_bytes) key and register them lazily on first use.
+#
+# The global `g_ds_conn_info` RDMA communication domain is assumed to already
+# have been created by `moe_comm_create_kunpeng` during MoE token-dispatcher
+# initialization.
+# ---------------------------------------------------------------------------
+_RDMA_AG_LOCK = threading.Lock()
+_RDMA_AG_STATE: dict[tuple, dict] = {}
+
+
+def _rdma_allgather_info_kunpeng(
+    local_info_tensor: torch.Tensor,
+    global_info_tensor: torch.Tensor,
+    comm_size: int,
+) -> None:
+    """Full-mesh RDMA allgather using a persistent registered buffer.
+
+    Args:
+        local_info_tensor: per-rank contribution, shape [6], dtype int64.
+        global_info_tensor: output buffer, shape [comm_size, 6], dtype int64,
+            flattened for the copy-out step.
+        comm_size: number of ranks in the RDMA communication domain.
+    """
+    send_size_bytes = (
+        local_info_tensor.element_size() * local_info_tensor.numel()
+    )  # 48 bytes
+    recv_size_bytes = send_size_bytes  # per-rank recv size == send size
+
+    device = local_info_tensor.device
+    key = (str(device), comm_size, send_size_bytes)
+
+    with _RDMA_AG_LOCK:
+        state = _RDMA_AG_STATE.get(key)
+        if state is None:
+            # Persistent buffers live for the lifetime of the process; they are
+            # viewed as int64 for the copy in/out below but registered with the
+            # NIC as raw byte ranges.
+            send_buf = torch.empty(send_size_bytes, dtype=torch.uint8, device=device)
+            recv_buf = torch.empty(
+                comm_size * send_size_bytes, dtype=torch.uint8, device=device
+            )
+            torch.ops.sgl_kernel.rdma_allgather_full_init_kunpeng(
+                send_buf, send_size_bytes, recv_buf, recv_size_bytes
+            )
+            state = {"send_buf": send_buf, "recv_buf": recv_buf}
+            _RDMA_AG_STATE[key] = state
+        send_buf = state["send_buf"]
+        recv_buf = state["recv_buf"]
+
+    # Copy current-round data into the persistent send buffer, then run RDMA
+    # allgather.  The recv buffer holds the concatenation of all ranks'
+    # contributions ordered by rank index.
+    send_buf.view(torch.int64).copy_(local_info_tensor)
+    torch.ops.sgl_kernel.rdma_allgather_full_kunpeng(
+        send_buf, send_size_bytes, recv_buf, recv_size_bytes
+    )
+
+    # Copy the gathered result into the caller-provided output tensor.
+    global_info_tensor.view(-1).copy_(recv_buf.view(torch.int64))
 
 
 @dataclass
@@ -70,6 +140,7 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
+    @KunpengProfiler(depth=1)
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
@@ -78,11 +149,17 @@ class MLPSyncBatchInfo:
             device=device,
         )
 
-        torch.distributed.all_gather_into_tensor(
-            global_info_tensor.flatten(),
-            local_info_tensor,
-            group=group,
-        )
+        if _is_cpu_920f and _use_rdma_allgather:
+            comm_size = self.dp_size * self.tp_size * self.cp_size
+            _rdma_allgather_info_kunpeng(
+                local_info_tensor, global_info_tensor, comm_size
+            )
+        else:
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor.flatten(),
+                local_info_tensor,
+                group=group,
+            )
         if device == "cpu":
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
