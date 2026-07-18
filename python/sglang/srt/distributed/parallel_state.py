@@ -499,10 +499,6 @@ class GroupCoordinator:
                 self.use_kunpeng_pp_communicator,
             )
 
-        logger.debug(f"[DEBUG] [Communicator] group={group_name}"
-                    f"(cpu_group_size={self.cpu_group.size()}, device_group_size={self.device_group.size()}, "
-                    f"world_size={self.world_size}, backend={torch_distributed_backend}, "
-                    f"kunpeng_enabled={self.use_kunpeng_communicator})")
         logger.debug(
             "[DEBUG] [Communicator] group=%s"
             "(cpu_group_size=%s, "

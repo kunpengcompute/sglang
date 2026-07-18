@@ -261,6 +261,13 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
+    # Fallback Kunpeng 920F where device_group is not initialized in "GroupCoordinator 
+    # mooncake init".  Without this, all_gather_into_tensor receives group=None and
+    # silently falls back to the world group, causing size mismatch when PP>1
+    if group is None:
+        group = tp_group.cpu_group
+        device = "cpu"
+
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
 
     mlp_sync_info = MLPSyncBatchInfo(
