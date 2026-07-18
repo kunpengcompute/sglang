@@ -259,3 +259,71 @@ class KunpengCommunicator:
         kernel.shm_allgather_finalize_kunpeng()
         kernel.shm_allreduce_finalize_kunpeng()
         kernel.shm_pool_destroy_kunpeng()
+
+
+class KunpengPPCommunicator:
+    """Pipeline parallel P2P communicator using kutacc pp_put/pp_recv.
+
+    Replaces Gloo's isend/irecv for cross-node PP activation transfer.
+    Creates a separate global kurmcl communication domain (distinct from the
+    MoE sub-domain) to avoid RDMA resource conflicts.
+
+    """
+
+    def __init__(self, pp_group: dist.ProcessGroup, global_group: dist.ProcessGroup,
+                 pp_ranks: list = None, max_buf_bytes: int = 256 * 1024 * 1024):
+        self.pp_group = pp_group
+        self.global_group = global_group
+        self.comm_size = pp_group.size()
+        self.comm_rank = pp_group.rank()
+        self.max_buf_bytes = max_buf_bytes
+        self.buffer = torch.empty(max_buf_bytes, dtype=torch.uint8)
+        self._pp_initialized = False
+        # pp_ranks[local_rank] = world_rank, used to convert PP local rank
+        # to world rank for pp_put/pp_recv in the global domain.
+        self.pp_ranks = pp_ranks or list(range(self.comm_size))
+
+        # Domain creation and pp_init are deferred to init_pp_domain(),
+        # called after MoE _init_rdma_comm creates both domains together.
+
+    def init_pp_domain(self):
+        """Call pp_init after MoE sub-domain is created.
+
+        The global kurmcl domain is already created in _init_rdma_comm
+        via moe_comm_create_all_kunpeng (together with the MoE sub-domain).
+        This function only does pp_init (buffer registration + MR exchange).
+        """
+        if self._pp_initialized:
+            return
+
+        global_pg_ptr = pg_helper.get_process_group_ptr(self.global_group)
+        # pp_init (registers buffer, exchanges MR info, barriers)
+        kernel.pp_comm_init_kunpeng(self.buffer, global_pg_ptr)
+        self._pp_initialized = True
+        logger.debug(
+            "[KunpengPPCommunicator] pp_init OK "
+            "(rank=%s, buf_size=%s)",
+            dist.get_rank(), self.max_buf_bytes,
+        )
+
+    def copy_to_buffer(self, tensor: torch.Tensor, offset: int = 0):
+        """Copy tensor data into the PP buffer at the given offset."""
+        kernel.pp_copy_to_buffer_kunpeng(tensor, offset)
+
+    def copy_from_buffer(self, tensor: torch.Tensor, offset: int = 0):
+        """Copy data from the PP buffer at the given offset into tensor."""
+        kernel.pp_copy_from_buffer_kunpeng(tensor, offset)
+
+    def send_batch(self, dst_rank: int, total_size: int):
+        """Single pp_put for all data already copied to the buffer."""
+        world_rank = self.pp_ranks[dst_rank]
+        kernel.pp_send_batch_kunpeng(world_rank, total_size)
+
+    def recv_batch(self, src_rank: int, total_size: int):
+        """Single pp_recv for all data expected in the buffer."""
+        world_rank = self.pp_ranks[src_rank]
+        kernel.pp_recv_batch_kunpeng(world_rank, total_size)
+
+    def __del__(self):
+        if hasattr(self, "buffer"):
+            kernel.pp_comm_finalize_kunpeng()

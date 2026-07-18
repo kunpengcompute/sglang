@@ -214,7 +214,27 @@ def _ensure_rdma_initialized(
         state.combine_initialized = True
 
         state.rdma_initialized = True
-        logger.info(f"[KunpengMoE rank={state.ep_rank}] Global RDMA state initialized")
+        logger.info(
+            "[KunpengMoE] Global RDMA state initialized (ep_rank=%s)",
+            state.ep_rank,
+        )
+
+        from sglang.srt.distributed.parallel_state import get_pp_group
+        try:
+            pp_group = get_pp_group()
+            if pp_group.kunpeng_pp_communicator is not None:
+                pp_group.kunpeng_pp_communicator.init_pp_domain()
+                logger.info(
+                    "[KunpengMoE] PP domain initialized, pp_init done "
+                    "(ep_rank=%s)",
+                    state.ep_rank,
+                )
+        except Exception as e:
+            logger.warning(
+                "[KunpengMoE] PP domain init skipped "
+                "(ep_rank=%s, error=%s)",
+                state.ep_rank, e,
+            )
 
     return state
 
@@ -226,14 +246,38 @@ def _ensure_rdma_initialized(
 
 def _init_rdma_comm(group: dist.ProcessGroup, ep_size: int, ep_rank: int):
     from sgl_kernel import pg_helper
+    from sglang.srt.distributed.parallel_state import get_world_group, get_pp_group
 
     pg_ptr = pg_helper.get_process_group_ptr(group)
     logger.info(
-        f"[KunpengMoE rank={ep_rank}] _init_rdma_comm: "
-        f"pg_ptr=0x{pg_ptr:x}, ep_size={ep_size}, ep_rank={ep_rank}"
+        "[KunpengMoE] _init_rdma_comm "
+        "(pg_ptr=0x%s, ep_size=%s, ep_rank=%s)",
+        format(pg_ptr, "x"), ep_size, ep_rank,
     )
 
-    torch.ops.sgl_kernel.moe_comm_create_kunpeng(pg_ptr)
+    try:
+        pp_group = get_pp_group()
+        use_kunpeng_pp = (
+            pp_group.kunpeng_pp_communicator is not None
+            and pp_group.use_kunpeng_pp_communicator
+        )
+    except Exception:
+        use_kunpeng_pp = False
+
+    if use_kunpeng_pp:
+        world_group = get_world_group()
+        global_pg_ptr = pg_helper.get_process_group_ptr(world_group.cpu_group)
+        torch.ops.sgl_kernel.moe_comm_create_all_kunpeng(global_pg_ptr, pg_ptr)
+        logger.info(
+            "[KunpengMoE] MoE global + sub-domain created (ep_rank=%s)",
+            ep_rank,
+        )
+    else:
+        torch.ops.sgl_kernel.moe_comm_create_kunpeng(pg_ptr)
+        logger.info(
+            "[KunpengMoE] MoE sub-domain created, no global (ep_rank=%s)",
+            ep_rank,
+        )
 
 
 def _init_buffers(state: _KunpengDispatcherState):

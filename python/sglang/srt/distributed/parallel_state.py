@@ -473,6 +473,36 @@ class GroupCoordinator:
         if self.use_kunpeng_communicator:
             self.kunpeng_communicator = KunpengCommunicator(group=self.cpu_group)
 
+        # PP P2P communicator using kutacc pp_put/pp_recv
+        self.use_kunpeng_pp_communicator = (
+            _is_cpu_920f
+            and group_name == "pp"
+            and self.world_size > 1
+        )
+        self.kunpeng_pp_communicator: Optional[Any] = None
+        if self.use_kunpeng_pp_communicator:
+            from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
+                KunpengPPCommunicator,
+            )
+            
+            from sglang.srt.distributed.parallel_state import get_world_group
+            world_group = get_world_group()
+            self.kunpeng_pp_communicator = KunpengPPCommunicator(
+                pp_group=self.cpu_group,
+                global_group=world_group.cpu_group,
+                pp_ranks=self.ranks,
+            )
+            logger.debug(
+                "[DEBUG] [PP Communicator] group=%s "
+                "(pp_size=%s, pp_rank=%s, kunpeng_pp_enabled=%s)",
+                group_name, self.world_size, self.rank_in_group,
+                self.use_kunpeng_pp_communicator,
+            )
+
+        logger.debug(f"[DEBUG] [Communicator] group={group_name}"
+                    f"(cpu_group_size={self.cpu_group.size()}, device_group_size={self.device_group.size()}, "
+                    f"world_size={self.world_size}, backend={torch_distributed_backend}, "
+                    f"kunpeng_enabled={self.use_kunpeng_communicator})")
         logger.debug(
             "[DEBUG] [Communicator] group=%s"
             "(cpu_group_size=%s, "
@@ -1412,19 +1442,57 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
 
-        for tensor in tensor_list:
-            if tensor.numel() == 0:
-                # Skip sending empty tensors.
-                continue
+        # Use kutacc pp_put for CPU tensor P2P transfer when available
+        use_kutacc_pp = (
+            self.use_kunpeng_pp_communicator
+            and self.kunpeng_pp_communicator is not None
+        )
 
-            # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
-                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+        if use_kutacc_pp:
+            for w in p2p_works:
+                if w.work is not None:
+                    w.work.wait()
+            p2p_works = []
+            pp_offset = 0
+            has_kutacc_tensors = False
+            kutacc_tensors = []  # (offset, tensor) pairs for async work tracking
 
-            comm_group = metadata_group if tensor.is_cpu else group
-            work = send_func(tensor, self.ranks[dst], group=comm_group)
-            if async_send:
-                p2p_works.append(P2PWork(work, tensor))
+            for idx, tensor in enumerate(tensor_list):
+                if tensor.numel() == 0:
+                    continue
+                if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                if tensor.is_cpu:
+                    if not tensor.is_contiguous():
+                        tensor = tensor.contiguous()
+                    self.kunpeng_pp_communicator.copy_to_buffer(
+                        tensor, offset=pp_offset
+                    )
+                    kutacc_tensors.append((pp_offset, tensor))
+                    pp_offset += tensor.nbytes
+                    has_kutacc_tensors = True
+                else:
+                    comm_group = metadata_group if tensor.is_cpu else group
+                    work = send_func(tensor, self.ranks[dst], group=comm_group)
+                    if async_send:
+                        p2p_works.append(P2PWork(work, tensor))
+
+            if has_kutacc_tensors:
+                self.kunpeng_pp_communicator.send_batch(
+                    dst_rank=dst, total_size=pp_offset
+                )
+                if async_send:
+                    p2p_works.append(P2PWork(None, None))
+        else:
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    continue
+                if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                comm_group = metadata_group if tensor.is_cpu else group
+                work = send_func(tensor, self.ranks[dst], group=comm_group)
+                if async_send:
+                    p2p_works.append(P2PWork(work, tensor))
         return p2p_works
 
     def recv_tensor_dict(
@@ -1453,38 +1521,102 @@ class GroupCoordinator:
 
         recv_metadata_list = self.recv_object(src=src)
         tensor_dict: Dict[str, Any] = {}
-        for key, value in recv_metadata_list:
-            if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
-                if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
+
+        # Use kutacc pp_recv for CPU tensor P2P transfer when available
+        use_kutacc_pp = (
+            self.use_kunpeng_pp_communicator
+            and self.kunpeng_pp_communicator is not None
+        )
+
+        if use_kutacc_pp:
+            # Batch mode: first collect all CPU tensor metadata, then do a
+            # single pp_recv, then copy data from buffer to each tensor.
+            recv_list = []  # (key, tensor, use_all_gather, orig_shape)
+            pp_offset = 0
+            has_kutacc_tensors = False
+
+            for key, value in recv_metadata_list:
+                if isinstance(value, TensorMetadata):
+                    tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                    if tensor.numel() == 0:
+                        tensor_dict[key] = tensor
+                        continue
+
+                    use_all_gather = (
+                        all_gather_group is not None
+                        and tensor.numel() % all_gather_size == 0
+                    )
+                    if use_all_gather:
+                        orig_shape = tensor.shape
+                        tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                    else:
+                        orig_shape = None
+
+                    if tensor.is_cpu:
+                        if not tensor.is_contiguous():
+                            tensor = tensor.contiguous()
+                        recv_list.append((key, tensor, use_all_gather, orig_shape, pp_offset))
+                        pp_offset += tensor.nbytes
+                        has_kutacc_tensors = True
+                    else:
+                        comm_group = metadata_group if tensor.is_cpu else group
+                        work = torch.distributed.irecv(
+                            tensor, src=self.ranks[src], group=comm_group
+                        )
+                        work.wait()
+                        if use_all_gather:
+                            tensor = all_gather_group.all_gather(tensor, dim=0)
+                            tensor = tensor.reshape(orig_shape)
+                        tensor_dict[key] = tensor
+                else:
+                    tensor_dict[key] = value
+
+            if has_kutacc_tensors:
+                self.kunpeng_pp_communicator.recv_batch(
+                    src_rank=src, total_size=pp_offset
+                )
+                for key, tensor, use_all_gather, orig_shape, offset in recv_list:
+                    self.kunpeng_pp_communicator.copy_from_buffer(
+                        tensor, offset=offset
+                    )
+                for key, tensor, _, _, _ in recv_list:
+                    if use_all_gather:
+                        tensor = all_gather_group.all_gather(tensor, dim=0)
+                        tensor = tensor.reshape(orig_shape)
                     tensor_dict[key] = tensor
-                    continue
+        else:
+            for key, value in recv_metadata_list:
+                if isinstance(value, TensorMetadata):
+                    tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                    if tensor.numel() == 0:
+                        # Skip broadcasting empty tensors.
+                        tensor_dict[key] = tensor
+                        continue
 
-                # send-allgather: send only a slice, then do allgather.
-                use_all_gather = (
-                    all_gather_group is not None
-                    and tensor.numel() % all_gather_size == 0
-                )
+                    # send-allgather: send only a slice, then do allgather.
+                    use_all_gather = (
+                        all_gather_group is not None
+                        and tensor.numel() % all_gather_size == 0
+                    )
 
-                if use_all_gather:
-                    orig_shape = tensor.shape
-                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                    if use_all_gather:
+                        orig_shape = tensor.shape
+                        tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-                # We have to use irecv here to make it work for both isend and send.
-                comm_group = metadata_group if tensor.is_cpu else group
-                work = torch.distributed.irecv(
-                    tensor, src=self.ranks[src], group=comm_group
-                )
-                work.wait()
+                    # We have to use irecv here to make it work for both isend and send.
+                    comm_group = metadata_group if tensor.is_cpu else group
+                    work = torch.distributed.irecv(
+                        tensor, src=self.ranks[src], group=comm_group
+                    )
+                    work.wait()
 
-                if use_all_gather:
-                    tensor = all_gather_group.all_gather(tensor, dim=0)
-                    tensor = tensor.reshape(orig_shape)
+                    if use_all_gather:
+                        tensor = all_gather_group.all_gather(tensor, dim=0)
+                        tensor = tensor.reshape(orig_shape)
 
-                tensor_dict[key] = tensor
-            else:
-                tensor_dict[key] = value
+                    tensor_dict[key] = tensor
+                else:
+                    tensor_dict[key] = value
         return tensor_dict
 
     def barrier(self):

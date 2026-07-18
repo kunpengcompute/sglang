@@ -864,7 +864,8 @@ class SchedulerPPMixin:
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
-            p2p_work.work.wait()
+            if p2p_work.work is not None:
+                p2p_work.work.wait()
         work.clear()
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
