@@ -617,8 +617,12 @@ class KunpengCpuBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # MLA_KUNPENG with prefix — attn_mqa needs paged KV cache read
-        if layer.tp_k_head_num == 1 and layer.tp_q_head_num != 1:
+        # MLA_KUNPENG with prefix — attn_mqa needs paged KV cache read.
+        if (
+            layer.tp_k_head_num == 1
+            and layer.tp_q_head_num != 1
+            and self.forward_metadata is not None
+        ):
             return self._forward_extend_mla_paged(
                 q, k, v, layer, forward_batch, save_kv_cache
             )

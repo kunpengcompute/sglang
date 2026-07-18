@@ -139,9 +139,25 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
 
 void moe_comm_create_kunpeng(int64_t process_group_ptr);
 
+void moe_comm_create_all_kunpeng(int64_t global_pg_ptr, int64_t sub_pg_ptr);
+
 void moe_comm_finalize_kunpeng();
 
 void moe_comm_barrier_kunpeng();
+
+// PP P2P communication (implemented in comm/pp_comm.cpp)
+void pp_comm_init_kunpeng(at::Tensor buffer, int64_t process_group_ptr);
+
+void pp_comm_finalize_kunpeng();
+
+// Batch mode PP communication
+void pp_copy_to_buffer_kunpeng(at::Tensor tensor, int64_t offset);
+
+void pp_copy_from_buffer_kunpeng(at::Tensor tensor, int64_t offset);
+
+void pp_send_batch_kunpeng(int64_t dest_rank, int64_t total_size);
+
+void pp_recv_batch_kunpeng(int64_t src_rank, int64_t total_size);
 
 void rdma_allgather_full_init_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size);
 
@@ -471,11 +487,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("moe_comm_create_kunpeng(int process_group_ptr) -> ()");
     m.impl("moe_comm_create_kunpeng", moe_comm_create_kunpeng);
 
+    m.def("moe_comm_create_all_kunpeng(int global_pg_ptr, int sub_pg_ptr) -> ()");
+    m.impl("moe_comm_create_all_kunpeng", moe_comm_create_all_kunpeng);
+
     m.def("moe_comm_finalize_kunpeng() -> ()");
     m.impl("moe_comm_finalize_kunpeng", moe_comm_finalize_kunpeng);
 
     m.def("moe_comm_barrier_kunpeng() -> ()");
     m.impl("moe_comm_barrier_kunpeng", moe_comm_barrier_kunpeng);
+
+    // PP P2P communication operators
+    m.def("pp_comm_init_kunpeng(Tensor buffer, int process_group_ptr) -> ()");
+    m.impl("pp_comm_init_kunpeng", pp_comm_init_kunpeng);
+
+    m.def("pp_comm_finalize_kunpeng() -> ()");
+    m.impl("pp_comm_finalize_kunpeng", pp_comm_finalize_kunpeng);
+
+    // Batch mode PP communication
+    m.def("pp_copy_to_buffer_kunpeng(Tensor tensor, int offset) -> ()");
+    m.impl("pp_copy_to_buffer_kunpeng", pp_copy_to_buffer_kunpeng);
+
+    m.def("pp_copy_from_buffer_kunpeng(Tensor tensor, int offset) -> ()");
+    m.impl("pp_copy_from_buffer_kunpeng", pp_copy_from_buffer_kunpeng);
+
+    m.def("pp_send_batch_kunpeng(int dest_rank, int total_size) -> ()");
+    m.impl("pp_send_batch_kunpeng", pp_send_batch_kunpeng);
+
+    m.def("pp_recv_batch_kunpeng(int src_rank, int total_size) -> ()");
+    m.impl("pp_recv_batch_kunpeng", pp_recv_batch_kunpeng);
 
     // RDMA full-mesh allgather (reuses the comm created by moe_comm_create_kunpeng)
     m.def("rdma_allgather_full_init_kunpeng(Tensor send_buf, int send_size, Tensor recv_buf, int recv_size) -> ()");
