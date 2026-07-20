@@ -1511,6 +1511,281 @@ class ShardedStateLoader(BaseModelLoader):
             )
 
 
+class KunpengStateLoader(BaseModelLoader):
+    """Kunpeng model loader for MOE A2A scenarios with pre-sharded checkpoints.
+
+    Both non-expert and expert weights are expected to be preprocessed:
+
+    - Non-expert weights: per-rank sharded safetensors in
+      ``{model_path}/model-rank-{rank}-part-*.safetensors``, loaded via
+      direct ``copy_()`` (same layout as ``ShardedStateLoader``).
+
+    - Expert weights: per-expert safetensors in
+      ``{model_path}/experts/layer_{lid}/expert_{eid}.safetensors``,
+      each containing the **full** (non-TP-sharded) weights for one
+      routed expert, already concatenated (gate+up → w13_weight).
+      TP sharding and EPLB expert placement are applied at load time.
+    """
+
+    DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        extra_config = (
+            {}
+            if load_config.model_loader_extra_config is None
+            else load_config.model_loader_extra_config.copy()
+        )
+        self.pattern = extra_config.pop("pattern", self.DEFAULT_PATTERN)
+        if extra_config:
+            raise ValueError(
+                f"Unexpected extra config keys for load format "
+                f"{load_config.load_format}: {list(extra_config.keys())}"
+            )
+
+    # -- helpers ----------------------------------------------------------------
+
+    @staticmethod
+    def _is_expert_weight(name: str) -> bool:
+        """Return True if *name* belongs to an MoE expert (routed or shared)."""
+        return ".mlp.experts." in name or ".mlp.shared_experts." in name
+
+    def _get_sharded_path(
+        self, model_name_or_path: str, revision: Optional[str]
+    ) -> str:
+        """Return the local directory containing the sharded safetensors files."""
+        if os.path.isdir(model_name_or_path):
+            return model_name_or_path
+
+    @staticmethod
+    def _filter_subtensors(tensors: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Remove tensors that share storage with a larger tensor (delegate to ShardedStateLoader)."""
+        return ShardedStateLoader._filter_subtensors(tensors)
+
+    def _iter_full_checkpoint_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+        is_expert: bool,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Yield weights from the full checkpoint, filtered by *is_expert*."""
+        tmp_load_config = dataclasses.replace(
+            self.load_config, load_format=LoadFormat.AUTO
+        )
+        default_loader = DefaultModelLoader(tmp_load_config)
+        source = DefaultModelLoader.Source.init_new(model_config, model)
+
+        for name, tensor in default_loader._get_weights_iterator(source):
+            if self._is_expert_weight(name) == is_expert:
+                yield name, tensor
+
+        for sec_source in cast(
+            Iterable[DefaultModelLoader.Source],
+            getattr(model, "secondary_weights", ()),
+        ):
+            for name, tensor in default_loader._get_weights_iterator(sec_source):
+                if self._is_expert_weight(name) == is_expert:
+                    yield name, tensor
+
+    def _iter_non_expert_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Yield only non-expert weights from the full checkpoint."""
+        yield from self._iter_full_checkpoint_weights(
+            model_config, model, is_expert=False
+        )
+
+    def _load_sharded_non_expert(self, model: nn.Module, filepaths: List[str]) -> None:
+        """Load non-expert weights from sharded safetensors via direct copy."""
+        from safetensors.torch import safe_open
+
+        state_dict = self._filter_subtensors(dict(model.named_parameters()))
+        for path in filepaths:
+            with safe_open(path, framework="pt") as f:
+                for key in f.keys():
+                    if key not in state_dict:
+                        continue
+                    tensor = f.get_tensor(key)
+                    param_data = state_dict[key].data
+                    param_shape = state_dict[key].shape
+
+                    param_data.copy_(tensor)
+                    state_dict.pop(key)
+        non_moe_state_dict = {}
+        for key, tensor in state_dict.items():
+            if not self._is_expert_weight(key):
+                non_moe_state_dict[key] = tensor
+
+        if non_moe_state_dict:
+            raise ValueError(
+                f"Missing keys {tuple(non_moe_state_dict)} in loaded state!"
+            )
+
+    # -- preprocessed expert weight loading -------------------------------------
+
+    def _load_expert_weights_from_preprocessed(
+        self, model: nn.Module, model_config: ModelConfig
+    ) -> bool:
+        """Load routed expert weights from preprocessed per-expert files.
+
+        Returns True on success, False if preprocessed files are not available
+        (caller should fall back to full checkpoint loading).
+        """
+        from safetensors.torch import load_file
+
+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        metadata = get_global_expert_location_metadata()
+        logger.info(
+            "KunpengStateLoader: metadata ep_size=%d, num_layers=%d, "
+            "num_physical_experts=%d, num_logical_experts=%d",
+            metadata.ep_size,
+            metadata.num_layers,
+            metadata.num_physical_experts,
+            metadata.num_logical_experts,
+        )
+        for lid in range(metadata.num_layers):
+            sample = metadata.physical_to_logical_map[lid, :8].tolist()
+            logger.info("  layer %d physical_to_logical[:8] = %s", lid, sample)
+        # ---------------------------
+
+        experts_base = os.path.join(model_config.model_path, "experts")
+        if not os.path.isdir(experts_base):
+            raise RuntimeError(f"Cannot find any expert weights with `{experts_base}`")
+
+        # Collect FusedMoE modules keyed by layer_id
+        moe_modules: Dict[int, "FusedMoE"] = {}
+        for module in model.modules():
+            if (
+                isinstance(module, FusedMoE)
+                and getattr(module, "_num_local_routed", 0) > 0
+            ):
+                moe_modules[module.layer_id] = module
+
+        logger.info(
+            "KunpengStateLoader: found %d FusedMoE modules, layers=%s",
+            len(moe_modules),
+            sorted(moe_modules.keys()),
+        )
+
+        loaded = 0
+        for layer_id, moe in moe_modules.items():
+            layer_dir = os.path.join(experts_base, f"layer_{layer_id}")
+            if not os.path.isdir(layer_dir):
+                raise RuntimeError(f"Cannot find expert layer dir `{layer_dir}`")
+
+            for local_i in range(moe._num_local_routed):
+                global_phys = moe.moe_ep_rank * moe._num_local_routed + local_i
+                logical_id = int(
+                    metadata.physical_to_logical_map[layer_id, global_phys].item()
+                )
+
+                filepath = os.path.join(layer_dir, f"expert_{logical_id}.safetensors")
+                if not os.path.isfile(filepath):
+                    raise RuntimeError(f"Cannot find expert weight file `{filepath}`")
+
+                data = load_file(filepath)
+
+                self._copy_expert_weights(data, moe, local_i)
+                loaded += 1
+
+        logger.info("KunpengStateLoader: loaded %d preprocessed expert files.", loaded)
+
+        return loaded > 0
+
+    def _copy_expert_weights(
+        self,
+        data: Dict[str, torch.Tensor],
+        moe: nn.Module,
+        local_i: int,
+    ) -> None:
+        """Copy one expert's weights into *moe* module at slot *local_i*.
+
+        The tensors in *data* are preprocessed: gate+up already concatenated
+        into ``w13_*``, with a leading batch-1 dim added by split_moe_experts.
+        No TP sharding is done (moe_tp_size == 1 in MOE A2A).
+        """
+        # Map file keys (e.g. "model.layers.0.mlp.experts.w13_weight")
+        # to local param names (e.g. "w13_weight")
+        moe_params = dict(moe.named_parameters())
+        param_name_to_key = {k.split(".")[-1]: k for k in moe_params}
+
+        for file_key, full_tensor in data.items():
+            short = file_key.split(".")[-1]  # "w13_weight", "w13_weight_scale", ...
+            if short not in param_name_to_key:
+                logger.warning(
+                    "KunpengStateLoader: skip unknown key '%s' (short='%s')",
+                    file_key,
+                    short,
+                )
+                continue
+            param = moe_params[param_name_to_key[short]]
+
+            # Remove the leading batch-1 dim added by split_moe_experts
+            flat = full_tensor[0] if full_tensor.dim() == 3 else full_tensor
+
+            dst = param.data[local_i]
+            for dim, size in enumerate(flat.shape):
+                if size < dst.shape[dim]:
+                    dst = dst.narrow(dim, 0, size)
+
+            dst.copy_(flat)
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        pass
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        from sglang.srt.distributed import (
+            get_attn_tensor_model_parallel_rank,
+            get_attn_tensor_model_parallel_world_size,
+        )
+
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(model_config, self.load_config, quant_config)
+
+        # ---------- Phase 1: expert weights from preprocessed files ----------
+        self._load_expert_weights_from_preprocessed(model, model_config)
+
+        # ---------- Phase 2: non-expert weights from sharded files ----------
+        attn_tp_rank = get_attn_tensor_model_parallel_rank()
+        attn_tp_size = get_attn_tensor_model_parallel_world_size()
+        pattern = os.path.join(
+            model_config.model_path,
+            f"tp{attn_tp_size}",
+            self.pattern.format(rank=attn_tp_rank, part="*"),
+        )
+        filepaths = glob.glob(pattern)
+        if not filepaths:
+            raise RuntimeError(f"Cannot find any non-expert weights with `{pattern}`")
+        logger.info(
+            "KunpengStateLoader: loading non-expert weights from %d sharded file(s).",
+            len(filepaths),
+        )
+        self._load_sharded_non_expert(model, filepaths)
+
+        # ---------- Phase 3: post-process ----------
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
+        post_load_weights(model, model_config)
+        return model.eval()
+
+
 class BitsAndBytesModelLoader(BaseModelLoader):
     """Model loader to load model weights with BitAndBytes quantization."""
 
@@ -3304,6 +3579,9 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)
+
+    if load_config.load_format == LoadFormat.KUNPENG_STATE:
+        return KunpengStateLoader(load_config)
 
     if load_config.load_format == LoadFormat.BITSANDBYTES:
         return BitsAndBytesModelLoader(load_config)
