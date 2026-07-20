@@ -110,3 +110,11 @@ bool is_shm_initialized();
  * @return       Pointer to the allocated shared memory.
  */
 void *alloc_shm_raw(size_t bytes);
+
+/**
+ * Perform a shared-memory fence on the intra-node or intra-socket window,
+ * selected by attn_tp_size.
+ *
+ * @param attn_tp_size  16 -> fence intra-node window; 8 -> fence intra-socket window.
+ */
+void shm_fence_kunpeng(int64_t attn_tp_size);

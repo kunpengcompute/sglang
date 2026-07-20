@@ -304,3 +304,14 @@ void *alloc_shm_raw(size_t bytes)
 
     return allocated_ptr;
 }
+
+void shm_fence_kunpeng(int64_t attn_tp_size)
+{
+    TORCH_CHECK(attn_tp_size == 8 || attn_tp_size == 16,
+                "Unsupported attn_tp_size for shm_fence_kunpeng: ", attn_tp_size);
+    if (attn_tp_size == 16) {
+        kupl_shm_fence(kupl_win_intra_node);
+    } else {  // attn_tp_size == 8
+        kupl_shm_fence(kupl_win_intra_socket);
+    }
+}

@@ -220,20 +220,20 @@ def _ensure_rdma_initialized(
         )
 
         from sglang.srt.distributed.parallel_state import get_pp_group
+
         try:
             pp_group = get_pp_group()
             if pp_group.kunpeng_pp_communicator is not None:
                 pp_group.kunpeng_pp_communicator.init_pp_domain()
                 logger.info(
-                    "[KunpengMoE] PP domain initialized, pp_init done "
-                    "(ep_rank=%s)",
+                    "[KunpengMoE] PP domain initialized, pp_init done " "(ep_rank=%s)",
                     state.ep_rank,
                 )
         except Exception as e:
             logger.warning(
-                "[KunpengMoE] PP domain init skipped "
-                "(ep_rank=%s, error=%s)",
-                state.ep_rank, e,
+                "[KunpengMoE] PP domain init skipped " "(ep_rank=%s, error=%s)",
+                state.ep_rank,
+                e,
             )
 
     return state
@@ -250,9 +250,10 @@ def _init_rdma_comm(group: dist.ProcessGroup, ep_size: int, ep_rank: int):
 
     pg_ptr = pg_helper.get_process_group_ptr(group)
     logger.info(
-        "[KunpengMoE] _init_rdma_comm "
-        "(pg_ptr=0x%s, ep_size=%s, ep_rank=%s)",
-        format(pg_ptr, "x"), ep_size, ep_rank,
+        "[KunpengMoE] _init_rdma_comm " "(pg_ptr=0x%s, ep_size=%s, ep_rank=%s)",
+        format(pg_ptr, "x"),
+        ep_size,
+        ep_rank,
     )
 
     try:
@@ -487,6 +488,14 @@ class KunpengDispatcher(BaseDispatcher):
         else:
             self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
 
+        # State stashed by dispatch_send() for dispatch_recv(); allows
+        # shared experts computation to be inserted between send and recv.
+        self._dispatch_pending: Optional[dict] = None
+
+        # State stashed by combine_send() for combine_recv(); allows
+        # shared experts allreduce to be inserted between send and recv.
+        self._combine_pending: Optional[dict] = None
+
         # Initialize process-global RDMA state (idempotent)
         self._state = _ensure_rdma_initialized(
             group=self.group,
@@ -500,9 +509,15 @@ class KunpengDispatcher(BaseDispatcher):
         )
 
     @KunpengProfiler(depth=2)
-    def dispatch(
+    def dispatch_send(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
-    ) -> KunpengDispatchOutput:
+    ) -> None:
+        """Phase 1 of dispatch: quantize + barrier + RDMA send.
+
+        Call ``dispatch_recv()`` afterwards to complete the dispatch and
+        obtain ``KunpengDispatchOutput``.  Splitting send/recv allows shared
+        experts computation to be overlapped with the RDMA network transfer.
+        """
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(
                 f"KunpengDispatcher only supports standard topk output, "
@@ -545,11 +560,6 @@ class KunpengDispatcher(BaseDispatcher):
 
         t_quant_and_copy_end = time.perf_counter()
 
-        # Dispatch barrier
-        t_barrier_start = time.perf_counter()
-        torch.ops.sgl_kernel.moe_comm_barrier_kunpeng()
-        t_barrier_end = time.perf_counter()
-
         # Dispatch send
         t_send_start = time.perf_counter()
         batch_id = 0
@@ -563,6 +573,37 @@ class KunpengDispatcher(BaseDispatcher):
             batch_id,
         )
         t_send_end = time.perf_counter()
+
+        # Stash state needed by dispatch_recv().
+        self._dispatch_pending = {
+            "num_tokens": num_tokens,
+            "batch_size": batch_size,
+            "batch_id": batch_id,
+            "t_total_start": t_total_start,
+        }
+
+        if envs.SGLANG_KUNPENG_PROFILE.get():
+            logger.info(
+                f"[KunpengMoE rank={self.ep_rank}] dispatch_send timing (ms): "
+                f"quant_and_copy={1000*(t_quant_and_copy_end - t_quant_and_copy_start):.2f}, "
+                f"dispatch_send={1000*(t_send_end - t_send_start):.2f}, "
+                f"num_tokens={num_tokens}, batch_size={batch_size}"
+            )
+
+    @KunpengProfiler(depth=2)
+    def dispatch_recv(self) -> KunpengDispatchOutput:
+        """Phase 2 of dispatch: RDMA recv + topk_convert.
+
+        Must be called after ``dispatch_send()``.  Inserting shared experts
+        computation between ``dispatch_send()`` and ``dispatch_recv()``
+        overlaps it with the RDMA network transfer.
+        """
+        state = self._state
+        pending = self._dispatch_pending
+        num_tokens = pending["num_tokens"]
+        batch_size = pending["batch_size"]
+        batch_id = pending["batch_id"]
+        t_total_start = pending["t_total_start"]
 
         # Dispatch recv
         t_recv_start = time.perf_counter()
@@ -591,15 +632,14 @@ class KunpengDispatcher(BaseDispatcher):
         t_total_end = time.perf_counter()
         if envs.SGLANG_KUNPENG_PROFILE.get():
             logger.info(
-                f"[KunpengMoE rank={self.ep_rank}] dispatch timing (ms): "
-                f"quant_and_copy={1000*(t_quant_and_copy_end - t_quant_and_copy_start):.2f}, "
-                f"barrier={1000*(t_barrier_end - t_barrier_start):.2f}, "
-                f"dispatch_send={1000*(t_send_end - t_send_start):.2f}, "
+                f"[KunpengMoE rank={self.ep_rank}] dispatch_recv timing (ms): "
                 f"dispatch_recv={1000*(t_recv_end - t_recv_start):.2f}, "
                 f"topk_convert={1000*(t_convert_end - t_convert_start):.2f}, "
-                f"total={1000*(t_total_end - t_total_start):.2f}, "
+                f"total_dispatch={1000*(t_total_end - t_total_start):.2f}, "
                 f"num_tokens={num_tokens}, batch_size={batch_size}"
             )
+
+        self._dispatch_pending = None
 
         return KunpengDispatchOutput(
             num_tokens=num_tokens,
@@ -611,8 +651,24 @@ class KunpengDispatcher(BaseDispatcher):
             max_dispatch_tokens_per_rank=state.num_max_dispatch_tokens_per_rank,
         )
 
+    def dispatch(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> KunpengDispatchOutput:
+        """Full dispatch: send + recv (convenience wrapper).
+
+        For overlapping shared experts with the RDMA transfer, call
+        ``dispatch_send()`` and ``dispatch_recv()`` separately instead.
+        """
+        self.dispatch_send(hidden_states, topk_output)
+        return self.dispatch_recv()
+
     @KunpengProfiler(depth=2)
-    def combine(self, combine_input: KunpengCombineInput) -> torch.Tensor:
+    def combine_send(self, combine_input: KunpengCombineInput) -> None:
+        """Phase 1 of combine: quantize + RDMA-write expert outputs to peers.
+
+        Non-blocking. To overlap shared-expert allreduce with RDMA transfer,
+        call combine_send() first, run the allreduce, then call combine_recv().
+        """
         state = self._state
         topk_weights = state.topk_weights_buf
         topk_ids_index = state.topk_ids_index_buf
@@ -623,13 +679,6 @@ class KunpengDispatcher(BaseDispatcher):
         else:
             recv_src_info = state.recv_src_info_bak
 
-        t_total_start = time.perf_counter()
-
-        t_barrier_start = time.perf_counter()
-        torch.ops.sgl_kernel.moe_comm_barrier_kunpeng()
-        t_barrier_end = time.perf_counter()
-
-        # Combine send: RDMA-write expert outputs back to source ranks
         t_send_start = time.perf_counter()
         batch_id = 0
         torch.ops.sgl_kernel.moe_combine_send_kunpeng(
@@ -649,15 +698,45 @@ class KunpengDispatcher(BaseDispatcher):
         )
         t_send_end = time.perf_counter()
 
-        # Combine recv: wait for incoming data and perform weighted reduction
+        # Stash state needed by combine_recv().
+        self._combine_pending = {
+            "num_tokens": num_tokens,
+            "batch_size": batch_size,
+            "batch_id": batch_id,
+            "t_send_start": t_send_start,
+            "t_send_end": t_send_end,
+        }
+
+        if envs.SGLANG_KUNPENG_PROFILE.get():
+            logger.info(
+                f"[KunpengMoE rank={self.ep_rank}] combine_send timing (ms): "
+                f"combine_send={1000*(t_send_end - t_send_start):.2f}, "
+                f"num_tokens={num_tokens}, batch_size={batch_size}"
+            )
+
+    @KunpengProfiler(depth=2)
+    def combine_recv(self) -> torch.Tensor:
+        """Phase 2 of combine: wait for RDMA + weighted reduction.
+
+        Must be called after ``combine_send()``. Inserting shared-expert allreduce
+        between ``combine_send()`` and ``combine_recv()`` overlaps it with the RDMA network transfer.
+        """
+        state = self._state
+        pending = self._combine_pending
+        num_tokens = pending["num_tokens"]
+        batch_size = pending["batch_size"]
+        batch_id = pending["batch_id"]
+        t_send_start = pending["t_send_start"]
+        t_send_end = pending["t_send_end"]
+
         t_recv_start = time.perf_counter()
         torch.ops.sgl_kernel.moe_combine_recv_kunpeng(
             state.combined_x,
-            topk_ids_index,
-            topk_weights,
+            state.topk_ids_index_buf,
+            state.topk_weights_buf,
             batch_size,
             state.num_max_dispatch_tokens_per_rank,
-            topk_ids_index.shape[1] // 2,
+            state.topk_ids_index_buf.shape[1] // 2,
             state.hidden_size,
             batch_id,
         )
@@ -665,18 +744,26 @@ class KunpengDispatcher(BaseDispatcher):
 
         result = state.combined_x[:batch_size]
 
-        t_total_end = time.perf_counter()
         if envs.SGLANG_KUNPENG_PROFILE.get():
             logger.info(
-                f"[KunpengMoE rank={self.ep_rank}] combine timing (ms): "
-                f"barrier={1000*(t_barrier_end - t_barrier_start):.2f}, "
+                f"[KunpengMoE rank={self.ep_rank}] combine_recv timing (ms): "
                 f"combine_send={1000*(t_send_end - t_send_start):.2f}, "
                 f"combine_recv={1000*(t_recv_end - t_recv_start):.2f}, "
-                f"total={1000*(t_total_end - t_total_start):.2f}, "
                 f"num_tokens={num_tokens}, batch_size={batch_size}"
             )
 
+        self._combine_pending = None
         return result
+
+    @KunpengProfiler(depth=2)
+    def combine(self, combine_input: KunpengCombineInput) -> torch.Tensor:
+        """Full combine: send + recv (convenience wrapper).
+
+        For overlapping shared experts allreduce with the RDMA transfer, call
+        ``combine_send()`` and ``combine_recv()`` separately instead.
+        """
+        self.combine_send(combine_input)
+        return self.combine_recv()
 
     def __del__(self):
         # Only finalize when the process is shutting down.

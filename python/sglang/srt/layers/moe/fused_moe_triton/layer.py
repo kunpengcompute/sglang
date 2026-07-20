@@ -86,7 +86,6 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1079,7 +1078,6 @@ class FusedMoE(torch.nn.Module):
         else:
             return self.forward_impl(hidden_states, topk_output)
 
-    @KunpengProfiler(depth=1)
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
@@ -1107,7 +1105,6 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    @KunpengProfiler(depth=2)
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
