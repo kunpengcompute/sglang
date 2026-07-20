@@ -35,10 +35,13 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -57,13 +60,14 @@ from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_t
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cpu_920f, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu_920f = is_cpu_920f()
 
 
 class DeepseekModelNextN(nn.Module):
@@ -102,7 +106,19 @@ class DeepseekModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        if quant_config is not None and quant_config.get_name() == "quark":
+        if _is_cpu_920f:
+            self.eh_proj = ColumnParallelLinear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                gather_output=False,
+                quant_config=None,
+                params_dtype=torch.bfloat16,
+                prefix=add_prefix("eh_proj", prefix),
+                tp_rank=get_attention_tp_rank(),
+                tp_size=get_attention_tp_size(),
+            )
+        elif quant_config is not None and quant_config.get_name() == "quark":
             self.eh_proj = ReplicatedLinear(
                 2 * config.hidden_size,
                 config.hidden_size,
@@ -191,7 +207,17 @@ class DeepseekModelNextN(nn.Module):
                 ),
                 dim=-1,
             )
-            if isinstance(self.eh_proj, ReplicatedLinear):
+
+            if _is_cpu_920f:
+                hidden_states = torch.ops.sgl_kernel.bf16_linear_kunpeng(
+                    eh_input.to(self.eh_proj.weight.dtype),
+                    self.eh_proj.weight,
+                    None,
+                )
+                hidden_states = get_attention_tp_group().batch_all_gather(
+                    hidden_states, dim=-1
+                )
+            elif isinstance(self.eh_proj, ReplicatedLinear):
                 hidden_states, _ = self.eh_proj(eh_input)
             else:
                 hidden_states = self.eh_proj(eh_input)
