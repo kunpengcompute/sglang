@@ -777,6 +777,13 @@ class DeepseekV2WeightLoaderMixin:
                 get_global_server_args().max_prefill_tokens,
             )
 
+        # Prepack eh_proj.weight for Kunpeng 920F CPU (MTP/NextN only).
+        if _is_cpu_920f and is_nextn and hasattr(self.model, "eh_proj"):
+            torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                self.model.eh_proj.weight,
+                get_global_server_args().max_prefill_tokens,
+            )
+
         # Prepack MoEGate weights for Kunpeng 920F CPU (DeepSeek models)
         if _is_cpu_920f:
             from sglang.srt.models.deepseek_v2 import MoEGate as _DeepSeekMoEGate
