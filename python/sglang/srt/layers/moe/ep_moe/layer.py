@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 import torch
 
@@ -59,6 +59,10 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
+from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_world_size,
+    get_attn_tp_group,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -653,30 +657,54 @@ class KunpengMoE(FusedMoE):
         )
         self.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
         self.moe_token_multiple = 2
+        # Shared-experts output produced during the dispatch send/recv gap
+        # when a shared_experts_fn callback is supplied to forward().
+        self._shared_output: Optional[torch.Tensor] = None
 
     @KunpengProfiler(depth=1)
     def forward(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        shared_experts_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
             KunpengCombineInput,
             KunpengDispatchOutput,
         )
 
-        # Step 1: Dispatch — quantize + RDMA send/recv
-        dispatch_output = self.dispatcher.dispatch(
+        # Step 1: Dispatch send — quantize + RDMA send
+        self.dispatcher.dispatch_send(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+
+        # Step 2: Shared experts computation overlapped with RDMA transfer.
+        # Pass skip_allreduce=True so the shared expert's down_proj skips its
+        # built-in ATTN_TP all_reduce
+        if shared_experts_fn is not None:
+            self._shared_output = shared_experts_fn(hidden_states, skip_allreduce=True)
+        else:
+            self._shared_output = None
+
+        # Step 3: Dispatch recv — wait for RDMA data to arrive.
+        dispatch_output = self.dispatcher.dispatch_recv()
         assert isinstance(dispatch_output, KunpengDispatchOutput)
 
-        # Step 2: Expert computation (placeholder)
+        # Step 4: Expert computation
         combine_input = self.run_moe_core(dispatch_output)
 
-        # Step 3: Combine — RDMA combine_send/recv
-        hidden_states = self.dispatcher.combine(combine_input=combine_input)
+        # Step 5: Combine send — RDMA-write expert outputs to peers (non-blocking).
+        self.dispatcher.combine_send(combine_input=combine_input)
+
+        # Step 6: Shared expert allreduce overlapped with RDMA combine transfer.
+        if self._shared_output is not None:
+            attn_tp_size = get_attn_tensor_model_parallel_world_size()
+            torch.ops.sgl_kernel.shm_fence_kunpeng(attn_tp_size)
+            self._shared_output = get_attn_tp_group().all_reduce(self._shared_output)
+
+        # Step 7: Combine recv — wait for RDMA + weighted reduction.
+        hidden_states = self.dispatcher.combine_recv()
 
         return hidden_states
 

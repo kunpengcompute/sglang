@@ -145,6 +145,8 @@ void moe_comm_finalize_kunpeng();
 
 void moe_comm_barrier_kunpeng();
 
+void shm_fence_kunpeng(int64_t attn_tp_size);
+
 // PP P2P communication (implemented in comm/pp_comm.cpp)
 void pp_comm_init_kunpeng(at::Tensor buffer, int64_t process_group_ptr);
 
@@ -495,6 +497,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("moe_comm_barrier_kunpeng() -> ()");
     m.impl("moe_comm_barrier_kunpeng", moe_comm_barrier_kunpeng);
+
+    m.def("shm_fence_kunpeng(int attn_tp_size) -> ()");
+    m.impl("shm_fence_kunpeng", shm_fence_kunpeng);
 
     // PP P2P communication operators
     m.def("pp_comm_init_kunpeng(Tensor buffer, int process_group_ptr) -> ()");

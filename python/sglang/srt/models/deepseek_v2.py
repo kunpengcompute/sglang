@@ -878,7 +878,11 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
+                if get_moe_a2a_backend().is_kunpeng_cpu():
+                    # Shared experts are computed inside KunpengMoE.forward
+                    # between dispatch_send and dispatch_recv.
+                    shared_output = None
+                elif self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
@@ -1059,10 +1063,22 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+        if (
+            get_moe_a2a_backend().is_kunpeng_cpu()
+            and not sbo_enabled_flag
+            and self.num_fused_shared_experts == 0
+        ):
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                shared_experts_fn=self._forward_shared_experts,
+            )
+            shared_output = self.experts._shared_output
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
         if (
             hidden_states.shape[0] > 0
@@ -1094,11 +1110,16 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def _forward_shared_experts(
-        self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
+        self,
+        hidden_states,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        skip_allreduce: bool = False,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             return self.shared_experts(
-                hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+                hidden_states,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                should_allreduce_fusion=skip_allreduce,
             )
         else:
             return None
