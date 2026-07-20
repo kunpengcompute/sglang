@@ -90,7 +90,7 @@ case "$ROLE" in
             --disaggregation-mode decode
             --max-total-tokens 139328
             --load-balance-method follow_bootstrap_room
-            --decode-log-interval 1
+            --decode-log-interval 10
             --num-reserved-decode-tokens 256
         )
         ;;
@@ -124,6 +124,17 @@ case "$ROLE" in
             --health-check-timeout-secs 10000
             --host "$IP"
         )
+        # Common args for tokenizer-side HTTP server
+        HTTP_COMMON_ARGS=(
+            --model "$MODEL_PATH"
+            --device cpu --trust-remote-code
+            --host "$ROUTER_IP"
+            --disaggregation-bootstrap-port 9001
+            --nnodes 1 --node-rank 0 --dist-timeout 600
+            --enable-dp-attention --dp 1 --tp-size 1
+            --max-total-tokens 64
+            --skip-server-warmup
+        )
         ;;
     *)
         echo "Error: unknown role '$ROLE'" >&2
@@ -134,65 +145,44 @@ esac
 # Combine and execute
 if [[ "$ROLE" == "router" ]]; then
     if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
-        # 启动 prefill HTTP server（tokenizer 侧）
+        # Launch prefill HTTP server (tokenizer side)
         echo "Launching prefill HTTP server..."
-        HTTP_PREFILL_ARGS=(
-            --model "$MODEL_PATH"
-            --device cpu --trust-remote-code
-            --host "$ROUTER_IP" --port 30001
-            --dist-init-addr "$PREFILL_MASTER_ADDR:$PREFILL_MASTER_PORT"
-            --disaggregation-mode prefill
-            --disaggregation-bootstrap-port 9001
-            --nnodes 1 --node-rank 0 --dist-timeout 600
-            --enable-dp-attention --dp 1 --tp-size 1
-            --max-total-tokens 64
-            --skip-server-warmup
-        )
-        LD_PRELOAD="/path/to/libpthread_hook.so" \
-        python -m sglang.launch_server "${HTTP_PREFILL_ARGS[@]}" \
-            > "$LOG_PATH/router_prefill_http.log" 2>&1 &
-        PREFILL_HTTP_PID=$!
+        LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
+        python -m sglang.launch_server \
+            "${HTTP_COMMON_ARGS[@]}" \
+            --port 30001 \
+            --dist-init-addr "$PREFILL_MASTER_ADDR:$PREFILL_MASTER_PORT" \
+            --disaggregation-mode prefill \
+        > "$LOG_PATH/router_prefill_http.log" 2>&1 &
 
-        # 启动 decode HTTP server（tokenizer 侧）
+        # Launch decode HTTP server (tokenizer side)
         echo "Launching decode HTTP server..."
-        HTTP_DECODE_ARGS=(
-            --model "$MODEL_PATH"
-            --device cpu --trust-remote-code
-            --host "$ROUTER_IP" --port 30002
-            --dist-init-addr "$DECODE_MASTER_ADDR:$DECODE_MASTER_PORT"
-            --disaggregation-mode decode
-            --disaggregation-bootstrap-port 9001
-            --nnodes 1 --node-rank 0 --dist-timeout 600
-            --enable-dp-attention --dp 1 --tp-size 1
-            --max-total-tokens 64
-            --skip-server-warmup
-        )
-        LD_PRELOAD="/path/to/libpthread_hook.so" \
-        python -m sglang.launch_server "${HTTP_DECODE_ARGS[@]}" \
-            > "$LOG_PATH/router_decode_http.log" 2>&1 &
-        DECODE_HTTP_PID=$!
+        LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
+        python -m sglang.launch_server \
+            "${HTTP_COMMON_ARGS[@]}" \
+            --port 30002 \
+            --dist-init-addr "$DECODE_MASTER_ADDR:$DECODE_MASTER_PORT" \
+            --disaggregation-mode decode \
+        > "$LOG_PATH/router_decode_http.log" 2>&1 &
 
-        # 轮询等待两个 HTTP server 就绪
+        # Poll until both HTTP servers are ready (up to 2 minutes each)
         for port in 30001 30002; do
             echo "Waiting for HTTP server on port $port..."
-            _ready=0
             for i in $(seq 1 60); do
-                if ss -tlnp 2>/dev/null | grep -q ":$port "; then
-                    echo "HTTP server on port $port ready"
-                    _ready=1
-                    break
-                fi
+                ss -tlnp 2>/dev/null | grep -q ":$port " && break
                 sleep 2
             done
-            if [[ "$_ready" -eq 0 ]]; then
+            ss -tlnp 2>/dev/null | grep -q ":$port " || {
                 echo "ERROR: HTTP server on port $port failed to start within 120 seconds"
                 exit 1
-            fi
+            }
+            echo "HTTP server on port $port ready"
         done
     fi
-    # 启动 sglang_router ----
+    
+    # Launch sglang_router ----
     echo "Launching PD disaggregation router..."
-        python -m sglang_router.launch_router "${SPECIFIC_ARGS[@]}" \
+    taskset -c 228 python -m sglang_router.launch_router "${SPECIFIC_ARGS[@]}" \
         > "$LOG_PATH/router_$IP.log" 2>&1 &
 
     exit 0
@@ -202,34 +192,32 @@ fi
 IB_DEVICE_ALL="roceroh0,roceroh1,roceroh2,roceroh3,roceroh4,roceroh5,roceroh6,roceroh7"
 
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
-    echo "Launch binary server..."
-    for ((ATTN_TP_RANK=0; ATTN_TP_RANK < (TP_SIZE * PP_SIZE / WORLD_SIZE); ATTN_TP_RANK++)); do
+    for ((RANK_IN_NODE=0; RANK_IN_NODE < (TP_SIZE * PP_SIZE / WORLD_SIZE); RANK_IN_NODE++)); do
         if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" ]]; then
-            SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${ATTN_TP_RANK}/sglang_server"
+            SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/sglang_server"
         else
             SERVER_BIN="python -m sglang.launch_server"
         fi
 
-        ON_PACKAGE_MEMORY_NODE=$((ATTN_TP_RANK +16))
-        echo 0 > /sys/devices/system/node/node${ATTN_TP_RANK}/hugepages/hugepages-2048kB/nr_hugepages
+        ON_PACKAGE_MEMORY_NODE=$((RANK_IN_NODE +16))
+        echo 0 > /sys/devices/system/node/node${RANK_IN_NODE}/hugepages/hugepages-2048kB/nr_hugepages
         echo 2020 > /sys/devices/system/node/node${ON_PACKAGE_MEMORY_NODE}/hugepages/hugepages-2048kB/nr_hugepages
 
-        # Per-rank IB device: map ATTN_TP_RANK to an index in IB_DEVICE_ALL.
-        # With N configured devices, each device serves (attn_tp_size / N) ranks.
+        # Per-rank IB device: map RANK_IN_NODE to an index in IB_DEVICE_ALL.
         if [[ "$ROLE" == "prefill" || "$ROLE" == "decode" ]]; then
             IFS=',' read -ra _IB_DEVS <<< "$IB_DEVICE_ALL"
             _IB_COUNT=${#_IB_DEVS[@]}
-            _IB_IDX=$((ATTN_TP_RANK * _IB_COUNT / (TP_SIZE * PP_SIZE / WORLD_SIZE)))
+            _IB_IDX=$((RANK_IN_NODE * _IB_COUNT / (TP_SIZE * PP_SIZE / WORLD_SIZE)))
             IB_ARGS=(--disaggregation-ib-device "${_IB_DEVS[$_IB_IDX]}")
         else
             IB_ARGS=()
         fi
 
-        taskset -c $((ATTN_TP_RANK * 38 + 20)) \
+        taskset -c $((RANK_IN_NODE * 38 + 20)) \
         $SERVER_BIN "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
-          --tp-rank-in-node ${ATTN_TP_RANK} \
-          --port $((30000 + ATTN_TP_RANK)) \
-          > "${LOG_PATH}/${DP_RANK}_${ATTN_TP_RANK}_$IP.log" 2>&1 &
+          --tp-rank-in-node ${RANK_IN_NODE} \
+          --port $((30000 + RANK_IN_NODE)) \
+          > "${LOG_PATH}/${DP_RANK}_${RANK_IN_NODE}_$IP.log" 2>&1 &
     done
 else
     # Non-binary launch: sglang forks workers internally, so pass all devices
@@ -242,7 +230,5 @@ else
 
     python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
       --port 30000 \
-      > "$LOG_PATH/${DP_RANK}_$IP.log" 2>&1
+      > "$LOG_PATH/${DP_RANK}_$IP.log" 2>&1 &
 fi
-
-
