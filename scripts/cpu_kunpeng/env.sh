@@ -13,7 +13,7 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: source env.sh [prefill|decode|native]
+# Usage: source env.sh [prefill|decode|native|router]
 
 # ------------------------------------------------------------
 # Helper: expand IP range notation "base_ip | ranges"
@@ -101,8 +101,9 @@ export KUPL_PATH="/path-to-KUPL"
 export KUTACC_PATH="/path-to-KUTACC"
 export SGLANG_PATH="/path-to-SGLang"
 export CONDA_ENV_PATH="$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME"
-export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"  
-
+export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
+# Required when SGLANG_ENABLE_TOKENIZER_SEPERATE=1 (used by tokenizer-side HTTP servers)
+export LIBPTHREAD_HOOK_PATH="/path/to/libpthread_hook.so"
 export GEMM_TILING_PLAN_FILE="$SGLANG_PATH/scripts/cpu_kunpeng/configs"
 
 # TP/EP size
@@ -137,12 +138,12 @@ export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
-export SGLANG_ENABLE_TOKENIZER_SEPERATE=0
+export SGLANG_ENABLE_TOKENIZER_SEPERATE=0  # Only supports PD disaggregation mode
 export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
 export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=1
-export SGLANG_KUNPENG_RDMA_ALLGATHER=0
+export SGLANG_KUNPENG_RDMA_ALLGATHER=0  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_ENABLE_MTP=0
 # Kunpeng SHM pool
 export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476

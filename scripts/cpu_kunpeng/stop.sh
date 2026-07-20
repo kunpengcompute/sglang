@@ -42,10 +42,9 @@ if [[ "$ROLE" == "router" ]]; then
         if [ -n "$MAIN_PIDS" ]; then
             echo "Killing process(es): $MAIN_PIDS"
             kill -15 $MAIN_PIDS 2>/dev/null
-            sleep 3
+            sleep 5
             REMAINING=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
             if [ -n "$REMAINING" ]; then
-                echo "Sending SIGKILL to: $REMAINING"
                 kill -9 $REMAINING 2>/dev/null
             fi
             echo "Router stopped."
@@ -75,13 +74,11 @@ for i in "${!NODES[@]}"; do
                 kill -15 $pid 2>/dev/null
             done
 
-            echo "Waiting 10 seconds for shutdown..."
             sleep 10
 
             REMAINING=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
             if [ -n "$REMAINING" ]; then
-                echo "Processes still running on '"$node"': $REMAINING"
-                echo "Sending SIGKILL..."
+                echo "Processes still running on '"$node"'. Sending SIGKILL..."
                 for pid in $REMAINING; do
                     kill -9 $pid 2>/dev/null
                 done
@@ -94,11 +91,10 @@ for i in "${!NODES[@]}"; do
 
         ZOMBIES=$(ps aux | awk '\''$8 ~ /^Z/ && $11 ~ /sglang/ {print $2}'\'')
         if [ -n "$ZOMBIES" ]; then
-            echo "Found zombie processes on '$node': $ZOMBIES"
+            echo "Found zombie processes on '$node'"
             for zpid in $ZOMBIES; do
                 parent_pid=$(ps -o ppid= -p $zpid 2>/dev/null | xargs)
                 if [ -n "$parent_pid" ] && [ "$parent_pid" != "1" ]; then
-                    echo "Killing parent process $parent_pid of zombie $zpid on '$node'"
                     kill -9 $parent_pid 2>/dev/null
                 fi
             done
