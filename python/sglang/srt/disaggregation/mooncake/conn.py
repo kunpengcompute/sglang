@@ -130,6 +130,9 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: list[int]
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
+    # Start layer of the decode-side KV pool that dst_kv_ptrs points to.
+    # Used by get_*_kv_ptrs_with_pp when prefill and decode use different pp_size.
+    decode_start_layer: int = 0
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -159,8 +162,11 @@ class KVArgsRegisterInfo:
             enable_hisparse=(
                 msg[12].decode("ascii") == "1" if len(msg) > 12 else False
             ),
+            decode_start_layer=(
+                int(msg[13].decode("ascii")) if len(msg) > 13 and len(msg[13]) > 0 else 0
+            ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
 
@@ -1221,6 +1227,12 @@ class MooncakeKVManager(CommonKVManager):
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
+                            # Propagate decode-side start layer so get_*_kv_ptrs_with_pp
+                            # can correctly index dst buffer when prefill and decode
+                            # use different pp_size (e.g. prefill pp=4, decode pp=2).
+                            self.kv_args.decode_start_layer = getattr(
+                                target_rank_registration_info, "decode_start_layer", 0
+                            )
                             if target_rank_registration_info.enable_hisparse:
                                 ret = self.send_kvcache_hisparse(
                                     req.mooncake_session_id,
@@ -1243,6 +1255,9 @@ class MooncakeKVManager(CommonKVManager):
                             and staging_strategy is not None
                             and target_rank_registration_info.staging is not None
                         ):
+                            self.kv_args.decode_start_layer = getattr(
+                                target_rank_registration_info, "decode_start_layer", 0
+                            )
                             ret, deferred = self._do_staging_transfer(
                                 staging_strategy,
                                 kv_chunk,
@@ -1258,6 +1273,9 @@ class MooncakeKVManager(CommonKVManager):
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
                         else:
+                            self.kv_args.decode_start_layer = getattr(
+                                target_rank_registration_info, "decode_start_layer", 0
+                            )
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -1811,6 +1829,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
                         enable_hisparse,
+                        str(
+                            getattr(self.kv_mgr.kv_args, "decode_start_layer", 0)
+                        ).encode("ascii"),
                         packed_staging_base_ptr,
                         staging_total_size_str,
                     ]
