@@ -47,10 +47,6 @@ int g_comm_rank = 0;
 c10d::ProcessGroup *g_process_group = nullptr;
 static bool g_is_prefill = true;
 
-extern void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c);
-extern void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
-                                     int64_t num_threads, bool is_prefill = true);
-
 template <typename T, int64_t N>
 struct SmallVector {
     T array[N];

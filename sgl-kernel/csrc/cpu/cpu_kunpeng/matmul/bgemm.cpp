@@ -225,12 +225,14 @@ at::Tensor bf16_bmm_prepack_kunpeng(const at::Tensor &weight, int64_t batch_size
     return packed_weight;
 }
 
-at::Tensor bmm_kunpeng(const at::Tensor &input, const at::Tensor &weight)
+void bmm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output)
 {
     TORCH_CHECK(input.dim() == 3, "input must be 3D [B, M, K]");
     TORCH_CHECK(weight.dim() == 3, "weight must be 3D [B, N, K]");
+    TORCH_CHECK(output.dim() == 3, "output must be 3D [B, M, N]");
     TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be BF16");
     TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
+    TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output must be BF16");
     TORCH_CHECK(input.stride(2) == 1, "input last dim must be contiguous");
 
     int64_t B = input.size(0);
@@ -239,8 +241,9 @@ at::Tensor bmm_kunpeng(const at::Tensor &input, const at::Tensor &weight)
     int64_t N = weight.size(1);
 
     TORCH_CHECK(weight.size(0) == B && weight.size(2) == K, "weight shape mismatch");
+    TORCH_CHECK(output.size(0) == B && output.size(1) == M && output.size(2) == N,
+                "output shape mismatch");
 
-    // Compute tiling once, reuse across all heads
     kutacc::MatrixTilingBlock t = bgemm_find_optimal_tiling_plan(M, N, K);
 
     auto [tile_m, tile_n, tile_k] = t;
@@ -248,7 +251,6 @@ at::Tensor bmm_kunpeng(const at::Tensor &input, const at::Tensor &weight)
 
     int64_t blocks_in_k = K / tile_k;
 
-    auto output = at::empty({B, M, N}, input.options());
     int64_t workspace_size = blocks_in_k * N * M * 2;
 
     int64_t grain = std::max(int64_t(1), B / at::get_num_threads());
@@ -265,6 +267,4 @@ at::Tensor bmm_kunpeng(const at::Tensor &input, const at::Tensor &weight)
                                      reinterpret_cast<bfloat16_t *>(output[b].data_ptr()), local_tmpc);
         }
     });
-
-    return output;
 }

@@ -75,6 +75,9 @@ void shm_allreduce_kunpeng(at::Tensor input)
 
     int64_t batch = input.size(0);
     int64_t dim = input.size(1);
+
+    if (batch == 0) return;
+
     size_t total_bytes = static_cast<size_t>(input.numel()) * sizeof(bfloat16_t);
     at::Tensor shm_tensor = get_or_create_shm_tensor(dim, batch);
 

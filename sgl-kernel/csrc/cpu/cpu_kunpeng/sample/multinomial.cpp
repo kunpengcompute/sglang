@@ -25,7 +25,7 @@
 
 #include "common.h"
 
-at::Tensor multinomial_kunpeng(const at::Tensor &probs, int64_t num_samples, bool replacement)
+void multinomial_kunpeng(const at::Tensor &probs, at::Tensor out, int64_t num_samples, bool replacement)
 {
     CHECK_LAST_DIM_CONTIGUOUS_INPUT(probs);
     CHECK_DIM(2, probs);
@@ -36,21 +36,22 @@ at::Tensor multinomial_kunpeng(const at::Tensor &probs, int64_t num_samples, boo
                     num_samples, " vs ", probs.size(1));
     }
 
+    int64_t batch = probs.size(0);
+    TORCH_CHECK(out.dim() == 2, "out must be 2D");
+    TORCH_CHECK(out.size(0) == batch && out.size(1) == num_samples, "out shape mismatch");
+    TORCH_CHECK(out.scalar_type() == at::kLong, "out must be int64");
+
     if (num_samples == 1) {
-        // Gumbel-max trick via PyTorch's vectorized exponential_ + div + argmax
         auto noise = at::empty_like(probs);
         noise.exponential_(1.0);
         auto ratio = probs / noise;
-        return at::argmax(ratio, 1, true);
+        out.copy_(at::argmax(ratio, 1, true));
+        return;
     }
 
-    // num_samples > 1: cumsum + binary search
-    int64_t batch = probs.size(0);
     int64_t vocab = probs.size(1);
-
-    auto result = at::empty({batch, num_samples}, at::dtype(at::kLong));
+    int64_t *result_data = out.data_ptr<int64_t>();
     const float *probs_data = probs.data_ptr<float>();
-    int64_t *result_data = result.data_ptr<int64_t>();
     int64_t stride = probs.stride(0);
 
     kutacc::parallel_for(0, batch, 1, [&](int64_t start, int64_t end) {
@@ -90,6 +91,4 @@ at::Tensor multinomial_kunpeng(const at::Tensor &probs, int64_t num_samples, boo
             }
         }
     });
-
-    return result;
 }
