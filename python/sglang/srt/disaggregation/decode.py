@@ -336,6 +336,7 @@ class DecodePreallocQueue:
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.decode_start_layer = self.token_to_kv_pool.start_layer
+        # end_layer is exclusive, so num_layers = end_layer - start_layer
         kv_args.decode_num_layers = (
             self.token_to_kv_pool.end_layer - self.token_to_kv_pool.start_layer
         )

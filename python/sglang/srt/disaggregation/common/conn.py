@@ -336,14 +336,15 @@ class CommonKVManager(BaseKVManager):
             f"decode pp size > 1. "
             f"Got decode pp_size={self.pp_size}, prefill pp_size={info.pp_size}."
         )
-        if info.pp_size == self.pp_size:
+        if info.pp_size == self.pp_size:    # prefill pp_size == decode pp_size
             target_pp_ranks = [self.pp_rank]
-        elif self.pp_size == 1:
+        elif self.pp_size == 1:             # decode pp_size == 1
             target_pp_ranks = list(range(info.pp_size))
             required_prefill_response_num *= info.pp_size // self.pp_size
-        elif info.pp_size == 1 and self.pp_size > 1:
+        elif info.pp_size == 1 and self.pp_size > 1:    # prefill pp_size == 1 
             target_pp_ranks = [0]
         else:
+            # prefill pp_size > decode pp_size and prefill pp_size  % decode pp_size == 0
             ratio = info.pp_size // self.pp_size
             start = self.pp_rank * ratio
             target_pp_ranks = list(range(start, start + ratio))
@@ -429,6 +430,7 @@ class CommonKVManager(BaseKVManager):
         decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
         decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
 
+        # prefill pp_size < decode pp_size: slice src to decode's layer range
         if decode_num_layers > 0 and decode_num_layers < num_kv_layers:
             src_local_start = decode_start_layer - start_layer
             src_local_end = src_local_start + decode_num_layers
@@ -444,7 +446,9 @@ class CommonKVManager(BaseKVManager):
             src_v_ptrs = src_kv_ptrs[num_kv_layers:]
             num_send_layers = num_kv_layers
 
+        # map prefill layer to decode dst buffer local index
         dst_local_start = start_layer - decode_start_layer
+        # src is sliced to decode's range, so dst_local_start becomes 0
         if decode_num_layers > 0 and decode_num_layers < num_kv_layers:
             dst_local_start = 0
         dst_local_end = dst_local_start + num_send_layers
@@ -482,6 +486,7 @@ class CommonKVManager(BaseKVManager):
         decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
         num_prefill_layers = len(src_kv_ptrs)
 
+        # prefill pp_size < decode pp_size: slice src to decode's layer range
         if decode_num_layers > 0 and decode_num_layers < num_prefill_layers:
             src_local_start = decode_start_layer - start_layer
             src_local_end = src_local_start + decode_num_layers

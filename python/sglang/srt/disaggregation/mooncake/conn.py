@@ -130,6 +130,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: list[int]
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
+    # decode-side layer info, used to slice prefill src when prefill pp != decode pp
     decode_start_layer: int = 0
     decode_num_layers: int = 0
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
@@ -612,6 +613,7 @@ class MooncakeKVManager(CommonKVManager):
             )
             decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
             decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
+            # slice item_lens to match sliced src (MLA: only K part)
             if decode_num_layers > 0 and decode_num_layers < len(item_lens):
                 k_item_lens = item_lens[
                     decode_start_layer : decode_start_layer + decode_num_layers
@@ -635,6 +637,7 @@ class MooncakeKVManager(CommonKVManager):
             decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
             decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
             total_item_layers = len(item_lens) // 2
+            # slice item_lens to match sliced src (MHA: K and V parts)
             if (
                 decode_num_layers > 0
                 and decode_num_layers < total_item_layers
@@ -1257,6 +1260,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
+                            # propagate decode-side layer info from decode registration info
                             self.kv_args.decode_start_layer = getattr(
                                 target_rank_registration_info, "decode_start_layer", 0
                             )
@@ -1367,6 +1371,8 @@ class MooncakeKVManager(CommonKVManager):
                                 (req.endpoint, req.dst_port, req.room)
                             )
 
+                            # sync status when all dst ranks received KV, or
+                            # one room maps to multiple dst sessions (prefill pp=1, decode pp>1)
                             num_dst_sessions = len(
                                 self.transfer_infos.get(kv_chunk.room, {})
                             )
@@ -1392,6 +1398,7 @@ class MooncakeKVManager(CommonKVManager):
                                         status,
                                         prefill_unique_rank,
                                     )
+                                # reset accumulators so each dst session gets its own sync_status
                                 polls = []
                                 dst_ranks_infos = []
                     else:

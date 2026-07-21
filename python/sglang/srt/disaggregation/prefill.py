@@ -146,6 +146,7 @@ class PrefillBootstrapQueue:
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        # default to 0, will be filled from decode metadata per-request
         kv_args.decode_start_layer = 0
         kv_args.decode_num_layers = 0
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
