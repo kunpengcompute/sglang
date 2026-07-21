@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.distributed import get_socket_tp_group
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -72,49 +73,29 @@ class DeepseekMLAKunpengForwardMixin:
         if self.q_lora_rank is not None:
             # uk
             bs = q_nope.size(1)  # num_local_heads
-            m = q_nope.size(0)  # n_tokens
             k = q_nope.size(2)  # qk_nope_head_dim
-            n = self.w_kc_int8.size(2)  # kv_lora_rank
 
-            a_3d = q_nope.transpose(0, 1).contiguous()  # (bs, m, k)
+            a_3d = q_nope.transpose(0, 1)  # (bs, m, k)
 
             scale_shape = (bs, k, 1)
             scale_3d = self.w_kc_scale.view(scale_shape)
 
-            q_nope_out = torch.empty(
-                (bs, m, n), dtype=torch.bfloat16, device=q_nope.device
-            )
-            pa_3d = torch.empty_like(a_3d)
-
-            torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(a_3d, pa_3d)
-            torch.ops.sgl_kernel.batched_gemm_woqs8_allthreads_kunpeng(
-                pa_3d, self.w_kc_int8_packed, None, scale_3d, q_nope_out
-            )
+            pa_3d = kunpeng.batched_gemm_pack_allthreads_kunpeng(a_3d)
+            q_nope_out = kunpeng.batched_gemm_woqs8_allthreads_kunpeng(
+                pa_3d, self.w_kc_int8_packed, None, scale_3d)
 
         else:
-            q_nope_input = q_nope.transpose(0, 1).contiguous()
-            q_nope_out = torch.ops.sgl_kernel.bmm_kunpeng(
-                q_nope_input, self.w_kc_packed
-            )
+            q_nope_input = q_nope.transpose(0, 1)
+            q_nope_out = kunpeng.bmm_kunpeng(q_nope_input, self.w_kc_packed)
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
         if self.rotary_emb is not None:
-            q_out_kp = torch.empty_like(q_pe)
-            k_out_kp = torch.empty_like(k_pe)
-            torch.ops.sgl_kernel.rope_kunpeng(
-                positions,
-                q_pe,
-                k_pe,
-                q_out_kp,
-                k_out_kp,
-                self.rotary_emb.cos_sin_cache,
-            )
-            q_pe = q_out_kp
-            k_pe = k_out_kp
+            q_pe, k_pe = kunpeng.rope_kunpeng(
+                positions, q_pe, k_pe, self.rotary_emb.cos_sin_cache)
 
-        q_combined = torch.cat([q_nope_out, q_pe], dim=-1)  # (B, num_local_heads, D_qk)
-        k_combined = torch.cat([k_nope, k_pe], dim=-1)  # (B, 1, D_kv+D_rope)
+        q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
+        k_combined = kunpeng.cat_kunpeng(k_nope, k_pe, -1)  # (B, 1, D_kv+D_rope)
 
         forward_batch.token_to_kv_pool.set_kv_buffer(
             self.attn_mqa, forward_batch.out_cache_loc, k_combined, k_nope
@@ -155,13 +136,7 @@ class DeepseekMLAKunpengForwardMixin:
             # (B, numhead_local, D_qk) → (B/a2a, numhead_local*a2a, D_qk)
             B_q, numhead_local_q, D_qk = q.shape
             batchsize_per_tp = B_q // all2all_size
-            q_a2a = torch.empty(
-                (batchsize_per_tp, numhead_local_q * all2all_size, D_qk),
-                dtype=q.dtype,
-                device=q.device,
-            )
-            torch.ops.sgl_kernel.shm_mla_q_alltoall_kunpeng(q, q_a2a)
-            q = q_a2a
+            q = kunpeng.shm_mla_q_alltoall_kunpeng(q, all2all_size)
 
             # After all2all each rank holds all Nh = num_local_heads * a2a heads;
             # temporarily override tp_q_head_num for the reshape in
@@ -188,16 +163,9 @@ class DeepseekMLAKunpengForwardMixin:
             # (B/a2a, Nh_in_group, D_kv) → (B, numhead_local, D_kv)
             all_heads_in_group = self.num_local_heads * all2all_size
             attn_output = attn_output.view(batchsize_per_tp, all_heads_in_group, self.kv_lora_rank)
-            B, numhead_local, D_kv = (
-                batchsize_per_tp * all2all_size,
-                self.num_local_heads,
-                self.kv_lora_rank,
-            )
-            o_a2a = torch.empty(
-                (B, numhead_local, D_kv), dtype=attn_output.dtype, device=attn_output.device
-            )
-            torch.ops.sgl_kernel.shm_mla_o_alltoall_kunpeng(attn_output, o_a2a)
-            attn_output = o_a2a.view(-1, numhead_local, D_kv)
+            attn_output = kunpeng.shm_mla_o_alltoall_kunpeng(attn_output, all2all_size)
+            # reshape back to flattened for w_vc
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         else:
             attn_output = self.attn_mqa(
                 q,
@@ -212,33 +180,26 @@ class DeepseekMLAKunpengForwardMixin:
 
         if self.q_lora_rank is not None:
             bs = attn_output.size(1)
-            m = attn_output.size(0)
-            k = attn_output.size(2)
             n = self.w_vc_int8.size(1)
 
-            a_3d = attn_output.transpose(0, 1).contiguous()
+            a_3d = attn_output.transpose(0, 1)
 
             rscale_3d = self.w_vc_scale.view(bs, n, 1)
 
-            c_tensor_3d = torch.empty(
-                (bs, m, n), dtype=torch.bfloat16, device=attn_output.device
-            )
-            pa_3d = torch.empty(a_3d.shape, dtype=a_3d.dtype, device=a_3d.device)
+            pa_3d = kunpeng.batched_gemm_pack_allthreads_kunpeng(a_3d)
+            c_tensor_3d = kunpeng.batched_gemm_woqs8_allthreads_kunpeng(
+                pa_3d, self.w_vc_int8_packed, rscale_3d, None)
 
-            torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(a_3d, pa_3d)
-            torch.ops.sgl_kernel.batched_gemm_woqs8_allthreads_kunpeng(
-                pa_3d, self.w_vc_int8_packed, rscale_3d, None, c_tensor_3d
-            )
-
-            attn_bmm_output = c_tensor_3d.transpose(0, 1).reshape(
+            attn_bmm_output = kunpeng.contiguous_kunpeng(
+                c_tensor_3d.transpose(0, 1)).reshape(
                 -1, self.num_local_heads * self.v_head_dim
             )
         else:
-            attn_bmm_input = attn_output.transpose(0, 1).contiguous()
-            attn_bmm_output = (
-                torch.ops.sgl_kernel.bmm_kunpeng(attn_bmm_input, self.w_vc_packed)
-                .transpose(0, 1)
-                .reshape(-1, self.num_local_heads * self.v_head_dim)
+            attn_bmm_input = attn_output.transpose(0, 1)
+            c_tensor_3d = kunpeng.bmm_kunpeng(attn_bmm_input, self.w_vc_packed)
+            attn_bmm_output = kunpeng.contiguous_kunpeng(
+                c_tensor_3d.transpose(0, 1)).reshape(
+                -1, self.num_local_heads * self.v_head_dim
             )
 
         # o_proj

@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_kunpeng_hbw_pool, is_kunpeng_hbw_swap
+from sglang.srt.graph import ops as kunpeng
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -682,11 +683,6 @@ class KunpengCpuBackend(AttentionBackend):
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
-
         if layer.is_cross_attention:
             cache_loc = forward_batch.encoder_out_cache_loc
         else:
@@ -696,7 +692,6 @@ class KunpengCpuBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
         if _enable_hbw_swap and self.hbw_kvbuffer is not None:
             swap_index = self.hbw_kvbuffer.get_safe_on_package_memory_index(
@@ -736,33 +731,21 @@ class KunpengCpuBackend(AttentionBackend):
         page_size = metadata.page_size
 
         q_4d = q_.unsqueeze(1)
-        o_4d = o_.unsqueeze(1)
 
         kvcache_paged = kv_k[:, 0, :].reshape(-1, page_size, kv_cache_dim)
 
         extra_buffer = (
-            torch.empty(metadata.extra_bytes, dtype=torch.uint8, device=q_.device)
+            kunpeng.alloc_buffer(metadata.extra_bytes)
             if metadata.extra_bytes > 0
             else torch.empty(0, dtype=torch.uint8, device=q_.device)
         )
 
-        softmax_lse = torch.empty(
-            (batch_size, 1, num_q_heads), dtype=torch.float32, device=q_.device
-        )
+        o_graph, softmax_lse = kunpeng.flash_mla_dense_decode_kunpeng(
+            q_4d, kvcache_paged, block_table, seq_lens,
+            softmax_scale, False, extra_buffer,
+            self._decode_meta, head_dim_v)
 
-        torch.ops.sgl_kernel.flash_mla_dense_decode_kunpeng(
-            q_4d,
-            kvcache_paged,
-            None,
-            block_table,
-            seq_lens,
-            o_4d,
-            softmax_lse,
-            softmax_scale,
-            False,
-            extra_buffer,
-            self._decode_meta,
-        )
+        o = o_graph.view(batch_size, -1)
 
         # SDMA pipeline: swapout current layer, swapin next layer
         if _enable_hbw_swap and self.hbw_kvbuffer is not None:

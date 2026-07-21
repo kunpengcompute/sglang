@@ -648,6 +648,11 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_kc_scale = bind_or_assign(
                         self_attn.w_kc_scale, w_kc_scale.contiguous()
                     )
+                    _w_kc = self_attn.w_kc_int8.transpose(1, 2).contiguous()
+                    self_attn.w_kc_int8_packed = torch.empty(
+                        _w_kc.shape, dtype=_w_kc.dtype, device=_w_kc.device)
+                    torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(
+                        _w_kc, self_attn.w_kc_int8_packed)
                 w_vc = w_vc.contiguous().transpose(1, 2)
                 if _is_npu:
                     w_vc = w_vc.contiguous()
@@ -659,6 +664,20 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_vc_scale = bind_or_assign(
                         self_attn.w_vc_scale, w_vc_scale.contiguous()
                     )
+                    _w_vc = self_attn.w_vc_int8.contiguous()
+                    self_attn.w_vc_int8_packed = torch.empty(
+                        _w_vc.shape, dtype=_w_vc.dtype, device=_w_vc.device)
+                    torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(
+                        _w_vc, self_attn.w_vc_int8_packed)
+
+                if _is_cpu_920f and self_attn.q_lora_rank is None:
+                    batch_size = get_global_server_args().max_prefill_tokens
+                    self_attn.w_kc_packed = \
+                        torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
+                            self_attn.w_kc, batch_size)
+                    self_attn.w_vc_packed = \
+                        torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
+                            self_attn.w_vc, batch_size)
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
@@ -728,40 +747,6 @@ class DeepseekV2WeightLoaderMixin:
                     if hasattr(experts, "w13_weight") and hasattr(experts, "w2_weight"):
                         _kunpeng_prepack_igemm_expert_weight(experts.w13_weight)
                         _kunpeng_prepack_igemm_expert_weight(experts.w2_weight)
-
-                # Prepack MLA bmm/int8 weights for Kunpeng
-                if self_attn.q_lora_rank is None and self_attn.w_kc is not None:
-                    batch_size = get_global_server_args().max_prefill_tokens
-                    self_attn.w_kc_packed = (
-                        torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
-                            self_attn.w_kc, batch_size
-                        )
-                    )
-                    self_attn.w_vc_packed = (
-                        torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
-                            self_attn.w_vc, batch_size
-                        )
-                    )
-                if self_attn.w_kc_int8 is not None:
-                    w_kc_t = self_attn.w_kc_int8.transpose(1, 2).contiguous()
-                    self_attn.w_kc_int8_packed = torch.empty(
-                        w_kc_t.shape,
-                        dtype=w_kc_t.dtype,
-                        device=w_kc_t.device,
-                    )
-                    torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(
-                        w_kc_t, self_attn.w_kc_int8_packed
-                    )
-
-                    w_vc_t = self_attn.w_vc_int8.contiguous()
-                    self_attn.w_vc_int8_packed = torch.empty(
-                        w_vc_t.shape,
-                        dtype=w_vc_t.dtype,
-                        device=w_vc_t.device,
-                    )
-                    torch.ops.sgl_kernel.batched_gemm_pack_allthreads_kunpeng(
-                        w_vc_t, self_attn.w_vc_int8_packed
-                    )
 
         # Prepack lm_head.weight for Kunpeng 920F CPU
         # Skip for MTP (is_nextn): lm_head will be replaced by set_embed_and_head()
