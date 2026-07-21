@@ -185,6 +185,7 @@ from sglang.srt.utils import (
     is_hip,
     is_host_cpu_arm64,
     is_kunpeng_hbw_pool,
+    is_kunpeng_graph_capture,
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
@@ -220,6 +221,7 @@ _is_cpu_arm64 = is_host_cpu_arm64()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_920f = is_cpu_920f()
 _is_kunpeng_hbw_pool = is_kunpeng_hbw_pool()
+_is_kunpeng_graph_capture = is_kunpeng_graph_capture()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -1399,6 +1401,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             continue
                         tensor_hbw = self.weight_hbw_pool.move_to_hbw(param)
                         param.data = tensor_hbw
+
+            if _is_cpu_920f and _is_kunpeng_graph_capture:
+                from sglang.srt.graph.collect_weights import collect_model_weights
+                self.graph_fixed_weights = collect_model_weights(self.model)
+            else:
+                self.graph_fixed_weights = None
 
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
@@ -3021,6 +3029,71 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
+        # ── sglang graph capture/replay for Kunpeng decode ──
+        # TODO: sampler (model_runner.sample() in tp_worker.py) is outside
+        # the graph.  Move it into forward_decode to cover embed→sample.
+        if _is_cpu_920f and _is_kunpeng_graph_capture:
+            from sglang.srt.graph import capture, finalize
+
+            input_ids64 = forward_batch.input_ids.long()
+
+            if not hasattr(self, '_sglang_decode_graph'):
+                fixed = self.graph_fixed_weights[:]
+                for kv in self.token_to_kv_pool.kv_buffer:
+                    fixed.append(kv)
+                # cos_sin_cache shared across all layers
+                layer0 = self.model.model.layers[0]
+                if layer0.self_attn.rotary_emb is not None:
+                    fixed.append(layer0.self_attn.rotary_emb.cos_sin_cache)
+                # next_token_logits_buffer (pre-allocated, reused)
+                if forward_batch.next_token_logits_buffer is not None:
+                    fixed.append(forward_batch.next_token_logits_buffer)
+                # MoE state buffers (process-level singleton, not in model tree)
+                try:
+                    from sglang.srt.layers.moe.token_dispatcher.kunpeng import \
+                        _KunpengDispatcherState
+                    state = _KunpengDispatcherState.get()
+                    for attr in ('parallel_policy', 'dispatch_send_buf',
+                                 'dispatch_recv_buf', 'combine_send_buf',
+                                 'combine_recv_buf', 'recv_token_ids_buf',
+                                 'recv_experts_offset', 'combined_x',
+                                 'topk_weights_buf', 'topk_ids_index_buf'):
+                        t = getattr(state, attr, None)
+                        if t is not None:
+                            fixed.append(t)
+                except Exception:
+                    pass
+                meta = self.attn_backend.forward_metadata
+                inputs = [input_ids64,
+                          forward_batch.positions,
+                          meta.block_table,
+                          meta.seq_lens,
+                          forward_batch.out_cache_loc,
+                          self.attn_backend._decode_meta]
+
+                with capture(inputs=inputs, fixed=fixed):
+                    ret = self.model.forward(
+                        input_ids64,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+                    logits = ret.next_token_logits
+
+                self._sglang_decode_graph = finalize([logits])
+
+            input_tensors = [input_ids64,
+                             forward_batch.positions,
+                             self.attn_backend.forward_metadata.block_table,
+                             self.attn_backend.forward_metadata.seq_lens,
+                             forward_batch.out_cache_loc,
+                             self.attn_backend._decode_meta]
+            logits, = self._sglang_decode_graph.run(input_tensors)
+
+            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+            ret = LogitsProcessorOutput(next_token_logits=logits)
+            return ret
 
         # Launch forward
         ctx = (
