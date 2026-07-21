@@ -1393,11 +1393,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
             if _is_cpu_920f and _is_kunpeng_hbw_pool:
-                for name, param in self.model.named_parameters():
-                    if "embed_tokens" in name:
-                        continue
-                    tensor_hbw = self.weight_hbw_pool.move_to_hbw(param)
-                    param.data = tensor_hbw
+                if not self.is_draft_worker:
+                    for name, param in self.model.named_parameters():
+                        if "embed_tokens" in name:
+                            continue
+                        tensor_hbw = self.weight_hbw_pool.move_to_hbw(param)
+                        param.data = tensor_hbw
 
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (

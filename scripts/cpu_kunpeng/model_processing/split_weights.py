@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 from collections import defaultdict
+from typing import Optional
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -112,7 +113,12 @@ def _rename_mtp_key(key: str) -> str:
 # ============================================================================
 
 
-def split_moe_experts(model_dir: str, output_dir: str):
+def split_moe_experts(
+    model_dir: str,
+    output_dir: str,
+    num_hidden_layers: Optional[int] = None,
+    mtp_output_dir: Optional[str] = None,
+):
 
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
     if not os.path.exists(index_path):
@@ -133,7 +139,13 @@ def split_moe_experts(model_dir: str, output_dir: str):
     sorted_layers = sorted(layer_to_expert_keys.keys())
 
     for layer in tqdm(sorted_layers, desc="处理 MoE 层"):
-        layer_dir = os.path.join(output_dir, f"layer_{layer}")
+        # 当指定 num_hidden_layers 时，MTP 层的 expert 输出到独立目录
+        if num_hidden_layers is not None and layer >= num_hidden_layers:
+            layer_dir = os.path.join(
+                mtp_output_dir, f"layer_{layer - num_hidden_layers}"
+            )
+        else:
+            layer_dir = os.path.join(output_dir, f"layer_{layer}")
         os.makedirs(layer_dir, exist_ok=True)
 
         expert_dict = layer_to_expert_keys[layer]
@@ -204,7 +216,8 @@ def split_non_moe_weights(
     attention_tp_size: int = 16,
     socket_tp_size=8,
     ranks=None,
-    num_hidden_layers=61,
+    num_hidden_layers=None,
+    mtp_output_dir: Optional[str] = None,
 ):
     if ranks is None:
         ranks = list(range(attention_tp_size))
@@ -218,6 +231,7 @@ def split_non_moe_weights(
 
     non_layer_keys = []
     layer_keys = []
+    mtp_keys = []
 
     for key in weight_map.keys():
         if "layers." not in key:
@@ -226,9 +240,13 @@ def split_non_moe_weights(
             layer_idx = _extract_layer_idx(key)
             if layer_idx < 0:
                 continue
-            layer_keys.append(key)
+            # 当指定 num_hidden_layers 时，MTP 层的权重单独处理
+            if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+                mtp_keys.append(key)
+            else:
+                layer_keys.append(key)
 
-    all_keys = non_layer_keys + layer_keys
+    all_keys = non_layer_keys + layer_keys + mtp_keys
     fused_qkva = "model.layers.0.self_attn.q_a_proj.weight" in layer_keys
     all_weights = load_shards_into_memory(all_keys, weight_map, model_dir)
 
@@ -252,164 +270,173 @@ def split_non_moe_weights(
             socket_tp_size,
         )
 
+    def _process_layer_key(key, target_dict, rank):
+        """对单个 layer key 做切分，结果写入 target_dict。"""
+        if "_scale" in key:
+            return
+
+        # shared experts
+        if "shared_experts.gate_proj.weight" in key:
+            up_key = key.replace("gate_proj", "up_proj")
+            tensor = all_weights[key]
+            tensor_scale = all_weights[key + "_scale"]
+            up_tensor = all_weights[up_key]
+            up_tensor_scale = all_weights[up_key + "_scale"]
+            new_key = key.replace("gate_proj", "gate_up_proj")
+
+            target_dict[new_key] = split_and_concat_for_rank(
+                [tensor, up_tensor], "attention_tp", 0, rank
+            )
+            target_dict[new_key + "_scale"] = split_and_concat_for_rank(
+                [tensor_scale, up_tensor_scale], "attention_tp", 0, rank
+            )
+            return
+
+        elif "shared_experts.up_proj.weight" in key:
+            return
+
+        elif "shared_experts.down_proj.weight" in key:
+            tensor = all_weights[key]
+            scale_tensor = all_weights[key + "_scale"]
+
+            target_dict[key] = split_for_rank(tensor, "attention_tp", 1, rank)
+            target_dict[key + "_scale"] = split_for_rank(scale_tensor, "none", 0, rank)
+            return
+
+        # mlp
+        elif "mlp.down_proj.weight" in key:
+            tensor = all_weights[key]
+            scale_tensor = all_weights[key + "_scale"]
+            target_dict[key] = split_for_rank(tensor, "attention_tp", 1, rank)
+            target_dict[key + "_scale"] = split_for_rank(scale_tensor, "none", 0, rank)
+            return
+
+        elif "mlp.gate_proj.weight" in key:
+            up_key = key.replace("gate_proj", "up_proj")
+            tensor = all_weights[key]
+            tensor_scale = all_weights[key + "_scale"]
+            up_tensor = all_weights[up_key]
+            up_scale_tensor = all_weights[up_key + "_scale"]
+            new_key = key.replace("gate_proj", "gate_up_proj")
+
+            target_dict[new_key] = split_and_concat_for_rank(
+                [tensor, up_tensor], "attention_tp", 0, rank
+            )
+            target_dict[new_key + "_scale"] = split_and_concat_for_rank(
+                [tensor_scale, up_scale_tensor], "attention_tp", 0, rank
+            )
+            return
+
+        elif "mlp.up_proj.weight" in key:
+            return
+
+        # attention
+        elif any(
+            k in key
+            for k in [
+                "self_attn.q_proj.weight",
+                "self_attn.q_b_proj.weight",
+                "self_attn.kv_b_proj.weight",
+            ]
+        ):
+            tensor = all_weights[key]
+            scale_tensor = all_weights[key + "_scale"]
+            target_dict[key] = split_for_rank(tensor, "attention_tp", 0, rank)
+            target_dict[key + "_scale"] = split_for_rank(
+                scale_tensor, "attention_tp", 0, rank
+            )
+            return
+
+        elif "self_attn.o_proj.weight" in key:
+            tensor = all_weights[key]
+            scale_tensor = all_weights[key + "_scale"]
+            target_dict[key] = split_for_rank(tensor, "attention_tp", 1, rank)
+            target_dict[key + "_scale"] = split_for_rank(scale_tensor, "none", 0, rank)
+            return
+
+        elif "self_attn.q_a_proj.weight" in key:
+            if fused_qkva:
+                return
+            tensor = all_weights[key]
+            scale_tensor = all_weights[key + "_scale"]
+            target_dict[key] = split_for_rank(tensor, "none", 0, rank)
+            target_dict[key + "_scale"] = split_for_rank(scale_tensor, "none", 0, rank)
+            return
+
+        elif "self_attn.kv_a_proj_with_mqa.weight" in key:
+            if not fused_qkva:
+                tensor = all_weights[key]
+                scale_tensor = all_weights[key + "_scale"]
+                target_dict[key] = split_for_rank(tensor, "none", 0, rank)
+                target_dict[key + "_scale"] = split_for_rank(
+                    scale_tensor, "none", 0, rank
+                )
+                return
+            else:
+                qa_key = key.replace(
+                    "self_attn.kv_a_proj_with_mqa", "self_attn.q_a_proj"
+                )
+                tensor = all_weights[key]
+                qa_tensor = all_weights[qa_key]
+                scale_tensor = all_weights[key + "_scale"]
+                qa_scale_tensor = all_weights[qa_key + "_scale"]
+                new_key = key.replace("kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa")
+
+                fused_tensor = torch.cat([qa_tensor, tensor], dim=0)
+                fused_scale = torch.cat([qa_scale_tensor, scale_tensor], dim=0)
+                target_dict[new_key] = split_for_rank(
+                    fused_tensor, "socket_tp", 0, rank
+                )
+                target_dict[new_key + "_scale"] = split_for_rank(
+                    fused_scale, "socket_tp", 0, rank
+                )
+                return
+
+        elif any(k in key for k in ["eh_proj", "embed_tokens", "shared_head.head"]):
+            tensor = all_weights[key]
+            target_dict[key] = split_for_rank(tensor, "attention_tp", 0, rank)
+            return
+
+        else:
+            tensor = all_weights[key]
+            target_dict[key] = split_for_rank(tensor, "none", 0, rank)
+
     for rank in tqdm(ranks, desc="处理rank"):
         rank_weights = {}
+        mtp_rank_weights = {}
 
         for key in non_layer_keys:
             tensor = all_weights[key]
             if "embed_tokens" in key:
                 rank_weights[key] = split_for_rank(tensor, "attention_tp", 0, rank)
+                mtp_rank_weights[key] = split_for_rank(tensor, "attention_tp", 0, rank)
             elif "lm_head" in key:
                 rank_weights[key] = split_for_rank(tensor, "attention_tp", 0, rank)
+                mtp_rank_weights[key] = split_for_rank(tensor, "attention_tp", 0, rank)
             else:
                 rank_weights[key] = split_for_rank(tensor, "none", 0, rank)
 
         for key in tqdm(layer_keys, desc=f"处理keys(rank={rank})", leave=False):
-            if "_scale" in key:
-                continue
+            _process_layer_key(key, rank_weights, rank)
 
-            # shared experts
-            if "shared_experts.gate_proj.weight" in key:
-                up_key = key.replace("gate_proj", "up_proj")
-                tensor = all_weights[key]
-                tensor_scale = all_weights[key + "_scale"]
-                up_tensor = all_weights[up_key]
-                up_tensor_scale = all_weights[up_key + "_scale"]
-                new_key = key.replace("gate_proj", "gate_up_proj")
-
-                rank_weights[new_key] = split_and_concat_for_rank(
-                    [tensor, up_tensor], "attention_tp", 0, rank
-                )
-                rank_weights[new_key + "_scale"] = split_and_concat_for_rank(
-                    [tensor_scale, up_tensor_scale], "attention_tp", 0, rank
-                )
-
-            elif "shared_experts.up_proj.weight" in key:
-                continue
-
-            elif "shared_experts.down_proj.weight" in key:
-                tensor = all_weights[key]
-                scale_tensor = all_weights[key + "_scale"]
-
-                rank_weights[key] = split_for_rank(tensor, "attention_tp", 1, rank)
-                rank_weights[key + "_scale"] = split_for_rank(
-                    scale_tensor, "none", 0, rank
-                )
-
-            # mlp
-            elif "mlp.down_proj.weight" in key:
-                tensor = all_weights[key]
-                scale_tensor = all_weights[key + "_scale"]
-                rank_weights[key] = split_for_rank(tensor, "attention_tp", 1, rank)
-                rank_weights[key + "_scale"] = split_for_rank(
-                    scale_tensor, "none", 0, rank
-                )
-
-            elif "mlp.gate_proj.weight" in key:
-                up_key = key.replace("gate_proj", "up_proj")
-                tensor = all_weights[key]
-                tensor_scale = all_weights[key + "_scale"]
-                up_tensor = all_weights[up_key]
-                up_scale_tensor = all_weights[up_key + "_scale"]
-                new_key = key.replace("gate_proj", "gate_up_proj")
-
-                rank_weights[new_key] = split_and_concat_for_rank(
-                    [tensor, up_tensor], "attention_tp", 0, rank
-                )
-                rank_weights[new_key + "_scale"] = split_and_concat_for_rank(
-                    [tensor_scale, up_scale_tensor], "attention_tp", 0, rank
-                )
-
-            elif "mlp.up_proj.weight" in key:
-                continue
-
-            # attention
-            elif any(
-                k in key
-                for k in [
-                    "self_attn.q_proj.weight",
-                    "self_attn.q_b_proj.weight",
-                    "self_attn.kv_b_proj.weight",
-                ]
-            ):
-                tensor = all_weights[key]
-                scale_tensor = all_weights[key + "_scale"]
-                rank_weights[key] = split_for_rank(tensor, "attention_tp", 0, rank)
-                rank_weights[key + "_scale"] = split_for_rank(
-                    scale_tensor, "attention_tp", 0, rank
-                )
-
-            elif "self_attn.o_proj.weight" in key:
-                tensor = all_weights[key]
-                scale_tensor = all_weights[key + "_scale"]
-                rank_weights[key] = split_for_rank(tensor, "attention_tp", 1, rank)
-                rank_weights[key + "_scale"] = split_for_rank(
-                    scale_tensor, "none", 0, rank
-                )
-
-            elif "self_attn.q_a_proj.weight" in key:
-                if fused_qkva:
-                    continue
-                tensor = all_weights[key]
-                scale_tensor = all_weights[key + "_scale"]
-                rank_weights[key] = split_for_rank(tensor, "none", 0, rank)
-                rank_weights[key + "_scale"] = split_for_rank(
-                    scale_tensor, "none", 0, rank
-                )
-
-            elif "self_attn.kv_a_proj_with_mqa.weight" in key:
-                if not fused_qkva:
-                    tensor = all_weights[key]
-                    scale_tensor = all_weights[key + "_scale"]
-                    rank_weights[key] = split_for_rank(tensor, "none", 0, rank)
-                    rank_weights[key + "_scale"] = split_for_rank(
-                        scale_tensor, "none", 0, rank
-                    )
-                else:
-                    qa_key = key.replace(
-                        "self_attn.kv_a_proj_with_mqa", "self_attn.q_a_proj"
-                    )
-                    tensor = all_weights[key]
-                    qa_tensor = all_weights[qa_key]
-                    scale_tensor = all_weights[key + "_scale"]
-                    qa_scale_tensor = all_weights[qa_key + "_scale"]
-                    new_key = key.replace(
-                        "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
-                    )
-
-                    fused_tensor = torch.cat([qa_tensor, tensor], dim=0)
-                    fused_scale = torch.cat([qa_scale_tensor, scale_tensor], dim=0)
-                    rank_weights[new_key] = split_for_rank(
-                        fused_tensor, "socket_tp", 0, rank
-                    )
-                    rank_weights[new_key + "_scale"] = split_for_rank(
-                        fused_scale, "socket_tp", 0, rank
-                    )
-
-            elif "eh_proj" in key:
-                tensor = all_weights[key]
-                rank_weights[key] = split_for_rank(tensor, "attention_tp", 1, rank)
-
-            else:
-                tensor = all_weights[key]
-                rank_weights[key] = split_for_rank(tensor, "none", 0, rank)
-
-        key_num = len(rank_weights.keys())
-        weights_saved = {}
-        _keys = list(rank_weights.keys())
-        for k in _keys:
-            v = rank_weights.pop(k)
-            if _extract_layer_idx(k) < num_hidden_layers:
-                weights_saved[k] = v
-            else:
-                weights_saved[_rename_mtp_key(k)] = v
-        assert len(weights_saved.keys()) == key_num
+        for key in tqdm(mtp_keys, desc=f"处理MTP keys(rank={rank})", leave=False):
+            _process_layer_key(key, mtp_rank_weights, rank)
 
         out_layer_path = os.path.join(
             output_dir, f"model-rank-{rank}-part-0.safetensors"
         )
-        save_file(weights_saved, out_layer_path)
-        del weights_saved
+        save_file(rank_weights, out_layer_path)
+        del rank_weights
+
+        if mtp_output_dir is not None and mtp_rank_weights:
+            mtp_layer_path = os.path.join(
+                mtp_output_dir, f"model-rank-{rank}-part-0.safetensors"
+            )
+            mtp_weights_renamed = {
+                _rename_mtp_key(k): v for k, v in mtp_rank_weights.items()
+            }
+            save_file(mtp_weights_renamed, mtp_layer_path)
+        del mtp_rank_weights
 
 
 # ============================================================================
@@ -451,8 +478,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_hidden_layers",
         type=int,
-        default=61,
-        help="隐藏层数量，用于区分 MTP 层与普通层的边界",
+        default=None,
+        help="隐藏层数量，用于区分 MTP 层与普通层的边界；不传时表示无 MTP 层，所有权重保存到同一目录",
     )
 
     args = parser.parse_args()
@@ -463,12 +490,23 @@ if __name__ == "__main__":
         print(f"输出目录 (output_dir)     : {args.output_dir}")
         print(f"Attention TP 大小         : {args.attention_tp_size}")
         print(f"Socket TP 大小            : {args.socket_tp_size}")
-        print(f"隐藏层数量                : {args.num_hidden_layers}")
+        if args.num_hidden_layers is not None:
+            print(f"隐藏层数量                : {args.num_hidden_layers}")
+            print(
+                f"MTP 输出目录              : {args.output_dir}_mtp/tp{args.attention_tp_size}"
+            )
         print("========================================================\n")
 
         output_dir = args.output_dir + f"/tp{args.attention_tp_size}"
+        mtp_output_dir = (
+            args.output_dir + f"_mtp/tp{args.attention_tp_size}"
+            if args.num_hidden_layers is not None
+            else None
+        )
 
         os.makedirs(output_dir, exist_ok=True)
+        if mtp_output_dir is not None:
+            os.makedirs(mtp_output_dir, exist_ok=True)
 
         split_non_moe_weights(
             args.model_dir,
@@ -477,30 +515,54 @@ if __name__ == "__main__":
             args.socket_tp_size,
             ranks=list(range(args.attention_tp_size)),
             num_hidden_layers=args.num_hidden_layers,
+            mtp_output_dir=mtp_output_dir,
         )
     else:
         print("=================== MoE 专家切分配置 ===================")
         print(f"模型目录 (model_dir)      : {args.model_dir}")
         print(f"输出目录 (output_dir)     : {args.output_dir}")
+        if args.num_hidden_layers is not None:
+            print(f"隐藏层数量                : {args.num_hidden_layers}")
+            print(f"MTP 输出目录              : {args.output_dir}_mtp/experts")
         print("========================================================\n")
 
         output_dir = args.output_dir + "/experts"
+        mtp_output_dir = (
+            args.output_dir + "_mtp/experts"
+            if args.num_hidden_layers is not None
+            else None
+        )
 
         os.makedirs(output_dir, exist_ok=True)
+        if mtp_output_dir is not None:
+            os.makedirs(mtp_output_dir, exist_ok=True)
 
         split_moe_experts(
             args.model_dir,
             output_dir,
+            num_hidden_layers=args.num_hidden_layers,
+            mtp_output_dir=mtp_output_dir,
         )
+
+    # 将非 .safetensors 文件（config.json、tokenizer 等）复制到输出目录；
+    # 若启用 MTP 分离，也复制一份到 MTP 输出目录，保证独立加载时元数据完整
+    mtp_meta_output_dir = (
+        args.output_dir + "_mtp" if args.num_hidden_layers is not None else None
+    )
+    if mtp_meta_output_dir is not None:
+        os.makedirs(mtp_meta_output_dir, exist_ok=True)
 
     for file in os.listdir(args.model_dir):
         if os.path.splitext(file)[1] in (".safetensors",):
             continue
         src = os.path.join(args.model_dir, file)
-        dst = os.path.join(args.output_dir, file)
-        if os.path.isdir(src):
-            if os.path.exists(dst):
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
-        else:
-            shutil.copy(src, dst)
+        for dst_dir in (args.output_dir, mtp_meta_output_dir):
+            if dst_dir is None:
+                continue
+            dst = os.path.join(dst_dir, file)
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy(src, dst)
