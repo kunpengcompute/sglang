@@ -23,6 +23,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_npu,
 )
+from sglang.srt.graph import ops as kunpeng
 
 if is_cuda():
     from flashinfer.sampling import (
@@ -625,7 +626,7 @@ def sampling_from_probs_torch(
     """
     if sampling_seed is None:
         if _is_cpu_920f:
-            sampled_index = torch.ops.sgl_kernel.multinomial_kunpeng(probs, 1, True)
+            sampled_index = kunpeng.multinomial_kunpeng(probs, 1, True)
         else:
             sampled_index = torch.multinomial(probs, num_samples=1, replacement=True)
     else:

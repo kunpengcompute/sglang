@@ -58,6 +58,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
+    is_cpu_920f,
     is_cuda,
     is_hip,
     is_npu,
@@ -78,6 +79,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_cpu_920f = is_cpu_920f()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
@@ -1618,6 +1620,18 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         assert not self.nsa_kv_cache_store_fp8
+
+        if _is_cpu_920f:
+            from sglang.srt.graph import ops as kunpeng
+            kv = self.kv_buffer[layer_id - self.start_layer]
+            kdim = kv.shape[-1]
+            kunpeng.set_kv_buffer_kunpeng(
+                kv.squeeze(1),
+                loc,
+                cache_k.reshape(-1, kdim),
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 

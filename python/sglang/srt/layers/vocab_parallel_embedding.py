@@ -17,6 +17,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
@@ -527,7 +528,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                     added_vocab_end=self.shard_indices.added_vocab_end_index,
                 )
                 if not get_attn_tp_context().input_scattered:
-                    if self.use_attn_tp_group:
+                    if _is_cpu_920f:
+                        kunpeng.shm_allreduce_kunpeng(output_parallel)
+                    elif self.use_attn_tp_group:
                         output_parallel = attn_tp_all_reduce(output_parallel)
                     else:
                         output_parallel = tensor_model_parallel_all_reduce(

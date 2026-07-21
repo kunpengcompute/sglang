@@ -24,6 +24,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_allocation_symmetric,
@@ -39,7 +40,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cpu_920f, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
+_is_cpu_920f = is_cpu_920f()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_DISABLE_LINEARQUANT"
 )
@@ -1535,7 +1537,10 @@ class RowParallelLinear(LinearBase):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
-            if self.use_dp_attention_reduce:
+            if _is_cpu_920f:
+                kunpeng.shm_allreduce_kunpeng(output_parallel)
+                output = output_parallel
+            elif self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
                 quantize_communications = (

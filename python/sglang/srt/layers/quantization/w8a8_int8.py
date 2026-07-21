@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+from sglang.srt.graph import ops as kunpeng
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
@@ -244,10 +245,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             else:
                 # quant
                 batch_size = x.shape[0]
-                dim = x.shape[1]
-                norm_int8 = torch.empty((batch_size, dim), dtype=torch.int8)
-                norm_scale = torch.empty((batch_size, 1), dtype=torch.float32)
-                torch.ops.sgl_kernel.quant_kunpeng(x, norm_int8, norm_scale)
+                norm_int8, norm_scale = kunpeng.quant_kunpeng(x)
 
             # gemm
             n, k = layer.weight.shape
@@ -255,25 +253,15 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(batch_size, n, k)
             )
 
-            output = torch.empty([batch_size, n], dtype=torch.bfloat16)
+            pack_a = kunpeng.s8_gemm_pack_kunpeng(norm_int8, tile_m, tile_k)
 
-            pack_a = torch.empty_like(norm_int8)
-            torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(norm_int8, pack_a, tile_m, tile_k)
+            workspace = kunpeng.alloc_buffer(batch_size * n * 64,
+                                         dtype=torch.bfloat16)
 
-            workspace_size = batch_size * n * 64
-            workspace = torch.empty(workspace_size, dtype=torch.bfloat16)
-
-            torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_kunpeng(
-                pack_a,
-                layer.weight,
-                layer.weight_scale.view(-1),
-                norm_scale.view(-1),
-                output,
-                workspace,
-                tile_m,
-                tile_n,
-                tile_k,
-            )
+            output = kunpeng.s8_s8_packed_gemm_bf16_dq_kunpeng(
+                pack_a, layer.weight, layer.weight_scale.view(-1),
+                norm_scale.view(-1), workspace,
+                tile_m, tile_n, tile_k)
 
             return output
 

@@ -73,6 +73,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
+from sglang.srt.graph import ops as kunpeng
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -654,7 +655,7 @@ class GroupCoordinator:
                 and input_.shape[0] > 0
                 and input_.shape[0] <= self.kunpeng_communicator.max_tokens
             ):
-                torch.ops.sgl_kernel.shm_allreduce_kunpeng(input_)
+                kunpeng.shm_allreduce_kunpeng(input_)
             else:
                 torch.distributed.all_reduce(
                     input_,
@@ -846,7 +847,7 @@ class GroupCoordinator:
             and input.shape[0] > 0
             and input.shape[0] <= self.kunpeng_communicator.max_tokens
         ):
-            torch.ops.sgl_kernel.shm_reduce_scatter_kunpeng(input)
+            kunpeng.shm_reduce_scatter_kunpeng(input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
@@ -945,9 +946,7 @@ class GroupCoordinator:
 
         if input_.shape[0] > 0:
             try:
-                torch.ops.sgl_kernel.shm_batched_allgather_kunpeng(
-                    input_, output, self.world_size
-                )
+                output = kunpeng.shm_batched_allgather_kunpeng(input_, self.world_size)
             except RuntimeError:
                 # Fall back to Gloo when SHM pool is exhausted.
                 # all_gather_into_tensor concatenates on dim=0, so we gather

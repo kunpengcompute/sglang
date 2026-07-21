@@ -33,6 +33,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
@@ -70,6 +71,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
+    is_cpu_920f,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -85,6 +87,7 @@ _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_cpu_920f = is_cpu_920f()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
@@ -1015,9 +1018,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         hidden_states
                     )
                 else:
-                    hidden_states = attention_tensor_model_parallel_all_reduce(
-                        hidden_states
-                    )
+                    if _is_cpu_920f:
+                        kunpeng.shm_allreduce_kunpeng(hidden_states)
+                    else:
+                        hidden_states = attention_tensor_model_parallel_all_reduce(
+                            hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -1090,9 +1095,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         hidden_states
                     )
                 else:
-                    hidden_states = attention_tensor_model_parallel_all_reduce(
-                        hidden_states
-                    )
+                    if _is_cpu_920f:
+                        kunpeng.shm_allreduce_kunpeng(hidden_states)
+                    else:
+                        hidden_states = attention_tensor_model_parallel_all_reduce(
+                            hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)

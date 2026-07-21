@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.srt.graph import ops as kunpeng
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
@@ -431,18 +432,15 @@ class RMSNorm(MultiPlatformOp):
                 x, self.weight.data, self.variance_epsilon
             )
         elif _is_cpu_920f:
-            outs = torch.empty_like(x)
             if residual is not None:
                 if post_residual_addition is not None:
+                    assert False, "no impl"
                     residual = residual + post_residual_addition
-                torch.ops.sgl_kernel.fused_add_rmsnorm_kunpeng(
-                    x, residual, self.weight.data, self.variance_epsilon, outs
-                )
+                outs = kunpeng.fused_add_rmsnorm_kunpeng(
+                    x, residual, self.weight.data, self.variance_epsilon)
                 return outs, residual
-            torch.ops.sgl_kernel.rmsnorm_kunpeng(
-                x, self.weight.data, self.variance_epsilon, outs
-            )
-            return outs
+            return kunpeng.rmsnorm_kunpeng(
+                x, self.weight.data, self.variance_epsilon)
         else:
             return self.forward_native(x, residual, post_residual_addition)
 

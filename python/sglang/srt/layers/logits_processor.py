@@ -58,6 +58,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import is_cpu_920f, is_npu, use_intel_amx_backend
+from sglang.srt.graph import ops as kunpeng
 
 logger = logging.getLogger(__name__)
 
@@ -911,9 +912,16 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             elif _is_cpu_920f:
-                logits = torch.ops.sgl_kernel.bf16_linear_kunpeng(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight, None
-                )
+                hs = hidden_states.to(lm_head.weight.dtype)
+                M, K = hs.shape
+                N = lm_head.weight.shape[0]
+                tile_m, tile_n, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+                blocks_in_k = K // tile_k
+                ws_numel = blocks_in_k * N * M * 2 if blocks_in_k > 1 else 0
+                packed_hs = kunpeng.bf16_gemm_pack_kunpeng(hs, tile_m, tile_k)
+                logits = kunpeng.bf16_packed_gemm_kunpeng(
+                    packed_hs, lm_head.weight,
+                    kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16), 32)
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
@@ -948,7 +956,7 @@ class LogitsProcessor(nn.Module):
             if _is_cpu_920f:
                 # batch_all_gather gathers on dim=-1, directly producing
                 # [batch, vocab_size] matching the kernel's natural layout.
-                global_logits = get_attn_tp_group().batch_all_gather(logits, dim=-1)
+                global_logits = kunpeng.shm_batched_allgather_kunpeng(logits, self.attn_tp_size)
             else:
                 global_logits = torch.empty(
                     (
@@ -999,6 +1007,16 @@ class LogitsProcessor(nn.Module):
     def _copy_logits_to_buffer(
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
+        if _is_cpu_920f:
+            logits_slice = logits[:, : self.vocab_size]
+            if logits_metadata.next_token_logits_buffer is not None:
+                kunpeng.copy_kunpeng(logits_metadata.next_token_logits_buffer,
+                          logits_slice)
+                assert False, "no impl"
+            buf = kunpeng.alloc_buffer(logits_slice.numel(), dtype=torch.float32)
+            buf_2d = buf.view(logits_slice.shape)
+            kunpeng.copy_kunpeng(buf_2d, logits_slice)
+            return buf_2d
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
             assert logits_buffer.dtype == torch.float
