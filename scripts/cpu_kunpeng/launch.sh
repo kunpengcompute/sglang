@@ -69,16 +69,23 @@ if [[ "$ROLE" == "all" ]]; then
     # Wait for prefill and decode HTTP servers to be ready (up to 20 minutes total)
     endpoints=("${PREFILL_MASTER_ADDR}:30000" "${DECODE_MASTER_ADDR}:30000")
     echo "[$(date +%T)] Waiting for prefill and decode servers to be ready (up to 20 minutes)..."
+    ready=(0 0)
     for i in $(seq 1 600); do
-        curl -sf --max-time 2 "http://${endpoints[0]}/health" >/dev/null 2>&1 &&
-            curl -sf --max-time 2 "http://${endpoints[1]}/health" >/dev/null 2>&1 && break
+        for j in 0 1; do
+            if [[ "${ready[$j]}" -eq 0 ]] &&
+                curl -sf --max-time 2 "http://${endpoints[$j]}/health" >/dev/null 2>&1; then
+                ready[$j]=1
+                echo "[$(date +%T)] ${endpoints[$j]} ready"
+            fi
+        done
+        [[ "${ready[0]}" -eq 1 && "${ready[1]}" -eq 1 ]] && break
         sleep 2
     done
-    for ep in "${endpoints[@]}"; do
-        curl -sf --max-time 2 "http://$ep/health" >/dev/null 2>&1 || {
-            echo "ERROR: HTTP server at $ep failed to start within 30 minutes"
+    for j in 0 1; do
+        if [[ "${ready[$j]}" -eq 0 ]]; then
+            echo "ERROR: HTTP server at ${endpoints[$j]} failed to start within 20 minutes"
             exit 1
-        }
+        fi
     done
     echo "[$(date +%T)] ===== Prefill and decode servers launched (running in background) ====="
 

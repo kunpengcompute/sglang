@@ -34,7 +34,7 @@ NUM_REQUESTS=0
 STREAM=false
 DP_ENABLED=false
 DP_RANK=0
-PROMPT_FILE="prompts/5.txt"
+PROMPT_FILE="prompts/128.txt"
 
 while getopts "d:hpsn:m:f:" opt; do
   case $opt in
@@ -120,9 +120,34 @@ BODY="{
 BODY_FILE=$(mktemp)
 printf '%s' "$BODY" > "$BODY_FILE"
 
-time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
-  -H "Content-Type: application/json" \
-  -d @"$BODY_FILE"
+if [ "$STREAM" = true ]; then
+    STREAM_FILE=$(mktemp)
+    time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
+      -H "Content-Type: application/json" \
+      -d @"$BODY_FILE" | tee "$STREAM_FILE"
+
+    # Count streamed chunks: every "data:" line except the trailing [DONE].
+    CHUNK_COUNT=$(grep -c "^data:" "$STREAM_FILE")
+    DONE_COUNT=$(grep -c "\[DONE\]" "$STREAM_FILE")
+    CHUNK_COUNT=$((CHUNK_COUNT - DONE_COUNT))
+
+    rm -f "$STREAM_FILE"
+
+    if [ "$CHUNK_COUNT" -gt 0 ]; then
+        RATE=$(awk -v m="$MAX_TOKENS" -v c="$CHUNK_COUNT" \
+            'BEGIN { printf "%.2f", m / c }')
+        echo "" >&2
+        echo "===================================" >&2
+        echo "Receive rate: $RATE tokens/chunk" >&2
+        echo "  max_tokens: $MAX_TOKENS" >&2
+        echo "  chunks:     $CHUNK_COUNT" >&2
+        echo "===================================" >&2
+    fi
+else
+    time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
+      -H "Content-Type: application/json" \
+      -d @"$BODY_FILE"
+fi
 
 rm -f "$BODY_FILE"
 
