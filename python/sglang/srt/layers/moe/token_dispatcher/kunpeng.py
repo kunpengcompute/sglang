@@ -36,6 +36,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
+from sglang.srt.graph import ops as kunpeng
 
 kernel = torch.ops.sgl_kernel
 
@@ -49,7 +50,6 @@ logger = logging.getLogger(__name__)
 
 class KunpengDispatchOutput(NamedTuple):
     num_tokens: int
-    recv_tokens: int
     packed_recv_x: torch.Tensor
     combine_send_buf: torch.Tensor
     recv_token_ids_buf: torch.Tensor
@@ -550,20 +550,20 @@ class KunpengDispatcher(BaseDispatcher):
             _tp_offset : _tp_offset + _tp_count, hidden_states.shape[1] :
         ].view(torch.float32)
 
-        torch.ops.sgl_kernel.quant_kunpeng(
+        kunpeng.quant_inplace_kunpeng(
             hidden_states[_tp_offset : _tp_offset + _tp_count], norm_int8, norm_scale
         )
 
         if _tp_count > 0:
-            state.topk_ids_index_buf[:batch_size, 0::2] = topk_ids
-            state.topk_weights_buf[:batch_size].copy_(topk_weights)
+            kunpeng.copy_kunpeng(state.topk_ids_index_buf[:batch_size, 0::2], topk_ids)
+            kunpeng.copy_kunpeng(state.topk_weights_buf[:batch_size], topk_weights)
 
         t_quant_and_copy_end = time.perf_counter()
 
         # Dispatch send
         t_send_start = time.perf_counter()
         batch_id = 0
-        torch.ops.sgl_kernel.moe_dispatch_send_kunpeng(
+        kunpeng.moe_dispatch_send_kunpeng(
             norm_int8_and_scale,
             state.topk_ids_index_buf,
             state.num_experts,
@@ -607,7 +607,7 @@ class KunpengDispatcher(BaseDispatcher):
 
         # Dispatch recv
         t_recv_start = time.perf_counter()
-        torch.ops.sgl_kernel.moe_dispatch_recv_kunpeng(
+        kunpeng.moe_dispatch_recv_kunpeng(
             batch_id,
         )
         t_recv_end = time.perf_counter()
@@ -618,7 +618,7 @@ class KunpengDispatcher(BaseDispatcher):
             cur_src_info = state.recv_src_info
         else:
             cur_src_info = state.recv_src_info_bak
-        recv_tokens = torch.ops.sgl_kernel.topk_convert_kunpeng(
+        kunpeng.topk_convert_kunpeng(
             cur_src_info,
             state.recv_token_ids_buf,
             state.recv_experts_offset,
@@ -643,7 +643,6 @@ class KunpengDispatcher(BaseDispatcher):
 
         return KunpengDispatchOutput(
             num_tokens=num_tokens,
-            recv_tokens=recv_tokens,
             packed_recv_x=state.packed_recv_x,
             combine_send_buf=state.combine_send_buf,
             recv_token_ids_buf=state.recv_token_ids_buf,
@@ -681,7 +680,7 @@ class KunpengDispatcher(BaseDispatcher):
 
         t_send_start = time.perf_counter()
         batch_id = 0
-        torch.ops.sgl_kernel.moe_combine_send_kunpeng(
+        kunpeng.moe_combine_send_kunpeng(
             state.combine_send_buf,
             recv_src_info,
             state.num_max_dispatch_tokens_per_rank,
@@ -730,7 +729,7 @@ class KunpengDispatcher(BaseDispatcher):
         t_send_end = pending["t_send_end"]
 
         t_recv_start = time.perf_counter()
-        torch.ops.sgl_kernel.moe_combine_recv_kunpeng(
+        kunpeng.moe_combine_recv_kunpeng(
             state.combined_x,
             state.topk_ids_index_buf,
             state.topk_weights_buf,

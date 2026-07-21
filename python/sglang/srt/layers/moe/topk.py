@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+from sglang.srt.graph import ops as kunpeng
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -675,30 +676,10 @@ def grouped_topk_kunpeng(
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-    num_token = gating_output.shape[0]
-    num_experts = gating_output.shape[1]
 
-    token_weights = torch.empty(
-        num_token, topk, dtype=torch.float32, device=gating_output.device
-    )
-    token_ids = torch.empty(
-        num_token, topk, dtype=torch.int16, device=gating_output.device
-    )
-
-    torch.ops.sgl_kernel.grouped_topk_kunpeng(
-        router_logits=gating_output,
-        token_weights=token_weights,
-        token_ids=token_ids,
-        topk=topk,
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-        bias=None,
-        experts_offset=None,
-        renormalize=renormalize,
-        scoring_func_sigmoid=False,
-        moe_balance=False,
-        v2=0,
-    )
+    token_weights, token_ids = kunpeng.grouped_topk_kunpeng(
+        gating_output, None, topk, num_expert_group, topk_group,
+        bool(renormalize), False, False, 0)
 
     topk_weights = token_weights
     topk_ids = token_ids
@@ -1126,9 +1107,8 @@ def _load_balance_padded_tokens_kunpeng(
     num_experts: int,
     topk: int,
 ) -> torch.Tensor:
-    torch.ops.sgl_kernel.load_balance_padded_tokens_kunpeng(
-        topk_ids, topk_weights, num_token_non_padded, num_experts, topk
-    )
+    kunpeng.load_balance_padded_tokens_kunpeng(
+        topk_ids, topk_weights, num_token_non_padded, num_experts, topk)
     return topk_ids, topk_weights
 
 
@@ -1145,30 +1125,9 @@ def biased_grouped_topk_kunpeng(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    num_token = gating_output.shape[0]
-    num_experts = gating_output.shape[1]
-
-    token_weights = torch.empty(
-        num_token, topk, dtype=torch.float32, device=gating_output.device
-    )
-    token_ids = torch.empty(
-        num_token, topk, dtype=torch.int16, device=gating_output.device
-    )
-
-    torch.ops.sgl_kernel.grouped_topk_kunpeng(
-        router_logits=gating_output,
-        token_weights=token_weights,
-        token_ids=token_ids,
-        topk=topk,
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-        bias=correction_bias,
-        experts_offset=None,
-        renormalize=renormalize,
-        scoring_func_sigmoid=True,
-        moe_balance=False,
-        v2=0,
-    )
+    token_weights, token_ids = kunpeng.grouped_topk_kunpeng(
+        gating_output, correction_bias, topk, num_expert_group, topk_group,
+        renormalize, True, False, 0)
 
     topk_weights = token_weights
     topk_ids = token_ids

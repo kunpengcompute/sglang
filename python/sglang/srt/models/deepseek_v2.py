@@ -51,6 +51,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
@@ -288,15 +289,8 @@ class DeepseekV2MLP(nn.Module):
             )
             return x
         else:
-            m = gate_up.shape[0]
-            n = gate_up.shape[1]
-            gateup_int8 = torch.empty([m, n // 2], dtype=torch.int8)
-            gateup_scale = torch.empty([m, 1], dtype=torch.float32)
-
             # silu_mul_quant
-            torch.ops.sgl_kernel.silu_mul_quant_kunpeng(
-                gate_up, gateup_int8, gateup_scale
-            )
+            gateup_int8, gateup_scale = kunpeng.silu_mul_quant_kunpeng(gate_up)
 
             # down proj with pre-quantized int8 input
             x, _ = self.down_proj(
@@ -388,9 +382,15 @@ class MoEGate(nn.Module):
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif _is_cpu_920f:
-                logits = torch.ops.sgl_kernel.bf16_linear_kunpeng(
-                    hidden_states, self.weight, None
-                )
+                M, K = hidden_states.shape
+                N = self.weight.shape[0]
+                tile_m, tile_n, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+                blocks_in_k = K // tile_k
+                ws_numel = blocks_in_k * N * M * 2 if blocks_in_k > 1 else 0
+                packed_hs = kunpeng.bf16_gemm_pack_kunpeng(hidden_states, tile_m, tile_k)
+                logits = kunpeng.bf16_packed_gemm_kunpeng(
+                    packed_hs, self.weight,
+                    kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16), 32)
             else:
                 logits = F.linear(hidden_states, self.weight, None)
 
@@ -1095,7 +1095,7 @@ class DeepseekV2MoE(nn.Module):
             if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
                 x.add_(final_hidden_states)
             elif get_moe_a2a_backend().is_kunpeng_cpu():
-                torch.ops.sgl_kernel.mul_scalar_add_kunpeng(
+                kunpeng.mul_scalar_add_kunpeng(
                     final_hidden_states, x, self.routed_scaling_factor
                 )
             else:

@@ -63,6 +63,7 @@ from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
 )
+from sglang.srt.graph import ops as kunpeng
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -719,7 +720,6 @@ class KunpengMoE(FusedMoE):
 
         t_total_start = time.perf_counter()
 
-        recv_tokens = dispatch_output.recv_tokens
         hidden = self.hidden_size
         num_local_experts = self.num_local_experts
         max_dispatch_tokens = dispatch_output.max_dispatch_tokens_per_rank
@@ -742,9 +742,9 @@ class KunpengMoE(FusedMoE):
                 recv_dense_size, inter_dim * 2
             )
         else:
-            moe_gateup = torch.empty(
-                recv_dense_size, inter_dim * 2, dtype=torch.bfloat16
-            )
+            moe_gateup = kunpeng.alloc_buffer(
+                recv_dense_size * inter_dim * 2, dtype=torch.bfloat16
+            ).view(recv_dense_size, inter_dim * 2)
 
         # Workspace buffers (sizes follow C++ reference heuristic).
         # TODO(kunpeng): get fusedmoe_fixed_size from env
@@ -753,11 +753,11 @@ class KunpengMoE(FusedMoE):
         else:
             fusedmoe_fixed_size = 256
 
-        tmpx_gateup = torch.empty(fusedmoe_fixed_size * hidden, dtype=torch.int8)
-        tmpy_gateup = torch.empty(
+        tmpx_gateup = kunpeng.alloc_buffer(fusedmoe_fixed_size * hidden, dtype=torch.int8)
+        tmpy_gateup = kunpeng.alloc_buffer(
             fusedmoe_fixed_size * inter_dim * 4, dtype=torch.float32
         )
-        tmp_scales_gateup = torch.empty(fusedmoe_fixed_size * 4, dtype=torch.float32)
+        tmp_scales_gateup = kunpeng.alloc_buffer(fusedmoe_fixed_size * 4, dtype=torch.float32)
 
         # 1) gateup GEMM
         # Split packed_recv_x [recv_size, hidden+4] uint8 into act and scale
@@ -766,12 +766,12 @@ class KunpengMoE(FusedMoE):
         scale = packed_recv_x[:, hidden : hidden + 4].view(torch.float32)
 
         t_gateup_start = time.perf_counter()
-        torch.ops.sgl_kernel.igemm_fusedmoe_gateup_kunpeng(
+        kunpeng.igemm_fusedmoe_gateup_kunpeng(
             act,
             scale,
             self.w13_weight,
             self.w13_weight_scale,
-            dispatch_output.recv_token_ids_buf[:recv_tokens],
+            dispatch_output.recv_token_ids_buf,
             dispatch_output.recv_experts_offset,
             moe_gateup,
             tmpx_gateup,
@@ -781,29 +781,34 @@ class KunpengMoE(FusedMoE):
         t_gateup_end = time.perf_counter()
 
         # 2) SiLU + mul + quantize
-        moe_silu_int8 = torch.empty(recv_dense_size, inter_dim, dtype=torch.int8)
-        moe_silu_scale = torch.empty(recv_dense_size, 1, dtype=torch.float32)
+        moe_silu_int8 = kunpeng.alloc_buffer(
+            recv_dense_size * inter_dim, dtype=torch.int8
+        ).view(recv_dense_size, inter_dim)
+        moe_silu_scale = kunpeng.alloc_buffer(
+            recv_dense_size, dtype=torch.float32
+        ).view(recv_dense_size, 1)
 
         t_silu_start = time.perf_counter()
-        torch.ops.sgl_kernel.silu_mul_quant_kunpeng(
-            moe_gateup[:recv_tokens],
-            moe_silu_int8[:recv_tokens],
+        kunpeng.moe_silu_mul_quant_kunpeng(
+            moe_gateup,
+            moe_silu_int8,
             moe_silu_scale,
+            dispatch_output.recv_experts_offset,
         )
         t_silu_end = time.perf_counter()
 
         # 3) down GEMM
-        tmpx_down = torch.empty(fusedmoe_fixed_size * inter_dim, dtype=torch.int8)
-        tmpy_down = torch.empty(fusedmoe_fixed_size * hidden, dtype=torch.float32)
-        tmp_scales_down = torch.empty(fusedmoe_fixed_size * 4, dtype=torch.float32)
+        tmpx_down = kunpeng.alloc_buffer(fusedmoe_fixed_size * inter_dim, dtype=torch.int8)
+        tmpy_down = kunpeng.alloc_buffer(fusedmoe_fixed_size * hidden, dtype=torch.float32)
+        tmp_scales_down = kunpeng.alloc_buffer(fusedmoe_fixed_size * 4, dtype=torch.float32)
 
         t_down_start = time.perf_counter()
-        torch.ops.sgl_kernel.igemm_fusedmoe_down_kunpeng(
+        kunpeng.igemm_fusedmoe_down_kunpeng(
             moe_silu_int8,
             self.w2_weight,
             moe_silu_scale,
             self.w2_weight_scale,
-            dispatch_output.recv_token_ids_buf[:recv_tokens],
+            dispatch_output.recv_token_ids_buf,
             dispatch_output.recv_experts_offset,
             moe_down,
             tmpx_down,
@@ -820,7 +825,7 @@ class KunpengMoE(FusedMoE):
                 f"silu_mul_quant={1000*(t_silu_end - t_silu_start):.2f}, "
                 f"down={1000*(t_down_end - t_down_start):.2f}, "
                 f"total={1000*(t_total_end - t_total_start):.2f}, "
-                f"recv_tokens={recv_tokens}, "
+                f"recv_tokens={int(dispatch_output.recv_experts_offset[-1].item())}, "
                 f"hidden={hidden}, inter_dim={inter_dim}, "
                 f"num_local_experts={num_local_experts}"
             )
