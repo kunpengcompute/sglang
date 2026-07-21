@@ -203,6 +203,20 @@ def kutacc_mha(
     pack_attn_k = torch.empty(pack_k_shape, dtype=dtype, device=device)
     pack_attn_v = torch.empty(pack_v_shape, dtype=dtype, device=device)
 
+    # Non-packed path: kernel reads K/V in BC=128 tiles and Q/O in BR=128 tiles.
+    # When n_token is not a multiple of 128, the last tile crosses the buffer
+    # boundary and corrupts the heap. Pad K/V to a 128-multiple to avoid this.
+    if not kv_is_packed:
+        padded_kv = ((n_token + BC - 1) // BC) * BC
+        para_k = torch.zeros(
+            padded_kv, num_heads, qk_head_dim, dtype=dtype, device=device
+        )
+        para_k[:n_token] = key
+        para_v = torch.zeros(
+            padded_kv, num_heads, vo_head_dim, dtype=dtype, device=device
+        )
+        para_v[:n_token] = value
+
     attn_s = torch.empty(thread_num, BC * BR, dtype=torch.float32, device=device)
     attn_out_block_old = torch.empty(
         thread_num, BR, vo_head_dim, dtype=torch.float32, device=device
@@ -242,9 +256,7 @@ def kutacc_mha(
         )
         para_k = pack_attn_k
         para_v = pack_attn_v
-    else:
-        para_k = key
-        para_v = value
+    # non-packed path: para_k/para_v already allocated as padded buffers above
 
     cur_lens = extend_seq_lens.tolist()
     seq_lens = extend_seq_lens.tolist()  # same as cur_lens when no prefix
@@ -260,8 +272,19 @@ def kutacc_mha(
         cur_q_loc = chunk_q_loc[chunk_idx]
 
         cur_total_q = cur_q.shape[0]
+        # Pad Q/O to BR=128 multiple: kernel loads Q into pack_attn_q (BR rows)
+        # and writes O from attn_out_block (BR rows) back to cur_out. Without
+        # padding, the last tile overflows when cur_total_q is not a multiple
+        # of BR.
+        padded_cur_q = ((cur_total_q + BR - 1) // BR) * BR
+        if padded_cur_q != cur_total_q:
+            cur_q_padded = torch.zeros(
+                padded_cur_q, num_heads, qk_head_dim, dtype=dtype, device=device
+            )
+            cur_q_padded[:cur_total_q] = cur_q
+            cur_q = cur_q_padded
         cur_out = torch.empty(
-            cur_total_q, num_heads, vo_head_dim, dtype=dtype, device=device
+            padded_cur_q, num_heads, vo_head_dim, dtype=dtype, device=device
         )
 
         # seq_lens for this chunk (each sequence's total length so far)
