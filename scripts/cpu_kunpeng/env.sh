@@ -151,11 +151,11 @@ export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=50
 # Kunpeng HBW pool
 export SGLANG_ENABLE_HBW_POOL=1
 export SGLANG_ENABLE_HBW_SWAP=0
-export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=3662
+export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=3800
 # Kunpeng SDMA parameters
 export SGLANG_KUNPENG_SDMA_MAX_EVENTS=10
 export SGLANG_KUNPENG_SDMA_THRESHOLD=5
-# Load format (e.g. "sharded_state", leave empty for default)
+# Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
 # PD disaggregation mode
 export IS_PREFILL="1"
