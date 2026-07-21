@@ -35,8 +35,8 @@ class KVArgs:
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
-    # for pp decode (start layer of the decode-side KV pool that dst_kv_ptrs points to)
     decode_start_layer: int
+    decode_num_layers: int
     # for system dp
     system_dp_rank: int
 

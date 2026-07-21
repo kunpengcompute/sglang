@@ -130,9 +130,8 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: list[int]
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
-    # Start layer of the decode-side KV pool that dst_kv_ptrs points to.
-    # Used by get_*_kv_ptrs_with_pp when prefill and decode use different pp_size.
     decode_start_layer: int = 0
+    decode_num_layers: int = 0
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -165,8 +164,11 @@ class KVArgsRegisterInfo:
             decode_start_layer=(
                 int(msg[13].decode("ascii")) if len(msg) > 13 and len(msg[13]) > 0 else 0
             ),
+            decode_num_layers=(
+                int(msg[14].decode("ascii")) if len(msg) > 14 and len(msg[14]) > 0 else 0
+            ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 15),
         )
 
 
@@ -608,11 +610,20 @@ class MooncakeKVManager(CommonKVManager):
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
+            decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
+            decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
+            if decode_num_layers > 0 and decode_num_layers < len(item_lens):
+                k_item_lens = item_lens[
+                    decode_start_layer : decode_start_layer + decode_num_layers
+                ]
+                sliced_item_lens = list(k_item_lens)
+            else:
+                sliced_item_lens = item_lens
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
                     dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
+                    sliced_item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -621,7 +632,25 @@ class MooncakeKVManager(CommonKVManager):
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
             # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
-            # Use correct item lengths for K and V separately
+            decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
+            decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
+            total_item_layers = len(item_lens) // 2
+            if (
+                decode_num_layers > 0
+                and decode_num_layers < total_item_layers
+            ):
+                k_item_lens = item_lens[
+                    decode_start_layer : decode_start_layer + decode_num_layers
+                ]
+                v_item_lens = item_lens[
+                    total_item_layers
+                    + decode_start_layer : total_item_layers
+                    + decode_start_layer
+                    + decode_num_layers
+                ]
+                sliced_item_lens = list(k_item_lens) + list(v_item_lens)
+            else:
+                sliced_item_lens = item_lens
             if layers_current_pp_stage > len(dst_k_ptrs):
                 logger.error(
                     "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
@@ -632,14 +661,14 @@ class MooncakeKVManager(CommonKVManager):
                 (
                     src_k_ptrs[layer_id],
                     dst_k_ptrs[layer_id],
-                    item_lens[layer_id],  # K item length
+                    sliced_item_lens[layer_id],  # K item length
                 )
                 for layer_id in range(layers_current_pp_stage)
             ] + [
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    item_lens[layers_current_pp_stage + layer_id],  # V item length
+                    sliced_item_lens[layers_current_pp_stage + layer_id],  # V item length
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -1171,9 +1200,10 @@ class MooncakeKVManager(CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
+                in_transfer_infos = kv_chunk.room in self.transfer_infos
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
-                    if kv_chunk.room in self.transfer_infos
+                    if in_transfer_infos
                     else []
                 )
                 polls = []
@@ -1227,11 +1257,11 @@ class MooncakeKVManager(CommonKVManager):
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
-                            # Propagate decode-side start layer so get_*_kv_ptrs_with_pp
-                            # can correctly index dst buffer when prefill and decode
-                            # use different pp_size (e.g. prefill pp=4, decode pp=2).
                             self.kv_args.decode_start_layer = getattr(
                                 target_rank_registration_info, "decode_start_layer", 0
+                            )
+                            self.kv_args.decode_num_layers = getattr(
+                                target_rank_registration_info, "decode_num_layers", 0
                             )
                             if target_rank_registration_info.enable_hisparse:
                                 ret = self.send_kvcache_hisparse(
@@ -1258,6 +1288,9 @@ class MooncakeKVManager(CommonKVManager):
                             self.kv_args.decode_start_layer = getattr(
                                 target_rank_registration_info, "decode_start_layer", 0
                             )
+                            self.kv_args.decode_num_layers = getattr(
+                                target_rank_registration_info, "decode_num_layers", 0
+                            )
                             ret, deferred = self._do_staging_transfer(
                                 staging_strategy,
                                 kv_chunk,
@@ -1275,6 +1308,9 @@ class MooncakeKVManager(CommonKVManager):
                         else:
                             self.kv_args.decode_start_layer = getattr(
                                 target_rank_registration_info, "decode_start_layer", 0
+                            )
+                            self.kv_args.decode_num_layers = getattr(
+                                target_rank_registration_info, "decode_num_layers", 0
                             )
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
@@ -1331,9 +1367,22 @@ class MooncakeKVManager(CommonKVManager):
                                 (req.endpoint, req.dst_port, req.room)
                             )
 
-                            # Only sync status when all the dst ranks have received the kvcache
-                            if len(polls) == req.required_dst_info_num:
-                                status = KVPoll.Success if all(polls) else KVPoll.Failed
+                            num_dst_sessions = len(
+                                self.transfer_infos.get(kv_chunk.room, {})
+                            )
+                            should_sync = (
+                                len(polls) == req.required_dst_info_num
+                                or (
+                                    req.required_dst_info_num == 1
+                                    and num_dst_sessions > 1
+                                )
+                            )
+                            if should_sync:
+                                status = (
+                                    KVPoll.Success
+                                    if all(polls)
+                                    else KVPoll.Failed
+                                )
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
@@ -1343,6 +1392,8 @@ class MooncakeKVManager(CommonKVManager):
                                         status,
                                         prefill_unique_rank,
                                     )
+                                polls = []
+                                dst_ranks_infos = []
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -1418,9 +1469,8 @@ class MooncakeKVManager(CommonKVManager):
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
+                    reg_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    self.decode_kv_args_table[mooncake_session_id] = reg_info
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
@@ -1436,9 +1486,8 @@ class MooncakeKVManager(CommonKVManager):
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
+                    tinfo = TransferInfo.from_zmq(waiting_req_bytes)
+                    self.transfer_infos[room][mooncake_session_id] = tinfo
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.update_status(room, KVPoll.WaitingForInput)
@@ -1498,7 +1547,9 @@ class MooncakeKVManager(CommonKVManager):
                     if bootstrap_room in self.request_status:
                         self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
                         expected_response_num = (
-                            self.required_prefill_response_num_table[bootstrap_room]
+                            self.required_prefill_response_num_table.get(
+                                bootstrap_room, -1
+                            )
                         )
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
@@ -1831,6 +1882,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         enable_hisparse,
                         str(
                             getattr(self.kv_mgr.kv_args, "decode_start_layer", 0)
+                        ).encode("ascii"),
+                        str(
+                            getattr(self.kv_mgr.kv_args, "decode_num_layers", 0)
                         ).encode("ascii"),
                         packed_staging_base_ptr,
                         staging_total_size_str,
