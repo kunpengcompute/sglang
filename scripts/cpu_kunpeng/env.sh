@@ -111,8 +111,10 @@ export TP_SIZE=256
 export EP_SIZE=${TP_SIZE}
 
 # PP size and chunked prefill size can be configured independently
-export PP_SIZE=1 # >1 enable pp  eg: 2
 export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size
+export PP_SIZE=1 # >1 enable pp  eg: 2
+export PREFILL_PP_SIZE=1
+export DECODE_PP_SIZE=1
 
 # Communication
 export GLOO_SOCKET_IFNAME=enp26s0f0
@@ -186,6 +188,7 @@ prefill_config() {
     export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="1"
     export SGLANG_SKIP_HTTP=1
+    export PP_SIZE=$PREFILL_PP_SIZE
 }
 
 # ------------------------------------------------------------
@@ -202,6 +205,7 @@ decode_config() {
     export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="0"
     export SGLANG_SKIP_HTTP=1
+    export PP_SIZE=$DECODE_PP_SIZE
 }
 
 # ------------------------------------------------------------

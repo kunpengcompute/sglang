@@ -318,15 +318,37 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
-        assert self.pp_size == info.pp_size or self.pp_size == 1, (
-            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
+        assert (
+            self.pp_size == info.pp_size
+            or self.pp_size == 1
+            or (
+                info.pp_size > self.pp_size
+                and info.pp_size % self.pp_size == 0
+            )
+            or (
+                info.pp_size == 1
+                and self.pp_size > 1
+                and self.pp_size % info.pp_size == 0
+            )
+        ), (
+            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}), "
+            f"or 1, or a divisor of prefill pp size, or prefill pp size should be 1 when "
+            f"decode pp size > 1. "
+            f"Got decode pp_size={self.pp_size}, prefill pp_size={info.pp_size}."
         )
-        if info.pp_size == self.pp_size:
+        if info.pp_size == self.pp_size:    # prefill pp_size == decode pp_size
             target_pp_ranks = [self.pp_rank]
-        else:
+        elif self.pp_size == 1:             # decode pp_size == 1
             target_pp_ranks = list(range(info.pp_size))
             required_prefill_response_num *= info.pp_size // self.pp_size
+        elif info.pp_size == 1 and self.pp_size > 1:    # prefill pp_size == 1 
+            target_pp_ranks = [0]
+        else:
+            # prefill pp_size > decode pp_size and prefill pp_size  % decode pp_size == 0
+            ratio = info.pp_size // self.pp_size
+            start = self.pp_rank * ratio
+            target_pp_ranks = list(range(start, start + ratio))
+            required_prefill_response_num *= ratio
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
@@ -405,44 +427,83 @@ class CommonKVManager(BaseKVManager):
         num_kv_layers = len(src_kv_ptrs) // 2
         end_layer = start_layer + num_kv_layers
         dst_num_total_layers = len(dst_kv_ptrs) // 2
-        src_k_ptrs = src_kv_ptrs[:num_kv_layers]
-        src_v_ptrs = src_kv_ptrs[num_kv_layers:]
-        if num_kv_layers == dst_num_total_layers:
+        decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
+        decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
+
+        # prefill pp_size < decode pp_size: slice src to decode's layer range
+        if decode_num_layers > 0 and decode_num_layers < num_kv_layers:
+            src_local_start = decode_start_layer - start_layer
+            src_local_end = src_local_start + decode_num_layers
+            src_k_ptrs = src_kv_ptrs[src_local_start:src_local_end]
+            src_v_ptrs = src_kv_ptrs[
+                num_kv_layers
+                + src_local_start : num_kv_layers
+                + src_local_end
+            ]
+            num_send_layers = decode_num_layers
+        else:
+            src_k_ptrs = src_kv_ptrs[:num_kv_layers]
+            src_v_ptrs = src_kv_ptrs[num_kv_layers:]
+            num_send_layers = num_kv_layers
+
+        # map prefill layer to decode dst buffer local index
+        dst_local_start = start_layer - decode_start_layer
+        # src is sliced to decode's range, so dst_local_start becomes 0
+        if decode_num_layers > 0 and decode_num_layers < num_kv_layers:
+            dst_local_start = 0
+        dst_local_end = dst_local_start + num_send_layers
+
+        if num_send_layers == dst_num_total_layers:
             dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
             dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
         elif (
-            num_kv_layers < dst_num_total_layers
-            and dst_num_total_layers % num_kv_layers != 0
+            num_send_layers < dst_num_total_layers
+            and dst_num_total_layers % num_send_layers != 0
         ):
             # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
             # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
-            multiplier_ratio = dst_num_total_layers // num_kv_layers
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            v_ptr_offset = num_kv_layers * multiplier_ratio
+            multiplier_ratio = dst_num_total_layers // num_send_layers
+            dst_k_ptrs = dst_kv_ptrs[dst_local_start:dst_local_end]
+            v_ptr_offset = num_send_layers * multiplier_ratio
             dst_v_ptrs = dst_kv_ptrs[
-                v_ptr_offset + start_layer : v_ptr_offset + end_layer
+                v_ptr_offset + dst_local_start : v_ptr_offset + dst_local_end
             ]
         else:
-            # Decode pp size should be equal to prefill pp size or 1
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            dst_k_ptrs = dst_kv_ptrs[dst_local_start:dst_local_end]
             dst_v_ptrs = dst_kv_ptrs[
-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+                dst_num_total_layers
+                + dst_local_start : dst_num_total_layers
+                + dst_local_end
             ]
-        layers_current_pp_stage = len(src_k_ptrs)
+        layers_current_pp_stage = num_send_layers
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], int]:
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
-        if len(src_kv_ptrs) == len(dst_kv_ptrs):
+        decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
+        decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
+        num_prefill_layers = len(src_kv_ptrs)
+
+        # prefill pp_size < decode pp_size: slice src to decode's layer range
+        if decode_num_layers > 0 and decode_num_layers < num_prefill_layers:
+            src_local_start = decode_start_layer - start_layer
+            src_local_end = src_local_start + decode_num_layers
+            sliced_src_kv_ptrs = src_kv_ptrs[src_local_start:src_local_end]
+            dst_local_start = 0
+            dst_local_end = decode_num_layers
+        else:
+            sliced_src_kv_ptrs = src_kv_ptrs
+            dst_local_start = start_layer - decode_start_layer
+            dst_local_end = dst_local_start + num_prefill_layers
+
+        if len(sliced_src_kv_ptrs) == len(dst_kv_ptrs):
             sliced_dst_kv_ptrs = dst_kv_ptrs
         else:
-            # Decode pp size should be equal to prefill pp size or 1
-            sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
-        layers_current_pp_stage = len(src_kv_ptrs)
-        return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
+            sliced_dst_kv_ptrs = dst_kv_ptrs[dst_local_start:dst_local_end]
+        layers_current_pp_stage = len(sliced_src_kv_ptrs)
+        return sliced_src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
 
 class CommonKVSender(BaseKVSender):
