@@ -227,8 +227,10 @@ class KunpengCpuBackend(AttentionBackend):
         self.num_layers = model_runner.model_config.num_hidden_layers
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
+            if model_runner.server_args.speculative_num_draft_tokens is not None
+            else 1
         )
-        self.mla_padding_enable = True
+        self.mla_padding_enable = False
 
         self._decode_meta = torch.ops.sgl_kernel.flash_mla_meta_create_kunpeng()
 
@@ -286,7 +288,9 @@ class KunpengCpuBackend(AttentionBackend):
             group_rank = socket_group.rank_in_group
             B = seq_lens.shape[0]
             batchsize_per_tp = B // all2all_size
-            seq_lens = seq_lens[group_rank * batchsize_per_tp : (group_rank + 1) * batchsize_per_tp]
+            seq_lens = seq_lens[
+                group_rank * batchsize_per_tp : (group_rank + 1) * batchsize_per_tp
+            ]
             req_pool_indices = req_pool_indices[
                 group_rank * batchsize_per_tp : (group_rank + 1) * batchsize_per_tp
             ]
@@ -338,6 +342,58 @@ class KunpengCpuBackend(AttentionBackend):
                 0, forward_batch.token_to_kv_pool.get_key_buffer(0)
             )
 
+    def _get_kv_buffer(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cache_loc: torch.Tensor,
+        save_kv_cache: bool,
+    ) -> torch.Tensor:
+        if save_kv_cache and not _enable_hbw_swap:
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+
+        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
+            swap_index = self.hbw_kvbuffer.get_safe_on_package_memory_index(
+                layer.layer_id
+            )
+
+            if _enable_debug:
+                diff = torch.abs(
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    - self.hbw_kvbuffer.kv_buffer[swap_index]
+                )
+                max_diff = diff.max().item()
+                if max_diff > 1e-5:
+                    logger.error(
+                        f"layer {layer.layer_id} swap error, max_diff={max_diff}"
+                    )
+
+            self.hbw_kvbuffer.kv_buffer[swap_index][cache_loc] = k
+            return self.hbw_kvbuffer.kv_buffer[swap_index]
+        else:
+            return forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+    def _try_hbw_swap_pipeline(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+    ):
+        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
+            if save_kv_cache:
+                self.hbw_kvbuffer.queue_async_swapout(
+                    layer.layer_id,
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                )
+            next_layer_id = layer.layer_id + 1
+            if next_layer_id < self.num_layers:
+                self.hbw_kvbuffer.queue_async_swapin(
+                    next_layer_id,
+                    forward_batch.token_to_kv_pool.get_key_buffer(next_layer_id),
+                )
+
     def _forward_extend_kutacc(
         self,
         q,
@@ -385,8 +441,6 @@ class KunpengCpuBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         cache_loc = forward_batch.out_cache_loc
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         meta = self.forward_metadata
         page_size = meta.page_size
@@ -396,10 +450,7 @@ class KunpengCpuBackend(AttentionBackend):
 
         if self.mla_padding_enable:
             q_padded = torch.zeros(
-                bs,
-                max_ext_len,
-                layer.tp_q_head_num,
-                layer.qk_head_dim,
+                (bs, max_ext_len, layer.tp_q_head_num, layer.qk_head_dim),
                 dtype=q.dtype,
                 device=q.device,
             )
@@ -414,10 +465,16 @@ class KunpengCpuBackend(AttentionBackend):
                 bs, max_ext_len, layer.tp_q_head_num, layer.qk_head_dim
             )
 
-        kv_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_buf = self._get_kv_buffer(
+            layer, forward_batch, k, v, cache_loc, save_kv_cache
+        )
         kvcache_paged = kv_buf[:, 0, :].reshape(-1, page_size, kv_buf.shape[-1])
 
-        softmax_scale = 1.0 / math.sqrt(layer.qk_head_dim)
+        softmax_scale = (
+            layer.scaling
+            if layer.scaling is not None
+            else 1.0 / math.sqrt(layer.qk_head_dim)
+        )
         o_padded = torch.zeros(
             (bs, max_ext_len, layer.tp_q_head_num, layer.v_head_dim),
             dtype=q.dtype,
@@ -447,6 +504,8 @@ class KunpengCpuBackend(AttentionBackend):
             extra_buffer,
             self._decode_meta,
         )
+
+        self._try_hbw_swap_pipeline(layer, forward_batch, save_kv_cache)
 
         if self.mla_padding_enable:
             o_flat = torch.zeros(
@@ -565,31 +624,9 @@ class KunpengCpuBackend(AttentionBackend):
         else:
             cache_loc = forward_batch.out_cache_loc
 
-        if save_kv_cache and not _enable_hbw_swap:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
-            swap_index = self.hbw_kvbuffer.get_safe_on_package_memory_index(
-                layer.layer_id
-            )
-
-            if _enable_debug:
-                diff = torch.abs(
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                    - self.hbw_kvbuffer.kv_buffer[swap_index]
-                )
-                max_diff = diff.max().item()
-                if max_diff > 1e-5:
-                    logger.error(
-                        f"layer {layer.layer_id} swap error, max_diff={max_diff}"
-                    )
-
-            self.hbw_kvbuffer.kv_buffer[swap_index][cache_loc] = k
-            kv_k = self.hbw_kvbuffer.kv_buffer[swap_index]
-        else:
-            kv_k = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_k = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc, save_kv_cache)
         softmax_scale = (
             layer.scaling
             if layer.scaling is not None
@@ -624,21 +661,7 @@ class KunpengCpuBackend(AttentionBackend):
 
         o = o_graph.view(batch_size, -1)
 
-        # SDMA pipeline: swapout current layer, swapin next layer
-        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
-            if save_kv_cache:
-                self.hbw_kvbuffer.queue_async_swapout(
-                    layer.layer_id,
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                )
-            next_layer_id = layer.layer_id + 1
-            if next_layer_id < self.num_layers:
-                self.hbw_kvbuffer.queue_async_swapin(
-                    next_layer_id,
-                    forward_batch.token_to_kv_pool.get_key_buffer(next_layer_id),
-                )
-
-        del extra_buffer
+        self._try_hbw_swap_pipeline(layer, forward_batch, save_kv_cache)
 
         return o
 
