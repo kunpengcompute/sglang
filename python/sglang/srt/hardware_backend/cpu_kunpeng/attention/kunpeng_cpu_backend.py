@@ -101,60 +101,6 @@ class KunpengCpuMetadata:
         self.extra_bytes: int = 0
 
 
-# kutacc flash_attention tile sizes (hard-coded in the SVE kernel)
-BR = 128
-BC = 128
-
-
-def _build_chunk_data(extend_seq_lens, query, per_seq_offsets, chunked_size):
-    """Split Q into chunks across all sequences (varlen-aware)."""
-    bs = extend_seq_lens.shape[0]
-    max_seq_len = extend_seq_lens.max().item()
-
-    chunk_cur_q = []
-    chunk_q_loc = []
-    chunk_starts = []
-
-    for chunked_loop in range(0, max_seq_len, chunked_size):
-        chunk_start = chunked_loop
-        chunk_end = min(max_seq_len, chunked_loop + chunked_size)
-        chunk_starts.append(chunked_loop)
-
-        q_parts = []
-        q_lens = []
-        for b in range(bs):
-            seq_len = extend_seq_lens[b].item()
-            local_start = max(0, min(chunk_start, seq_len))
-            local_end = max(0, min(chunk_end, seq_len))
-            cur_len = local_end - local_start
-            if cur_len > 0:
-                global_start = per_seq_offsets[b] + local_start
-                q_parts.append(query[global_start : global_start + cur_len])
-            q_lens.append(cur_len)
-        cur_q = (
-            torch.cat(q_parts, dim=0)
-            if q_parts
-            else torch.empty(
-                0,
-                query.shape[1],
-                query.shape[2],
-                dtype=query.dtype,
-                device=query.device,
-            )
-        )
-
-        chunk_cur_q.append(cur_q)
-        chunk_q_loc.append(
-            torch.tensor(
-                [0]
-                + torch.cumsum(torch.tensor(q_lens, dtype=torch.int32), dim=0).tolist(),
-                dtype=torch.int32,
-            )
-        )
-
-    return chunk_cur_q, chunk_q_loc, chunk_starts
-
-
 def kutacc_mha(
     query,
     key,
@@ -162,177 +108,109 @@ def kutacc_mha(
     softmax_scale,
     extend_seq_lens,
     is_causal=True,
-    chunked_size=512,
 ):
+    """Workspace-based flash attention mirroring DeepSeek-V3-Sample prefill.
+
+    Allocates K/V at sum_seq_len = bs * max_seq_len (per-sequence padding) and
+    slices all scratch buffers from a single contiguous workspace tensor so the
+    kernel's BR/BC tile over-reads stay inside the workspace instead of
+    corrupting glibc heap metadata.
+    """
     device = query.device
     dtype = query.dtype
     bs = extend_seq_lens.shape[0]
-    n_token = query.shape[0]  # may include TP-alignment padding
+    n_token = query.shape[0]
+    kv_n_token = key.shape[0]  # K/V may be TP-padded beyond actual token count
     max_seq_len = extend_seq_lens.max().item()
     num_heads = query.shape[1]
     qk_head_dim = query.shape[2]
     vo_head_dim = value.shape[2]
-    kv_is_packed = bs == 1
 
     thread_num = torch.ops.sgl_kernel.get_flash_attention_thread_num()
-    padded_max = int(((max(max_seq_len, n_token) + 1023) // 1024) * 1024 + 100)
+    # Query the kernel's tile sizes (BR, BC) from C++ to avoid duplicating
+    # constants on the Python side. The kernel reads/writes in these tiles,
+    # so Q/O must be padded by BR and scratch tensors sized accordingly.
+    BR, BC = torch.ops.sgl_kernel.get_flash_attention_block_kunpeng()
 
-    # cu_seqlens from real extend lengths
+    # cu_seqlens from real extend lengths (matching sample
+    # get_start_loc(0, n_seqs, cur_lens) = cumsum(cur_lens)).
     query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=device)
     query_start_loc[1:] = torch.cumsum(extend_seq_lens, dim=0)
-    key_start_loc = query_start_loc.clone()
+    key_start_loc = query_start_loc.clone()  # prefill: seq_lens == cur_lens
 
-    # per-sequence global start offsets in the flattened Q tensor
-    per_seq_offsets = torch.tensor(
-        [0] + torch.cumsum(extend_seq_lens, dim=0).tolist()[:-1],
-        dtype=torch.int32,
-        device=device,
+    # K/V buffer sized to hold the (possibly TP-padded) K/V data, with at
+    # least bs * max_seq_len slots so the kernel's BC=128 tile over-read past
+    # any sequence end stays inside the buffer instead of hitting a glibc
+    # chunk header.
+    sum_seq_len = max(bs * max_seq_len, kv_n_token)
+    para_k = torch.zeros(
+        sum_seq_len, num_heads, qk_head_dim, dtype=dtype, device=device
+    )
+    para_k[:kv_n_token] = key
+    para_v = torch.zeros(
+        sum_seq_len, num_heads, vo_head_dim, dtype=dtype, device=device
+    )
+    para_v[:kv_n_token] = value
+
+    # Q/O: pad to n_token + BR. The kernel loads Q in BR=128 tiles and writes
+    # O in BR=128 tiles; without padding the last tile overflows under PyTorch's
+    # caching allocator. (DeepSeek-V3-Sample uses a bump allocator so adjacent
+    # tensors absorb the over-read/write; we have to pad explicitly.)
+    padded_n_token = n_token + BR
+    padded_q = torch.zeros(
+        padded_n_token, num_heads, qk_head_dim, dtype=dtype, device=device
+    )
+    padded_q[:n_token] = query
+    attn_out = torch.zeros(
+        padded_n_token, num_heads, vo_head_dim, dtype=dtype, device=device
     )
 
-    attn_out = torch.full(
-        (n_token, num_heads, vo_head_dim), -1.0, dtype=dtype, device=device
-    )
+    # Workspace for all scratch tensors. C++ side bump-allocates contiguous
+    # slices from this buffer (pack_attn_k/v/q, attn_s, out/max/base block
+    # old/new), matching sample prefill_model.cpp L101-113. Any kernel
+    # over-read/write past a scratch tensor lands inside the workspace.
+    MAX_SEQ_LEN_SUPPORTED = 2048
+    dtype_size = query.element_size()
+    f32_size = 4
 
-    if kv_is_packed:
-        pack_k_shape = (padded_max, num_heads, qk_head_dim)
-        pack_v_shape = (padded_max, num_heads, vo_head_dim)
-    else:
-        pack_k_shape = (thread_num, BC, qk_head_dim)
-        pack_v_shape = (thread_num, BC, vo_head_dim)
+    def align64(x):
+        return (x + 63) // 64 * 64
 
-    pack_attn_q = torch.empty(thread_num, BR * qk_head_dim, dtype=dtype, device=device)
-    pack_attn_k = torch.empty(pack_k_shape, dtype=dtype, device=device)
-    pack_attn_v = torch.empty(pack_v_shape, dtype=dtype, device=device)
+    ws_bytes = 0
+    ws_bytes += align64(
+        thread_num * MAX_SEQ_LEN_SUPPORTED * qk_head_dim * dtype_size
+    )  # pack_attn_k
+    ws_bytes += align64(
+        thread_num * MAX_SEQ_LEN_SUPPORTED * vo_head_dim * dtype_size
+    )  # pack_attn_v
+    ws_bytes += align64(thread_num * BR * qk_head_dim * dtype_size)  # pack_attn_q
+    ws_bytes += align64(thread_num * BC * BR * f32_size)  # attn_s
+    ws_bytes += (
+        align64(thread_num * BR * vo_head_dim * f32_size) * 2
+    )  # out_block old/new
+    ws_bytes += align64(thread_num * BR * f32_size) * 4  # max/base old/new
 
-    # Non-packed path: kernel reads K/V in BC=128 tiles and Q/O in BR=128 tiles.
-    # When n_token is not a multiple of 128, the last tile crosses the buffer
-    # boundary and corrupts the heap. Pad K/V to a 128-multiple to avoid this.
-    if not kv_is_packed:
-        padded_kv = ((n_token + BC - 1) // BC) * BC
-        para_k = torch.zeros(
-            padded_kv, num_heads, qk_head_dim, dtype=dtype, device=device
-        )
-        para_k[:n_token] = key
-        para_v = torch.zeros(
-            padded_kv, num_heads, vo_head_dim, dtype=dtype, device=device
-        )
-        para_v[:n_token] = value
-
-    attn_s = torch.empty(thread_num, BC * BR, dtype=torch.float32, device=device)
-    attn_out_block_old = torch.empty(
-        thread_num, BR, vo_head_dim, dtype=torch.float32, device=device
-    )
-    attn_out_block_new = torch.empty(
-        thread_num, BR, vo_head_dim, dtype=torch.float32, device=device
-    )
-    attn_max_block_old = torch.empty(thread_num, BR, dtype=torch.float32, device=device)
-    attn_max_block_new = torch.empty(thread_num, BR, dtype=torch.float32, device=device)
-    attn_base_block_old = torch.empty(
-        thread_num, BR, dtype=torch.float32, device=device
-    )
-    attn_base_block_new = torch.empty(
-        thread_num, BR, dtype=torch.float32, device=device
-    )
-
-    if kv_is_packed:
-        torch.ops.sgl_kernel.flash_attention_k_block_pack_kunpeng(
-            kv_len=n_token,
-            num_heads=num_heads,
-            qk_head_dim=qk_head_dim,
-            output_len=padded_max,
-            input_stride0=key.stride(0),
-            input_stride1=key.stride(1),
-            input=key,
-            output=pack_attn_k,
-        )
-        torch.ops.sgl_kernel.flash_attention_v_block_pack_kunpeng(
-            kv_len=n_token,
-            num_heads=num_heads,
-            vo_head_dim=vo_head_dim,
-            output_len=padded_max,
-            input_stride0=value.stride(0),
-            input_stride1=value.stride(1),
-            input=value,
-            output=pack_attn_v,
-        )
-        para_k = pack_attn_k
-        para_v = pack_attn_v
-    # non-packed path: para_k/para_v already allocated as padded buffers above
+    workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=device)
 
     cur_lens = extend_seq_lens.tolist()
-    seq_lens = extend_seq_lens.tolist()  # same as cur_lens when no prefix
-    chunk_cur_q, chunk_q_loc, _ = _build_chunk_data(
-        extend_seq_lens, query, per_seq_offsets, chunked_size
+    seq_lens = extend_seq_lens.tolist()  # prefill: same as cur_lens
+
+    torch.ops.sgl_kernel.flash_attention_with_workspace(
+        q=padded_q,
+        k=para_k,
+        v=para_v,
+        out=attn_out,
+        workspace=workspace,
+        causal=is_causal,
+        softmax_scale=softmax_scale,
+        query_start_loc=query_start_loc,
+        key_start_loc=key_start_loc,
+        chunked_prefill_size=max_seq_len,
+        seq_lens=seq_lens,
+        cur_lens=cur_lens,
     )
 
-    for chunk_idx, chunked_loop in enumerate(range(0, max_seq_len, chunked_size)):
-        cur_q = chunk_cur_q[chunk_idx]
-        if cur_q.numel() == 0:
-            continue
-        cur_q = cur_q.contiguous()
-        cur_q_loc = chunk_q_loc[chunk_idx]
-
-        cur_total_q = cur_q.shape[0]
-        # Pad Q/O to BR=128 multiple: kernel loads Q into pack_attn_q (BR rows)
-        # and writes O from attn_out_block (BR rows) back to cur_out. Without
-        # padding, the last tile overflows when cur_total_q is not a multiple
-        # of BR.
-        padded_cur_q = ((cur_total_q + BR - 1) // BR) * BR
-        if padded_cur_q != cur_total_q:
-            cur_q_padded = torch.zeros(
-                padded_cur_q, num_heads, qk_head_dim, dtype=dtype, device=device
-            )
-            cur_q_padded[:cur_total_q] = cur_q
-            cur_q = cur_q_padded
-        cur_out = torch.empty(
-            padded_cur_q, num_heads, vo_head_dim, dtype=dtype, device=device
-        )
-
-        # seq_lens for this chunk (each sequence's total length so far)
-        chunk_seq_lens = [s + chunked_loop for s in seq_lens]
-
-        torch.ops.sgl_kernel.flash_attention_kunpeng(
-            q=cur_q,
-            k=para_k,
-            v=para_v,
-            out=cur_out,
-            pack_attn_q=pack_attn_q,
-            pack_attn_k=pack_attn_k,
-            pack_attn_v=pack_attn_v,
-            attn_s=attn_s,
-            attn_out_block_old=attn_out_block_old,
-            attn_out_block_new=attn_out_block_new,
-            attn_max_block_old=attn_max_block_old,
-            attn_max_block_new=attn_max_block_new,
-            attn_base_block_old=attn_base_block_old,
-            attn_base_block_new=attn_base_block_new,
-            causal=is_causal,
-            softmax_scale=softmax_scale,
-            query_start_loc=cur_q_loc,
-            key_start_loc=key_start_loc,
-            chunked_prefill_size=chunked_size,
-            seq_lens=chunk_seq_lens,
-            cur_lens=cur_lens,
-            is_kv_packed=kv_is_packed,
-        )
-
-        # Write per-chunk output back to global output
-        chunk_start = chunked_loop
-        chunk_end = min(max_seq_len, chunked_loop + chunked_size)
-        offset = 0
-        for b in range(bs):
-            seq_len_b = extend_seq_lens[b].item()
-            local_start = max(0, min(chunk_start, seq_len_b))
-            local_end = max(0, min(chunk_end, seq_len_b))
-            cur_len_b = local_end - local_start
-            if cur_len_b > 0:
-                global_row = per_seq_offsets[b] + chunk_start
-                attn_out[global_row : global_row + cur_len_b] = cur_out[
-                    offset : offset + cur_len_b
-                ]
-                offset += cur_len_b
-
-    return attn_out
+    return attn_out[:n_token]
 
 
 class KunpengCpuBackend(AttentionBackend):
@@ -493,7 +371,6 @@ class KunpengCpuBackend(AttentionBackend):
             softmax_scale=softmax_scale,
             extend_seq_lens=forward_batch.extend_seq_lens,
             is_causal=True,
-            chunked_size=512,
         )
 
         return o_3d.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
