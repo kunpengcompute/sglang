@@ -43,7 +43,7 @@ def capture(inputs, fixed=None):
     return _CaptureContext(inputs, fixed)
 
 
-def finalize(outputs):
+def finalize(outputs, external_pool=None):
     global _captured_storages, _captured_views, _captured_ops, \
            _captured_num_inputs, _captured_fixed
     if _captured_storages is None:
@@ -95,7 +95,8 @@ def finalize(outputs):
             views.append(view)
             output_view_ids.append(view.id)
 
-    gh = _C.Graph(storages, views, ops, output_view_ids, num_inputs, fixed)
+    gh = _C.Graph(storages, views, ops, output_view_ids, num_inputs, fixed,
+                  external_pool)
     return gh
 
 

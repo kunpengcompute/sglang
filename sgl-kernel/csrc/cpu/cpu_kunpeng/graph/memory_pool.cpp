@@ -27,3 +27,11 @@ void MemoryPool::allocate(size_t size)
     auto options = torch::TensorOptions().dtype(torch::kByte).device(torch::kCPU);
     tensor_ = torch::empty({static_cast<int64_t>(size)}, options);
 }
+
+void MemoryPool::adopt(torch::Tensor tensor)
+{
+    TORCH_CHECK(tensor.device().is_cpu(), "MemoryPool::adopt: tensor must be on CPU");
+    TORCH_CHECK(tensor.dtype() == torch::kByte,
+                "MemoryPool::adopt: tensor must be uint8, got ", tensor.dtype());
+    tensor_ = std::move(tensor);
+}

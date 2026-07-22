@@ -32,6 +32,7 @@ public:
     MemoryPool& operator=(MemoryPool&& other) noexcept = default;
 
     void allocate(size_t size);
+    void adopt(torch::Tensor tensor);
     void* data() { return tensor_.defined() ? tensor_.data_ptr() : nullptr; }
     size_t size() const { return tensor_.defined() ? tensor_.nbytes() : 0; }
 

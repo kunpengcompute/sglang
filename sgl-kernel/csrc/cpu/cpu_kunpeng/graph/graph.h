@@ -33,7 +33,8 @@ public:
           std::vector<OpRecord> ops,
           std::vector<int> output_view_ids,
           int num_inputs,
-          const std::unordered_map<int, torch::Tensor>& fixed);
+          const std::unordered_map<int, torch::Tensor>& fixed,
+          torch::Tensor external_pool = {});
 
     // Backward-compatible: hold fixed tensor references to keep memory alive.
     // data_ptr is already set during begin_capture; this only stores references.
@@ -43,9 +44,10 @@ public:
     std::vector<torch::Tensor> run(const std::vector<torch::Tensor>& inputs);
 
 private:
-    void finalize(const std::unordered_map<int, torch::Tensor>& fixed);
+    void finalize(const std::unordered_map<int, torch::Tensor>& fixed,
+                  torch::Tensor external_pool);
     void compute_death_ops();
-    void plan_memory();
+    void plan_memory(torch::Tensor external_pool);
     void detect_outputs();
     void precompute_replay();
     void hold_fixed(const std::unordered_map<int, torch::Tensor>& fixed);

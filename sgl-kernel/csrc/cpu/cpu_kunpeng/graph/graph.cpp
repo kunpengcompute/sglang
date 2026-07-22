@@ -33,7 +33,8 @@ Graph::Graph(std::vector<StorageBuf> storages,
              std::vector<OpRecord> ops,
              std::vector<int> output_view_ids,
              int num_inputs,
-             const std::unordered_map<int, torch::Tensor>& fixed)
+             const std::unordered_map<int, torch::Tensor>& fixed,
+             torch::Tensor external_pool)
     : num_inputs_(num_inputs),
       storages_(std::move(storages)),
       views_(std::move(views)),
@@ -41,14 +42,15 @@ Graph::Graph(std::vector<StorageBuf> storages,
       output_view_ids_(std::move(output_view_ids))
 {
     total_ops_ = static_cast<int>(op_records_.size());
-    finalize(fixed);
+    finalize(fixed, std::move(external_pool));
 }
 
-void Graph::finalize(const std::unordered_map<int, torch::Tensor>& fixed)
+void Graph::finalize(const std::unordered_map<int, torch::Tensor>& fixed,
+                     torch::Tensor external_pool)
 {
     compute_death_ops();
     detect_outputs();
-    plan_memory();
+    plan_memory(std::move(external_pool));
     precompute_replay();
     hold_fixed(fixed);
     for (int i = 0; i < total_ops_; ++i) {
@@ -90,7 +92,7 @@ void Graph::detect_outputs()
     }
 }
 
-void Graph::plan_memory()
+void Graph::plan_memory(torch::Tensor external_pool)
 {
     std::vector<std::tuple<int, int, int, size_t>> intervals;
     for (size_t i = 0; i < storages_.size(); ++i) {
@@ -150,7 +152,15 @@ void Graph::plan_memory()
     for (const auto& pe : placed)
         pool_size = std::max(pool_size, pe.offset + pe.size);
     pool_size = (pool_size + MEMORY_ALIGNMENT - 1) / MEMORY_ALIGNMENT * MEMORY_ALIGNMENT;
-    pool_.allocate(pool_size);
+
+    if (external_pool.defined()) {
+        TORCH_CHECK(external_pool.nbytes() >= static_cast<int64_t>(pool_size),
+                    "plan_memory: external pool too small (",
+                    external_pool.nbytes(), " bytes vs needed ", pool_size, " bytes)");
+        pool_.adopt(std::move(external_pool));
+    } else {
+        pool_.allocate(pool_size);
+    }
 
     if constexpr (kGraphDebugPrint) {
         std::cout << "===== plan_memory: pool allocated " << pool_size

@@ -191,10 +191,16 @@ void init_graph_cpp(py::module& m)
                          const std::vector<OpRecord>& ops,
                          const std::vector<int>& output_view_ids,
                          int num_inputs,
-                         const std::unordered_map<int, torch::Tensor>& fixed) {
+                         const std::unordered_map<int, torch::Tensor>& fixed,
+                         py::object external_pool) {
+            torch::Tensor pool_tensor;
+            if (!external_pool.is_none()) pool_tensor = external_pool.cast<torch::Tensor>();
             return std::make_unique<Graph>(storages, views, ops,
-                                           output_view_ids, num_inputs, fixed);
-        }))
+                                           output_view_ids, num_inputs, fixed,
+                                           pool_tensor);
+        }), py::arg("storages"), py::arg("views"), py::arg("ops"),
+            py::arg("output_view_ids"), py::arg("num_inputs"),
+            py::arg("fixed"), py::arg("external_pool") = py::none())
         .def("run", &Graph::run)
         .def("set_fixed", &Graph::set_fixed);
 
