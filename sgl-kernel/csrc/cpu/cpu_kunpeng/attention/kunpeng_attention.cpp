@@ -178,3 +178,67 @@ void varlen_attention_kunpeng(at::Tensor q,    // [total_q_tokens, num_heads, qk
 
     kutacc::varlen_attention(kt_q, kt_k, kt_v, kt_out, causal, softmax_scale, kt_query_start_loc, kt_key_start_loc);
 }
+
+
+void flash_attention_with_workspace(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::Tensor workspace,
+                                    bool causal, double softmax_scale, at::Tensor query_start_loc,
+                                    at::Tensor key_start_loc, int64_t chunked_prefill_size,
+                                    std::vector<int64_t> seq_lens, std::vector<int64_t> cur_lens)
+{
+    constexpr int64_t MAX_SEQ_LEN_SUPPORTED = 2048;
+    auto [BR, BC] = kutacc::get_flash_attention_block();
+
+    int64_t qk_head_dim = q.size(2);
+    int64_t vo_head_dim = v.size(2);
+
+    // PARAMETER_CHECK (matching sample L95-98)
+    for (auto x : cur_lens) {
+        TORCH_CHECK(x <= MAX_SEQ_LEN_SUPPORTED, "cur_lens must be <= ", MAX_SEQ_LEN_SUPPORTED,
+                    " (MAX_SEQ_LEN_SUPPORTED), got ", x);
+    }
+
+    auto threads_num = kutacc::get_thread_num();
+    auto dtype = q.scalar_type();
+    auto f32 = at::kFloat;
+
+    // Bump-allocate scratch tensors from workspace. All slices are physically
+    // contiguous so kernel over-read/write stays inside the workspace.
+    int64_t offset = 0;
+    auto alloc = [&](at::ScalarType st, std::vector<int64_t> sizes) {
+        int64_t elem_size = at::elementSize(st);
+        int64_t numel = 1;
+        for (auto s : sizes)
+            numel *= s;
+        int64_t bytes = numel * elem_size;
+        int64_t aligned_bytes = (bytes + 63) / 64 * 64;  // 64-byte alignment
+        TORCH_CHECK(offset + aligned_bytes <= workspace.numel(), "workspace too small: need ", offset + aligned_bytes,
+                    " got ", workspace.numel());
+        // Slice exactly `bytes` for correct reshape, advance offset by
+        // `aligned_bytes` to keep next allocation 64-byte aligned. The gap
+        // between `bytes` and `aligned_bytes` absorbs minor over-read.
+        auto t = workspace.slice(0, offset, offset + bytes).view(st).reshape(sizes);
+        offset += aligned_bytes;
+        return t;
+    };
+
+    auto pack_attn_k = alloc(dtype, {threads_num, MAX_SEQ_LEN_SUPPORTED, qk_head_dim});
+    auto pack_attn_v = alloc(dtype, {threads_num, MAX_SEQ_LEN_SUPPORTED, vo_head_dim});
+    auto pack_attn_q = alloc(dtype, {threads_num, BR * qk_head_dim});
+    auto attn_s = alloc(f32, {threads_num, BC * BR});
+    auto attn_out_block_old = alloc(f32, {threads_num, BR, vo_head_dim});
+    auto attn_out_block_new = alloc(f32, {threads_num, BR, vo_head_dim});
+    auto attn_max_block_old = alloc(f32, {threads_num, BR});
+    auto attn_max_block_new = alloc(f32, {threads_num, BR});
+    auto attn_base_block_old = alloc(f32, {threads_num, BR});
+    auto attn_base_block_new = alloc(f32, {threads_num, BR});
+
+    // is_kv_packed=false always (matching sample attention_interface.cpp L67).
+    kutacc::flash_attention(
+        to_kutacc<bfloat16_t, 3>(q), to_kutacc<bfloat16_t, 3>(k), to_kutacc<bfloat16_t, 3>(v),
+        to_kutacc<bfloat16_t, 3>(out), to_kutacc<bfloat16_t, 2>(pack_attn_q), to_kutacc<bfloat16_t, 3>(pack_attn_k),
+        to_kutacc<bfloat16_t, 3>(pack_attn_v), to_kutacc<float, 2>(attn_s), to_kutacc<float, 3>(attn_out_block_old),
+        to_kutacc<float, 3>(attn_out_block_new), to_kutacc<float, 2>(attn_max_block_old),
+        to_kutacc<float, 2>(attn_max_block_new), to_kutacc<float, 2>(attn_base_block_old),
+        to_kutacc<float, 2>(attn_base_block_new), causal, softmax_scale, to_kutacc<int, 1>(query_start_loc),
+        to_kutacc<int, 1>(key_start_loc), chunked_prefill_size, seq_lens, cur_lens, /*is_kv_packed=*/false);
+}

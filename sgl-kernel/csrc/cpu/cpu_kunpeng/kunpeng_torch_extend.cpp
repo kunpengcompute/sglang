@@ -102,6 +102,11 @@ void flash_attention_kunpeng(at::Tensor q, at::Tensor k, at::Tensor v, at::Tenso
 void varlen_attention_kunpeng(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, bool causal,
                               double softmax_scale, at::Tensor query_start_loc, at::Tensor key_start_loc);
 
+void flash_attention_with_workspace(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::Tensor workspace,
+                                    bool causal, double softmax_scale, at::Tensor query_start_loc,
+                                    at::Tensor key_start_loc, int64_t chunked_prefill_size,
+                                    std::vector<int64_t> seq_lens, std::vector<int64_t> cur_lens);
+
 // === Memory 算子声明 ===
 at::Tensor hbw_allocator_kunpeng(int64_t size);
 
@@ -427,6 +432,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "bool causal, float softmax_scale, "
         "Tensor query_start_loc, Tensor key_start_loc) -> ()");
     m.impl("varlen_attention_kunpeng", varlen_attention_kunpeng);
+
+    m.def(
+        "flash_attention_with_workspace("
+        "Tensor q, Tensor k, Tensor v, Tensor out, Tensor workspace, "
+        "bool causal, float softmax_scale, "
+        "Tensor query_start_loc, Tensor key_start_loc, "
+        "int chunked_prefill_size, "
+        "int[] seq_lens, int[] cur_lens) -> ()");
+    m.impl("flash_attention_with_workspace", flash_attention_with_workspace);
 
     // hbw_allocator
     m.def("hbw_allocator_kunpeng(int size) -> Tensor");
