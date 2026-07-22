@@ -224,7 +224,7 @@ class KunpengCpuBackend(AttentionBackend):
         self.head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
         self.head_dim_v = model_config.v_head_dim
         self.kv_cache_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
-        self.num_layers = model_runner.model_config.num_hidden_layers
+        self.num_layers = model_runner.num_effective_layers
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
             if model_runner.server_args.speculative_num_draft_tokens is not None
@@ -236,7 +236,7 @@ class KunpengCpuBackend(AttentionBackend):
 
         # HBW swap: SDMA-based async DDR <-> HBW data movement
         self.hbw_kvbuffer = None
-        if _enable_hbw_swap:
+        if _enable_hbw_swap and not model_runner.is_draft_worker:
             self.hbw_kvbuffer = KunpengHBWKVbuffer(
                 size=model_runner.max_total_num_tokens,
                 page_size=model_runner.page_size,
@@ -655,9 +655,16 @@ class KunpengCpuBackend(AttentionBackend):
         )
 
         o_graph, softmax_lse = kunpeng.flash_mla_dense_decode_kunpeng(
-            q_4d, kvcache_paged, block_table, seq_lens,
-            softmax_scale, False, extra_buffer,
-            self._decode_meta, head_dim_v)
+            q_4d,
+            kvcache_paged,
+            block_table,
+            seq_lens,
+            softmax_scale,
+            False,
+            extra_buffer,
+            self._decode_meta,
+            head_dim_v,
+        )
 
         o = o_graph.view(batch_size, -1)
 
