@@ -3089,7 +3089,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                              self.attn_backend.forward_metadata.seq_lens,
                              forward_batch.out_cache_loc,
                              self.attn_backend._decode_meta]
+            t0 = time.time()
             logits, = self._sglang_decode_graph.run(input_tensors)
+            t1 = time.time()
+            logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
 
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
             ret = LogitsProcessorOutput(next_token_logits=logits)
