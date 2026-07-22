@@ -21,6 +21,8 @@
 
 #include "sgl_kernel_ops.h"
 
+#include "cpu_kunpeng/graph/init_graph_cpp.h"
+
 void quant_kunpeng(at::Tensor input, at::Tensor out, at::Tensor scale);
 
 void rmsnorm_kunpeng(at::Tensor acts, at::Tensor weights, double eps, at::Tensor outs);
@@ -35,6 +37,10 @@ void fused_add_rmsnorm_quant_kunpeng(at::Tensor acts, at::Tensor residual, at::T
 void silu_mul_quant_kunpeng(at::Tensor gateup, at::Tensor outs, at::Tensor scales);
 
 void mul_scalar_add_kunpeng(at::Tensor input, at::Tensor out, double alpha);
+
+void set_kv_buffer_kunpeng(at::Tensor kv_buffer, at::Tensor loc, at::Tensor cache_k);
+
+void copy_kunpeng(at::Tensor dst, at::Tensor src);
 
 void s8_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c, int64_t ldc,
                           bool with_idx, std::optional<at::Tensor> idx);
@@ -58,7 +64,7 @@ void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor ou
 
 at::Tensor bf16_bmm_prepack_kunpeng(const at::Tensor &weight, int64_t batch_size);
 
-at::Tensor bmm_kunpeng(const at::Tensor &input, const at::Tensor &weight);
+void bmm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor out);
 
 void init_tiling();
 
@@ -210,7 +216,7 @@ int64_t topk_convert_kunpeng(at::Tensor src_info, at::Tensor token_ids, at::Tens
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, int64_t num_token_non_padded,
                                         int64_t num_experts, int64_t topk);
 
-at::Tensor multinomial_kunpeng(const at::Tensor &probs, int64_t num_samples, bool replacement);
+void multinomial_kunpeng(const at::Tensor &probs, at::Tensor out, int64_t num_samples, bool replacement);
 
 void argmax_kunpeng(const at::Tensor prob_distribution, at::Tensor token_ids, at::Tensor token_probs, int64_t height,
                     int64_t width);
@@ -272,6 +278,8 @@ void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at
 void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, int64_t max_ext_len, at::Tensor q_padded);
 
 void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, int64_t max_ext_len, at::Tensor o_flat);
+
+void register_graph_kernels();
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 {
@@ -344,7 +352,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("bf16_bmm_prepack_kunpeng", bf16_bmm_prepack_kunpeng);
 
     // bmm compute
-    m.def("bmm_kunpeng(Tensor input, Tensor weight) -> Tensor");
+    m.def("bmm_kunpeng(Tensor input, Tensor weight, Tensor(a!) out) -> ()");
     m.impl("bmm_kunpeng", bmm_kunpeng);
 
     // batched gemm pack
@@ -594,7 +602,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("topk_convert_kunpeng", topk_convert_kunpeng);
 
     // multinomial sampling
-    m.def("multinomial_kunpeng(Tensor probs, int num_samples, bool replacement) -> Tensor");
+    m.def("multinomial_kunpeng(Tensor probs, Tensor(a!) out, int num_samples, bool replacement) -> ()");
     m.impl("multinomial_kunpeng", multinomial_kunpeng);
 
     // argmax
@@ -701,4 +709,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "unpad_o_right_mtp_kunpeng("
         "Tensor o_padded, Tensor ext_lens, int max_ext_len, Tensor o_flat) -> ()");
     m.impl("unpad_o_right_mtp_kunpeng", unpad_o_right_mtp_kunpeng);
+
+    // set_kv_buffer (MLA KV cache write)
+    m.def("set_kv_buffer_kunpeng(Tensor(a!) kv_buffer, Tensor loc, Tensor cache_k) -> ()");
+    m.impl("set_kv_buffer_kunpeng", set_kv_buffer_kunpeng);
+
+    // copy (tensor copy for graph tracking)
+    m.def("copy_kunpeng(Tensor(a!) dst, Tensor src) -> ()");
+    m.impl("copy_kunpeng", copy_kunpeng);
+
+    m.def("register_graph_kernels() -> ()");
+    m.impl("register_graph_kernels", register_graph_kernels);
+
+    // Inject graph_cpp submodule into sgl_kernel
+    {
+        py::module sgl_mod = py::module::import("sgl_kernel");
+        py::module graph_mod = sgl_mod.def_submodule("graph_cpp", "Graph engine");
+        init_graph_cpp(graph_mod);
+    }
 }

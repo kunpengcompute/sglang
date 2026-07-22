@@ -26,6 +26,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sgl_kernel import pg_helper
+from sglang.srt.graph import ops as kunpeng
 
 kernel = torch.ops.sgl_kernel
 
@@ -234,7 +235,7 @@ class KunpengCommunicator:
 
         t_ag_start = time.perf_counter()
         # TODO(kunpeng): use dual allgather for alternative implementation
-        kernel.shm_dual_allgather_kunpeng(
+        kunpeng.shm_dual_allgather_kunpeng(
             src0, dst0, self.src_dummy_tensor, self.dummy_tensor
         )
         t_ag_end = time.perf_counter()

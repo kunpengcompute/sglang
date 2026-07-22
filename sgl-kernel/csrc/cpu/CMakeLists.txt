@@ -102,10 +102,17 @@ endif()
 add_compile_options(-Wno-unused-value)
 add_compile_options(-Wno-vla-cxx-extension)
 
+find_library(TORCH_PYTHON_LIB torch_python
+    PATHS ${TORCH_INSTALL_PREFIX}/lib
+    NO_DEFAULT_PATH)
+if(NOT TORCH_PYTHON_LIB)
+    message(FATAL_ERROR "libtorch_python not found in ${TORCH_INSTALL_PREFIX}/lib")
+endif()
+
 set(KUTACC_LIB "$ENV{KUTACC_LIB}/libkutacc.so")
 set(KUTACC_INCLUDE "$ENV{KUTACC_INCLUDE}")
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB} ${KUTACC_LIB})
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIB} ${NUMA_LIB} ${KUTACC_LIB})
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS} ${KUTACC_INCLUDE})
 
 install(TARGETS common_ops

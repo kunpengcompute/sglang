@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
     use_intel_xpu_backend,
 )
+from sglang.srt.graph import ops as kunpeng
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -109,20 +110,15 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         **kwargs,
     ) -> torch.Tensor:
         if _is_cpu_920f:
-            output = torch.empty(
-                (input_.shape[0], layer.weight.shape[1]), dtype=layer.weight.dtype
-            )
-            torch.ops.sgl_kernel.embedding_kunpeng(
+            return kunpeng.embedding_kunpeng(
                 input_,
                 layer.weight,
-                output,
                 kwargs.get("org_vocab_start", 0),
                 kwargs.get("org_vocab_end", 0),
                 kwargs.get("num_org_vocab_padding", 0),
                 kwargs.get("added_vocab_start", 0),
                 kwargs.get("added_vocab_end", 0),
             )
-            return output
         return F.embedding(input_, layer.weight)
 
 

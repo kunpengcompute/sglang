@@ -78,6 +78,8 @@ void shm_batched_allgather_kunpeng(at::Tensor input, at::Tensor output, int64_t 
     int64_t batch = input.size(0);
     int64_t dim = input.size(1);
 
+    if (batch == 0) return;
+
     at::Tensor sendbuf_tensor = get_or_create_shm_tensor(dim, batch);
     at::Tensor recvbuf_tensor = get_or_create_shm_tensor(dim * comm_size, batch);
 
