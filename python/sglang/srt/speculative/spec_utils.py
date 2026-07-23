@@ -459,36 +459,19 @@ def align_evict_mask_to_page_size_native(
     num_draft_tokens: int,
 ):
     original_shape = evict_mask.shape
-    if evict_mask.dim() == 1:
-        evict_mask = evict_mask.unsqueeze(0)
-        if not isinstance(seq_lens, torch.Tensor):
-            seq_lens = torch.tensor([seq_lens], device=evict_mask.device)
-        elif seq_lens.dim() == 0:
-            seq_lens = seq_lens.unsqueeze(0)
-    else:
-        if seq_lens.dim() == 0:
-            seq_lens = seq_lens.unsqueeze(0)
-    
-    B, L = evict_mask.shape
     device = evict_mask.device
+    evict_mask = evict_mask.view(-1, num_draft_tokens)
 
     sum_true = evict_mask.sum(dim=1, dtype=torch.int64)
     num_false = num_draft_tokens - sum_true
     start_raw = ((seq_lens + num_false - 1) // page_size) * page_size - seq_lens
     start = torch.clamp(start_raw, min=0, max=num_draft_tokens)
-    end = torch.clamp(start + page_size, min=0, max=num_draft_tokens)
 
-    cols = torch.arange(L, device=device).unsqueeze(0)
-    mask = (cols >= start.unsqueeze(1)) & (cols < end.unsqueeze(1))
+    cols = torch.arange(num_draft_tokens, device=device).unsqueeze(0)
+    mask = (cols >= start.unsqueeze(1))
+    evict_mask.masked_fill_(mask, False)
 
-    if evict_mask.dtype == torch.bool:
-        evict_mask.masked_fill_(mask, False)
-    else:
-        evict_mask.masked_fill_(mask, 0)
-    
-    if len(original_shape) == 1:
-        return evict_mask.squeeze(0)
-    return evict_mask
+    return evict_mask.view(original_shape)
 
 
 @triton.jit
