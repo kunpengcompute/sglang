@@ -3283,7 +3283,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
             ) as recorder_outputs,
         ):
-            if os.environ.get("SGLANG_KUPL_ASYNC", "0") == "1":
+            if os.environ.get("SGLANG_FORWARD_ASYNC", "0") == "1":
                 if self.kupl_executor is None:
                     from sglang.srt.model_executor.kupl_executor import KuplExecutor
                     self.kupl_executor = KuplExecutor()
