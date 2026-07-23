@@ -144,8 +144,10 @@ install(TARGETS pg_helper
 # === kupl_async: pybind11 module for async task submission to KUPL executor ===
 set(KUPL_ASYNC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/cpu_kunpeng/kupl_async_kunpeng.cpp")
 Python_add_library(kupl_async MODULE WITH_SOABI ${KUPL_ASYNC_SOURCES})
+set_target_properties(kupl_async PROPERTIES OUTPUT_NAME "_kupl_async")
 target_link_libraries(kupl_async PRIVATE
     ${TORCH_LIBRARIES}
+    kupl
 )
 target_include_directories(kupl_async PRIVATE
     ${TORCH_INCLUDE_DIRS}
@@ -154,20 +156,7 @@ target_include_directories(kupl_async PRIVATE
     ${KUTACC_INCLUDE}
 )
 
-# Find KUPL library (libkupl.so) through KUTACC_LIB's directory or KUPL_PATH
-get_filename_component(KUTACC_LIB_DIR "${KUTACC_LIB}" DIRECTORY)
-find_library(KUPL_LIB kupl HINTS "${KUTACC_LIB_DIR}")
-if(NOT KUPL_LIB)
-    message(WARNING "libkupl not found in ${KUTACC_LIB_DIR}, trying LIBRARY_PATH")
-    find_library(KUPL_LIB kupl)
-endif()
-if(KUPL_LIB)
-    message(STATUS "Found libkupl: ${KUPL_LIB}")
-    target_link_libraries(kupl_async PRIVATE ${KUPL_LIB})
-else()
-    message(WARNING "libkupl not found, kupl_async may fail to link")
-endif()
-
 install(TARGETS kupl_async
     LIBRARY DESTINATION sgl_kernel
 )
+
