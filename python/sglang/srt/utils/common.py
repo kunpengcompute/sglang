@@ -203,6 +203,9 @@ def is_kunpeng_hbw_swap() -> bool:
 def is_kunpeng_graph_capture() -> bool:
     return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_GRAPH_CAPTURE") == "1"
 
+def is_kunpeng_graph_profile() -> bool:
+    return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_GRAPH_PROFILE") == "1"
+
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
     is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
