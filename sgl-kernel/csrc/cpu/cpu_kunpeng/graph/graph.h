@@ -43,6 +43,10 @@ public:
     }
     std::vector<torch::Tensor> run(const std::vector<torch::Tensor>& inputs);
 
+    void enable_profile(bool enable);
+    std::vector<int64_t> get_profile_row() const { return profile_row_; }
+    const std::vector<std::string>& profile_op_names() const { return op_names_; }
+
 private:
     void finalize(const std::unordered_map<int, torch::Tensor>& fixed,
                   torch::Tensor external_pool);
@@ -84,4 +88,8 @@ private:
 
     std::vector<at::Tensor> saved_;
     std::vector<at::Tensor> op_tensors_;
+
+    bool profile_enabled_ = false;
+    std::vector<int64_t> profile_row_;
+    int64_t profile_base_ns_;
 };

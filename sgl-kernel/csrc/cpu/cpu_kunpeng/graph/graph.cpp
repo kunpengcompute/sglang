@@ -18,6 +18,7 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
@@ -43,6 +44,11 @@ Graph::Graph(std::vector<StorageBuf> storages,
 {
     total_ops_ = static_cast<int>(op_records_.size());
     finalize(fixed, std::move(external_pool));
+
+    profile_row_.assign(total_ops_ + 1, 0);
+    auto ts = std::chrono::high_resolution_clock::now();
+    profile_base_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        ts.time_since_epoch()).count();
 }
 
 void Graph::finalize(const std::unordered_map<int, torch::Tensor>& fixed,
@@ -59,6 +65,11 @@ void Graph::finalize(const std::unordered_map<int, torch::Tensor>& fixed,
                 ? op_records_[i].op_name
                 : op_records_[i].profile_name);
     }
+}
+
+void Graph::enable_profile(bool enable)
+{
+    profile_enabled_ = enable;
 }
 
 void Graph::compute_death_ops()
@@ -348,6 +359,13 @@ std::vector<torch::Tensor> Graph::run(const std::vector<torch::Tensor>& inputs)
         for (int j = 0; j < count; ++j)
             op_tensors_.push_back(cached_tensors_[flat_vids_[begin + j]]);
 
+        if (profile_enabled_) {
+            auto ts = std::chrono::high_resolution_clock::now();
+            profile_row_[op_idx] =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    ts.time_since_epoch()).count() - profile_base_ns_;
+        }
+
         RECORD_FUNCTION(op_names_[op_idx].c_str(), std::vector<c10::IValue>{});
         if constexpr (kGraphDebugPrint) {
             std::cout << "[replay op " << op_idx << "] " << op_names_[op_idx] << std::endl;
@@ -371,6 +389,13 @@ std::vector<torch::Tensor> Graph::run(const std::vector<torch::Tensor>& inputs)
             }
         }
         op_dispatch_[op_idx](op_tensors_, op_records_[op_idx].scalar_args);
+    }
+
+    if (profile_enabled_) {
+        auto ts = std::chrono::high_resolution_clock::now();
+        profile_row_[total_ops_] =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                ts.time_since_epoch()).count() - profile_base_ns_;
     }
 
     // Restore 0-dim placeholder tensors

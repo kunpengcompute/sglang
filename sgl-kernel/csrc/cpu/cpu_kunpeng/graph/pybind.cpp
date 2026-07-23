@@ -202,7 +202,11 @@ void init_graph_cpp(py::module& m)
             py::arg("output_view_ids"), py::arg("num_inputs"),
             py::arg("fixed"), py::arg("external_pool") = py::none())
         .def("run", &Graph::run)
-        .def("set_fixed", &Graph::set_fixed);
+        .def("set_fixed", &Graph::set_fixed)
+        .def("enable_profile", &Graph::enable_profile)
+        .def("get_profile_row", &Graph::get_profile_row)
+        .def("profile_op_names", &Graph::profile_op_names,
+             py::return_value_policy::reference_internal);
 
     py::class_<GraphOpRegistry::OpInfo>(m, "OpInfo")
         .def(py::init<>())

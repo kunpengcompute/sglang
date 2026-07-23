@@ -159,6 +159,7 @@ export SGLANG_KUNPENG_SDMA_MAX_EVENTS=10
 export SGLANG_KUNPENG_SDMA_THRESHOLD=5
 # Kunpeng graph capture
 export SGLANG_ENABLE_GRAPH_CAPTURE=0
+export SGLANG_ENABLE_GRAPH_PROFILE=0
 # Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
 # PD disaggregation mode
