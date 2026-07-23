@@ -86,29 +86,27 @@ void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at
     auto target_predict_a = target_predict.accessor<int64_t, 2>();
 
     for (int64_t b = 0; b < bs; b++) {
-        int64_t last_accepted_retrieve_idx = retrieve_index_a[b][0];
-        accept_index_a[b][0] = (int32_t)last_accepted_retrieve_idx;
         int32_t num_accepted_tokens = 0;
-        int64_t cur_index = 0;
-        for (int64_t j = 1; j < spec_steps; j++) {
+        int64_t last_accepted_retrieve_idx = accept_index_a[b][0] = retrieve_index_a[b][0];
+        int64_t cur_index = 0, pre_index = 0;
+        for (int64_t j = 0; j < spec_steps; j++) {
+            pre_index = cur_index;
             cur_index = retrieve_next_token_a[b][cur_index];
             if (cur_index == -1) {
                 break;
             }
-            int64_t draft_index = retrieve_index_a[b][cur_index];
             int64_t draft_token_id = candidates_a[b][cur_index];
-            int64_t target_token_id = target_predict_a[b][last_accepted_retrieve_idx];
+            int64_t target_token_id = target_predict_a[b][pre_index];
             if (draft_token_id == target_token_id) {
                 predicts_a[last_accepted_retrieve_idx] = (int32_t)target_token_id;
                 num_accepted_tokens++;
-                accept_index_a[b][num_accepted_tokens] = (int32_t)draft_index;
-                last_accepted_retrieve_idx = draft_index;
+                last_accepted_retrieve_idx = accept_index_a[b][num_accepted_tokens] = retrieve_index_a[b][cur_index];
             } else {
                 break;
             }
         }
         accept_token_num_a[b] = num_accepted_tokens;
-        predicts_a[last_accepted_retrieve_idx] = (int32_t)target_predict_a[b][last_accepted_retrieve_idx];
+        predicts_a[last_accepted_retrieve_idx] = (int32_t)target_predict_a[b][pre_index];
     }
 }
 
