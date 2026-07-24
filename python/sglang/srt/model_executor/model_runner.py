@@ -3084,7 +3084,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                     logits = ret.next_token_logits
 
-                self._sglang_decode_graph = finalize([logits])
+                if _is_kunpeng_hbw_pool:
+                    if not hasattr(self, '_graph_hbw_tensor'):
+                        remaining = self.weight_hbw_pool.largest_free_bytes
+                        self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
+                            (remaining,), torch.uint8)
+                    self._sglang_decode_graph = finalize(
+                        [logits], external_pool=self._graph_hbw_tensor)
+                else:
+                    self._sglang_decode_graph = finalize([logits])
 
                 if _is_kunpeng_graph_profile:
                     self._sglang_decode_graph.enable_profile(True)
