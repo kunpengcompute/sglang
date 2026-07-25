@@ -117,13 +117,18 @@ case "$ROLE" in
             --prefill "$_router_prefill_url" 9001
             --decode "$_router_decode_url"
             --policy cache_aware
-            --prefill-policy cache_aware
             --health-check-interval-secs 10000
             --queue-timeout-secs 10000
             --request-timeout-secs 10000
             --health-check-timeout-secs 10000
             --host "$IP"
         )
+        if [[ "$PREFILL_BUCKET" == "1" ]]; then
+            SPECIFIC_ARGS+=(
+                --prefill "${PREFILL_LONG_PROMPT_MASTER_ADDR:+http://$PREFILL_LONG_PROMPT_MASTER_ADDR:30000}" 9001
+                --prefill-policy bucket
+            )
+        fi
         # Common args for tokenizer-side HTTP server
         HTTP_COMMON_ARGS=(
             --model "$MODEL_PATH"

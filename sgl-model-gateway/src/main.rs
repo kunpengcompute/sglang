@@ -146,7 +146,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "bucket", "consistent_hashing", "prefix_hash", "manual"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -160,6 +160,10 @@ struct CliArgs {
     /// Relative threshold for load balancing trigger
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
+
+    /// Interval in seconds between bucket boundary adjustment operations
+    #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
+    bucket_adjust_interval_secs: usize,
 
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -203,11 +207,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "bucket", "consistent_hashing", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "bucket", "consistent_hashing", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup and registration
@@ -732,6 +736,12 @@ impl CliArgs {
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
             },
+            "bucket" => PolicyConfig::Bucket {
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
+            },
+            "consistent_hashing" => PolicyConfig::ConsistentHashing,
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
