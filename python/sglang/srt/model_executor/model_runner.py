@@ -3045,10 +3045,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 fixed = self.graph_fixed_weights[:]
                 for kv in self.token_to_kv_pool.kv_buffer:
                     fixed.append(kv)
-                # cos_sin_cache shared across all layers
-                layer0 = self.model.model.layers[0]
-                if layer0.self_attn.rotary_emb is not None:
-                    fixed.append(layer0.self_attn.rotary_emb.cos_sin_cache)
+                # cos_sin_cache shared across all layers (skip PPMissingLayer on non-first PP rank)
+                for _layer in self.model.model.layers:
+                    if hasattr(_layer, 'self_attn') and _layer.self_attn.rotary_emb is not None:
+                        fixed.append(_layer.self_attn.rotary_emb.cos_sin_cache)
+                        break
                 # next_token_logits_buffer (pre-allocated, reused)
                 if forward_batch.next_token_logits_buffer is not None:
                     fixed.append(forward_batch.next_token_logits_buffer)
@@ -3074,6 +3075,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                           meta.seq_lens,
                           forward_batch.out_cache_loc,
                           self.attn_backend._decode_meta]
+                if pp_proxy_tensors is not None and self.support_pp:
+                    inputs.append(pp_proxy_tensors.tensors["hidden_states"])
+                    inputs.append(pp_proxy_tensors.tensors["residual"])
+                    kwargs["pp_proxy_tensors"] = PPProxyTensors({
+                        "hidden_states": inputs[-2],
+                        "residual": inputs[-1],
+                    })
+                    self._sglang_decode_has_pp_inputs = True
 
                 with capture(inputs=inputs, fixed=fixed):
                     ret = self.model.forward(
@@ -3082,17 +3091,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         forward_batch,
                         **kwargs,
                     )
-                    logits = ret.next_token_logits
+                    if isinstance(ret, PPProxyTensors):
+                        hidden_states = ret.tensors["hidden_states"]
+                        residual = ret.tensors["residual"]
+                    else:
+                        logits = ret.next_token_logits
 
-                if _is_kunpeng_hbw_pool:
-                    if not hasattr(self, '_graph_hbw_tensor'):
-                        remaining = self.weight_hbw_pool.largest_free_bytes
-                        self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
-                            (remaining,), torch.uint8)
-                    self._sglang_decode_graph = finalize(
-                        [logits], external_pool=self._graph_hbw_tensor)
+                if isinstance(ret, PPProxyTensors):
+                    self._sglang_decode_returns_pp = True
+                    if _is_kunpeng_hbw_pool:
+                        if not hasattr(self, '_graph_hbw_tensor'):
+                            remaining = self.weight_hbw_pool.largest_free_bytes
+                            self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
+                                (remaining,), torch.uint8)
+                        self._sglang_decode_graph = finalize(
+                            [hidden_states, residual], external_pool=self._graph_hbw_tensor)
+                    else:
+                        self._sglang_decode_graph = finalize([hidden_states, residual])
                 else:
-                    self._sglang_decode_graph = finalize([logits])
+                    self._sglang_decode_returns_pp = False
+                    if _is_kunpeng_hbw_pool:
+                        if not hasattr(self, '_graph_hbw_tensor'):
+                            remaining = self.weight_hbw_pool.largest_free_bytes
+                            self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
+                                (remaining,), torch.uint8)
+                        self._sglang_decode_graph = finalize(
+                            [logits], external_pool=self._graph_hbw_tensor)
+                    else:
+                        self._sglang_decode_graph = finalize([logits])
 
                 if _is_kunpeng_graph_profile:
                     self._sglang_decode_graph.enable_profile(True)
@@ -3103,8 +3129,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                              self.attn_backend.forward_metadata.seq_lens,
                              forward_batch.out_cache_loc,
                              self.attn_backend._decode_meta]
+            if getattr(self, '_sglang_decode_has_pp_inputs', False) and pp_proxy_tensors is not None:
+                input_tensors.append(pp_proxy_tensors.tensors["hidden_states"])
+                input_tensors.append(pp_proxy_tensors.tensors["residual"])
             t0 = time.time()
-            logits, = self._sglang_decode_graph.run(input_tensors)
+            outputs = self._sglang_decode_graph.run(input_tensors)
             t1 = time.time()
             logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
 
@@ -3124,8 +3153,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 })
 
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-            ret = LogitsProcessorOutput(next_token_logits=logits)
-            return ret
+            if getattr(self, '_sglang_decode_returns_pp', False):
+                hidden_states, residual = outputs
+                return PPProxyTensors({"hidden_states": hidden_states, "residual": residual})
+            else:
+                logits, = outputs
+                return LogitsProcessorOutput(next_token_logits=logits)
 
         # Launch forward
         ctx = (

@@ -97,7 +97,7 @@ def worker_main() -> None:
         len(bound_cpus),
     )
 
-    init_oob_comms()
+    init_oob_comms(world_size)
     init_shm_pool(dist.group.WORLD)
 
     kernel.shm_allreduce_init_kunpeng(HEIGHT * WIDTH)

@@ -98,7 +98,7 @@ def worker_main() -> None:
         len(bound_cpus),
     )
 
-    init_oob_comms()
+    init_oob_comms(world_size)
     init_shm_pool(dist.group.WORLD)
 
     dist.barrier()

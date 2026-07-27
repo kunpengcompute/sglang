@@ -42,7 +42,7 @@ BASE_ARGS=(
     --node-rank "$DP_RANK"
     --dist-timeout 600
     --enable-dp-attention
-    --dp-size "$((WORLD_SIZE / PP_SIZE))"
+    --dp-size "$DP_SIZE"
     --tp-size "$TP_SIZE"
     --ep-size "$EP_SIZE"
     --pp-size "$PP_SIZE"
@@ -207,7 +207,14 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
         if [[ "$ROLE" == "prefill" || "$ROLE" == "decode" ]]; then
             IFS=',' read -ra _IB_DEVS <<< "$IB_DEVICE_ALL"
             _IB_COUNT=${#_IB_DEVS[@]}
-            _IB_IDX=$((RANK_IN_NODE * _IB_COUNT / (TP_SIZE * PP_SIZE / WORLD_SIZE)))
+            _ATTN_TP_SIZE=$((TP_SIZE / DP_SIZE))
+            if [[ "$_ATTN_TP_SIZE" == "8" ]]; then
+                # attn=8 (dp=32): 1 rank maps to 1 NIC, aligned with prefill attn_rank to avoid cross-subnet RDMA
+                _IB_IDX=$((RANK_IN_NODE % _IB_COUNT))
+            else
+                # attn=16 (dp=16): 2 ranks share 1 NIC (original formula)
+                _IB_IDX=$((RANK_IN_NODE * _IB_COUNT / (TP_SIZE * PP_SIZE / WORLD_SIZE)))
+            fi
             IB_ARGS=(--disaggregation-ib-device "${_IB_DEVS[$_IB_IDX]}")
         else
             IB_ARGS=()

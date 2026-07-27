@@ -91,6 +91,8 @@ void shm_allreduce_kunpeng(at::Tensor input)
     for (int i = 0; i < intra_node_size; ++i) {
         get_peer_shm_baseptr(i, local_buffer_ptr, (void **)&remote_buffers_ptr[i]);
     }
+    // ensure all peers have finished copying their input into SHM before allreduce reads them
+    kupl_shm_fence(kupl_win_intra_node);
 
     // allreduce in-place on the SHM buffer
     size_t num_elements = input.numel();

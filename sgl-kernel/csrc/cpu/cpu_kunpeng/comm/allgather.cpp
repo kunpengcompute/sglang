@@ -103,6 +103,9 @@ void shm_batched_allgather_kunpeng(at::Tensor input, at::Tensor output, int64_t 
         get_peer_shm_baseptr(comm_start + i, recvbuf, reinterpret_cast<void **>(&remote_recvbuf[i]));
     }
 
+    // ensure all peers have finished copying their input into SHM before allgather reads them
+    kupl_shm_fence(kupl_win_intra_node);
+
     // batch allgather in-place on SHM buffers
     kutacc::shm_allgather_request_h request = (comm_size == 8) ? g_ag_request_comm8 : g_ag_request;
     kutacc::shm_batch_allgather(batch, sendbuf, dim, recvbuf, dim * comm_size, kutacc::SHM_DATATYPE_BFLOAT16,
