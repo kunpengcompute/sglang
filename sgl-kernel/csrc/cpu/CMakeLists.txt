@@ -142,7 +142,7 @@ install(TARGETS pg_helper
 )
 
 # === kupl_async: pybind11 module for async task submission to KUPL executor ===
-set(KUPL_ASYNC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/cpu_kunpeng/kupl_async_kunpeng.cpp")
+set(KUPL_ASYNC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/cpu_kunpeng/async/kupl_async_kunpeng.cpp")
 Python_add_library(kupl_async MODULE WITH_SOABI ${KUPL_ASYNC_SOURCES})
 set_target_properties(kupl_async PROPERTIES OUTPUT_NAME "_kupl_async")
 target_link_libraries(kupl_async PRIVATE

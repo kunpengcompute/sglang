@@ -357,7 +357,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
         self.device_timer = None
-        self.kupl_executor = None
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -3263,27 +3262,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
             ) as recorder_outputs,
         ):
-            if os.environ.get("SGLANG_KUPL_ASYNC", "0") == "1":
-                if self.kupl_executor is None:
-                    from sglang.srt.model_executor.kupl_executor import KuplExecutor
-                    self.kupl_executor = KuplExecutor()
-                self.kupl_executor.submit(
-                    self._forward_raw,
-                    forward_batch,
-                    skip_attn_backend_init,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
-                )
-                output = self.kupl_executor.wait()
-            else:
-                output = self._forward_raw(
-                    forward_batch,
-                    skip_attn_backend_init,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
-                )
+            output = self._forward_raw(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,
