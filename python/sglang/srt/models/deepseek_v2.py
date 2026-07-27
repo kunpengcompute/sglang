@@ -51,10 +51,11 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.graph import ops as kunpeng
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
+from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
@@ -1473,6 +1474,14 @@ class DeepseekV2AttentionMLA(
             and 90 <= _device_sm < 120
         )
 
+        self.swap_mgr = None
+        if _is_cpu_920f:
+            from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
+                KunpengSwapManager,
+            )
+
+            self.swap_mgr = KunpengSwapManager.get_instance()
+
         self.init_mha_forward()
         self.init_mha_kunpeng_forward()
         self.init_mla_forward()
@@ -1952,6 +1961,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator,
         )
 
+        if _is_cpu_920f and hasattr(self, "_swap_mgr"):
+            self._swap_mgr.swap_next_expert_layer(self.layer_id)
+
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
@@ -2163,6 +2175,19 @@ class DeepseekV2Model(nn.Module):
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
+        if _is_cpu_920f:
+            self.swap_mgr = KunpengSwapManager.get_instance()
+            # Pre-scan MoE layers and register swap order with the manager.
+            moe_layers = [
+                self.layers[i]
+                for i in range(self.start_layer, self.end_layer)
+                if isinstance(self.layers[i].mlp, DeepseekV2MoE)
+            ]
+            self.swap_mgr.register_moe_swap_order(moe_layers)
+            for layer in moe_layers:
+                layer._swap_mgr = self.swap_mgr
+            self._first_moe_layer_idx = moe_layers[0].layer_id if moe_layers else None
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -2174,6 +2199,15 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+
+        if _is_cpu_920f and self._first_moe_layer_idx is not None:
+            first_layer = self.layers[self._first_moe_layer_idx]
+            self.swap_mgr.swap_expert_layer(
+                self._first_moe_layer_idx,
+                first_layer.mlp.experts.w13_weight,
+                first_layer.mlp.experts.w2_weight,
+            )
+
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:

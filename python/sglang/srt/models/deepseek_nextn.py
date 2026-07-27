@@ -170,6 +170,14 @@ class DeepseekModelNextN(nn.Module):
         else:
             self.cp_size = None
 
+        if _is_cpu_920f:
+            from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
+                KunpengSwapManager,
+            )
+
+            self.swap_mgr = KunpengSwapManager.get_instance()
+            self.swap_moe_layer_indices = [0]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -187,6 +195,15 @@ class DeepseekModelNextN(nn.Module):
                 input_embeds.device if input_embeds is not None else input_ids.device
             ),
         )
+
+        
+        if _is_cpu_920f and self.swap_moe_layer_indices:
+            self.swap_mgr.swap_expert_layer(
+                0,
+                self.decoder.mlp.experts.w13_weight,
+                self.decoder.mlp.experts.w2_weight,
+            )
+
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
