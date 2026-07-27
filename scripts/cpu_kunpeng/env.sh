@@ -125,6 +125,16 @@ export PREFILL_PP_SIZE=1
 export PREFILL_LONG_PROMPT_PP_SIZE=2
 export DECODE_PP_SIZE=1
 
+# Optional second argument: prefill instance name (e.g. "long_prompt")
+if [[ -n "$2" ]]; then
+    export PREFILL_INSTANCE="$2"
+fi
+
+# Optional third argument: enable prefill bucket policy (e.g. "prefill_bucket")
+if [[ "$3" == "prefill_bucket" ]]; then
+    export PREFILL_BUCKET=1
+fi
+
 # Communication
 export GLOO_SOCKET_IFNAME=enp26s0f0
 export MV2_COMM_WORLD_LOCAL_SIZE=16

@@ -24,10 +24,12 @@ fi
 ROLE="$1"
 DP_RANK="$2"
 LOG_PATH="$3"
+INSTANCE="$4"
+BUCKET="$5"
 IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 
 # Source environment config (exports CONDA_ACTIVATE_CMD, PYTHON_SCRIPT, etc.)
-source ./env.sh "$ROLE"
+source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET"
 
 # Base arguments common to both roles
 BASE_ARGS=(
@@ -127,6 +129,9 @@ case "$ROLE" in
             SPECIFIC_ARGS+=(
                 --prefill "${PREFILL_LONG_PROMPT_MASTER_ADDR:+http://$PREFILL_LONG_PROMPT_MASTER_ADDR:30000}" 9001
                 --prefill-policy bucket
+                --balance-abs-threshold 64
+                --balance-rel-threshold 1.5
+                --bucket-adjust-interval-secs 5
             )
         fi
         # Common args for tokenizer-side HTTP server

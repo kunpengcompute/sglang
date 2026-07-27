@@ -244,3 +244,62 @@ sh curl.sh -p -s -f prompts/ragged.txt
 | `-f FILE` | prompt 文件 | prompts/5.txt |
 
 根据请求的返回结果对正确性进行验证。
+
+## 5. Prefill 多实例部署
+
+### 5.1 配置说明
+
+在 `scripts/cpu_kunpeng/env.sh` 中配置两个 prefill 实例：
+
+```bash
+# 默认实例（短请求）
+PREFILL_IP_SPEC="xxx.xxx.xxx. | 1-16"
+PREFILL_MASTER_ADDR="xxx.xxx.xxx.1"
+PREFILL_MASTER_PORT="5000"
+PREFILL_PP_SIZE=1
+
+# 长请求实例
+PREFILL_LONG_PROMPT_IP_SPEC="xxx.xxx.xxx. | 17-32"
+PREFILL_LONG_PROMPT_MASTER_ADDR="xxx.xxx.xxx.17"
+PREFILL_LONG_PROMPT_MASTER_PORT="5020"
+PREFILL_LONG_PROMPT_PP_SIZE=2
+```
+
+### 5.2 启动方式
+
+#### 1. 单实例模式（默认）
+
+```bash
+# prefill（在节点1上执行）
+sh launch.sh prefill
+
+# decode（在 decode master 节点上执行）
+sh launch.sh decode
+
+# router（在 router 节点上执行）
+sh launch.sh router
+```
+
+#### 2. 双实例模式（Bucket 负载均衡策略）
+
+```bash
+# 实例1（短请求 prefill，节点1~16，在节点1上执行）
+sh launch.sh prefill
+
+# 实例2（长请求 prefill，节点17~32，在节点17上执行）
+sh launch.sh prefill long_prompt
+
+# decode（在 decode master 节点上执行）
+sh launch.sh decode
+
+# router（在 router 节点上执行，启用 bucket 策略）
+sh launch.sh router prefill_bucket
+```
+
+### 5.3 注意事项
+
+- 两个 prefill 实例的 master 节点不同，需分别在各自 master 节点上启动
+- 两个实例的 `MASTER_PORT` 不能相同（默认：5000 vs 5020）
+- router 传入 `prefill_bucket` 参数时，自动注册两个 prefill 实例并启用 bucket 负载均衡策略
+- router 不传 `prefill_bucket` 参数时，只注册一个 prefill 实例，使用 `--policy` 指定的策略
+- 长请求实例的 `PP_SIZE` 可独立配置（默认：2）
