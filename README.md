@@ -244,3 +244,90 @@ sh curl.sh -p -s -f prompts/ragged.txt
 | `-f FILE` | prompt 文件 | prompts/5.txt |
 
 根据请求的返回结果对正确性进行验证。
+
+## 5. Prefill 多实例部署
+
+### 5.1 配置说明
+
+在 `scripts/cpu_kunpeng/env.sh` 中配置两个 prefill 实例：
+
+```bash
+# 默认实例（短请求）
+PREFILL_IP_SPEC="xxx.xxx.xxx. | 1-16"
+PREFILL_MASTER_ADDR="xxx.xxx.xxx.1"
+PREFILL_MASTER_PORT="5000"
+PREFILL_PP_SIZE=1
+
+# 长请求实例
+PREFILL_LONG_PROMPT_IP_SPEC="xxx.xxx.xxx. | 17-32"
+PREFILL_LONG_PROMPT_MASTER_ADDR="xxx.xxx.xxx.17"
+PREFILL_LONG_PROMPT_MASTER_PORT="5020"
+PREFILL_LONG_PROMPT_PP_SIZE=2
+```
+
+### 5.2 启动方式
+
+#### 1. 单实例模式（默认）
+
+```bash
+# prefill（在节点1上执行）
+sh launch.sh prefill
+
+# decode（在 decode master 节点上执行）
+sh launch.sh decode
+
+# router（在 router 节点上执行）
+sh launch.sh router
+```
+
+#### 2. 双实例模式（Bucket 负载均衡策略）
+
+```bash
+# 实例1（短请求 prefill，节点1~16，在节点1上执行）
+sh launch.sh prefill
+
+# 实例2（长请求 prefill，节点17~32，在节点17上执行）
+sh launch.sh prefill long_prompt
+
+# decode（在 decode master 节点上执行）
+sh launch.sh decode
+
+# router（在 router 节点上执行，启用 bucket 策略）
+sh launch.sh router prefill_bucket
+```
+
+### 5.3 注意事项
+
+- 两个 prefill 实例的 master 节点不同，需分别在各自 master 节点上启动
+- 两个实例的 `MASTER_PORT` 不能相同（默认：5000 vs 5020）
+- router 传入 `prefill_bucket` 参数时，自动注册两个 prefill 实例并启用 bucket 负载均衡策略
+- router 不传 `prefill_bucket` 参数时，只注册一个 prefill 实例，使用 `--policy` 指定的策略
+- 长请求实例的 `PP_SIZE` 可独立配置（默认：2）
+
+### 5.4 Bucket 策略 CLI 参数说明
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--prefill-policy bucket` | - | 按请求字符数分桶路由到不同 prefill 实例 |
+| `--balance-abs-threshold` | 64 | 两实例字符数绝对差超过此值时触发负载均衡切换 |
+| `--balance-rel-threshold` | 1.5 | 高负载实例字符数超过低负载的 1.5 倍时才认为不平衡（与绝对阈值同时满足） |
+| `--bucket-adjust-interval-secs` | 5 | 每 5 秒根据历史负载自动调整分界线 |
+
+#### 负载均衡策略
+
+当请求到达时，先按字符数通过二分查找定位到对应的 boundary 分桶，选择对应的 prefill 实例。同时检查两个实例的累计字符数负载，当**同时满足**以下两个条件时，认为负载不平衡，改为路由到负载低的实例：
+
+- 绝对差：`max_load - min_load > balance_abs_threshold`
+- 相对差：`max_load > balance_rel_threshold × min_load`
+
+两个条件同时满足才触发切换，避免负载轻微不均时频繁切换。
+
+#### 分界线自动调整
+
+初始分界线将字符长度范围 `[0, 4096]` 均分给各实例（2个实例时：实例1负责 `[0, 2047]`，实例2负责 `[2048, MAX]`）。后台线程每隔 `bucket_adjust_interval_secs` 秒执行一次自动调整：
+
+1. 统计时间窗口内（`period = bucket_adjust_interval_secs × 1000` 毫秒）各请求的字符数分布
+2. 根据历史负载重新划分各实例的 boundary 范围，使各实例负载更均衡
+3. 如果负载变化不大（新负载 < 2倍旧负载 且 旧负载 < 2倍新负载），则跳过调整
+
+如果请求大部分为短请求（< 1k 字符），实例1负载会偏高，分界线会自动往大调，最终收敛到接近 1k 的位置。
