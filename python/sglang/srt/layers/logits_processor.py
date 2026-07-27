@@ -432,22 +432,27 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
-            if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            if _is_cpu_920f:
+                assert logits_metadata.padded_static_len < 0
+                pruned_states = kunpeng.last_tokens(
+                    hidden_states, logits_metadata.extend_seq_lens)
             else:
-                # If padding_static length is 5 and extended_seq_lens is [2, 3],
-                # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-                # and this retrieves t01 and t12, which are the valid last tokens
-                idx = torch.arange(
-                    len(logits_metadata.extend_seq_lens),
-                    device=logits_metadata.extend_seq_lens.device,
-                )
-                last_index = (
-                    idx * logits_metadata.padded_static_len
-                    + logits_metadata.extend_seq_lens
-                    - 1
-                )
-            pruned_states = hidden_states[last_index]
+                if logits_metadata.padded_static_len < 0:
+                    last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                else:
+                    # If padding_static length is 5 and extended_seq_lens is [2, 3],
+                    # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
+                    # and this retrieves t01 and t12, which are the valid last tokens
+                    idx = torch.arange(
+                        len(logits_metadata.extend_seq_lens),
+                        device=logits_metadata.extend_seq_lens.device,
+                    )
+                    last_index = (
+                        idx * logits_metadata.padded_static_len
+                        + logits_metadata.extend_seq_lens
+                        - 1
+                    )
+                pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
             if aux_hidden_states is not None:
