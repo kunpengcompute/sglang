@@ -274,6 +274,11 @@ class KunpengHBWPool:
         return self.used_bytes / self.pool_size if self.pool_size > 0 else 0.0
 
     @property
+    def largest_free_bytes(self) -> int:
+        """Return size of the largest contiguous free block."""
+        return max((s for _, s in self._free_blocks), default=0)
+
+    @property
     def num_allocated(self) -> int:
         """Return number of currently allocated tensors."""
         return len(self._allocated)

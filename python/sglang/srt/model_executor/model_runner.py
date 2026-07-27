@@ -186,6 +186,7 @@ from sglang.srt.utils import (
     is_host_cpu_arm64,
     is_kunpeng_hbw_pool,
     is_kunpeng_graph_capture,
+    is_kunpeng_graph_profile,
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
@@ -222,6 +223,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_920f = is_cpu_920f()
 _is_kunpeng_hbw_pool = is_kunpeng_hbw_pool()
 _is_kunpeng_graph_capture = is_kunpeng_graph_capture()
+_is_kunpeng_graph_profile = is_kunpeng_graph_profile()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -3081,7 +3083,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                     logits = ret.next_token_logits
 
-                self._sglang_decode_graph = finalize([logits])
+                if _is_kunpeng_hbw_pool:
+                    if not hasattr(self, '_graph_hbw_tensor'):
+                        remaining = self.weight_hbw_pool.largest_free_bytes
+                        self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
+                            (remaining,), torch.uint8)
+                    self._sglang_decode_graph = finalize(
+                        [logits], external_pool=self._graph_hbw_tensor)
+                else:
+                    self._sglang_decode_graph = finalize([logits])
+
+                if _is_kunpeng_graph_profile:
+                    self._sglang_decode_graph.enable_profile(True)
 
             input_tensors = [input_ids64,
                              forward_batch.positions,
@@ -3093,6 +3106,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logits, = self._sglang_decode_graph.run(input_tensors)
             t1 = time.time()
             logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
+
+            if _is_kunpeng_graph_profile:
+                from sglang.srt.graph.profile import write_profile
+                profile_dir = os.environ.get(
+                    "SGLANG_TORCH_PROFILER_DIR", "/tmp")
+                path = os.path.join(
+                    profile_dir,
+                    f"sglang_graph_rank{self.tp_rank}.jsonl")
+                row = self._sglang_decode_graph.get_profile_row()
+                op_names = self._sglang_decode_graph.profile_op_names()
+                write_profile(path, row, op_names, {
+                    "forward_mode": "decode",
+                    "count": len(op_names),
+                    "batch_size": forward_batch.batch_size,
+                })
 
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
             ret = LogitsProcessorOutput(next_token_logits=logits)
