@@ -29,7 +29,6 @@ void multinomial_kunpeng(const at::Tensor &probs, at::Tensor out, int64_t num_sa
 {
     CHECK_LAST_DIM_CONTIGUOUS_INPUT(probs);
     CHECK_DIM(2, probs);
-    TORCH_CHECK(probs.scalar_type() == at::kFloat, "probs must be float32, got ", probs.scalar_type());
     TORCH_CHECK(num_samples >= 1, "num_samples must be >= 1, got ", num_samples);
     if (!replacement) {
         TORCH_CHECK(num_samples <= probs.size(1), "num_samples must be <= vocab_size when replacement=False, got ",
@@ -51,8 +50,9 @@ void multinomial_kunpeng(const at::Tensor &probs, at::Tensor out, int64_t num_sa
 
     int64_t vocab = probs.size(1);
     int64_t *result_data = out.data_ptr<int64_t>();
-    const float *probs_data = probs.data_ptr<float>();
     int64_t stride = probs.stride(0);
+    TORCH_CHECK(probs.scalar_type() == at::kFloat, "probs must be float32, got ", probs.scalar_type());
+    const float *probs_data = probs.data_ptr<float>();
 
     kutacc::parallel_for(0, batch, 1, [&](int64_t start, int64_t end) {
         std::mt19937 rng(std::random_device{}());

@@ -679,6 +679,40 @@ def _setup_flash_mla_dense_decode_kunpeng():
     register_op('flash_mla_dense_decode_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_pad_q_left_mtp_kunpeng():
+    def shape_infer(q, seq_lens, max_seq_len):
+        bsz = seq_lens.shape[0]
+        n_heads = q.shape[1]
+        head_dim = q.shape[2]
+        return [((bsz, max_seq_len, n_heads, head_dim), q.dtype)]
+
+    def eager_fn(q, seq_lens, max_seq_len):
+        bsz = seq_lens.shape[0]
+        n_heads = q.shape[1]
+        head_dim = q.shape[2]
+        q_padded = torch.empty((bsz, max_seq_len, n_heads, head_dim), dtype=q.dtype)
+        torch.ops.sgl_kernel.pad_q_left_mtp_kunpeng(q, seq_lens, q_padded)
+        return q_padded
+
+    register_op('pad_q_left_mtp_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_unpad_o_right_mtp_kunpeng():
+    def shape_infer(o, seq_lens, sum_seq_len):
+        n_heads = o.shape[2]
+        head_dim = o.shape[3]
+        return [((sum_seq_len, n_heads, head_dim), o.dtype)]
+
+    def eager_fn(o, seq_lens, sum_seq_len):
+        n_heads = o.shape[2]
+        head_dim = o.shape[3]
+        o_flat = torch.empty((sum_seq_len, n_heads, head_dim), dtype=o.dtype)
+        torch.ops.sgl_kernel.unpad_o_right_mtp_kunpeng(o, seq_lens, o_flat)
+        return o_flat
+
+    register_op('unpad_o_right_mtp_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_topk_convert_kunpeng():
     def shape_infer(src_info, token_ids, experts_offset, num_ranks,
                     num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill):
@@ -801,6 +835,8 @@ def setup():
     _setup_copy_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()
     _setup_flash_attention_with_workspace_kunpeng()
+    _setup_pad_q_left_mtp_kunpeng()
+    _setup_unpad_o_right_mtp_kunpeng()
     _setup_topk_convert_kunpeng()
     _setup_igemm_fusedmoe_gateup_kunpeng()
     _setup_igemm_fusedmoe_down_kunpeng()

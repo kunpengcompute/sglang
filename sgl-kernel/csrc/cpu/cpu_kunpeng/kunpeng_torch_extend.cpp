@@ -262,9 +262,9 @@ void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at
                                 at::Tensor candidates, at::Tensor retrieve_index, at::Tensor retrieve_next_token,
                                 at::Tensor retrieve_next_sibling, at::Tensor target_predict);
 
-void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, int64_t max_ext_len, at::Tensor q_padded);
+void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded);
 
-void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, int64_t max_ext_len, at::Tensor o_flat);
+void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Tensor o_flat);
 
 void register_graph_kernels();
 
@@ -671,14 +671,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor retrieve_next_sibling, Tensor target_predict) -> ()");
     m.impl("verify_tree_greedy_kunpeng", verify_tree_greedy_kunpeng);
 
-    m.def(
-        "pad_q_left_mtp_kunpeng("
-        "Tensor q_heads, Tensor ext_lens, int max_ext_len, Tensor q_padded) -> ()");
+    m.def("pad_q_left_mtp_kunpeng(Tensor q_heads, Tensor ext_lens, Tensor q_padded) -> ()");
     m.impl("pad_q_left_mtp_kunpeng", pad_q_left_mtp_kunpeng);
 
-    m.def(
-        "unpad_o_right_mtp_kunpeng("
-        "Tensor o_padded, Tensor ext_lens, int max_ext_len, Tensor o_flat) -> ()");
+    m.def("unpad_o_right_mtp_kunpeng(Tensor o_padded, Tensor ext_lens, Tensor o_flat) -> ()");
     m.impl("unpad_o_right_mtp_kunpeng", unpad_o_right_mtp_kunpeng);
 
     // set_kv_buffer (MLA KV cache write)
