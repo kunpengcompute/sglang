@@ -3,8 +3,8 @@ import torch
 from sglang.srt.graph._capture import (
     is_capturing,
     lookup_or_register,
-    register_output,
     record_op,
+    register_output,
 )
 
 _DEBUG = False

@@ -46,6 +46,7 @@ Usage:
     kv = mgr.get_kv_layer(layer_id)              # HBM (drains events)
 """
 
+import atexit
 import logging
 import threading
 from dataclasses import dataclass
@@ -106,6 +107,11 @@ class KunpengSwapManager:
         self._expert_buffer_w2: Optional[torch.Tensor] = None
         self._expert_buffer_layer: Optional[int] = None
 
+        self._cur_kv_ddr: Optional[torch.Tensor] = None
+        self._cur_kv_hbm: Optional[torch.Tensor] = None
+        self._kv_start_layer: int = 0
+        self._kv_end_layer: int = 0
+
         # HBW memory pool for swap buffer allocations (lazy init on first use).
         self._hbw_pool: Optional[KunpengHBWPool] = None
         if _is_kunpeng_hbw_pool:
@@ -115,6 +121,12 @@ class KunpengSwapManager:
         sdma_event_num = torch.ops.sgl_kernel.get_sdma_event_num()
         self._expert_event_tensor = torch.zeros(sdma_event_num, dtype=torch.int32)
         self._expert_event_num_tensor = torch.tensor([0], dtype=torch.int32)
+        self._kv_swap_in_event_tensor = torch.zeros(sdma_event_num, dtype=torch.int32)
+        self._kv_swap_in_event_num_tensor = torch.tensor([0], dtype=torch.int32)
+        self._kv_ddr_event_tensor = torch.zeros(sdma_event_num, dtype=torch.int32)
+        self._kv_ddr_event_num_tensor = torch.tensor([0], dtype=torch.int32)
+        self._kv_hbm_event_tensor = torch.zeros(sdma_event_num, dtype=torch.int32)
+        self._kv_hbm_event_num_tensor = torch.tensor([0], dtype=torch.int32)
 
         logger.info(
             "KunpengSwapManager initialized: swap_expert=%s swap_kv=%s kv_blockwise=%s",
@@ -122,6 +134,13 @@ class KunpengSwapManager:
             self.enable_swap_kv,
             self.enable_swap_kv_blockwise,
         )
+
+        atexit.register(self._cleanup_sdma)
+
+    def _cleanup_sdma(self):
+        """Release SDMA resources on exit."""
+        if KunpengSwapManager._sdma_initialized:
+            torch.ops.sgl_kernel.kupl_sdma_clear()
 
     @classmethod
     def get_instance(cls) -> "KunpengSwapManager":
@@ -145,6 +164,36 @@ class KunpengSwapManager:
         """
         self._moe_layers = {ly.layer_id: ly for ly in moe_layers}
         self._moe_layer_order = [ly.layer_id for ly in moe_layers]
+
+    def register_kv_swap_range(self, start_layer: int, end_layer: int) -> None:
+        """Register the valid layer range for KV buffer swap prefetch.
+
+        Args:
+            start_layer: first layer index (inclusive) handled by this PP rank.
+            end_layer: last layer index (exclusive) handled by this PP rank.
+        """
+        self._kv_start_layer = start_layer
+        self._kv_end_layer = end_layer
+
+    def swap_next_kv_layer(self, current_layer_id: int, forward_batch) -> None:
+        """Prefetch the next layer's KV cache buffer via SDMA.
+
+        Call this after the attention computation of *current_layer_id*
+        is done.  Sets ``_cur_kv_ddr`` to the next layer's DDR KV cache
+        so that ``set_kv_buffer`` can write to the correct buffer.
+
+        Args:
+            current_layer_id: the layer that just finished attention.
+            forward_batch: the current forward batch (needed to access
+                ``token_to_kv_pool``).
+        """
+        next_layer_id = current_layer_id + 1
+        if next_layer_id >= self._kv_end_layer:
+            return
+        self.swap_kv_layer(
+            next_layer_id,
+            forward_batch.token_to_kv_pool.get_key_buffer(next_layer_id),
+        )
 
     def swap_next_expert_layer(self, current_layer_id: int) -> None:
         """Prefetch the next MoE layer's weights via SDMA.
@@ -290,3 +339,96 @@ class KunpengSwapManager:
                 self._expert_event_tensor, self._expert_event_num_tensor
             )
         return self._expert_buffer_w13, self._expert_buffer_w2
+
+    def init_kv_buffer(
+        self,
+        num_tokens: int,
+        head_num: int,
+        kv_cache_dim: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Allocate single-layer HBM KV cache buffer. Idempotent.
+
+        Shape: (num_tokens, head_num, kv_cache_dim).  The buffer is
+        recycled across layers — only one layer's KV cache resides in
+        HBM at any time, matching the expert weight swap pattern.
+
+        Must be called before any :meth:`swap_kv_layer` call when
+        KV swap is enabled.
+        """
+        if not self.enable_swap_kv or self._cur_kv_hbm is not None:
+            return
+        shape = (num_tokens, head_num, kv_cache_dim)
+        self._cur_kv_hbm = self._hbw_pool.alloc(shape, dtype=dtype)
+        logger.info(
+            "KV HBM buffer allocated: shape=%s dtype=%s",
+            shape,
+            dtype,
+        )
+
+    def swap_kv_layer(self, layer_id: int, kv_buffer: torch.Tensor) -> None:
+        """Populate KV HBM buffer for *layer_id* via SDMA async copy.
+
+        Call this for the first layer at forward entry, and for layer
+        N+1 after layer N's attention completes (prefetch).
+
+        - Swap enabled: copies DDR → HBM via graph-compatible
+          ``kunpeng.kupl_sdma_memcpy_chunked`` with internal event management.
+        - Swap disabled: stores DDR reference directly (zero-copy).
+
+        Args:
+            layer_id: absolute layer index in the model.
+            kv_buffer: DDR KV cache tensor for the current layer.
+        """
+        self._cur_kv_ddr = kv_buffer
+
+        if not self.enable_swap_kv:
+            return
+
+        if self._cur_kv_hbm is None:
+            raise RuntimeError(
+                "KV HBM buffer not allocated. Call init_kv_buffer(...) first."
+            )
+
+        total_bytes = kv_buffer.numel() * kv_buffer.element_size()
+        kunpeng.kupl_sdma_memcpy_chunked(
+            self._cur_kv_hbm,
+            kv_buffer,
+            self._kv_swap_in_event_tensor,
+            self._kv_swap_in_event_num_tensor,
+            0,  # dst_byte_offset
+            0,  # src_byte_offset
+            total_bytes,
+            14 * 1024 * 1024,  # chunk_bytes = 14 MB
+            512,  # max_pending_events
+        )
+
+
+    def set_kv_buffer(
+        self, target_kv_buffer: torch.Tensor, loc: torch.Tensor, cache_k: torch.Tensor
+    ) -> None:
+        """Scatter-write computed K into the current layer's DDR KV cache.
+
+        Uses the buffer set by the preceding :meth:`swap_kv_layer` call.
+        Routes through the graph-compatible ``set_kv_buffer_kunpeng`` op.
+        """
+        kdim = target_kv_buffer.shape[-1]
+        kunpeng.set_kv_buffer_kunpeng(
+            target_kv_buffer.squeeze(1),
+            loc,
+            cache_k.reshape(-1, kdim),
+        )
+
+    def get_kv_cache(self) -> torch.Tensor:
+        """Return KV cache for the current layer from HBM buffer.
+
+        Always returns a tensor ready for attention compute:
+        - Swap enabled: HBM buffer (drains pending DDR→HBM copy events).
+        - Swap disabled: DDR buffer directly (zero-copy).
+        """
+        if self.enable_swap_kv:
+            kunpeng.kupl_sdma_wait_all(
+                self._kv_swap_in_event_tensor, self._kv_swap_in_event_num_tensor
+            )
+            return self._cur_kv_hbm
+        return self._cur_kv_ddr

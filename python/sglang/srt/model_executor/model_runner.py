@@ -771,6 +771,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     moe_expert_dtype=experts.w13_weight.dtype,
                 )
 
+            if self.swap_mgr.enable_swap_kv:
+                self.swap_mgr.init_kv_buffer(
+                    num_tokens=self.token_to_kv_pool.kv_buffer[0].shape[0],
+                    head_num=self.token_to_kv_pool.kv_buffer[0].shape[1],
+                    kv_cache_dim=self.token_to_kv_pool.kv_buffer[0].shape[2],
+                    dtype=self.kv_cache_dtype,
+                )
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
@@ -3054,14 +3062,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if forward_batch.next_token_logits_buffer is not None:
             fixed.append(forward_batch.next_token_logits_buffer)
         # Expert HBM swap buffers (reused across layers, allocated once)
-        if (
-            getattr(self, "swap_mgr", None) is not None
-            and self.swap_mgr.enable_swap_expert
-        ):
+        if self.swap_mgr.enable_swap_expert:
             fixed.append(self.swap_mgr._expert_buffer_w13)
             fixed.append(self.swap_mgr._expert_buffer_w2)
             fixed.append(self.swap_mgr._expert_event_tensor)
             fixed.append(self.swap_mgr._expert_event_num_tensor)
+        if self.swap_mgr.enable_swap_kv:
+            fixed.append(self.swap_mgr._cur_kv_hbm)
+            fixed.append(self.swap_mgr._kv_swap_in_event_tensor)
+            fixed.append(self.swap_mgr._kv_swap_in_event_num_tensor)
         try:
             from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
                 _KunpengDispatcherState,

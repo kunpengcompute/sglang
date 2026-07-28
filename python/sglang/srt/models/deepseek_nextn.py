@@ -203,6 +203,10 @@ class DeepseekModelNextN(nn.Module):
                 self.decoder.mlp.experts.w13_weight,
                 self.decoder.mlp.experts.w2_weight,
             )
+        if _is_cpu_920f:
+            self.swap_mgr.swap_kv_layer(
+                0, forward_batch.token_to_kv_pool.get_key_buffer(0)
+            )
 
 
         if input_embeds is None:
