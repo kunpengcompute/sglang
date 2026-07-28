@@ -303,7 +303,9 @@ class GroupCoordinator:
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             device_group = None
             if "mooncake" in torch_distributed_backend:
-                from mooncake.ep import MooncakeBackendOptions
+                from sglang.srt.utils.numa_utils import get_mooncake__ep__mooncake_backend_options
+
+                MooncakeBackendOptions = get_mooncake__ep__mooncake_backend_options()
 
                 if not _is_cpu_920f:
                     device_group = torch.distributed.new_group(
@@ -1972,7 +1974,9 @@ def init_distributed_environment(
     )
     if "mooncake" in backend:
         try:
-            from mooncake import ep as mooncake_ep
+            from sglang.srt.utils.numa_utils import get_mooncake__ep
+
+            mooncake_ep = get_mooncake__ep()
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
@@ -1995,7 +1999,9 @@ def init_distributed_environment(
         _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
 
         if backend == "mooncake":
-            from mooncake.ep import MooncakeBackendOptions
+            from sglang.srt.utils.numa_utils import get_mooncake__ep__mooncake_backend_options
+
+            MooncakeBackendOptions = get_mooncake__ep__mooncake_backend_options()
 
             # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
             active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")

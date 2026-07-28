@@ -76,7 +76,9 @@ class EPBuffer:
             return cls._buffer
 
         # Lazy import Buffer to avoid creating CUDA context at module import time
-        from mooncake.mooncake_ep_buffer import Buffer
+        from sglang.srt.utils.numa_utils import get_mooncake__mooncake_ep_buffer__buffer
+
+        Buffer = get_mooncake__mooncake_ep_buffer__buffer()
 
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
@@ -115,7 +117,9 @@ class _MooncakeEPDispatcherImpl:
         deepep_mode: DeepEPMode,
     ):
         try:
-            from mooncake.mooncake_ep_buffer import Buffer  # noqa: F401
+            from sglang.srt.utils.numa_utils import get_mooncake__mooncake_ep_buffer__buffer
+
+            Buffer = get_mooncake__mooncake_ep_buffer__buffer()  # noqa: F401
         except ImportError:
             raise ImportError(
                 "Mooncake EP is not installed. Please install Mooncake package at "

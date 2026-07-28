@@ -844,7 +844,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def remote_instance_init_transfer_engine(self):
         try:
-            from mooncake.engine import TransferEngine
+            from sglang.srt.utils.numa_utils import get_mooncake__engine__transfer_engine
+
+            TransferEngine = get_mooncake__engine__transfer_engine()
         except ImportError as e:
             logger.warning(
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake"
@@ -1129,8 +1131,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.mooncake_ib_device:
                 mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
                 try:
-                    from mooncake import ep as mooncake_ep
+                    from sglang.srt.utils.numa_utils import get_mooncake__ep
 
+                    mooncake_ep = get_mooncake__ep()
                     mooncake_ep.set_device_filter(mooncake_ib_device)
                 except:
                     pass  # A warning will be raised in `init_distributed_environment`

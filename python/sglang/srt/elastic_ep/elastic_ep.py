@@ -145,8 +145,9 @@ def _refresh_ep_members() -> None:
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:
-    from mooncake import ep as mooncake_ep
+    from sglang.srt.utils.numa_utils import get_mooncake__ep
 
+    mooncake_ep = get_mooncake__ep()
     world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
     if not all(mooncake_ep.get_peer_state(world_backend, global_ranks)):
         # The relaunched ranks have not finished initializing yet.
@@ -175,7 +176,9 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 
 
 def join_process_groups():
-    from mooncake import ep as mooncake_ep
+    from sglang.srt.utils.numa_utils import get_mooncake__ep
+
+    mooncake_ep = get_mooncake__ep()
 
     def join_backend(label: str, backend) -> None:
         logger.info("Recovered rank joining Mooncake backend %s", label)

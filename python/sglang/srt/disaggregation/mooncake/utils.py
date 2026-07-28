@@ -48,12 +48,14 @@ def init_mooncake_custom_mem_pool(
         try:
             # TODO(shangming): abstract custom allocator class for more backends
             if custom_mem_pool_type == "NVLINK":
-                from mooncake.allocator import NVLinkAllocator
+                from sglang.srt.utils.numa_utils import get_mooncake__allocator__nvlink_allocator
 
+                NVLinkAllocator = get_mooncake__allocator__nvlink_allocator()
                 allocator = NVLinkAllocator.get_allocator(device)
             elif custom_mem_pool_type == "BAREX":
-                from mooncake.allocator import BarexAllocator
+                from sglang.srt.utils.numa_utils import get_mooncake__allocator__barex_allocator
 
+                BarexAllocator = get_mooncake__allocator__barex_allocator()
                 allocator = BarexAllocator.get_allocator(device)
             elif custom_mem_pool_type == "INTRA_NODE_NVLINK":
                 return False, None, None

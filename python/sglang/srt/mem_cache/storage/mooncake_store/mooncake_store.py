@@ -32,8 +32,9 @@ logger = logging.getLogger(__name__)
 class MooncakeHostTensorAllocator(HostTensorAllocator):
     def __init__(self):
         super().__init__()
-        from mooncake.store import MooncakeHostMemAllocator
+        from sglang.srt.utils.numa_utils import get_mooncake__store__mooncake_host_mem_allocator
 
+        MooncakeHostMemAllocator = get_mooncake__store__mooncake_host_mem_allocator()
         self.allocator = MooncakeHostMemAllocator()
         self.ptr = None
 
@@ -233,8 +234,9 @@ class MooncakeBaseStore:
 
     def _import_mooncake_store(self):
         try:
-            from mooncake.store import MooncakeDistributedStore
+            from sglang.srt.utils.numa_utils import get_mooncake__store__mooncake_distributed_store
 
+            MooncakeDistributedStore = get_mooncake__store__mooncake_distributed_store()
             return MooncakeDistributedStore
         except ImportError as e:
             raise ImportError(

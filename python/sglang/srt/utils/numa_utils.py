@@ -1,3 +1,4 @@
+import enum
 import ctypes
 import glob
 import logging
@@ -22,8 +23,9 @@ _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
-_cpu_to_node_cache = None
-_node_to_cpus_cache = {}
+_CPU_TO_NODE_CACHE = None
+_NODE_TO_CPUS_CACHE = {}
+_MOONCAKE_IMPORT_HELPER = {}
 
 libnuma = None
 
@@ -41,29 +43,53 @@ if libnuma is None:
 else:
     from ctypes import *
 
+    # Constants normally obtained via ctypes_configure from <sched.h>/<numa.h>.
+    # Hard-coded to avoid the PyPy-only ctypes_configure dependency.
+    #   NUMA_NUM_NODES  -> <numa.h>           (2048 on this system)
+    #   CPU_SETSIZE     -> __CPU_SETSIZE in <sched.h>  (1024)
+    #   NCPUBITS        -> __NCPUBITS in <sched.h>     (8 * sizeof(unsigned long))
+    NUMA_NUM_NODES = 2048
+    CPU_SETSIZE = 1024
+    NCPUBITS = 8 * sizeof(c_ulong)
+
     class bitmask_t(Structure):
         _fields_ = [
             ('size', c_ulong),
             ('maskp', POINTER(c_ulong)),
         ]
 
-    libnuma.numa_max_node.argtypes = []
-    libnuma.numa_max_node.restype = c_int
+    class nodemask_t(Structure):
+        _fields_ = [('n', c_ulong * (NUMA_NUM_NODES // (sizeof(c_ulong) * 8)))]
+
+    libnuma.copy_bitmask_to_nodemask.argtypes = [POINTER(bitmask_t), POINTER(nodemask_t)]
+    libnuma.copy_bitmask_to_nodemask.restype = c_void_p
 
     libnuma.numa_allocate_cpumask.argtypes = []
     libnuma.numa_allocate_cpumask.restype = POINTER(bitmask_t)
 
-    libnuma.numa_node_to_cpus.argtypes = [c_int, POINTER(bitmask_t)]
-    libnuma.numa_node_to_cpus.restype = ctypes.c_int
+    libnuma.numa_bitmask_clearall.argtypes = [POINTER(bitmask_t)]
+    libnuma.numa_bitmask_clearall.restype = POINTER(bitmask_t)
 
     libnuma.numa_bitmask_free.argtypes = [POINTER(bitmask_t)]
     libnuma.numa_bitmask_free.restype = c_void_p
 
+    libnuma.numa_bitmask_isbitset.argtypes = [POINTER(bitmask_t), c_uint]
+    libnuma.numa_bitmask_isbitset.restype = c_int
+
+    libnuma.numa_get_membind.argtypes = []
+    libnuma.numa_get_membind.restype = POINTER(bitmask_t)
+
+    libnuma.numa_max_node.argtypes = []
+    libnuma.numa_max_node.restype = c_int
+
+    libnuma.numa_node_to_cpus.argtypes = [c_int, POINTER(bitmask_t)]
+    libnuma.numa_node_to_cpus.restype = ctypes.c_int
+
     libnuma.numa_num_configured_cpus.argtypes = []
     libnuma.numa_num_configured_cpus.restype = c_int
 
-    libnuma.numa_bitmask_isbitset.argtypes = [POINTER(bitmask_t), c_uint]
-    libnuma.numa_bitmask_isbitset.restype = c_int
+    libnuma.numa_set_membind.argtypes = [POINTER(bitmask_t)]
+    libnuma.numa_set_membind.restype = c_void_p
 
 
 @contextmanager
@@ -248,14 +274,39 @@ def _query_numa_node_for_gpu(device_id: int):
             pass  # Ignore shutdown errors
 
 
-# region: core binding
-def _get_max_node():
-    """
-    Maximum number of NUMA node.
+# region core binding
+def __nodemask_isset(mask, node):
+    if node >= NUMA_NUM_NODES:
+        return 0
 
-    @rtype: C{int}
+    if mask.n[node // (8 * sizeof(c_ulong))] & (1 << (node % (8 * sizeof(c_ulong)))):
+        return 1
+
+    return 0
+
+
+def __nodemask_set(mask, node):
+    mask.n[node // (8 * sizeof(c_ulong))] |= (1 << (node % (8 * sizeof(c_ulong))))
+
+
+def __nodemask_zero(mask):
+    tmp = bitmask_t()
+    tmp.maskp = cast(byref(mask), POINTER(c_ulong))
+    tmp.size = sizeof(nodemask_t) * 8
+    libnuma.numa_bitmask_clearall(byref(tmp))
+
+
+def _numa_nodemask_to_set(mask):
     """
-    return libnuma.numa_max_node()
+    Convert NUMA nodemask to Python set.
+    """
+    result = set()
+
+    for i in range(0, _get_max_node() + 1):
+        if __nodemask_isset(mask, i):
+            result.add(i)
+
+    return result
 
 
 def _node_to_cpus(node):
@@ -285,15 +336,70 @@ def _node_to_cpus(node):
     return result
 
 
+def _get_max_node():
+    """
+    Maximum number of NUMA node.
+
+    @rtype: C{int}
+    """
+    return libnuma.numa_max_node()
+
+
+def _get_membind():
+    """
+    Returns  the  mask of nodes from which memory can currently be allocated.
+
+    @return: node mask
+    @rtype: C{set}
+    """
+    bitmask = libnuma.numa_get_membind()
+    nodemask = nodemask_t()
+    libnuma.copy_bitmask_to_nodemask(bitmask, byref(nodemask))
+    libnuma.numa_bitmask_free(bitmask)
+    return _numa_nodemask_to_set(nodemask)
+
+
+def _set_to_numa_nodemask(mask):
+    """
+    Conver Python set to NUMA nodemask.
+    """
+    result = nodemask_t()
+    __nodemask_zero(result)
+
+    for i in range(0, _get_max_node() + 1):
+        if i in mask:
+            __nodemask_set(result, i)
+
+    return result
+
+
+def _set_membind(nodemask):
+    """
+    Sets the memory allocation mask.
+
+    The thread will only allocate memory from the nodes set in nodemask.
+
+    @param nodemask: node mask
+    @type nodemask: C{set}
+    """
+    mask = _set_to_numa_nodemask(nodemask)
+
+    tmp = bitmask_t()
+    tmp.maskp = cast(byref(mask), POINTER(c_ulong))
+    tmp.size = sizeof(nodemask_t) * 8
+
+    libnuma.numa_set_membind(byref(tmp))
+
+
 def _get_cpu_to_node_map() -> Dict[int, int]:
-    global _cpu_to_node_cache
-    if _cpu_to_node_cache is not None:
-        return _cpu_to_node_cache
+    global _CPU_TO_NODE_CACHE
+    if _CPU_TO_NODE_CACHE is not None:
+        return _CPU_TO_NODE_CACHE
     mapping = {}
     for node in range(_get_max_node() + 1):
         for cpu in _node_to_cpus(node):
             mapping[cpu] = node
-    _cpu_to_node_cache = mapping
+    _CPU_TO_NODE_CACHE = mapping
     return mapping
 
 
@@ -309,10 +415,17 @@ def _current_affinity_numa_nodes() -> Set[int]:
 
 
 def _get_node_cpus(node: int) -> List[int]:
-    global _node_to_cpus_cache
-    if node not in _node_to_cpus_cache:
-        _node_to_cpus_cache[node] = sorted(_node_to_cpus(node))
-    return _node_to_cpus_cache[node]
+    global _NODE_TO_CPUS_CACHE
+    if node not in _NODE_TO_CPUS_CACHE:
+        _NODE_TO_CPUS_CACHE[node] = sorted(_node_to_cpus(node))
+    return _NODE_TO_CPUS_CACHE[node]
+
+
+def _offset_is_valid(offset: int) -> bool:
+    # todo
+    if offset is None:
+        return False
+    return True
 
 
 def _resolve_offset_cpus(offset: int) -> List[int]:
@@ -329,9 +442,22 @@ def _resolve_offset_cpus(offset: int) -> List[int]:
     return result
 
 
+def _process_core_binding(offset: int, pid: Optional[int] = None) -> None:
+    if not _offset_is_valid(offset):
+        return
+
+    if pid is None or pid == 0:
+        pid = os.getpid()
+    cpu_list = _resolve_offset_cpus(offset)
+    if not cpu_list:
+        return
+
+    os.sched_setaffinity(pid, cpu_list)
+
+
 def zmq_context_core_binding(ctx):
     offset = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
-    if offset is None:
+    if not _offset_is_valid(offset):
         return ctx
 
     if libnuma is None:
@@ -341,3 +467,109 @@ def zmq_context_core_binding(ctx):
     for cpu in cpu_list:
         ctx.set(THREAD_AFFINITY_CPU_ADD, cpu)
     return ctx
+
+
+@contextmanager
+def mooncake_binding_ctx(offset: Optional[int] = None):
+    if offset is None:
+        offset = envs.SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET.get()
+
+    saved_cpu = os.sched_getaffinity(0)
+    saved_membind = _get_membind()
+    _process_core_binding(offset=offset)
+
+    try:
+        yield
+    finally:
+        os.sched_setaffinity(0, saved_cpu)
+        _set_membind(saved_membind)
+
+
+def mooncake_binding_wrapper(func):
+    def wrapper(*args, **kwargs):
+        with mooncake_binding_ctx():
+            return func(*args, **kwargs)
+    return wrapper
+
+
+class MooncakeNamespace(enum.Enum):
+    NVLinkAllocator = enum.auto()
+    BarexAllocator = enum.auto()
+    MooncakeBackendOptions = enum.auto()
+    TransferEngine = enum.auto()
+    EP = enum.auto()
+    Buffer = enum.auto()
+    MooncakeHostMemAllocator = enum.auto()
+    MooncakeDistributedStore = enum.auto()
+
+
+@mooncake_binding_wrapper
+def get_mooncake__allocator__nvlink_allocator():
+    global _MOONCAKE_IMPORT_HELPER
+    if name := MooncakeNamespace.NVLinkAllocator not in _MOONCAKE_IMPORT_HELPER:
+        from mooncake.allocator import NVLinkAllocator
+        _MOONCAKE_IMPORT_HELPER[name] = NVLinkAllocator
+    return _MOONCAKE_IMPORT_HELPER[name]
+
+
+@mooncake_binding_wrapper
+def get_mooncake__allocator__barex_allocator():
+    global _MOONCAKE_IMPORT_HELPER
+    if name := MooncakeNamespace.BarexAllocator not in _MOONCAKE_IMPORT_HELPER:
+        from mooncake.allocator import BarexAllocator
+        _MOONCAKE_IMPORT_HELPER[name] = BarexAllocator
+    return _MOONCAKE_IMPORT_HELPER[name]
+
+
+@mooncake_binding_wrapper
+def get_mooncake__ep__mooncake_backend_options():
+    global _MOONCAKE_IMPORT_HELPER
+    if name := MooncakeNamespace.MooncakeBackendOptions not in _MOONCAKE_IMPORT_HELPER:
+        from mooncake.ep import MooncakeBackendOptions
+        _MOONCAKE_IMPORT_HELPER[name] = MooncakeBackendOptions
+    return _MOONCAKE_IMPORT_HELPER[name]
+
+
+@mooncake_binding_wrapper
+def get_mooncake__engine__transfer_engine():
+    global _MOONCAKE_IMPORT_HELPER
+    if name := MooncakeNamespace.TransferEngine not in _MOONCAKE_IMPORT_HELPER:
+        from mooncake.engine import TransferEngine
+        _MOONCAKE_IMPORT_HELPER[name] = TransferEngine
+    return _MOONCAKE_IMPORT_HELPER[name]
+
+
+@mooncake_binding_wrapper
+def get_mooncake__ep():
+    global _MOONCAKE_IMPORT_HELPER
+    if name := MooncakeNamespace.EP not in _MOONCAKE_IMPORT_HELPER:
+        from mooncake import ep
+        _MOONCAKE_IMPORT_HELPER[name] = ep
+    return _MOONCAKE_IMPORT_HELPER[name]
+
+
+@mooncake_binding_wrapper
+def get_mooncake__mooncake_ep_buffer__buffer():
+    global _MOONCAKE_IMPORT_HELPER
+    if name := MooncakeNamespace.Buffer not in _MOONCAKE_IMPORT_HELPER:
+        from mooncake.mooncake_ep_buffer import Buffer
+        _MOONCAKE_IMPORT_HELPER[name] = Buffer
+    return _MOONCAKE_IMPORT_HELPER[name]
+
+
+@mooncake_binding_wrapper
+def get_mooncake__store__mooncake_host_mem_allocator():
+    global _MOONCAKE_IMPORT_HELPER
+    if name := MooncakeNamespace.MooncakeHostMemAllocator not in _MOONCAKE_IMPORT_HELPER:
+        from mooncake.store import MooncakeHostMemAllocator
+        _MOONCAKE_IMPORT_HELPER[name] = MooncakeHostMemAllocator
+    return _MOONCAKE_IMPORT_HELPER[name]
+
+
+@mooncake_binding_wrapper
+def get_mooncake__store__mooncake_distributed_store():
+    global _MOONCAKE_IMPORT_HELPER
+    if name := MooncakeNamespace.MooncakeDistributedStore not in _MOONCAKE_IMPORT_HELPER:
+        from mooncake.store import MooncakeDistributedStore
+        _MOONCAKE_IMPORT_HELPER[name] = MooncakeDistributedStore
+    return _MOONCAKE_IMPORT_HELPER[name]
