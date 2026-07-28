@@ -32,7 +32,7 @@ class GraphOp:
         tensor_args = [a for a in args if isinstance(a, torch.Tensor) or a is None]
         non_tensor_args = [a for a in args if not isinstance(a, torch.Tensor) and a is not None]
 
-        inputs = [lookup_or_register(t) for t in tensor_args]
+        inputs = [lookup_or_register(t, idx=i) for i, t in enumerate(tensor_args)]
 
         out_infos = self.shape_infer(*args, **kwargs)
         if not isinstance(out_infos, list):
