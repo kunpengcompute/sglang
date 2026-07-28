@@ -97,9 +97,17 @@ class DeepseekMLAKunpengForwardMixin:
         q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
         k_combined = kunpeng.cat_kunpeng(k_nope, k_pe, -1)  # (B, 1, D_kv+D_rope)
 
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mqa, forward_batch.out_cache_loc, k_combined, k_nope
-        )
+        if self.swap_mgr.enable_swap_kv:
+            self.swap_mgr.set_kv_buffer(
+                self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, k_combined
+            )
+            self.swap_mgr.set_kv_buffer(
+                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, k_combined
+            )
+        else:
+            self.swap_mgr.set_kv_buffer(
+                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, k_combined
+            )
 
         return (
             q_combined,

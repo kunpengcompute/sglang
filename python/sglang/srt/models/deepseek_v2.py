@@ -1879,6 +1879,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
+        self._swap_mgr: Optional[KunpengSwapManager] = None
+
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
             return ""
@@ -1934,6 +1936,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+
+        if _is_cpu_920f and hasattr(self, "_swap_mgr"):
+            self._swap_mgr.swap_next_kv_layer(self.layer_id, forward_batch)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -2187,6 +2192,10 @@ class DeepseekV2Model(nn.Module):
             for layer in moe_layers:
                 layer._swap_mgr = self.swap_mgr
             self._first_moe_layer_idx = moe_layers[0].layer_id if moe_layers else None
+            # Register KV swap range and set _swap_mgr on all layers for KV prefetch.
+            self.swap_mgr.register_kv_swap_range(self.start_layer, self.end_layer)
+            for i in range(self.start_layer, self.end_layer):
+                self.layers[i]._swap_mgr = self.swap_mgr
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -2206,6 +2215,12 @@ class DeepseekV2Model(nn.Module):
                 self._first_moe_layer_idx,
                 first_layer.mlp.experts.w13_weight,
                 first_layer.mlp.experts.w2_weight,
+            )
+
+        if _is_cpu_920f:
+            self.swap_mgr.swap_kv_layer(
+                self.start_layer,
+                forward_batch.token_to_kv_pool.get_key_buffer(self.start_layer),
             )
 
         total_num_layers = self.end_layer - self.start_layer

@@ -27,6 +27,7 @@ from sglang.srt.utils import BumpAllocator
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+
 class DeepseekMHAKunpengForwardMixin:
 
     def init_mha_kunpeng_forward(self: DeepseekV2AttentionMLA):
@@ -74,9 +75,10 @@ class DeepseekMHAKunpengForwardMixin:
         # Apply RoPE
         if self.rotary_emb is not None:
             q_pe, k_pe = kunpeng.rope_kunpeng(
-                positions, q_pe, k_pe, self.rotary_emb.cos_sin_cache)
+                positions, q_pe, k_pe, self.rotary_emb.cos_sin_cache
+            )
 
-        kunpeng.copy_kunpeng(q[..., self.qk_nope_head_dim:], q_pe)
+        kunpeng.copy_kunpeng(q[..., self.qk_nope_head_dim :], q_pe)
         self._set_mla_kv_buffer_kunpeng(latent_cache, kv_a, k_pe, forward_batch)
 
         # kv_b
@@ -109,13 +111,20 @@ class DeepseekMHAKunpengForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        kunpeng.copy_kunpeng(
-            latent_cache[:, :, : self.kv_lora_rank], kv_a.unsqueeze(1))
-        kunpeng.copy_kunpeng(
-            latent_cache[:, :, self.kv_lora_rank :], k_pe)
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-        )
+        kunpeng.copy_kunpeng(latent_cache[:, :, : self.kv_lora_rank], kv_a.unsqueeze(1))
+        kunpeng.copy_kunpeng(latent_cache[:, :, self.kv_lora_rank :], k_pe)
+
+        if self.swap_mgr.enable_swap_kv:
+            self.swap_mgr.set_kv_buffer(
+                self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, latent_cache
+            )
+            self.swap_mgr.set_kv_buffer(
+                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, latent_cache
+            )
+        else:
+            self.swap_mgr.set_kv_buffer(
+                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, latent_cache
+            )
 
     def _get_mla_kv_buffer_kunpeng(
         self: DeepseekV2AttentionMLA,
@@ -123,9 +132,7 @@ class DeepseekMHAKunpengForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
-            self.attn_mha.layer_id
-        )
+        latent_cache_buf = self.swap_mgr.get_kv_cache()
         latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
 
         kv_a, k_pe = latent_cache.split(

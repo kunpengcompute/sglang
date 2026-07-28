@@ -318,7 +318,7 @@ class KunpengCpuBackend(AttentionBackend):
         save_kv_cache: bool,
     ) -> torch.Tensor:
 
-        return forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        return KunpengSwapManager.get_instance().get_kv_cache()
 
     def _forward_extend_kutacc(
         self,
