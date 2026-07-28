@@ -24,7 +24,14 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_world_size,
+    get_attn_tp_group,
+)
 from sglang.srt.environ import envs
+from sglang.srt.graph import ops as kunpeng
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
+from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
@@ -58,12 +65,6 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
-from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
-from sglang.srt.distributed import (
-    get_attn_tensor_model_parallel_world_size,
-    get_attn_tp_group,
-)
-from sglang.srt.graph import ops as kunpeng
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -662,6 +663,8 @@ class KunpengMoE(FusedMoE):
         # when a shared_experts_fn callback is supplied to forward().
         self._shared_output: Optional[torch.Tensor] = None
 
+        self.swap_mgr = KunpengSwapManager.get_instance()
+
     @KunpengProfiler(depth=1)
     def forward(
         self,
@@ -714,16 +717,16 @@ class KunpengMoE(FusedMoE):
         self,
         dispatch_output: KunpengDispatchOutput,
     ) -> KunpengCombineInput:
-        from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
-            KunpengCombineInput,
-        )
+        from sglang.srt.layers.moe.token_dispatcher.kunpeng import KunpengCombineInput
 
         t_total_start = time.perf_counter()
+
+        w13_weight, w2_weight = self.swap_mgr.get_expert_weights(self.layer_id)
 
         hidden = self.hidden_size
         num_local_experts = self.num_local_experts
         max_dispatch_tokens = dispatch_output.max_dispatch_tokens_per_rank
-        inter_dim = self.w13_weight.shape[1] // 2
+        inter_dim = w13_weight.shape[1] // 2
         max_tokens = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")) * int(
             os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024")
         )
@@ -769,7 +772,7 @@ class KunpengMoE(FusedMoE):
         kunpeng.igemm_fusedmoe_gateup_kunpeng(
             act,
             scale,
-            self.w13_weight,
+            w13_weight,
             self.w13_weight_scale,
             dispatch_output.recv_token_ids_buf,
             dispatch_output.recv_experts_offset,
@@ -805,7 +808,7 @@ class KunpengMoE(FusedMoE):
         t_down_start = time.perf_counter()
         kunpeng.igemm_fusedmoe_down_kunpeng(
             moe_silu_int8,
-            self.w2_weight,
+            w2_weight,
             moe_silu_scale,
             self.w2_weight_scale,
             dispatch_output.recv_token_ids_buf,

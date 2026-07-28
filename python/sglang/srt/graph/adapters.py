@@ -473,6 +473,58 @@ def _setup_moe_combine_recv_kunpeng():
     register_op('moe_combine_recv_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_kupl_sdma_memcpy_chunked():
+    def shape_infer(
+        dst,
+        src,
+        event_tensor,
+        event_num_tensor,
+        dst_byte_offset,
+        src_byte_offset,
+        total_bytes,
+        chunk_bytes,
+        max_pending_events,
+    ):
+        return []
+
+    def eager_fn(
+        dst,
+        src,
+        event_tensor,
+        event_num_tensor,
+        dst_byte_offset,
+        src_byte_offset,
+        total_bytes,
+        chunk_bytes,
+        max_pending_events,
+    ):
+        torch.ops.sgl_kernel.kupl_sdma_memcpy_chunked(
+            dst,
+            src,
+            event_tensor,
+            event_num_tensor,
+            dst_byte_offset,
+            src_byte_offset,
+            total_bytes,
+            chunk_bytes,
+            max_pending_events,
+        )
+        return None
+
+    register_op("kupl_sdma_memcpy_chunked", shape_infer, eager_fn)
+
+
+def _setup_kupl_sdma_wait_all():
+    def shape_infer(event_tensor, event_num_tensor):
+        return []
+
+    def eager_fn(event_tensor, event_num_tensor):
+        torch.ops.sgl_kernel.kupl_sdma_wait_all(event_tensor, event_num_tensor)
+        return None
+
+    register_op("kupl_sdma_wait_all", shape_infer, eager_fn)
+
+
 def _setup_cat_kunpeng():
     def shape_infer(a, b, dim):
         shape = list(a.shape)
@@ -681,6 +733,8 @@ def setup():
     _setup_moe_dispatch_recv_kunpeng()
     _setup_moe_combine_send_kunpeng()
     _setup_moe_combine_recv_kunpeng()
+    _setup_kupl_sdma_memcpy_chunked()
+    _setup_kupl_sdma_wait_all()
     _setup_cat_kunpeng()
     _setup_contiguous_kunpeng()
     _setup_set_kv_buffer_kunpeng()

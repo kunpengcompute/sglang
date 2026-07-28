@@ -99,6 +99,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
@@ -184,9 +185,9 @@ from sglang.srt.utils import (
     is_cpu_920f,
     is_hip,
     is_host_cpu_arm64,
-    is_kunpeng_hbw_pool,
     is_kunpeng_graph_capture,
     is_kunpeng_graph_profile,
+    is_kunpeng_hbw_pool,
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
@@ -619,6 +620,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if _is_cpu_920f and _is_kunpeng_hbw_pool:
             self.init_hbw_pool_kunpeng()
 
+        if _is_cpu_920f:
+            self.swap_mgr = KunpengSwapManager.get_instance()
+
         # Expert parallelism
         self.eplb_manager = (
             EPLBManager(self)
@@ -743,6 +747,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
+
+        # Init Kunpeng CPU swap HBM buffers (expert weights + KV cache).
+        if _is_cpu_920f:
+
+            model = self.model.model  # DeepseekV2Model or DeepseekModelNextN
+
+            if self.swap_mgr.enable_swap_expert and (
+                hasattr(model, "decoder") or model._first_moe_layer_idx is not None
+            ):
+                if hasattr(model, "decoder"):
+                    # DeepseekModelNextN: single decoder layer with MoE
+                    experts = model.decoder.mlp.experts
+                else:
+                    # DeepseekV2Model: multiple layers
+                    experts = model.layers[model._first_moe_layer_idx].mlp.experts
+                self.swap_mgr.init_expert_buffer(
+                    hidden_size=experts.hidden_size,
+                    moe_intermediate_size=experts.intermediate_size_per_partition,
+                    num_experts=experts.num_local_experts,
+                    moe_expert_dtype=experts.w13_weight.dtype,
+                )
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -1406,6 +1431,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if _is_cpu_920f and _is_kunpeng_graph_capture:
                 from sglang.srt.graph.collect_weights import collect_model_weights
+
                 self.graph_fixed_weights = collect_model_weights(self.model)
                 self._sglang_graph_cache = OrderedDict()
                 self._graph_hbw_tensor = None
@@ -2324,7 +2350,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ), f"weights_pool_size_mb must be positive, got {weights_pool_size_mb}"
         weights_pool_size_bytes = weights_pool_size_mb * 1024 * 1024
         self.weight_hbw_pool = KunpengHBWPool.get_instance(
-            name="weights",
             pool_size_bytes=weights_pool_size_bytes,
             alignment=1024,
         )
@@ -3024,8 +3049,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if forward_batch.next_token_logits_buffer is not None:
             fixed.append(forward_batch.next_token_logits_buffer)
         try:
-            from sglang.srt.layers.moe.token_dispatcher.kunpeng import \
-                _KunpengDispatcherState
+            from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+                _KunpengDispatcherState,
+            )
             state = _KunpengDispatcherState.get()
             for attr in ('parallel_policy', 'dispatch_send_buf',
                          'dispatch_recv_buf', 'combine_send_buf',
@@ -3138,16 +3164,122 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # TODO: sampler (model_runner.sample() in tp_worker.py) is outside
         # the graph.  Move it into forward_decode to cover embed→sample.
         if _is_cpu_920f and _is_kunpeng_graph_capture:
-            meta = self.attn_backend.forward_metadata
-            inputs = [forward_batch.input_ids.long(),
-                      forward_batch.positions,
-                      meta.block_table,
-                      meta.seq_lens,
-                      forward_batch.out_cache_loc,
-                      self.attn_backend._decode_meta]
-            logits = self._kunpeng_graph_forward(
-                forward_batch, inputs, "decode", use_hbw=True, **kwargs)
-            return LogitsProcessorOutput(next_token_logits=logits)
+            from sglang.srt.graph import capture, finalize
+
+            input_ids64 = forward_batch.input_ids.long()
+
+            if not hasattr(self, "_sglang_decode_graph"):
+                fixed = self.graph_fixed_weights[:]
+                for kv in self.token_to_kv_pool.kv_buffer:
+                    fixed.append(kv)
+                # cos_sin_cache shared across all layers
+                layer0 = self.model.model.layers[0]
+                if layer0.self_attn.rotary_emb is not None:
+                    fixed.append(layer0.self_attn.rotary_emb.cos_sin_cache)
+                # next_token_logits_buffer (pre-allocated, reused)
+                if forward_batch.next_token_logits_buffer is not None:
+                    fixed.append(forward_batch.next_token_logits_buffer)
+                # Expert HBM swap buffers (reused across layers, allocated once)
+                if self.swap_mgr.enable_swap_expert:
+                    fixed.append(self.swap_mgr._expert_buffer_w13)
+                    fixed.append(self.swap_mgr._expert_buffer_w2)
+                    fixed.append(self.swap_mgr._expert_event_tensor)
+                    fixed.append(self.swap_mgr._expert_event_num_tensor)
+                # MoE state buffers (process-level singleton, not in model tree)
+                try:
+                    from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+                        _KunpengDispatcherState,
+                    )
+
+                    state = _KunpengDispatcherState.get()
+                    for attr in (
+                        "parallel_policy",
+                        "dispatch_send_buf",
+                        "dispatch_recv_buf",
+                        "combine_send_buf",
+                        "combine_recv_buf",
+                        "recv_token_ids_buf",
+                        "recv_experts_offset",
+                        "combined_x",
+                        "topk_weights_buf",
+                        "topk_ids_index_buf",
+                    ):
+                        t = getattr(state, attr, None)
+                        if t is not None:
+                            fixed.append(t)
+                except Exception:
+                    pass
+                meta = self.attn_backend.forward_metadata
+                inputs = [
+                    input_ids64,
+                    forward_batch.positions,
+                    meta.block_table,
+                    meta.seq_lens,
+                    forward_batch.out_cache_loc,
+                    self.attn_backend._decode_meta,
+                ]
+
+                with capture(inputs=inputs, fixed=fixed):
+                    ret = self.model.forward(
+                        input_ids64,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+                    logits = ret.next_token_logits
+
+                if _is_kunpeng_hbw_pool:
+                    if not hasattr(self, "_graph_hbw_tensor"):
+                        remaining = self.weight_hbw_pool.largest_free_bytes
+                        self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
+                            (remaining,), torch.uint8
+                        )
+                    self._sglang_decode_graph = finalize(
+                        [logits], external_pool=self._graph_hbw_tensor
+                    )
+                else:
+                    self._sglang_decode_graph = finalize([logits])
+
+                if _is_kunpeng_graph_profile:
+                    self._sglang_decode_graph.enable_profile(True)
+
+            input_tensors = [
+                input_ids64,
+                forward_batch.positions,
+                self.attn_backend.forward_metadata.block_table,
+                self.attn_backend.forward_metadata.seq_lens,
+                forward_batch.out_cache_loc,
+                self.attn_backend._decode_meta,
+            ]
+            t0 = time.time()
+            (logits,) = self._sglang_decode_graph.run(input_tensors)
+            t1 = time.time()
+            logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
+
+            if _is_kunpeng_graph_profile:
+                from sglang.srt.graph.profile import write_profile
+
+                profile_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+                path = os.path.join(
+                    profile_dir, f"sglang_graph_rank{self.tp_rank}.jsonl"
+                )
+                row = self._sglang_decode_graph.get_profile_row()
+                op_names = self._sglang_decode_graph.profile_op_names()
+                write_profile(
+                    path,
+                    row,
+                    op_names,
+                    {
+                        "forward_mode": "decode",
+                        "count": len(op_names),
+                        "batch_size": forward_batch.batch_size,
+                    },
+                )
+
+            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+            ret = LogitsProcessorOutput(next_token_logits=logits)
+            return ret
 
         # Launch forward
         ctx = (
