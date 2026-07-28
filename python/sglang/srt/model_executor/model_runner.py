@@ -3293,6 +3293,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
+        # ── sglang graph capture/replay for Kunpeng idle ──
+        if _is_cpu_920f and _is_kunpeng_graph_capture:
+            inputs = [forward_batch.input_ids.long(),
+                      forward_batch.positions]
+            logits = self._kunpeng_graph_forward(
+                forward_batch, inputs, "idle", use_hbw=True, **kwargs)
+            return LogitsProcessorOutput(next_token_logits=logits)
+
         ctx = (
             self.device_timer.wrap(metadata={"category": "idle"})
             if self.device_timer
