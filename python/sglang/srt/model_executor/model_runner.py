@@ -3098,8 +3098,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         from sglang.srt.graph import capture, finalize
 
-        input_ids64 = forward_batch.input_ids.long()
-        total_tokens = input_ids64.shape[0]
+        assert forward_batch.input_ids.dtype == torch.int64, \
+            f"graph input_ids must be int64, got {forward_batch.input_ids.dtype}"
+        total_tokens = forward_batch.input_ids.shape[0]
         graph_cache_key = (forward_batch.forward_mode, total_tokens)
 
         if graph_cache_key not in self._sglang_graph_cache:
@@ -3111,7 +3112,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             with capture(inputs=inputs, fixed=fixed):
                 ret = self.model.forward(
-                    input_ids64,
+                    forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
                     **kwargs,
@@ -3188,7 +3189,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # the graph.  Move it into forward_decode to cover embed→sample.
         if _is_cpu_920f and _is_kunpeng_graph_capture:
             meta = self.attn_backend.forward_metadata
-            inputs = [forward_batch.input_ids.long(),
+            inputs = [forward_batch.input_ids,
                       forward_batch.positions,
                       meta.block_table,
                       meta.seq_lens,
@@ -3268,7 +3269,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # ── sglang graph capture/replay for Kunpeng extend ──
         if _is_cpu_920f and _is_kunpeng_graph_capture:
-            inputs = [forward_batch.input_ids.long(),
+            inputs = [forward_batch.input_ids,
                       forward_batch.positions,
                       forward_batch.extend_seq_lens,
                       forward_batch.out_cache_loc]
@@ -3305,7 +3306,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # ── sglang graph capture/replay for Kunpeng idle ──
         if _is_cpu_920f and _is_kunpeng_graph_capture:
-            inputs = [forward_batch.input_ids.long(),
+            inputs = [forward_batch.input_ids,
                       forward_batch.positions]
             logits = self._kunpeng_graph_forward(
                 forward_batch, inputs, "idle", use_hbw=True, **kwargs)
