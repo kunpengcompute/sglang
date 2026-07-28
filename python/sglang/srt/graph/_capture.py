@@ -104,7 +104,7 @@ def is_capturing():
     return _C.CaptureManager.instance().is_capturing()
 
 
-def lookup_or_register(tensor):
+def lookup_or_register(tensor, idx=0):
     global _none_storage_id
     mgr = _C.CaptureManager.instance()
     if tensor is None:
@@ -119,6 +119,15 @@ def lookup_or_register(tensor):
     base = _C.storage_base(tensor)
     so = _C.storage_offset(tensor)
     sid = mgr.lookup_storage(base)
+    if sid < 0:
+        print(
+            f"[capture] lookup_or_register FAIL at {idx}-th parameter: "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"numel={tensor.numel()}, "
+            f"data_ptr=0x{tensor.data_ptr():x}, "
+            f"storage_base=0x{base:x}",
+            flush=True,
+        )
     assert sid >= 0, "non-return-value parameter tensor not registered"
 
     vid = mgr.find_or_register_view(sid, so, tensor)
