@@ -9,9 +9,10 @@ import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Set
 
 import psutil
+from zmq import THREAD_AFFINITY_CPU_ADD
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -20,6 +21,49 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
+
+_cpu_to_node_cache = None
+_node_to_cpus_cache = {}
+
+libnuma = None
+
+for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
+    try:
+        libnuma = ctypes.CDLL(libnuma_so)
+    except OSError as e:
+        logger.debug(f"{e}")
+        libnuma = None
+    if libnuma is not None:
+        break
+
+if libnuma is None:
+    logger.warning("libnuma is None")
+else:
+    from ctypes import *
+
+    class bitmask_t(Structure):
+        _fields_ = [
+            ('size', c_ulong),
+            ('maskp', POINTER(c_ulong)),
+        ]
+
+    libnuma.numa_max_node.argtypes = []
+    libnuma.numa_max_node.restype = c_int
+
+    libnuma.numa_allocate_cpumask.argtypes = []
+    libnuma.numa_allocate_cpumask.restype = POINTER(bitmask_t)
+
+    libnuma.numa_node_to_cpus.argtypes = [c_int, POINTER(bitmask_t)]
+    libnuma.numa_node_to_cpus.restype = ctypes.c_int
+
+    libnuma.numa_bitmask_free.argtypes = [POINTER(bitmask_t)]
+    libnuma.numa_bitmask_free.restype = c_void_p
+
+    libnuma.numa_num_configured_cpus.argtypes = []
+    libnuma.numa_num_configured_cpus.restype = c_int
+
+    libnuma.numa_bitmask_isbitset.argtypes = [POINTER(bitmask_t), c_uint]
+    libnuma.numa_bitmask_isbitset.restype = c_int
 
 
 @contextmanager
@@ -95,23 +139,7 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
     return None
 
 
-def get_libnuma():
-    libnuma = None
-
-    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
-        try:
-            libnuma = ctypes.CDLL(libnuma_so)
-        except OSError as e:
-            logger.debug(f"{e}")
-            libnuma = None
-        if libnuma is not None:
-            break
-    return libnuma
-
-
 def numa_bind_to_node(node: int):
-    libnuma = get_libnuma()
-
     if libnuma is None or libnuma.numa_available() < 0:
         logger.warning("numa not available on this system, skip bind action")
     else:
@@ -122,7 +150,6 @@ def numa_bind_to_node(node: int):
 def _can_set_mempolicy() -> bool:
     """Check if the process has permission to use NUMA memory policy syscalls."""
     try:
-        libnuma = get_libnuma()
         if libnuma is None or libnuma.numa_available() < 0:
             return False
         mode = ctypes.c_int()
@@ -219,3 +246,98 @@ def _query_numa_node_for_gpu(device_id: int):
             pynvml.nvmlShutdown()
         except Exception:
             pass  # Ignore shutdown errors
+
+
+# region: core binding
+def _get_max_node():
+    """
+    Maximum number of NUMA node.
+
+    @rtype: C{int}
+    """
+    return libnuma.numa_max_node()
+
+
+def _node_to_cpus(node):
+    """
+    Get CPUs available on C{node}.
+
+    @return: set of CPU ids
+    @rtype: C{set}
+    """
+    result = set()
+
+    if node < 0 or node > _get_max_node():
+        raise ValueError(node)
+
+    mask = libnuma.numa_allocate_cpumask()
+
+    if libnuma.numa_node_to_cpus(node, mask) < 0:
+        libnuma.numa_bitmask_free(mask)
+        raise RuntimeError(node)
+
+    ncpus = libnuma.numa_num_configured_cpus()
+    for i in range(0, ncpus):
+        if libnuma.numa_bitmask_isbitset(mask, ctypes.c_uint(i)):
+            result.add(i)
+
+    libnuma.numa_bitmask_free(mask)
+    return result
+
+
+def _get_cpu_to_node_map() -> Dict[int, int]:
+    global _cpu_to_node_cache
+    if _cpu_to_node_cache is not None:
+        return _cpu_to_node_cache
+    mapping = {}
+    for node in range(_get_max_node() + 1):
+        for cpu in _node_to_cpus(node):
+            mapping[cpu] = node
+    _cpu_to_node_cache = mapping
+    return mapping
+
+
+def _current_affinity_numa_nodes() -> Set[int]:
+    my_cpus = os.sched_getaffinity(0)
+    cpu_to_node = _get_cpu_to_node_map()
+    nodes: Set[int] = set()
+    for cpu in my_cpus:
+        node = cpu_to_node.get(cpu)
+        if node is not None:
+            nodes.add(node)
+    return nodes
+
+
+def _get_node_cpus(node: int) -> List[int]:
+    global _node_to_cpus_cache
+    if node not in _node_to_cpus_cache:
+        _node_to_cpus_cache[node] = sorted(_node_to_cpus(node))
+    return _node_to_cpus_cache[node]
+
+
+def _resolve_offset_cpus(offset: int) -> List[int]:
+    nodes = _current_affinity_numa_nodes()
+    result = []
+    for node in sorted(nodes):
+        sorted_cpus = _get_node_cpus(node)
+        if offset < 0:
+            idx = len(sorted_cpus) + offset
+        else:
+            idx = offset
+        if 0 <= idx < len(sorted_cpus):
+            result.append(sorted_cpus[idx])
+    return result
+
+
+def zmq_context_core_binding(ctx):
+    offset = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
+    if offset is None:
+        return ctx
+
+    if libnuma is None:
+        return ctx
+
+    cpu_list = _resolve_offset_cpus(offset)
+    for cpu in cpu_list:
+        ctx.set(THREAD_AFFINITY_CPU_ADD, cpu)
+    return ctx

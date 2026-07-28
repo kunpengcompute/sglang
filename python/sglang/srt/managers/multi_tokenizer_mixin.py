@@ -48,6 +48,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.numa_utils import zmq_context_core_binding
 from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
@@ -58,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 class SocketMapping:
     def __init__(self):
-        self._zmq_context = zmq.Context()
+        self._zmq_context = zmq_context_core_binding(zmq.Context())
         self._mapping: Dict[str, zmq.Socket] = {}
 
     def clear_all_sockets(self):
@@ -323,7 +324,7 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
-        context = zmq.asyncio.Context(3)
+        context = zmq_context_core_binding(zmq.asyncio.Context(3))
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )

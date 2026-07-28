@@ -232,7 +232,11 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.numa_utils import (
+    get_numa_node_if_available,
+    numa_bind_to_node,
+    zmq_context_core_binding,
+)
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -507,7 +511,7 @@ class Scheduler(
                     self.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
-        context = zmq.Context(2)
+        context = zmq_context_core_binding(zmq.Context(2))
         self.idle_sleeper = None
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:

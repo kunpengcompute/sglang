@@ -17,6 +17,7 @@ from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto, get_open_port
+from sglang.srt.utils.numa_utils import zmq_context_core_binding
 
 # SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
 SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
@@ -190,7 +191,7 @@ class MessageQueue:
                 get_local_ip_auto("0.0.0.0") if n_remote_reader > 0 else "127.0.0.1"
             )
 
-        context = Context()
+        context = zmq_context_core_binding(Context())
 
         if n_local_reader > 0:
             # for local readers, we will:
@@ -260,7 +261,7 @@ class MessageQueue:
         self.handle = handle
         self._is_writer = False
 
-        context = Context()
+        context = zmq_context_core_binding(Context())
 
         if rank in handle.local_reader_ranks:
             assert handle.buffer is not None

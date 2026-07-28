@@ -33,6 +33,8 @@ import msgspec
 import zmq
 from pydantic import BaseModel
 
+from sglang.srt.utils.numa_utils import zmq_context_core_binding
+
 logger = logging.getLogger(__name__)
 
 
@@ -188,7 +190,7 @@ class ZmqEventPublisher(EventPublisher):
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
 
         # ZMQ sockets
-        self._ctx = zmq.Context.instance()
+        self._ctx = zmq_context_core_binding(zmq.Context.instance())
         self._pub: Optional[zmq.Socket] = None
         self._replay: Optional[zmq.Socket] = None
         self._dp_rank = attn_dp_rank
