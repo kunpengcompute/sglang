@@ -49,7 +49,7 @@ class RouterArgs:
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
-    prefill_short_count: int = 2
+    prefill_short_count: int = 0
     prefill_length_threshold: int = 4096
     dp_aware: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support

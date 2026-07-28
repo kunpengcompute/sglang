@@ -125,6 +125,8 @@ impl BucketPolicy {
                     bucket_guard.chars_per_url = Arc::new(Mutex::new(
                         worker_urls.iter().map(|u| (u.clone(), 0)).collect(),
                     ));
+                } else {
+                    error!("Failed to acquire write lock for bucket initialization in grouped_threshold mode");
                 }
                 continue;
             }

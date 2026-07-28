@@ -215,7 +215,7 @@ struct CliArgs {
     decode_policy: Option<String>,
 
     /// Number of prefill workers dedicated to short requests (for grouped_threshold policy)
-    #[arg(long, default_value_t = 2, help_heading = "PD Disaggregation")]
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
     prefill_short_count: usize,
 
     /// Character count threshold for short vs long requests (for grouped_threshold policy)
@@ -769,14 +769,7 @@ impl CliArgs {
             "grouped_threshold" => PolicyConfig::Bucket {
                 balance_abs_threshold: self.balance_abs_threshold,
                 balance_rel_threshold: self.balance_rel_threshold,
-                bucket_adjust_interval_secs: self.eviction_interval as usize,
-                prefill_short_count: self.prefill_short_count,
-                prefill_length_threshold: self.prefill_length_threshold,
-            },
-            "bucket" => PolicyConfig::Bucket {
-                balance_abs_threshold: self.balance_abs_threshold,
-                balance_rel_threshold: self.balance_rel_threshold,
-                bucket_adjust_interval_secs: self.eviction_interval as usize,
+                bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
                 prefill_short_count: self.prefill_short_count,
                 prefill_length_threshold: self.prefill_length_threshold,
             },

@@ -678,7 +678,7 @@ impl Router {
         request_id_headers = None,
         pd_disaggregation = false,
         bucket_adjust_interval_secs = 5,
-        prefill_short_count = 2,
+        prefill_short_count = 0,
         prefill_length_threshold = 4096,
         prefill_urls = None,
         decode_urls = None,
