@@ -91,7 +91,7 @@ DECODE_MASTER_PORT="5010"
 
 NATIVE_IP_SPEC="xxx.xxx.xxx. | 17-32"
 NATIVE_MASTER_ADDR="xxx.xxx.xxx.1"
-NATIVE_MASTER_PORT="5010"
+NATIVE_MASTER_PORT="5010"       
 
 # Router node IP (single IP for PD disaggregation router)
 export ROUTER_IP="xxx.xxx.xxx.1"
@@ -101,6 +101,8 @@ LOG_BASE_DIR="/path-to-logs"
 CONDA_ENV_NAME="my_env"
 CONDA_BASE_PATH="/path-to-conda"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
+MODEL_PATH_PREFILL="/path-to-deepseek-r1-channel-int8"
+MODEL_PATH_DECODE="/path-to-deepseek-r1-channel-int8"
 SPECULATIVE_DRAFT_MODEL_PATH=""
 
 export HPCKIT_PATH="/path-to-HPCKit"
@@ -119,14 +121,27 @@ export SDMA_KO_PATH="/path-to-sdma-ko"
 
 # TP/EP size
 export TP_SIZE=256
+export DP_SIZE=16
 export EP_SIZE=${TP_SIZE}
+export PP_SIZE=1 # >1 enable pp  eg: 2
+
+# Prefill TP/EP/PP size
+export PREFILL_TP_SIZE=256
+export PREFILL_DP_SIZE=16
+export PREFILL_EP_SIZE=${PREFILL_TP_SIZE}
+export PREFILL_PP_SIZE=1
+
+# Decode TP/EP/PP size
+export DECODE_TP_SIZE=256
+export DECODE_DP_SIZE=32
+export DECODE_EP_SIZE=${DECODE_TP_SIZE}
+export DECODE_PP_SIZE=2
+
 
 # PP size and chunked prefill size can be configured independently
 export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size
 export PP_SIZE=1 # >1 enable pp  eg: 2
-export PREFILL_PP_SIZE=1
 export PREFILL_LONG_PROMPT_PP_SIZE=2
-export DECODE_PP_SIZE=1
 
 # Optional second argument: prefill instance name (e.g. "long_prompt")
 if [[ -n "$2" ]]; then
@@ -222,6 +237,11 @@ prefill_config() {
     export ROLE="prefill"
     export IS_PREFILL="1"
     export SGLANG_SKIP_HTTP=1
+    export TP_SIZE=$PREFILL_TP_SIZE
+    export DP_SIZE=$PREFILL_DP_SIZE
+    export EP_SIZE=$PREFILL_EP_SIZE
+    export PP_SIZE=$PREFILL_PP_SIZE
+    export MODEL_PATH=$MODEL_PATH_PREFILL
 }
 
 # ------------------------------------------------------------
@@ -236,7 +256,11 @@ decode_config() {
     export ROLE="decode"
     export IS_PREFILL="0"
     export SGLANG_SKIP_HTTP=1
+    export TP_SIZE=$DECODE_TP_SIZE
+    export DP_SIZE=$DECODE_DP_SIZE
+    export EP_SIZE=$DECODE_EP_SIZE
     export PP_SIZE=$DECODE_PP_SIZE
+    export MODEL_PATH=$MODEL_PATH_DECODE
 }
 
 # ------------------------------------------------------------

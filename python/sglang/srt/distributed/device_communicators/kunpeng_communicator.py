@@ -50,12 +50,12 @@ def get_intra_die_group() -> dist.ProcessGroup:
     return _INTRA_DIE
 
 
-def init_oob_comms():
+def init_oob_comms(intra_node_size: int = 16):
     global _OOB_COMMS_INITIALIZED, _INTRA_SOCKET, _INTRA_DIE
     if _OOB_COMMS_INITIALIZED:
         return
 
-    # Kunpeng CPU: each node has 16 NUMA nodes, each socket has 8 NUMA nodes, each die has 4 NUMA nodes
+    # Kunpeng CPU: each node has 2 sockets, each socket has 2 dies
     intra_socket_size = 8
     intra_die_size = 4
 
@@ -170,7 +170,7 @@ class KunpengCommunicator:
         # and should be derived from model config in the future.
         self.max_elements = self.max_tokens * 7168
 
-        init_oob_comms()
+        init_oob_comms(self.comm_size)
         init_shm_pool(self.group)
 
         kernel.shm_reduce_scatter_init_kunpeng()

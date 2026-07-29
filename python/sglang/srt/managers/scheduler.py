@@ -3879,17 +3879,18 @@ def configure_scheduler_process(
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         if _is_cpu_920f:
             p = psutil.Process(os.getpid())
-            attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
+            tp_ranks_in_node = (server_args.tp_size * server_args.pp_size ) // server_args.nnodes
+            tp_rank_in_node = tp_rank % tp_ranks_in_node
             # TODO (kunpeng): hard code here, should use a more elegant way.
             if os.environ.get("SGLANG_FORWARD_ASYNC", "0") == "1":
                 p.cpu_affinity(
-                    list(range(attn_tp_rank * 38, attn_tp_rank * 38 + 17))
-                    + list(range(attn_tp_rank * 38 + 21, attn_tp_rank * 38 + 37))
+                    list(range(tp_rank_in_node * 38, tp_rank_in_node * 38 + 17))
+                    + list(range(tp_rank_in_node * 38 + 21, tp_rank_in_node * 38 + 37))
                 )  # 0~16, 21~36
             else:
                 p.cpu_affinity(
-                    list(range(attn_tp_rank * 38, attn_tp_rank * 38 + 16))
-                    + list(range(attn_tp_rank * 38 + 21, attn_tp_rank * 38 + 37))
+                    list(range(tp_rank_in_node * 38, tp_rank_in_node * 38 + 16))
+                    + list(range(tp_rank_in_node * 38 + 21, tp_rank_in_node * 38 + 37))
                 )  # 0~15, 21~36
             logger.info(os.sched_getaffinity(os.getpid()))
         else:
@@ -3971,9 +3972,10 @@ def run_scheduler_process(
             if envs.SGLANG_SET_CPU_AFFINITY.get():
                 if _is_cpu_920f:
                     p = psutil.Process(os.getpid())
-                    attn_tp_rank = tp_rank % (server_args.tp_size // server_args.dp_size)
+                    tp_ranks_in_node = (server_args.tp_size * server_args.pp_size ) // server_args.nnodes
+                    tp_rank_in_node = tp_rank % tp_ranks_in_node
                     # TODO (kunpeng): hard code here, should use a more elegant way.
-                    p.cpu_affinity({attn_tp_rank * 38 + 16})  # 16
+                    p.cpu_affinity({tp_rank_in_node * 38 + 16})  # 16
 
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()
