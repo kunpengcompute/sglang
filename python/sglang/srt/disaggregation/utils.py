@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cpu_920f, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs
@@ -64,7 +64,16 @@ def poll_and_all_reduce(pollers, gloo_group: dist.ProcessGroup):
     else:
         polls = [int(poller.poll()) for poller in pollers]
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+    if is_cpu_920f():
+        group_ranks = torch.tensor(
+            dist.get_process_group_ranks(gloo_group),
+            dtype=torch.int32,
+        )
+        torch.ops.sgl_kernel.shm_allreduce_min_int8_kunpeng(
+            tensor_to_reduce, group_ranks
+        )
+    else:
+        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
     return tensor_to_reduce.tolist()
 
 
@@ -80,11 +89,19 @@ def poll_and_all_reduce_attn_cp_tp_group(
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(
-        tensor_to_reduce,
-        op=dist.ReduceOp.MIN,
-        group=attn_cp_cpu_group,
-    )
+    if is_cpu_920f():
+        cp_ranks = dist.get_process_group_ranks(attn_cp_cpu_group)
+        if len(cp_ranks) > 1:
+            group_ranks = torch.tensor(cp_ranks, dtype=torch.int32)
+            torch.ops.sgl_kernel.shm_allreduce_min_int8_kunpeng(
+                tensor_to_reduce, group_ranks
+            )
+    else:
+        dist.all_reduce(
+            tensor_to_reduce,
+            op=dist.ReduceOp.MIN,
+            group=attn_cp_cpu_group,
+        )
     return tensor_to_reduce.tolist()
 
 

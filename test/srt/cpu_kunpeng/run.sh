@@ -33,6 +33,7 @@
 #   dual_allgather   -- SHM dual_allgather benchmark vs torch.distributed
 #   batch_allgather  -- SHM batched_allgather benchmark vs torch.distributed
 #   allreduce        -- SHM allreduce benchmark vs torch.distributed
+#   all_reduce_min_int8 -- SHM all_reduce min_int8 correctness vs torch.distributed
 #   mla_alltoall     -- SHM MLA alltoall correctness + benchmark vs torch.distributed
 #   rdma_allgather   -- RDMA full-mesh allgather correctness + benchmark vs torch.distributed
 #
@@ -44,7 +45,7 @@
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: bash run.sh <test_name>" >&2
-    echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce" >&2
+    echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8" >&2
     exit 1
 fi
 
@@ -83,6 +84,12 @@ case "${TEST_NAME}" in
         MASTER_PORT=5004
         TEST_LABEL="SHM allreduce benchmark"
         ;;
+    all_reduce_min_int8)
+        TEST_FILE="${SCRIPT_DIR}/test_allreduce.py"
+        MASTER_PORT=5010
+        TEST_LABEL="SHM all_reduce min_int8 correctness"
+        export SGLANG_TEST_TYPE="all_reduce_min_int8"
+        ;;
     mla_alltoall)
         TEST_FILE="${SCRIPT_DIR}/test_mla_alltoall.py"
         MASTER_PORT=8006
@@ -95,7 +102,7 @@ case "${TEST_NAME}" in
         ;;
     *)
         echo "ERROR: unknown test '${TEST_NAME}'" >&2
-        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, mla_alltoall, rdma_allgather" >&2
+        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8, mla_alltoall, rdma_allgather" >&2
         exit 1
         ;;
 esac
