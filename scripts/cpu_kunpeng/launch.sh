@@ -65,6 +65,12 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Persist time-sensitive env vars so all nodes source the same values
+cat > "$SCRIPT_DIR/.time_env.sh" << EOF
+export LOG_DATE="$(date +%y%m%d)"
+export LOG_TIME="$(date +%H%M%S)"
+EOF
+
 # all mode: launch prefill, decode, and router via background launch.sh calls
 if [[ "$ROLE" == "all" ]]; then
     echo "[$(date +%T)] ===== Launching all roles (prefill + decode + router) in background ====="

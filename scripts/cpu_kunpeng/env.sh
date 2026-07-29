@@ -220,8 +220,6 @@ prefill_config() {
     export WORLD_SIZE=${#NODE_IPS[@]}
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="prefill"
-    export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="1"
     export SGLANG_SKIP_HTTP=1
 }
@@ -236,8 +234,6 @@ decode_config() {
     export MASTER_PORT="$DECODE_MASTER_PORT"
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="decode"
-    export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="0"
     export SGLANG_SKIP_HTTP=1
     export PP_SIZE=$DECODE_PP_SIZE
@@ -253,8 +249,6 @@ native_config() {
     export MASTER_PORT="$NATIVE_MASTER_PORT"
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="native"
-    export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 }
 
 # ------------------------------------------------------------
@@ -263,8 +257,6 @@ native_config() {
 router_config() {
     export ROLE="router"
     export NODE_IPS_LIST="$ROUTER_IP"
-    export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="0"
     export SGLANG_LAUNCH_HTTP_ONLY=1
 }
@@ -293,6 +285,10 @@ case "$ACTION" in
         return 1
         ;;
 esac
+
+source "${SCRIPT_DIR}/.time_env.sh"
+export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/$ROLE/${LOG_TIME}"
+export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 
 if [[ "$IS_PREFILL" == "1" ]]; then
     export SGLANG_KUNPENG_MAX_SEQ_NUM=4
