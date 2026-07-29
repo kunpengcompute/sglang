@@ -86,7 +86,7 @@ case "$ROLE" in
             --max-prefill-tokens 4096
             --max-total-tokens 18496
             --prefill-max-requests 4
-            --load-balance-method follow_bootstrap_room
+            --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
         )
         ;;
@@ -94,7 +94,7 @@ case "$ROLE" in
         SPECIFIC_ARGS=(
             --disaggregation-mode decode
             --max-total-tokens 139328
-            --load-balance-method follow_bootstrap_room
+            --load-balance-method round_robin
             --decode-log-interval 10
             --num-reserved-decode-tokens 256
         )
