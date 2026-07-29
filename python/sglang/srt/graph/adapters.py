@@ -657,17 +657,19 @@ def _setup_flash_mla_dense_decode_kunpeng():
                     softmax_scale, is_causal, extra_buffer, meta,
                     head_dim_v):
         bsz = q.shape[0]
+        seq_len = q.shape[1]
         n_heads = q.shape[2]
-        return [((bsz, 1, n_heads, head_dim_v), torch.bfloat16),
-                ((bsz, 1, n_heads), torch.float32)]
+        return [((bsz, seq_len, n_heads, head_dim_v), torch.bfloat16),
+                ((bsz, seq_len, n_heads), torch.float32)]
 
     def eager_fn(q, kcache, block_table, seqlens_kv,
                  softmax_scale, is_causal, extra_buffer, meta,
                  head_dim_v):
         bsz = q.shape[0]
+        seq_len = q.shape[1]
         n_heads = q.shape[2]
-        o = torch.empty((bsz, 1, n_heads, head_dim_v), dtype=torch.bfloat16)
-        softmax_lse = torch.empty((bsz, 1, n_heads), dtype=torch.float32)
+        o = torch.empty((bsz, seq_len, n_heads, head_dim_v), dtype=torch.bfloat16)
+        softmax_lse = torch.empty((bsz, seq_len, n_heads), dtype=torch.float32)
         torch.ops.sgl_kernel.flash_mla_dense_decode_kunpeng(
             q, kcache, None,
             block_table, seqlens_kv,

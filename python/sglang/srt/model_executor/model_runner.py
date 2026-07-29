@@ -3057,7 +3057,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         fixed = self.graph_fixed_weights[:]
         for kv in self.token_to_kv_pool.kv_buffer:
             fixed.append(kv)
-        layer0 = self.model.model.layers[0]
+        if self.is_draft_worker:
+            layer0 = self.model.model.decoder
+            fixed.append(
+                [self.model.model.embed_tokens.weight, self.model.lm_head.weight]
+            )
+        else:
+            layer0 = self.model.model.layers[0]
         if layer0.self_attn.rotary_emb is not None:
             fixed.append(layer0.self_attn.rotary_emb.cos_sin_cache)
         if forward_batch.next_token_logits_buffer is not None:
@@ -3129,7 +3135,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     forward_batch,
                     **kwargs,
                 )
-                logits = ret.next_token_logits
+                logits, hidden_states = ret.next_token_logits, ret.hidden_states
 
             if use_hbw and _is_kunpeng_hbw_pool:
                 if self._graph_hbw_tensor is None:
@@ -3137,9 +3143,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
                         (remaining,), torch.uint8
                     )
-                graph = finalize([logits], external_pool=self._graph_hbw_tensor)
+                graph = finalize(
+                    [logits, hidden_states], external_pool=self._graph_hbw_tensor
+                )
             else:
-                graph = finalize([logits])
+                graph = finalize([logits, hidden_states])
 
             if _is_kunpeng_graph_profile:
                 graph.enable_profile(True)
@@ -3153,7 +3161,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             graph = self._sglang_graph_cache[graph_cache_key]
 
         t0 = time.time()
-        (logits,) = graph.run(inputs)
+        logits, hidden_states = graph.run(inputs)
         t1 = time.time()
         logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
 
@@ -3175,7 +3183,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 },
             )
 
-        return logits
+        return logits, hidden_states
 
     def forward_decode(
         self,
@@ -3212,10 +3220,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.out_cache_loc,
                 self.attn_backend._decode_meta,
             ]
-            logits = self._kunpeng_graph_forward(
+            logits, hidden_states = self._kunpeng_graph_forward(
                 forward_batch, inputs, "decode", use_hbw=True, **kwargs
             )
-            return LogitsProcessorOutput(next_token_logits=logits)
+            return LogitsProcessorOutput(
+                next_token_logits=logits, hidden_states=hidden_states
+            )
 
         # Launch forward
         ctx = (
@@ -3287,16 +3297,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # ── sglang graph capture/replay for Kunpeng extend ──
         if _is_cpu_920f and _is_kunpeng_graph_capture:
+            meta = self.attn_backend.forward_metadata
             inputs = [
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch.extend_seq_lens,
                 forward_batch.out_cache_loc,
+                self.attn_backend._decode_meta,
             ]
-            logits = self._kunpeng_graph_forward(
-                forward_batch, inputs, "extend", use_hbw=False, **kwargs
+            if meta:
+                inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
+            if self.is_draft_worker:
+                inputs.append(forward_batch.spec_info.hidden_states)
+            inputs = [item for item in inputs if item is not None]
+            logits, hidden_states = self._kunpeng_graph_forward(
+                forward_batch,
+                inputs,
+                forward_batch.forward_mode.name,
+                use_hbw=False,
+                **kwargs,
             )
-            return (LogitsProcessorOutput(next_token_logits=logits), True)
+            return (
+                LogitsProcessorOutput(
+                    next_token_logits=logits, hidden_states=hidden_states
+                ),
+                can_run_graph,
+            )
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
@@ -3328,10 +3354,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # ── sglang graph capture/replay for Kunpeng idle ──
         if _is_cpu_920f and _is_kunpeng_graph_capture:
             inputs = [forward_batch.input_ids, forward_batch.positions]
-            logits = self._kunpeng_graph_forward(
+            if self.is_draft_worker:
+                inputs.append(forward_batch.spec_info.hidden_states)
+            logits, hidden_states = self._kunpeng_graph_forward(
                 forward_batch, inputs, "idle", use_hbw=True, **kwargs
             )
-            return LogitsProcessorOutput(next_token_logits=logits)
+            return LogitsProcessorOutput(
+                next_token_logits=logits, hidden_states=hidden_states
+            )
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "idle"})

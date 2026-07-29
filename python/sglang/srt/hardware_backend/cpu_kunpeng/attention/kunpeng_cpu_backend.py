@@ -188,8 +188,15 @@ def kutacc_mha(
     workspace = kunpeng.alloc_buffer(ws_bytes)
 
     attn_out = kunpeng.flash_attention_with_workspace_kunpeng(
-        padded_q, para_k, para_v, workspace, extend_seq_lens,
-        is_causal, softmax_scale, max_seq_len)
+        padded_q,
+        para_k,
+        para_v,
+        workspace,
+        extend_seq_lens,
+        is_causal,
+        softmax_scale,
+        max_seq_len,
+    )
 
     return attn_out[:n_token]
 
@@ -333,11 +340,14 @@ class KunpengCpuBackend(AttentionBackend):
 
         # --- reshape to 3D ---
         q_3d = kunpeng.contiguous_kunpeng(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim))
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        )
         k_3d = kunpeng.contiguous_kunpeng(
-            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim))
+            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        )
         v_3d = kunpeng.contiguous_kunpeng(
-            v.view(-1, layer.tp_v_head_num, layer.v_head_dim))
+            v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        )
 
         softmax_scale = (
             layer.scaling
@@ -415,8 +425,6 @@ class KunpengCpuBackend(AttentionBackend):
             )
         else:
             o_flat = o_padded
-
-        self._try_hbw_swap_pipeline(layer, forward_batch, save_kv_cache)
 
         return o_flat.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

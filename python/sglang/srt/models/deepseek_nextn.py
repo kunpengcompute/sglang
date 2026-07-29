@@ -55,6 +55,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
@@ -213,25 +214,30 @@ class DeepseekModelNextN(nn.Module):
             hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
-            eh_input = torch.cat(
-                (
-                    self.enorm(hidden_states),
-                    self.hnorm(
-                        forward_batch.spec_info.hidden_states
-                        if self.rot_weight is None
-                        else torch.matmul(
-                            forward_batch.spec_info.hidden_states, self.rot_weight
-                        )
-                    ),
-                ),
-                dim=-1,
+            e_input = self.enorm(hidden_states)
+            h_input = self.hnorm(
+                forward_batch.spec_info.hidden_states
+                if self.rot_weight is None
+                else torch.matmul(
+                    forward_batch.spec_info.hidden_states, self.rot_weight
+                )
             )
+            eh_input = kunpeng.cat(e_input, h_input, -1)
 
             if _is_cpu_920f:
-                hidden_states = torch.ops.sgl_kernel.bf16_linear_kunpeng(
-                    eh_input.to(self.eh_proj.weight.dtype),
+                M, K = eh_input.shape
+                N = self.eh_proj.weight.shape[0]
+                tile_m, tile_n, tile_k = (
+                    torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+                )
+                blocks_in_k = K // tile_k
+                ws_numel = blocks_in_k * M * N * 2 if blocks_in_k > 1 else 0
+                packed_eh = kunpeng.bf16_pack_kunpeng(eh_input, tile_m, tile_k)
+                hidden_states = kunpeng.bf16_packed_gemm_kunpeng(
+                    packed_eh,
                     self.eh_proj.weight,
-                    None,
+                    kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16),
+                    32,
                 )
                 hidden_states = get_attention_tp_group().batch_all_gather(
                     hidden_states, dim=-1
