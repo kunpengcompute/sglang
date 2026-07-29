@@ -150,6 +150,8 @@ void init_graph_cpp(py::module& m)
                 buf.id = sid;
                 view.storage_id = sid;
                 if (is_fixed) {
+                    TORCH_CHECK(buf.storage_base != nullptr,
+                                "begin_capture: fixed tensor has nullptr storage");
                     buf.data_ptr = buf.storage_base;
                     all_bufs.push_back(buf);
                 } else {
