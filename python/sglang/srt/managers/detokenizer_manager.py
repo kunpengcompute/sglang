@@ -104,6 +104,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.send_to_tokenizer = get_zmq_socket(
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
+        from sglang.srt.utils.numa_utils import zmq_debug_util
+        zmq_debug_util()
 
     def init_tokenizer(self, server_args: ServerArgs):
         if server_args.skip_tokenizer_init:

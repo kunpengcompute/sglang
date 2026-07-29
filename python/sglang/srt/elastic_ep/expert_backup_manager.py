@@ -58,6 +58,8 @@ class ExpertBackupManager:
         self.backup_weights_from_disk()
         self.start_transfer_server()
 
+        from sglang.srt.utils.numa_utils import zmq_debug_util
+        zmq_debug_util()
         # Block until all expert backup clients have reported readiness, to avoid
         # losing the initial PUB message due to slow joiners.
         num_ready_clients = 0

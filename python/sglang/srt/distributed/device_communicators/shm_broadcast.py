@@ -252,6 +252,9 @@ class MessageQueue:
 
         logger.debug("Message queue communication handle: %s", self.handle)
 
+        from sglang.srt.utils.numa_utils import zmq_debug_util
+        zmq_debug_util()
+
     def export_handle(self) -> Handle:
         return self.handle
 
@@ -295,6 +298,9 @@ class MessageQueue:
             socket_addr = na.to_tcp()
             logger.debug("Connecting to %s", socket_addr)
             self.remote_socket.connect(socket_addr)
+
+        from sglang.srt.utils.numa_utils import zmq_debug_util
+        zmq_debug_util()
 
         return self
 

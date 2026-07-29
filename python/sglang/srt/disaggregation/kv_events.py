@@ -275,6 +275,8 @@ class ZmqEventPublisher(EventPublisher):
                 self._pub.bind(self._endpoint)
             else:
                 self._pub.connect(self._endpoint)
+            from sglang.srt.utils.numa_utils import zmq_debug_util
+            zmq_debug_util()
 
         # Set up replay socket: use ROUTER
         # 1) handles multiple REQ clients (identities)
@@ -286,6 +288,8 @@ class ZmqEventPublisher(EventPublisher):
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
             self._replay.bind(self._replay_endpoint)
+            from sglang.srt.utils.numa_utils import zmq_debug_util
+            zmq_debug_util()
 
     def _publisher_thread(self) -> None:
         """Background thread that processes the event queue."""

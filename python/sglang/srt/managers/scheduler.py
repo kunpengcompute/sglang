@@ -557,6 +557,9 @@ class Scheduler(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
 
+        from sglang.srt.utils.numa_utils import zmq_debug_util
+        zmq_debug_util()
+
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation

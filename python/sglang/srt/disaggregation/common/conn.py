@@ -130,6 +130,8 @@ class CommonKVManager(BaseKVManager):
             context, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
+        from sglang.srt.utils.numa_utils import zmq_debug_util
+        zmq_debug_util()
 
         self.request_status: Dict[int, KVPoll] = {}
         self.failure_records: Dict[int, str] = {}
@@ -419,6 +421,8 @@ class CommonKVManager(BaseKVManager):
         if is_ipv6:
             socket.setsockopt(zmq.IPV6, 1)
         socket.connect(endpoint)
+        from sglang.srt.utils.numa_utils import zmq_debug_util
+        zmq_debug_util()
         return socket
 
     def get_mha_kv_ptrs_with_pp(
@@ -762,6 +766,8 @@ class CommonKVReceiver(BaseKVReceiver):
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.connect(endpoint)
+                from sglang.srt.utils.numa_utils import zmq_debug_util
+                zmq_debug_util()
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]

@@ -367,6 +367,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
+        from sglang.srt.utils.numa_utils import zmq_debug_util
+        zmq_debug_util()
+
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}

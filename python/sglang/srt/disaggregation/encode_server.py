@@ -260,6 +260,8 @@ class MMEncoder:
             self.schedule_socket = get_zmq_socket(
                 self.context, zmq.PULL, schedule_path, True
             )
+            from sglang.srt.utils.numa_utils import zmq_debug_util
+            zmq_debug_util()
         self.background_tasks: Set[asyncio.Task] = set()
 
         if self.server_args.enable_mm_global_cache:
@@ -1152,6 +1154,9 @@ class MMEncoder:
                 sock.close()
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
+
+        from sglang.srt.utils.numa_utils import zmq_debug_util
+        zmq_debug_util()
 
     async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
         try:

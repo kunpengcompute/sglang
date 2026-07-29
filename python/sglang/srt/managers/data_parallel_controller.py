@@ -155,10 +155,14 @@ class DataParallelController:
                 self.recv_from_tokenizer = get_zmq_socket(
                     self.context, zmq.PULL, port_args.scheduler_input_ipc_name, True
                 )
+                from sglang.srt.utils.numa_utils import zmq_debug_util
+                zmq_debug_util()
             else:
                 self.recv_from_tokenizer = get_zmq_socket(
                     self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
                 )
+                from sglang.srt.utils.numa_utils import zmq_debug_util
+                zmq_debug_util()
 
         # Dispatch method
         self.round_robin_counter = 0

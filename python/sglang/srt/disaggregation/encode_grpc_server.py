@@ -232,6 +232,9 @@ async def serve_grpc_encoder(server_args: ServerArgs):
             daemon=True,
         ).start()
 
+    from sglang.srt.utils.numa_utils import zmq_debug_util
+    zmq_debug_util()
+
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
 
     server = grpc.aio.server(

@@ -721,6 +721,8 @@ def prefetch_staging_reqs(
                         sock.setsockopt(zmq.IPV6, 1)
                     sock.connect(ep)
                     prefetch_sockets[ep] = sock
+                    from sglang.srt.utils.numa_utils import zmq_debug_util
+                    zmq_debug_util()
                 prefetch_sockets[ep].send_multipart(
                     [
                         b"STAGING_REQ",
