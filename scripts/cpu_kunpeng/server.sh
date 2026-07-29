@@ -31,6 +31,9 @@ IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 # Source environment config (exports CONDA_ACTIVATE_CMD, PYTHON_SCRIPT, etc.)
 source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET"
 
+rmmod sdma_dae 2>/dev/null || true
+insmod "$SDMA_KO_PATH" safe_mode=0 share_chns=160
+
 # Base arguments common to both roles
 BASE_ARGS=(
     --model "$MODEL_PATH"

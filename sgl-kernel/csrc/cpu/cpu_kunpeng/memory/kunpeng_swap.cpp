@@ -21,20 +21,24 @@
 
 #include "cpu_kunpeng/adapters/register_graph_kernels.h"
 #include "cpu_kunpeng/utils/sdma_util.h"
+#include "cpu_kunpeng/utils/sdma_thres_util.h"
 
 int64_t get_sdma_event_num()
 {
     return static_cast<int64_t>(utils::EVENT_NUM);
 }
 
-void kupl_sdma_init_torch()
+void kupl_sdma_init_torch(int64_t sdmathreshold)
 {
+    SdmaCtlThredInit();
+    SetSdmaThreshold(sdmathreshold);
     utils::kupl_sdma_init();
 }
 
 void kupl_sdma_clear_torch()
 {
     utils::kupl_sdma_clear();
+    DevmemFdDestroy();
 }
 
 int64_t kupl_get_free_event_id_torch()
@@ -160,7 +164,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("get_sdma_event_num() -> int");
     m.impl("get_sdma_event_num", get_sdma_event_num);
 
-    m.def("kupl_sdma_init() -> ()");
+    m.def("kupl_sdma_init(int sdmathreshold) -> ()");
     m.impl("kupl_sdma_init", kupl_sdma_init_torch);
 
     m.def("kupl_sdma_clear() -> ()");
