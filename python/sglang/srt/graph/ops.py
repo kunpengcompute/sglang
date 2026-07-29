@@ -45,7 +45,10 @@ class GraphOp:
                 shape, dtype = info
             else:
                 shape, dtype = info, tensor_args[0].dtype
-            out = torch.empty(shape, dtype=dtype)
+            if any(s == 0 for s in shape):
+                out = torch.empty(1, dtype=dtype)[:0].view(shape)
+            else:
+                out = torch.empty(shape, dtype=dtype)
             vid, so = register_output(out)
             outputs.append((vid, so))
             output_tensors.append(out)

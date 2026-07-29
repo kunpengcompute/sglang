@@ -8,6 +8,7 @@ _captured_ops = None
 _captured_num_inputs = None
 _captured_fixed = None
 _none_storage_id = None
+_captured_input_map = None
 
 
 class _CaptureContext:
@@ -17,25 +18,32 @@ class _CaptureContext:
 
     def __enter__(self):
         global _captured_storages, _captured_views, _captured_ops, \
-               _captured_num_inputs, _captured_fixed, _none_storage_id
+               _captured_num_inputs, _captured_fixed, _none_storage_id, \
+               _captured_input_map
         _captured_storages = None
         _captured_views = None
         _captured_ops = None
         _captured_num_inputs = None
         _captured_fixed = None
         _none_storage_id = None
-        _C.CaptureManager.instance().begin_capture(self.inputs, self.fixed)
+        _captured_input_map = None
+        mgr = _C.CaptureManager.instance()
+        mgr.begin_capture(self.inputs, self.fixed)
+        _captured_input_map = {}
+        for i, t in enumerate(self.inputs):
+            _captured_input_map[id(t)] = (i, _C.storage_offset(t), i)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         global _captured_storages, _captured_views, _captured_ops, \
-               _captured_num_inputs, _captured_fixed
+               _captured_num_inputs, _captured_fixed, _captured_input_map
         mgr = _C.CaptureManager.instance()
         if mgr.is_capturing():
             _captured_storages, _captured_views, _captured_ops, \
                 _captured_num_inputs = mgr.end_capture()
             n = len(self.inputs)
             _captured_fixed = {n + i: t for i, t in enumerate(self.fixed)}
+        _captured_input_map = None
         return False
 
 
@@ -45,7 +53,7 @@ def capture(inputs, fixed=None):
 
 def finalize(outputs, external_pool=None):
     global _captured_storages, _captured_views, _captured_ops, \
-           _captured_num_inputs, _captured_fixed
+           _captured_num_inputs, _captured_fixed, _captured_input_map
     if _captured_storages is None:
         raise RuntimeError("No captured graph to finalize")
     storages = _captured_storages
@@ -58,6 +66,7 @@ def finalize(outputs, external_pool=None):
     _captured_ops = None
     _captured_num_inputs = None
     _captured_fixed = None
+    _captured_input_map = None
 
     output_view_ids = []
     mgr = _C.CaptureManager.instance()
@@ -105,7 +114,7 @@ def is_capturing():
 
 
 def lookup_or_register(tensor, idx=0):
-    global _none_storage_id
+    global _none_storage_id, _captured_input_map
     mgr = _C.CaptureManager.instance()
     if tensor is None:
         if _none_storage_id is None:
@@ -116,7 +125,15 @@ def lookup_or_register(tensor, idx=0):
             _none_storage_id = mgr.register_storage(buf)
         vid = mgr.find_or_register_view(_none_storage_id, 0, tensor)
         return vid, 0, _none_storage_id
+    if _captured_input_map is not None:
+        cached = _captured_input_map.get(id(tensor))
+        if cached is not None:
+            return cached
     base = _C.storage_base(tensor)
+    assert base != 0, (
+        f"non-input tensor has nullptr storage at {idx}-th parameter: "
+        f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
+    )
     so = _C.storage_offset(tensor)
     sid = mgr.lookup_storage(base)
     if sid < 0:
