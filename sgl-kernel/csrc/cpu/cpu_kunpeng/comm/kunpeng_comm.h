@@ -102,6 +102,20 @@ void shm_allreduce_init_kunpeng(int64_t max_num_elements);
 void shm_allreduce_finalize_kunpeng();
 
 /**
+ * Perform element-wise min-allreduce on a uint8 tensor in-place,
+ * restricted to the given subgroup.
+ *
+ * Lazy-allocates an SHM buffer on the first call; cleanup is handled
+ * automatically by shm_allreduce_finalize_kunpeng().
+ *
+ * @param input       1D uint8 tensor to reduce in-place.
+ * @param group_ranks 1D int32 tensor listing the intra-node ranks that
+ *                    participate in this allreduce.  Only these ranks'
+ *                    data is included in the element-wise minimum.
+ */
+void shm_allreduce_min_int8_kunpeng(at::Tensor input, at::Tensor group_ranks);
+
+/**
  * Initialize the SHM MLA alltoall request.
  * Must be called after shm_pool_create_kunpeng().
  *

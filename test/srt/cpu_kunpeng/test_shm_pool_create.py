@@ -88,7 +88,7 @@ def worker_main() -> None:
         len(bound_cpus),
     )
 
-    init_oob_comms()
+    init_oob_comms(world_size)
     intra_socket_group = get_intra_socket_group()
     intra_die_group = get_intra_die_group()
 

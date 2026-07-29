@@ -7311,6 +7311,11 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser(prog="sglang serve")
     ServerArgs.add_cli_args(parser)
 
+    # Suppress argparse error usage in NUMA multi-replica mode (child processes leak Python flags to argv).
+    if os.getenv("SGLANG_ENABLE_NUMA_DUPLICATION", "0") == "1":
+        import sys
+        parser.error = lambda msg: sys.exit(2)
+
     # Check for config file and merge arguments if present
     if "--config" in argv:
         # Import here to avoid circular imports
@@ -7390,6 +7395,11 @@ class PortArgs:
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
+            # With binary launch, only the first TP rank of each DP group runs HTTP.
+            # E.g. TP=256 DP=32 WORLD=16 → 2 DP groups/node, 8 TP ranks/DP group.
+            # tp_rank_in_node 0..7 → DP0, 8..15 → DP1. Only 0 and 8 run HTTP.
+            _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+            _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
                 na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
             else:
@@ -7405,7 +7415,7 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                if _is_kunpeng_binary_launch and server_args.tp_rank_in_node>=1:
+                if _is_kunpeng_binary_launch and server_args.tp_rank_in_node % _kunpeng_ranks_per_dp >= 1:
                     scheduler_input_port = port_base + 4 + 1 + dp_rank
                 else:
                     assert worker_ports is not None
@@ -7413,7 +7423,7 @@ class PortArgs:
 
             try:
                 if dp_rank is None:
-                    if _is_kunpeng_binary_launch and server_args.tp_rank_in_node>=1:
+                    if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
                         pass
                     else:
                         wait_port_available(dist_init_port, "dist_init_port")
@@ -7425,7 +7435,7 @@ class PortArgs:
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
-                    if _is_kunpeng_binary_launch and server_args.tp_rank_in_node>=1:
+                    if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
                         pass
                     else:
                         wait_port_available(scheduler_input_port, "scheduler_input_port")

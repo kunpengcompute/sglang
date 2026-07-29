@@ -228,8 +228,10 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
-        if self.server_args.node_rank == 0:
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+        _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+        _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
+        if self.server_args.node_rank == 0 and _node_rank_in_node == 0:
+            if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
                 pass
             else:
                 self.send_to_rpc = get_zmq_socket(
@@ -610,7 +612,8 @@ class Engine(EngineScoreMixin, EngineBase):
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+            _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+            if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
                 DataParallelController(server_args, port_args, run_scheduler_process_func)
             else:
                 proc = mp.Process(
@@ -693,9 +696,12 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Start the engine info bootstrap server if per-rank info is needed.
         engine_info_bootstrap_server = None
+        _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+        _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
         if (
             server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
             and server_args.node_rank == 0
+            and _node_rank_in_node == 0
         ):
             bootstrap_port = server_args.engine_info_bootstrap_port
             if not is_port_available(bootstrap_port):
@@ -735,10 +741,10 @@ class Engine(EngineScoreMixin, EngineBase):
         if _is_skip_http:
             start_node = 0
 
-        if server_args.node_rank >= start_node:
+        if server_args.node_rank >= start_node or _node_rank_in_node >= 1:
             # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
             # so they can just wait here.
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+            if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
                 pass
             else:
                 scheduler_init_result.wait_for_ready()
@@ -766,7 +772,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     None,
                 )
 
-        if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+        if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
             return None, None, port_args, scheduler_init_result, None
 
         # Launch detokenizer process

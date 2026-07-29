@@ -97,7 +97,7 @@ def worker_main() -> None:
         len(bound_cpus),
     )
 
-    init_oob_comms()
+    init_oob_comms(world_size)
     init_shm_pool(dist.group.WORLD)
 
     kernel.shm_allreduce_init_kunpeng(HEIGHT * WIDTH)
@@ -196,5 +196,87 @@ def worker_main() -> None:
     _rank_log(rank, "worker done")
 
 
+def worker_all_reduce_min_int8_main() -> None:
+    """Test shm_allreduce_min_int8_kunpeng correctness vs dist.all_reduce(op=MIN)."""
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method="env://",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    _rank_log(rank, "all_reduce_min_int8: world_size=%d", world_size)
+
+    init_oob_comms(world_size)
+    init_shm_pool(dist.group.WORLD)
+
+    dist.barrier()
+
+    # ---- Test 1: full-group allreduce (all ranks) ---------------------------
+    torch.manual_seed(42 + rank)
+    data = torch.randint(0, 256, (16,), dtype=torch.uint8)
+    ref = data.clone()
+
+    dist.all_reduce(ref, op=dist.ReduceOp.MIN)
+    group_ranks = torch.tensor(list(range(world_size)), dtype=torch.int32)
+    kernel.shm_allreduce_min_int8_kunpeng(data, group_ranks)
+
+    if not torch.allclose(data, ref):
+        logger.error("[rank %d] Test 1 FAILED: data=%s ref=%s", rank, data, ref)
+
+    dist.barrier()
+
+    # ---- Test 2: partial sub-group (even ranks only) ------------------------
+    torch.manual_seed(99 + rank)
+    data = torch.randint(0, 256, (10,), dtype=torch.uint8)
+    ref = data.clone()
+
+    sub_ranks = [r for r in range(world_size) if r % 2 == 0]
+    sub_group = dist.new_group(ranks=sub_ranks, backend="gloo")
+    group_ranks = torch.tensor(sub_ranks, dtype=torch.int32)
+    kernel.shm_allreduce_min_int8_kunpeng(data, group_ranks)
+
+    # Only ranks in the sub_group can verify: Gloo allreduce on non-member is a no-op,
+    # but SHM allreduce requires all intra-node ranks to participate (due to fence).
+    if rank in sub_ranks:
+        dist.all_reduce(ref, op=dist.ReduceOp.MIN, group=sub_group)
+        if not torch.allclose(data, ref):
+            logger.error("[rank %d] Test 2 FAILED: data=%s ref=%s", rank, data, ref)
+    else:
+        rank0_rank = sub_ranks[0]
+        logger.info(
+            "[rank %d] Test 2 non-member, SHM data=%s (expect member=%s MIN), skipping gloo cmp",
+            rank, data, rank0_rank,
+        )
+
+    dist.barrier()
+
+    # ---- Test 3: single-element tensor --------------------------------------
+    data = torch.tensor([rank], dtype=torch.uint8)
+    ref = data.clone()
+
+    dist.all_reduce(ref, op=dist.ReduceOp.MIN)
+    group_ranks = torch.tensor(list(range(world_size)), dtype=torch.int32)
+    kernel.shm_allreduce_min_int8_kunpeng(data, group_ranks)
+
+    if not torch.allclose(data, ref):
+        logger.error("[rank %d] Test 3 FAILED: data=%s ref=%s", rank, data, ref)
+
+    dist.barrier()
+
+    _rank_log(rank, "all_reduce_min_int8: all tests passed")
+
+    kernel.shm_pool_destroy_kunpeng()
+    dist.destroy_process_group()
+    _rank_log(rank, "worker_all_reduce_min_int8 done")
+
+
 if __name__ == "__main__":
-    worker_main()
+    test_type = os.environ.get("SGLANG_TEST_TYPE", "allreduce")
+    if test_type == "all_reduce_min_int8":
+        worker_all_reduce_min_int8_main()
+    else:
+        worker_main()

@@ -155,7 +155,7 @@ def worker_main() -> None:
         len(bound_cpus),
     )
 
-    init_oob_comms()
+    init_oob_comms(world_size)
 
     # For intra-socket tests, create an attn_tp group of 8 ranks in the same socket.
     group_size = DEFAULT_GROUP_SIZE
