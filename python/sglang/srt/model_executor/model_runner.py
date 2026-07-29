@@ -3071,6 +3071,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             fixed.append(self.swap_mgr._cur_kv_hbm)
             fixed.append(self.swap_mgr._kv_swap_in_event_tensor)
             fixed.append(self.swap_mgr._kv_swap_in_event_num_tensor)
+            fixed.append(self.swap_mgr._kv_ddr_event_tensor)
+            fixed.append(self.swap_mgr._kv_ddr_event_num_tensor)
         try:
             from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
                 _KunpengDispatcherState,

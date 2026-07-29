@@ -1968,8 +1968,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator,
         )
 
-        if _is_cpu_920f and hasattr(self, "_swap_mgr"):
+        if _is_cpu_920f:
             self._swap_mgr.swap_next_expert_layer(self.layer_id)
+        if _is_cpu_920f and self._swap_mgr.enable_swap_kv:
+            self._swap_mgr.wait_kv_ddr()
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True

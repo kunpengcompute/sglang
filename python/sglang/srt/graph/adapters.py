@@ -525,6 +525,41 @@ def _setup_kupl_sdma_wait_all():
     register_op("kupl_sdma_wait_all", shape_infer, eager_fn)
 
 
+def _setup_kupl_sdma_set_kv_buffer():
+    def shape_infer(
+        kv_buffer,
+        loc,
+        cache_k,
+        event_tensor,
+        event_num_tensor,
+        max_pending_events,
+        chunk_bytes,
+    ):
+        return []
+
+    def eager_fn(
+        kv_buffer,
+        loc,
+        cache_k,
+        event_tensor,
+        event_num_tensor,
+        max_pending_events,
+        chunk_bytes,
+    ):
+        torch.ops.sgl_kernel.kupl_sdma_set_kv_buffer(
+            kv_buffer,
+            loc,
+            cache_k,
+            event_tensor,
+            event_num_tensor,
+            max_pending_events,
+            chunk_bytes,
+        )
+        return None
+
+    register_op("kupl_sdma_set_kv_buffer", shape_infer, eager_fn)
+
+
 def _setup_cat_kunpeng():
     def shape_infer(a, b, dim):
         shape = list(a.shape)
@@ -735,6 +770,7 @@ def setup():
     _setup_moe_combine_recv_kunpeng()
     _setup_kupl_sdma_memcpy_chunked()
     _setup_kupl_sdma_wait_all()
+    _setup_kupl_sdma_set_kv_buffer()
     _setup_cat_kunpeng()
     _setup_contiguous_kunpeng()
     _setup_set_kv_buffer_kunpeng()

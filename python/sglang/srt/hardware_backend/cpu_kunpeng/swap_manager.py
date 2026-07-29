@@ -127,8 +127,6 @@ class KunpengSwapManager:
         self._kv_swap_in_event_num_tensor = torch.tensor([0], dtype=torch.int32)
         self._kv_ddr_event_tensor = torch.zeros(sdma_event_num, dtype=torch.int32)
         self._kv_ddr_event_num_tensor = torch.tensor([0], dtype=torch.int32)
-        self._kv_hbm_event_tensor = torch.zeros(sdma_event_num, dtype=torch.int32)
-        self._kv_hbm_event_num_tensor = torch.tensor([0], dtype=torch.int32)
 
         logger.info(
             "KunpengSwapManager initialized: swap_expert=%s swap_kv=%s kv_blockwise=%s",
@@ -405,7 +403,6 @@ class KunpengSwapManager:
             512,  # max_pending_events
         )
 
-
     def set_kv_buffer(
         self, target_kv_buffer: torch.Tensor, loc: torch.Tensor, cache_k: torch.Tensor
     ) -> None:
@@ -419,6 +416,44 @@ class KunpengSwapManager:
             target_kv_buffer.squeeze(1),
             loc,
             cache_k.reshape(-1, kdim),
+        )
+
+    def set_kv_buffer_sdma(self, loc: torch.Tensor, cache_k: torch.Tensor) -> None:
+        """Scatter-write computed K into DDR KV cache via SDMA async copy.
+
+        Uses the internal ``_cur_kv_ddr`` buffer set by the preceding
+        :meth:`swap_kv_layer` call.
+
+        Routes through the graph-compatible ``kupl_sdma_set_kv_buffer`` op.
+        Pending DDR write events are drained via :meth:`wait_kv_ddr`.
+
+        Args:
+            loc: token indices (1D, int32 or int64).
+            cache_k: computed K tensor (will be reshaped to 2D and made contiguous).
+        """
+        kdim = self._cur_kv_ddr.shape[-1]
+        kv_ddr_2d = self._cur_kv_ddr.squeeze(1)
+        cache_k_2d = kunpeng.contiguous_kunpeng(cache_k.reshape(-1, kdim))
+
+        self._kv_ddr_event_num_tensor.zero_()
+        kunpeng.kupl_sdma_set_kv_buffer(
+            kv_ddr_2d,
+            loc,
+            cache_k_2d,
+            self._kv_ddr_event_tensor,
+            self._kv_ddr_event_num_tensor,
+            512,
+            14 * 1024 * 1024,
+        )
+
+    def wait_kv_ddr(self) -> None:
+        """Drain all pending DDR SDMA write events.
+
+        Call this at the end of an inference round to ensure DDR KV
+        cache writes are complete.
+        """
+        kunpeng.kupl_sdma_wait_all(
+            self._kv_ddr_event_tensor, self._kv_ddr_event_num_tensor
         )
 
     def get_kv_cache(self) -> torch.Tensor:
