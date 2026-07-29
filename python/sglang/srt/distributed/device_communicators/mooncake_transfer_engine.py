@@ -178,7 +178,7 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
-        from sglang.srt.utils.numa_utils import mooncake_binding_ctx
+        from sglang.srt.utils.numa_utils import mooncake_transfer_engine_init_proxy
 
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
@@ -186,21 +186,22 @@ class MooncakeTransferEngine:
                 hostname += f":{get_free_port()}:npu_{self.gpu_id}"
             else:
                 hostname += f":{get_free_port()}:npu_{npu_phy_id}"
-            with mooncake_binding_ctx():
-                ret_value = self.engine.initialize(
-                    hostname,
-                    "P2PHANDSHAKE",
-                    "ascend",
-                    device_name if device_name is not None else "",
-                )
+
+            ret_value = mooncake_transfer_engine_init_proxy(
+                self.engine,
+                hostname,
+                "P2PHANDSHAKE",
+                "ascend",
+                device_name if device_name is not None else "",
+            )
         else:
-            with mooncake_binding_ctx():
-                ret_value = self.engine.initialize(
-                    hostname,
-                    "P2PHANDSHAKE",
-                    "rdma",
-                    device_name if device_name is not None else "",
-                )
+            ret_value = mooncake_transfer_engine_init_proxy(
+                self.engine,
+                hostname,
+                "P2PHANDSHAKE",
+                "rdma",
+                device_name if device_name is not None else "",
+            )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")

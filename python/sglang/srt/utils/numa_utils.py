@@ -469,26 +469,18 @@ def zmq_context_core_binding(ctx):
     return ctx
 
 
-@contextmanager
-def mooncake_binding_ctx(offset: Optional[int] = None):
-    if offset is None:
-        offset = envs.SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET.get()
-
-    saved_cpu = os.sched_getaffinity(0)
-    saved_membind = _get_membind()
-    _process_core_binding(offset=offset)
-
-    try:
-        yield
-    finally:
-        os.sched_setaffinity(0, saved_cpu)
-        _set_membind(saved_membind)
-
-
 def mooncake_binding_wrapper(func):
     def wrapper(*args, **kwargs):
-        with mooncake_binding_ctx():
-            return func(*args, **kwargs)
+        offset = envs.SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET.get()
+        saved_cpu = os.sched_getaffinity(0)
+        saved_membind = _get_membind()
+        _process_core_binding(offset=offset)
+
+        ret = func(*args, **kwargs)
+
+        os.sched_setaffinity(0, saved_cpu)
+        _set_membind(saved_membind)
+        return ret
     return wrapper
 
 
@@ -573,3 +565,20 @@ def get_mooncake__store__mooncake_distributed_store():
         from mooncake.store import MooncakeDistributedStore
         _MOONCAKE_IMPORT_HELPER[name] = MooncakeDistributedStore
     return _MOONCAKE_IMPORT_HELPER[name]
+
+
+@mooncake_binding_wrapper
+def mooncake_transfer_engine_init_proxy(
+    engine,
+    server_name,
+    metadata_server,
+    protocol,
+    device_name,
+):
+    ret_value = engine.initialize(
+        server_name,
+        metadata_server,
+        protocol,
+        device_name,
+    )
+    return ret_value
