@@ -116,11 +116,8 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
     intra_socket_rank = g_intra_socket_group->getRank();
 
     TORCH_CHECK(intra_node_size % 8 == 0, "intra_node_size must be divisible by 8, got ", intra_node_size);
-    TORCH_CHECK(intra_node_size == intra_socket_size * 2,
-                "expect 2 sockets per node, got node_size=", intra_node_size, " socket_size=", intra_socket_size);
-    TORCH_CHECK(intra_socket_size == intra_die_size * 2,
-                "expect 2 dies per socket, got socket_size=", intra_socket_size, " die_size=", intra_die_size);
-
+    TORCH_CHECK(intra_socket_size == 8, "intra_socket_size != 8");	 
+    TORCH_CHECK(intra_die_size == 4, "intra_die_size != 4");
     int pid = getpid();
 
     kupl_shm_oob_cb_t oob_cbs;

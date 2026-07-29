@@ -56,9 +56,8 @@ def init_oob_comms(intra_node_size: int = 16):
         return
 
     # Kunpeng CPU: each node has 2 sockets, each socket has 2 dies
-    # intra_node_size = attn_tp_size (e.g. 16 → socket=8, die=4; 8 → socket=4, die=2)
-    intra_socket_size = intra_node_size // 2
-    intra_die_size = intra_node_size // 4
+    intra_socket_size = 8
+    intra_die_size = 4
 
     if not dist.is_initialized():
         raise ValueError("Distributed environment not initialized")
