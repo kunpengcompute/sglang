@@ -101,9 +101,7 @@ class DeepseekMLAKunpengForwardMixin:
             self.swap_mgr.set_kv_buffer(
                 self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, k_combined
             )
-            self.swap_mgr.set_kv_buffer(
-                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, k_combined
-            )
+            self.swap_mgr.set_kv_buffer_sdma(forward_batch.out_cache_loc, k_combined)
         else:
             self.swap_mgr.set_kv_buffer(
                 self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, k_combined
