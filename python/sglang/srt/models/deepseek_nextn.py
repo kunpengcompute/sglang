@@ -222,7 +222,7 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch.spec_info.hidden_states, self.rot_weight
                 )
             )
-            eh_input = kunpeng.cat(e_input, h_input, -1)
+            eh_input = kunpeng.cat_kunpeng(e_input, h_input, -1)
 
             if _is_cpu_920f:
                 M, K = eh_input.shape
@@ -232,7 +232,7 @@ class DeepseekModelNextN(nn.Module):
                 )
                 blocks_in_k = K // tile_k
                 ws_numel = blocks_in_k * M * N * 2 if blocks_in_k > 1 else 0
-                packed_eh = kunpeng.bf16_pack_kunpeng(eh_input, tile_m, tile_k)
+                packed_eh = kunpeng.bf16_gemm_pack_kunpeng(eh_input, tile_m, tile_k)
                 hidden_states = kunpeng.bf16_packed_gemm_kunpeng(
                     packed_eh,
                     self.eh_proj.weight,

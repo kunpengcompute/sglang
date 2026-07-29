@@ -3059,7 +3059,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             fixed.append(kv)
         if self.is_draft_worker:
             layer0 = self.model.model.decoder
-            fixed.append(
+            fixed.extend(
                 [self.model.model.embed_tokens.weight, self.model.lm_head.weight]
             )
         else:

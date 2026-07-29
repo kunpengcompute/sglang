@@ -760,7 +760,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         if batch.forward_mode.is_idle():
             return
 
-        batch.input_ids = self.verified_id
+        batch.input_ids = self.verified_id.long()
         batch.extend_lens = batch.spec_info.num_accepted_tokens_cpu
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
