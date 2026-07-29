@@ -48,6 +48,7 @@ Usage:
 
 import atexit
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -94,7 +95,8 @@ class KunpengSwapManager:
         with cls._sdma_init_lock:
             if cls._sdma_initialized:
                 return
-            torch.ops.sgl_kernel.kupl_sdma_init()
+            sdma_threshold = int(os.environ.get("SGLANG_KUNPENG_SDMA_THRESHOLD"))
+            torch.ops.sgl_kernel.kupl_sdma_init(sdma_threshold)
             cls._sdma_initialized = True
 
     def __init__(self):

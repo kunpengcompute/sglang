@@ -114,6 +114,9 @@ export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
 export LIBPTHREAD_HOOK_PATH="/path/to/libpthread_hook.so"
 export GEMM_TILING_PLAN_FILE="$SGLANG_PATH/scripts/cpu_kunpeng/configs"
 
+# Kunpeng SDMA driver
+export SDMA_KO_PATH="/path-to-sdma-ko"
+
 # TP/EP size
 export TP_SIZE=256
 export EP_SIZE=${TP_SIZE}
