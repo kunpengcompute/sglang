@@ -15,25 +15,30 @@
 
 from sgl_kernel._kupl_async import PyKuplExecutor
 from sgl_kernel._kupl_async import PyKuplEgroup
+from sgl_kernel._kupl_async import PyKuplQueue
 
-__all__ = ["KuplExecutor", "KuplEgroup"]
+__all__ = ["KuplExecutor", "KuplEgroup", "KuplQueue"]
 
 
 class KuplEgroup:
     def __init__(self, executors: list[int]):
         self._impl = PyKuplEgroup(executors)
 
+class KuplQueue:
+    def __init__(self):
+        self._impl = PyKuplQueue()
 
 class KuplExecutor:
     def __init__(self):
         self._impl = PyKuplExecutor()
 
-    def submit(self, fn, *args, egroup=None, **kwargs):
+    def submit(self, fn, *args, egroup=None, queue=None, **kwargs):
         eg = egroup._impl if egroup is not None else None
+        q = queue._impl if queue is not None else None
         if kwargs:
-            self._impl.submit(lambda: fn(*args, **kwargs), egroup=eg)
+            self._impl.submit(lambda: fn(*args, **kwargs), egroup=eg, queue=q)
         else:
-            self._impl.submit(fn, *args, egroup=eg)
+            self._impl.submit(fn, *args, egroup=eg, queue=q)
 
     def wait(self):
         return self._impl.wait()
