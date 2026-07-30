@@ -203,7 +203,7 @@ export SGLANG_ENABLE_MTP=0  # 默认关
 - **LOAD\_FORMAT**：权重加载格式，设为`sharded_state`启用分片加载加速启动（DeepSeek V3 INT8推荐）。
 
 **多线程后端**
-- **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**：仅在`TORCH_USE_KUPL`设为1时生效，指定kupl多线程后端。常规PyTorch仅支持omp。`KUPL_EXECUTOR_COUNT`默认32。
+- **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**：指定kupl多线程后端与线程数。常规PyTorch仅支持omp。`KUPL_EXECUTOR_COUNT`默认32。
 
 ## 4. 正确性验证
 
