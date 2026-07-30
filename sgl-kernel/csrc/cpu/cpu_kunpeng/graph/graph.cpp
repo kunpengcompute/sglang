@@ -46,9 +46,6 @@ Graph::Graph(std::vector<StorageBuf> storages,
     finalize(fixed, std::move(external_pool));
 
     profile_row_.assign(total_ops_ + 1, 0);
-    auto ts = std::chrono::high_resolution_clock::now();
-    profile_base_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        ts.time_since_epoch()).count();
 }
 
 void Graph::finalize(const std::unordered_map<int, torch::Tensor>& fixed,
@@ -361,9 +358,9 @@ std::vector<torch::Tensor> Graph::run(const std::vector<torch::Tensor>& inputs)
 
         if (profile_enabled_) {
             auto ts = std::chrono::high_resolution_clock::now();
-            profile_row_[op_idx] =
+            profile_row_[op_idx] = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    ts.time_since_epoch()).count() - profile_base_ns_;
+                    ts.time_since_epoch()).count());
         }
 
         RECORD_FUNCTION(op_names_[op_idx].c_str(), std::vector<c10::IValue>{});
@@ -393,9 +390,9 @@ std::vector<torch::Tensor> Graph::run(const std::vector<torch::Tensor>& inputs)
 
     if (profile_enabled_) {
         auto ts = std::chrono::high_resolution_clock::now();
-        profile_row_[total_ops_] =
+        profile_row_[total_ops_] = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                ts.time_since_epoch()).count() - profile_base_ns_;
+                ts.time_since_epoch()).count());
     }
 
     // Restore 0-dim placeholder tensors
