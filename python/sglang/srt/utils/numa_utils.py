@@ -436,7 +436,7 @@ def _resolve_offset_cpus(offset: int) -> List[int]:
 
 
 def _process_core_binding(offset: int, pid: Optional[int] = None) -> None:
-    if not _offset_is_valid(offset):
+    if offset is None:
         return
 
     if pid is None or pid == 0:
