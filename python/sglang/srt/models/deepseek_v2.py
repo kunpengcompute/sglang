@@ -51,10 +51,11 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.graph import ops as kunpeng
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
+from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
@@ -1473,6 +1474,14 @@ class DeepseekV2AttentionMLA(
             and 90 <= _device_sm < 120
         )
 
+        self.swap_mgr = None
+        if _is_cpu_920f:
+            from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
+                KunpengSwapManager,
+            )
+
+            self.swap_mgr = KunpengSwapManager.get_instance()
+
         self.init_mha_forward()
         self.init_mha_kunpeng_forward()
         self.init_mla_forward()
@@ -1870,6 +1879,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
+        self._swap_mgr: Optional[KunpengSwapManager] = None
+        if _is_cpu_920f:
+            self._swap_mgr = KunpengSwapManager.get_instance()
+
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
             return ""
@@ -1926,6 +1939,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             topk_indices = None
 
+        if _is_cpu_920f and (not self.is_nextn):
+            self._swap_mgr.swap_next_kv_layer(self.layer_id, forward_batch)
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -1951,6 +1967,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
+
+        if _is_cpu_920f:
+            self._swap_mgr.swap_next_expert_layer(self.layer_id)
+        if _is_cpu_920f and self._swap_mgr.enable_swap_kv:
+            self._swap_mgr.wait_kv_ddr()
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2163,6 +2184,19 @@ class DeepseekV2Model(nn.Module):
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
+        if _is_cpu_920f:
+            self.swap_mgr = KunpengSwapManager.get_instance()
+            # Pre-scan MoE layers and register swap order with the manager.
+            moe_layers = [
+                self.layers[i]
+                for i in range(self.start_layer, self.end_layer)
+                if isinstance(self.layers[i].mlp, DeepseekV2MoE)
+            ]
+            self.swap_mgr.register_moe_swap_order(moe_layers)
+            self._first_moe_layer_idx = moe_layers[0].layer_id if moe_layers else None
+            # Register KV swap range and set _swap_mgr on all layers for KV prefetch.
+            self.swap_mgr.register_kv_swap_range(self.start_layer, self.end_layer)
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -2174,6 +2208,21 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+
+        if _is_cpu_920f and self._first_moe_layer_idx is not None:
+            first_layer = self.layers[self._first_moe_layer_idx]
+            self.swap_mgr.swap_expert_layer(
+                self._first_moe_layer_idx,
+                first_layer.mlp.experts.w13_weight,
+                first_layer.mlp.experts.w2_weight,
+            )
+
+        if _is_cpu_920f:
+            self.swap_mgr.swap_kv_layer(
+                self.start_layer,
+                forward_batch.token_to_kv_pool.get_key_buffer(self.start_layer),
+            )
+
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:

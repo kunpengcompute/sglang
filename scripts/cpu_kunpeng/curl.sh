@@ -23,7 +23,7 @@ usage() {
   echo "  -d RANK     Route to specific DP rank"
   echo "  -n NUM      Number of requests / prompt entries (default: all lines from file)"
   echo "  -m TOKENS   Max tokens per request (default: 10)"
-  echo "  -f FILE     Prompt file with one prompt per line (default: prompts/5.txt)"
+  echo "  -f FILE     Prompt file with one prompt per line (default: prompts/128.txt)"
   echo "  -h          Show this help message"
   exit 0
 }

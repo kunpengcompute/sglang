@@ -24,10 +24,15 @@ fi
 ROLE="$1"
 DP_RANK="$2"
 LOG_PATH="$3"
+INSTANCE="$4"
+BUCKET="$5"
 IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 
 # Source environment config (exports CONDA_ACTIVATE_CMD, PYTHON_SCRIPT, etc.)
-source ./env.sh "$ROLE"
+source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET"
+
+rmmod sdma_dae 2>/dev/null || true
+insmod "$SDMA_KO_PATH" safe_mode=0 share_chns=160
 
 # Base arguments common to both roles
 BASE_ARGS=(
@@ -42,7 +47,7 @@ BASE_ARGS=(
     --node-rank "$DP_RANK"
     --dist-timeout 600
     --enable-dp-attention
-    --dp-size "$((WORLD_SIZE / PP_SIZE))"
+    --dp-size "$DP_SIZE"
     --tp-size "$TP_SIZE"
     --ep-size "$EP_SIZE"
     --pp-size "$PP_SIZE"
@@ -81,7 +86,7 @@ case "$ROLE" in
             --max-prefill-tokens 4096
             --max-total-tokens 18496
             --prefill-max-requests 4
-            --load-balance-method follow_bootstrap_room
+            --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
         )
         ;;
@@ -89,7 +94,7 @@ case "$ROLE" in
         SPECIFIC_ARGS=(
             --disaggregation-mode decode
             --max-total-tokens 139328
-            --load-balance-method follow_bootstrap_room
+            --load-balance-method round_robin
             --decode-log-interval 10
             --num-reserved-decode-tokens 256
         )
@@ -117,13 +122,21 @@ case "$ROLE" in
             --prefill "$_router_prefill_url" 9001
             --decode "$_router_decode_url"
             --policy cache_aware
-            --prefill-policy cache_aware
             --health-check-interval-secs 10000
             --queue-timeout-secs 10000
             --request-timeout-secs 10000
             --health-check-timeout-secs 10000
             --host "$IP"
         )
+        if [[ "$PREFILL_BUCKET" == "1" ]]; then
+            SPECIFIC_ARGS+=(
+                --prefill "${PREFILL_LONG_PROMPT_MASTER_ADDR:+http://$PREFILL_LONG_PROMPT_MASTER_ADDR:30000}" 9001
+                --prefill-policy bucket
+                --balance-abs-threshold 64
+                --balance-rel-threshold 1.5
+                --bucket-adjust-interval-secs 5
+            )
+        fi
         # Common args for tokenizer-side HTTP server
         HTTP_COMMON_ARGS=(
             --model "$MODEL_PATH"
@@ -207,7 +220,14 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
         if [[ "$ROLE" == "prefill" || "$ROLE" == "decode" ]]; then
             IFS=',' read -ra _IB_DEVS <<< "$IB_DEVICE_ALL"
             _IB_COUNT=${#_IB_DEVS[@]}
-            _IB_IDX=$((RANK_IN_NODE * _IB_COUNT / (TP_SIZE * PP_SIZE / WORLD_SIZE)))
+            _ATTN_TP_SIZE=$((TP_SIZE / DP_SIZE))
+            if [[ "$_ATTN_TP_SIZE" == "8" ]]; then
+                # attn=8 (dp=32): 1 rank maps to 1 NIC, aligned with prefill attn_rank to avoid cross-subnet RDMA
+                _IB_IDX=$((RANK_IN_NODE % _IB_COUNT))
+            else
+                # attn=16 (dp=16): 2 ranks share 1 NIC (original formula)
+                _IB_IDX=$((RANK_IN_NODE * _IB_COUNT / (TP_SIZE * PP_SIZE / WORLD_SIZE)))
+            fi
             IB_ARGS=(--disaggregation-ib-device "${_IB_DEVS[$_IB_IDX]}")
         else
             IB_ARGS=()

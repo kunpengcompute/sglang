@@ -3,8 +3,8 @@ import torch
 from sglang.srt.graph._capture import (
     is_capturing,
     lookup_or_register,
-    register_output,
     record_op,
+    register_output,
 )
 
 _DEBUG = False
@@ -32,7 +32,7 @@ class GraphOp:
         tensor_args = [a for a in args if isinstance(a, torch.Tensor) or a is None]
         non_tensor_args = [a for a in args if not isinstance(a, torch.Tensor) and a is not None]
 
-        inputs = [lookup_or_register(t) for t in tensor_args]
+        inputs = [lookup_or_register(t, idx=i) for i, t in enumerate(tensor_args)]
 
         out_infos = self.shape_infer(*args, **kwargs)
         if not isinstance(out_infos, list):
@@ -45,7 +45,10 @@ class GraphOp:
                 shape, dtype = info
             else:
                 shape, dtype = info, tensor_args[0].dtype
-            out = torch.empty(shape, dtype=dtype)
+            if any(s == 0 for s in shape):
+                out = torch.empty(1, dtype=dtype)[:0].view(shape)
+            else:
+                out = torch.empty(shape, dtype=dtype)
             vid, so = register_output(out)
             outputs.append((vid, so))
             output_tensors.append(out)

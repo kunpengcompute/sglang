@@ -26,6 +26,8 @@ show_usage() {
 
 # Parse args: ROLE (positional) + optional --no-log flag
 ROLE=""
+INSTANCE=""
+BUCKET=""
 SHOW_LOG=1
 for arg in "$@"; do
     case "$arg" in
@@ -34,6 +36,12 @@ for arg in "$@"; do
             ;;
         prefill|decode|native|router|all)
             ROLE="$arg"
+            ;;
+        long_prompt)
+            INSTANCE="$arg"
+            ;;
+        prefill_bucket)
+            BUCKET="$arg"
             ;;
         *)
             echo "Error: Unknown argument '$arg'" >&2
@@ -56,6 +64,12 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# Persist time-sensitive env vars so all nodes source the same values
+cat > "$SCRIPT_DIR/.time_env.sh" << EOF
+export LOG_DATE="$(date +%y%m%d)"
+export LOG_TIME="$(date +%H%M%S)"
+EOF
 
 # all mode: launch prefill, decode, and router via background launch.sh calls
 if [[ "$ROLE" == "all" ]]; then
@@ -96,7 +110,7 @@ fi
 
 # Source config for the specified role
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-source ./env.sh "$ROLE"
+source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET"
 
 mkdir -p "$LOG_DIR"
 
@@ -119,7 +133,7 @@ for i in "${!NODES[@]}"; do
     echo "[$(date +%T)] Starting dp_rank $dp_rank on $node_ip"
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
         "root@$node_ip" \
-        "cd \"$PWD\" && sh ./server.sh \"$ROLE\" \"$dp_rank\" \"$LOG_DIR\"" \
+        "cd \"$PWD\" && sh ./server.sh \"$ROLE\" \"$dp_rank\" \"$LOG_DIR\" \"$INSTANCE\" \"$BUCKET\"" \
         >"$LOG_DIR/ssh_${ROLE}_rank${dp_rank}.log" 2>&1 &
 done
 

@@ -19,12 +19,14 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
 
 class DeepseekMHAKunpengForwardMixin:
 
@@ -70,30 +72,21 @@ class DeepseekMHAKunpengForwardMixin:
         latent_cache = latent_cache.unsqueeze(1)
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
-        # Apply RoPE (kunpeng vs standard path)
+        # Apply RoPE
         if self.rotary_emb is not None:
-            q_out_kp = torch.empty_like(q_pe)
-            k_out_kp = torch.empty_like(k_pe)
-            torch.ops.sgl_kernel.rope_kunpeng(
-                positions,
-                q_pe,
-                k_pe,
-                q_out_kp,
-                k_out_kp,
-                self.rotary_emb.cos_sin_cache,
+            q_pe, k_pe = kunpeng.rope_kunpeng(
+                positions, q_pe, k_pe, self.rotary_emb.cos_sin_cache
             )
-            q_pe = q_out_kp
-            k_pe = k_out_kp
 
-        q[..., self.qk_nope_head_dim :] = q_pe
-        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        kunpeng.copy_kunpeng(q[..., self.qk_nope_head_dim :], q_pe)
+        self._set_mla_kv_buffer_kunpeng(latent_cache, kv_a, k_pe, forward_batch)
 
         # kv_b
         out, _ = self.kv_b_proj(kv_a)
         kv = out.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
-        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        k = self._concat_and_cast_mha_k_kunpeng(k_nope, k_pe, forward_batch)
 
         return q, k, v, forward_batch
 
@@ -111,30 +104,35 @@ class DeepseekMHAKunpengForwardMixin:
         output, _ = self.o_proj(attn_output)
         return output
 
-    def _set_mla_kv_buffer(
+    def _set_mla_kv_buffer_kunpeng(
         self: DeepseekV2AttentionMLA,
         latent_cache: torch.Tensor,
         kv_a: torch.Tensor,
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
+        kunpeng.copy_kunpeng(latent_cache[:, :, : self.kv_lora_rank], kv_a.unsqueeze(1))
+        kunpeng.copy_kunpeng(latent_cache[:, :, self.kv_lora_rank :], k_pe)
 
-        # Save latent cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-        )
+        if self.swap_mgr.enable_swap_kv:
+            self.swap_mgr.set_kv_buffer(
+                self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, latent_cache
+            )
+            self.swap_mgr.set_kv_buffer(
+                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, latent_cache
+            )
+        else:
+            self.swap_mgr.set_kv_buffer(
+                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, latent_cache
+            )
 
-    def _get_mla_kv_buffer(
+    def _get_mla_kv_buffer_kunpeng(
         self: DeepseekV2AttentionMLA,
         kv_indices: torch.Tensor,
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
-            self.attn_mha.layer_id
-        )
+        latent_cache_buf = self.swap_mgr.get_kv_cache()
         latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
 
         kv_a, k_pe = latent_cache.split(
@@ -143,15 +141,14 @@ class DeepseekMHAKunpengForwardMixin:
         kv_a = kv_a.squeeze(1).contiguous()
         return kv_a, k_pe
 
-    def _concat_and_cast_mha_k(
+    def _concat_and_cast_mha_k_kunpeng(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
-        k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
-        k = k_nope.new_empty(*k_shape)
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
-        return k
+        return kunpeng.cat_kunpeng(
+            k_nope,
+            k_pe.expand(-1, self.num_local_heads, -1),
+            -1,
+        )

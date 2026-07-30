@@ -35,9 +35,7 @@ static int64_t tensor_storage_offset(const torch::Tensor& t)
 static uintptr_t tensor_storage_base(const torch::Tensor& t)
 {
     if (!t.defined()) return 0;
-    int64_t so = t.storage_offset();
-    return reinterpret_cast<uintptr_t>(
-        static_cast<char*>(t.data_ptr()) - so * t.element_size());
+    return reinterpret_cast<uintptr_t>(t.storage().data());
 }
 
 static std::pair<StorageBuf, TensorView> tensor_to_buf_and_view(const torch::Tensor& t)
@@ -56,7 +54,7 @@ static std::pair<StorageBuf, TensorView> tensor_to_buf_and_view(const torch::Ten
     }
 
     int64_t so = t.storage_offset();
-    void* base = static_cast<char*>(t.data_ptr()) - so * t.element_size();
+    void* base = const_cast<void*>(t.storage().data());
 
     StorageBuf buf;
     buf.storage_base = base;
@@ -152,6 +150,8 @@ void init_graph_cpp(py::module& m)
                 buf.id = sid;
                 view.storage_id = sid;
                 if (is_fixed) {
+                    TORCH_CHECK(buf.storage_base != nullptr,
+                                "begin_capture: fixed tensor has nullptr storage");
                     buf.data_ptr = buf.storage_base;
                     all_bufs.push_back(buf);
                 } else {

@@ -51,6 +51,11 @@ source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 export CC=$(which clang)
 export CXX=$(which clang++)
 
+# Load KUTACC environment variables
+KUTACC_PATH=/path-to-KUTACC
+export KUTACC_LIB=${KUTACC_PATH}/install/lib
+export KUTACC_INCLUDE=${KUTACC_PATH}/install/include
+
 # Enter the sgl-kernel subdirectory and install the kernel module
 cd ../sgl-kernel
 pip install -v . --no-build-isolation
@@ -97,9 +102,9 @@ When using non-DeepSeek models, you need to comment out lines 98~99 in `srt/mode
 Four deployment modes are available via `source env.sh [mode]`:
 
 - **native** (default): Non-PD disaggregated, single-cluster full serving. Nodes read from `NATIVE_IP_SPEC`, load balancing via `round_robin`.
-- **prefill**: PD disaggregation prefill role. Nodes read from `PREFILL_IP_SPEC`, `SGLANG_SKIP_HTTP=1`.
-- **decode**: PD disaggregation decode role. Nodes read from `DECODE_IP_SPEC`, `SGLANG_SKIP_HTTP=1`.
-- **router**: PD disaggregation router node, single-node running `sglang_router.launch_router`, `SGLANG_LAUNCH_HTTP_ONLY=1`.
+- **prefill**: PD disaggregation prefill role. Nodes read from `PREFILL_IP_SPEC`.
+- **decode**: PD disaggregation decode role. Nodes read from `DECODE_IP_SPEC`.
+- **router**: PD disaggregation router node, single-node running `sglang_router.launch_router`.
 
 When `IS_PREFILL=1` (prefill mode), `SGLANG_KUNPENG_MAX_SEQ_NUM=4` and `SGLANG_KUNPENG_MAX_CUR_LEN=1024` are set automatically; when `IS_PREFILL=0` (decode/native), `SGLANG_KUNPENG_MAX_SEQ_NUM=128` and `SGLANG_KUNPENG_MAX_CUR_LEN=1` are set.
 
@@ -200,7 +205,7 @@ export SGLANG_ENABLE_MTP=0  # default off
 - **LOAD\_FORMAT**: Weight loading format. Set to `sharded_state` for sharded loading to accelerate startup (recommended for DeepSeek V3 INT8).
 
 **Multi-Thread Backend**
-- **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**: Only effective when `TORCH_USE_KUPL` is set to 1. Specifies kupl multi-threading backend. Standard PyTorch only supports omp. `KUPL_EXECUTOR_COUNT` defaults to 32.
+- **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**: Specifies kupl multi-threading backend. Standard PyTorch only supports omp. `KUPL_EXECUTOR_COUNT` defaults to 32.
 
 ## 4. Correctness Verification
 
@@ -241,3 +246,90 @@ sh curl.sh -p -s -f prompts/ragged.txt
 | `-f FILE` | Prompt file | prompts/5.txt |
 
 Verify correctness based on the response returned by the request.
+
+## 5. Prefill Multi-Instance Deployment
+
+### 5.1 Configuration
+
+Configure two prefill instances in `scripts/cpu_kunpeng/env.sh`:
+
+```bash
+# Default instance (short requests)
+PREFILL_IP_SPEC="xxx.xxx.xxx. | 1-16"
+PREFILL_MASTER_ADDR="xxx.xxx.xxx.1"
+PREFILL_MASTER_PORT="5000"
+PREFILL_PP_SIZE=1
+
+# Long prompt instance
+PREFILL_LONG_PROMPT_IP_SPEC="xxx.xxx.xxx. | 17-32"
+PREFILL_LONG_PROMPT_MASTER_ADDR="xxx.xxx.xxx.17"
+PREFILL_LONG_PROMPT_MASTER_PORT="5020"
+PREFILL_LONG_PROMPT_PP_SIZE=2
+```
+
+### 5.2 Startup
+
+#### 1. Single Instance Mode (Default)
+
+```bash
+# Prefill (run on prefill master node)
+sh launch.sh prefill
+
+# Decode (run on decode master node)
+sh launch.sh decode
+
+# Router (run on router node)
+sh launch.sh router
+```
+
+#### 2. Dual Instance Mode (Bucket Load Balancing Strategy)
+
+```bash
+# Instance 1 (short request prefill, nodes 1~16, run on node 1)
+sh launch.sh prefill
+
+# Instance 2 (long request prefill, nodes 17~32, run on node 17)
+sh launch.sh prefill long_prompt
+
+# Decode (run on decode master node)
+sh launch.sh decode
+
+# Router (run on router node with bucket strategy enabled)
+sh launch.sh router prefill_bucket
+```
+
+### 5.3 Notes
+
+- The two prefill instances have different master nodes and must be started on their respective master nodes
+- The `MASTER_PORT` of the two instances must differ (default: 5000 vs 5020)
+- When the `prefill_bucket` parameter is passed to the router, it automatically registers two prefill instances and enables the bucket load balancing strategy
+- When `prefill_bucket` is not passed, only one prefill instance is registered and the strategy specified by `--policy` is used
+- The `PP_SIZE` of the long request instance can be configured independently (default: 2)
+
+### 5.4 Bucket Strategy CLI Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--prefill-policy bucket` | - | Route by request character count to different prefill instances via bucket splitting |
+| `--balance-abs-threshold` | 64 | Trigger load-balancing switch when the absolute difference in character counts between two instances exceeds this value |
+| `--balance-rel-threshold` | 1.5 | Imbalance is only considered when the higher-load instance has >1.5x characters compared to the lower-load instance (must be met together with the absolute threshold) |
+| `--bucket-adjust-interval-secs` | 5 | Automatically adjust boundaries based on historical load every 5 seconds |
+
+#### Load Balancing Strategy
+
+When a request arrives, it is first routed to the corresponding prefill instance based on character count using binary search to locate the matching boundary bucket. Simultaneously, the cumulative character counts of both instances are checked. When **both** of the following conditions are met, the load is considered unbalanced and the request is routed to the lower-load instance instead:
+
+- Absolute difference: `max_load - min_load > balance_abs_threshold`
+- Relative difference: `max_load > balance_rel_threshold × min_load`
+
+Both conditions must be satisfied simultaneously to trigger the switch, preventing frequent switching due to minor load imbalances.
+
+#### Boundary Auto-Adjustment
+
+Initial boundaries evenly divide the character length range `[0, 4096]` across instances (2 instances: instance 1 handles `[0, 2047]`, instance 2 handles `[2048, MAX]`). A background thread runs auto-adjustment every `bucket_adjust_interval_secs` seconds:
+
+1. Collect character count distribution of requests within the time window (`period = bucket_adjust_interval_secs × 1000` milliseconds)
+2. Redistribute boundary ranges across instances based on historical load to balance workload
+3. Skip adjustment if load change is minor (new load < 2x old load AND old load < 2x new load)
+
+If most requests are short (< 1k characters), instance 1's load will be higher, causing the boundary to automatically shift upward and eventually converge near the 1k position.

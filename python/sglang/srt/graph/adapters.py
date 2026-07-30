@@ -135,6 +135,29 @@ def _setup_alloc_buffer():
     register_op('alloc_buffer', shape_infer, eager_fn)
 
 
+def _setup_zero_():
+    def shape_infer(t):
+        return []
+
+    def eager_fn(t):
+        t.zero_()
+        return None
+
+    register_op('zero_', shape_infer, eager_fn)
+
+
+def _setup_last_tokens():
+    def shape_infer(hidden_states, extend_seq_lens):
+        return [((extend_seq_lens.shape[0], hidden_states.shape[1]),
+                 hidden_states.dtype)]
+
+    def eager_fn(hidden_states, extend_seq_lens):
+        last_index = torch.cumsum(extend_seq_lens, dim=0) - 1
+        return hidden_states[last_index]
+
+    register_op('last_tokens', shape_infer, eager_fn)
+
+
 def _setup_s8_s8_packed_gemm_bf16_dq_kunpeng():
     def shape_infer(input, weight, weight_scale, scale, workspace,
                     tile_m, tile_n, tile_k):
@@ -450,6 +473,93 @@ def _setup_moe_combine_recv_kunpeng():
     register_op('moe_combine_recv_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_kupl_sdma_memcpy_chunked():
+    def shape_infer(
+        dst,
+        src,
+        event_tensor,
+        event_num_tensor,
+        dst_byte_offset,
+        src_byte_offset,
+        total_bytes,
+        chunk_bytes,
+        max_pending_events,
+    ):
+        return []
+
+    def eager_fn(
+        dst,
+        src,
+        event_tensor,
+        event_num_tensor,
+        dst_byte_offset,
+        src_byte_offset,
+        total_bytes,
+        chunk_bytes,
+        max_pending_events,
+    ):
+        torch.ops.sgl_kernel.kupl_sdma_memcpy_chunked(
+            dst,
+            src,
+            event_tensor,
+            event_num_tensor,
+            dst_byte_offset,
+            src_byte_offset,
+            total_bytes,
+            chunk_bytes,
+            max_pending_events,
+        )
+        return None
+
+    register_op("kupl_sdma_memcpy_chunked", shape_infer, eager_fn)
+
+
+def _setup_kupl_sdma_wait_all():
+    def shape_infer(event_tensor, event_num_tensor):
+        return []
+
+    def eager_fn(event_tensor, event_num_tensor):
+        torch.ops.sgl_kernel.kupl_sdma_wait_all(event_tensor, event_num_tensor)
+        return None
+
+    register_op("kupl_sdma_wait_all", shape_infer, eager_fn)
+
+
+def _setup_kupl_sdma_set_kv_buffer():
+    def shape_infer(
+        kv_buffer,
+        loc,
+        cache_k,
+        event_tensor,
+        event_num_tensor,
+        max_pending_events,
+        chunk_bytes,
+    ):
+        return []
+
+    def eager_fn(
+        kv_buffer,
+        loc,
+        cache_k,
+        event_tensor,
+        event_num_tensor,
+        max_pending_events,
+        chunk_bytes,
+    ):
+        torch.ops.sgl_kernel.kupl_sdma_set_kv_buffer(
+            kv_buffer,
+            loc,
+            cache_k,
+            event_tensor,
+            event_num_tensor,
+            max_pending_events,
+            chunk_bytes,
+        )
+        return None
+
+    register_op("kupl_sdma_set_kv_buffer", shape_infer, eager_fn)
+
+
 def _setup_cat_kunpeng():
     def shape_infer(a, b, dim):
         shape = list(a.shape)
@@ -492,6 +602,32 @@ def _setup_copy_kunpeng():
         return None
 
     register_op('copy_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_flash_attention_with_workspace_kunpeng():
+    def shape_infer(q, k, v, workspace, extend_seq_lens,
+                    causal, softmax_scale, chunked_prefill_size):
+        return [((q.shape[0], q.shape[1], v.shape[2]), q.dtype)]
+
+    def eager_fn(q, k, v, workspace, extend_seq_lens,
+                 causal, softmax_scale, chunked_prefill_size):
+        qsl = torch.zeros(extend_seq_lens.shape[0] + 1,
+                          dtype=torch.int32, device=extend_seq_lens.device)
+        qsl[1:] = torch.cumsum(extend_seq_lens, dim=0)
+        ksl = qsl.clone()
+        cur_lens = (qsl[1:] - qsl[:-1]).tolist()
+        seq_lens = cur_lens
+
+        out = torch.empty(q.shape[0], q.shape[1], v.shape[2], dtype=q.dtype)
+        torch.ops.sgl_kernel.flash_attention_with_workspace(
+            q=q, k=k, v=v, out=out, workspace=workspace,
+            causal=causal, softmax_scale=softmax_scale,
+            query_start_loc=qsl, key_start_loc=ksl,
+            chunked_prefill_size=chunked_prefill_size,
+            cur_lens=cur_lens, seq_lens=seq_lens)
+        return out
+
+    register_op('flash_attention_with_workspace_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_flash_mla_dense_decode_kunpeng():
@@ -608,6 +744,8 @@ def setup():
     _setup_rope_kunpeng()
     _setup_s8_gemm_pack_kunpeng()
     _setup_alloc_buffer()
+    _setup_zero_()
+    _setup_last_tokens()
     _setup_s8_s8_packed_gemm_bf16_dq_kunpeng()
     _setup_bf16_gemm_pack_kunpeng()
     _setup_bf16_packed_gemm_kunpeng()
@@ -630,11 +768,15 @@ def setup():
     _setup_moe_dispatch_recv_kunpeng()
     _setup_moe_combine_send_kunpeng()
     _setup_moe_combine_recv_kunpeng()
+    _setup_kupl_sdma_memcpy_chunked()
+    _setup_kupl_sdma_wait_all()
+    _setup_kupl_sdma_set_kv_buffer()
     _setup_cat_kunpeng()
     _setup_contiguous_kunpeng()
     _setup_set_kv_buffer_kunpeng()
     _setup_copy_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()
+    _setup_flash_attention_with_workspace_kunpeng()
     _setup_topk_convert_kunpeng()
     _setup_igemm_fusedmoe_gateup_kunpeng()
     _setup_igemm_fusedmoe_down_kunpeng()

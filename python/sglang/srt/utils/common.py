@@ -197,8 +197,21 @@ def is_kunpeng_binary_launch() -> bool:
 def is_kunpeng_hbw_pool() -> bool:
     return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_HBW_POOL") == "1"
 
-def is_kunpeng_hbw_swap() -> bool:
-    return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_HBW_SWAP") == "1"
+
+def is_kunpeng_swap_expert() -> bool:
+    return is_kunpeng_hbw_pool() and os.environ.get("SGLANG_KUNPENG_SWAP_EXPERT") == "1"
+
+
+def is_kunpeng_swap_kv() -> bool:
+    return is_kunpeng_hbw_pool() and os.environ.get("SGLANG_KUNPENG_SWAP_KV") == "1"
+
+
+def is_kunpeng_swap_kv_blockwise() -> bool:
+    return (
+        is_kunpeng_swap_kv()
+        and os.environ.get("SGLANG_KUNPENG_SWAP_KV_BLOCKWISE") == "1"
+    )
+
 
 def is_kunpeng_graph_capture() -> bool:
     return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_GRAPH_CAPTURE") == "1"

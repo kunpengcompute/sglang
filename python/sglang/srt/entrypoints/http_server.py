@@ -2131,7 +2131,8 @@ def _setup_and_run_http_server(
     Called by launch_server after subprocesses have been launched.
     """
     # Set global states
-    if is_kunpeng_binary_launch() and server_args.tp_rank_in_node >= 1:
+    _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+    if is_kunpeng_binary_launch() and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
         pass
     else:
         set_global_state(
@@ -2225,8 +2226,9 @@ def _setup_and_run_http_server(
         if not envs.SGLANG_ENABLE_BINARY_LAUNCH.get():
             p.cpu_affinity({34})  # 34
 
-    if is_kunpeng_binary_launch() and server_args.tp_rank_in_node >= 1:
-        logger.info("HTTP server disabled.")
+    _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+    if is_kunpeng_binary_launch() and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
+        logger.info("HTTP server disabled (not first TP rank of DP group).")
         threading.Event().wait()
     else:
         try:

@@ -24,15 +24,16 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.distributed import get_socket_tp_group
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import *
+from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.common import is_kunpeng_hbw_pool, is_kunpeng_hbw_swap
-from sglang.srt.graph import ops as kunpeng
+from sglang.srt.utils.common import is_kunpeng_hbw_pool
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -42,7 +43,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
-_enable_hbw_swap = is_kunpeng_hbw_swap()
 _enable_debug = False
 
 
@@ -116,8 +116,6 @@ def kutacc_mha(
     kernel's BR/BC tile over-reads stay inside the workspace instead of
     corrupting glibc heap metadata.
     """
-    device = query.device
-    dtype = query.dtype
     bs = extend_seq_lens.shape[0]
     n_token = query.shape[0]
     kv_n_token = key.shape[0]  # K/V may be TP-padded beyond actual token count
@@ -132,38 +130,35 @@ def kutacc_mha(
     # so Q/O must be padded by BR and scratch tensors sized accordingly.
     BR, BC = torch.ops.sgl_kernel.get_flash_attention_block_kunpeng()
 
-    # cu_seqlens from real extend lengths (matching sample
-    # get_start_loc(0, n_seqs, cur_lens) = cumsum(cur_lens)).
-    query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-    query_start_loc[1:] = torch.cumsum(extend_seq_lens, dim=0)
-    key_start_loc = query_start_loc.clone()  # prefill: seq_lens == cur_lens
-
     # K/V buffer sized to hold the (possibly TP-padded) K/V data, with at
     # least bs * max_seq_len slots so the kernel's BC=128 tile over-read past
     # any sequence end stays inside the buffer instead of hitting a glibc
     # chunk header.
     sum_seq_len = max(bs * max_seq_len, kv_n_token)
-    para_k = torch.zeros(
-        sum_seq_len, num_heads, qk_head_dim, dtype=dtype, device=device
+    para_k = kunpeng.alloc_buffer(
+        sum_seq_len * num_heads * qk_head_dim * query.element_size()
     )
-    para_k[:kv_n_token] = key
-    para_v = torch.zeros(
-        sum_seq_len, num_heads, vo_head_dim, dtype=dtype, device=device
+    kunpeng.zero_(para_k)
+    para_k = para_k.view(query.dtype).view(sum_seq_len, num_heads, qk_head_dim)
+    kunpeng.copy_kunpeng(para_k[:kv_n_token], key)
+    para_v = kunpeng.alloc_buffer(
+        sum_seq_len * num_heads * vo_head_dim * value.element_size()
     )
-    para_v[:kv_n_token] = value
+    kunpeng.zero_(para_v)
+    para_v = para_v.view(value.dtype).view(sum_seq_len, num_heads, vo_head_dim)
+    kunpeng.copy_kunpeng(para_v[:kv_n_token], value)
 
     # Q/O: pad to n_token + BR. The kernel loads Q in BR=128 tiles and writes
     # O in BR=128 tiles; without padding the last tile overflows under PyTorch's
     # caching allocator. (DeepSeek-V3-Sample uses a bump allocator so adjacent
     # tensors absorb the over-read/write; we have to pad explicitly.)
     padded_n_token = n_token + BR
-    padded_q = torch.zeros(
-        padded_n_token, num_heads, qk_head_dim, dtype=dtype, device=device
+    padded_q = kunpeng.alloc_buffer(
+        padded_n_token * num_heads * qk_head_dim * query.element_size()
     )
-    padded_q[:n_token] = query
-    attn_out = torch.zeros(
-        padded_n_token, num_heads, vo_head_dim, dtype=dtype, device=device
-    )
+    kunpeng.zero_(padded_q)
+    padded_q = padded_q.view(query.dtype).view(padded_n_token, num_heads, qk_head_dim)
+    kunpeng.copy_kunpeng(padded_q[:n_token], query)
 
     # Workspace for all scratch tensors. C++ side bump-allocates contiguous
     # slices from this buffer (pack_attn_k/v/q, attn_s, out/max/base block
@@ -190,25 +185,11 @@ def kutacc_mha(
     )  # out_block old/new
     ws_bytes += align64(thread_num * BR * f32_size) * 4  # max/base old/new
 
-    workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=device)
+    workspace = kunpeng.alloc_buffer(ws_bytes)
 
-    cur_lens = extend_seq_lens.tolist()
-    seq_lens = extend_seq_lens.tolist()  # prefill: same as cur_lens
-
-    torch.ops.sgl_kernel.flash_attention_with_workspace(
-        q=padded_q,
-        k=para_k,
-        v=para_v,
-        out=attn_out,
-        workspace=workspace,
-        causal=is_causal,
-        softmax_scale=softmax_scale,
-        query_start_loc=query_start_loc,
-        key_start_loc=key_start_loc,
-        chunked_prefill_size=max_seq_len,
-        seq_lens=seq_lens,
-        cur_lens=cur_lens,
-    )
+    attn_out = kunpeng.flash_attention_with_workspace_kunpeng(
+        padded_q, para_k, para_v, workspace, extend_seq_lens,
+        is_causal, softmax_scale, max_seq_len)
 
     return attn_out[:n_token]
 
@@ -233,17 +214,7 @@ class KunpengCpuBackend(AttentionBackend):
         self.mla_padding_enable = False
 
         self._decode_meta = torch.ops.sgl_kernel.flash_mla_meta_create_kunpeng()
-
-        # HBW swap: SDMA-based async DDR <-> HBW data movement
-        self.hbw_kvbuffer = None
-        if _enable_hbw_swap and not model_runner.is_draft_worker:
-            self.hbw_kvbuffer = KunpengHBWKVbuffer(
-                size=model_runner.max_total_num_tokens,
-                page_size=model_runner.page_size,
-                kv_cache_dim=self.kv_cache_dim,
-                num_layers=self.num_layers,
-            )
-            self.hbw_kvbuffer.init_hbw_swapbuffer()
+        self.swap_mgr = KunpengSwapManager.get_instance()
 
     def __del__(self):
         if hasattr(self, "_decode_meta") and self._decode_meta is not None:
@@ -337,11 +308,6 @@ class KunpengCpuBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
-        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
-            self.hbw_kvbuffer.queue_async_swapin(
-                0, forward_batch.token_to_kv_pool.get_key_buffer(0)
-            )
-
     def _get_kv_buffer(
         self,
         layer: RadixAttention,
@@ -351,48 +317,8 @@ class KunpengCpuBackend(AttentionBackend):
         cache_loc: torch.Tensor,
         save_kv_cache: bool,
     ) -> torch.Tensor:
-        if save_kv_cache and not _enable_hbw_swap:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
-            swap_index = self.hbw_kvbuffer.get_safe_on_package_memory_index(
-                layer.layer_id
-            )
-
-            if _enable_debug:
-                diff = torch.abs(
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                    - self.hbw_kvbuffer.kv_buffer[swap_index]
-                )
-                max_diff = diff.max().item()
-                if max_diff > 1e-5:
-                    logger.error(
-                        f"layer {layer.layer_id} swap error, max_diff={max_diff}"
-                    )
-
-            self.hbw_kvbuffer.kv_buffer[swap_index][cache_loc] = k
-            return self.hbw_kvbuffer.kv_buffer[swap_index]
-        else:
-            return forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-
-    def _try_hbw_swap_pipeline(
-        self,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool,
-    ):
-        if _enable_hbw_swap and self.hbw_kvbuffer is not None:
-            if save_kv_cache:
-                self.hbw_kvbuffer.queue_async_swapout(
-                    layer.layer_id,
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                )
-            next_layer_id = layer.layer_id + 1
-            if next_layer_id < self.num_layers:
-                self.hbw_kvbuffer.queue_async_swapin(
-                    next_layer_id,
-                    forward_batch.token_to_kv_pool.get_key_buffer(next_layer_id),
-                )
+        return KunpengSwapManager.get_instance().get_kv_cache()
 
     def _forward_extend_kutacc(
         self,
@@ -406,13 +332,14 @@ class KunpengCpuBackend(AttentionBackend):
         """Kutacc flash_attention prefill path with dump support."""
         # --- cache ---
         cache_loc = forward_batch.out_cache_loc
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         # --- reshape to 3D ---
-        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
-        k_3d = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim).contiguous()
-        v_3d = v.view(-1, layer.tp_v_head_num, layer.v_head_dim).contiguous()
+        q_3d = kunpeng.contiguous_kunpeng(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim))
+        k_3d = kunpeng.contiguous_kunpeng(
+            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim))
+        v_3d = kunpeng.contiguous_kunpeng(
+            v.view(-1, layer.tp_v_head_num, layer.v_head_dim))
 
         softmax_scale = (
             layer.scaling
@@ -438,7 +365,7 @@ class KunpengCpuBackend(AttentionBackend):
         v,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=True,
+        save_kv_cache=False,
     ):
         cache_loc = forward_batch.out_cache_loc
 
@@ -466,7 +393,7 @@ class KunpengCpuBackend(AttentionBackend):
             )
 
         kv_buf = self._get_kv_buffer(
-            layer, forward_batch, k, v, cache_loc, save_kv_cache
+            layer, forward_batch, k, v, cache_loc, False
         )
         kvcache_paged = kv_buf[:, 0, :].reshape(-1, page_size, kv_buf.shape[-1])
 
@@ -505,8 +432,6 @@ class KunpengCpuBackend(AttentionBackend):
             self._decode_meta,
         )
 
-        self._try_hbw_swap_pipeline(layer, forward_batch, save_kv_cache)
-
         if self.mla_padding_enable:
             o_flat = torch.zeros(
                 (q_heads.shape[0], layer.tp_q_head_num, layer.v_head_dim),
@@ -527,7 +452,7 @@ class KunpengCpuBackend(AttentionBackend):
         v,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=True,
+        save_kv_cache=False,
     ):
 
         if layer.qk_head_dim != layer.v_head_dim:
@@ -539,9 +464,6 @@ class KunpengCpuBackend(AttentionBackend):
             cache_loc = forward_batch.encoder_out_cache_loc
         else:
             cache_loc = forward_batch.out_cache_loc
-
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -575,7 +497,7 @@ class KunpengCpuBackend(AttentionBackend):
         v,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=True,
+        save_kv_cache=False,
     ):
         # MLA_KUNPENG with prefix — attn_mqa needs paged KV cache read.
         if (
@@ -584,7 +506,7 @@ class KunpengCpuBackend(AttentionBackend):
             and self.forward_metadata is not None
         ):
             return self._forward_extend_mla_paged(
-                q, k, v, layer, forward_batch, save_kv_cache
+                q, k, v, layer, forward_batch, False
             )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
@@ -600,11 +522,11 @@ class KunpengCpuBackend(AttentionBackend):
 
         if use_kutacc:
             return self._forward_extend_kutacc(
-                q, k, v, layer, forward_batch, save_kv_cache
+                q, k, v, layer, forward_batch, False
             )
         else:
             return self.forward_extend_native(
-                q, k, v, layer, forward_batch, save_kv_cache
+                q, k, v, layer, forward_batch, False
             )
 
     def forward_decode(
@@ -614,7 +536,7 @@ class KunpengCpuBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
+        save_kv_cache: bool = False,
     ):
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -626,7 +548,7 @@ class KunpengCpuBackend(AttentionBackend):
 
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        kv_k = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc, save_kv_cache)
+        kv_k = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc, False)
         softmax_scale = (
             layer.scaling
             if layer.scaling is not None
@@ -667,8 +589,6 @@ class KunpengCpuBackend(AttentionBackend):
         )
 
         o = o_graph.view(batch_size, -1)
-
-        self._try_hbw_swap_pipeline(layer, forward_batch, save_kv_cache)
 
         return o
 

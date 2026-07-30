@@ -88,6 +88,9 @@ void shm_reduce_scatter_kunpeng(at::Tensor input)
         get_peer_shm_baseptr(i, local_buffer_ptr, (void **)&remote_buffers_ptr[i]);
     }
 
+    // ensure all peers have finished copying their input into SHM before reduce_scatter reads them
+    kupl_shm_fence(kupl_win_intra_node);
+
     // reduce_scatter in-place on the SHM buffer
     kutacc::shm_reduce_scatter((void **)remote_buffers_ptr, batch, dim, g_rs_request);
 

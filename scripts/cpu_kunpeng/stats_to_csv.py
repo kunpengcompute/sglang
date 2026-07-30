@@ -1,3 +1,17 @@
+# Copyright 2026 Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 import json
 import sys
 from collections import defaultdict
@@ -58,7 +72,9 @@ def to_csv(input_path, output_path):
             stats[name] = compute_stats(durs, num_runs)
         total_all_ms = sum(s["total_ms"] for s in stats.values())
         for name, s in stats.items():
-            s["percent"] = (s["total_ms"] / total_all_ms * 100) if total_all_ms > 0 else 0.0
+            s["percent"] = (
+                (s["total_ms"] / total_all_ms * 100) if total_all_ms > 0 else 0.0
+            )
         op_stats[mode_name] = stats
 
     with open(output_path, "w") as f:
@@ -68,9 +84,11 @@ def to_csv(input_path, output_path):
             total_ms = 0
             for name in op_order.get(mode_name, []):
                 s = stats[name]
-                f.write(f"{name},{s['count']},{s['min_us']:.1f},{s['max_us']:.1f},"
-                        f"{s['avg_us']:.1f},{s['total_ms']:.3f},{s['percent']:.1f}%\n")
-                total_ms += s['total_ms']
+                f.write(
+                    f"{name},{s['count']},{s['min_us']:.1f},{s['max_us']:.1f},"
+                    f"{s['avg_us']:.1f},{s['total_ms']:.3f},{s['percent']:.1f}%\n"
+                )
+                total_ms += s["total_ms"]
             f.write(f"total,,,,,{total_ms:.3f},100.0%\n")
             f.write("\n")
 

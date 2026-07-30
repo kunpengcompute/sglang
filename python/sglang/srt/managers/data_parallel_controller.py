@@ -151,8 +151,10 @@ class DataParallelController:
             zmq.Context(1 + server_args.dp_size),
             ZmqOffset.DATA_PARALLEL_CONTROLLER,
         )
-        if server_args.node_rank == 0:
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+        _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+        _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
+        if server_args.node_rank == 0 and _node_rank_in_node == 0:
+            if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
                 pass
             elif _is_skip_http:
                 self.recv_from_tokenizer = get_zmq_socket(
@@ -283,8 +285,10 @@ class DataParallelController:
                 server_args.tp_size * server_args.pp_size * server_args.gpu_id_step
             )
 
-            if server_args.node_rank == 0:
-                if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+            _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+            _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
+            if server_args.node_rank == 0 and _node_rank_in_node == 0:
+                if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
                     pass
                 else:
                     self.workers[dp_rank] = get_zmq_socket(
@@ -337,6 +341,7 @@ class DataParallelController:
             List of worker ports (same on all nodes after broadcast).
         """
         # Determine the endpoint for inter-node communication
+        _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
         if server_args.dist_init_addr is None:
             na = NetworkAddress(
                 server_args.host or "127.0.0.1",
@@ -344,20 +349,25 @@ class DataParallelController:
             )
         else:
             na = NetworkAddress.parse(server_args.dist_init_addr)
-            na = NetworkAddress(na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA)
+            na = NetworkAddress(
+                na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
+            )
         endpoint = na.to_tcp()
 
-        if server_args.node_rank == 0:
+        _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+        _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
+        _dp_num_per_node = max(server_args.dp_size * server_args.pp_size // server_args.nnodes, 1)
+        if server_args.node_rank == 0 and _node_rank_in_node == 0:
             # Node 0: Broadcast worker ports to all other nodes
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+            if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
                 return []
             else:
                 return self._broadcast_ports_as_server(
-                    endpoint, server_args.nnodes - 1, worker_ports
+                    endpoint, server_args.nnodes * _dp_num_per_node - 1, worker_ports
                 )
         else:
             # Other nodes: Receive worker ports from node 0
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+            if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
                 return []
             else:
                 return self._receive_ports_as_client(endpoint, server_args.node_rank)
@@ -450,8 +460,10 @@ class DataParallelController:
 
         # Pre-allocate worker ports on node 0 to avoid conflicts
         worker_ports = []
-        if server_args.node_rank == 0:
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+        _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+        _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
+        if server_args.node_rank == 0 and _node_rank_in_node == 0:
+            if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
                 pass
             else:
                 for dp_rank in range(server_args.dp_size):
@@ -672,7 +684,9 @@ def run_data_parallel_controller_process(
 
             p = psutil.Process(os.getpid())
             # TODO (kunpeng): hard code here, should use a more elegant way.
-            p.cpu_affinity({58})  # 20
+            _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+            _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
+            p.cpu_affinity({58 + 304 * _node_rank_in_node})  # 20
             logger.info(os.sched_getaffinity(os.getpid()))
 
     setproctitle.setproctitle("sglang::data_parallel_controller")
@@ -705,8 +719,10 @@ def run_data_parallel_controller_process(
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
-        if server_args.node_rank == 0:
-            if _is_kunpeng_binary_launch and server_args.tp_rank_in_node >= 1:
+        _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+        _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
+        if server_args.node_rank == 0 and _node_rank_in_node == 0:
+            if _is_kunpeng_binary_launch and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
                 pass
             else:
                 controller.event_loop()

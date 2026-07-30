@@ -77,13 +77,21 @@ PREFILL_IP_SPEC="xxx.xxx.xxx. | 1-16"
 PREFILL_MASTER_ADDR="xxx.xxx.xxx.1"
 PREFILL_MASTER_PORT="5000"
 
+# Bucket policy switch: 1=enable second prefill instance + bucket policy, 0=disable
+export PREFILL_BUCKET=0
+
+# Prefill long prompt instance
+PREFILL_LONG_PROMPT_IP_SPEC="xxx.xxx.xxx. | 17-32"
+PREFILL_LONG_PROMPT_MASTER_ADDR="xxx.xxx.xxx.17"
+PREFILL_LONG_PROMPT_MASTER_PORT="5020"
+
 DECODE_IP_SPEC="xxx.xxx.xxx. | 17-32"
 DECODE_MASTER_ADDR="xxx.xxx.xxx.17"
 DECODE_MASTER_PORT="5010"
 
 NATIVE_IP_SPEC="xxx.xxx.xxx. | 17-32"
 NATIVE_MASTER_ADDR="xxx.xxx.xxx.1"
-NATIVE_MASTER_PORT="5010"
+NATIVE_MASTER_PORT="5010"       
 
 # Router node IP (single IP for PD disaggregation router)
 export ROUTER_IP="xxx.xxx.xxx.1"
@@ -93,6 +101,8 @@ LOG_BASE_DIR="/path-to-logs"
 CONDA_ENV_NAME="my_env"
 CONDA_BASE_PATH="/path-to-conda"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
+MODEL_PATH_PREFILL=$MODEL_PATH
+MODEL_PATH_DECODE=$MODEL_PATH
 SPECULATIVE_DRAFT_MODEL_PATH=""
 
 export HPCKIT_PATH="/path-to-HPCKit"
@@ -106,15 +116,41 @@ export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
 export LIBPTHREAD_HOOK_PATH="/path/to/libpthread_hook.so"
 export GEMM_TILING_PLAN_FILE="$SGLANG_PATH/scripts/cpu_kunpeng/configs"
 
+# Kunpeng SDMA driver
+export SDMA_KO_PATH="/path-to-sdma-ko"
+
 # TP/EP size
 export TP_SIZE=256
+export DP_SIZE=16
 export EP_SIZE=${TP_SIZE}
+export PP_SIZE=1 # >1 enable pp  eg: 2
+
+# Prefill TP/EP/PP size
+export PREFILL_TP_SIZE=${TP_SIZE}
+export PREFILL_DP_SIZE=${DP_SIZE}
+export PREFILL_EP_SIZE=${PREFILL_TP_SIZE}
+export PREFILL_PP_SIZE=${PP_SIZE}
+
+# Decode TP/EP/PP size
+export DECODE_TP_SIZE=${TP_SIZE}
+export DECODE_DP_SIZE=${DP_SIZE}
+export DECODE_EP_SIZE=${DECODE_TP_SIZE}
+export DECODE_PP_SIZE=${PP_SIZE}
+
 
 # PP size and chunked prefill size can be configured independently
 export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size
-export PP_SIZE=1 # >1 enable pp  eg: 2
-export PREFILL_PP_SIZE=1
-export DECODE_PP_SIZE=1
+export PREFILL_LONG_PROMPT_PP_SIZE=2
+
+# Optional second argument: prefill instance name (e.g. "long_prompt")
+if [[ -n "$2" ]]; then
+    export PREFILL_INSTANCE="$2"
+fi
+
+# Optional third argument: enable prefill bucket policy (e.g. "prefill_bucket")
+if [[ "$3" == "prefill_bucket" ]]; then
+    export PREFILL_BUCKET=1
+fi
 
 # Communication
 export GLOO_SOCKET_IFNAME=enp26s0f0
@@ -145,7 +181,7 @@ export SGLANG_ENABLE_TOKENIZER_SEPERATE=0  # Only supports PD disaggregation mod
 export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
-export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=1
+export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=0
 export SGLANG_KUNPENG_RDMA_ALLGATHER=0  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_ENABLE_MTP=0
 # Kunpeng SHM pool
@@ -153,8 +189,10 @@ export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476
 export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=50
 # Kunpeng HBW pool
 export SGLANG_ENABLE_HBW_POOL=1
-export SGLANG_ENABLE_HBW_SWAP=0
-export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=3800
+export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=4000
+export SGLANG_KUNPENG_SWAP_EXPERT=0
+export SGLANG_KUNPENG_SWAP_KV=0
+export SGLANG_KUNPENG_SWAP_KV_BLOCKWISE=0
 # Kunpeng SDMA parameters
 export SGLANG_KUNPENG_SDMA_MAX_EVENTS=10
 export SGLANG_KUNPENG_SDMA_THRESHOLD=5
@@ -181,18 +219,28 @@ fi
 # Function: prefill_config
 # ------------------------------------------------------------
 prefill_config() {
-    # Expand IP list
-    NODE_IPS=($(expand_ip_range "$PREFILL_IP_SPEC"))
+    local instance="${PREFILL_INSTANCE:-1}"
+    if [[ "$instance" == "long_prompt" ]]; then
+        NODE_IPS=($(expand_ip_range "$PREFILL_LONG_PROMPT_IP_SPEC"))
+        export MASTER_ADDR="$PREFILL_LONG_PROMPT_MASTER_ADDR"
+        export MASTER_PORT="$PREFILL_LONG_PROMPT_MASTER_PORT"
+        export PP_SIZE=$PREFILL_LONG_PROMPT_PP_SIZE
+    else
+        NODE_IPS=($(expand_ip_range "$PREFILL_IP_SPEC"))
+        export MASTER_ADDR="$PREFILL_MASTER_ADDR"
+        export MASTER_PORT="$PREFILL_MASTER_PORT"
+        export PP_SIZE=$PREFILL_PP_SIZE
+    fi
     export WORLD_SIZE=${#NODE_IPS[@]}
-    export MASTER_ADDR="$PREFILL_MASTER_ADDR"
-    export MASTER_PORT="$PREFILL_MASTER_PORT"
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="prefill"
-    export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="1"
     export SGLANG_SKIP_HTTP=1
+    export TP_SIZE=$PREFILL_TP_SIZE
+    export DP_SIZE=$PREFILL_DP_SIZE
+    export EP_SIZE=$PREFILL_EP_SIZE
     export PP_SIZE=$PREFILL_PP_SIZE
+    export MODEL_PATH=$MODEL_PATH_PREFILL
 }
 
 # ------------------------------------------------------------
@@ -205,11 +253,13 @@ decode_config() {
     export MASTER_PORT="$DECODE_MASTER_PORT"
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="decode"
-    export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="0"
     export SGLANG_SKIP_HTTP=1
+    export TP_SIZE=$DECODE_TP_SIZE
+    export DP_SIZE=$DECODE_DP_SIZE
+    export EP_SIZE=$DECODE_EP_SIZE
     export PP_SIZE=$DECODE_PP_SIZE
+    export MODEL_PATH=$MODEL_PATH_DECODE
 }
 
 # ------------------------------------------------------------
@@ -222,8 +272,6 @@ native_config() {
     export MASTER_PORT="$NATIVE_MASTER_PORT"
     export NODE_IPS_LIST="${NODE_IPS[*]}"
     export ROLE="native"
-    export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 }
 
 # ------------------------------------------------------------
@@ -232,8 +280,6 @@ native_config() {
 router_config() {
     export ROLE="router"
     export NODE_IPS_LIST="$ROUTER_IP"
-    export LOG_DIR="${LOG_BASE_DIR}/$(date +%y%m%d)/$ROLE/$(date +%H%M%S)"
-    export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
     export IS_PREFILL="0"
     export SGLANG_LAUNCH_HTTP_ONLY=1
 }
@@ -262,6 +308,10 @@ case "$ACTION" in
         return 1
         ;;
 esac
+
+source "${SCRIPT_DIR}/.time_env.sh"
+export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/$ROLE/${LOG_TIME}"
+export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 
 if [[ "$IS_PREFILL" == "1" ]]; then
     export SGLANG_KUNPENG_MAX_SEQ_NUM=4

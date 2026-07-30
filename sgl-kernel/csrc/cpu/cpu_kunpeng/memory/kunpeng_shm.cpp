@@ -115,10 +115,9 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
     intra_socket_size = g_intra_socket_group->getSize();
     intra_socket_rank = g_intra_socket_group->getRank();
 
-    TORCH_CHECK(intra_node_size == 16, "intra_node_size != 16");
-    TORCH_CHECK(intra_socket_size == 8, "intra_socket_size != 8");
+    TORCH_CHECK(intra_node_size % 8 == 0, "intra_node_size must be divisible by 8, got ", intra_node_size);
+    TORCH_CHECK(intra_socket_size == 8, "intra_socket_size != 8");	 
     TORCH_CHECK(intra_die_size == 4, "intra_die_size != 4");
-
     int pid = getpid();
 
     kupl_shm_oob_cb_t oob_cbs;
@@ -309,9 +308,5 @@ void shm_fence_kunpeng(int64_t attn_tp_size)
 {
     TORCH_CHECK(attn_tp_size == 8 || attn_tp_size == 16,
                 "Unsupported attn_tp_size for shm_fence_kunpeng: ", attn_tp_size);
-    if (attn_tp_size == 16) {
-        kupl_shm_fence(kupl_win_intra_node);
-    } else {  // attn_tp_size == 8
-        kupl_shm_fence(kupl_win_intra_socket);
-    }
+    kupl_shm_fence(kupl_win_intra_node);
 }

@@ -170,6 +170,14 @@ class DeepseekModelNextN(nn.Module):
         else:
             self.cp_size = None
 
+        if _is_cpu_920f:
+            from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
+                KunpengSwapManager,
+            )
+
+            self.swap_mgr = KunpengSwapManager.get_instance()
+            self.swap_moe_layer_indices = [0]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -187,6 +195,17 @@ class DeepseekModelNextN(nn.Module):
                 input_embeds.device if input_embeds is not None else input_ids.device
             ),
         )
+
+        if _is_cpu_920f and self.swap_moe_layer_indices:
+            self.swap_mgr.swap_expert_layer(
+                0,
+                self.decoder.mlp.experts.w13_weight,
+                self.decoder.mlp.experts.w2_weight,
+            )
+        if _is_cpu_920f:
+            self.swap_mgr.swap_kv_layer(
+                0, forward_batch.token_to_kv_pool.get_key_buffer(0)
+            )
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -292,9 +311,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nextn_quant_config = quant_config
         # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
         if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
-            from sglang.srt.layers.quantization.quark.utils import (
-                should_ignore_layer,
-            )
+            from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 
             ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
             mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
