@@ -436,8 +436,6 @@ def _resolve_offset_cpus(offset: int) -> List[int]:
 
 
 _BIND_VERIFY_MAX_RETRIES = 5
-_ZMQ_GLOBAL_OFFSET: int = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
-_MOONCAKE_GLOBAL_OFFSET: int = envs.SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET.get()
 
 
 def _process_core_binding(offset: Optional[int], pid: Optional[int] = None) -> None:
@@ -464,6 +462,9 @@ def _process_core_binding(offset: Optional[int], pid: Optional[int] = None) -> N
         f"Failed to bind pid {pid} to CPUs {sorted(target)} after "
         f"{_BIND_VERIFY_MAX_RETRIES} attempts, current affinity: {sorted(actual)}"
     )
+
+
+_ZMQ_GLOBAL_OFFSET: int = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
 
 
 class ZmqOffset(enum.IntEnum):
@@ -569,7 +570,7 @@ def zmq_context_core_binding(ctx, offset: int):
 
 def mooncake_binding_wrapper(func):
     def wrapper(*args, **kwargs):
-        offset = _MOONCAKE_GLOBAL_OFFSET
+        offset = envs.SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET.get()
         saved_cpu = os.sched_getaffinity(0)
         saved_membind = _get_membind()
         _process_core_binding(offset=offset)
