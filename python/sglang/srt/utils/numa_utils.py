@@ -435,9 +435,6 @@ def _resolve_offset_cpus(offset: int) -> List[int]:
     return result
 
 
-_BIND_VERIFY_MAX_RETRIES = 5
-
-
 def _process_core_binding(offset: Optional[int], pid: Optional[int] = None) -> None:
     if offset is None:
         return
@@ -449,22 +446,9 @@ def _process_core_binding(offset: Optional[int], pid: Optional[int] = None) -> N
         return
 
     os.sched_setaffinity(pid, cpu_list)
-    # Verify the affinity actually took effect; retry on mismatch (setaffinity can
-    # silently fail or be overridden by cgroup/cpuset constraints).
-    target = set(cpu_list)
-    for attempt in range(_BIND_VERIFY_MAX_RETRIES):
-        actual = os.sched_getaffinity(pid)
-        if actual == target:
-            return
-        os.sched_setaffinity(pid, cpu_list)
-        time.sleep(0.01)
-    logger.warning(
-        f"Failed to bind pid {pid} to CPUs {sorted(target)} after "
-        f"{_BIND_VERIFY_MAX_RETRIES} attempts, current affinity: {sorted(actual)}"
-    )
 
 
-_ZMQ_GLOBAL_OFFSET: int = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
+_zmq_global_offset: int = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
 
 
 class ZmqOffset(enum.IntEnum):
@@ -477,7 +461,7 @@ class ZmqOffset(enum.IntEnum):
     Iterating ZmqOffset yields only canonical bucket members; aliases are skipped.
     """
 
-    BASE = 0 if _ZMQ_GLOBAL_OFFSET is None else _ZMQ_GLOBAL_OFFSET
+    BASE = 0 if _zmq_global_offset is None else _zmq_global_offset
 
     # ===== Core buckets (canonical, one independent offset each) =====
     TOKENIZER_MANAGER        = BASE          # bucket 0: tokenizer entry side
@@ -533,7 +517,7 @@ def _validate_zmq_offset_range() -> None:
     that are too short, leaving the corresponding socket unbound on that node.
     Early warning helps the user tune SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.
     """
-    if _ZMQ_GLOBAL_OFFSET is None:
+    if _zmq_global_offset is None:
         return
     if libnuma is None or libnuma.numa_available() < 0:
         return
@@ -556,7 +540,7 @@ _validate_zmq_offset_range()
 
 
 def zmq_context_core_binding(ctx, offset: int):
-    if _ZMQ_GLOBAL_OFFSET is None:
+    if _zmq_global_offset is None:
         return ctx
 
     if libnuma is None:
