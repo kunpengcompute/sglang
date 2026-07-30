@@ -91,7 +91,7 @@ DECODE_MASTER_PORT="5010"
 
 NATIVE_IP_SPEC="xxx.xxx.xxx. | 17-32"
 NATIVE_MASTER_ADDR="xxx.xxx.xxx.1"
-NATIVE_MASTER_PORT="5010"       
+NATIVE_MASTER_PORT="5010"
 
 # Router node IP (single IP for PD disaggregation router)
 export ROUTER_IP="xxx.xxx.xxx.1"
@@ -115,15 +115,14 @@ export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
 # Required when SGLANG_ENABLE_TOKENIZER_SEPERATE=1 (used by tokenizer-side HTTP servers)
 export LIBPTHREAD_HOOK_PATH="/path/to/libpthread_hook.so"
 export GEMM_TILING_PLAN_FILE="$SGLANG_PATH/scripts/cpu_kunpeng/configs"
-
 # Kunpeng SDMA driver
 export SDMA_KO_PATH="/path-to-sdma-ko"
 
-# TP/EP size
+# Native TP/EP size
 export TP_SIZE=256
 export DP_SIZE=16
 export EP_SIZE=${TP_SIZE}
-export PP_SIZE=1 # >1 enable pp  eg: 2
+export PP_SIZE=1  # >1 enable pp  eg: 2
 
 # Prefill TP/EP/PP size
 export PREFILL_TP_SIZE=${TP_SIZE}
@@ -136,7 +135,6 @@ export DECODE_TP_SIZE=${TP_SIZE}
 export DECODE_DP_SIZE=${DP_SIZE}
 export DECODE_EP_SIZE=${DECODE_TP_SIZE}
 export DECODE_PP_SIZE=${PP_SIZE}
-
 
 # PP size and chunked prefill size can be configured independently
 export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size
@@ -159,12 +157,12 @@ export MV2_COMM_WORLD_LOCAL_SIZE=16
 # Thread
 export OMP_NUM_THREADS=1
 export OMP_PROC_BIND=false
-export TORCH_USE_KUPL=1
 export KUPL_EXECUTOR_BACKEND=pthread
-export KUPL_EXECUTOR_COUNT=32
+export KUPL_EXECUTOR_COUNT=33  # set to 32 when SGLANG_FORWARD_ASYNC=0
+export SGLANG_FORWARD_ASYNC=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export TORCH_COMPILE_DISABLE=1
 export SGLANG_ENABLE_TORCH_COMPILE=0
-export SGLANG_FORWARD_ASYNC=0
+export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=4
 
 # SGLang
 export SGLANG_LOG_MS=1
@@ -172,8 +170,6 @@ export SGLANG_USE_CPU_ENGINE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_WARMUP_TIMEOUT=1600
-# Force query prefill DP rank, when disaggregation and curl -d is needed
-export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
@@ -202,13 +198,13 @@ export SGLANG_ENABLE_GRAPH_CAPTURE=0
 export SGLANG_ENABLE_GRAPH_PROFILE=0
 # Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
-# PD disaggregation mode
+# PD disaggregation mode for kutacc
 export IS_PREFILL="1"
 # Other options
 export DROP_CACHES=0
 
 # ------------------------------------------------------------
-# load local config
+# Load local config
 # ------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_ENV_ROLE="${1:-native}"
@@ -217,69 +213,58 @@ if [[ -f "$SCRIPT_DIR/.user_env.sh" ]]; then
 fi
 
 # ------------------------------------------------------------
-# Function: prefill_config
+# Helpers: resolve variables by role prefix (PREFILL / DECODE / NATIVE)
+# ------------------------------------------------------------
+_export_node_config() {
+    local prefix="$1"
+    local _var
+    _var="${prefix}_IP_SPEC";     NODE_IPS=($(expand_ip_range "${!_var}"))
+    _var="${prefix}_MASTER_ADDR"; export MASTER_ADDR="${!_var}"
+    _var="${prefix}_MASTER_PORT"; export MASTER_PORT="${!_var}"
+    export WORLD_SIZE=${#NODE_IPS[@]}
+    export NODE_IPS_LIST="${NODE_IPS[*]}"
+}
+
+_export_pd_vars() {
+    local prefix="$1"
+    local _var
+    _var="${prefix}_TP_SIZE";    export TP_SIZE="${!_var}"
+    _var="${prefix}_DP_SIZE";    export DP_SIZE="${!_var}"
+    _var="${prefix}_EP_SIZE";    export EP_SIZE="${!_var}"
+    _var="${prefix}_PP_SIZE";    export PP_SIZE="${!_var}"
+    _var="MODEL_PATH_${prefix}"; export MODEL_PATH="${!_var}"
+}
+
+# ------------------------------------------------------------
+# Per-role config functions (called via "${ACTION}_config")
 # ------------------------------------------------------------
 prefill_config() {
+    _export_pd_vars "PREFILL"
     local instance="${PREFILL_INSTANCE:-1}"
+    local _prefix
     if [[ "$instance" == "long_prompt" ]]; then
-        NODE_IPS=($(expand_ip_range "$PREFILL_LONG_PROMPT_IP_SPEC"))
-        export MASTER_ADDR="$PREFILL_LONG_PROMPT_MASTER_ADDR"
-        export MASTER_PORT="$PREFILL_LONG_PROMPT_MASTER_PORT"
         export PP_SIZE=$PREFILL_LONG_PROMPT_PP_SIZE
+        _prefix="PREFILL_LONG_PROMPT"
     else
-        NODE_IPS=($(expand_ip_range "$PREFILL_IP_SPEC"))
-        export MASTER_ADDR="$PREFILL_MASTER_ADDR"
-        export MASTER_PORT="$PREFILL_MASTER_PORT"
-        export PP_SIZE=$PREFILL_PP_SIZE
+        _prefix="PREFILL"
     fi
-    export WORLD_SIZE=${#NODE_IPS[@]}
-    export NODE_IPS_LIST="${NODE_IPS[*]}"
-    export ROLE="prefill"
+    _export_node_config "$_prefix"
     export IS_PREFILL="1"
     export SGLANG_SKIP_HTTP=1
-    export TP_SIZE=$PREFILL_TP_SIZE
-    export DP_SIZE=$PREFILL_DP_SIZE
-    export EP_SIZE=$PREFILL_EP_SIZE
-    export PP_SIZE=$PREFILL_PP_SIZE
-    export MODEL_PATH=$MODEL_PATH_PREFILL
 }
 
-# ------------------------------------------------------------
-# Function: decode_config
-# ------------------------------------------------------------
 decode_config() {
-    NODE_IPS=($(expand_ip_range "$DECODE_IP_SPEC"))
-    export WORLD_SIZE=${#NODE_IPS[@]}
-    export MASTER_ADDR="$DECODE_MASTER_ADDR"
-    export MASTER_PORT="$DECODE_MASTER_PORT"
-    export NODE_IPS_LIST="${NODE_IPS[*]}"
-    export ROLE="decode"
+    _export_pd_vars "DECODE"
+    _export_node_config "DECODE"
     export IS_PREFILL="0"
     export SGLANG_SKIP_HTTP=1
-    export TP_SIZE=$DECODE_TP_SIZE
-    export DP_SIZE=$DECODE_DP_SIZE
-    export EP_SIZE=$DECODE_EP_SIZE
-    export PP_SIZE=$DECODE_PP_SIZE
-    export MODEL_PATH=$MODEL_PATH_DECODE
 }
 
-# ------------------------------------------------------------
-# Function: native_config
-# ------------------------------------------------------------
 native_config() {
-    NODE_IPS=($(expand_ip_range "$NATIVE_IP_SPEC"))
-    export WORLD_SIZE=${#NODE_IPS[@]}
-    export MASTER_ADDR="$NATIVE_MASTER_ADDR"
-    export MASTER_PORT="$NATIVE_MASTER_PORT"
-    export NODE_IPS_LIST="${NODE_IPS[*]}"
-    export ROLE="native"
+    _export_node_config "NATIVE"
 }
 
-# ------------------------------------------------------------
-# Function: router_config
-# ------------------------------------------------------------
 router_config() {
-    export ROLE="router"
     export NODE_IPS_LIST="$ROUTER_IP"
     export IS_PREFILL="0"
     export SGLANG_LAUNCH_HTTP_ONLY=1
@@ -292,17 +277,8 @@ ACTION="${1:-native}"
 shift
 
 case "$ACTION" in
-    prefill)
-        prefill_config
-        ;;
-    decode)
-        decode_config
-        ;;
-    native)
-        native_config
-        ;;
-    router)
-        router_config
+    prefill|decode|native|router)
+        "${ACTION}_config"
         ;;
     *)
         echo "Usage: source env.sh [prefill|decode|native|router]" >&2
@@ -311,7 +287,7 @@ case "$ACTION" in
 esac
 
 source "${SCRIPT_DIR}/.time_env.sh"
-export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/$ROLE/${LOG_TIME}"
+export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/$ACTION/${LOG_TIME}"
 export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 
 if [[ "$IS_PREFILL" == "1" ]]; then
@@ -322,7 +298,7 @@ else
     export SGLANG_KUNPENG_MAX_CUR_LEN=1
 fi
 
-if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ROLE" == "router" ]]; then
+if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]]; then
     source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 
     export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}

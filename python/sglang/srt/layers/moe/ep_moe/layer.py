@@ -823,7 +823,7 @@ class KunpengMoE(FusedMoE):
         t_total_end = time.perf_counter()
         if envs.SGLANG_KUNPENG_PROFILE.get():
             logger.info(
-                f"[KunpengMoE rank={self.moe_ep_rank}] run_moe_core timing (ms): "
+                f"|   |---run_moe_core timing (ms): "
                 f"gateup={1000*(t_gateup_end - t_gateup_start):.2f}, "
                 f"silu_mul_quant={1000*(t_silu_end - t_silu_start):.2f}, "
                 f"down={1000*(t_down_end - t_down_start):.2f}, "
