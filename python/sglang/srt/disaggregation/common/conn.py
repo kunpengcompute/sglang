@@ -42,7 +42,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
-from sglang.srt.utils.numa_utils import zmq_context_core_binding
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ class CommonKVManager(BaseKVManager):
         )
 
         # bind zmq socket
-        context = zmq_context_core_binding(zmq.Context())
+        context = zmq_context_core_binding(zmq.Context(), ZmqOffset.PD_COMMON_KV_MANAGER)
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             context, zmq.PULL, host=self.local_ip
         )
@@ -417,7 +417,8 @@ class CommonKVManager(BaseKVManager):
 
     @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
-        socket = zmq_context_core_binding(zmq.Context()).socket(zmq.PUSH)
+        ctx = zmq_context_core_binding(zmq.Context(), ZmqOffset.PD_COMMON_KV_MANAGER)
+        socket = ctx.socket(zmq.PUSH)
         if is_ipv6:
             socket.setsockopt(zmq.IPV6, 1)
         socket.connect(endpoint)
@@ -607,7 +608,7 @@ class CommonKVSender(BaseKVSender):
 
 
 class CommonKVReceiver(BaseKVReceiver):
-    _ctx = zmq_context_core_binding(zmq.Context())
+    _ctx = zmq_context_core_binding(zmq.Context(), ZmqOffset.PD_COMMON_KV_RECEIVER)
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()

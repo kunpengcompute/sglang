@@ -30,7 +30,7 @@ from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
 from sglang.srt.utils.network import NetworkAddress, get_zmq_socket
-from sglang.srt.utils.numa_utils import zmq_context_core_binding
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 
 logger = logging.getLogger(__name__)
 SGLangEncoderServicer = sglang_encoder_pb2_grpc.SglangEncoderServicer
@@ -208,7 +208,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
 
 async def serve_grpc_encoder(server_args: ServerArgs):
     ctx = mp.get_context("spawn")
-    zmq_ctx = zmq_context_core_binding(zmq.asyncio.Context(10))
+    zmq_ctx = zmq_context_core_binding(zmq.asyncio.Context(10), ZmqOffset.PD_ENCODE_GRPC_SERVER)
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
 

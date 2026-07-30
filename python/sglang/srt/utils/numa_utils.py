@@ -421,13 +421,6 @@ def _get_node_cpus(node: int) -> List[int]:
     return _NODE_TO_CPUS_CACHE[node]
 
 
-def _offset_is_valid(offset: int) -> bool:
-    # todo
-    if offset is None:
-        return False
-    return True
-
-
 def _resolve_offset_cpus(offset: int) -> List[int]:
     nodes = _current_affinity_numa_nodes()
     result = []
@@ -455,9 +448,99 @@ def _process_core_binding(offset: int, pid: Optional[int] = None) -> None:
     os.sched_setaffinity(pid, cpu_list)
 
 
-def zmq_context_core_binding(ctx):
-    offset = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
-    if not _offset_is_valid(offset):
+_zmq_global_offset: int = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
+
+
+class ZmqOffset(enum.IntEnum):
+    """CPU affinity offset for ZMQ sockets, organized by core buckets.
+
+    Each bucket is an independent CPU offset (relative to BASE). Multiple names
+    within the same bucket are aliases (IntEnum semantics), meaning those sockets
+    intentionally share one core -- they do not run hot simultaneously, or benefit
+    from sharing cache. Changing a bucket's offset propagates to all its aliases.
+    Iterating ZmqOffset yields only canonical bucket members; aliases are skipped.
+    """
+
+    BASE = 0 if _zmq_global_offset is None else _zmq_global_offset
+
+    # ===== Core buckets (canonical, one independent offset each) =====
+    TOKENIZER_MANAGER        = BASE          # bucket 0: tokenizer entry side
+    DETOKENIZER_MANAGER      = BASE + 1      # bucket 1: detokenizer
+    DATA_PARALLEL_CONTROLLER = BASE + 2      # bucket 2: dp control plane
+    SCHEDULER                = BASE + 3      # bucket 3: scheduler
+    MODEL_PARALLEL_COMM      = BASE + 4      # bucket 4: model parallel comm groups
+    PD_KV_TRANSPORT          = BASE + 5      # bucket 5: pd kv transport
+    PD_ENCODE_SERVER         = BASE + 6      # bucket 6: pd encode server (grpc / mm receiver / mm encoder)
+    SGLANG_ENGINE            = BASE + 7      # bucket 7: engine request/response path
+    MISC                     = BASE + 8      # bucket 8: maintenance ops (expert backup / checkpoint / dumper)
+
+    # ===== Aliases (reference a bucket above to share its core) =====
+    # tokenizer entry side (shares bucket 0)
+    SOCKET_MAPPING           = TOKENIZER_MANAGER
+    MULTI_TOKENIZER_ROUTER   = TOKENIZER_MANAGER
+
+    # model parallel comm groups (share bucket 4)
+    TP                       = MODEL_PARALLEL_COMM
+    ATTN_CP                  = MODEL_PARALLEL_COMM
+    ATTN_TP                  = MODEL_PARALLEL_COMM
+    SOCKET_TP                = MODEL_PARALLEL_COMM
+    MOE_DP                   = MODEL_PARALLEL_COMM
+    MOE_EP                   = MODEL_PARALLEL_COMM
+    MOE_TP                   = MODEL_PARALLEL_COMM
+    PP                       = MODEL_PARALLEL_COMM
+
+    # pd kv transport (shares bucket 5)
+    PD_COMMON_KV_MANAGER     = PD_KV_TRANSPORT
+    PD_COMMON_KV_RECEIVER    = PD_KV_TRANSPORT
+    PD_KV_EVENT              = PD_KV_TRANSPORT
+    PD_PREFETCH              = PD_KV_TRANSPORT
+
+    # pd encode server (shares bucket 6)
+    PD_ENCODE_GRPC_SERVER    = PD_ENCODE_SERVER
+    PD_WAITING_IMAGE_REQUEST = PD_ENCODE_SERVER
+    PD_MM_RECEIVER_BASE      = PD_ENCODE_SERVER
+    PD_MM_ENCODER_ASYNC      = PD_ENCODE_SERVER
+    PD_MM_ENCODER            = PD_ENCODE_SERVER
+
+    # maintenance ops (shares bucket 8)
+    EXPERT_BACKUP_CLIENT     = MISC
+    EXPERT_BACKUP_MANAGER    = MISC
+    CHECKPOINT_ENGINE        = MISC
+    DUMPER                   = MISC
+
+
+def _validate_zmq_offset_range() -> None:
+    """Check that the max relative offset of ZmqOffset fits within the available
+    CPUs of each NUMA node in the current affinity.
+
+    Emits only a warning when exceeded: _resolve_offset_cpus silently skips nodes
+    that are too short, leaving the corresponding socket unbound on that node.
+    Early warning helps the user tune SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.
+    """
+    if _zmq_global_offset is None:
+        return
+    if libnuma is None or libnuma.numa_available() < 0:
+        return
+    try:
+        max_relative_offset = max(int(member) - int(ZmqOffset.BASE) for member in ZmqOffset)
+        for node in sorted(_current_affinity_numa_nodes()):
+            cpu_count = len(_get_node_cpus(node))
+            if cpu_count <= max_relative_offset:
+                logger.warning(
+                    f"NUMA node {node} has {cpu_count} CPUs, but ZmqOffset requires "
+                    f"offset up to {max_relative_offset} (BASE={int(ZmqOffset.BASE)}). "
+                    f"Sockets with offset >= {cpu_count} on this node will not be bound. "
+                    f"Consider reducing SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET or increasing node CPU count."
+                )
+    except Exception as e:
+        logger.debug(f"validate zmq offset range failed: {e}")
+
+
+_validate_zmq_offset_range()
+
+
+def zmq_context_core_binding(ctx, offset: int):
+    if _zmq_global_offset is None:
         return ctx
 
     if libnuma is None:

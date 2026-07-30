@@ -30,7 +30,7 @@ except ImportError:
         "Please install it with: pip install sglang[checkpoint-engine]"
     )
 
-from sglang.srt.utils.numa_utils import zmq_context_core_binding
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ class SGLangCheckpointEngineWorkerExtension:
             zmq_handles: Dict mapping device UUID to ZMQ socket path
         """
         if self._zmq_ctx is None:
-            self._zmq_ctx = zmq_context_core_binding(zmq.Context())
+            self._zmq_ctx = zmq_context_core_binding(zmq.Context(), ZmqOffset.CHECKPOINT_ENGINE)
         device_uuid = self.get_device_uuid()
         device_id = self.get_device_id()
         if device_uuid not in zmq_handles:

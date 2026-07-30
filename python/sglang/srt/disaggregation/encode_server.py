@@ -56,7 +56,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket,
 )
-from sglang.srt.utils.numa_utils import zmq_context_core_binding
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 
 logger = logging.getLogger(__name__)
 
@@ -243,8 +243,8 @@ class MMEncoder:
             device_config=self.device_config,
         )
 
-        self.context = zmq_context_core_binding(zmq.asyncio.Context(2))
-        self.sync_context = zmq_context_core_binding(zmq.Context())  # Reuse sync context for thread pool
+        self.context = zmq_context_core_binding(zmq.asyncio.Context(2), ZmqOffset.PD_MM_ENCODER_ASYNC)
+        self.sync_context = zmq_context_core_binding(zmq.Context(), ZmqOffset.PD_MM_ENCODER)  # Reuse sync context for thread pool
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
