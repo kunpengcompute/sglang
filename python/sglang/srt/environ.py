@@ -569,11 +569,13 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
-    # CPU(Kunpeng 920F)
+    # KUNPENG_CPU
     SGLANG_USE_CPU_920F = EnvBool(False)
     SGLANG_KUNPENG_PROFILE = EnvBool(False)
-    SGLANG_ENABLE_BINARY_LAUNCH = EnvBool(False)
-    SGLANG_KUNPENG_RDMA_ALLGATHER = EnvBool(True)
+    SGLANG_ENABLE_BINARY_LAUNCH = EnvBool(True)
+    SGLANG_KUNPENG_RDMA_ALLGATHER = EnvBool(False)
+    SGLANG_KUNPENG_MAX_SEQ_NUM = EnvInt(128)
+    SGLANG_FORWARD_ASYNC = EnvBool(True)
 
 
 envs = Envs()

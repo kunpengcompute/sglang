@@ -626,7 +626,7 @@ def sampling_from_probs_torch(
     """
     if sampling_seed is None:
         if _is_cpu_920f:
-            sampled_index = kunpeng.multinomial_kunpeng(probs, 1, True)
+            sampled_index = kunpeng.multinomial_kunpeng(probs.float(), 1, True)
         else:
             sampled_index = torch.multinomial(probs, num_samples=1, replacement=True)
     else:

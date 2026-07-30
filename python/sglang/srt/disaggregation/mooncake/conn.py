@@ -35,9 +35,12 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import is_cpu_920f
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+_is_cpu_920f = is_cpu_920f()
 
 
 class KVTransferError(Exception):
@@ -163,10 +166,14 @@ class KVArgsRegisterInfo:
                 msg[12].decode("ascii") == "1" if len(msg) > 12 else False
             ),
             decode_start_layer=(
-                int(msg[13].decode("ascii")) if len(msg) > 13 and len(msg[13]) > 0 else 0
+                int(msg[13].decode("ascii"))
+                if len(msg) > 13 and len(msg[13]) > 0
+                else 0
             ),
             decode_num_layers=(
-                int(msg[14].decode("ascii")) if len(msg) > 14 and len(msg[14]) > 0 else 0
+                int(msg[14].decode("ascii"))
+                if len(msg) > 14 and len(msg[14]) > 0
+                else 0
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15),
@@ -638,10 +645,7 @@ class MooncakeKVManager(CommonKVManager):
             decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
             total_item_layers = len(item_lens) // 2
             # slice item_lens to match sliced src (MHA: K and V parts)
-            if (
-                decode_num_layers > 0
-                and decode_num_layers < total_item_layers
-            ):
+            if decode_num_layers > 0 and decode_num_layers < total_item_layers:
                 k_item_lens = item_lens[
                     decode_start_layer : decode_start_layer + decode_num_layers
                 ]
@@ -671,7 +675,9 @@ class MooncakeKVManager(CommonKVManager):
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    sliced_item_lens[layers_current_pp_stage + layer_id],  # V item length
+                    sliced_item_lens[
+                        layers_current_pp_stage + layer_id
+                    ],  # V item length
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -690,6 +696,10 @@ class MooncakeKVManager(CommonKVManager):
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+            # Bind executor worker to dedicated CPU (same as transfer_worker).
+            if _is_cpu_920f:
+                os.sched_setaffinity(0, {self.attn_tp_rank * 38 + 19})
+
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
@@ -871,6 +881,10 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
+            # Bind executor worker to dedicated CPU (same as transfer_worker).
+            if _is_cpu_920f:
+                os.sched_setaffinity(0, {self.attn_tp_rank * 38 + 19})
+
             src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
             dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
             src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
@@ -1193,6 +1207,9 @@ class MooncakeKVManager(CommonKVManager):
         staging_buffer=None,
     ):
         staging_strategy = None
+        # Bind transfer_worker to a dedicated CPU to avoid CPU 0 contention.
+        if _is_cpu_920f:
+            os.sched_setaffinity(0, {self.attn_tp_rank * 38 + 19})
 
         while True:
             try:
@@ -1376,19 +1393,11 @@ class MooncakeKVManager(CommonKVManager):
                             num_dst_sessions = len(
                                 self.transfer_infos.get(kv_chunk.room, {})
                             )
-                            should_sync = (
-                                len(polls) == req.required_dst_info_num
-                                or (
-                                    req.required_dst_info_num == 1
-                                    and num_dst_sessions > 1
-                                )
+                            should_sync = len(polls) == req.required_dst_info_num or (
+                                req.required_dst_info_num == 1 and num_dst_sessions > 1
                             )
                             if should_sync:
-                                status = (
-                                    KVPoll.Success
-                                    if all(polls)
-                                    else KVPoll.Failed
-                                )
+                                status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
@@ -1426,6 +1435,10 @@ class MooncakeKVManager(CommonKVManager):
     def start_prefill_thread(self):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
+            # Bind to dedicated CPU (attn_tp_rank * 38 + 19) to avoid CPU 0 contention.
+            if _is_cpu_920f:
+                os.sched_setaffinity(0, {self.attn_tp_rank * 38 + 19})
+
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
@@ -1503,6 +1516,10 @@ class MooncakeKVManager(CommonKVManager):
 
     def start_decode_thread(self):
         def decode_thread():
+            # Bind to dedicated CPU (attn_tp_rank * 38 + 19) to avoid CPU 0 contention.
+            if _is_cpu_920f:
+                os.sched_setaffinity(0, {self.attn_tp_rank * 38 + 19})
+
             while True:
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
@@ -1576,6 +1593,10 @@ class MooncakeKVManager(CommonKVManager):
                     self.update_status(bootstrap_room, status)
 
         def heartbeat_checker():
+            # Bind to dedicated CPU (attn_tp_rank * 38 + 19) to avoid CPU 0 contention.
+            if _is_cpu_920f:
+                os.sched_setaffinity(0, {self.attn_tp_rank * 38 + 19})
+
             while True:
                 time.sleep(self.heartbeat_interval)
                 with self.connection_lock:

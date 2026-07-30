@@ -584,7 +584,7 @@ class KunpengDispatcher(BaseDispatcher):
 
         if envs.SGLANG_KUNPENG_PROFILE.get():
             logger.info(
-                f"[KunpengMoE rank={self.ep_rank}] dispatch_send timing (ms): "
+                f"|   |---dispatch_send timing (ms): "
                 f"quant_and_copy={1000*(t_quant_and_copy_end - t_quant_and_copy_start):.2f}, "
                 f"dispatch_send={1000*(t_send_end - t_send_start):.2f}, "
                 f"num_tokens={num_tokens}, batch_size={batch_size}"
@@ -632,7 +632,7 @@ class KunpengDispatcher(BaseDispatcher):
         t_total_end = time.perf_counter()
         if envs.SGLANG_KUNPENG_PROFILE.get():
             logger.info(
-                f"[KunpengMoE rank={self.ep_rank}] dispatch_recv timing (ms): "
+                f"|   |---dispatch_recv timing (ms): "
                 f"dispatch_recv={1000*(t_recv_end - t_recv_start):.2f}, "
                 f"topk_convert={1000*(t_convert_end - t_convert_start):.2f}, "
                 f"total_dispatch={1000*(t_total_end - t_total_start):.2f}, "
@@ -706,13 +706,6 @@ class KunpengDispatcher(BaseDispatcher):
             "t_send_end": t_send_end,
         }
 
-        if envs.SGLANG_KUNPENG_PROFILE.get():
-            logger.info(
-                f"[KunpengMoE rank={self.ep_rank}] combine_send timing (ms): "
-                f"combine_send={1000*(t_send_end - t_send_start):.2f}, "
-                f"num_tokens={num_tokens}, batch_size={batch_size}"
-            )
-
     @KunpengProfiler(depth=2)
     def combine_recv(self) -> torch.Tensor:
         """Phase 2 of combine: wait for RDMA + weighted reduction.
@@ -742,14 +735,6 @@ class KunpengDispatcher(BaseDispatcher):
         t_recv_end = time.perf_counter()
 
         result = state.combined_x[:batch_size]
-
-        if envs.SGLANG_KUNPENG_PROFILE.get():
-            logger.info(
-                f"[KunpengMoE rank={self.ep_rank}] combine_recv timing (ms): "
-                f"combine_send={1000*(t_send_end - t_send_start):.2f}, "
-                f"combine_recv={1000*(t_recv_end - t_recv_start):.2f}, "
-                f"num_tokens={num_tokens}, batch_size={batch_size}"
-            )
 
         self._combine_pending = None
         return result

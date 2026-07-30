@@ -67,6 +67,7 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -256,6 +257,7 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
 _is_cpu_920f = is_cpu_920f()
+_enable_kunpeng_profile = envs.SGLANG_KUNPENG_PROFILE.get()
 
 
 @dataclass
@@ -1531,9 +1533,13 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if _is_cpu_920f and _enable_kunpeng_profile:
+                    KunpengProfiler.enabled = True
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
+                if _is_cpu_920f and _enable_kunpeng_profile:
+                    KunpengProfiler.enabled = False
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
 
@@ -1635,6 +1641,7 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    @KunpengProfiler
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1821,6 +1828,7 @@ class Scheduler(
         ]
         return work_reqs, control_reqs
 
+    @KunpengProfiler
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
@@ -3084,6 +3092,7 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    @KunpengProfiler
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -3879,10 +3888,12 @@ def configure_scheduler_process(
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         if _is_cpu_920f:
             p = psutil.Process(os.getpid())
-            tp_ranks_in_node = (server_args.tp_size * server_args.pp_size ) // server_args.nnodes
+            tp_ranks_in_node = (
+                server_args.tp_size * server_args.pp_size
+            ) // server_args.nnodes
             tp_rank_in_node = tp_rank % tp_ranks_in_node
             # TODO (kunpeng): hard code here, should use a more elegant way.
-            if os.environ.get("SGLANG_FORWARD_ASYNC", "0") == "1":
+            if envs.SGLANG_FORWARD_ASYNC.get():
                 p.cpu_affinity(
                     list(range(tp_rank_in_node * 38, tp_rank_in_node * 38 + 17))
                     + list(range(tp_rank_in_node * 38 + 21, tp_rank_in_node * 38 + 37))
@@ -3902,12 +3913,6 @@ def configure_scheduler_process(
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
             numa_bind_to_node(numa_node)
-
-    if _is_cpu_920f and os.environ.get("TORCH_USE_KUPL", "") == "1":
-        torch.set_num_threads(int(os.environ.get("KUPL_EXECUTOR_COUNT", "1")))
-        logger.info(
-            f"torch_num_threads = {torch.get_num_threads()}, enable kupl multi-threads"
-        )
 
     return dp_rank
 
@@ -3966,16 +3971,16 @@ def run_scheduler_process(
         if pipe_writer is not None:
             pipe_writer.send(scheduler.get_init_info())
 
-        # Isolate the main process from communication threads
-        # assign core 36 on each NUMA node exclusively to the main process.
-        if os.environ.get("SGLANG_FORWARD_ASYNC", "0") == "0":
-            if envs.SGLANG_SET_CPU_AFFINITY.get():
-                if _is_cpu_920f:
-                    p = psutil.Process(os.getpid())
-                    tp_ranks_in_node = (server_args.tp_size * server_args.pp_size ) // server_args.nnodes
-                    tp_rank_in_node = tp_rank % tp_ranks_in_node
-                    # TODO (kunpeng): hard code here, should use a more elegant way.
-                    p.cpu_affinity({tp_rank_in_node * 38 + 16})  # 16
+        # Isolate the main process from communication threads.
+        if envs.SGLANG_SET_CPU_AFFINITY.get():
+            if _is_cpu_920f:
+                p = psutil.Process(os.getpid())
+                tp_ranks_in_node = (
+                    server_args.tp_size * server_args.pp_size
+                ) // server_args.nnodes
+                tp_rank_in_node = tp_rank % tp_ranks_in_node
+                # TODO (kunpeng): hard code here, should use a more elegant way.
+                p.cpu_affinity({tp_rank_in_node * 38 + 17})
 
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()

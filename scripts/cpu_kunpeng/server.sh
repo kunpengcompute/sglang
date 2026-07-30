@@ -46,7 +46,6 @@ BASE_ARGS=(
     --nnodes "$WORLD_SIZE"
     --node-rank "$DP_RANK"
     --dist-timeout 600
-    --enable-dp-attention
     --dp-size "$DP_SIZE"
     --tp-size "$TP_SIZE"
     --ep-size "$EP_SIZE"
@@ -57,9 +56,11 @@ BASE_ARGS=(
     --skip-server-warmup
     --disable-custom-all-reduce
     --disable-radix-cache
-    --disable-overlap-schedule
+    --enable-dp-attention
     --enable-dp-lm-head
     --enable-dp-mlp
+    --disable-overlap-schedule
+    --enable-dp-attention-local-control-broadcast
     --quantization w8a8_int8
     ${LOAD_FORMAT:+--load-format "$LOAD_FORMAT"}
 )
@@ -83,9 +84,9 @@ case "$ROLE" in
         SPECIFIC_ARGS=(
             --disaggregation-mode prefill
             --disaggregation-bootstrap-port 9001
-            --max-prefill-tokens 4096
+            --max-prefill-tokens $((SGLANG_KUNPENG_MAX_SEQ_NUM * SGLANG_KUNPENG_MAX_CUR_LEN))
             --max-total-tokens 18496
-            --prefill-max-requests 4
+            --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
             --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
         )
@@ -102,9 +103,10 @@ case "$ROLE" in
     native)
         SPECIFIC_ARGS=(
             --disaggregation-bootstrap-port 9001
-            --max-prefill-tokens 4096   # long prompt -> 131072
-            --max-total-tokens 18496 # long prompt -> 131072
-            # --context-length 131072 # long prompt
+            --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
+            --max-prefill-tokens $((SGLANG_KUNPENG_MAX_SEQ_NUM * SGLANG_KUNPENG_MAX_CUR_LEN))   # long prompt -> 131072
+            --max-total-tokens 18496    # long prompt -> 131072
+            # --context-length 131072   # long prompt
             --load-balance-method round_robin
         )
         ;;
@@ -144,7 +146,7 @@ case "$ROLE" in
             --host "$ROUTER_IP"
             --disaggregation-bootstrap-port 9001
             --nnodes 1 --node-rank 0 --dist-timeout 600
-            --enable-dp-attention --dp 1 --tp-size 1
+            --dp-size "$DP_SIZE" --tp-size 1
             --max-total-tokens 64
             --skip-server-warmup
         )
@@ -222,10 +224,10 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
             _IB_COUNT=${#_IB_DEVS[@]}
             _ATTN_TP_SIZE=$((TP_SIZE / DP_SIZE))
             if [[ "$_ATTN_TP_SIZE" == "8" ]]; then
-                # attn=8 (dp=32): 1 rank maps to 1 NIC, aligned with prefill attn_rank to avoid cross-subnet RDMA
+                # attn_tp=8 (dp=32): 1 rank maps to 1 NIC, aligned with prefill attn_rank to avoid cross-subnet RDMA
                 _IB_IDX=$((RANK_IN_NODE % _IB_COUNT))
             else
-                # attn=16 (dp=16): 2 ranks share 1 NIC (original formula)
+                # attn_tp=16 (dp=16): 2 ranks share 1 NIC (original formula)
                 _IB_IDX=$((RANK_IN_NODE * _IB_COUNT / (TP_SIZE * PP_SIZE / WORLD_SIZE)))
             fi
             IB_ARGS=(--disaggregation-ib-device "${_IB_DEVS[$_IB_IDX]}")
