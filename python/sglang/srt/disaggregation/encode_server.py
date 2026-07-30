@@ -1414,7 +1414,7 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
 def launch_server(server_args: ServerArgs):
     global encoder
     ctx = mp.get_context("spawn")
-    zmq_ctx = zmq_context_core_binding(zmq.Context(10))
+    zmq_ctx = zmq_context_core_binding(zmq.Context(10), ZmqOffset.PD_ENCODER_LAUNCH_SERVER)
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
     if server_args.dist_init_addr:

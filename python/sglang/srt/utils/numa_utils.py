@@ -395,6 +395,7 @@ class ZmqOffset(enum.IntEnum):
     PD_MM_RECEIVER_BASE      = PD_ENCODE_SERVER
     PD_MM_ENCODER_ASYNC      = PD_ENCODE_SERVER
     PD_MM_ENCODER            = PD_ENCODE_SERVER
+    PD_ENCODER_LAUNCH_SERVER = PD_ENCODE_SERVER
 
     # maintenance ops (shares bucket 8)
     EXPERT_BACKUP_CLIENT     = MISC
