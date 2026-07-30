@@ -1,4 +1,5 @@
 import ctypes
+import enum
 import glob
 import logging
 import math
@@ -21,9 +22,6 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
-
-_cpu_to_node_cache = None
-_node_to_cpus_cache = {}
 
 libnuma = None
 
@@ -248,7 +246,12 @@ def _query_numa_node_for_gpu(device_id: int):
             pass  # Ignore shutdown errors
 
 
-# region: core binding
+# region core binding
+_cpu_to_node_cache = None
+_node_to_cpus_cache = {}
+_zmq_global_offset: int = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
+
+
 def _get_max_node():
     """
     Maximum number of NUMA node.
@@ -340,9 +343,6 @@ def _process_core_binding(offset: Optional[int], pid: Optional[int] = None) -> N
         return
 
     os.sched_setaffinity(pid, cpu_list)
-
-
-_zmq_global_offset: int = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
 
 
 class ZmqOffset(enum.IntEnum):
