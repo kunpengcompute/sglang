@@ -18,6 +18,7 @@ SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_path('purelib')
 UPDATE_SGLANG=false
 UPDATE_KERNEL=false
 UPDATE_KUTACC=false
+UPDATE_KUPL=false
 
 case "$1" in
     sglang)
@@ -29,13 +30,17 @@ case "$1" in
     kutacc)
         UPDATE_KUTACC=true
         ;;
+    kupl)
+        UPDATE_KUPL=true
+        ;;
     ""|all)
         UPDATE_SGLANG=true
         UPDATE_KERNEL=true
         UPDATE_KUTACC=true
+        UPDATE_KUPL=true
         ;;
     *)
-        echo "Usage: $0 [sglang|kernel|kutacc|all] (default: all)"
+        echo "Usage: $0 [sglang|kernel|kutacc|kupl|all] (default: all)"
         exit 1
         ;;
 esac
@@ -61,6 +66,11 @@ check_if_update_needed() {
     fi
     if [ "${UPDATE_KUTACC}" = "true" ]; then
         if [ "$KUTACC_PATH/install/lib/libkutacc.so.25.1.RC1" -nt "$MARKER_FILE" ]; then
+            return 0
+        fi
+    fi
+    if [ "${UPDATE_KUPL}" = "true" ]; then
+        if [ "$KUPL_PATH/lib/libkupl.so.1" -nt "$MARKER_FILE" ]; then
             return 0
         fi
     fi
@@ -106,6 +116,9 @@ for i in $(seq 0 15); do
         fi
         if [ "${UPDATE_KUTACC}" = "true" ]; then
             swap_file "$KUTACC_PATH/install/lib/libkutacc.so.25.1.RC1" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/libkutacc.so.25.1.RC1"
+        fi
+        if [ "${UPDATE_KUPL}" = "true" ]; then
+            swap_file "$KUPL_PATH/lib/libkupl.so.1" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/libkupl.so.1"
         fi
     ) &
 done

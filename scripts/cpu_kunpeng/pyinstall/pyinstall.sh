@@ -47,6 +47,17 @@ if [ ! -f sglang_server.spec ]; then
       --add-binary "$BISHENG_LIB/libomp.so:." \
       --add-binary "$CONDA_ENV_PATH/lib/libstdc++.so.6:." \
       --add-binary "$CONDA_ENV_PATH/lib/libgcc_s.so.1:." \
+      --add-binary "/usr/lib64/libdl.so.2:." \
+      --add-binary "/usr/lib64/libpthread.so.0:." \
+      --add-binary "/usr/lib64/libc.so.6:." \
+      --add-binary "/usr/lib64/libutil.so.1:." \
+      --add-binary "/usr/lib64/libm.so.6:." \
+      --add-binary "/usr/lib64/librt.so.1:." \
+      --add-binary "/usr/lib64/libmemkind.so:." \
+      --add-binary "/usr/lib64/libhwloc.so.15:." \
+      --add-binary "/usr/lib64/libfribidi.so.0:." \
+      --add-binary "/usr/lib64/libresolv.so.2:." \
+      --add-binary "/usr/lib64/libcrypt.so.1:." \
       --add-data "$SGLANG_SRC/sglang:sglang" \
       --add-data "$SITE_PACKAGES/sgl_kernel:sgl_kernel" \
       --hidden-import torch \
