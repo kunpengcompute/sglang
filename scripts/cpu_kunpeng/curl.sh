@@ -15,35 +15,57 @@
 #!/bin/bash
 
 usage() {
-  echo "Usage: $0 [-p] [-s] [-d RANK] [-n NUM] [-m TOKENS] [-f FILE] [-h]"
+  echo "Usage:"
+  echo "  $0 [-d RANK] [-n NUM] [-m TOKENS] [-p] [-s] [-f FILE]                # batch (single request)"
+  echo "  $0 -d RANGE [-n NUM] [-c CONC] [-m TOKENS] [-p] [-s] [-v] [-f FILE]  # round-robin benchmark"
+  echo "  $0 [-i] [-d RANK] [-m TOKENS] [-h]                                   # interactive chat"
+  echo ""
+  echo "Modes (mutually exclusive):"
+  echo "  (default)   Batch mode — single request with an array of prompts."
+  echo "  -d RANGE    Round-robin benchmark — triggered by -d with a range (e.g. 0-15, 0,2,5)."
+  echo "              Reports: throughput (req/s, tok/s) + per-request latency (P50/P99)."
+  echo "  -i          Interactive chat mode — multi-turn streaming conversation."
   echo ""
   echo "Options:"
-  echo "  -p          Enable profiling (start/stop profile)"
-  echo "  -s          Enable streaming mode"
-  echo "  -d RANK     Route to specific DP rank"
-  echo "  -n NUM      Number of requests / prompt entries (default: all lines from file)"
-  echo "  -m TOKENS   Max tokens per request (default: 10)"
-  echo "  -f FILE     Prompt file with one prompt per line (default: prompts/128.txt)"
   echo "  -h          Show this help message"
+  echo "  -m TOKENS   Max tokens per request / per turn (default: 10 batch, 128 chat)"
+  echo "  -d RANK|RANGE  DP rank (e.g. 5) or range (e.g. 0-15, 0,2,5 → triggers round-robin)"
+  echo ""
+  echo "  --- batch & round-robin only ---"
+  echo "  -p          Enable profiling (start/stop profile via separate curl calls)"
+  echo "  -s          Enable streaming mode"
+  echo "  -f FILE     Prompt file, one prompt per line (default: prompts/128.txt)"
+  echo "  -n NUM      Number of requests to send (default: all lines from file)"
+  echo ""
+  echo "  --- round-robin only ---"
+  echo "  -c CONC     Max concurrent requests (default: 64)"
+  echo "  -v          Print each request's full response body"
   exit 0
 }
 
 PROFILE=false
 MAX_TOKENS=10
+MAX_TOKENS_SET=false
 NUM_REQUESTS=0
 STREAM=false
+VERBOSE=false
+INTERACTIVE=false
 DP_ENABLED=false
 DP_RANK=0
+CONCURRENCY=64
 PROMPT_FILE="prompts/128.txt"
 
-while getopts "d:hpsn:m:f:" opt; do
+while getopts "d:hipsvn:m:c:f:" opt; do
   case $opt in
     h) usage ;;
+    i) INTERACTIVE=true ;;
     p) PROFILE=true ;;
     s) STREAM=true ;;
+    v) VERBOSE=true ;;
     d) DP_ENABLED=true; DP_RANK=$OPTARG ;;
     n) NUM_REQUESTS=$OPTARG ;;
-    m) MAX_TOKENS=$OPTARG ;;
+    c) CONCURRENCY=$OPTARG ;;
+    m) MAX_TOKENS=$OPTARG; MAX_TOKENS_SET=true ;;
     f) PROMPT_FILE=$OPTARG ;;
     *) echo "Invalid option: -$OPTARG" >&2
        exit 1 ;;
@@ -52,25 +74,31 @@ done
 
 shift $((OPTIND - 1))
 
-if [ ! -f "$PROMPT_FILE" ]; then
+# =============================================================================
+# Common setup
+# =============================================================================
+
+if [ "$INTERACTIVE" = false ] && [ ! -f "$PROMPT_FILE" ]; then
   echo "Error: file not found: $PROMPT_FILE" >&2
   exit 1
 fi
 
-# Read prompts from file (one per line)
+# Read prompts from file (one per line) — only for non-interactive modes
 PROMPTS=()
-while IFS= read -r line || [ -n "$line" ]; do
-  PROMPTS+=("$line")
-done < "$PROMPT_FILE"
+if [ "$INTERACTIVE" = false ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    PROMPTS+=("$line")
+  done < "$PROMPT_FILE"
 
-if [ ${#PROMPTS[@]} -eq 0 ]; then
-  echo "Error: prompt file is empty" >&2
-  exit 1
-fi
+  if [ ${#PROMPTS[@]} -eq 0 ]; then
+    echo "Error: prompt file is empty" >&2
+    exit 1
+  fi
 
-# Default NUM_REQUESTS to all lines from file if not specified
-if [ "$NUM_REQUESTS" -eq 0 ]; then
-  NUM_REQUESTS=${#PROMPTS[@]}
+  # Default NUM_REQUESTS to all lines from file if not specified
+  if [ "$NUM_REQUESTS" -eq 0 ]; then
+    NUM_REQUESTS=${#PROMPTS[@]}
+  fi
 fi
 
 # Escape JSON special characters in a string
@@ -84,73 +112,422 @@ json_escape() {
   echo "$s"
 }
 
-# Build prompt JSON array from PROMPTS, cycling if NUM_REQUESTS exceeds list length
-PROMPT_JSON="["
-for ((i=0; i<NUM_REQUESTS; i++)); do
-  idx=$((i % ${#PROMPTS[@]}))
-  escaped=$(json_escape "${PROMPTS[$idx]}")
-  if [ $i -gt 0 ]; then
-    PROMPT_JSON+=","
-  fi
-  PROMPT_JSON+="\"$escaped\""
-done
-PROMPT_JSON+="]"
+# Parse DP ranks spec (e.g. "0-15", "0,2,4", "0-3,7,10-12")
+parse_ranks() {
+  local spec="$1"
+  local ranks=()
+  IFS=',' read -ra parts <<< "$spec"
+  for part in "${parts[@]}"; do
+    part="${part// /}"
+    if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      for ((r=${BASH_REMATCH[1]}; r<=${BASH_REMATCH[2]}; r++)); do
+        ranks+=("$r")
+      done
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      ranks+=("$part")
+    else
+      echo "Error: invalid rank '$part' in '$spec'" >&2
+      exit 1
+    fi
+  done
+  echo "${ranks[*]}"
+}
 
 IP=$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
 PORT=30000
+URL="http://${IP}:${PORT}/v1/completions"
 
-if [ "$PROFILE" = true ]; then
-  curl --noproxy "*" http://${IP}:${PORT}/start_profile
-fi
+# =============================================================================
+# Non-interactive dispatch: round-robin detection + profile start
+# =============================================================================
 
-if [ "$DP_ENABLED" = true ]; then
-  DP_LINE=",\"routed_dp_rank\": $DP_RANK"
-else
-  DP_LINE=""
-fi
-
-BODY="{
-    \"model\": \"deepseek-v2\",
-    \"prompt\": $PROMPT_JSON,
-    \"stream\": $STREAM,
-    \"max_tokens\": $MAX_TOKENS,
-    \"temperature\": 0$DP_LINE
-  }"
-
-BODY_FILE=$(mktemp)
-printf '%s' "$BODY" > "$BODY_FILE"
-
-if [ "$STREAM" = true ]; then
-    STREAM_FILE=$(mktemp)
-    time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
-      -H "Content-Type: application/json" \
-      -d @"$BODY_FILE" | tee "$STREAM_FILE"
-
-    # Count streamed chunks: every "data:" line except the trailing [DONE].
-    CHUNK_COUNT=$(grep -c "^data:" "$STREAM_FILE")
-    DONE_COUNT=$(grep -c "\[DONE\]" "$STREAM_FILE")
-    CHUNK_COUNT=$((CHUNK_COUNT - DONE_COUNT))
-
-    rm -f "$STREAM_FILE"
-
-    if [ "$CHUNK_COUNT" -gt 0 ]; then
-        RATE=$(awk -v m="$MAX_TOKENS" -v c="$CHUNK_COUNT" \
-            'BEGIN { printf "%.2f", m / c }')
-        echo "" >&2
-        echo "===================================" >&2
-        echo "Receive rate: $RATE tokens/chunk" >&2
-        echo "  max_tokens: $MAX_TOKENS" >&2
-        echo "  chunks:     $CHUNK_COUNT" >&2
-        echo "===================================" >&2
+if [ "$INTERACTIVE" = false ]; then
+  # Detect round-robin mode: -d value contains '-' or ','
+  ROUND_ROBIN=false
+  DP_RANKS=()
+  NUM_RANKS=0
+  if [ "$DP_ENABLED" = true ] && [[ "$DP_RANK" =~ [-,] ]]; then
+    ROUND_ROBIN=true
+    read -ra DP_RANKS <<< "$(parse_ranks "$DP_RANK")"
+    NUM_RANKS=${#DP_RANKS[@]}
+    if [ "$NUM_RANKS" -eq 0 ]; then
+      echo "Error: no DP ranks parsed from '$DP_RANK'" >&2
+      exit 1
     fi
-else
-    time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
-      -H "Content-Type: application/json" \
-      -d @"$BODY_FILE"
+  fi
+
+  if [ "$PROFILE" = true ]; then
+    curl --noproxy "*" http://${IP}:${PORT}/start_profile
+  fi
 fi
 
-rm -f "$BODY_FILE"
+# =============================================================================
+# Mode 1: Original batch — single request with array of prompts
+# =============================================================================
 
-if [ "$PROFILE" = true ]; then
-  curl --noproxy "*" http://${IP}:${PORT}/stop_profile
+if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ]; then
+
+  # Build prompt JSON array from PROMPTS, cycling if NUM_REQUESTS exceeds list length
+  PROMPT_JSON="["
+  for ((i=0; i<NUM_REQUESTS; i++)); do
+    idx=$((i % ${#PROMPTS[@]}))
+    escaped=$(json_escape "${PROMPTS[$idx]}")
+    if [ $i -gt 0 ]; then
+      PROMPT_JSON+=","
+    fi
+    PROMPT_JSON+="\"$escaped\""
+  done
+  PROMPT_JSON+="]"
+
+  if [ "$DP_ENABLED" = true ]; then
+    DP_LINE=",\"routed_dp_rank\": $DP_RANK"
+  else
+    DP_LINE=""
+  fi
+
+  BODY="{
+      \"model\": \"DeepSeek-R1\",
+      \"prompt\": $PROMPT_JSON,
+      \"stream\": $STREAM,
+      \"max_tokens\": $MAX_TOKENS,
+      \"temperature\": 0$DP_LINE
+    }"
+
+  BODY_FILE=$(mktemp)
+  printf '%s' "$BODY" > "$BODY_FILE"
+
+  if [ "$STREAM" = true ]; then
+      STREAM_FILE=$(mktemp)
+      time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
+        -H "Content-Type: application/json" \
+        -d @"$BODY_FILE" | tee "$STREAM_FILE"
+
+      # Count streamed chunks: every "data:" line except the trailing [DONE].
+      CHUNK_COUNT=$(grep -c "^data:" "$STREAM_FILE")
+      DONE_COUNT=$(grep -c "\[DONE\]" "$STREAM_FILE")
+      CHUNK_COUNT=$((CHUNK_COUNT - DONE_COUNT))
+
+      rm -f "$STREAM_FILE"
+
+      if [ "$CHUNK_COUNT" -gt 0 ]; then
+          RATE=$(awk -v m="$MAX_TOKENS" -v c="$CHUNK_COUNT" \
+              'BEGIN { printf "%.2f", m / c }')
+          echo "" >&2
+          echo "===================================" >&2
+          echo "Receive rate: $RATE tokens/chunk" >&2
+          echo "  max_tokens: $MAX_TOKENS" >&2
+          echo "  chunks:     $CHUNK_COUNT" >&2
+          echo "===================================" >&2
+      fi
+  else
+      time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
+        -H "Content-Type: application/json" \
+        -d @"$BODY_FILE"
+  fi
+
+  rm -f "$BODY_FILE"
+
+  if [ "$PROFILE" = true ]; then
+    curl --noproxy "*" http://${IP}:${PORT}/stop_profile
+  fi
+
+  exit 0
+fi
+
+# =============================================================================
+# Mode 2: Round-robin benchmark — concurrent requests across DP ranks
+# =============================================================================
+
+if [ "$ROUND_ROBIN" = true ]; then
+  RESULT_DIR=$(mktemp -d)
+  trap 'rm -rf "$RESULT_DIR"' EXIT
+
+  # Unique run ID for correlating with router logs (router uses X-Request-Id header)
+  RUN_ID="curl-$(date +%s)-$$"
+
+  send_request() {
+    local idx=$1
+    local rank=${DP_RANKS[$((idx % NUM_RANKS))]}
+    local escaped
+    escaped=$(json_escape "${PROMPTS[$((idx % ${#PROMPTS[@]}))]}")
+
+    local body="{
+        \"model\": \"DeepSeek-R1\",
+        \"prompt\": \"$escaped\",
+        \"stream\": $STREAM,
+        \"max_tokens\": $MAX_TOKENS,
+        \"temperature\": 0,
+        \"routed_dp_rank\": $rank
+      }"
+
+    local body_file
+    body_file=$(mktemp)
+    printf '%s' "$body" > "$body_file"
+
+    local resp_file="$RESULT_DIR/resp_${idx}"
+    local start_ts
+    start_ts=$(date +%s.%N)
+
+    # Client-generated request ID sent via X-Request-Id header;
+    # router uses this ID in its logs for easy correlation.
+    local rid="${RUN_ID}-${idx}"
+    echo "$rid" > "$RESULT_DIR/rid_${idx}"
+
+    curl --noproxy "*" -s "$URL" \
+      -H "Content-Type: application/json" \
+      -H "X-Request-Id: $rid" \
+      -d @"$body_file" > "$resp_file" 2>/dev/null
+
+    local end_ts
+    end_ts=$(date +%s.%N)
+    echo "$start_ts $end_ts" > "$RESULT_DIR/time_${idx}"
+
+    if [ "$STREAM" = true ]; then
+      local chunks done_count
+      chunks=$(grep -c "^data:" "$resp_file" 2>/dev/null || true)
+      chunks="${chunks:-0}"
+      done_count=$(grep -c "\[DONE\]" "$resp_file" 2>/dev/null || true)
+      done_count="${done_count:-0}"
+      echo $((chunks - done_count)) > "$RESULT_DIR/tokens_${idx}"
+    else
+      local tokens
+      tokens=$(grep -oP '"completion_tokens":\s*\K\d+' "$resp_file" 2>/dev/null | head -1)
+      echo "${tokens:-0}" > "$RESULT_DIR/tokens_${idx}"
+    fi
+
+    rm -f "$body_file"
+  }
+
+  echo "Round-robin: $NUM_REQUESTS requests, concurrency=$CONCURRENCY, $NUM_RANKS DP ranks ($DP_RANK)"
+  echo "  URL: $URL"
+  echo "  Max tokens/req: $MAX_TOKENS, Stream: $STREAM"
+  echo "  Run ID: $RUN_ID  (grep this in router logs)"
+  echo ""
+
+  # FIFO-based concurrency semaphore
+  FIFO=$(mktemp -u)
+  mkfifo "$FIFO"
+  exec 3<>"$FIFO"
+  rm "$FIFO"
+  for ((i = 0; i < CONCURRENCY; i++)); do
+    echo >&3
+  done
+
+  WALL_START=$(date +%s.%N)
+
+  for ((i = 0; i < NUM_REQUESTS; i++)); do
+    read -u 3
+    {
+      send_request "$i"
+      echo >&3
+    } &
+  done
+
+  wait
+  WALL_END=$(date +%s.%N)
+  exec 3>&-
+
+  if [ "$PROFILE" = true ]; then
+    curl --noproxy "*" http://${IP}:${PORT}/stop_profile
+  fi
+
+  # --- Compute and print results ---
+  WALL_TIME=$(awk -v s="$WALL_START" -v e="$WALL_END" 'BEGIN { printf "%.3f", e - s }')
+
+  TOTAL_TOKENS=0
+  FAILED=0
+  for ((i = 0; i < NUM_REQUESTS; i++)); do
+    t=$(cat "$RESULT_DIR/tokens_${i}" 2>/dev/null)
+    if [[ "$t" =~ ^[0-9]+$ ]]; then
+      TOTAL_TOKENS=$((TOTAL_TOKENS + t))
+      [ "$t" -eq 0 ] && FAILED=$((FAILED + 1))
+    else
+      FAILED=$((FAILED + 1))
+    fi
+  done
+
+  REQ_PER_SEC=$(awk -v n="$NUM_REQUESTS" -v t="$WALL_TIME" 'BEGIN { printf "%.2f", n / t }')
+  TOKENS_PER_SEC=$(awk -v n="$TOTAL_TOKENS" -v t="$WALL_TIME" 'BEGIN { printf "%.2f", n / t }')
+
+  echo "==================================="
+  echo "Throughput Results"
+  echo "==================================="
+  echo "  Total requests:      $NUM_REQUESTS"
+  echo "  Concurrency:         $CONCURRENCY"
+  echo "  DP ranks:            $DP_RANK ($NUM_RANKS ranks, round-robin)"
+  echo "  Max tokens/req:      $MAX_TOKENS"
+  echo "  Stream:              $STREAM"
+  echo "  Total wall time:     ${WALL_TIME}s"
+  echo "  Total output tokens: $TOTAL_TOKENS"
+  echo "  Failed requests:     $FAILED"
+  echo "  Requests/sec:        $REQ_PER_SEC"
+  echo "  Tokens/sec:          $TOKENS_PER_SEC"
+  echo "==================================="
+
+  # --- Per-Request Latency ---
+  LAT_FILE="$RESULT_DIR/all_latencies"
+  : > "$LAT_FILE"
+
+  echo ""
+  echo "==================================="
+  echo "Per-Request Latency (relative to test start)"
+  echo "==================================="
+  printf "%-6s %-6s %-12s %-12s %-10s %-8s %s\n" "Req#" "Rank" "Start(s)" "End(s)" "Latency(s)" "Tokens" "ReqID"
+  for ((i = 0; i < NUM_REQUESTS; i++)); do
+    rank=${DP_RANKS[$((i % NUM_RANKS))]}
+    if [ -f "$RESULT_DIR/time_${i}" ]; then
+      read -r s e < "$RESULT_DIR/time_${i}"
+      rel_start=$(awk -v s="$s" -v w="$WALL_START" 'BEGIN { printf "%.3f", s - w }')
+      rel_end=$(awk -v e="$e" -v w="$WALL_START" 'BEGIN { printf "%.3f", e - w }')
+      dur=$(awk -v s="$s" -v e="$e" 'BEGIN { printf "%.3f", e - s }')
+      echo "$dur" >> "$LAT_FILE"
+      toks=$(cat "$RESULT_DIR/tokens_${i}" 2>/dev/null || echo "?")
+      rid=$(cat "$RESULT_DIR/rid_${i}" 2>/dev/null || echo "N/A")
+      printf "%-6d %-6d %-12s %-12s %-10s %-8s %s\n" "$i" "$rank" "$rel_start" "$rel_end" "$dur" "$toks" "$rid"
+    else
+      printf "%-6d %-6d %-12s %-12s %-10s %-8s %s\n" "$i" "$rank" "N/A" "N/A" "N/A" "N/A" "N/A"
+    fi
+  done
+
+  if [ -s "$LAT_FILE" ]; then
+    awk '{ a[NR]=$1; sum+=$1 } END {
+      n=NR; if(n==0) exit;
+      for(i=1;i<=n;i++) for(j=i+1;j<=n;j++) if(a[i]>a[j]){t=a[i];a[i]=a[j];a[j]=t}
+      p50=a[int((n+1)*0.5)]; p99=a[int((n+1)*0.99)];
+      if(p99=="") p99=a[n];
+      printf "\n===================================\n";
+      printf "Latency Summary\n";
+      printf "===================================\n";
+      printf "  Min:      %.3fs\n", a[1];
+      printf "  Max:      %.3fs\n", a[n];
+      printf "  Avg:      %.3fs\n", sum/n;
+      printf "  P50:      %.3fs\n", p50;
+      printf "  P99:      %.3fs\n", p99;
+      printf "===================================\n";
+    }' "$LAT_FILE"
+  fi
+
+  if [ "$VERBOSE" = true ]; then
+    echo ""
+    echo "==================================="
+    echo "Per-Request Responses"
+    echo "==================================="
+    for ((i = 0; i < NUM_REQUESTS; i++)); do
+      rank=${DP_RANKS[$((i % NUM_RANKS))]}
+      echo "----- Request #$i (rank=$rank) -----"
+      if [ -s "$RESULT_DIR/resp_${i}" ]; then
+        cat "$RESULT_DIR/resp_${i}"
+        echo ""
+      else
+        echo "<no response>"
+      fi
+    done
+    echo "==================================="
+  fi
+
+  exit 0
+fi
+
+# =============================================================================
+# Mode 3: Interactive chat — multi-turn streaming conversation
+# =============================================================================
+
+if [ "$INTERACTIVE" = true ]; then
+  CHAT_URL="http://${IP}:${PORT}/v1/chat/completions"
+
+  # Use a larger default for chat if -m was not explicitly passed
+  if [ "$MAX_TOKENS_SET" = false ]; then
+    MAX_TOKENS=1024
+  fi
+
+  echo "--- AI chat mode (Ctrl+C to exit) ---"
+  echo "  URL: $CHAT_URL"
+  echo "  Model: deepseek-v3, Max tokens: $MAX_TOKENS, Stream: true"
+  if [ "$DP_ENABLED" = true ]; then
+    echo "  DP rank: $DP_RANK"
+  fi
+  echo ""
+
+  HISTORY=()
+
+  trap 'echo ""; exit 0' INT
+
+  while true; do
+    read -e -p "User: " USER_INPUT
+    if [[ -z "$USER_INPUT" ]]; then continue; fi
+
+    echo -n "AI: "
+
+    # Build messages array from conversation history plus the new user turn
+    escaped_input=$(json_escape "$USER_INPUT")
+    MESSAGES="["
+    first=true
+    for msg in "${HISTORY[@]}"; do
+      if [ "$first" = true ]; then
+        first=false
+      else
+        MESSAGES+=","
+      fi
+      MESSAGES+="$msg"
+    done
+    if [ "$first" = false ]; then
+      MESSAGES+=","
+    fi
+    MESSAGES+="{\"role\":\"user\",\"content\":\"$escaped_input\"}"
+    MESSAGES+="]"
+
+    # Record user turn in history
+    HISTORY+=("{\"role\":\"user\",\"content\":\"$escaped_input\"}")
+
+    DP_LINE=""
+    if [ "$DP_ENABLED" = true ]; then
+      DP_LINE=",\"routed_dp_rank\":$DP_RANK"
+    fi
+
+    BODY="{\"model\":\"DeepSeek-R1\",\"messages\":$MESSAGES,\"stream\":true,\"max_tokens\":$MAX_TOKENS,\"temperature\":0$DP_LINE}"
+
+    BODY_FILE=$(mktemp)
+    printf '%s' "$BODY" > "$BODY_FILE"
+
+    TURN_START=$(date +%s.%N)
+    FIRST_TOKEN_TS=""
+    TOKEN_COUNT=0
+    FULL_RESPONSE=""
+    while read -r line; do
+      CONTENT=$(echo "$line" | grep -o '"content":"[^"]*"' | cut -d'"' -f4)
+      if [[ ! -z "$CONTENT" ]]; then
+        if [ -z "$FIRST_TOKEN_TS" ]; then
+          FIRST_TOKEN_TS=$(date +%s.%N)
+        fi
+        printf "%b" "$CONTENT"
+        FULL_RESPONSE+="$CONTENT"
+        TOKEN_COUNT=$((TOKEN_COUNT + 1))
+      fi
+    done < <(curl --noproxy "*" -N -s -X POST "$CHAT_URL" \
+      -H "Content-Type: application/json" \
+      -d @"$BODY_FILE")
+    TURN_END=$(date +%s.%N)
+
+    rm -f "$BODY_FILE"
+
+    # Record assistant reply in history
+    if [[ ! -z "$FULL_RESPONSE" ]]; then
+      escaped_resp=$(json_escape "$FULL_RESPONSE")
+      HISTORY+=("{\"role\":\"assistant\",\"content\":\"$escaped_resp\"}")
+    fi
+
+    # --- Timing summary ---
+    if [ -n "$FIRST_TOKEN_TS" ]; then
+      TTFT=$(awk -v s="$TURN_START" -v f="$FIRST_TOKEN_TS" 'BEGIN { printf "%.3f", f - s }')
+      TOTAL=$(awk -v s="$TURN_START" -v e="$TURN_END" 'BEGIN { printf "%.3f", e - s }')
+      TPOT=$(awk -v n="$TOKEN_COUNT" -v tt="$TTFT" -v total="$TOTAL" 'BEGIN { dn=n-1; if (dn>0) printf "%.1f", (total-tt)/dn*1000; else print "0" }')
+      echo -e "\n---------------------------------------"
+      echo "TTFT: ${TTFT}s | Tokens: $TOKEN_COUNT | Total: ${TOTAL}s | TPOT: ${TPOT} ms/tok"
+    else
+      echo -e "\n---------------------------------------"
+      echo "(no response)"
+    fi
+  done
+
+  exit 0
 fi
