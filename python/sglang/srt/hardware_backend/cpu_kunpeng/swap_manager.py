@@ -25,9 +25,10 @@ weights from here.
 Behavior (controlled by environment variables):
 - SGLANG_KUNPENG_SWAP_EXPERT: enable expert weights swap
     - Layer-wise, read-only (no write back), single-layer HBM recycling.
-- SGLANG_KUNPENG_SWAP_KV: enable KV cache swap
+- SGLANG_KUNPENG_SWAP_KV_IN: enable KV cache swap-in (DDR → HBM via SDMA)
     - Layer-wise (prefill / when BLOCKWISE=0): copy entire layer KV, write back.
     - Block-wise (decode when BLOCKWISE=1): copy only needed blocks, write back.
+- SGLANG_KUNPENG_SWAP_KV_OUT: enable KV cache write-back (SDMA write to DDR)
 - SGLANG_KUNPENG_SWAP_KV_BLOCKWISE: use block-wise KV swap in decode mode.
 
 Usage:
@@ -62,8 +63,9 @@ from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator imp
 from sglang.srt.utils.common import (
     is_kunpeng_hbw_pool,
     is_kunpeng_swap_expert,
-    is_kunpeng_swap_kv,
     is_kunpeng_swap_kv_blockwise,
+    is_kunpeng_swap_kv_in,
+    is_kunpeng_swap_kv_out,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,7 +103,8 @@ class KunpengSwapManager:
 
     def __init__(self):
         self.enable_swap_expert = is_kunpeng_swap_expert()
-        self.enable_swap_kv = is_kunpeng_swap_kv()
+        self.enable_swap_kv_in = is_kunpeng_swap_kv_in()
+        self.enable_swap_kv_out = is_kunpeng_swap_kv_out()
         self.enable_swap_kv_blockwise = is_kunpeng_swap_kv_blockwise()
 
         # Expert: HBM buffer for expert weights.
@@ -129,9 +132,11 @@ class KunpengSwapManager:
         self._kv_ddr_event_num_tensor = torch.tensor([0], dtype=torch.int32)
 
         logger.info(
-            "KunpengSwapManager initialized: swap_expert=%s swap_kv=%s kv_blockwise=%s",
+            "KunpengSwapManager initialized: swap_expert=%s swap_kv_in=%s "
+            "swap_kv_out=%s kv_blockwise=%s",
             self.enable_swap_expert,
-            self.enable_swap_kv,
+            self.enable_swap_kv_in,
+            self.enable_swap_kv_out,
             self.enable_swap_kv_blockwise,
         )
 
@@ -356,7 +361,7 @@ class KunpengSwapManager:
         Must be called before any :meth:`swap_kv_layer` call when
         KV swap is enabled.
         """
-        if not self.enable_swap_kv or self._cur_kv_hbm is not None:
+        if not self.enable_swap_kv_in or self._cur_kv_hbm is not None:
             return
         shape = (num_tokens, head_num, kv_cache_dim)
         self._cur_kv_hbm = self._hbw_pool.alloc(shape, dtype=dtype)
@@ -382,7 +387,7 @@ class KunpengSwapManager:
         """
         self._cur_kv_ddr = kv_buffer
 
-        if not self.enable_swap_kv:
+        if not self.enable_swap_kv_in:
             return
 
         if self._cur_kv_hbm is None:
@@ -391,16 +396,12 @@ class KunpengSwapManager:
             )
 
         total_bytes = kv_buffer.numel() * kv_buffer.element_size()
-        kunpeng.kupl_sdma_memcpy_chunked(
+        kunpeng.kupl_sdma_kv_swapin(
             self._cur_kv_hbm,
             kv_buffer,
             self._kv_swap_in_event_tensor,
             self._kv_swap_in_event_num_tensor,
-            0,  # dst_byte_offset
-            0,  # src_byte_offset
             total_bytes,
-            14 * 1024 * 1024,  # chunk_bytes = 14 MB
-            512,  # max_pending_events
         )
 
     def set_kv_buffer(
@@ -463,7 +464,7 @@ class KunpengSwapManager:
         - Swap enabled: HBM buffer (drains pending DDR→HBM copy events).
         - Swap disabled: DDR buffer directly (zero-copy).
         """
-        if self.enable_swap_kv:
+        if self.enable_swap_kv_in:
             kunpeng.kupl_sdma_wait_all(
                 self._kv_swap_in_event_tensor, self._kv_swap_in_event_num_tensor
             )

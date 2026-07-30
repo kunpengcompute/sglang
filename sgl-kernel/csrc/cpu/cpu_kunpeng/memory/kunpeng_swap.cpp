@@ -23,6 +23,9 @@
 #include "cpu_kunpeng/utils/sdma_util.h"
 #include "cpu_kunpeng/utils/sdma_thres_util.h"
 
+constexpr int64_t kSwapChunkBytes = 14 * 1024 * 1024;  // 14 MB
+constexpr int64_t kSwapMaxPendingEvents = 512;
+
 int64_t get_sdma_event_num()
 {
     return static_cast<int64_t>(utils::EVENT_NUM);
@@ -108,22 +111,12 @@ void kupl_sdma_memcpy_chunked(at::Tensor dst, at::Tensor src,
     int event_count = event_num_tensor.item<int>();
     int next_slot = event_count;
     int n_chunks = static_cast<int>((total_bytes + chunk_bytes - 1) / chunk_bytes);
+    int *event_ptr = event_tensor.data_ptr<int>();
 
     for (int i = 0; i < n_chunks; i++) {
         int64_t rel_offset = static_cast<int64_t>(i) * chunk_bytes;
         int64_t size = std::min(chunk_bytes, total_bytes - rel_offset);
 
-        // Drain the oldest pending event to make room if saturated.
-        if (next_slot >= static_cast<int>(max_pending_events)) {
-            int old_id = event_tensor[0].item<int>();
-            utils::kupl_sdma_wait(old_id);
-            // Shift remaining pending ids left by one slot.
-            if (next_slot > 1)
-                std::memmove(event_tensor.data_ptr<int>(),
-                             event_tensor.data_ptr<int>() + 1,
-                             (next_slot - 1) * sizeof(int));
-            next_slot -= 1;
-        }
 
         int event_id = utils::kupl_get_free_event_id();
         void *dst_ptr = static_cast<char *>(dst.data_ptr()) + dst_byte_offset + rel_offset;
@@ -131,11 +124,12 @@ void kupl_sdma_memcpy_chunked(at::Tensor dst, at::Tensor src,
             static_cast<const char *>(src_contig.data_ptr()) + src_byte_offset + rel_offset;
         utils::kupl_sdma_async(event_id, dst_ptr, src_ptr, static_cast<int>(size), 0);
 
-        event_tensor[next_slot] = event_id;
+        event_ptr[next_slot] = event_id;
         next_slot += 1;
     }
 
-    event_num_tensor[0] = next_slot;
+    event_num_tensor.data_ptr<int>()[0] = next_slot;
+
 }
 
 // ==========================================================================
@@ -144,7 +138,8 @@ void kupl_sdma_memcpy_chunked(at::Tensor dst, at::Tensor src,
 
 void kupl_sdma_wait_all(at::Tensor event_tensor, at::Tensor event_num_tensor)
 {
-    int event_num = event_num_tensor.item<int>();
+
+    int event_num = event_num_tensor.data_ptr<int>()[0];
     if (event_num == 0)
         return;
 
@@ -152,7 +147,7 @@ void kupl_sdma_wait_all(at::Tensor event_tensor, at::Tensor event_num_tensor)
     for (int i = 0; i < event_num; i++) {
         utils::kupl_sdma_wait(event_data[i]);
     }
-    event_num_tensor.zero_();
+    event_num_tensor.data_ptr<int>()[0] = 0;
 }
 
 void kupl_sdma_set_kv_buffer(at::Tensor kv_buffer, at::Tensor loc, at::Tensor cache_k, at::Tensor event_tensor,
@@ -217,6 +212,15 @@ void kupl_sdma_set_kv_buffer(at::Tensor kv_buffer, at::Tensor loc, at::Tensor ca
     }
 }
 
+void kupl_sdma_kv_swapin(at::Tensor dst, at::Tensor src, at::Tensor event_tensor, at::Tensor event_num_tensor,
+                         int64_t total_bytes)
+{
+    kupl_sdma_memcpy_chunked(dst, src, event_tensor, event_num_tensor,
+                             0,  // dst_byte_offset
+                             0,  // src_byte_offset
+                             total_bytes, kSwapChunkBytes, kSwapMaxPendingEvents);
+}
+
 // ==========================================================================
 // Torch library registration (eager mode)
 // ==========================================================================
@@ -255,6 +259,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("kupl_sdma_wait_all", kupl_sdma_wait_all);
 
     m.def(
+        "kupl_sdma_kv_swapin(Tensor dst, Tensor src, "
+        "Tensor(a!) event_tensor, Tensor(b!) event_num_tensor, "
+        "int total_bytes) -> ()");
+    m.impl("kupl_sdma_kv_swapin", kupl_sdma_kv_swapin);
+
+    m.def(
         "kupl_sdma_set_kv_buffer(Tensor kv_buffer, Tensor loc, Tensor cache_k, "
         "Tensor(a!) event_tensor, Tensor(b!) event_num_tensor, "
         "int max_pending_events, int chunk_bytes) -> ()");
@@ -272,6 +282,9 @@ static KernelRegistrar _r_sdma_memcpy_chunked(
 static KernelRegistrar _r_sdma_wait_all(
     "kupl_sdma_wait_all",
     make_dispatch_v<decltype(&kupl_sdma_wait_all), &kupl_sdma_wait_all>);
+
+static KernelRegistrar _r_sdma_kv_swapin("kupl_sdma_kv_swapin",
+                                         make_dispatch_v<decltype(&kupl_sdma_kv_swapin), &kupl_sdma_kv_swapin>);
 
 static KernelRegistrar _r_sdma_set_kv_buffer(
     "kupl_sdma_set_kv_buffer", make_dispatch_v<decltype(&kupl_sdma_set_kv_buffer), &kupl_sdma_set_kv_buffer>);

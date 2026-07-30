@@ -202,13 +202,17 @@ def is_kunpeng_swap_expert() -> bool:
     return is_kunpeng_hbw_pool() and os.environ.get("SGLANG_KUNPENG_SWAP_EXPERT") == "1"
 
 
-def is_kunpeng_swap_kv() -> bool:
-    return is_kunpeng_hbw_pool() and os.environ.get("SGLANG_KUNPENG_SWAP_KV") == "1"
+def is_kunpeng_swap_kv_in() -> bool:
+    return is_kunpeng_hbw_pool() and os.environ.get("SGLANG_KUNPENG_SWAP_KV_IN") == "1"
+
+
+def is_kunpeng_swap_kv_out() -> bool:
+    return is_kunpeng_swap_kv_in() and os.environ.get("SGLANG_KUNPENG_SWAP_KV_OUT") == "1"
 
 
 def is_kunpeng_swap_kv_blockwise() -> bool:
     return (
-        is_kunpeng_swap_kv()
+        is_kunpeng_swap_kv_in()
         and os.environ.get("SGLANG_KUNPENG_SWAP_KV_BLOCKWISE") == "1"
     )
 
