@@ -771,7 +771,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     moe_expert_dtype=experts.w13_weight.dtype,
                 )
 
-            if self.swap_mgr.enable_swap_kv:
+            if self.swap_mgr.enable_swap_kv_in:
                 self.swap_mgr.init_kv_buffer(
                     num_tokens=self.token_to_kv_pool.kv_buffer[0].shape[0],
                     head_num=self.token_to_kv_pool.kv_buffer[0].shape[1],
@@ -3067,10 +3067,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             fixed.append(self.swap_mgr._expert_buffer_w2)
             fixed.append(self.swap_mgr._expert_event_tensor)
             fixed.append(self.swap_mgr._expert_event_num_tensor)
-        if self.swap_mgr.enable_swap_kv:
+        if self.swap_mgr.enable_swap_kv_in:
             fixed.append(self.swap_mgr._cur_kv_hbm)
             fixed.append(self.swap_mgr._kv_swap_in_event_tensor)
             fixed.append(self.swap_mgr._kv_swap_in_event_num_tensor)
+        if self.swap_mgr.enable_swap_kv_out:
             fixed.append(self.swap_mgr._kv_ddr_event_tensor)
             fixed.append(self.swap_mgr._kv_ddr_event_num_tensor)
         try:

@@ -114,13 +114,18 @@ class DeepseekMHAKunpengForwardMixin:
         kunpeng.copy_kunpeng(latent_cache[:, :, : self.kv_lora_rank], kv_a.unsqueeze(1))
         kunpeng.copy_kunpeng(latent_cache[:, :, self.kv_lora_rank :], k_pe)
 
-        if self.swap_mgr.enable_swap_kv:
+        if self.swap_mgr.enable_swap_kv_in:
             self.swap_mgr.set_kv_buffer(
                 self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, latent_cache
             )
-            self.swap_mgr.set_kv_buffer(
-                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, latent_cache
-            )
+            if self.swap_mgr.enable_swap_kv_out:
+                self.swap_mgr.set_kv_buffer_sdma(
+                    forward_batch.out_cache_loc, latent_cache
+                )
+            else:
+                self.swap_mgr.set_kv_buffer(
+                    self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, latent_cache
+                )
         else:
             self.swap_mgr.set_kv_buffer(
                 self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, latent_cache

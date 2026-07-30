@@ -1574,6 +1574,8 @@ class DeepseekV2AttentionMLA(
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
+                if _is_cpu_920f:
+                    self.swap_mgr.get_kv_cache()
                 return hidden_states[0]
         else:
             if (
@@ -1583,6 +1585,8 @@ class DeepseekV2AttentionMLA(
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
+                if _is_cpu_920f:
+                    self.swap_mgr.get_kv_cache()
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
@@ -1970,7 +1974,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if _is_cpu_920f:
             self._swap_mgr.swap_next_expert_layer(self.layer_id)
-        if _is_cpu_920f and self._swap_mgr.enable_swap_kv:
+        if _is_cpu_920f and self._swap_mgr.enable_swap_kv_out:
             self._swap_mgr.wait_kv_ddr()
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
