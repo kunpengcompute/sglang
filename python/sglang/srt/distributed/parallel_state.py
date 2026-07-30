@@ -523,7 +523,7 @@ class GroupCoordinator:
         if use_message_queue_broadcaster and self.world_size > 1 and not recovered_rank:
             # Recovered ranks create their mq_broadcaster in elastic_ep.py
             self.mq_broadcaster = MessageQueue.create_from_process_group(
-                self.cpu_group, 1 << 22, 6, zmq_core_binding_offset
+                self.cpu_group, 1 << 22, 6, zmq_core_binding_offset=zmq_core_binding_offset
             )
 
     def __repr__(self):
