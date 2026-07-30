@@ -46,7 +46,7 @@ def to_csv(input_path, output_path):
             if not runs_by_mode or runs_by_mode[-1][0] != current_mode:
                 runs_by_mode.append((current_mode, []))
         elif obj["_type"] == "op":
-            current_run.append((obj["name"], obj["dur_us"]))
+            current_run.append((obj["name"], obj["dur_ns"] / 1000.0))
 
     if current_run and current_mode is not None:
         runs_by_mode[-1][1].append(current_run)
