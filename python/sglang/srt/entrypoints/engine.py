@@ -236,8 +236,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 self.send_to_rpc = get_zmq_socket(
                     context, zmq.DEALER, self.port_args.rpc_ipc_name, True
                 )
-                from sglang.srt.utils.numa_utils import zmq_debug_util
-                zmq_debug_util()
         else:
             self.send_to_rpc = None
 

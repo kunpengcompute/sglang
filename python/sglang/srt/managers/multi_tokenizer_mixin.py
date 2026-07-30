@@ -74,8 +74,6 @@ class SocketMapping:
             return
         logger.info(f"Registering {type_str} {ipc_name=} in SocketMapping...")
         socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
-        from sglang.srt.utils.numa_utils import zmq_debug_util
-        zmq_debug_util()
         self._mapping[ipc_name] = socket
 
     def send_output(self, ipc_name: str, output: Any):
@@ -349,8 +347,6 @@ class MultiTokenizerRouter:
             print_exception_wrapper(self.handle_loop), self._loop
         )
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
-        from sglang.srt.utils.numa_utils import zmq_debug_util
-        zmq_debug_util()
 
     def _run_loop(self):
         self._loop.run_forever()

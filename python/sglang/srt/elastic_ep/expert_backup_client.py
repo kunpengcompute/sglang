@@ -70,8 +70,6 @@ class ExpertBackupClient:
 
         self._receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._receive_thread.start()
-        from sglang.srt.utils.numa_utils import zmq_debug_util
-        zmq_debug_util()
 
     def _receive_loop(self):
         cnt = 0

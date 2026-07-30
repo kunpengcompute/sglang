@@ -430,8 +430,6 @@ class WaitingImageRequest:
             host=host_name,
         )
         logger.info(f"Waiting for input {self.embedding_port = }")
-        from sglang.srt.utils.numa_utils import zmq_debug_util
-        zmq_debug_util()
         self.recv_embedding_data = None
         # ok=1 pending=0 fail=-1
         self.status = WaitingImageRequestStatus.PENDING
@@ -732,8 +730,6 @@ class MMReceiverBase(ABC):
             asyncio.create_task(
                 self.encode(req_id, mm_data, embedding_port, "encode", "send")
             )
-            from sglang.srt.utils.numa_utils import zmq_debug_util
-            zmq_debug_util()
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
                 timeout=20,

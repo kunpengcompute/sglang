@@ -89,8 +89,6 @@ class SGLangCheckpointEngineWorkerExtension:
             run=self.get_model_loader(),
             post_hook=self.get_post_hook(),
         )
-        from sglang.srt.utils.numa_utils import zmq_debug_util
-        zmq_debug_util()
 
 
 class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExtension):

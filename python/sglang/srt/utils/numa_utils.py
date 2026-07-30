@@ -665,11 +665,3 @@ def mooncake_transfer_engine_init_proxy(
         device_name,
     )
     return ret_value
-
-
-def zmq_debug_util():
-    import traceback
-    import time
-    traceback.print_stack()
-    logger.warning("sleep 180 s...")
-    time.sleep(180)

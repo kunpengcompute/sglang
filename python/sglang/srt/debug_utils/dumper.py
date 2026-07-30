@@ -1047,8 +1047,6 @@ def _create_zmq_rpc_broadcast(
     sock.bind("tcp://*:0")
     bound_port = int(sock.getsockopt_string(zmq.LAST_ENDPOINT).rsplit(":", 1)[1])
     local_addr = f"tcp://{_get_local_ip_by_remote()}:{bound_port}"
-    from sglang.srt.utils.numa_utils import zmq_debug_util
-    zmq_debug_util()
 
     def serve_loop():
         while True:
