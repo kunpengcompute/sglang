@@ -101,8 +101,8 @@ LOG_BASE_DIR="/path-to-logs"
 CONDA_ENV_NAME="my_env"
 CONDA_BASE_PATH="/path-to-conda"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
-MODEL_PATH_PREFILL="/path-to-deepseek-r1-channel-int8"
-MODEL_PATH_DECODE="/path-to-deepseek-r1-channel-int8"
+MODEL_PATH_PREFILL=$MODEL_PATH
+MODEL_PATH_DECODE=$MODEL_PATH
 SPECULATIVE_DRAFT_MODEL_PATH=""
 
 export HPCKIT_PATH="/path-to-HPCKit"
@@ -126,21 +126,20 @@ export EP_SIZE=${TP_SIZE}
 export PP_SIZE=1 # >1 enable pp  eg: 2
 
 # Prefill TP/EP/PP size
-export PREFILL_TP_SIZE=256
-export PREFILL_DP_SIZE=16
+export PREFILL_TP_SIZE=${TP_SIZE}
+export PREFILL_DP_SIZE=${DP_SIZE}
 export PREFILL_EP_SIZE=${PREFILL_TP_SIZE}
-export PREFILL_PP_SIZE=1
+export PREFILL_PP_SIZE=${PP_SIZE}
 
 # Decode TP/EP/PP size
-export DECODE_TP_SIZE=256
-export DECODE_DP_SIZE=32
+export DECODE_TP_SIZE=${TP_SIZE}
+export DECODE_DP_SIZE=${DP_SIZE}
 export DECODE_EP_SIZE=${DECODE_TP_SIZE}
-export DECODE_PP_SIZE=2
+export DECODE_PP_SIZE=${PP_SIZE}
 
 
 # PP size and chunked prefill size can be configured independently
 export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size
-export PP_SIZE=1 # >1 enable pp  eg: 2
 export PREFILL_LONG_PROMPT_PP_SIZE=2
 
 # Optional second argument: prefill instance name (e.g. "long_prompt")
