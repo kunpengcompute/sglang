@@ -586,7 +586,7 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info,
     int64_t *count_data = count.data_ptr<int64_t>();
     count_data[0]++;
     const int16_t *src_info_data =
-        (count_data[0] & 1) ? src_info.data_ptr<int16_t>() : src_info.data_ptr_bak<int16_t>();
+        (count_data[0] & 1) ? src_info.data_ptr<int16_t>() : src_info_bak.data_ptr<int16_t>();
     int32_t *token_ids_data = token_ids.data_ptr<int32_t>();
     int32_t *experts_offset_data = experts_offset.data_ptr<int32_t>();
 
