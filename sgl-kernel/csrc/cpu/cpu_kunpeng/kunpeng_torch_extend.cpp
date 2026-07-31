@@ -176,10 +176,10 @@ void moe_dispatch_recv_kunpeng(int64_t batch_id);
 
 void moe_dispatch_finalize_kunpeng();
 
-void moe_combine_send_kunpeng(at::Tensor x, at::Tensor src_info, int64_t num_max_dispatch_tokens_per_rank,
-                              int64_t num_experts, int64_t hidden, at::Tensor parallel_sizes, int64_t batch_id,
-                              at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights, int64_t num_tokens,
-                              int64_t num_topk, bool enable_allgather);
+void moe_combine_send_kunpeng(at::Tensor x, at::Tensor count, at::Tensor src_info, at::Tensor src_info_bak,
+                              int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, int64_t hidden,
+                              at::Tensor parallel_sizes, int64_t batch_id, at::Tensor combined_x, at::Tensor topk_idx,
+                              at::Tensor topk_weights, int64_t num_tokens, int64_t num_topk, bool enable_allgather);
 
 void moe_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights, int64_t num_tokens,
                               int64_t num_max_dispatch_tokens_per_rank, int64_t num_topk, int64_t hidden,
@@ -195,10 +195,11 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8, at::Tensor experts_w2
                                  at::Tensor experts_w2_scale, at::Tensor token_ids, at::Tensor experts_offset,
                                  at::Tensor moe_down, at::Tensor tmpx, at::Tensor tmpy, at::Tensor tmp_scales);
 
-int64_t topk_convert_kunpeng(at::Tensor src_info, at::Tensor token_ids, at::Tensor experts_offset, int64_t num_ranks,
-                             int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank, bool is_prefill);
+int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info, at::Tensor src_info_bak, at::Tensor token_ids,
+                             at::Tensor experts_offset, int64_t num_ranks, int64_t num_local_experts,
+                             int64_t num_max_dispatch_tokens_per_rank, bool is_prefill);
 
-void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, int64_t num_token_non_padded,
+void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
                                         int64_t num_experts, int64_t topk);
 
 void multinomial_kunpeng(const at::Tensor &probs, at::Tensor out, int64_t num_samples, bool replacement);
@@ -457,7 +458,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def(
         "load_balance_padded_tokens_kunpeng("
-        "Tensor(a!) topk_ids, Tensor(b!) topk_weights, int num_token_non_padded, "
+        "Tensor(a!) topk_ids, Tensor(b!) topk_weights, Tensor num_token_non_padded, "
         "int num_experts, int topk) -> ()");
     m.impl("load_balance_padded_tokens_kunpeng", load_balance_padded_tokens_kunpeng);
 
@@ -530,7 +531,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("moe_dispatch_finalize_kunpeng", moe_dispatch_finalize_kunpeng);
 
     m.def(
-        "moe_combine_send_kunpeng(Tensor x, Tensor src_info, "
+        "moe_combine_send_kunpeng(Tensor x, Tensor count, Tensor src_info, Tensor src_info_bak, "
         "int num_max_dispatch_tokens_per_rank, int num_experts, int hidden, "
         "Tensor parallel_sizes, int batch_id, "
         "Tensor combined_x, Tensor topk_idx, Tensor topk_weights, "
@@ -564,7 +565,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def(
         "topk_convert_kunpeng("
-        "Tensor src_info, Tensor(a!) token_ids, Tensor(b!) experts_offset, "
+        "Tensor(a!) count, Tensor src_info, Tensor src_info_bak, Tensor(b!) token_ids, Tensor(c!) experts_offset, "
         "int num_ranks, int num_local_experts, int num_max_dispatch_tokens_per_rank, bool is_prefill) -> int");
     m.impl("topk_convert_kunpeng", topk_convert_kunpeng);
 

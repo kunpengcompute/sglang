@@ -446,18 +446,18 @@ def _setup_moe_dispatch_recv_kunpeng():
 
 
 def _setup_moe_combine_send_kunpeng():
-    def shape_infer(x, src_info, num_max_dispatch_tokens_per_rank,
+    def shape_infer(x, count, src_info, src_info_bak, num_max_dispatch_tokens_per_rank,
                     num_experts, hidden, parallel_sizes, batch_id,
                     combined_x, topk_idx, topk_weights, num_tokens,
                     num_topk, enable_allgather):
         return []
 
-    def eager_fn(x, src_info, num_max_dispatch_tokens_per_rank,
+    def eager_fn(x, count, src_info, src_info_bak, num_max_dispatch_tokens_per_rank,
                  num_experts, hidden, parallel_sizes, batch_id,
                  combined_x, topk_idx, topk_weights, num_tokens,
                  num_topk, enable_allgather):
         torch.ops.sgl_kernel.moe_combine_send_kunpeng(
-            x, src_info, num_max_dispatch_tokens_per_rank,
+            x, count, src_info, src_info_bak, num_max_dispatch_tokens_per_rank,
             num_experts, hidden, parallel_sizes, batch_id,
             combined_x, topk_idx, topk_weights, num_tokens,
             num_topk, enable_allgather)
@@ -716,14 +716,14 @@ def _setup_unpad_o_right_mtp_kunpeng():
 
 
 def _setup_topk_convert_kunpeng():
-    def shape_infer(src_info, token_ids, experts_offset, num_ranks,
+    def shape_infer(count, src_info, src_info_bak, token_ids, experts_offset, num_ranks,
                     num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill):
         return []
 
-    def eager_fn(src_info, token_ids, experts_offset, num_ranks,
+    def eager_fn(count, src_info, src_info_bak, token_ids, experts_offset, num_ranks,
                  num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill):
         torch.ops.sgl_kernel.topk_convert_kunpeng(
-            src_info, token_ids, experts_offset, num_ranks,
+            count, src_info, src_info_bak, token_ids, experts_offset, num_ranks,
             num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill)
         return None
 

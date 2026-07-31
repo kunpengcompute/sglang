@@ -3089,6 +3089,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             state = _KunpengDispatcherState.get()
             for attr in (
                 "parallel_policy",
+                "dispatch_call_count",
                 "dispatch_send_buf",
                 "dispatch_recv_buf",
                 "combine_send_buf",
@@ -3215,6 +3216,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             inputs = [
                 forward_batch.input_ids,
                 forward_batch.positions,
+                forward_batch.num_token_non_padded,
                 meta.block_table,
                 meta.seq_lens,
                 forward_batch.out_cache_loc,
@@ -3303,6 +3305,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.positions,
                 forward_batch.extend_seq_lens,
                 forward_batch.out_cache_loc,
+                forward_batch.num_token_non_padded,
                 self.attn_backend._decode_meta,
             ]
             if meta:
@@ -3522,6 +3525,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
             and not is_nsa_enable_prefill_cp()
+            and not _is_cpu_920f
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,

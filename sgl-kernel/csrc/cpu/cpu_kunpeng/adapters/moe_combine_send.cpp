@@ -18,15 +18,10 @@
 
 #include "register_graph_kernels.h"
 
-void moe_combine_send_kunpeng(at::Tensor x, at::Tensor src_info,
-                              int64_t num_max_dispatch_tokens_per_rank,
-                              int64_t num_experts, int64_t hidden,
-                              at::Tensor parallel_sizes, int64_t batch_id,
-                              at::Tensor combined_x, at::Tensor topk_idx,
-                              at::Tensor topk_weights, int64_t num_tokens,
-                              int64_t num_topk, bool enable_allgather);
+void moe_combine_send_kunpeng(at::Tensor x, at::Tensor count, at::Tensor src_info, at::Tensor src_info_bak,
+                              int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, int64_t hidden,
+                              at::Tensor parallel_sizes, int64_t batch_id, at::Tensor combined_x, at::Tensor topk_idx,
+                              at::Tensor topk_weights, int64_t num_tokens, int64_t num_topk, bool enable_allgather);
 
 static KernelRegistrar _r_moe_combine_send(
-    "moe_combine_send_kunpeng",
-    make_dispatch_v<decltype(&moe_combine_send_kunpeng),
-                    &moe_combine_send_kunpeng>);
+    "moe_combine_send_kunpeng", make_dispatch_v<decltype(&moe_combine_send_kunpeng), &moe_combine_send_kunpeng>);

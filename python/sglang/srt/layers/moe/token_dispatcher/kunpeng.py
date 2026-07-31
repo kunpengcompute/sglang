@@ -112,7 +112,7 @@ class _KunpengDispatcherState:
         self.max_tokens: int = 0
         self.num_max_dispatch_tokens_per_rank: int = 0
 
-        self.dispatch_call_count: int = 0
+        self.dispatch_call_count: torch.Tensor = torch.tensor([0], dtype=torch.int64)
         self.router_topk: int = 0
         self.attn_tp_size: int = 0
         self.attn_tp_rank: int = 0
@@ -527,7 +527,6 @@ class KunpengDispatcher(BaseDispatcher):
         t_total_start = time.perf_counter()
 
         state = self._state
-        state.dispatch_call_count += 1
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
         topk = topk_ids.shape[1]
@@ -614,12 +613,10 @@ class KunpengDispatcher(BaseDispatcher):
 
         # Build token_ids and experts_offset from recv_src_info.
         t_convert_start = time.perf_counter()
-        if state.dispatch_call_count % 2 == 1:
-            cur_src_info = state.recv_src_info
-        else:
-            cur_src_info = state.recv_src_info_bak
         kunpeng.topk_convert_kunpeng(
-            cur_src_info,
+            state.dispatch_call_count,
+            state.recv_src_info,
+            state.recv_src_info_bak,
             state.recv_token_ids_buf,
             state.recv_experts_offset,
             state.ep_size,
@@ -673,16 +670,14 @@ class KunpengDispatcher(BaseDispatcher):
         topk_ids_index = state.topk_ids_index_buf
         num_tokens = combine_input.num_tokens
         batch_size = num_tokens * self.attn_tp_size
-        if state.dispatch_call_count % 2 == 1:
-            recv_src_info = state.recv_src_info
-        else:
-            recv_src_info = state.recv_src_info_bak
 
         t_send_start = time.perf_counter()
         batch_id = 0
         kunpeng.moe_combine_send_kunpeng(
             state.combine_send_buf,
-            recv_src_info,
+            state.dispatch_call_count,
+            state.recv_src_info,
+            state.recv_src_info_bak,
             state.num_max_dispatch_tokens_per_rank,
             state.num_experts,
             state.hidden_size,

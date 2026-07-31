@@ -1103,7 +1103,7 @@ def _load_balance_padded_tokens(
 def _load_balance_padded_tokens_kunpeng(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
-    num_token_non_padded: int,
+    num_token_non_padded: torch.Tensor,
     num_experts: int,
     topk: int,
 ) -> torch.Tensor:
@@ -1244,7 +1244,7 @@ def _post_process_topk_ids(
         topk_ids, topk_weights = _load_balance_padded_tokens_kunpeng(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            num_token_non_padded=int(num_token_non_padded),
+            num_token_non_padded=num_token_non_padded,
             num_experts=router_logits.shape[1],
             topk=topk_ids.shape[1],
         )

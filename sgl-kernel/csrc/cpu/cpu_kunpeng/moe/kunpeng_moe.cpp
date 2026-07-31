@@ -38,10 +38,10 @@
 moe_comm_t g_moe_comm = {nullptr, nullptr, 0};
 moe_comm_h g_moe_comm_h = &g_moe_comm;
 
-kutacc::kurmcl_conn_info_h g_ds_conn_info = nullptr;       // = g_moe_comm.local_ds_conn_info
-kutacc::kurmcl_conn_info_h g_global_ds_conn_info = nullptr; // = g_moe_comm.global_ds_conn_info
-bool g_comm_initialized = false;       // MoE sub-domain initialized
-bool g_global_comm_initialized = false; // Global domain initialized
+kutacc::kurmcl_conn_info_h g_ds_conn_info = nullptr;         // = g_moe_comm.local_ds_conn_info
+kutacc::kurmcl_conn_info_h g_global_ds_conn_info = nullptr;  // = g_moe_comm.global_ds_conn_info
+bool g_comm_initialized = false;                             // MoE sub-domain initialized
+bool g_global_comm_initialized = false;                      // Global domain initialized
 int g_comm_size = 0;
 int g_comm_rank = 0;
 c10d::ProcessGroup *g_process_group = nullptr;
@@ -82,8 +82,8 @@ void moe_comm_create_all_kunpeng(int64_t global_pg_ptr, int64_t sub_pg_ptr)
         int global_size = global_pg->getSize();
         int global_rank = global_pg->getRank();
 
-        int ret = kutacc::kurmcl_comm_create(global_size, global_rank, oob_cbs_h,
-                                             (void *)global_pg, &g_moe_comm.global_ds_conn_info);
+        int ret = kutacc::kurmcl_comm_create(global_size, global_rank, oob_cbs_h, (void *)global_pg,
+                                             &g_moe_comm.global_ds_conn_info);
         TORCH_CHECK(ret == KUTACC_OK, "kurmcl_comm_create (global) failed with code ", ret);
         g_global_ds_conn_info = g_moe_comm.global_ds_conn_info;  // sync legacy alias
         g_global_comm_initialized = true;
@@ -97,8 +97,8 @@ void moe_comm_create_all_kunpeng(int64_t global_pg_ptr, int64_t sub_pg_ptr)
         g_comm_size = sub_pg->getSize();
         g_comm_rank = sub_pg->getRank();
 
-        int ret = kutacc::kurmcl_comm_create(g_comm_size, g_comm_rank, oob_cbs_h,
-                                             (void *)sub_pg, &g_moe_comm.local_ds_conn_info);
+        int ret = kutacc::kurmcl_comm_create(g_comm_size, g_comm_rank, oob_cbs_h, (void *)sub_pg,
+                                             &g_moe_comm.local_ds_conn_info);
         TORCH_CHECK(ret == KUTACC_OK, "kurmcl_comm_create (sub) failed with code ", ret);
         g_ds_conn_info = g_moe_comm.local_ds_conn_info;  // sync legacy alias
         g_comm_initialized = true;
@@ -121,7 +121,8 @@ void moe_comm_create_kunpeng(int64_t process_group_ptr)
     oob_cbs_h->oob_barrier = kunpeng_oob::kurmcl_oob_barrier;
     oob_cbs_h->oob_alltoall = kunpeng_oob::kurmcl_oob_alltoall;
 
-    int ret = kutacc::kurmcl_comm_create(g_comm_size, g_comm_rank, oob_cbs_h, (void *)g_process_group, &g_moe_comm.local_ds_conn_info);
+    int ret = kutacc::kurmcl_comm_create(g_comm_size, g_comm_rank, oob_cbs_h, (void *)g_process_group,
+                                         &g_moe_comm.local_ds_conn_info);
     g_ds_conn_info = g_moe_comm.local_ds_conn_info;  // sync legacy alias
 
     TORCH_CHECK(ret == KUTACC_OK, "kurmcl_comm_create failed with code ", ret);
@@ -240,21 +241,22 @@ void moe_combine_init_kunpeng(at::Tensor combine_send_buf, at::Tensor combined_x
                              g_moe_comm_h->local_ds_conn_info);
 }
 
-void moe_combine_send_kunpeng(at::Tensor x, at::Tensor src_info, int64_t num_max_dispatch_tokens_per_rank,
-                              int64_t num_experts, int64_t hidden, at::Tensor parallel_sizes, int64_t batch_id,
-                              at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights, int64_t num_tokens,
-                              int64_t num_topk, bool enable_allgather)
+void moe_combine_send_kunpeng(at::Tensor x, at::Tensor count, at::Tensor src_info, at::Tensor src_info_bak,
+                              int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, int64_t hidden,
+                              at::Tensor parallel_sizes, int64_t batch_id, at::Tensor combined_x, at::Tensor topk_idx,
+                              at::Tensor topk_weights, int64_t num_tokens, int64_t num_topk, bool enable_allgather)
 {
     bfloat16_t *x_data = reinterpret_cast<bfloat16_t *>(x.data_ptr());
-    int16_t *src_info_data = reinterpret_cast<int16_t *>(src_info.data_ptr());
+    const int64_t *count_data = count.data_ptr<int64_t>();
+    int16_t *src_info_data = (count_data[0] & 1) ? src_info.data_ptr<int16_t>() : src_info_bak.data_ptr<int16_t>();
     int16_t *parallel_sizes_data = reinterpret_cast<int16_t *>(parallel_sizes.data_ptr());
     bfloat16_t *combined_x_data = reinterpret_cast<bfloat16_t *>(combined_x.data_ptr());
     int16_t *topk_idx_data = reinterpret_cast<int16_t *>(topk_idx.data_ptr());
     float *topk_weights_data = reinterpret_cast<float *>(topk_weights.data_ptr());
 
     kutacc::moe_combine_send(x_data, src_info_data, num_max_dispatch_tokens_per_rank, num_experts, hidden,
-                             parallel_sizes_data, batch_id, g_moe_comm_h->local_ds_conn_info, combined_x_data, topk_idx_data,
-                             topk_weights_data, num_tokens, num_topk, enable_allgather);
+                             parallel_sizes_data, batch_id, g_moe_comm_h->local_ds_conn_info, combined_x_data,
+                             topk_idx_data, topk_weights_data, num_tokens, num_topk, enable_allgather);
 }
 
 void moe_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights, int64_t num_tokens,
@@ -415,7 +417,7 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
     }
 }
 
-void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, int64_t num_token_non_padded,
+void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
                                         int64_t num_experts, int64_t topk)
 {
     TORCH_CHECK(topk_ids.scalar_type() == at::kShort, "topk_ids must be int16");
@@ -425,7 +427,7 @@ void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_wei
     int16_t *topk_ids_data = topk_ids.data_ptr<int16_t>();
     float *topk_weights_data = topk_weights.data_ptr<float>();
     int64_t num_total = topk_ids.size(0);
-    int64_t pad_start = num_token_non_padded;
+    int64_t pad_start = num_token_non_padded.data_ptr<int32_t>()[0];
     int64_t num_pad = num_total - pad_start;
 
     if (num_pad <= 0) return;
@@ -572,7 +574,8 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
 // Converts recv_src_info (per-expert, per-rank token counts) into a flat
 // token_ids array and an experts_offset array for indexed access.
 // ---------------------------------------------------------------------------
-int64_t topk_convert_kunpeng(at::Tensor src_info,        // [num_local_experts, num_ranks*(max_tokens*2+1)] int16
+int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info,
+                             at::Tensor src_info_bak,    // [num_local_experts, num_ranks*(max_tokens*2+1)] int16
                              at::Tensor token_ids,       // [recv_dense_size] int32 (output)
                              at::Tensor experts_offset,  // [num_local_experts + 1] int32 (output)
                              int64_t num_ranks, int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank,
@@ -580,7 +583,10 @@ int64_t topk_convert_kunpeng(at::Tensor src_info,        // [num_local_experts, 
 {
     TORCH_CHECK(experts_offset.size(0) == num_local_experts + 1, "experts_offset size must be num_local_experts + 1");
 
-    const int16_t *src_info_data = src_info.data_ptr<int16_t>();
+    int64_t *count_data = count.data_ptr<int64_t>();
+    count_data[0]++;
+    const int16_t *src_info_data =
+        (count_data[0] & 1) ? src_info.data_ptr<int16_t>() : src_info.data_ptr_bak<int16_t>();
     int32_t *token_ids_data = token_ids.data_ptr<int32_t>();
     int32_t *experts_offset_data = experts_offset.data_ptr<int32_t>();
 
