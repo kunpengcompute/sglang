@@ -3360,7 +3360,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.positions = torch.tensor([], dtype=torch.int64)
             inputs = [forward_batch.input_ids, forward_batch.positions]
             if self.is_draft_worker:
-                forward_batch.spec_info.hidden_states = torch.tensor([], dtype=torch.bfloat16)
+                forward_batch.spec_info.hidden_states = torch.tensor([0, 7168], dtype=torch.bfloat16)
                 inputs.append(forward_batch.spec_info.hidden_states)
             logits, hidden_states = self._kunpeng_graph_forward(
                 forward_batch, inputs, "idle", use_hbw=True, **kwargs
