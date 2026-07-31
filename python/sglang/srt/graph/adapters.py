@@ -329,6 +329,17 @@ def _setup_shm_allreduce_kunpeng():
     register_op('shm_allreduce_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_shm_fence_kunpeng():
+    def shape_infer(attn_tp_size):
+        return []
+
+    def eager_fn(attn_tp_size):
+        torch.ops.sgl_kernel.shm_fence_kunpeng(attn_tp_size)
+        return None
+
+    register_op('shm_fence_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_shm_reduce_scatter_kunpeng():
     def shape_infer(input):
         return []
@@ -785,6 +796,7 @@ def setup():
     _setup_shm_mla_q_alltoall_kunpeng()
     _setup_shm_mla_o_alltoall_kunpeng()
     _setup_shm_allreduce_kunpeng()
+    _setup_shm_fence_kunpeng()
     _setup_shm_reduce_scatter_kunpeng()
     _setup_shm_dual_allgather_kunpeng()
     _setup_bmm_kunpeng()

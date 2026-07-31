@@ -1019,6 +1019,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     )
                 else:
                     if _is_cpu_920f:
+                        kunpeng.shm_fence_kunpeng(context.attn_tp_size)
                         kunpeng.shm_allreduce_kunpeng(hidden_states)
                     else:
                         hidden_states = attention_tensor_model_parallel_all_reduce(
@@ -1096,6 +1097,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     )
                 else:
                     if _is_cpu_920f:
+                        kunpeng.shm_fence_kunpeng(context.attn_tp_size)
                         kunpeng.shm_allreduce_kunpeng(hidden_states)
                     else:
                         hidden_states = attention_tensor_model_parallel_all_reduce(

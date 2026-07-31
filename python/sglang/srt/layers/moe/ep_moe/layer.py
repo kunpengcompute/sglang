@@ -25,7 +25,6 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed import (
-    get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
 )
 from sglang.srt.environ import envs
@@ -703,8 +702,6 @@ class KunpengMoE(FusedMoE):
 
         # Step 6: Shared expert allreduce overlapped with RDMA combine transfer.
         if self._shared_output is not None:
-            attn_tp_size = get_attn_tensor_model_parallel_world_size()
-            torch.ops.sgl_kernel.shm_fence_kunpeng(attn_tp_size)
             self._shared_output = get_attn_tp_group().all_reduce(self._shared_output)
 
         # Step 7: Combine recv — wait for RDMA + weighted reduction.

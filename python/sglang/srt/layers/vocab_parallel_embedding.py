@@ -529,6 +529,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
                 if not get_attn_tp_context().input_scattered:
                     if _is_cpu_920f:
+                        kunpeng.shm_fence_kunpeng(get_attention_tp_size())
                         kunpeng.shm_allreduce_kunpeng(output_parallel)
                     elif self.use_attn_tp_group:
                         output_parallel = attn_tp_all_reduce(output_parallel)
