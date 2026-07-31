@@ -304,11 +304,11 @@ if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]]
     export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
     export LD_LIBRARY_PATH=/usr/lib64/libibverbs:$LD_LIBRARY_PATH
     export LD_LIBRARY_PATH=${KUPL_PATH}/lib:$LD_LIBRARY_PATH
-    export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:$LD_LIBRARY_PATH
+    export LD_LIBRARY_PATH=${KUTACC_PATH}/lib:$LD_LIBRARY_PATH
 fi
 
-export KUTACC_LIB=${KUTACC_PATH}/install/lib
-export KUTACC_INCLUDE=${KUTACC_PATH}/install/include
+export KUTACC_LIB=${KUTACC_PATH}/lib
+export KUTACC_INCLUDE=${KUTACC_PATH}/include
 
 export CPATH=${KUPL_PATH}/include:$CPATH
 export INCLUDE=${KUPL_PATH}/include:$INCLUDE
