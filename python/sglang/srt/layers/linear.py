@@ -13,6 +13,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
+    get_attn_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -1538,6 +1539,7 @@ class RowParallelLinear(LinearBase):
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             if _is_cpu_920f:
+                kunpeng.shm_fence_kunpeng(get_attn_tensor_model_parallel_world_size())
                 kunpeng.shm_allreduce_kunpeng(output_parallel)
                 output = output_parallel
             elif self.use_dp_attention_reduce:

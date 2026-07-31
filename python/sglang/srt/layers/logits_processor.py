@@ -961,6 +961,7 @@ class LogitsProcessor(nn.Module):
             if _is_cpu_920f:
                 # batch_all_gather gathers on dim=-1, directly producing
                 # [batch, vocab_size] matching the kernel's natural layout.
+                kunpeng.shm_fence_kunpeng(self.attn_tp_size)
                 global_logits = kunpeng.shm_batched_allgather_kunpeng(logits, self.attn_tp_size)
             else:
                 global_logits = torch.empty(

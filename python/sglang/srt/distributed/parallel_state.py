@@ -655,6 +655,7 @@ class GroupCoordinator:
                 and input_.shape[0] > 0
                 and input_.shape[0] <= self.kunpeng_communicator.max_tokens
             ):
+                kunpeng.shm_fence_kunpeng(self.world_size)
                 kunpeng.shm_allreduce_kunpeng(input_)
             else:
                 torch.distributed.all_reduce(
@@ -946,6 +947,7 @@ class GroupCoordinator:
 
         if input_.shape[0] > 0:
             try:
+                kunpeng.shm_fence_kunpeng(self.world_size)
                 output = kunpeng.shm_batched_allgather_kunpeng(input_, self.world_size)
             except RuntimeError:
                 # Fall back to Gloo when SHM pool is exhausted.
