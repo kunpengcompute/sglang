@@ -92,13 +92,34 @@ def run_sdpa_forward_mha(
 
 
 class KunpengCpuMetadata:
-    """Metadata for a single forward pass, holding pre-computed tensors reused across layers."""
+    """Metadata for a single forward pass, holding pre-computed tensors reused across layers.
+
+    Buffers (seq_lens_buf, extend_seq_lens_buf, block_table_buf) are allocated once via
+    init_buffers() and reused via copy-in each forward so graph capture always sees the
+    same tensor storage.
+    """
 
     def __init__(self):
         self.block_table: Optional[torch.Tensor] = None
         self.seq_lens: Optional[torch.Tensor] = None
+        self.extend_seq_lens: Optional[torch.Tensor] = None
         self.page_size: int = 0
         self.extra_bytes: int = 0
+
+        # Pre-allocated buffers for graph capture
+        self._seq_lens_buf: Optional[torch.Tensor] = None
+        self._extend_seq_lens_buf: Optional[torch.Tensor] = None
+        self._block_table_buf: Optional[torch.Tensor] = None
+
+    def init_buffers(self, max_bs: int, max_blocks: int, device):
+        """Allocate reusable buffers for graph-capture-friendly metadata tensors."""
+        self._seq_lens_buf = torch.zeros((max_bs,), dtype=torch.int32, device=device)
+        self._extend_seq_lens_buf = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=device
+        )
+        self._block_table_buf = torch.zeros(
+            (max_bs, max_blocks), dtype=torch.int32, device=device
+        )
 
 
 def kutacc_mha(
@@ -223,11 +244,27 @@ class KunpengCpuBackend(AttentionBackend):
         self._decode_meta = torch.ops.sgl_kernel.flash_mla_meta_create_kunpeng()
         self.swap_mgr = KunpengSwapManager.get_instance()
 
+        # Create the forward metadata once and allocate reusable buffers so
+        # graph capture always sees the same tensor storage across forwards.
+        self.forward_metadata = KunpengCpuMetadata()
+        self.forward_metadata.init_buffers(
+            max_bs=model_runner.max_running_requests,
+            max_blocks=(model_config.context_len + model_runner.page_size - 1)
+            // model_runner.page_size,
+            device=model_runner.device,
+        )
+
     def __del__(self):
         if hasattr(self, "_decode_meta") and self._decode_meta is not None:
             torch.ops.sgl_kernel.flash_mla_meta_destroy_kunpeng(self._decode_meta)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # Reset metadata view fields so extend mode (which doesn't call
+        # _init_decode_metadata) doesn't carry stale data from prior forwards.
+        self.forward_metadata.seq_lens = None
+        self.forward_metadata.extend_seq_lens = None
+        self.forward_metadata.block_table = None
+
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_decode_metadata(forward_batch)
         elif (
@@ -249,7 +286,7 @@ class KunpengCpuBackend(AttentionBackend):
         return
 
     def _init_decode_metadata(self, forward_batch: ForwardBatch, seqlen_q: int = 1):
-        metadata = KunpengCpuMetadata()
+        metadata = self.forward_metadata
 
         metadata.page_size = forward_batch.token_to_kv_pool.page_size
         seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -277,19 +314,21 @@ class KunpengCpuBackend(AttentionBackend):
         else:
             num_heads_q = self.num_q_heads
 
-        metadata.seq_lens = seq_lens
+        # Copy seq_lens into pre-allocated buffer (graph capture reuses tensor storage).
+        batch_size = seq_lens.shape[0]
+        metadata._seq_lens_buf[:batch_size].copy_(seq_lens)
+        metadata.seq_lens = metadata._seq_lens_buf[:batch_size]
 
-        batch_size = metadata.seq_lens.shape[0]
         max_seq_len = metadata.seq_lens.max().item()
         max_blocks = (max_seq_len + metadata.page_size - 1) // metadata.page_size
-        metadata.extend_seq_lens = torch.full(
-            (batch_size,), seqlen_q, dtype=torch.int32
-        )
-        metadata.block_table = torch.zeros(
-            (batch_size, max_blocks),
-            dtype=torch.int32,
-            device=metadata.seq_lens.device,
-        )
+
+        # Copy extend_seq_lens into pre-allocated buffer.
+        metadata._extend_seq_lens_buf[:batch_size] = seqlen_q
+        metadata.extend_seq_lens = metadata._extend_seq_lens_buf[:batch_size]
+
+        # Copy block_table into pre-allocated buffer.
+        metadata.block_table = metadata._block_table_buf[:batch_size, :max_blocks]
+        metadata.block_table.zero_()
         for b in range(batch_size):
             req_idx = req_pool_indices[b].item()
             seq_len = metadata.seq_lens[b].item()
@@ -312,8 +351,6 @@ class KunpengCpuBackend(AttentionBackend):
                 meta=self._decode_meta,
             )
         )
-
-        self.forward_metadata = metadata
 
     def _get_kv_buffer(
         self,
