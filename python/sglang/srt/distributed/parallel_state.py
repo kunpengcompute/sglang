@@ -80,6 +80,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_cpu_920f = is_cpu_920f()
+_enable_shm_fence = envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -476,17 +477,16 @@ class GroupCoordinator:
 
         # PP P2P communicator using kutacc pp_put/pp_recv
         self.use_kunpeng_pp_communicator = (
-            _is_cpu_920f
-            and group_name == "pp"
-            and self.world_size > 1
+            _is_cpu_920f and group_name == "pp" and self.world_size > 1
         )
         self.kunpeng_pp_communicator: Optional[Any] = None
         if self.use_kunpeng_pp_communicator:
             from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
                 KunpengPPCommunicator,
             )
-            
+
             from sglang.srt.distributed.parallel_state import get_world_group
+
             world_group = get_world_group()
             self.kunpeng_pp_communicator = KunpengPPCommunicator(
                 pp_group=self.cpu_group,
@@ -496,7 +496,9 @@ class GroupCoordinator:
             logger.debug(
                 "[DEBUG] [PP Communicator] group=%s "
                 "(pp_size=%s, pp_rank=%s, kunpeng_pp_enabled=%s)",
-                group_name, self.world_size, self.rank_in_group,
+                group_name,
+                self.world_size,
+                self.rank_in_group,
                 self.use_kunpeng_pp_communicator,
             )
 
@@ -655,7 +657,8 @@ class GroupCoordinator:
                 and input_.shape[0] > 0
                 and input_.shape[0] <= self.kunpeng_communicator.max_tokens
             ):
-                kunpeng.shm_fence_kunpeng(self.world_size)
+                if _enable_shm_fence:
+                    kunpeng.shm_fence_kunpeng(self.world_size)
                 kunpeng.shm_allreduce_kunpeng(input_)
             else:
                 torch.distributed.all_reduce(
@@ -947,7 +950,8 @@ class GroupCoordinator:
 
         if input_.shape[0] > 0:
             try:
-                kunpeng.shm_fence_kunpeng(self.world_size)
+                if _enable_shm_fence:
+                    kunpeng.shm_fence_kunpeng(self.world_size)
                 output = kunpeng.shm_batched_allgather_kunpeng(input_, self.world_size)
             except RuntimeError:
                 # Fall back to Gloo when SHM pool is exhausted.
@@ -1457,7 +1461,10 @@ class GroupCoordinator:
             for idx, tensor in enumerate(tensor_list):
                 if tensor.numel() == 0:
                     continue
-                if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+                if (
+                    all_gather_group is not None
+                    and tensor.numel() % all_gather_size == 0
+                ):
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
                 if tensor.is_cpu:
                     if not tensor.is_contiguous():
@@ -1484,7 +1491,10 @@ class GroupCoordinator:
             for tensor in tensor_list:
                 if tensor.numel() == 0:
                     continue
-                if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+                if (
+                    all_gather_group is not None
+                    and tensor.numel() % all_gather_size == 0
+                ):
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
                 comm_group = metadata_group if tensor.is_cpu else group
                 work = send_func(tensor, self.ranks[dst], group=comm_group)
@@ -1534,7 +1544,9 @@ class GroupCoordinator:
 
             for key, value in recv_metadata_list:
                 if isinstance(value, TensorMetadata):
-                    tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                    tensor = torch.empty(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
                     if tensor.numel() == 0:
                         tensor_dict[key] = tensor
                         continue
@@ -1552,7 +1564,9 @@ class GroupCoordinator:
                     if tensor.is_cpu:
                         if not tensor.is_contiguous():
                             tensor = tensor.contiguous()
-                        recv_list.append((key, tensor, use_all_gather, orig_shape, pp_offset))
+                        recv_list.append(
+                            (key, tensor, use_all_gather, orig_shape, pp_offset)
+                        )
                         pp_offset += tensor.nbytes
                         has_kutacc_tensors = True
                     else:
@@ -1573,9 +1587,7 @@ class GroupCoordinator:
                     src_rank=src, total_size=pp_offset
                 )
                 for key, tensor, use_all_gather, orig_shape, offset in recv_list:
-                    self.kunpeng_pp_communicator.copy_from_buffer(
-                        tensor, offset=offset
-                    )
+                    self.kunpeng_pp_communicator.copy_from_buffer(tensor, offset=offset)
                 for key, tensor, _, _, _ in recv_list:
                     if use_all_gather:
                         tensor = all_gather_group.all_gather(tensor, dim=0)
@@ -1584,7 +1596,9 @@ class GroupCoordinator:
         else:
             for key, value in recv_metadata_list:
                 if isinstance(value, TensorMetadata):
-                    tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                    tensor = torch.empty(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
                     if tensor.numel() == 0:
                         # Skip broadcasting empty tensors.
                         tensor_dict[key] = tensor

@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
@@ -48,6 +49,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_920f = is_cpu_920f()
 _is_npu = is_npu()
+_enable_shm_fence = envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get()
 
 logger = logging.getLogger(__name__)
 
@@ -529,7 +531,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
                 if not get_attn_tp_context().input_scattered:
                     if _is_cpu_920f:
-                        kunpeng.shm_fence_kunpeng(get_attention_tp_size())
+                        if _enable_shm_fence:
+                            kunpeng.shm_fence_kunpeng(get_attention_tp_size())
                         kunpeng.shm_allreduce_kunpeng(output_parallel)
                     elif self.use_attn_tp_group:
                         output_parallel = attn_tp_all_reduce(output_parallel)

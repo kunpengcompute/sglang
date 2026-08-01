@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu_920f = is_cpu_920f()
+_enable_shm_fence = envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get()
 
 
 @dataclasses.dataclass
@@ -435,10 +436,13 @@ class LogitsProcessor(nn.Module):
             if _is_cpu_920f:
                 assert logits_metadata.padded_static_len < 0
                 pruned_states = kunpeng.last_tokens(
-                    hidden_states, logits_metadata.extend_seq_lens)
+                    hidden_states, logits_metadata.extend_seq_lens
+                )
             else:
                 if logits_metadata.padded_static_len < 0:
-                    last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                    last_index = (
+                        torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                    )
                 else:
                     # If padding_static length is 5 and extended_seq_lens is [2, 3],
                     # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
@@ -920,13 +924,18 @@ class LogitsProcessor(nn.Module):
                 hs = hidden_states.to(lm_head.weight.dtype)
                 M, K = hs.shape
                 N = lm_head.weight.shape[0]
-                tile_m, tile_n, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+                tile_m, tile_n, tile_k = (
+                    torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+                )
                 blocks_in_k = K // tile_k
                 ws_numel = blocks_in_k * N * M * 2 if blocks_in_k > 1 else 0
                 packed_hs = kunpeng.bf16_gemm_pack_kunpeng(hs, tile_m, tile_k)
                 logits = kunpeng.bf16_packed_gemm_kunpeng(
-                    packed_hs, lm_head.weight,
-                    kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16), 32)
+                    packed_hs,
+                    lm_head.weight,
+                    kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16),
+                    32,
+                )
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
@@ -961,8 +970,11 @@ class LogitsProcessor(nn.Module):
             if _is_cpu_920f:
                 # batch_all_gather gathers on dim=-1, directly producing
                 # [batch, vocab_size] matching the kernel's natural layout.
-                kunpeng.shm_fence_kunpeng(self.attn_tp_size)
-                global_logits = kunpeng.shm_batched_allgather_kunpeng(logits, self.attn_tp_size)
+                if _enable_shm_fence:
+                    kunpeng.shm_fence_kunpeng(self.attn_tp_size)
+                global_logits = kunpeng.shm_batched_allgather_kunpeng(
+                    logits, self.attn_tp_size
+                )
             else:
                 global_logits = torch.empty(
                     (
@@ -1016,8 +1028,9 @@ class LogitsProcessor(nn.Module):
         if _is_cpu_920f:
             logits_slice = logits[:, : self.vocab_size]
             if logits_metadata.next_token_logits_buffer is not None:
-                kunpeng.copy_kunpeng(logits_metadata.next_token_logits_buffer,
-                          logits_slice)
+                kunpeng.copy_kunpeng(
+                    logits_metadata.next_token_logits_buffer, logits_slice
+                )
                 assert False, "no impl"
             buf = kunpeng.alloc_buffer(logits_slice.numel(), dtype=torch.float32)
             buf_2d = buf.view(logits_slice.shape)

@@ -87,6 +87,7 @@ _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_enable_shm_fence = envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get()
 _is_cpu_920f = is_cpu_920f()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -1019,11 +1020,13 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     )
                 else:
                     if _is_cpu_920f:
-                        kunpeng.shm_fence_kunpeng(context.attn_tp_size)
+                        if _enable_shm_fence:
+                            kunpeng.shm_fence_kunpeng(context.attn_tp_size)
                         kunpeng.shm_allreduce_kunpeng(hidden_states)
                     else:
                         hidden_states = attention_tensor_model_parallel_all_reduce(
-                            hidden_states)
+                            hidden_states
+                        )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -1097,11 +1100,13 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     )
                 else:
                     if _is_cpu_920f:
-                        kunpeng.shm_fence_kunpeng(context.attn_tp_size)
+                        if _enable_shm_fence:
+                            kunpeng.shm_fence_kunpeng(context.attn_tp_size)
                         kunpeng.shm_allreduce_kunpeng(hidden_states)
                     else:
                         hidden_states = attention_tensor_model_parallel_all_reduce(
-                            hidden_states)
+                            hidden_states
+                        )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
