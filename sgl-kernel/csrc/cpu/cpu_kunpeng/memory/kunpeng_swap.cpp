@@ -151,65 +151,52 @@ void kupl_sdma_wait_all(at::Tensor event_tensor, at::Tensor event_num_tensor)
 }
 
 void kupl_sdma_set_kv_buffer(at::Tensor kv_buffer, at::Tensor loc, at::Tensor cache_k, at::Tensor event_tensor,
-                             at::Tensor event_num_tensor, int64_t max_pending_events, int64_t chunk_bytes)
+                             at::Tensor event_num_tensor)
 {
     TORCH_CHECK(kv_buffer.dim() == 2, "kv_buffer must be 2D");
     TORCH_CHECK(loc.dim() == 1, "loc must be 1D");
     TORCH_CHECK(cache_k.dim() == 2, "cache_k must be 2D");
     TORCH_CHECK(cache_k.size(1) == kv_buffer.size(1), "cache_k dim-1 must match kv_buffer dim-1");
     TORCH_CHECK(cache_k.size(0) == loc.size(0), "cache_k and loc token count mismatch");
-    TORCH_CHECK(kv_buffer.is_contiguous(), "kv_buffer must be contiguous");
-    TORCH_CHECK(cache_k.is_contiguous(), "cache_k must be contiguous");
-    TORCH_CHECK(kv_buffer.stride(1) == 1 && cache_k.stride(1) == 1, "kv_buffer and cache_k must have contiguous dim-1");
+    TORCH_CHECK(kv_buffer.stride(1) == 1 && cache_k.stride(1) == 1,
+                "kv_buffer and cache_k must have contiguous dim-1 (stride==1)");
 
+    int64_t kdim = kv_buffer.size(1);
     int64_t tokens = loc.size(0);
     if (tokens == 0) return;
 
-    int64_t kdim = kv_buffer.size(1);
     int64_t elem_sz = kv_buffer.element_size();
     int64_t dst_stride = kv_buffer.stride(0) * elem_sz;
     int64_t src_stride = cache_k.stride(0) * elem_sz;
     int64_t row_bytes = kdim * elem_sz;
 
+    uint8_t *buf = static_cast<uint8_t *>(kv_buffer.data_ptr());
+    uint8_t *src = static_cast<uint8_t *>(cache_k.data_ptr());
+
+    int event_count = event_num_tensor.item<int>();
+    int next_slot = event_count;
+    int *event_ptr = event_tensor.data_ptr<int>();
+
     if (loc.scalar_type() == at::kInt) {
-        int32_t *idx32 = loc.data_ptr<int32_t>();
-        int64_t run_start = 0;
-        while (run_start < tokens) {
-            int64_t run_end = run_start + 1;
-            while (run_end < tokens && idx32[run_end] == idx32[run_end - 1] + 1) {
-                run_end++;
-            }
-            int64_t run_count = run_end - run_start;
-            int64_t dst_offset = static_cast<int64_t>(idx32[run_start]) * dst_stride;
-            int64_t src_offset = run_start * src_stride;
-            int64_t total_bytes = run_count * row_bytes;
-
-            kupl_sdma_memcpy_chunked(kv_buffer, cache_k, event_tensor, event_num_tensor, dst_offset, src_offset,
-                                     total_bytes, chunk_bytes, max_pending_events);
-
-            run_start = run_end;
+        int32_t *idx = loc.data_ptr<int32_t>();
+        for (int64_t i = 0; i < tokens; i++) {
+            int event_id = utils::kupl_get_free_event_id();
+            utils::kupl_sdma_async(event_id, buf + static_cast<int64_t>(idx[i]) * dst_stride, src + i * src_stride,
+                                   static_cast<int>(row_bytes), 0);
+            event_ptr[next_slot] = event_id;
+            next_slot++;
         }
-        return;
-    }
-
-    int64_t *idx_arr = loc.data_ptr<int64_t>();
-
-    int64_t run_start = 0;
-    while (run_start < tokens) {
-        int64_t run_end = run_start + 1;
-        while (run_end < tokens && idx_arr[run_end] == idx_arr[run_end - 1] + 1) {
-            run_end++;
+    } else {
+        int64_t *idx = loc.data_ptr<int64_t>();
+        for (int64_t i = 0; i < tokens; i++) {
+            int event_id = utils::kupl_get_free_event_id();
+            utils::kupl_sdma_async(event_id, buf + idx[i] * dst_stride, src + i * src_stride,
+                                   static_cast<int>(row_bytes), 0);
+            event_ptr[next_slot] = event_id;
+            next_slot++;
         }
-        int64_t run_count = run_end - run_start;
-        int64_t dst_offset = idx_arr[run_start] * dst_stride;
-        int64_t src_offset = run_start * src_stride;
-        int64_t total_bytes = run_count * row_bytes;
-
-        kupl_sdma_memcpy_chunked(kv_buffer, cache_k, event_tensor, event_num_tensor, dst_offset, src_offset,
-                                 total_bytes, chunk_bytes, max_pending_events);
-
-        run_start = run_end;
     }
+    event_num_tensor.data_ptr<int>()[0] = next_slot;
 }
 
 void kupl_sdma_kv_swapin(at::Tensor dst, at::Tensor src, at::Tensor event_tensor, at::Tensor event_num_tensor,
@@ -266,8 +253,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def(
         "kupl_sdma_set_kv_buffer(Tensor kv_buffer, Tensor loc, Tensor cache_k, "
-        "Tensor(a!) event_tensor, Tensor(b!) event_num_tensor, "
-        "int max_pending_events, int chunk_bytes) -> ()");
+        "Tensor(a!) event_tensor, Tensor(b!) event_num_tensor) -> ()");
     m.impl("kupl_sdma_set_kv_buffer", kupl_sdma_set_kv_buffer);
 }
 

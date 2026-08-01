@@ -315,7 +315,6 @@ class KunpengCpuBackend(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         cache_loc: torch.Tensor,
-        save_kv_cache: bool,
     ) -> torch.Tensor:
 
         return KunpengSwapManager.get_instance().get_kv_cache()
@@ -327,7 +326,6 @@ class KunpengCpuBackend(AttentionBackend):
         v,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache: bool,
     ):
         """Kutacc flash_attention prefill path with dump support."""
         # --- cache ---
@@ -365,7 +363,6 @@ class KunpengCpuBackend(AttentionBackend):
         v,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=False,
     ):
         cache_loc = forward_batch.out_cache_loc
 
@@ -392,9 +389,7 @@ class KunpengCpuBackend(AttentionBackend):
                 bs, max_ext_len, layer.tp_q_head_num, layer.qk_head_dim
             )
 
-        kv_buf = self._get_kv_buffer(
-            layer, forward_batch, k, v, cache_loc, False
-        )
+        kv_buf = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
         kvcache_paged = kv_buf[:, 0, :].reshape(-1, page_size, kv_buf.shape[-1])
 
         softmax_scale = (
@@ -452,7 +447,6 @@ class KunpengCpuBackend(AttentionBackend):
         v,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=False,
     ):
 
         if layer.qk_head_dim != layer.v_head_dim:
@@ -505,9 +499,7 @@ class KunpengCpuBackend(AttentionBackend):
             and layer.tp_q_head_num != 1
             and self.forward_metadata is not None
         ):
-            return self._forward_extend_mla_paged(
-                q, k, v, layer, forward_batch, False
-            )
+            return self._forward_extend_mla_paged(q, k, v, layer, forward_batch)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
         is_cross_attn = layer.is_cross_attention
@@ -521,13 +513,9 @@ class KunpengCpuBackend(AttentionBackend):
         )
 
         if use_kutacc:
-            return self._forward_extend_kutacc(
-                q, k, v, layer, forward_batch, False
-            )
+            return self._forward_extend_kutacc(q, k, v, layer, forward_batch)
         else:
-            return self.forward_extend_native(
-                q, k, v, layer, forward_batch, False
-            )
+            return self.forward_extend_native(q, k, v, layer, forward_batch)
 
     def forward_decode(
         self,
@@ -548,7 +536,7 @@ class KunpengCpuBackend(AttentionBackend):
 
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        kv_k = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc, False)
+        kv_k = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
         softmax_scale = (
             layer.scaling
             if layer.scaling is not None
