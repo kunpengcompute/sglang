@@ -178,11 +178,12 @@ export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
 export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=0
-export SGLANG_KUNPENG_RDMA_ALLGATHER=0  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
+export SGLANG_KUNPENG_RDMA_ALLGATHER=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_ENABLE_MTP=0
 # Kunpeng SHM pool
 export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476
 export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=50
+export SGLANG_KUNPENG_ENABLE_SHM_FENCE=0
 # Kunpeng HBW pool
 export SGLANG_ENABLE_HBW_POOL=1
 export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=4000

@@ -573,9 +573,10 @@ class Envs:
     SGLANG_USE_CPU_920F = EnvBool(False)
     SGLANG_KUNPENG_PROFILE = EnvBool(False)
     SGLANG_ENABLE_BINARY_LAUNCH = EnvBool(True)
-    SGLANG_KUNPENG_RDMA_ALLGATHER = EnvBool(False)
+    SGLANG_KUNPENG_RDMA_ALLGATHER = EnvBool(True)
     SGLANG_KUNPENG_MAX_SEQ_NUM = EnvInt(128)
     SGLANG_FORWARD_ASYNC = EnvBool(True)
+    SGLANG_KUNPENG_ENABLE_SHM_FENCE = EnvBool(False)
 
 
 envs = Envs()

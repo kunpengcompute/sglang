@@ -41,7 +41,15 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_cpu_920f, is_hip, is_npu, set_weight_attrs
+from sglang.srt.environ import envs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_cpu_920f,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -54,6 +62,7 @@ _is_cpu_920f = is_cpu_920f()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_DISABLE_LINEARQUANT"
 )
+_enable_shm_fence = envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get()
 
 logger = logging.getLogger(__name__)
 
@@ -1539,7 +1548,10 @@ class RowParallelLinear(LinearBase):
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             if _is_cpu_920f:
-                kunpeng.shm_fence_kunpeng(get_attn_tensor_model_parallel_world_size())
+                if _enable_shm_fence:
+                    kunpeng.shm_fence_kunpeng(
+                        get_attn_tensor_model_parallel_world_size()
+                    )
                 kunpeng.shm_allreduce_kunpeng(output_parallel)
                 output = output_parallel
             elif self.use_dp_attention_reduce:
