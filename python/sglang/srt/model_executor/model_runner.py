@@ -1448,8 +1448,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.graph_fixed_weights = collect_model_weights(self.model)
                 self._sglang_graph_cache = OrderedDict()
                 self._graph_hbw_tensor = None
-                self._sglang_graph_max_cache = int(os.environ.get(
-                    "SGLANG_KUNPENG_GRAPH_CACHE_SIZE", "4"))
+                self._sglang_graph_max_cache = int(
+                    os.environ.get("SGLANG_KUNPENG_GRAPH_CACHE_SIZE", "4")
+                )
             else:
                 self.graph_fixed_weights = None
 
@@ -3078,12 +3079,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
                 _KunpengDispatcherState,
             )
+
             state = _KunpengDispatcherState.get()
-            for attr in ('parallel_policy', 'dispatch_send_buf',
-                         'dispatch_recv_buf', 'combine_send_buf',
-                         'combine_recv_buf', 'recv_token_ids_buf',
-                         'recv_experts_offset', 'combined_x',
-                         'topk_weights_buf', 'topk_ids_index_buf'):
+            for attr in (
+                "parallel_policy",
+                "dispatch_send_buf",
+                "dispatch_recv_buf",
+                "combine_send_buf",
+                "combine_recv_buf",
+                "recv_token_ids_buf",
+                "recv_experts_offset",
+                "combined_x",
+                "topk_weights_buf",
+                "topk_ids_index_buf",
+            ):
                 t = getattr(state, attr, None)
                 if t is not None:
                     fixed.append(t)
@@ -3101,14 +3110,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         from sglang.srt.graph import capture, finalize
 
-        assert forward_batch.input_ids.dtype == torch.int64, \
-            f"graph input_ids must be int64, got {forward_batch.input_ids.dtype}"
+        assert (
+            forward_batch.input_ids.dtype == torch.int64
+        ), f"graph input_ids must be int64, got {forward_batch.input_ids.dtype}"
         total_tokens = forward_batch.input_ids.shape[0]
         graph_cache_key = (forward_batch.forward_mode, total_tokens)
 
         if graph_cache_key not in self._sglang_graph_cache:
-            while (len(self._sglang_graph_cache)
-                   >= self._sglang_graph_max_cache):
+            while len(self._sglang_graph_cache) >= self._sglang_graph_max_cache:
                 self._sglang_graph_cache.popitem(last=False)
 
             fixed = self._build_graph_fixed_tensors(forward_batch)
@@ -3126,9 +3135,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if self._graph_hbw_tensor is None:
                     remaining = self.weight_hbw_pool.largest_free_bytes
                     self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
-                        (remaining,), torch.uint8)
-                graph = finalize(
-                    [logits], external_pool=self._graph_hbw_tensor)
+                        (remaining,), torch.uint8
+                    )
+                graph = finalize([logits], external_pool=self._graph_hbw_tensor)
             else:
                 graph = finalize([logits])
 
@@ -3144,24 +3153,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             graph = self._sglang_graph_cache[graph_cache_key]
 
         t0 = time.time()
-        logits, = graph.run(inputs)
+        (logits,) = graph.run(inputs)
         t1 = time.time()
         logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
 
         if _is_kunpeng_graph_profile:
             from sglang.srt.graph.profile import write_profile
-            profile_dir = os.environ.get(
-                "SGLANG_TORCH_PROFILER_DIR", "/tmp")
-            path = os.path.join(
-                profile_dir,
-                f"sglang_graph_rank{self.tp_rank}.jsonl")
+
+            profile_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+            path = os.path.join(profile_dir, f"sglang_graph_rank{self.tp_rank}.jsonl")
             row = graph.get_profile_row()
             op_names = graph.profile_op_names()
-            write_profile(path, row, op_names, {
-                "forward_mode": forward_mode,
-                "count": len(op_names),
-                "total_tokens": total_tokens,
-            })
+            write_profile(
+                path,
+                row,
+                op_names,
+                {
+                    "forward_mode": forward_mode,
+                    "count": len(op_names),
+                    "total_tokens": total_tokens,
+                },
+            )
 
         return logits
 
@@ -3192,14 +3204,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # the graph.  Move it into forward_decode to cover embed→sample.
         if _is_cpu_920f and _is_kunpeng_graph_capture:
             meta = self.attn_backend.forward_metadata
-            inputs = [forward_batch.input_ids,
-                      forward_batch.positions,
-                      meta.block_table,
-                      meta.seq_lens,
-                      forward_batch.out_cache_loc,
-                      self.attn_backend._decode_meta]
+            inputs = [
+                forward_batch.input_ids,
+                forward_batch.positions,
+                meta.block_table,
+                meta.seq_lens,
+                forward_batch.out_cache_loc,
+                self.attn_backend._decode_meta,
+            ]
             logits = self._kunpeng_graph_forward(
-                forward_batch, inputs, "decode", use_hbw=True, **kwargs)
+                forward_batch, inputs, "decode", use_hbw=True, **kwargs
+            )
             return LogitsProcessorOutput(next_token_logits=logits)
 
         # Launch forward
@@ -3272,12 +3287,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # ── sglang graph capture/replay for Kunpeng extend ──
         if _is_cpu_920f and _is_kunpeng_graph_capture:
-            inputs = [forward_batch.input_ids,
-                      forward_batch.positions,
-                      forward_batch.extend_seq_lens,
-                      forward_batch.out_cache_loc]
+            inputs = [
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch.extend_seq_lens,
+                forward_batch.out_cache_loc,
+            ]
             logits = self._kunpeng_graph_forward(
-                forward_batch, inputs, "extend", use_hbw=False, **kwargs)
+                forward_batch, inputs, "extend", use_hbw=False, **kwargs
+            )
             return (LogitsProcessorOutput(next_token_logits=logits), True)
 
         ctx = (
@@ -3309,10 +3327,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # ── sglang graph capture/replay for Kunpeng idle ──
         if _is_cpu_920f and _is_kunpeng_graph_capture:
-            inputs = [forward_batch.input_ids,
-                      forward_batch.positions]
+            inputs = [forward_batch.input_ids, forward_batch.positions]
             logits = self._kunpeng_graph_forward(
-                forward_batch, inputs, "idle", use_hbw=True, **kwargs)
+                forward_batch, inputs, "idle", use_hbw=True, **kwargs
+            )
             return LogitsProcessorOutput(next_token_logits=logits)
 
         ctx = (
