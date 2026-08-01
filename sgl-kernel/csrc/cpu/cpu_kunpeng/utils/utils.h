@@ -40,3 +40,9 @@ static inline bool read_is_prefill_env()
     std::string s(env);
     return s == "1" || s == "true" || s == "TRUE" || s == "True";
 }
+
+namespace utils {
+
+uint64_t tensor_hash(const at::Tensor &tensor);
+
+}  // namespace utils

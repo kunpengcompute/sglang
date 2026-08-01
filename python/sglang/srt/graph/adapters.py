@@ -446,18 +446,18 @@ def _setup_moe_dispatch_recv_kunpeng():
 
 
 def _setup_moe_combine_send_kunpeng():
-    def shape_infer(x, src_info, num_max_dispatch_tokens_per_rank,
+    def shape_infer(x, count, src_info, src_info_bak, num_max_dispatch_tokens_per_rank,
                     num_experts, hidden, parallel_sizes, batch_id,
                     combined_x, topk_idx, topk_weights, num_tokens,
                     num_topk, enable_allgather):
         return []
 
-    def eager_fn(x, src_info, num_max_dispatch_tokens_per_rank,
+    def eager_fn(x, count, src_info, src_info_bak, num_max_dispatch_tokens_per_rank,
                  num_experts, hidden, parallel_sizes, batch_id,
                  combined_x, topk_idx, topk_weights, num_tokens,
                  num_topk, enable_allgather):
         torch.ops.sgl_kernel.moe_combine_send_kunpeng(
-            x, src_info, num_max_dispatch_tokens_per_rank,
+            x, count, src_info, src_info_bak, num_max_dispatch_tokens_per_rank,
             num_experts, hidden, parallel_sizes, batch_id,
             combined_x, topk_idx, topk_weights, num_tokens,
             num_topk, enable_allgather)
@@ -657,17 +657,19 @@ def _setup_flash_mla_dense_decode_kunpeng():
                     softmax_scale, is_causal, extra_buffer, meta,
                     head_dim_v):
         bsz = q.shape[0]
+        seq_len = q.shape[1]
         n_heads = q.shape[2]
-        return [((bsz, 1, n_heads, head_dim_v), torch.bfloat16),
-                ((bsz, 1, n_heads), torch.float32)]
+        return [((bsz, seq_len, n_heads, head_dim_v), torch.bfloat16),
+                ((bsz, seq_len, n_heads), torch.float32)]
 
     def eager_fn(q, kcache, block_table, seqlens_kv,
                  softmax_scale, is_causal, extra_buffer, meta,
                  head_dim_v):
         bsz = q.shape[0]
+        seq_len = q.shape[1]
         n_heads = q.shape[2]
-        o = torch.empty((bsz, 1, n_heads, head_dim_v), dtype=torch.bfloat16)
-        softmax_lse = torch.empty((bsz, 1, n_heads), dtype=torch.float32)
+        o = torch.empty((bsz, seq_len, n_heads, head_dim_v), dtype=torch.bfloat16)
+        softmax_lse = torch.empty((bsz, seq_len, n_heads), dtype=torch.float32)
         torch.ops.sgl_kernel.flash_mla_dense_decode_kunpeng(
             q, kcache, None,
             block_table, seqlens_kv,
@@ -679,15 +681,49 @@ def _setup_flash_mla_dense_decode_kunpeng():
     register_op('flash_mla_dense_decode_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_pad_q_left_mtp_kunpeng():
+    def shape_infer(q, seq_lens, max_seq_len):
+        bsz = seq_lens.shape[0]
+        n_heads = q.shape[1]
+        head_dim = q.shape[2]
+        return [((bsz, max_seq_len, n_heads, head_dim), q.dtype)]
+
+    def eager_fn(q, seq_lens, max_seq_len):
+        bsz = seq_lens.shape[0]
+        n_heads = q.shape[1]
+        head_dim = q.shape[2]
+        q_padded = torch.empty((bsz, max_seq_len, n_heads, head_dim), dtype=q.dtype)
+        torch.ops.sgl_kernel.pad_q_left_mtp_kunpeng(q, seq_lens, q_padded)
+        return q_padded
+
+    register_op('pad_q_left_mtp_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_unpad_o_right_mtp_kunpeng():
+    def shape_infer(o, seq_lens, sum_seq_len):
+        n_heads = o.shape[2]
+        head_dim = o.shape[3]
+        return [((sum_seq_len, n_heads, head_dim), o.dtype)]
+
+    def eager_fn(o, seq_lens, sum_seq_len):
+        n_heads = o.shape[2]
+        head_dim = o.shape[3]
+        o_flat = torch.empty((sum_seq_len, n_heads, head_dim), dtype=o.dtype)
+        torch.ops.sgl_kernel.unpad_o_right_mtp_kunpeng(o, seq_lens, o_flat)
+        return o_flat
+
+    register_op('unpad_o_right_mtp_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_topk_convert_kunpeng():
-    def shape_infer(src_info, token_ids, experts_offset, num_ranks,
+    def shape_infer(count, src_info, src_info_bak, token_ids, experts_offset, num_ranks,
                     num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill):
         return []
 
-    def eager_fn(src_info, token_ids, experts_offset, num_ranks,
+    def eager_fn(count, src_info, src_info_bak, token_ids, experts_offset, num_ranks,
                  num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill):
         torch.ops.sgl_kernel.topk_convert_kunpeng(
-            src_info, token_ids, experts_offset, num_ranks,
+            count, src_info, src_info_bak, token_ids, experts_offset, num_ranks,
             num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill)
         return None
 
@@ -801,6 +837,8 @@ def setup():
     _setup_copy_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()
     _setup_flash_attention_with_workspace_kunpeng()
+    _setup_pad_q_left_mtp_kunpeng()
+    _setup_unpad_o_right_mtp_kunpeng()
     _setup_topk_convert_kunpeng()
     _setup_igemm_fusedmoe_gateup_kunpeng()
     _setup_igemm_fusedmoe_down_kunpeng()

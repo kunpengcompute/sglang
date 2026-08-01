@@ -188,8 +188,15 @@ def kutacc_mha(
     workspace = kunpeng.alloc_buffer(ws_bytes)
 
     attn_out = kunpeng.flash_attention_with_workspace_kunpeng(
-        padded_q, para_k, para_v, workspace, extend_seq_lens,
-        is_causal, softmax_scale, max_seq_len)
+        padded_q,
+        para_k,
+        para_v,
+        workspace,
+        extend_seq_lens,
+        is_causal,
+        softmax_scale,
+        max_seq_len,
+    )
 
     return attn_out[:n_token]
 
@@ -333,11 +340,14 @@ class KunpengCpuBackend(AttentionBackend):
 
         # --- reshape to 3D ---
         q_3d = kunpeng.contiguous_kunpeng(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim))
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        )
         k_3d = kunpeng.contiguous_kunpeng(
-            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim))
+            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        )
         v_3d = kunpeng.contiguous_kunpeng(
-            v.view(-1, layer.tp_v_head_num, layer.v_head_dim))
+            v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        )
 
         softmax_scale = (
             layer.scaling
@@ -364,25 +374,19 @@ class KunpengCpuBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ):
-        cache_loc = forward_batch.out_cache_loc
+        if layer.is_cross_attention:
+            cache_loc = forward_batch.encoder_out_cache_loc
+        else:
+            cache_loc = forward_batch.out_cache_loc
 
         meta = self.forward_metadata
-        page_size = meta.page_size
         q_heads = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         bs = meta.seq_lens.shape[0]
         max_ext_len = self.speculative_num_draft_tokens
 
         if self.mla_padding_enable:
-            q_padded = torch.zeros(
-                (bs, max_ext_len, layer.tp_q_head_num, layer.qk_head_dim),
-                dtype=q.dtype,
-                device=q.device,
-            )
-            torch.ops.sgl_kernel.pad_q_left_mtp_kunpeng(
-                q_heads.contiguous(),
-                meta.extend_seq_lens,
-                max_ext_len,
-                q_padded,
+            q_padded = kunpeng.pad_q_left_mtp_kunpeng(
+                q_heads, meta.extend_seq_lens, max_ext_len
             )
         else:
             q_padded = q_heads.view(
@@ -390,54 +394,38 @@ class KunpengCpuBackend(AttentionBackend):
             )
 
         kv_buf = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
-        kvcache_paged = kv_buf[:, 0, :].reshape(-1, page_size, kv_buf.shape[-1])
+        kvcache_paged = kv_buf[:, 0, :].reshape(-1, meta.page_size, kv_buf.shape[-1])
 
         softmax_scale = (
             layer.scaling
             if layer.scaling is not None
             else 1.0 / math.sqrt(layer.qk_head_dim)
         )
-        o_padded = torch.zeros(
-            (bs, max_ext_len, layer.tp_q_head_num, layer.v_head_dim),
-            dtype=q.dtype,
-            device=q.device,
-        )
-        softmax_lse = torch.empty(
-            (bs, max_ext_len, layer.tp_q_head_num),
-            dtype=torch.float32,
-            device=q.device,
-        )
         extra_buffer = (
-            torch.empty(meta.extra_bytes, dtype=torch.uint8, device=q.device)
+            kunpeng.alloc_buffer(meta.extra_bytes)
             if meta.extra_bytes > 0
             else torch.empty(0, dtype=torch.uint8, device=q.device)
         )
 
-        torch.ops.sgl_kernel.flash_mla_dense_decode_kunpeng(
+        o_padded, softmax_lse = kunpeng.flash_mla_dense_decode_kunpeng(
             q_padded,
             kvcache_paged,
-            None,
             meta.block_table,
             meta.seq_lens,
-            o_padded,
-            softmax_lse,
             softmax_scale,
             False,
             extra_buffer,
             self._decode_meta,
+            layer.v_head_dim,
         )
 
         if self.mla_padding_enable:
-            o_flat = torch.zeros(
-                (q_heads.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-                dtype=q.dtype,
-                device=q.device,
-            )
-            torch.ops.sgl_kernel.unpad_o_right_mtp_kunpeng(
-                o_padded, meta.extend_seq_lens, max_ext_len, o_flat
+            o_flat = kunpeng.unpad_o_right_mtp_kunpeng(
+                o_padded, meta.extend_seq_lens, q_heads.shape[0]
             )
         else:
             o_flat = o_padded
+
         return o_flat.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend_native(

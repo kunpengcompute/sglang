@@ -18,9 +18,12 @@
 
 #include "register_graph_kernels.h"
 
-void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
-                                        int64_t num_experts, int64_t topk);
+void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded);
 
-static KernelRegistrar _r_load_balance_padded_tokens(
-    "load_balance_padded_tokens_kunpeng",
-    make_dispatch_v<decltype(&load_balance_padded_tokens_kunpeng), &load_balance_padded_tokens_kunpeng>);
+void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Tensor o_flat);
+
+static KernelRegistrar _r_pad_q_left_mtp("pad_q_left_mtp_kunpeng",
+                                         make_dispatch_v<decltype(&pad_q_left_mtp_kunpeng), &pad_q_left_mtp_kunpeng>);
+
+static KernelRegistrar _r_unpad_o_right_mtp(
+    "unpad_o_right_mtp_kunpeng", make_dispatch_v<decltype(&unpad_o_right_mtp_kunpeng), &unpad_o_right_mtp_kunpeng>);

@@ -201,6 +201,7 @@ void init_graph_cpp(py::module& m)
         }), py::arg("storages"), py::arg("views"), py::arg("ops"),
             py::arg("output_view_ids"), py::arg("num_inputs"),
             py::arg("fixed"), py::arg("external_pool") = py::none())
+        .def_readwrite("has_hidden_states", &Graph::has_hidden_states)
         .def("run", &Graph::run)
         .def("set_fixed", &Graph::set_fixed)
         .def("enable_profile", &Graph::enable_profile)

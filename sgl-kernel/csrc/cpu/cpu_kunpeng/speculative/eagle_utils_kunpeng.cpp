@@ -131,7 +131,7 @@ static void _copy_mtp_strided(scalar_t *src, scalar_t *dst, int64_t *offsets, in
     });
 }
 
-void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, int64_t max_ext_len, at::Tensor q_padded)
+void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded)
 {
     int64_t bs = ext_lens.size(0);
     std::vector<int64_t> offsets(bs + 1, 0);
@@ -139,12 +139,13 @@ void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, int64_t max
     for (int64_t b = 0; b < bs; b++) {
         offsets[b + 1] = offsets[b] + ext_a[b];
     }
+    int64_t max_ext_len = q_padded.size(1);
     _copy_mtp_strided(reinterpret_cast<bfloat16_t *>(q_heads.data_ptr()),
                       reinterpret_cast<bfloat16_t *>(q_padded.data_ptr()), offsets.data(), ext_a.data(), bs,
                       max_ext_len, q_heads.size(1), q_heads.size(2), true);
 }
 
-void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, int64_t max_ext_len, at::Tensor o_flat)
+void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Tensor o_flat)
 {
     int64_t bs = ext_lens.size(0);
     std::vector<int64_t> offsets(bs + 1, 0);
@@ -152,6 +153,7 @@ void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, int64_t
     for (int64_t b = 0; b < bs; b++) {
         offsets[b + 1] = offsets[b] + ext_a[b];
     }
+    int64_t max_ext_len = o_padded.size(1);
     _copy_mtp_strided(reinterpret_cast<bfloat16_t *>(o_padded.data_ptr()),
                       reinterpret_cast<bfloat16_t *>(o_flat.data_ptr()), offsets.data(), ext_a.data(), bs, max_ext_len,
                       o_flat.size(1), o_flat.size(2), false);
