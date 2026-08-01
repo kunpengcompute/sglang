@@ -3145,10 +3145,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         (remaining,), torch.uint8
                     )
                 graph = finalize(
-                    [logits, hidden_states], external_pool=self._graph_hbw_tensor
+                    [logits, hidden_states] if hidden_states is not None else [logits], external_pool=self._graph_hbw_tensor
                 )
             else:
-                graph = finalize([logits, hidden_states])
+                graph = finalize([logits, hidden_states] if hidden_states is not None else [logits])
+            graph.has_hidden_states = hidden_states is not None
 
             if _is_kunpeng_graph_profile:
                 graph.enable_profile(True)
@@ -3162,7 +3163,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             graph = self._sglang_graph_cache[graph_cache_key]
 
         t0 = time.time()
-        logits, hidden_states = graph.run(inputs)
+        if graph.has_hidden_states:
+            logits, hidden_states = graph.run(inputs)
+        else:
+            logits, = graph.run(inputs)
+            hidden_states = None
         t1 = time.time()
         logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
 

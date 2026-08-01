@@ -36,6 +36,7 @@ public:
           const std::unordered_map<int, torch::Tensor>& fixed,
           torch::Tensor external_pool = {});
 
+    bool has_hidden_states = false;
     // Backward-compatible: hold fixed tensor references to keep memory alive.
     // data_ptr is already set during begin_capture; this only stores references.
     void set_fixed(const std::unordered_map<int, torch::Tensor>& fixed) {
