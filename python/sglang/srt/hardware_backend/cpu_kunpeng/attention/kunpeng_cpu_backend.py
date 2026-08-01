@@ -394,7 +394,7 @@ class KunpengCpuBackend(AttentionBackend):
             )
 
         kv_buf = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
-        kvcache_paged = kv_buf[:, 0, :].reshape(-1, page_size, kv_buf.shape[-1])
+        kvcache_paged = kv_buf[:, 0, :].reshape(-1, meta.page_size, kv_buf.shape[-1])
 
         softmax_scale = (
             layer.scaling
