@@ -772,8 +772,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
             if self.swap_mgr.enable_swap_kv_in:
+                if self.swap_mgr.enable_swap_kv_blockwise:
+                    max_blocks = int(
+                        os.environ.get("SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS")
+                    )
+                    num_tokens = max_blocks * self.page_size
+                else:
+                    num_tokens = self.token_to_kv_pool.kv_buffer[0].shape[0]
+
                 self.swap_mgr.init_kv_buffer(
-                    num_tokens=self.token_to_kv_pool.kv_buffer[0].shape[0],
+                    num_tokens=num_tokens,
                     head_num=self.token_to_kv_pool.kv_buffer[0].shape[1],
                     kv_cache_dim=self.token_to_kv_pool.kv_buffer[0].shape[2],
                     dtype=self.kv_cache_dtype,
