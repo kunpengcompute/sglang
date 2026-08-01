@@ -566,34 +566,16 @@ def _setup_kupl_sdma_wait_all():
 
 
 def _setup_kupl_sdma_set_kv_buffer():
-    def shape_infer(
-        kv_buffer,
-        loc,
-        cache_k,
-        event_tensor,
-        event_num_tensor,
-        max_pending_events,
-        chunk_bytes,
-    ):
+    def shape_infer(kv_buffer, loc, cache_k, event_tensor, event_num_tensor):
         return []
 
-    def eager_fn(
-        kv_buffer,
-        loc,
-        cache_k,
-        event_tensor,
-        event_num_tensor,
-        max_pending_events,
-        chunk_bytes,
-    ):
+    def eager_fn(kv_buffer, loc, cache_k, event_tensor, event_num_tensor):
         torch.ops.sgl_kernel.kupl_sdma_set_kv_buffer(
             kv_buffer,
             loc,
             cache_k,
             event_tensor,
             event_num_tensor,
-            max_pending_events,
-            chunk_bytes,
         )
         return None
 
