@@ -92,12 +92,7 @@ def run_sdpa_forward_mha(
 
 
 class KunpengCpuMetadata:
-    """Metadata for a single forward pass, holding pre-computed tensors reused across layers.
-
-    Buffers (seq_lens_buf, extend_seq_lens_buf, block_table_buf) are allocated once via
-    init_buffers() and reused via copy-in each forward so graph capture always sees the
-    same tensor storage.
-    """
+    """Metadata for a single forward pass, holding pre-computed tensors reused across layers."""
 
     def __init__(self):
         self.block_table: Optional[torch.Tensor] = None
@@ -106,20 +101,17 @@ class KunpengCpuMetadata:
         self.page_size: int = 0
         self.extra_bytes: int = 0
 
-        # Pre-allocated buffers for graph capture
-        self._seq_lens_buf: Optional[torch.Tensor] = None
-        self._extend_seq_lens_buf: Optional[torch.Tensor] = None
-        self._block_table_buf: Optional[torch.Tensor] = None
-
-    def init_buffers(self, max_bs: int, max_blocks: int, device):
-        """Allocate reusable buffers for graph-capture-friendly metadata tensors."""
-        self._seq_lens_buf = torch.zeros((max_bs,), dtype=torch.int32, device=device)
-        self._extend_seq_lens_buf = torch.zeros(
-            (max_bs,), dtype=torch.int32, device=device
-        )
-        self._block_table_buf = torch.zeros(
-            (max_bs, max_blocks), dtype=torch.int32, device=device
-        )
+        # Block-wise HBW swap metadata (same for all layers within one decode step).
+        # Only populated when blockwise KV swap is enabled for decode.
+        # out_cache_loc sliced to match the all2all group (Btp entries, not B).
+        self.out_cache_loc: Optional[torch.Tensor] = None
+        # Starting token index in the full B-token K tensor. Non-zero only
+        # under attention-TP all2all where metadata covers a subset of tokens.
+        self.token_slice_start: int = 0
+        self.remapped_block_table: Optional[torch.Tensor] = None
+        self.hbw_cache_loc: Optional[torch.Tensor] = None
+        self.ddr_block_ids: Optional[torch.Tensor] = None
+        self.hbw_block_ids: Optional[torch.Tensor] = None
 
 
 def kutacc_mha(
@@ -244,15 +236,7 @@ class KunpengCpuBackend(AttentionBackend):
         self._decode_meta = torch.ops.sgl_kernel.flash_mla_meta_create_kunpeng()
         self.swap_mgr = KunpengSwapManager.get_instance()
 
-        # Create the forward metadata once and allocate reusable buffers so
-        # graph capture always sees the same tensor storage across forwards.
         self.forward_metadata = KunpengCpuMetadata()
-        self.forward_metadata.init_buffers(
-            max_bs=model_runner.max_running_requests,
-            max_blocks=(model_config.context_len + model_runner.page_size - 1)
-            // model_runner.page_size,
-            device=model_runner.device,
-        )
 
     def __del__(self):
         if hasattr(self, "_decode_meta") and self._decode_meta is not None:
@@ -264,9 +248,18 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata.seq_lens = None
         self.forward_metadata.extend_seq_lens = None
         self.forward_metadata.block_table = None
+        self.forward_metadata.out_cache_loc = None
+        self.forward_metadata.token_slice_start = 0
+        self.forward_metadata.remapped_block_table = None
+        self.forward_metadata.hbw_cache_loc = None
+        self.forward_metadata.ddr_block_ids = None
+        self.forward_metadata.hbw_block_ids = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            self._init_decode_metadata(forward_batch)
+            self._init_decode_metadata(
+                forward_batch,
+                enable_blockwise=self.swap_mgr.enable_swap_kv_blockwise,
+            )
         elif (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
@@ -285,7 +278,12 @@ class KunpengCpuBackend(AttentionBackend):
             forward_batch.seq_lens = save_seq_lens
         return
 
-    def _init_decode_metadata(self, forward_batch: ForwardBatch, seqlen_q: int = 1):
+    def _init_decode_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        seqlen_q: int = 1,
+        enable_blockwise: bool = False,
+    ):
         metadata = self.forward_metadata
 
         metadata.page_size = forward_batch.token_to_kv_pool.page_size
@@ -311,24 +309,29 @@ class KunpengCpuBackend(AttentionBackend):
             ]
             # After all2all each rank sees all heads in its socket group.
             num_heads_q = self.num_q_heads * all2all_size
+            # out_cache_loc must be sliced to match the all2all group so that
+            # block-wise swap metadata only covers this rank's Btp tokens.
+            metadata.out_cache_loc = forward_batch.out_cache_loc[
+                group_rank * batchsize_per_tp : (group_rank + 1) * batchsize_per_tp
+            ]
+            metadata.token_slice_start = group_rank * batchsize_per_tp
         else:
             num_heads_q = self.num_q_heads
+            metadata.out_cache_loc = forward_batch.out_cache_loc
 
-        # Copy seq_lens into pre-allocated buffer (graph capture reuses tensor storage).
-        batch_size = seq_lens.shape[0]
-        metadata._seq_lens_buf[:batch_size].copy_(seq_lens)
-        metadata.seq_lens = metadata._seq_lens_buf[:batch_size]
+        metadata.seq_lens = seq_lens
 
+        batch_size = metadata.seq_lens.shape[0]
         max_seq_len = metadata.seq_lens.max().item()
         max_blocks = (max_seq_len + metadata.page_size - 1) // metadata.page_size
-
-        # Copy extend_seq_lens into pre-allocated buffer.
-        metadata._extend_seq_lens_buf[:batch_size] = seqlen_q
-        metadata.extend_seq_lens = metadata._extend_seq_lens_buf[:batch_size]
-
-        # Copy block_table into pre-allocated buffer.
-        metadata.block_table = metadata._block_table_buf[:batch_size, :max_blocks]
-        metadata.block_table.zero_()
+        metadata.extend_seq_lens = torch.full(
+            (batch_size,), seqlen_q, dtype=torch.int32
+        )
+        metadata.block_table = torch.zeros(
+            (batch_size, max_blocks),
+            dtype=torch.int32,
+            device=metadata.seq_lens.device,
+        )
         for b in range(batch_size):
             req_idx = req_pool_indices[b].item()
             seq_len = metadata.seq_lens[b].item()
@@ -350,6 +353,82 @@ class KunpengCpuBackend(AttentionBackend):
                 is_kv_packed=False,
                 meta=self._decode_meta,
             )
+        )
+
+        if enable_blockwise:
+            self._init_blockwise_swap_metadata(metadata, forward_batch)
+
+    def _init_blockwise_swap_metadata(
+        self, metadata: KunpengCpuMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        """Compute the DDR<->HBM block mapping for one decode step.
+
+        Builds:
+        * ``ddr_block_ids`` / ``hbw_block_ids`` — the blocks to swap in.
+        * ``remapped_block_table`` — block_table with HBM slot indices, for
+          the attention kernel.
+        * ``hbw_cache_loc`` — remapped ``out_cache_loc`` for writing new K/V
+          into the HBM buffer.
+
+        The mapping is identical for every layer within the decode step, so it
+        is computed once here and handed to the swap manager via
+        ``set_blockwise_swap_meta``.
+        """
+        page_size = metadata.page_size
+        device = metadata.block_table.device
+        max_blocks_on_package = self.swap_mgr.max_blocks_on_package
+
+        # Blocks that receive new K/V this step (from out_cache_loc, which is
+        # already sliced to match the all2all group: Btp entries, not B).
+        cache_loc = metadata.out_cache_loc
+        ddr_block_of_new_tokens = cache_loc // page_size
+
+        unique_table_blocks = torch.unique(metadata.block_table)
+        unique_dirty_blocks = torch.unique(ddr_block_of_new_tokens)
+        unique_ddr_blocks = torch.unique(
+            torch.cat([unique_table_blocks, unique_dirty_blocks])
+        )
+
+        num_unique = unique_ddr_blocks.shape[0]
+        if num_unique > max_blocks_on_package:
+            raise RuntimeError(
+                f"Block-wise swap: needed {num_unique} blocks but HBW buffer "
+                f"only holds {max_blocks_on_package}. "
+                f"Increase SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS."
+            )
+
+        metadata.ddr_block_ids = unique_ddr_blocks.to(torch.int32)
+        metadata.hbw_block_ids = torch.arange(
+            num_unique, dtype=torch.int32, device=device
+        )
+
+        # ddr_to_hbw mapping tensor (block_table entries are DDR block ids).
+        max_ddr_block = int(unique_ddr_blocks.max().item())
+        ddr_to_hbw = torch.full(
+            (max_ddr_block + 1,), -1, dtype=torch.int32, device=device
+        )
+        ddr_to_hbw[metadata.ddr_block_ids] = metadata.hbw_block_ids
+
+        # Remapped block_table (DDR block id -> HBM slot id) for attention.
+        metadata.remapped_block_table = ddr_to_hbw[metadata.block_table]
+
+        # Remapped cache_loc (out_cache_loc) into HBM flat token space.
+        # hbw_cache_loc has Btp entries and is indexed with flat token ids.
+        offset_in_block = cache_loc % page_size
+        hbw_block_of_new_tokens = ddr_to_hbw[ddr_block_of_new_tokens]
+        metadata.hbw_cache_loc = (
+            hbw_block_of_new_tokens * page_size + offset_in_block
+        ).to(torch.int64)
+
+        ddr_kv = forward_batch.token_to_kv_pool.get_key_buffer(0)
+        block_bytes = page_size * ddr_kv.shape[-1] * ddr_kv.element_size()
+
+        self.swap_mgr.set_blockwise_swap_meta(
+            metadata.ddr_block_ids,
+            metadata.hbw_block_ids,
+            block_bytes,
+            metadata.hbw_cache_loc,
+            metadata.token_slice_start,
         )
 
     def _get_kv_buffer(
@@ -576,7 +655,11 @@ class KunpengCpuBackend(AttentionBackend):
 
         metadata = self.forward_metadata
         seq_lens = metadata.seq_lens
-        block_table = metadata.block_table
+        block_table = (
+            metadata.remapped_block_table
+            if metadata.remapped_block_table is not None
+            else metadata.block_table
+        )
         page_size = metadata.page_size
 
         q_4d = q_.unsqueeze(1)
