@@ -12,10 +12,11 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_hip, support_triton
+from sglang.srt.utils import get_bool_env_var, is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
 
 _is_hip = is_hip()
+_kv_pool_debug = get_bool_env_var("SGLANG_DEBUG_KV_POOL")
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -607,6 +608,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
+        if _kv_pool_debug:
+            logger.info(
+                f"[KV_POOL] release_kv_cache rid={req.rid} "
+                f"req_pool_idx={req.req_pool_idx} "
+                f"indices={indices_to_free.tolist()} "
+                f"start_p={start_p} end_p={end_p}"
+            )
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (

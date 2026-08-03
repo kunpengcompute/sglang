@@ -18,9 +18,11 @@ import torch
 import logging
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils import get_bool_env_var, get_num_new_pages
 
 logger = logging.getLogger(__name__)
+
+_kv_pool_debug = get_bool_env_var("SGLANG_DEBUG_KV_POOL")
 
 
 def alloc_extend_kernel_kunpeng(
@@ -148,6 +150,14 @@ class KunpengPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                     f"Total count: {len(out_indices)}"
                 )
 
+        if _kv_pool_debug:
+            logger.info(
+                f"[KV_POOL] alloc_extend need_pages={num_new_pages} "
+                f"extend_tokens={extend_num_tokens} "
+                f"free_before={len(self.free_pages)} "
+                f"free_after={len(self.free_pages) - num_new_pages}"
+            )
+
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -193,6 +203,14 @@ class KunpengPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                     f"unique_count={len(torch.unique(out_indices))}, "
                     f"total_count={len(out_indices)}"
                 )
+
+        if _kv_pool_debug:
+            logger.info(
+                f"[KV_POOL] alloc_decode need_pages={num_new_pages} "
+                f"seq_lens={seq_lens.tolist()} "
+                f"free_before={len(self.free_pages)} "
+                f"free_after={len(self.free_pages) - num_new_pages}"
+            )
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices.int()
