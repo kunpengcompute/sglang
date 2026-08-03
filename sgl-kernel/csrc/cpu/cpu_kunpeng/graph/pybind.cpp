@@ -97,6 +97,10 @@ void init_graph_cpp(py::module& m)
 {
     m.doc() = "Graph computation graph engine";
 
+    py::enum_<MemoryType>(m, "MemoryType")
+        .value("REGULAR", MemoryType::REGULAR)
+        .value("SHM", MemoryType::SHM);
+
     py::class_<StorageBuf>(m, "StorageBuf")
         .def(py::init<>())
         .def_readwrite("id", &StorageBuf::id)
@@ -107,6 +111,7 @@ void init_graph_cpp(py::module& m)
         .def_readwrite("death_op", &StorageBuf::death_op)
         .def_readwrite("size", &StorageBuf::size)
         .def_readwrite("in_pool", &StorageBuf::in_pool)
+        .def_readwrite("memory_type", &StorageBuf::memory_type)
         .def_property("data_ptr",
             [](const StorageBuf& b) { return reinterpret_cast<uintptr_t>(b.data_ptr); },
             [](StorageBuf& b, uintptr_t v) { b.data_ptr = reinterpret_cast<void*>(v); });
@@ -176,7 +181,10 @@ void init_graph_cpp(py::module& m)
             return self.lookup_storage(reinterpret_cast<void*>(base));
         })
         .def("register_storage", &CaptureManager::register_storage)
-        .def("register_output_storage", &CaptureManager::register_output_storage)
+        .def("register_output_storage", [](CaptureManager& self, StorageBuf buf, MemoryType memory_type) {
+            return self.register_output_storage(std::move(buf), memory_type);
+        })
+        .def("upgrade_storage_memory_type", &CaptureManager::upgrade_storage_memory_type)
         .def("register_view", &CaptureManager::register_view)
         .def("find_or_register_view", [](CaptureManager& self, int storage_id, int64_t storage_offset, py::object t) {
             torch::Tensor tensor;
@@ -192,15 +200,19 @@ void init_graph_cpp(py::module& m)
                          const std::vector<int>& output_view_ids,
                          int num_inputs,
                          const std::unordered_map<int, torch::Tensor>& fixed,
-                         py::object external_pool) {
+                         py::object external_pool,
+                         py::object external_shm_pool) {
             torch::Tensor pool_tensor;
             if (!external_pool.is_none()) pool_tensor = external_pool.cast<torch::Tensor>();
+            torch::Tensor shm_pool_tensor;
+            if (!external_shm_pool.is_none()) shm_pool_tensor = external_shm_pool.cast<torch::Tensor>();
             return std::make_unique<Graph>(storages, views, ops,
                                            output_view_ids, num_inputs, fixed,
-                                           pool_tensor);
+                                           pool_tensor, shm_pool_tensor);
         }), py::arg("storages"), py::arg("views"), py::arg("ops"),
             py::arg("output_view_ids"), py::arg("num_inputs"),
-            py::arg("fixed"), py::arg("external_pool") = py::none())
+            py::arg("fixed"), py::arg("external_pool") = py::none(),
+            py::arg("external_shm_pool") = py::none())
         .def_readwrite("has_hidden_states", &Graph::has_hidden_states)
         .def("run", &Graph::run)
         .def("set_fixed", &Graph::set_fixed)

@@ -104,6 +104,13 @@ int get_intra_node_size();
 bool is_shm_initialized();
 
 /**
+ * Get the number of remaining (unallocated) bytes in the shared memory pool.
+ *
+ * @return Remaining bytes, or 0 if the pool has not been initialized.
+ */
+int64_t shm_remaining_bytes_kunpeng();
+
+/**
  * Allocate raw bytes from the shared memory pool.
  *
  * @param bytes  Number of bytes to allocate.

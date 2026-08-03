@@ -1456,6 +1456,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.graph_fixed_weights = collect_model_weights(self.model)
                 self._sglang_graph_cache = OrderedDict()
                 self._graph_hbw_tensor = None
+                self._graph_shm_tensor = None
                 self._sglang_graph_max_cache = int(
                     os.environ.get("SGLANG_KUNPENG_GRAPH_CACHE_SIZE", "4")
                 )
@@ -3175,15 +3176,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 graph_outputs = [logits, hidden_states] if hidden_states is not None else [logits]
 
+            if self._graph_shm_tensor is None:
+                remaining = torch.ops.sgl_kernel.shm_remaining_bytes_kunpeng()
+                if remaining > 0:
+                    self._graph_shm_tensor = torch.ops.sgl_kernel.create_shm_tensor_kunpeng(
+                        torch.uint8, [remaining])
+
             if use_hbw and _is_kunpeng_hbw_pool:
                 if self._graph_hbw_tensor is None:
                     remaining = self.weight_hbw_pool.largest_free_bytes
                     self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
                         (remaining,), torch.uint8
                     )
-                graph = finalize(graph_outputs, external_pool=self._graph_hbw_tensor)
+                graph = finalize(
+                    [logits, hidden_states] if hidden_states is not None else [logits],
+                    external_pool=self._graph_hbw_tensor,
+                    external_shm_pool=self._graph_shm_tensor
+                )
             else:
-                graph = finalize(graph_outputs)
+                graph = finalize(
+                    [logits, hidden_states] if hidden_states is not None else [logits],
+                    external_shm_pool=self._graph_shm_tensor
+                )
             graph.has_hidden_states = (not is_pp_output) and hidden_states is not None
 
             if _is_kunpeng_graph_profile:

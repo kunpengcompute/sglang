@@ -5,6 +5,7 @@ from sglang.srt.graph._capture import (
     lookup_or_register,
     register_output,
     record_op,
+    upgrade_storage_memory_type,
 )
 from sglang.srt.graph.ops import ops, register_op
 from sglang.srt.graph import adapters  # noqa: F401 — registers all graph ops

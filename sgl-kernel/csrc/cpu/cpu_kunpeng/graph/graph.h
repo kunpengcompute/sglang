@@ -34,7 +34,8 @@ public:
           std::vector<int> output_view_ids,
           int num_inputs,
           const std::unordered_map<int, torch::Tensor>& fixed,
-          torch::Tensor external_pool = {});
+          torch::Tensor external_pool = {},
+          torch::Tensor external_shm_pool = {});
 
     bool has_hidden_states = false;
     // Backward-compatible: hold fixed tensor references to keep memory alive.
@@ -50,16 +51,12 @@ public:
 
 private:
     void finalize(const std::unordered_map<int, torch::Tensor>& fixed,
-                  torch::Tensor external_pool);
+                  torch::Tensor external_pool, torch::Tensor external_shm_pool);
     void compute_death_ops();
-    void plan_memory(torch::Tensor external_pool);
+    void plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_pool);
     void detect_outputs();
     void precompute_replay();
     void hold_fixed(const std::unordered_map<int, torch::Tensor>& fixed);
-
-    static bool intervals_overlap(int a_born, int a_death, int b_born, int b_death) {
-        return !(a_death < b_born || b_death < a_born);
-    }
 
     int num_inputs_ = 0;
     std::vector<int> input_storage_ids_;          // runtime input storage IDs (first N)
@@ -71,6 +68,7 @@ private:
     std::vector<TensorView> views_;
     std::vector<OpRecord> op_records_;
     MemoryPool pool_;
+    MemoryPool shm_pool_;
     std::vector<int> input_view_ids_;             // = input_storage_ids_ (primary view == storage_id)
     std::vector<int> output_view_ids_;
     std::vector<std::string> op_names_;

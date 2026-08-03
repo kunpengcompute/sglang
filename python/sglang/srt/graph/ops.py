@@ -5,16 +5,18 @@ from sglang.srt.graph._capture import (
     lookup_or_register,
     record_op,
     register_output,
+    upgrade_storage_memory_type,
 )
 
 _DEBUG = False
 
 
 class GraphOp:
-    def __init__(self, name, shape_infer, eager_fn=None):
+    def __init__(self, name, shape_infer, eager_fn=None, shm_fn=None):
         self.name = name
         self.shape_infer = shape_infer
         self.eager_fn = eager_fn
+        self.shm_fn = shm_fn
 
     def __call__(self, *args, **kwargs):
         profile_name = kwargs.pop('profile_name', '')
@@ -39,7 +41,6 @@ class GraphOp:
             out_infos = [out_infos]
 
         output_tensors = []
-        outputs = []
         for info in out_infos:
             if isinstance(info, tuple):
                 shape, dtype = info
@@ -49,9 +50,25 @@ class GraphOp:
                 out = torch.empty(1, dtype=dtype)[:0].view(shape)
             else:
                 out = torch.empty(shape, dtype=dtype)
-            vid, so = register_output(out)
-            outputs.append((vid, so))
             output_tensors.append(out)
+
+        # shm_fn receives the kernel-expanded args:
+        # input tensors, then output tensors, then scalar args.
+        shm_ids = set()
+        if self.shm_fn is not None:
+            shm_tensors = self.shm_fn(
+                *tensor_args, *output_tensors, *non_tensor_args, **kwargs) or []
+            shm_ids = {id(t) for t in shm_tensors if t is not None}
+
+        outputs = []
+        for out in output_tensors:
+            memory_type = 'shm' if id(out) in shm_ids else 'regular'
+            vid, so = register_output(out, memory_type=memory_type)
+            outputs.append((vid, so))
+
+        for t in tensor_args:
+            if t is not None and id(t) in shm_ids:
+                upgrade_storage_memory_type(t)
 
         record_op(self.name, inputs, outputs, non_tensor_args, profile_name)
 
@@ -71,8 +88,8 @@ class _Ops:
 _registry = {}
 
 
-def register_op(name, shape_infer, eager_fn=None):
-    op = GraphOp(name, shape_infer, eager_fn)
+def register_op(name, shape_infer, eager_fn=None, shm_fn=None):
+    op = GraphOp(name, shape_infer, eager_fn, shm_fn)
     _registry[name] = op
 
 

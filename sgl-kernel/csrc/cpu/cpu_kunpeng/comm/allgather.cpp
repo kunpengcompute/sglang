@@ -80,19 +80,30 @@ void shm_batched_allgather_kunpeng(at::Tensor input, at::Tensor output, int64_t 
 
     if (batch == 0) return;
 
-    at::Tensor sendbuf_tensor = get_or_create_shm_tensor(dim, batch);
-    at::Tensor recvbuf_tensor = get_or_create_shm_tensor(dim * comm_size, batch);
-
     size_t send_total_bytes = static_cast<size_t>(input.numel()) * sizeof(bfloat16_t);
     size_t recv_total_bytes = static_cast<size_t>(output.numel()) * sizeof(bfloat16_t);
 
-    // copy in: user input -> SHM sendbuf
-    std::memcpy(sendbuf_tensor.data_ptr(), input.data_ptr(), send_total_bytes);
+    // If both input and output already live in shared memory (e.g. graph SHM pool),
+    // use them directly as send/recv buffers: no copy in/out, no temp buffer.
+    bool shm_path = is_shm_tensor(input) && is_shm_tensor(output);
+    at::Tensor sendbuf_tensor, recvbuf_tensor;
+    void *sendbuf;
+    void *recvbuf;
+
+    if (shm_path) {
+        sendbuf = input.data_ptr();
+        recvbuf = output.data_ptr();
+    } else {
+        sendbuf_tensor = get_or_create_shm_tensor(dim, batch);
+        recvbuf_tensor = get_or_create_shm_tensor(dim * comm_size, batch);
+        sendbuf = sendbuf_tensor.data_ptr();
+        recvbuf = recvbuf_tensor.data_ptr();
+
+        // copy in: user input -> SHM sendbuf
+        std::memcpy(sendbuf, input.data_ptr(), send_total_bytes);
+    }
 
     // build remote peer pointers for sendbuf and recvbuf
-    void *sendbuf = sendbuf_tensor.data_ptr();
-    void *recvbuf = recvbuf_tensor.data_ptr();
-
     int64_t comm_rank = (comm_size == 8) ? (intra_node_rank % 8) : intra_node_rank;
     int64_t comm_start = intra_node_rank - comm_rank;
 
@@ -111,8 +122,9 @@ void shm_batched_allgather_kunpeng(at::Tensor input, at::Tensor output, int64_t 
     kutacc::shm_batch_allgather(batch, sendbuf, dim, recvbuf, dim * comm_size, kutacc::SHM_DATATYPE_BFLOAT16,
                                 remote_sendbuf, remote_recvbuf, 0, request, false, false);
 
-    // copy out: SHM recvbuf -> user output
-    std::memcpy(output.data_ptr(), recvbuf_tensor.data_ptr(), recv_total_bytes);
+    // copy out: SHM recvbuf -> user output (only for the eager fallback path)
+    if (!shm_path)
+        std::memcpy(output.data_ptr(), recvbuf, recv_total_bytes);
 }
 
 void shm_dual_allgather_kunpeng(at::Tensor src0_tensor, at::Tensor dst0_tensor, at::Tensor src1_tensor,

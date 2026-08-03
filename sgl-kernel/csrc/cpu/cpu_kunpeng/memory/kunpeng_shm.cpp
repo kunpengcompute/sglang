@@ -283,6 +283,12 @@ bool is_shm_initialized()
     return g_shm_initialized;
 }
 
+int64_t shm_remaining_bytes_kunpeng()
+{
+    if (!g_shm_initialized) return 0;
+    return static_cast<int64_t>(shm_available.size);
+}
+
 void *alloc_shm_raw(size_t bytes)
 {
     TORCH_CHECK(g_shm_initialized, "alloc_shm_raw called before shm_pool_create_kunpeng");

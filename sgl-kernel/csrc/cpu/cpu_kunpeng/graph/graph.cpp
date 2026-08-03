@@ -35,7 +35,8 @@ Graph::Graph(std::vector<StorageBuf> storages,
              std::vector<int> output_view_ids,
              int num_inputs,
              const std::unordered_map<int, torch::Tensor>& fixed,
-             torch::Tensor external_pool)
+             torch::Tensor external_pool,
+             torch::Tensor external_shm_pool)
     : num_inputs_(num_inputs),
       storages_(std::move(storages)),
       views_(std::move(views)),
@@ -43,17 +44,18 @@ Graph::Graph(std::vector<StorageBuf> storages,
       output_view_ids_(std::move(output_view_ids))
 {
     total_ops_ = static_cast<int>(op_records_.size());
-    finalize(fixed, std::move(external_pool));
+    finalize(fixed, std::move(external_pool), std::move(external_shm_pool));
 
     profile_row_.assign(total_ops_ + 1, 0);
 }
 
 void Graph::finalize(const std::unordered_map<int, torch::Tensor>& fixed,
-                     torch::Tensor external_pool)
+                     torch::Tensor external_pool,
+                     torch::Tensor external_shm_pool)
 {
     compute_death_ops();
     detect_outputs();
-    plan_memory(std::move(external_pool));
+    plan_memory(std::move(external_pool), std::move(external_shm_pool));
     precompute_replay();
     hold_fixed(fixed);
     for (int i = 0; i < total_ops_; ++i) {
@@ -100,32 +102,35 @@ void Graph::detect_outputs()
     }
 }
 
-void Graph::plan_memory(torch::Tensor external_pool)
+namespace {
+
+struct Interval {
+    int idx;
+    int born;
+    int death;
+    size_t size;
+};
+
+struct PlaceEntry {
+    int idx;
+    size_t offset;
+    size_t size;
+    int born;
+    int death;
+};
+
+bool intervals_overlap(int a_born, int a_death, int b_born, int b_death)
 {
-    std::vector<std::tuple<int, int, int, size_t>> intervals;
-    for (size_t i = 0; i < storages_.size(); ++i) {
-        const auto& s = storages_[i];
-        if (!s.in_pool) continue;
-        int born = std::max(0, s.born_op);
-        intervals.emplace_back(static_cast<int>(i), born, s.death_op, s.size);
-    }
+    return !(a_death < b_born || b_death < a_born);
+}
 
-    if constexpr (kGraphDebugPrint) {
-        std::cout << "===== plan_memory: " << intervals.size()
-                  << " pool-eligible storages =====" << std::endl;
-        for (const auto& [idx, born, death, size] : intervals) {
-            std::cout << "  storage[" << idx << "] born=" << born
-                      << " death=" << death << " size=" << size << std::endl;
-        }
-    }
-
+std::vector<PlaceEntry> pack_intervals(std::vector<Interval> intervals)
+{
     std::sort(intervals.begin(), intervals.end(), [](const auto& a, const auto& b) {
-        return std::get<3>(a) > std::get<3>(b);
+        return a.size != b.size ? a.size > b.size : a.idx < b.idx;
     });
 
-    struct PlaceEntry { int idx; size_t offset; size_t size; int born; int death; };
     std::vector<PlaceEntry> placed;
-
     for (const auto& [idx, born, death, size] : intervals) {
         if (size == 0) continue;
 
@@ -155,47 +160,66 @@ void Graph::plan_memory(torch::Tensor external_pool)
 
         placed.push_back({idx, best_offset, size, born, death});
     }
+    return placed;
+}
 
-    size_t pool_size = 0;
-    for (const auto& pe : placed)
-        pool_size = std::max(pool_size, pe.offset + pe.size);
-    pool_size = (pool_size + MEMORY_ALIGNMENT - 1) / MEMORY_ALIGNMENT * MEMORY_ALIGNMENT;
+}  // namespace
 
-    if (external_pool.defined()) {
-        TORCH_CHECK(external_pool.nbytes() >= static_cast<int64_t>(pool_size),
-                    "plan_memory: external pool too small (",
-                    external_pool.nbytes(), " bytes vs needed ", pool_size, " bytes)");
-        pool_.adopt(std::move(external_pool));
-    } else {
-        pool_.allocate(pool_size);
+void Graph::plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_pool)
+{
+    std::vector<Interval> regular_intervals;
+    std::vector<Interval> shm_intervals;
+    for (size_t i = 0; i < storages_.size(); ++i) {
+        const auto& s = storages_[i];
+        if (!s.in_pool) continue;
+        int born = std::max(0, s.born_op);
+        Interval iv{static_cast<int>(i), born, s.death_op, s.size};
+        if (s.memory_type == MemoryType::SHM)
+            shm_intervals.push_back(iv);
+        else
+            regular_intervals.push_back(iv);
     }
 
-    if constexpr (kGraphDebugPrint) {
-        std::cout << "===== plan_memory: pool allocated " << pool_size
-                  << " bytes (" << (pool_size / 1024) << " KiB) for "
-                  << placed.size() << " storages =====" << std::endl;
-        for (const auto& pe : placed) {
-            std::cout << "  storage[" << pe.idx << "] offset=" << pe.offset
-                      << " size=" << pe.size << " born=" << pe.born
-                      << " death=" << pe.death << std::endl;
+    auto assign_pool = [this](std::vector<Interval> intervals, MemoryPool& pool,
+                              torch::Tensor external, bool is_shm,
+                              const char* tag) {
+        if (intervals.empty()) return;
+
+        auto placed = pack_intervals(std::move(intervals));
+
+        size_t pool_size = 0;
+        for (const auto& pe : placed)
+            pool_size = std::max(pool_size, pe.offset + pe.size);
+        pool_size = (pool_size + MEMORY_ALIGNMENT - 1) / MEMORY_ALIGNMENT * MEMORY_ALIGNMENT;
+
+        if (external.defined()) {
+            TORCH_CHECK(external.nbytes() >= static_cast<int64_t>(pool_size),
+                        "plan_memory: external ", tag, " pool too small (",
+                        external.nbytes(), " bytes vs needed ", pool_size, " bytes)");
+            pool.adopt(std::move(external));
+        } else {
+            TORCH_CHECK(!is_shm,
+                        "plan_memory: ", tag, " pool requires external pool");
+            pool.allocate(pool_size);
         }
-    }
 
-    for (const auto& pe : placed)
-        storages_[pe.idx].data_ptr = pool_.ptr(pe.offset);
-
-    for (const auto& pe : placed) {
-        size_t end = pe.offset + pe.size;
-        if (end > pool_.size()) {
-            size_t extra = end - pool_.size();
-            std::cerr << "plan_memory: pool too small, need " << extra
-                      << " more bytes (storage " << pe.idx
-                      << " at offset " << pe.offset
-                      << " size " << pe.size << ", pool " << pool_.size()
-                      << ")" << std::endl;
-            TORCH_CHECK(false, "memory pool sized incorrectly");
+        if constexpr (kGraphDebugPrint) {
+            std::cout << "===== plan_memory: " << tag << " pool allocated "
+                      << pool_size << " bytes (" << (pool_size / 1024)
+                      << " KiB) for " << placed.size() << " storages =====" << std::endl;
+            for (const auto& pe : placed) {
+                std::cout << "  storage[" << pe.idx << "] offset=" << pe.offset
+                          << " size=" << pe.size << " born=" << pe.born
+                          << " death=" << pe.death << std::endl;
+            }
         }
-    }
+
+        for (const auto& pe : placed)
+            storages_[pe.idx].data_ptr = pool.ptr(pe.offset);
+    };
+
+    assign_pool(std::move(regular_intervals), pool_, std::move(external_pool), false, "regular");
+    assign_pool(std::move(shm_intervals), shm_pool_, std::move(external_shm_pool), true, "shm");
 }
 
 void Graph::precompute_replay()
