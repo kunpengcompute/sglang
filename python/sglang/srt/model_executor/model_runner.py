@@ -3125,15 +3125,72 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pass
         return fixed
 
+    def _build_kunpeng_graph_inputs(
+        self, forward_batch: ForwardBatch, kwargs: dict
+    ) -> list:
+        """Build the graph inputs for the Kunpeng graph path.
+
+        The input set differs per forward mode; PP proxy tensors are appended
+        when pipeline parallelism is active, and None entries are filtered out.
+        """
+        forward_mode = forward_batch.forward_mode
+        meta = self.attn_backend.forward_metadata
+
+        if forward_mode.is_idle():
+            forward_batch.input_ids = torch.tensor([], dtype=torch.int64)
+            forward_batch.positions = torch.tensor([], dtype=torch.int64)
+            inputs = [forward_batch.input_ids, forward_batch.positions]
+        elif forward_mode.is_decode():
+            inputs = [
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch.num_token_non_padded,
+            ]
+            if meta is not None:
+                inputs.extend([meta.block_table, meta.seq_lens])
+            inputs.extend(
+                [forward_batch.out_cache_loc, self.attn_backend._decode_meta]
+            )
+        else:
+            inputs = [
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch.extend_seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.num_token_non_padded,
+                self.attn_backend._decode_meta,
+            ]
+            if meta is not None:
+                inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
+
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if self.is_draft_worker and spec_info is not None:
+            if forward_mode.is_idle():
+                spec_info.hidden_states = torch.tensor(
+                    [0, 7168], dtype=torch.bfloat16
+                )
+            if getattr(spec_info, "hidden_states", None) is not None:
+                inputs.append(spec_info.hidden_states)
+
+        # PP: proxy tensors consumed by this pipeline stage must be registered
+        # as graph inputs so the capture system can track them.
+        pp = kwargs.get("pp_proxy_tensors")
+        if self.support_pp and pp is not None:
+            inputs.extend([pp.tensors["hidden_states"], pp.tensors["residual"]])
+
+        return [item for item in inputs if item is not None]
+
     def _kunpeng_graph_forward(
         self,
         forward_batch: ForwardBatch,
-        inputs: list,
-        forward_mode: str,
         use_hbw: bool = False,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         from sglang.srt.graph import capture, finalize
+
+        # Must be built first: the idle path empties input_ids/positions,
+        # which feeds total_tokens below.
+        inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
 
         assert (
             forward_batch.input_ids.dtype == torch.int64
@@ -3152,15 +3209,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self._sglang_graph_cache.popitem(last=False)
 
             fixed = self._build_graph_fixed_tensors(forward_batch)
-            if is_pp_graph:
-                pp = kwargs["pp_proxy_tensors"]
-                graph_inputs = list(inputs)
-                graph_inputs.append(pp.tensors["hidden_states"])
-                graph_inputs.append(pp.tensors["residual"])
-            else:
-                graph_inputs = inputs
 
-            with capture(inputs=graph_inputs, fixed=fixed):
+            with capture(inputs=inputs, fixed=fixed):
                 # pp_proxy_tensors must be passed to model.forward() even in
                 # non-decode modes (e.g. PP1 idle), otherwise the model's
                 # assert (pp_proxy_tensors is not None) will fail.
@@ -3219,17 +3269,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             graph, is_pp_graph, is_pp_output = self._sglang_graph_cache[graph_cache_key]
 
         t0 = time.time()
-        if is_pp_graph and kwargs.get("pp_proxy_tensors") is not None:
-            pp = kwargs["pp_proxy_tensors"]
-            run_inputs = list(inputs)
-            run_inputs.append(pp.tensors["hidden_states"])
-            run_inputs.append(pp.tensors["residual"])
-            outputs = graph.run(run_inputs)
-        else:
-            # No input proxies: PP stage 0 produces PPProxyTensors but receives
-            # none, plain graphs likewise.  Output arity is decided below by
-            # is_pp_output / graph.has_hidden_states.
-            outputs = graph.run(inputs)
+        # PP proxy tensors are already appended to inputs by the builder, so
+        # capture and replay share the same input list.
+        outputs = graph.run(inputs)
         t1 = time.time()
         logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
 
@@ -3240,12 +3282,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             path = os.path.join(profile_dir, f"sglang_graph_rank{self.tp_rank}.jsonl")
             row = graph.get_profile_row()
             op_names = graph.profile_op_names()
+            if forward_batch.forward_mode.is_idle():
+                graph_mode = "idle"
+            elif forward_batch.forward_mode.is_decode():
+                graph_mode = "decode"
+            else:
+                graph_mode = forward_batch.forward_mode.name
             write_profile(
                 path,
                 row,
                 op_names,
                 {
-                    "forward_mode": forward_mode,
+                    "forward_mode": graph_mode,
                     "count": len(op_names),
                     "total_tokens": total_tokens,
                 },
@@ -3286,18 +3334,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # TODO: sampler (model_runner.sample() in tp_worker.py) is outside
         # the graph.  Move it into forward_decode to cover embed→sample.
         if _is_cpu_920f and _is_kunpeng_graph_capture:
-            meta = self.attn_backend.forward_metadata
-            inputs = [
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch.num_token_non_padded,
-                meta.block_table,
-                meta.seq_lens,
-                forward_batch.out_cache_loc,
-                self.attn_backend._decode_meta,
-            ]
             output = self._kunpeng_graph_forward(
-                forward_batch, inputs, "decode", use_hbw=True, **kwargs
+                forward_batch, use_hbw=True, **kwargs
             )
             if isinstance(output, PPProxyTensors):
                 return output
@@ -3376,26 +3414,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # ── sglang graph capture/replay for Kunpeng extend ──
         if _is_cpu_920f and _is_kunpeng_graph_capture:
-            meta = self.attn_backend.forward_metadata
-            inputs = [
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch.extend_seq_lens,
-                forward_batch.out_cache_loc,
-                forward_batch.num_token_non_padded,
-                self.attn_backend._decode_meta,
-            ]
-            if meta:
-                inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
-            if self.is_draft_worker:
-                inputs.append(forward_batch.spec_info.hidden_states)
-            inputs = [item for item in inputs if item is not None]
             output = self._kunpeng_graph_forward(
-                forward_batch,
-                inputs,
-                forward_batch.forward_mode.name,
-                use_hbw=not self.is_draft_worker,
-                **kwargs,
+                forward_batch, use_hbw=not self.is_draft_worker, **kwargs
             )
             if isinstance(output, PPProxyTensors):
                 return (output, True)
@@ -3441,14 +3461,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # ── sglang graph capture/replay for Kunpeng idle ──
         if _is_cpu_920f and _is_kunpeng_graph_capture:
-            forward_batch.input_ids = torch.tensor([], dtype=torch.int64)
-            forward_batch.positions = torch.tensor([], dtype=torch.int64)
-            inputs = [forward_batch.input_ids, forward_batch.positions]
-            if self.is_draft_worker:
-                forward_batch.spec_info.hidden_states = torch.tensor([0, 7168], dtype=torch.bfloat16)
-                inputs.append(forward_batch.spec_info.hidden_states)
             output = self._kunpeng_graph_forward(
-                forward_batch, inputs, "idle", use_hbw=not self.is_draft_worker, **kwargs
+                forward_batch, use_hbw=not self.is_draft_worker, **kwargs
             )
             if isinstance(output, PPProxyTensors):
                 return output
