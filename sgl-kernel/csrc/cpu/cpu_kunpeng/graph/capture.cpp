@@ -80,11 +80,20 @@ int CaptureManager::register_storage(StorageBuf buf)
     return buf.id;
 }
 
-int CaptureManager::register_output_storage(StorageBuf buf)
+int CaptureManager::register_output_storage(StorageBuf buf, MemoryType memory_type)
 {
     TORCH_CHECK(capturing_, "register_output_storage: not in capture context");
     buf.born_op = static_cast<int>(op_records_.size());
+    buf.memory_type = memory_type;
     return register_storage(buf);
+}
+
+void CaptureManager::upgrade_storage_memory_type(int storage_id)
+{
+    TORCH_CHECK(capturing_, "upgrade_storage_memory_type: not in capture context");
+    TORCH_CHECK(storage_id >= 0 && storage_id < static_cast<int>(storages_.size()),
+                "upgrade_storage_memory_type: invalid storage id ", storage_id);
+    storages_[storage_id].memory_type = MemoryType::SHM;
 }
 
 int CaptureManager::register_view(TensorView view)

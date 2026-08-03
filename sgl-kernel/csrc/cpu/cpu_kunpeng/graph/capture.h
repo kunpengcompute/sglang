@@ -43,7 +43,8 @@ public:
 
     int lookup_storage(void* storage_base) const;
     int register_storage(StorageBuf buf);
-    int register_output_storage(StorageBuf buf);
+    int register_output_storage(StorageBuf buf, MemoryType memory_type);
+    void upgrade_storage_memory_type(int storage_id);
 
     int register_view(TensorView view);
     int find_or_register_view(int storage_id, int64_t storage_offset,

@@ -271,7 +271,8 @@ def _setup_shm_batched_allgather_kunpeng():
             input, output, comm_size)
         return output
 
-    register_op('shm_batched_allgather_kunpeng', shape_infer, eager_fn)
+    register_op('shm_batched_allgather_kunpeng', shape_infer, eager_fn,
+                shm_fn=lambda input, output, comm_size: [input, output])
 
 
 def _setup_shm_dual_allgather_kunpeng():
@@ -326,7 +327,8 @@ def _setup_shm_allreduce_kunpeng():
         torch.ops.sgl_kernel.shm_allreduce_kunpeng(input)
         return None
 
-    register_op('shm_allreduce_kunpeng', shape_infer, eager_fn)
+    register_op('shm_allreduce_kunpeng', shape_infer, eager_fn,
+                shm_fn=lambda input: [input])
 
 
 def _setup_shm_fence_kunpeng():

@@ -51,7 +51,7 @@ def capture(inputs, fixed=None):
     return _CaptureContext(inputs, fixed)
 
 
-def finalize(outputs, external_pool=None):
+def finalize(outputs, external_pool=None, external_shm_pool=None):
     global _captured_storages, _captured_views, _captured_ops, \
            _captured_num_inputs, _captured_fixed, _captured_input_map
     if _captured_storages is None:
@@ -105,7 +105,7 @@ def finalize(outputs, external_pool=None):
             output_view_ids.append(view.id)
 
     gh = _C.Graph(storages, views, ops, output_view_ids, num_inputs, fixed,
-                  external_pool)
+                  external_pool, external_shm_pool)
     return gh
 
 
@@ -151,15 +151,33 @@ def lookup_or_register(tensor, idx=0):
     return vid, so, sid
 
 
-def register_output(tensor):
+_MEMORY_TYPE_TO_ENUM = {
+    'regular': _C.MemoryType.REGULAR,
+    'shm': _C.MemoryType.SHM,
+}
+
+
+def register_output(tensor, memory_type='regular'):
     mgr = _C.CaptureManager.instance()
     so = _C.storage_offset(tensor)
     buf, view = _C.tensor_to_buf_and_view(tensor)
-    sid = mgr.register_output_storage(buf)
+    sid = mgr.register_output_storage(buf, _MEMORY_TYPE_TO_ENUM[memory_type])
     view.storage_id = sid
     view.is_return = True
     vid = mgr.register_view(view)
     return vid, so
+
+
+def upgrade_storage_memory_type(tensor):
+    """Upgrade the storage backing ``tensor`` to SHM memory type."""
+    mgr = _C.CaptureManager.instance()
+    base = _C.storage_base(tensor)
+    sid = mgr.lookup_storage(base)
+    assert sid >= 0, (
+        f"upgrade_storage_memory_type: storage not registered, "
+        f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
+    )
+    mgr.upgrade_storage_memory_type(sid)
 
 
 def record_op(op_name, inputs, outputs, scalar_args, profile_name=""):

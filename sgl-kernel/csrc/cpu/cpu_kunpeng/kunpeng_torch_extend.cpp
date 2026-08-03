@@ -214,6 +214,8 @@ void shm_pool_destroy_kunpeng();
 
 bool is_shm_tensor(at::Tensor tensor);
 
+int64_t shm_remaining_bytes_kunpeng();
+
 at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t> shape);
 
 void shm_reduce_scatter_init_kunpeng();
@@ -588,6 +590,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("is_shm_tensor(Tensor tensor) -> bool");
     m.impl("is_shm_tensor", is_shm_tensor);
+
+    m.def("shm_remaining_bytes_kunpeng() -> int");
+    m.impl("shm_remaining_bytes_kunpeng", shm_remaining_bytes_kunpeng);
 
     m.def("create_shm_tensor_kunpeng(ScalarType dtype, int[] shape) -> Tensor");
     m.impl("create_shm_tensor_kunpeng", create_shm_tensor_kunpeng);

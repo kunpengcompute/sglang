@@ -22,6 +22,11 @@
 
 // A contiguous block of memory.
 // Multiple TensorViews can share one StorageBuf.
+enum class MemoryType : int {
+    REGULAR = 0,  // regular CPU memory (DDR/HBW via external pool)
+    SHM = 1,      // shared memory (KuTACC SHM pool)
+};
+
 struct StorageBuf {
     int id = -1;
     void* storage_base = nullptr;  // for identity matching in registry
@@ -29,6 +34,7 @@ struct StorageBuf {
     int death_op = -1;
     size_t size = 0;        // bytes needed (max extent over all views)
     bool in_pool = true;    // allocated in memory pool; false = external/fixed
+    MemoryType memory_type = MemoryType::REGULAR;
     void* data_ptr = nullptr; // runtime data address (pool or external)
 };
 
