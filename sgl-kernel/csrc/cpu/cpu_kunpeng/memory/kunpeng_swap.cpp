@@ -209,6 +209,61 @@ void kupl_sdma_kv_swapin(at::Tensor dst, at::Tensor src, at::Tensor event_tensor
 }
 
 // ==========================================================================
+// Block-wise KV swap-in (DDR -> HBM), graph-op entry point
+// ==========================================================================
+//
+// Issues one SDMA event per block (independent of whether ids are
+// consecutive), appending the events to the caller's event table.
+
+void kupl_sdma_kv_block_swapin(at::Tensor dst_hbm, at::Tensor src_ddr, at::Tensor ddr_block_ids,
+                               at::Tensor hbw_block_ids, int64_t block_bytes, at::Tensor event_tensor,
+                               at::Tensor event_num_tensor)
+{
+    TORCH_CHECK(dst_hbm.is_contiguous(), "kupl_sdma_kv_block_swapin: dst_hbm must be contiguous");
+    TORCH_CHECK(src_ddr.is_contiguous(), "kupl_sdma_kv_block_swapin: src_ddr must be contiguous");
+    TORCH_CHECK(ddr_block_ids.dim() == 1 && hbw_block_ids.dim() == 1,
+                "kupl_sdma_kv_block_swapin: block id tensors must be 1D");
+    TORCH_CHECK(ddr_block_ids.size(0) == hbw_block_ids.size(0),
+                "kupl_sdma_kv_block_swapin: ddr_block_ids and hbw_block_ids length mismatch");
+    TORCH_CHECK(block_bytes > 0, "kupl_sdma_kv_block_swapin: block_bytes must be positive");
+    TORCH_CHECK(dst_hbm.dtype() == src_ddr.dtype(), "kupl_sdma_kv_block_swapin: dtype mismatch (dst=", dst_hbm.dtype(),
+                ", src=", src_ddr.dtype(), ")");
+    TORCH_CHECK(ddr_block_ids.scalar_type() == at::kInt && hbw_block_ids.scalar_type() == at::kInt,
+                "kupl_sdma_kv_block_swapin: block id tensors must be int32");
+
+    int64_t n_blocks = ddr_block_ids.size(0);
+    if (n_blocks == 0) return;
+
+    uint8_t *dst_base = static_cast<uint8_t *>(dst_hbm.data_ptr());
+    const uint8_t *src_base = static_cast<const uint8_t *>(src_ddr.data_ptr());
+    int64_t dst_capacity = dst_hbm.numel() * dst_hbm.element_size();
+    int64_t src_capacity = src_ddr.numel() * src_ddr.element_size();
+
+    int event_count = event_num_tensor.item<int>();
+    int next_slot = event_count;
+    int *event_ptr = event_tensor.data_ptr<int>();
+
+    const int32_t *ddr_ids = ddr_block_ids.data_ptr<int32_t>();
+    const int32_t *hbw_ids = hbw_block_ids.data_ptr<int32_t>();
+
+    for (int64_t i = 0; i < n_blocks; i++) {
+        int64_t ddr_offset = static_cast<int64_t>(ddr_ids[i]) * block_bytes;
+        int64_t hbw_offset = static_cast<int64_t>(hbw_ids[i]) * block_bytes;
+        TORCH_CHECK(hbw_offset + block_bytes <= dst_capacity, "kupl_sdma_kv_block_swapin: dst too small for hbw block ",
+                    hbw_ids[i]);
+        TORCH_CHECK(ddr_offset + block_bytes <= src_capacity, "kupl_sdma_kv_block_swapin: src too small for ddr block ",
+                    ddr_ids[i]);
+        int event_id = utils::kupl_get_free_event_id();
+        utils::kupl_sdma_async(event_id, dst_base + hbw_offset, src_base + ddr_offset, static_cast<int>(block_bytes),
+                               0);
+        event_ptr[next_slot] = event_id;
+        next_slot++;
+    }
+
+    event_num_tensor.data_ptr<int>()[0] = next_slot;
+}
+
+// ==========================================================================
 // Torch library registration (eager mode)
 // ==========================================================================
 
@@ -252,6 +307,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("kupl_sdma_kv_swapin", kupl_sdma_kv_swapin);
 
     m.def(
+        "kupl_sdma_kv_block_swapin(Tensor dst_hbm, Tensor src_ddr, "
+        "Tensor ddr_block_ids, Tensor hbw_block_ids, "
+        "int block_bytes, Tensor(a!) event_tensor, Tensor(b!) event_num_tensor) -> ()");
+    m.impl("kupl_sdma_kv_block_swapin", kupl_sdma_kv_block_swapin);
+
+    m.def(
         "kupl_sdma_set_kv_buffer(Tensor kv_buffer, Tensor loc, Tensor cache_k, "
         "Tensor(a!) event_tensor, Tensor(b!) event_num_tensor) -> ()");
     m.impl("kupl_sdma_set_kv_buffer", kupl_sdma_set_kv_buffer);
@@ -271,6 +332,9 @@ static KernelRegistrar _r_sdma_wait_all(
 
 static KernelRegistrar _r_sdma_kv_swapin("kupl_sdma_kv_swapin",
                                          make_dispatch_v<decltype(&kupl_sdma_kv_swapin), &kupl_sdma_kv_swapin>);
+
+static KernelRegistrar _r_sdma_kv_block_swapin(
+    "kupl_sdma_kv_block_swapin", make_dispatch_v<decltype(&kupl_sdma_kv_block_swapin), &kupl_sdma_kv_block_swapin>);
 
 static KernelRegistrar _r_sdma_set_kv_buffer(
     "kupl_sdma_set_kv_buffer", make_dispatch_v<decltype(&kupl_sdma_set_kv_buffer), &kupl_sdma_set_kv_buffer>);

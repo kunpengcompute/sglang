@@ -117,6 +117,20 @@ class KunpengSwapManager:
         self._kv_start_layer: int = 0
         self._kv_end_layer: int = 0
 
+        # Block-wise KV swap: DDR->HBM block mapping for the current decode
+        # step (computed by the attention backend, cached here for all layers).
+        self._blockwise_ddr_block_ids: Optional[torch.Tensor] = None
+        self._blockwise_hbw_block_ids: Optional[torch.Tensor] = None
+        self._blockwise_block_bytes: int = 0
+        self._blockwise_hbw_cache_loc: Optional[torch.Tensor] = None
+        self._blockwise_token_slice_start: int = 0
+        # Capacity of the single HBM swap buffer in KV blocks (blockwise mode).
+        self.max_blocks_on_package: int = (
+            int(os.environ.get("SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS", "0"))
+            if self.enable_swap_kv_blockwise
+            else 0
+        )
+
         # HBW memory pool for swap buffer allocations (lazy init on first use).
         self._hbw_pool: Optional[KunpengHBWPool] = None
         if _is_kunpeng_hbw_pool:
@@ -371,6 +385,36 @@ class KunpengSwapManager:
             dtype,
         )
 
+    def set_blockwise_swap_meta(
+        self,
+        ddr_block_ids: torch.Tensor,
+        hbw_block_ids: torch.Tensor,
+        block_bytes: int,
+        hbw_cache_loc: torch.Tensor,
+        token_slice_start: int,
+    ) -> None:
+        """Cache the DDR->HBM block mapping for the current decode step.
+
+        Called by the attention backend once per decode step (from
+        ``_init_blockwise_swap_metadata``). The mapping is the same for all
+        layers, so :meth:`swap_kv_layer` reuses it to swap in only the needed
+        blocks for each layer.
+
+        Args:
+            ddr_block_ids: unique DDR block ids to swap in.
+            hbw_block_ids: corresponding HBM slot ids (0..N-1).
+            block_bytes: bytes of one KV block.
+            hbw_cache_loc: flat token positions in the HBM buffer where this
+                step's new K/V must be written.
+            token_slice_start: starting token index in the full B-token K
+                tensor covered by ``hbw_cache_loc`` (all2all group offset).
+        """
+        self._blockwise_ddr_block_ids = ddr_block_ids
+        self._blockwise_hbw_block_ids = hbw_block_ids
+        self._blockwise_block_bytes = block_bytes
+        self._blockwise_hbw_cache_loc = hbw_cache_loc
+        self._blockwise_token_slice_start = token_slice_start
+
     def swap_kv_layer(self, layer_id: int, kv_buffer: torch.Tensor) -> None:
         """Populate KV HBM buffer for *layer_id* via SDMA async copy.
 
@@ -379,6 +423,9 @@ class KunpengSwapManager:
 
         - Swap enabled: copies DDR → HBM via graph-compatible
           ``kunpeng.kupl_sdma_memcpy_chunked`` with internal event management.
+        - Block-wise (decode): only copies the DDR blocks registered by
+          :meth:`set_blockwise_swap_meta` for this decode step, via
+          ``kunpeng.kupl_sdma_kv_block_swapin``.
         - Swap disabled: stores DDR reference directly (zero-copy).
 
         Args:
@@ -394,6 +441,21 @@ class KunpengSwapManager:
             raise RuntimeError(
                 "KV HBM buffer not allocated. Call init_kv_buffer(...) first."
             )
+
+        if self._blockwise_ddr_block_ids is not None:
+            # Block-wise swap-in: copy only the blocks needed by the current
+            # decode step. The mapping is identical across all layers, so the
+            # meta set once per step is reused for every layer.
+            kunpeng.kupl_sdma_kv_block_swapin(
+                self._cur_kv_hbm,
+                kv_buffer,
+                self._blockwise_ddr_block_ids,
+                self._blockwise_hbw_block_ids,
+                self._blockwise_block_bytes,
+                self._kv_swap_in_event_tensor,
+                self._kv_swap_in_event_num_tensor,
+            )
+            return
 
         total_bytes = kv_buffer.numel() * kv_buffer.element_size()
         kunpeng.kupl_sdma_kv_swapin(

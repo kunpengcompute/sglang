@@ -556,6 +556,41 @@ def _setup_kupl_sdma_kv_swapin():
     register_op("kupl_sdma_kv_swapin", shape_infer, eager_fn)
 
 
+def _setup_kupl_sdma_kv_block_swapin():
+    def shape_infer(
+        dst_hbm,
+        src_ddr,
+        ddr_block_ids,
+        hbw_block_ids,
+        block_bytes,
+        event_tensor,
+        event_num_tensor,
+    ):
+        return []
+
+    def eager_fn(
+        dst_hbm,
+        src_ddr,
+        ddr_block_ids,
+        hbw_block_ids,
+        block_bytes,
+        event_tensor,
+        event_num_tensor,
+    ):
+        torch.ops.sgl_kernel.kupl_sdma_kv_block_swapin(
+            dst_hbm,
+            src_ddr,
+            ddr_block_ids,
+            hbw_block_ids,
+            block_bytes,
+            event_tensor,
+            event_num_tensor,
+        )
+        return None
+
+    register_op("kupl_sdma_kv_block_swapin", shape_infer, eager_fn)
+
+
 def _setup_kupl_sdma_wait_all():
     def shape_infer(event_tensor, event_num_tensor):
         return []
@@ -831,6 +866,7 @@ def setup():
     _setup_moe_combine_recv_kunpeng()
     _setup_kupl_sdma_memcpy_chunked()
     _setup_kupl_sdma_kv_swapin()
+    _setup_kupl_sdma_kv_block_swapin()
     _setup_kupl_sdma_wait_all()
     _setup_kupl_sdma_set_kv_buffer()
     _setup_cat_kunpeng()
