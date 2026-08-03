@@ -3071,9 +3071,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 [self.model.model.embed_tokens.weight, self.model.lm_head.weight]
             )
         else:
-            layer0 = self.model.model.layers[0]
-        if layer0.self_attn.rotary_emb is not None:
-            fixed.append(layer0.self_attn.rotary_emb.cos_sin_cache)
+            # cos_sin_cache shared across all layers (skip PPMissingLayer on non-first PP rank)
+            for _layer in self.model.model.layers:
+                if hasattr(_layer, 'self_attn') and _layer.self_attn.rotary_emb is not None:
+                    fixed.append(_layer.self_attn.rotary_emb.cos_sin_cache)
+                    break
         if forward_batch.next_token_logits_buffer is not None:
             fixed.append(forward_batch.next_token_logits_buffer)
         # Expert HBM swap buffers (reused across layers, allocated once)
@@ -3122,29 +3124,56 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_mode: str,
         use_hbw: bool = False,
         **kwargs,
-    ):
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         from sglang.srt.graph import capture, finalize
 
         assert (
             forward_batch.input_ids.dtype == torch.int64
         ), f"graph input_ids must be int64, got {forward_batch.input_ids.dtype}"
         total_tokens = forward_batch.input_ids.shape[0]
-        graph_cache_key = (forward_batch.forward_mode, total_tokens)
+        # Received proxy tensors must be registered as graph inputs so the
+        # capture system can track them (otherwise consuming graph ops fail).
+        is_pp_graph = (
+            kwargs.get("pp_proxy_tensors") is not None
+            and self.support_pp
+        )
+        graph_cache_key = (forward_batch.forward_mode, total_tokens, is_pp_graph)
 
         if graph_cache_key not in self._sglang_graph_cache:
             while len(self._sglang_graph_cache) >= self._sglang_graph_max_cache:
                 self._sglang_graph_cache.popitem(last=False)
 
             fixed = self._build_graph_fixed_tensors(forward_batch)
+            if is_pp_graph:
+                pp = kwargs["pp_proxy_tensors"]
+                graph_inputs = list(inputs)
+                graph_inputs.append(pp.tensors["hidden_states"])
+                graph_inputs.append(pp.tensors["residual"])
+            else:
+                graph_inputs = inputs
 
-            with capture(inputs=inputs, fixed=fixed):
+            with capture(inputs=graph_inputs, fixed=fixed):
+                # pp_proxy_tensors must be passed to model.forward() even in
+                # non-decode modes (e.g. PP1 idle), otherwise the model's
+                # assert (pp_proxy_tensors is not None) will fail.
                 ret = self.model.forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
                     **kwargs,
                 )
-                logits, hidden_states = ret.next_token_logits, ret.hidden_states
+                is_pp_output = isinstance(ret, PPProxyTensors)
+                if is_pp_output:
+                    hidden_states = ret.tensors["hidden_states"]
+                    residual = ret.tensors["residual"]
+                else:
+                    logits = ret.next_token_logits
+                    hidden_states = ret.hidden_states
+
+            if is_pp_output:
+                graph_outputs = [hidden_states, residual]
+            else:
+                graph_outputs = [logits, hidden_states] if hidden_states is not None else [logits]
 
             if use_hbw and _is_kunpeng_hbw_pool:
                 if self._graph_hbw_tensor is None:
@@ -3152,30 +3181,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
                         (remaining,), torch.uint8
                     )
-                graph = finalize(
-                    [logits, hidden_states] if hidden_states is not None else [logits], external_pool=self._graph_hbw_tensor
-                )
+                graph = finalize(graph_outputs, external_pool=self._graph_hbw_tensor)
             else:
-                graph = finalize([logits, hidden_states] if hidden_states is not None else [logits])
-            graph.has_hidden_states = hidden_states is not None
+                graph = finalize(graph_outputs)
+            graph.has_hidden_states = (not is_pp_output) and hidden_states is not None
 
             if _is_kunpeng_graph_profile:
                 graph.enable_profile(True)
-            self._sglang_graph_cache[graph_cache_key] = graph
+            self._sglang_graph_cache[graph_cache_key] = (graph, is_pp_graph, is_pp_output)
             logger.info(
                 f"[graph] captured mode={forward_batch.forward_mode.name}, "
-                f"total_tokens={total_tokens}"
+                f"total_tokens={total_tokens}, pp={is_pp_graph}"
             )
         else:
             self._sglang_graph_cache.move_to_end(graph_cache_key)
-            graph = self._sglang_graph_cache[graph_cache_key]
+            graph, is_pp_graph, is_pp_output = self._sglang_graph_cache[graph_cache_key]
 
         t0 = time.time()
-        if graph.has_hidden_states:
-            logits, hidden_states = graph.run(inputs)
+        if is_pp_graph and kwargs.get("pp_proxy_tensors") is not None:
+            pp = kwargs["pp_proxy_tensors"]
+            run_inputs = list(inputs)
+            run_inputs.append(pp.tensors["hidden_states"])
+            run_inputs.append(pp.tensors["residual"])
+            outputs = graph.run(run_inputs)
         else:
-            logits, = graph.run(inputs)
-            hidden_states = None
+            # No input proxies: PP stage 0 produces PPProxyTensors but receives
+            # none, plain graphs likewise.  Output arity is decided below by
+            # is_pp_output / graph.has_hidden_states.
+            outputs = graph.run(inputs)
         t1 = time.time()
         logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
 
@@ -3197,7 +3230,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 },
             )
 
-        return logits, hidden_states
+        if is_pp_output:
+            hidden_states, residual = outputs
+            return PPProxyTensors({"hidden_states": hidden_states, "residual": residual})
+        if graph.has_hidden_states:
+            logits, hidden_states = outputs
+            return logits, hidden_states
+        logits, = outputs
+        return logits, None
 
     def forward_decode(
         self,
@@ -3235,9 +3275,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.out_cache_loc,
                 self.attn_backend._decode_meta,
             ]
-            logits, hidden_states = self._kunpeng_graph_forward(
+            output = self._kunpeng_graph_forward(
                 forward_batch, inputs, "decode", use_hbw=True, **kwargs
             )
+            if isinstance(output, PPProxyTensors):
+                return output
+            logits, hidden_states = output
             return LogitsProcessorOutput(
                 next_token_logits=logits, hidden_states=hidden_states
             )
@@ -3326,13 +3369,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.is_draft_worker:
                 inputs.append(forward_batch.spec_info.hidden_states)
             inputs = [item for item in inputs if item is not None]
-            logits, hidden_states = self._kunpeng_graph_forward(
+            output = self._kunpeng_graph_forward(
                 forward_batch,
                 inputs,
                 forward_batch.forward_mode.name,
                 use_hbw=False,
                 **kwargs,
             )
+            if isinstance(output, PPProxyTensors):
+                return (output, True)
+            logits, hidden_states = output
             return (
                 LogitsProcessorOutput(
                     next_token_logits=logits, hidden_states=hidden_states
@@ -3366,6 +3412,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+            if pp_proxy_tensors is not None:
+                hidden_states = pp_proxy_tensors.tensors["hidden_states"]
+                residual = pp_proxy_tensors.tensors["residual"]
+                kwargs["pp_proxy_tensors"].tensors["hidden_states"] = torch.empty(1, dtype=hidden_states.dtype)[:0].view(hidden_states.shape)
+                kwargs["pp_proxy_tensors"].tensors["residual"] = torch.empty(1, dtype=residual.dtype)[:0].view(residual.shape)
 
         # ── sglang graph capture/replay for Kunpeng idle ──
         if _is_cpu_920f and _is_kunpeng_graph_capture:
@@ -3375,9 +3426,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.is_draft_worker:
                 forward_batch.spec_info.hidden_states = torch.tensor([0, 7168], dtype=torch.bfloat16)
                 inputs.append(forward_batch.spec_info.hidden_states)
-            logits, hidden_states = self._kunpeng_graph_forward(
+            output = self._kunpeng_graph_forward(
                 forward_batch, inputs, "idle", use_hbw=True, **kwargs
             )
+            if isinstance(output, PPProxyTensors):
+                return output
+            logits, hidden_states = output
             return LogitsProcessorOutput(
                 next_token_logits=logits, hidden_states=hidden_states
             )
