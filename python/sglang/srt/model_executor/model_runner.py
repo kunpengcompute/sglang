@@ -3373,7 +3373,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
                 inputs,
                 forward_batch.forward_mode.name,
-                use_hbw=False,
+                use_hbw=not self.is_draft_worker,
                 **kwargs,
             )
             if isinstance(output, PPProxyTensors):
@@ -3427,7 +3427,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.spec_info.hidden_states = torch.tensor([0, 7168], dtype=torch.bfloat16)
                 inputs.append(forward_batch.spec_info.hidden_states)
             output = self._kunpeng_graph_forward(
-                forward_batch, inputs, "idle", use_hbw=True, **kwargs
+                forward_batch, inputs, "idle", use_hbw=not self.is_draft_worker, **kwargs
             )
             if isinstance(output, PPProxyTensors):
                 return output
