@@ -226,15 +226,22 @@ def assign_draft_cache_locs_native(
     speculative_num_steps: int = 0,
     topk: int = 1,
 ):
-    if topk ==1:
+    if topk == 1:
         B = req_pool_indices.shape[0]
 
         row_idx = req_pool_indices.unsqueeze(1).expand(B, speculative_num_steps)
-        col_idx = seq_lens.unsqueeze(1) + torch.arange(speculative_num_steps).unsqueeze(0)
+        col_idx = seq_lens.unsqueeze(1) + torch.arange(speculative_num_steps).unsqueeze(
+            0
+        )
 
-        req_to_token[row_idx, col_idx] = out_cache_loc.view(B, speculative_num_steps).to(torch.int32)
+        req_to_token[row_idx, col_idx] = out_cache_loc.view(
+            B, speculative_num_steps
+        ).to(torch.int32)
     else:
-        raise NotImplementedError("assign_draft_cache_locs_native is not implemented for topk > 1")
+        raise NotImplementedError(
+            "assign_draft_cache_locs_native is not implemented for topk > 1"
+        )
+
 
 @triton.jit
 def assign_draft_cache_locs(
@@ -465,10 +472,11 @@ def align_evict_mask_to_page_size_native(
     sum_true = evict_mask.sum(dim=1, dtype=torch.int64)
     num_false = num_draft_tokens - sum_true
     start_raw = ((seq_lens + num_false - 1) // page_size) * page_size - seq_lens
-    start = torch.clamp(start_raw, min=0, max=num_draft_tokens)
+    start = torch.clamp(start_raw, min=0)
+    end = torch.clamp(start + page_size, max=num_draft_tokens)
 
     cols = torch.arange(num_draft_tokens, device=device).unsqueeze(0)
-    mask = (cols >= start.unsqueeze(1))
+    mask = (cols >= start.unsqueeze(1)) & (cols < end.unsqueeze(1))
     evict_mask.masked_fill_(mask, False)
 
     return evict_mask.view(original_shape)
