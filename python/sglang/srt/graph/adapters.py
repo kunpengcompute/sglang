@@ -300,7 +300,10 @@ def _setup_shm_mla_q_alltoall_kunpeng():
         torch.ops.sgl_kernel.shm_mla_q_alltoall_kunpeng(q, output)
         return output
 
-    register_op('shm_mla_q_alltoall_kunpeng', shape_infer, eager_fn)
+    # Only the input is marked SHM: alltoall has no copy-out (the kernel writes
+    # the output directly), so the no-copy path only needs the input in SHM.
+    register_op('shm_mla_q_alltoall_kunpeng', shape_infer, eager_fn,
+                shm_fn=lambda q, output, tp_size: [q])
 
 
 def _setup_shm_mla_o_alltoall_kunpeng():
@@ -316,7 +319,10 @@ def _setup_shm_mla_o_alltoall_kunpeng():
         torch.ops.sgl_kernel.shm_mla_o_alltoall_kunpeng(o, output)
         return output
 
-    register_op('shm_mla_o_alltoall_kunpeng', shape_infer, eager_fn)
+    # Only the input is marked SHM: alltoall has no copy-out (the kernel writes
+    # the output directly), so the no-copy path only needs the input in SHM.
+    register_op('shm_mla_o_alltoall_kunpeng', shape_infer, eager_fn,
+                shm_fn=lambda o, output, tp_size: [o])
 
 
 def _setup_shm_allreduce_kunpeng():

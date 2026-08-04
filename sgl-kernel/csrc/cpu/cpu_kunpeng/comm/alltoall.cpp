@@ -233,6 +233,25 @@ static void copy_and_fence(at::Tensor input, bfloat16_t *local_send_ptr)
     kupl_shm_fence(kupl_win_intra_node);
 }
 
+// Build per-call peer pointers for the no-copy path: the input already lives in
+// SHM (e.g. graph SHM pool), so each rank's input tensor is used directly as
+// its send buffer and the memcpy is skipped. Deterministic graph layout keeps
+// the same pool offset on every rank, so peer addresses translate via KUPL.
+static void build_no_copy_peer_buffers(at::Tensor input, int64_t group_size,
+                                       std::vector<void *> &remote)
+{
+    int comm_rank = (group_size == 8) ? (get_intra_node_rank() % 8) : get_intra_node_rank();
+    int comm_start = get_intra_node_rank() - comm_rank;
+    remote.resize(group_size);
+    for (int i = 0; i < group_size; ++i) {
+        get_peer_shm_baseptr(comm_start + i, input.data_ptr(),
+                             reinterpret_cast<void **>(&remote[i]));
+    }
+    // Ensure all ranks' input data (written by their producer ops) is visible
+    // before the alltoall reads peer slots.
+    kupl_shm_fence(kupl_win_intra_node);
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1: copy data into the local SHM buffer and fence.
 // (The local SHM buffer is the same for both comm8 and comm16, so copy_in
@@ -256,9 +275,8 @@ void shm_mla_o_copy_in_kunpeng(at::Tensor o_tensor)
 // Group size is derived from the tensor shapes.
 // ---------------------------------------------------------------------------
 
-void shm_mla_q_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor)
+static void q_alltoall_exec(at::Tensor shape_ref, at::Tensor out_tensor, void **send_buffers)
 {
-    TORCH_CHECK(g_ata_initialized, "shm_mla_q_alltoall_exec_kunpeng called before shm_mla_alltoall_init_kunpeng");
     validate_bf16_contiguous(out_tensor, "out_tensor");
 
     // shape_ref provides the input shape: (B, Nh_local, D).
@@ -280,14 +298,20 @@ void shm_mla_q_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor
                 out_tensor.size(2));
 
     // shm_alltoall2D scatters along dim=1 (the head dimension).
-    kutacc::shm_alltoall2D(reinterpret_cast<void **>(get_ata_q_buffers(group_size).data()), out_tensor.data_ptr(), b,
+    kutacc::shm_alltoall2D(reinterpret_cast<void **>(send_buffers), out_tensor.data_ptr(), b,
                            sub_h * d, /*dim=*/1,
                            /*need_comm_fence=*/false, get_ata_request(group_size));
 }
 
-void shm_mla_o_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor)
+void shm_mla_q_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor)
 {
-    TORCH_CHECK(g_ata_initialized, "shm_mla_o_alltoall_exec_kunpeng called before shm_mla_alltoall_init_kunpeng");
+    TORCH_CHECK(g_ata_initialized, "shm_mla_q_alltoall_exec_kunpeng called before shm_mla_alltoall_init_kunpeng");
+    q_alltoall_exec(shape_ref, out_tensor,
+                    reinterpret_cast<void **>(get_ata_q_buffers(out_tensor.size(1) / shape_ref.size(1)).data()));
+}
+
+static void o_alltoall_exec(at::Tensor shape_ref, at::Tensor out_tensor, void **send_buffers)
+{
     validate_bf16_contiguous(out_tensor, "out_tensor");
 
     // shape_ref provides the input shape: (B/tp, Nh, D).
@@ -310,25 +334,74 @@ void shm_mla_o_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor
                 out_tensor.size(2));
 
     // shm_alltoall2D scatters along dim=0 (the batch dimension).
-    kutacc::shm_alltoall2D(reinterpret_cast<void **>(get_ata_o_buffers(group_size).data()), out_tensor.data_ptr(),
+    kutacc::shm_alltoall2D(reinterpret_cast<void **>(send_buffers), out_tensor.data_ptr(),
                            sub_b, h * d, /*dim=*/0,
                            /*need_comm_fence=*/false, get_ata_request(group_size));
+}
+
+void shm_mla_o_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor)
+{
+    TORCH_CHECK(g_ata_initialized, "shm_mla_o_alltoall_exec_kunpeng called before shm_mla_alltoall_init_kunpeng");
+    o_alltoall_exec(shape_ref, out_tensor,
+                    reinterpret_cast<void **>(get_ata_o_buffers(shape_ref.size(1) / out_tensor.size(1)).data()));
 }
 
 // ---------------------------------------------------------------------------
 // Convenience: single-call wrappers (copy + alltoall).
 // Safe when the caller guarantees cross-rank ordering (e.g. inside the model
 // forward pass where all TP ranks execute the same layer in lockstep).
+//
+// Dual-path: if the input already lives in shared memory (e.g. graph SHM pool),
+// it is used directly as the send buffer (no memcpy); otherwise the input is
+// copied into the pre-allocated local SHM buffer as before.
 // ---------------------------------------------------------------------------
 
 void shm_mla_q_alltoall_kunpeng(at::Tensor q_tensor, at::Tensor out_tensor)
 {
-    shm_mla_q_copy_in_kunpeng(q_tensor);
-    shm_mla_q_alltoall_exec_kunpeng(q_tensor, out_tensor);
+    TORCH_CHECK(g_ata_initialized, "shm_mla_q_alltoall_kunpeng called before shm_mla_alltoall_init_kunpeng");
+    validate_bf16_contiguous(q_tensor, "q_tensor");
+
+    int64_t numel = q_tensor.numel();
+    TORCH_CHECK(numel <= g_ata_max_elem,
+                "MLA alltoall q numel (", numel, ") exceeds pre-allocated max_elem (",
+                g_ata_max_elem, ")");
+
+    int64_t group_size = out_tensor.size(1) / q_tensor.size(1);
+    TORCH_CHECK(group_size == 8 || group_size == 16, "MLA alltoall q group_size must be 8 or 16, got ", group_size);
+
+    if (is_shm_tensor(q_tensor)) {
+        // no-copy: q already in SHM — use it directly as the send buffer.
+        std::vector<void *> remote;
+        build_no_copy_peer_buffers(q_tensor, group_size, remote);
+        q_alltoall_exec(q_tensor, out_tensor, remote.data());
+    } else {
+        shm_mla_q_copy_in_kunpeng(q_tensor);
+        q_alltoall_exec(q_tensor, out_tensor,
+                        reinterpret_cast<void **>(get_ata_q_buffers(group_size).data()));
+    }
 }
 
 void shm_mla_o_alltoall_kunpeng(at::Tensor o_tensor, at::Tensor out_tensor)
 {
-    shm_mla_o_copy_in_kunpeng(o_tensor);
-    shm_mla_o_alltoall_exec_kunpeng(o_tensor, out_tensor);
+    TORCH_CHECK(g_ata_initialized, "shm_mla_o_alltoall_kunpeng called before shm_mla_alltoall_init_kunpeng");
+    validate_bf16_contiguous(o_tensor, "o_tensor");
+
+    int64_t numel = o_tensor.numel();
+    TORCH_CHECK(numel <= g_ata_max_elem,
+                "MLA alltoall o numel (", numel, ") exceeds pre-allocated max_elem (",
+                g_ata_max_elem, ")");
+
+    int64_t group_size = o_tensor.size(1) / out_tensor.size(1);
+    TORCH_CHECK(group_size == 8 || group_size == 16, "MLA alltoall o group_size must be 8 or 16, got ", group_size);
+
+    if (is_shm_tensor(o_tensor)) {
+        // no-copy: o already in SHM — use it directly as the send buffer.
+        std::vector<void *> remote;
+        build_no_copy_peer_buffers(o_tensor, group_size, remote);
+        o_alltoall_exec(o_tensor, out_tensor, remote.data());
+    } else {
+        shm_mla_o_copy_in_kunpeng(o_tensor);
+        o_alltoall_exec(o_tensor, out_tensor,
+                        reinterpret_cast<void **>(get_ata_o_buffers(group_size).data()));
+    }
 }
