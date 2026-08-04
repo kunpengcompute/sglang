@@ -473,7 +473,7 @@ def align_evict_mask_to_page_size_native(
     num_false = num_draft_tokens - sum_true
     start_raw = ((seq_lens + num_false - 1) // page_size) * page_size - seq_lens
     start = torch.clamp(start_raw, min=0)
-    end = torch.clamp(start + page_size, max=num_draft_tokens)
+    end = torch.clamp(start_raw + page_size, max=num_draft_tokens)
 
     cols = torch.arange(num_draft_tokens, device=device).unsqueeze(0)
     mask = (cols >= start.unsqueeze(1)) & (cols < end.unsqueeze(1))
