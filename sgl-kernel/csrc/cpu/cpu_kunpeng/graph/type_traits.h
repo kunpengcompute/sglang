@@ -19,13 +19,14 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
-using ScalarArg = std::variant<bool, int64_t, double>;
+using ScalarArg = std::variant<bool, int64_t, double, std::string>;
 using DispatchFn = void (*)(std::vector<at::Tensor>&, const std::vector<ScalarArg>&);
 
 namespace graph_detail {
@@ -85,6 +86,11 @@ auto _extract_arg(std::vector<at::Tensor>& tensors, const std::vector<ScalarArg>
         return static_cast<int>(std::get<int64_t>(scalars[_scalar_offset_v<I, Tuple>]));
     } else if constexpr (std::is_same_v<ArgType, float>) {
         return static_cast<float>(std::get<double>(scalars[_scalar_offset_v<I, Tuple>]));
+    } else if constexpr (std::is_same_v<ArgType, std::string>) {
+        // Optional string scalar (e.g. print_hash op name): fall back to empty
+        // when the call site did not pass it during capture.
+        return _scalar_offset_v<I, Tuple> < scalars.size() ? std::get<std::string>(scalars[_scalar_offset_v<I, Tuple>])
+                                                           : std::string();
     } else {
         static_assert(sizeof(ArgType) == 0, "Unsupported argument type in graph dispatch");
     }
