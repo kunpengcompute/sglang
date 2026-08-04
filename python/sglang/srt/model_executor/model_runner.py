@@ -3151,7 +3151,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs.get("pp_proxy_tensors") is not None
             and self.support_pp
         )
-        graph_cache_key = (forward_batch.forward_mode, total_tokens, is_pp_graph)
+        # Batch size must be part of the key: per-sequence ops (e.g.
+        # last_tokens, MTP pad/unpad) fix their output shape at capture, so two
+        # batches with equal total_tokens but different sequence counts must
+        # not share a graph.
+        graph_cache_key = (
+            forward_batch.forward_mode,
+            total_tokens,
+            forward_batch.batch_size,
+            is_pp_graph,
+        )
 
         if graph_cache_key not in self._sglang_graph_cache:
             while len(self._sglang_graph_cache) >= self._sglang_graph_max_cache:
@@ -3218,7 +3227,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._sglang_graph_cache[graph_cache_key] = (graph, is_pp_graph, is_pp_output)
             logger.info(
                 f"[graph] captured mode={forward_batch.forward_mode.name}, "
-                f"total_tokens={total_tokens}, pp={is_pp_graph}"
+                f"total_tokens={total_tokens}, batch_size={forward_batch.batch_size}, "
+                f"pp={is_pp_graph}"
             )
         else:
             self._sglang_graph_cache.move_to_end(graph_cache_key)
