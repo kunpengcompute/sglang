@@ -100,9 +100,17 @@ case "${TEST_NAME}" in
         MASTER_PORT=8007
         TEST_LABEL="RDMA full-mesh allgather correctness + benchmark"
         ;;
+    pp_comm)
+        TEST_FILE="${SCRIPT_DIR}/test_pp_comm.py"
+        MASTER_PORT=5012
+        TEST_LABEL="PP unified RDMA message (pyobj/tensor/ack) correctness"
+        # PP p2p only needs two peers; fixed regardless of env.sh.
+        export PP_TEST_WORLD_SIZE=2
+        export PP_TEST_MASTER_PORT=5012
+        ;;
     *)
         echo "ERROR: unknown test '${TEST_NAME}'" >&2
-        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8, mla_alltoall, rdma_allgather" >&2
+        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8, mla_alltoall, rdma_allgather, pp_comm" >&2
         exit 1
         ;;
 esac
@@ -125,7 +133,11 @@ export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:${LD_LIBRARY_PATH}
 PYTHON="${PYTHON:-python3}"
 CPU_PER_RANK="${CPU_PER_RANK:-38}"
 MASTER_ADDR="127.0.0.1"
-WORLD_SIZE=16
+# PP p2p tests only need two peers; pp_comm exports PP_TEST_WORLD_SIZE=2
+# (env.sh sets WORLD_SIZE from NODE_IPS, so prefer the test-specific one).
+WORLD_SIZE="${PP_TEST_WORLD_SIZE:-${WORLD_SIZE:-16}}"
+# Same for the rendezvous port (env.sh sets MASTER_PORT per role).
+MASTER_PORT="${PP_TEST_MASTER_PORT:-${MASTER_PORT:-5012}}"
 IS_PRFILL="0"
 
 export MASTER_ADDR

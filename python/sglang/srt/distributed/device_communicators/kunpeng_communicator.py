@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import os
+import pickle
 import time
 import torch
 import torch.distributed as dist
@@ -31,6 +32,15 @@ from sglang.srt.graph import ops as kunpeng
 kernel = torch.ops.sgl_kernel
 
 logger = logging.getLogger(__name__)
+
+# Unified PP message kinds (must match comm/pp_comm.cpp).  Every PP message
+# (pyobj / tensor metadata / ack) is one pp_put + 1 imm with a frame header
+# [magic][kind][len][payload]; the receiver demuxes by kind.  Non-ack messages
+# are auto-acked by the C++ receiver so the sender can reuse the ring slot.
+PP_KIND_PYOBJ = 0
+PP_KIND_TENSOR = 1
+PP_KIND_ACK = 2
+PP_MSG_SLOTS = 8  # must match PP_MSG_SLOTS in pp_comm.cpp
 
 _INTRA_SOCKET: Optional[dist.ProcessGroup] = None
 _INTRA_DIE: Optional[dist.ProcessGroup] = None
@@ -123,14 +133,7 @@ def init_oob_comms(intra_node_size: int = 16):
 
 
 def init_shm_pool(group: dist.ProcessGroup):
-    """Initialize the Kunpeng shared memory pool.
-
-    Must be called after ``init_oob_comms`` since it needs the
-    intra-node, intra-socket and intra-die ProcessGroups.
-
-    This function is idempotent -- calling it multiple times is safe
-    (the C++ side also guards against double-init).
-    """
+    """Initialize the Kunpeng SHM pool (idempotent; requires init_oob_comms first)."""
     global _SHM_POOL_INITIALIZED, _OOB_COMMS_INITIALIZED, _INTRA_SOCKET, _INTRA_DIE
     if _SHM_POOL_INITIALIZED:
         return
@@ -177,14 +180,10 @@ class KunpengCommunicator:
         kernel.shm_allgather_init_kunpeng()
         kernel.shm_allreduce_init_kunpeng(self.max_elements)
 
-        # Pre-allocate SHM buffer for uint8 MIN allreduce (used by PD-separated
-        # polling). Must run before graph capture claims the remaining SHM
-        # pool bytes, otherwise lazy allocation would fail at runtime.
+        # Pre-allocate min-int8 allreduce SHM before graph capture claims the pool.
         kernel.shm_allreduce_min_int8_init_kunpeng(1024)
 
-        # Initialize SHM MLA alltoall with DeepSeek V3 parameters.
-        # qk_head_dim = 192 (128 nope + 64 rope), kv_lora_rank = 512,
-        # num_heads = 128, num_local_heads = num_heads / comm_size.
+        # SHM MLA alltoall (DeepSeek-V3 params); num_heads = 128.
         num_heads = 128
         kernel.shm_mla_alltoall_init_kunpeng(
             self.comm_size,
@@ -269,12 +268,10 @@ class KunpengCommunicator:
 
 
 class KunpengPPCommunicator:
-    """Pipeline parallel P2P communicator using kutacc pp_put/pp_recv.
+    """Pipeline parallel P2P communicator over kutacc pp_put/pp_recv.
 
-    Replaces Gloo's isend/irecv for cross-node PP activation transfer.
-    Creates a separate global kurmcl communication domain (distinct from the
-    MoE sub-domain) to avoid RDMA resource conflicts.
-
+    Replaces Gloo isend/irecv; every message is one pp_put + 1 imm
+    [magic][kind][len][payload], non-ACK messages auto-acked (flow control).
     """
 
     def __init__(self, pp_group: dist.ProcessGroup, global_group: dist.ProcessGroup,
@@ -286,32 +283,63 @@ class KunpengPPCommunicator:
         self.max_buf_bytes = max_buf_bytes
         self.buffer = torch.empty(max_buf_bytes, dtype=torch.uint8)
         self._pp_initialized = False
-        # pp_ranks[local_rank] = world_rank, used to convert PP local rank
-        # to world rank for pp_put/pp_recv in the global domain.
+        # pp_ranks[pp_rank] = world_rank, for the C++ per-peer message region.
         self.pp_ranks = pp_ranks or list(range(self.comm_size))
+        # Unacked messages per peer (flow control).
+        self._inflight = {r: 0 for r in range(self.comm_size)}
 
-        # Domain creation and pp_init are deferred to init_pp_domain(),
-        # called after MoE _init_rdma_comm creates both domains together.
+        # pp_init is deferred to init_pp_domain() after the MoE domains exist.
 
     def init_pp_domain(self):
-        """Call pp_init after MoE sub-domain is created.
-
-        The global kurmcl domain is already created in _init_rdma_comm
-        via moe_comm_create_all_kunpeng (together with the MoE sub-domain).
-        This function only does pp_init (buffer registration + MR exchange).
-        """
+        """Call pp_init after the global RDMA domain exists (buffer reg + pp_rank map)."""
         if self._pp_initialized:
             return
 
-        global_pg_ptr = pg_helper.get_process_group_ptr(self.global_group)
-        # pp_init (registers buffer, exchanges MR info, barriers)
-        kernel.pp_comm_init_kunpeng(self.buffer, global_pg_ptr)
+        pp_pg_ptr = pg_helper.get_process_group_ptr(self.pp_group)
+        kernel.pp_comm_init_kunpeng(
+            self.buffer,
+            pp_pg_ptr,
+            torch.tensor(self.pp_ranks, dtype=torch.int64),
+        )
         self._pp_initialized = True
         logger.debug(
             "[KunpengPPCommunicator] pp_init OK "
             "(rank=%s, buf_size=%s)",
             dist.get_rank(), self.max_buf_bytes,
         )
+
+    def pp_comm_init(self):
+        """Ensure the RDMA global domain + PP buffer are ready (idempotent)."""
+        if self._pp_initialized:
+            return
+        t0 = time.perf_counter()
+        logger.info(
+            "[KunpengPPCommunicator] pp_comm_init enter rank=%s t=%.3f",
+            dist.get_rank(), t0,
+        )
+        from sgl_kernel import pg_helper as _pg_helper
+        from sglang.srt.distributed.parallel_state import (
+            get_tp_group,
+            get_world_group,
+        )
+
+        # Same groups as the MoE dispatcher, so the domain topology is identical.
+        kernel.moe_comm_create_all_kunpeng(
+            _pg_helper.get_process_group_ptr(get_world_group().cpu_group),
+            _pg_helper.get_process_group_ptr(get_tp_group().cpu_group),
+        )
+        logger.info(
+            "[KunpengPPCommunicator] moe_comm_create_all_kunpeng done rank=%s "
+            "t=%.3f (+%.3fs)",
+            dist.get_rank(), time.perf_counter(), time.perf_counter() - t0,
+        )
+        self.init_pp_domain()
+        logger.info(
+            "[KunpengPPCommunicator] pp_init done rank=%s t=%.3f (+%.3fs)",
+            dist.get_rank(), time.perf_counter(), time.perf_counter() - t0,
+        )
+
+    # === tensor batch region ===
 
     def copy_to_buffer(self, tensor: torch.Tensor, offset: int = 0):
         """Copy tensor data into the PP buffer at the given offset."""
@@ -322,14 +350,86 @@ class KunpengPPCommunicator:
         kernel.pp_copy_from_buffer_kunpeng(tensor, offset)
 
     def send_batch(self, dst_rank: int, total_size: int):
-        """Single pp_put for all data already copied to the buffer."""
-        world_rank = self.pp_ranks[dst_rank]
-        kernel.pp_send_batch_kunpeng(world_rank, total_size)
+        """Single pp_put for the tensor data already copied to the buffer."""
+        kernel.pp_send_batch_kunpeng(dst_rank, total_size)
 
     def recv_batch(self, src_rank: int, total_size: int):
-        """Single pp_recv for all data expected in the buffer."""
-        world_rank = self.pp_ranks[src_rank]
-        kernel.pp_recv_batch_kunpeng(world_rank, total_size)
+        """Single pp_recv for the tensor data expected in the buffer."""
+        kernel.pp_recv_batch_kunpeng(src_rank, total_size)
+
+    # === unified message send ===
+
+    def send_pyobj(self, payload, dst_rank: int):
+        """Asynchronously send a python object to dst_rank (PP local rank)."""
+        self.pp_comm_init()
+        data = pickle.dumps(payload)
+        assert self._inflight[dst_rank] < PP_MSG_SLOTS, (
+            f"PP send_pyobj: {self._inflight[dst_rank]} inflight msgs to rank "
+            f"{dst_rank} exceed {PP_MSG_SLOTS} ring slots; acks not consumed in time"
+        )
+        # bytearray avoids frombuffer's non-writable-buffer warning.
+        kernel.pp_send_msg_kunpeng(
+            torch.frombuffer(bytearray(data), dtype=torch.uint8),
+            PP_KIND_PYOBJ,
+            dst_rank,
+        )
+        self._inflight[dst_rank] += 1
+
+    def send_tensor_message(self, metadata_list, tensor_list, dst_rank: int,
+                            all_gather_group=None, all_gather_size=1,
+                            all_gather_rank=0):
+        """Asynchronously send a tensor dict: metadata via message slot (TENSOR),
+        payloads staged in the batch region (second pp_put)."""
+        self.pp_comm_init()
+        meta = pickle.dumps(metadata_list)
+        assert self._inflight[dst_rank] < PP_MSG_SLOTS, (
+            f"PP send_tensor_message: {self._inflight[dst_rank]} inflight msgs "
+            f"to rank {dst_rank} exceed {PP_MSG_SLOTS} ring slots; acks not "
+            f"consumed in time"
+        )
+        kernel.pp_send_msg_kunpeng(
+            torch.frombuffer(bytearray(meta), dtype=torch.uint8),
+            PP_KIND_TENSOR,
+            dst_rank,
+        )
+        self._inflight[dst_rank] += 1
+
+        pp_offset = 0
+        for tensor in tensor_list:
+            if tensor.numel() == 0:
+                continue
+            if (
+                all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+            ):
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+            if not tensor.is_cpu:
+                raise RuntimeError("Kunpeng PP RDMA channel requires CPU tensors")
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            self.copy_to_buffer(tensor, pp_offset)
+            pp_offset += tensor.nbytes
+        # Always post the data imm (zero-length payloads are legal in IB).
+        self.send_batch(dst_rank, pp_offset)
+
+    # === unified message recv ===
+
+    def recv_message(self, src_rank: int):
+        """Receive the next message (1 imm) from src_rank.
+
+        Returns ``(kind, payload_bytes)``; a TENSOR message still needs recv_batch."""
+        self.pp_comm_init()
+        kind_t, payload_t = kernel.pp_recv_msg_kunpeng(src_rank)
+        return int(kind_t.item()), payload_t.numpy().tobytes()
+
+    # === ack / flow control ===
+
+    def inflight(self, dst_rank: int) -> int:
+        return self._inflight.get(dst_rank, 0)
+
+    def ack_received(self, dst_rank: int):
+        """Account one ack for `dst_rank` (an ACK message was consumed)."""
+        self._inflight[dst_rank] = max(self._inflight.get(dst_rank, 0) - 1, 0)
 
     def __del__(self):
         if hasattr(self, "buffer"):
