@@ -309,7 +309,7 @@ class SchedulerRuntimeCheckerMixin:
             protected = self.tree_cache.protected_size()
             session_held = self._session_held_tokens()
             total = self.max_total_num_tokens
-        return self._check_pool_invariant(
+        leak, msg = self._check_pool_invariant(
             "full",
             ps.full_available_size,
             ps.full_evictable_size,
@@ -318,6 +318,17 @@ class SchedulerRuntimeCheckerMixin:
             total,
             uncached,
         )
+        if leak:
+            allocator = getattr(self, "token_to_kv_pool_allocator", None)
+            if allocator is not None and getattr(allocator, "free_pages", None) is not None:
+                msg += (
+                    f" | allocator: size={allocator.size} "
+                    f"page_size={allocator.page_size} "
+                    f"free_pages.len={len(allocator.free_pages)} "
+                    f"release_pages.len={len(allocator.release_pages)} "
+                    f"num_pages={allocator.num_pages}"
+                )
+        return leak, msg
 
     def _check_swa_pool(
         self: Scheduler, ps: PoolStats, uncached: int = 0

@@ -20,6 +20,7 @@ Page-aligned memory pool.
 """
 
 import abc
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,6 +31,10 @@ from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+logger = logging.getLogger(__name__)
+
+_kv_pool_debug = get_bool_env_var("SGLANG_DEBUG_KV_POOL")
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -59,7 +64,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return ""
 
     def available_size(self):
-        return (len(self.free_pages) + len(self.release_pages)) * self.page_size
+        available = (len(self.free_pages) + len(self.release_pages)) * self.page_size
+        if _kv_pool_debug:
+            logger.info(
+                f"[KV_POOL] available_size "
+                f"free_pages={len(self.free_pages)} "
+                f"release_pages={len(self.release_pages)} "
+                f"page_size={self.page_size} "
+                f"available={available}"
+            )
+        return available
 
     def get_kvcache(self):
         return self._kvcache
@@ -492,6 +506,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        if _kv_pool_debug:
+            free_page_indices = torch.unique(free_index // self.page_size)
+            logger.info(
+                f"[KV_POOL] free numel={free_index.numel()} "
+                f"pages={free_page_indices.tolist()} "
+                f"free_before={len(self.free_pages)} "
+                f"release_before={len(self.release_pages)} "
+                f"in_free_group={not self.is_not_in_free_group}"
+            )
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
