@@ -239,6 +239,10 @@ void shm_allreduce_kunpeng(at::Tensor input);
 
 void shm_allreduce_min_int8_kunpeng(at::Tensor input, at::Tensor group_ranks);
 
+void shm_allreduce_min_int8_init_kunpeng(int64_t max_elements);
+
+void shm_allreduce_min_int8_finalize_kunpeng();
+
 void shm_allreduce_finalize_kunpeng();
 
 // SHM MLA Alltoall operators
@@ -632,9 +636,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("shm_allreduce_finalize_kunpeng() -> ()");
     m.impl("shm_allreduce_finalize_kunpeng", shm_allreduce_finalize_kunpeng);
 
-    // SHM Allreduce MIN_INT8 operator (lazy init, reuse existing finalize)
+    // SHM Allreduce MIN_INT8 operator (explicit init/finalize: SHM must be
+    // pre-allocated before graph capture claims the remaining pool bytes)
     m.def("shm_allreduce_min_int8_kunpeng(Tensor(a!) input, Tensor group_ranks) -> ()");
     m.impl("shm_allreduce_min_int8_kunpeng", shm_allreduce_min_int8_kunpeng);
+
+    m.def("shm_allreduce_min_int8_init_kunpeng(int max_elements) -> ()");
+    m.impl("shm_allreduce_min_int8_init_kunpeng", shm_allreduce_min_int8_init_kunpeng);
+
+    m.def("shm_allreduce_min_int8_finalize_kunpeng() -> ()");
+    m.impl("shm_allreduce_min_int8_finalize_kunpeng", shm_allreduce_min_int8_finalize_kunpeng);
 
     // SHM MLA Alltoall operators
     m.def(

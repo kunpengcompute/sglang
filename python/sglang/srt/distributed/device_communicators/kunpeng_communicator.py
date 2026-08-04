@@ -177,6 +177,11 @@ class KunpengCommunicator:
         kernel.shm_allgather_init_kunpeng()
         kernel.shm_allreduce_init_kunpeng(self.max_elements)
 
+        # Pre-allocate SHM buffer for uint8 MIN allreduce (used by PD-separated
+        # polling). Must run before graph capture claims the remaining SHM
+        # pool bytes, otherwise lazy allocation would fail at runtime.
+        kernel.shm_allreduce_min_int8_init_kunpeng(1024)
+
         # Initialize SHM MLA alltoall with DeepSeek V3 parameters.
         # qk_head_dim = 192 (128 nope + 64 rope), kv_lora_rank = 512,
         # num_heads = 128, num_local_heads = num_heads / comm_size.
@@ -259,6 +264,7 @@ class KunpengCommunicator:
         kernel.shm_reduce_scatter_finalize_kunpeng()
         kernel.shm_allgather_finalize_kunpeng()
         kernel.shm_allreduce_finalize_kunpeng()
+        kernel.shm_allreduce_min_int8_finalize_kunpeng()
         kernel.shm_pool_destroy_kunpeng()
 
 
