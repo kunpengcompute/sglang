@@ -213,6 +213,9 @@ def worker_all_reduce_min_int8_main() -> None:
     init_oob_comms(world_size)
     init_shm_pool(dist.group.WORLD)
 
+    kernel.shm_allreduce_min_int8_init_kunpeng(1024)
+    _rank_log(rank, "shm_allreduce_min_int8_init_kunpeng OK")
+
     dist.barrier()
 
     # ---- Test 1: full-group allreduce (all ranks) ---------------------------
@@ -268,6 +271,9 @@ def worker_all_reduce_min_int8_main() -> None:
     dist.barrier()
 
     _rank_log(rank, "all_reduce_min_int8: all tests passed")
+
+    kernel.shm_allreduce_min_int8_finalize_kunpeng()
+    _rank_log(rank, "shm_allreduce_min_int8_finalize_kunpeng OK")
 
     kernel.shm_pool_destroy_kunpeng()
     dist.destroy_process_group()

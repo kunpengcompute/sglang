@@ -318,6 +318,14 @@ class ModelRunnerOutput:
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
+    # Process-global graph pools shared across ModelRunner instances (e.g.
+    # multi-layer eagle runners in one process). The SHM/HBW bump allocators
+    # are process-global, so the first capture claims the remaining bytes and
+    # all runners must reuse the same pool tensors. Lazily created on first
+    # capture; never reset once created (SHM bytes cannot be reclaimed).
+    _graph_hbw_tensor = None
+    _graph_shm_tensor = None
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -1462,8 +1470,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 self.graph_fixed_weights = collect_model_weights(self.model)
                 self._sglang_graph_cache = OrderedDict()
-                self._graph_hbw_tensor = None
-                self._graph_shm_tensor = None
                 self._sglang_graph_max_cache = int(
                     os.environ.get("SGLANG_KUNPENG_GRAPH_CACHE_SIZE", "4")
                 )
@@ -3145,7 +3151,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs.get("pp_proxy_tensors") is not None
             and self.support_pp
         )
-        graph_cache_key = (forward_batch.forward_mode, total_tokens, is_pp_graph)
+        # Batch size must be part of the key: per-sequence ops (e.g.
+        # last_tokens, MTP pad/unpad) fix their output shape at capture, so two
+        # batches with equal total_tokens but different sequence counts must
+        # not share a graph.
+        graph_cache_key = (
+            forward_batch.forward_mode,
+            total_tokens,
+            forward_batch.batch_size,
+            is_pp_graph,
+        )
 
         if graph_cache_key not in self._sglang_graph_cache:
             while len(self._sglang_graph_cache) >= self._sglang_graph_max_cache:
@@ -3183,27 +3198,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 graph_outputs = [logits, hidden_states] if hidden_states is not None else [logits]
 
-            if self._graph_shm_tensor is None:
+            if ModelRunner._graph_shm_tensor is None:
                 remaining = torch.ops.sgl_kernel.shm_remaining_bytes_kunpeng()
                 if remaining > 0:
-                    self._graph_shm_tensor = torch.ops.sgl_kernel.create_shm_tensor_kunpeng(
+                    ModelRunner._graph_shm_tensor = torch.ops.sgl_kernel.create_shm_tensor_kunpeng(
                         torch.uint8, [remaining])
 
             if use_hbw and _is_kunpeng_hbw_pool:
-                if self._graph_hbw_tensor is None:
+                if ModelRunner._graph_hbw_tensor is None:
                     remaining = self.weight_hbw_pool.largest_free_bytes
-                    self._graph_hbw_tensor = self.weight_hbw_pool.alloc(
+                    ModelRunner._graph_hbw_tensor = self.weight_hbw_pool.alloc(
                         (remaining,), torch.uint8
                     )
                 graph = finalize(
                     [logits, hidden_states] if hidden_states is not None else [logits],
-                    external_pool=self._graph_hbw_tensor,
-                    external_shm_pool=self._graph_shm_tensor
+                    external_pool=ModelRunner._graph_hbw_tensor,
+                    external_shm_pool=ModelRunner._graph_shm_tensor
                 )
             else:
                 graph = finalize(
                     [logits, hidden_states] if hidden_states is not None else [logits],
-                    external_shm_pool=self._graph_shm_tensor
+                    external_shm_pool=ModelRunner._graph_shm_tensor
                 )
             graph.has_hidden_states = (not is_pp_output) and hidden_states is not None
 
@@ -3212,7 +3227,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._sglang_graph_cache[graph_cache_key] = (graph, is_pp_graph, is_pp_output)
             logger.info(
                 f"[graph] captured mode={forward_batch.forward_mode.name}, "
-                f"total_tokens={total_tokens}, pp={is_pp_graph}"
+                f"total_tokens={total_tokens}, batch_size={forward_batch.batch_size}, "
+                f"pp={is_pp_graph}"
             )
         else:
             self._sglang_graph_cache.move_to_end(graph_cache_key)

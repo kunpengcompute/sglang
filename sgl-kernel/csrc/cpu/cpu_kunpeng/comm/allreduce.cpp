@@ -46,6 +46,44 @@ static uint8_t *g_ar_min_int8_buffer = nullptr;
 static uint8_t **g_ar_min_int8_peer_buffers = nullptr;
 static size_t g_ar_min_int8_max_elements = 0;
 
+// ── shm_allreduce_min_int8 init ──────────────────────────────────────────
+// Pre-allocates the SHM buffer + peer pointers via KUPL address translation.
+// Must be called before the graph capture claims the remaining SHM pool bytes,
+// otherwise lazy allocation would fail with "Not enough shared memory".
+void shm_allreduce_min_int8_init_kunpeng(int64_t max_elements)
+{
+    TORCH_CHECK(is_shm_initialized(),
+                "shm_allreduce_min_int8_init_kunpeng called before shm_pool_create_kunpeng");
+
+    if (g_ar_min_int8_initialized) return;
+
+    TORCH_CHECK(max_elements > 0,
+                "shm_allreduce_min_int8_init_kunpeng: max_elements must be positive, got ",
+                max_elements);
+
+    g_ar_min_int8_rank = get_intra_node_rank();
+    g_ar_min_int8_size = get_intra_node_size();
+    g_ar_min_int8_max_elements = std::max(static_cast<size_t>(1024),
+                                          static_cast<size_t>(max_elements));
+
+    size_t slot_bytes = g_ar_min_int8_max_elements;
+    size_t total_bytes = static_cast<size_t>(g_ar_min_int8_size) * slot_bytes;
+    void *buf = alloc_shm_raw(total_bytes);
+    g_ar_min_int8_buffer = reinterpret_cast<uint8_t *>(buf);
+
+    // Build peer pointers via KUPL translation (same pattern as the original)
+    g_ar_min_int8_peer_buffers = new uint8_t *[g_ar_min_int8_size];
+    for (int i = 0; i < g_ar_min_int8_size; ++i) {
+        get_peer_shm_baseptr(i, g_ar_min_int8_buffer,
+                             reinterpret_cast<void **>(&g_ar_min_int8_peer_buffers[i]));
+    }
+
+    g_ar_min_int8_initialized = true;
+    std::cout << "[KuTACC] AllReduce min_int8 initialized, rank=" << g_ar_min_int8_rank
+              << ", size=" << g_ar_min_int8_size
+              << ", max_elements=" << g_ar_min_int8_max_elements << std::endl;
+}
+
 void shm_allreduce_init_kunpeng(int64_t max_num_elements)
 {
     TORCH_CHECK(is_shm_initialized(), "shm_allreduce_init_kunpeng called before shm_pool_create_kunpeng");
@@ -153,27 +191,9 @@ void shm_allreduce_min_int8_kunpeng(at::Tensor input, at::Tensor group_ranks)
     int64_t group_size = group_ranks.size(0);
     TORCH_CHECK(group_size >= 1, "shm_allreduce_min_int8_kunpeng: group must have at least 1 rank");
 
-    // Lazy init: allocate SHM buffer + pre-compute peer pointers via KUPL
-    // address translation (same pattern as the original).
-    if (!g_ar_min_int8_initialized) {
-        g_ar_min_int8_rank = get_intra_node_rank();
-        g_ar_min_int8_size = get_intra_node_size();
-        g_ar_min_int8_max_elements = std::max(static_cast<size_t>(1024), num_elements);
-
-        size_t slot_bytes = g_ar_min_int8_max_elements;
-        size_t total_bytes = static_cast<size_t>(g_ar_min_int8_size) * slot_bytes;
-        void *buf = alloc_shm_raw(total_bytes);
-        g_ar_min_int8_buffer = reinterpret_cast<uint8_t *>(buf);
-
-        // Build peer pointers via KUPL translation (same as original)
-        g_ar_min_int8_peer_buffers = new uint8_t *[g_ar_min_int8_size];
-        for (int i = 0; i < g_ar_min_int8_size; ++i) {
-            get_peer_shm_baseptr(i, g_ar_min_int8_buffer,
-                                 reinterpret_cast<void **>(&g_ar_min_int8_peer_buffers[i]));
-        }
-
-        g_ar_min_int8_initialized = true;
-    }
+    // Pre-allocated in shm_allreduce_min_int8_init_kunpeng (must be called first).
+    TORCH_CHECK(g_ar_min_int8_initialized,
+                "shm_allreduce_min_int8_kunpeng called before shm_allreduce_min_int8_init_kunpeng");
 
     TORCH_CHECK(
         num_elements <= g_ar_min_int8_max_elements,
@@ -224,6 +244,18 @@ void shm_allreduce_min_int8_kunpeng(at::Tensor input, at::Tensor group_ranks)
     }
 }
 
+void shm_allreduce_min_int8_finalize_kunpeng()
+{
+    // Cleanup uint8 min-allreduce (pre-allocated SHM buffer)
+    g_ar_min_int8_initialized = false;
+    delete[] g_ar_min_int8_peer_buffers;
+    g_ar_min_int8_peer_buffers = nullptr;
+    g_ar_min_int8_buffer = nullptr;
+    g_ar_min_int8_max_elements = 0;
+
+    std::cout << "[KuTACC] AllReduce min_int8 finalized" << std::endl;
+}
+
 void shm_allreduce_finalize_kunpeng()
 {
     // Cleanup bf16 sum-allreduce
@@ -233,12 +265,8 @@ void shm_allreduce_finalize_kunpeng()
     }
     g_ar_initialized = false;
 
-    // Cleanup uint8 min-allreduce (lazy-allocated buffer)
-    g_ar_min_int8_initialized = false;
-    delete[] g_ar_min_int8_peer_buffers;
-    g_ar_min_int8_peer_buffers = nullptr;
-    g_ar_min_int8_buffer = nullptr;
-    g_ar_min_int8_max_elements = 0;
+    // Cleanup uint8 min-allreduce (pre-allocated SHM buffer)
+    shm_allreduce_min_int8_finalize_kunpeng();
 
     std::cout << "[KuTACC] AllReduce finalized" << std::endl;
 }

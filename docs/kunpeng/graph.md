@@ -26,7 +26,7 @@ Kunpeng 计算图面向 920F 平台：对模型一次 forward 进行捕获（cap
 
 内存规划：按 `memory_type` 把入池 storage 分成 REGULAR/SHM 两组，各自独立做 interval packing（按 size 降序、同 size 按 id 升序，全序确定）。REGULAR 池可用外部池（如 HBW）或内部 `torch::empty`；SHM 池必须外部提供。确定性是正确性前提——no-copy 通信依赖所有 rank 对同一 storage 的池内 offset 完全一致。
 
-图按 `(forward_mode, total_tokens)` 为 key 做 LRU 缓存（默认容量 4），批大小变化会触发新捕获。decode/idle 模式的 REGULAR 张量可用 HBW 池，extend 不用。
+图按 `(forward_mode, total_tokens, batch_size, is_pp_graph)` 为 key 做 LRU 缓存（默认容量 4），批大小（序列数）变化会触发新捕获。batch_size 必须参与 key：`last_tokens`、MTP pad/unpad 等按序列数固定输出形状的算子要求同一张图的 batch 一致；is_pp_graph 区分 PP 代理张量是否作为图输入。decode/idle 模式的 REGULAR 张量可用 HBW 池，extend 不用。
 
 ## 开启与配置
 
