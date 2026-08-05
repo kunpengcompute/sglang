@@ -80,6 +80,7 @@ static std::vector<ScalarArg> _py_to_scalar_args(py::list src)
         if (PyBool_Check(item.ptr()))       out.push_back(item.cast<bool>());
         else if (PyLong_Check(item.ptr()))  out.push_back(item.cast<int64_t>());
         else if (PyFloat_Check(item.ptr())) out.push_back(item.cast<double>());
+        else if (PyUnicode_Check(item.ptr())) out.push_back(item.cast<std::string>());
         else throw std::runtime_error("scalar_args: unsupported type");
     }
     return out;

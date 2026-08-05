@@ -669,6 +669,18 @@ def _setup_copy_kunpeng():
     register_op('copy_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_print_hash_kunpeng():
+    def shape_infer(t, name=''):
+        return []
+
+    def eager_fn(t, name=''):
+        torch.ops.sgl_kernel.print_hash_kunpeng(t, name)
+        return None
+
+    register_op('print_hash', shape_infer, eager_fn)
+    register_op('print_hash_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_flash_attention_with_workspace_kunpeng():
     def shape_infer(q, k, v, workspace, extend_seq_lens,
                     causal, softmax_scale, chunked_prefill_size):
@@ -879,6 +891,7 @@ def setup():
     _setup_contiguous_kunpeng()
     _setup_set_kv_buffer_kunpeng()
     _setup_copy_kunpeng()
+    _setup_print_hash_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()
     _setup_flash_attention_with_workspace_kunpeng()
     _setup_pad_q_left_mtp_kunpeng()
