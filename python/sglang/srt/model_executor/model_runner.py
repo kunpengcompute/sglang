@@ -27,7 +27,7 @@ import socket
 import threading
 import time
 import uuid
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -99,7 +99,9 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
+from sglang.srt.hardware_backend.cpu_kunpeng.graph_runner.kunpeng_graph_runner import (
+    KunpengGraphRunner,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
@@ -185,10 +187,6 @@ from sglang.srt.utils import (
     is_cpu_920f,
     is_hip,
     is_host_cpu_arm64,
-    is_kunpeng_graph_capture,
-    is_kunpeng_graph_profile,
-    is_kunpeng_hbw_pool,
-    is_kunpeng_swap_expert,
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
@@ -223,10 +221,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_920f = is_cpu_920f()
-_is_kunpeng_hbw_pool = is_kunpeng_hbw_pool()
-_is_kunpeng_swap_expert = is_kunpeng_swap_expert()
-_is_kunpeng_graph_capture = is_kunpeng_graph_capture()
-_is_kunpeng_graph_profile = is_kunpeng_graph_profile()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -317,14 +311,6 @@ class ModelRunnerOutput:
 
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
-
-    # Process-global graph pools shared across ModelRunner instances (e.g.
-    # multi-layer eagle runners in one process). The SHM/HBW bump allocators
-    # are process-global, so the first capture claims the remaining bytes and
-    # all runners must reuse the same pool tensors. Lazily created on first
-    # capture; never reset once created (SHM bytes cannot be reclaimed).
-    _graph_hbw_tensor = None
-    _graph_shm_tensor = None
 
     def __init__(
         self,
@@ -626,12 +612,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
 
-        # init hbw pool
-        if _is_cpu_920f and _is_kunpeng_hbw_pool:
-            self.init_hbw_pool_kunpeng()
-
-        if _is_cpu_920f:
-            self.swap_mgr = KunpengSwapManager.get_instance()
+        # Init Kunpeng runner (hbw pool, swap manager, graph capture)
+        self.kunpeng_runner = KunpengGraphRunner.create(self)
 
         # Expert parallelism
         self.eplb_manager = (
@@ -760,47 +742,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init Kunpeng CPU swap HBM buffers (expert weights + KV cache).
         if _is_cpu_920f:
-
-            model = self.model.model  # DeepseekV2Model or DeepseekModelNextN
-
-            if self.swap_mgr.enable_swap_expert and (
-                hasattr(model, "decoder") or model._first_moe_layer_idx is not None
-            ):
-                if hasattr(model, "decoder"):
-                    # DeepseekModelNextN: single decoder layer with MoE
-                    experts = model.decoder.mlp.experts
-                else:
-                    # DeepseekV2Model: multiple layers
-                    experts = model.layers[model._first_moe_layer_idx].mlp.experts
-                self.swap_mgr.init_expert_buffer(
-                    hidden_size=experts.hidden_size,
-                    moe_intermediate_size=experts.intermediate_size_per_partition,
-                    num_experts=experts.num_local_experts,
-                    moe_expert_dtype=experts.w13_weight.dtype,
-                )
-
-            if self.swap_mgr.enable_swap_kv_in:
-                num_tokens_ddr = self.token_to_kv_pool.kv_buffer[0].shape[0]
-                head_num = self.token_to_kv_pool.kv_buffer[0].shape[1]
-                kv_cache_dim = self.token_to_kv_pool.kv_buffer[0].shape[2]
-                if self.swap_mgr.enable_swap_kv_blockwise:
-                    max_blocks = int(
-                        os.environ.get("SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS")
-                    )
-                    num_tokens = max_blocks * self.page_size
-                else:
-                    num_tokens = num_tokens_ddr
-
-                logger.info(
-                    f"num_tokens={num_tokens}, num_tokens_ddr={num_tokens_ddr}, head_num={head_num}, kv_cache_dim={kv_cache_dim}"
-                )
-
-                self.swap_mgr.init_kv_buffer(
-                    num_tokens=num_tokens,
-                    head_num=head_num,
-                    kv_cache_dim=kv_cache_dim,
-                    dtype=self.kv_cache_dtype,
-                )
+            self.kunpeng_runner.init_swap_buffers()
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -1454,27 +1396,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
-            if _is_cpu_920f and _is_kunpeng_hbw_pool:
-                if not self.is_draft_worker:
-                    for name, param in self.model.named_parameters():
-                        if "embed_tokens" in name:
-                            continue
-                        if "mlp.experts" in name:
-                            if _is_kunpeng_swap_expert:
-                                continue
-                        tensor_hbw = self.weight_hbw_pool.move_to_hbw(param)
-                        param.data = tensor_hbw
-
-            if _is_cpu_920f and _is_kunpeng_graph_capture:
-                from sglang.srt.graph.collect_weights import collect_model_weights
-
-                self.graph_fixed_weights = collect_model_weights(self.model)
-                self._sglang_graph_cache = OrderedDict()
-                self._sglang_graph_max_cache = int(
-                    os.environ.get("SGLANG_KUNPENG_GRAPH_CACHE_SIZE", "4")
-                )
-            else:
-                self.graph_fixed_weights = None
+            if _is_cpu_920f:
+                self.kunpeng_runner.init_after_model_load()
 
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
@@ -2372,24 +2295,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.attn_backend = self._get_attention_backend()
 
-    def init_hbw_pool_kunpeng(self):
-        """Initialize HBW memory pool for Kunpeng CPU backend."""
-        from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import (
-            KunpengHBWPool,
-        )
-
-        weights_pool_size_mb = int(
-            os.environ.get("SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB")
-        )
-        assert (
-            weights_pool_size_mb > 0
-        ), f"weights_pool_size_mb must be positive, got {weights_pool_size_mb}"
-        weights_pool_size_bytes = weights_pool_size_mb * 1024 * 1024
-        self.weight_hbw_pool = KunpengHBWPool.get_instance(
-            pool_size_bytes=weights_pool_size_bytes,
-            alignment=1024,
-        )
-
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
         draft_attn_backend = self.server_args.speculative_draft_attention_backend
@@ -2872,8 +2777,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cpu" and self.server_args.disable_cuda_graph:
             return
 
-        if self.device == "cpu" and not self.server_args.enable_torch_compile:
-            return
+        if self.device == "cpu":
+            if _is_cpu_920f:
+                pass
+            elif not self.server_args.enable_torch_compile:
+                return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -2892,6 +2800,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if current_platform.is_out_of_tree():
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.graph_runner = GraphRunnerCls(self)
+        elif _is_cpu_920f:
+            self.graph_runner = self.kunpeng_runner
         else:
             graph_runners = defaultdict(
                 lambda: CudaGraphRunner,
@@ -3075,255 +2985,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
-    def _build_graph_fixed_tensors(self, forward_batch):
-        fixed = self.graph_fixed_weights[:]
-        for kv in self.token_to_kv_pool.kv_buffer:
-            fixed.append(kv)
-        if self.is_draft_worker:
-            layer0 = self.model.model.decoder
-            fixed.extend(
-                [self.model.model.embed_tokens.weight, self.model.lm_head.weight]
-            )
-        else:
-            # cos_sin_cache shared across all layers (skip PPMissingLayer on non-first PP rank)
-            for _layer in self.model.model.layers:
-                if hasattr(_layer, 'self_attn') and _layer.self_attn.rotary_emb is not None:
-                    fixed.append(_layer.self_attn.rotary_emb.cos_sin_cache)
-                    break
-        if forward_batch.next_token_logits_buffer is not None:
-            fixed.append(forward_batch.next_token_logits_buffer)
-        # Expert HBM swap buffers (reused across layers, allocated once)
-        if self.swap_mgr.enable_swap_expert:
-            fixed.append(self.swap_mgr._expert_buffer_w13)
-            fixed.append(self.swap_mgr._expert_buffer_w2)
-            fixed.append(self.swap_mgr._expert_event_tensor)
-            fixed.append(self.swap_mgr._expert_event_num_tensor)
-        if self.swap_mgr.enable_swap_kv_in:
-            fixed.append(self.swap_mgr._cur_kv_hbm)
-            fixed.append(self.swap_mgr._kv_swap_in_event_tensor)
-            fixed.append(self.swap_mgr._kv_swap_in_event_num_tensor)
-        if self.swap_mgr.enable_swap_kv_out:
-            fixed.append(self.swap_mgr._kv_ddr_event_tensor)
-            fixed.append(self.swap_mgr._kv_ddr_event_num_tensor)
-        try:
-            from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
-                _KunpengDispatcherState,
-            )
-
-            state = _KunpengDispatcherState.get()
-            for attr in (
-                "parallel_policy",
-                "dispatch_call_count",
-                "dispatch_send_buf",
-                "dispatch_recv_buf",
-                "combine_send_buf",
-                "combine_recv_buf",
-                "recv_token_ids_buf",
-                "recv_experts_offset",
-                "combined_x",
-                "topk_weights_buf",
-                "topk_ids_index_buf",
-            ):
-                t = getattr(state, attr, None)
-                if t is not None:
-                    fixed.append(t)
-        except Exception:
-            pass
-        return fixed
-
-    def _build_kunpeng_graph_inputs(
-        self, forward_batch: ForwardBatch, kwargs: dict
-    ) -> list:
-        """Build the graph inputs for the Kunpeng graph path.
-
-        The input set differs per forward mode; PP proxy tensors are appended
-        when pipeline parallelism is active, and None entries are filtered out.
-        """
-        forward_mode = forward_batch.forward_mode
-        meta = self.attn_backend.forward_metadata
-
-        if forward_mode.is_idle():
-            forward_batch.input_ids = torch.tensor([], dtype=torch.int64)
-            forward_batch.positions = torch.tensor([], dtype=torch.int64)
-            inputs = [forward_batch.input_ids, forward_batch.positions]
-        elif forward_mode.is_decode():
-            inputs = [
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch.num_token_non_padded,
-            ]
-            if meta is not None:
-                inputs.extend([meta.block_table, meta.seq_lens])
-            inputs.extend(
-                [forward_batch.out_cache_loc, self.attn_backend._decode_meta]
-            )
-        else:
-            inputs = [
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch.extend_seq_lens,
-                forward_batch.out_cache_loc,
-                forward_batch.num_token_non_padded,
-                self.attn_backend._decode_meta,
-            ]
-            if meta is not None:
-                inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
-
-        spec_info = getattr(forward_batch, "spec_info", None)
-        if self.is_draft_worker and spec_info is not None:
-            if forward_mode.is_idle():
-                spec_info.hidden_states = torch.tensor(
-                    [0, 7168], dtype=torch.bfloat16
-                )
-            if getattr(spec_info, "hidden_states", None) is not None:
-                inputs.append(spec_info.hidden_states)
-
-        # PP: proxy tensors consumed by this pipeline stage must be registered
-        # as graph inputs so the capture system can track them.
-        pp = kwargs.get("pp_proxy_tensors")
-        if self.support_pp and pp is not None:
-            inputs.extend([pp.tensors["hidden_states"], pp.tensors["residual"]])
-
-        return [item for item in inputs if item is not None]
-
-    def _kunpeng_graph_forward(
-        self,
-        forward_batch: ForwardBatch,
-        use_hbw: bool = False,
-        **kwargs,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        from sglang.srt.graph import capture, finalize
-
-        # Must be built first: the idle path empties input_ids/positions,
-        # which feeds total_tokens below.
-        inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
-
-        assert (
-            forward_batch.input_ids.dtype == torch.int64
-        ), f"graph input_ids must be int64, got {forward_batch.input_ids.dtype}"
-        total_tokens = forward_batch.input_ids.shape[0]
-        # Received proxy tensors must be registered as graph inputs so the
-        # capture system can track them (otherwise consuming graph ops fail).
-        is_pp_graph = (
-            kwargs.get("pp_proxy_tensors") is not None
-            and self.support_pp
-        )
-        # Batch size must be part of the key: per-sequence ops (e.g.
-        # last_tokens, MTP pad/unpad) fix their output shape at capture, so two
-        # batches with equal total_tokens but different sequence counts must
-        # not share a graph.
-        graph_cache_key = (
-            forward_batch.forward_mode,
-            total_tokens,
-            forward_batch.batch_size,
-            is_pp_graph,
-        )
-
-        if graph_cache_key not in self._sglang_graph_cache:
-            while len(self._sglang_graph_cache) >= self._sglang_graph_max_cache:
-                self._sglang_graph_cache.popitem(last=False)
-
-            fixed = self._build_graph_fixed_tensors(forward_batch)
-
-            with capture(inputs=inputs, fixed=fixed):
-                # pp_proxy_tensors must be passed to model.forward() even in
-                # non-decode modes (e.g. PP1 idle), otherwise the model's
-                # assert (pp_proxy_tensors is not None) will fail.
-                ret = self.model.forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
-                is_pp_output = isinstance(ret, PPProxyTensors)
-                if is_pp_output:
-                    hidden_states = ret.tensors["hidden_states"]
-                    residual = ret.tensors["residual"]
-                else:
-                    logits = ret.next_token_logits
-                    hidden_states = ret.hidden_states
-
-            if is_pp_output:
-                graph_outputs = [hidden_states, residual]
-            else:
-                graph_outputs = [logits, hidden_states] if hidden_states is not None else [logits]
-
-            if ModelRunner._graph_shm_tensor is None:
-                remaining = torch.ops.sgl_kernel.shm_remaining_bytes_kunpeng()
-                if remaining > 0:
-                    ModelRunner._graph_shm_tensor = torch.ops.sgl_kernel.create_shm_tensor_kunpeng(
-                        torch.uint8, [remaining])
-
-            if use_hbw and _is_kunpeng_hbw_pool:
-                if ModelRunner._graph_hbw_tensor is None:
-                    remaining = self.weight_hbw_pool.largest_free_bytes
-                    ModelRunner._graph_hbw_tensor = self.weight_hbw_pool.alloc(
-                        (remaining,), torch.uint8
-                    )
-                graph = finalize(
-                    [logits, hidden_states] if hidden_states is not None else [logits],
-                    external_pool=ModelRunner._graph_hbw_tensor,
-                    external_shm_pool=ModelRunner._graph_shm_tensor
-                )
-            else:
-                graph = finalize(
-                    [logits, hidden_states] if hidden_states is not None else [logits],
-                    external_shm_pool=ModelRunner._graph_shm_tensor
-                )
-            graph.has_hidden_states = (not is_pp_output) and hidden_states is not None
-
-            if _is_kunpeng_graph_profile:
-                graph.enable_profile(True)
-            self._sglang_graph_cache[graph_cache_key] = (graph, is_pp_graph, is_pp_output)
-            logger.info(
-                f"[graph] captured mode={forward_batch.forward_mode.name}, "
-                f"total_tokens={total_tokens}, batch_size={forward_batch.batch_size}, "
-                f"pp={is_pp_graph}"
-            )
-        else:
-            self._sglang_graph_cache.move_to_end(graph_cache_key)
-            graph, is_pp_graph, is_pp_output = self._sglang_graph_cache[graph_cache_key]
-
-        t0 = time.time()
-        # PP proxy tensors are already appended to inputs by the builder, so
-        # capture and replay share the same input list.
-        outputs = graph.run(inputs)
-        t1 = time.time()
-        logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
-
-        if _is_kunpeng_graph_profile:
-            from sglang.srt.graph.profile import write_profile
-
-            profile_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
-            path = os.path.join(profile_dir, f"sglang_graph_rank{self.tp_rank}.jsonl")
-            row = graph.get_profile_row()
-            op_names = graph.profile_op_names()
-            if forward_batch.forward_mode.is_idle():
-                graph_mode = "idle"
-            elif forward_batch.forward_mode.is_decode():
-                graph_mode = "decode"
-            else:
-                graph_mode = forward_batch.forward_mode.name
-            write_profile(
-                path,
-                row,
-                op_names,
-                {
-                    "forward_mode": graph_mode,
-                    "count": len(op_names),
-                    "total_tokens": total_tokens,
-                },
-            )
-
-        if is_pp_output:
-            hidden_states, residual = outputs
-            return PPProxyTensors({"hidden_states": hidden_states, "residual": residual})
-        if graph.has_hidden_states:
-            logits, hidden_states = outputs
-            return logits, hidden_states
-        logits, = outputs
-        return logits, None
-
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -3345,20 +3006,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-
-        # ── sglang graph capture/replay for Kunpeng decode ──
-        # TODO: sampler (model_runner.sample() in tp_worker.py) is outside
-        # the graph.  Move it into forward_decode to cover embed→sample.
-        if _is_cpu_920f and _is_kunpeng_graph_capture:
-            output = self._kunpeng_graph_forward(
-                forward_batch, use_hbw=True, **kwargs
-            )
-            if isinstance(output, PPProxyTensors):
-                return output
-            logits, hidden_states = output
-            return LogitsProcessorOutput(
-                next_token_logits=logits, hidden_states=hidden_states
-            )
 
         # Launch forward
         ctx = (
@@ -3428,21 +3075,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        # ── sglang graph capture/replay for Kunpeng extend ──
-        if _is_cpu_920f and _is_kunpeng_graph_capture:
-            output = self._kunpeng_graph_forward(
-                forward_batch, use_hbw=not self.is_draft_worker, **kwargs
-            )
-            if isinstance(output, PPProxyTensors):
-                return (output, True)
-            logits, hidden_states = output
-            return (
-                LogitsProcessorOutput(
-                    next_token_logits=logits, hidden_states=hidden_states
-                ),
-                can_run_graph,
-            )
-
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
             if self.device_timer
@@ -3474,18 +3106,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 residual = pp_proxy_tensors.tensors["residual"]
                 kwargs["pp_proxy_tensors"].tensors["hidden_states"] = torch.empty(1, dtype=hidden_states.dtype)[:0].view(hidden_states.shape)
                 kwargs["pp_proxy_tensors"].tensors["residual"] = torch.empty(1, dtype=residual.dtype)[:0].view(residual.shape)
-
-        # ── sglang graph capture/replay for Kunpeng idle ──
-        if _is_cpu_920f and _is_kunpeng_graph_capture:
-            output = self._kunpeng_graph_forward(
-                forward_batch, use_hbw=not self.is_draft_worker, **kwargs
-            )
-            if isinstance(output, PPProxyTensors):
-                return output
-            logits, hidden_states = output
-            return LogitsProcessorOutput(
-                next_token_logits=logits, hidden_states=hidden_states
-            )
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "idle"})
@@ -3617,6 +3237,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
+        if _is_cpu_920f:
+            can_run_graph = self.kunpeng_runner.is_graph_active()
 
         # Hisparse coordinator
         if (
@@ -3627,11 +3249,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Replay cuda graph if applicable
         if can_run_graph:
+            if _is_cpu_920f and forward_batch.global_num_tokens_cpu is not None:
+                # Kunpeng decode graph path must pad input_ids to a multiple of
+                # attn_tp_size (same as the eager path below), otherwise the
+                # MoE dispatch kernel reports a batchsize mismatch.
+                forward_batch.prepare_mlp_sync_batch(self)
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if (
+                _is_cpu_920f
+                and forward_batch.global_num_tokens_cpu is not None
+                and self.pp_group.is_last_rank
+            ):
+                # Restore forward_mode/batch_size and trim logits back to the
+                # real (unpadded) batch after graph replay.  Only the last PP
+                # rank returns a LogitsProcessorOutput; earlier PP ranks return
+                # PPProxyTensors which post_forward_mlp_sync_batch cannot touch.
+                forward_batch.post_forward_mlp_sync_batch(ret)
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
