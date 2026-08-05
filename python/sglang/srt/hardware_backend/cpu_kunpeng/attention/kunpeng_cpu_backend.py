@@ -492,7 +492,7 @@ class KunpengCpuBackend(AttentionBackend):
         cache_loc: torch.Tensor,
     ) -> torch.Tensor:
 
-        return KunpengSwapManager.get_instance().get_kv_cache()
+        return self.swap_mgr.get_kv_cache()
 
     def _forward_extend_kutacc(
         self,
@@ -649,6 +649,9 @@ class KunpengCpuBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=False,
     ):
+
+        self.swap_mgr.get_kv_cache()
+
         # MLA_KUNPENG with prefix — attn_mqa needs paged KV cache read.
         if (
             layer.tp_k_head_num == 1

@@ -416,6 +416,16 @@ class KunpengGraphRunner:
             inputs.extend(
                 [forward_batch.out_cache_loc, self.model_runner.attn_backend._decode_meta]
             )
+            if self.swap_mgr._blockwise_ddr_block_ids is not None:
+                # Block-wise swap: the block_table passed to the attention
+                # kernel is the remapped (HBM slot) version; the per-step
+                # DDR/HBW block ids and the remapped cache_loc (for writing
+                # new K/V into HBM) must be registered as graph inputs too.
+                # meta.block_table is at index 3 here.
+                inputs[3] = self.swap_mgr._blockwise_remapped_block_table
+                inputs.append(self.swap_mgr._blockwise_hbw_cache_loc)
+                inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
+                inputs.append(self.swap_mgr._blockwise_hbw_block_ids)
         else:
             inputs = [
                 forward_batch.input_ids,
@@ -427,6 +437,10 @@ class KunpengGraphRunner:
             ]
             if meta is not None:
                 inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
+            if self.swap_mgr._blockwise_ddr_block_ids is not None:
+                inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
+                inputs.append(self.swap_mgr._blockwise_hbw_block_ids)
+                inputs.append(self.swap_mgr._blockwise_hbw_cache_loc)
 
         spec_info = getattr(forward_batch, "spec_info", None)
         if self.model_runner.is_draft_worker and spec_info is not None:
