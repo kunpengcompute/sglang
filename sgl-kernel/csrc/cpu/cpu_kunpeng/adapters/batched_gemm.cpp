@@ -39,3 +39,8 @@ static KernelRegistrar _r_batched_gemm_woqs8(
     "batched_gemm_woqs8_allthreads_kunpeng",
     make_dispatch_v<decltype(&batched_gemm_woqs8_graph),
                     &batched_gemm_woqs8_graph>);
+
+static KernelRegistrar _r_batched_gemm_woqs8_inplace(
+    "batched_gemm_woqs8_allthreads_inplace_kunpeng",
+    make_dispatch_v<decltype(&batched_gemm_woqs8_graph),
+                    &batched_gemm_woqs8_graph>);

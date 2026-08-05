@@ -197,17 +197,22 @@ class DeepseekMLAKunpengForwardMixin:
         if self.q_lora_rank is not None:
             bs = attn_output.size(1)
             n = self.w_vc_int8.size(1)
+            B = attn_output.size(0)
 
             a_3d = attn_output.transpose(0, 1)
 
             rscale_3d = self.w_vc_scale.view(bs, n, 1)
 
             pa_3d = kunpeng.batched_gemm_pack_allthreads_kunpeng(a_3d)
-            c_tensor_3d = kunpeng.batched_gemm_woqs8_allthreads_kunpeng(
-                pa_3d, self.w_vc_int8_packed, rscale_3d, None)
 
-            attn_bmm_output = kunpeng.contiguous_kunpeng(
-                c_tensor_3d.transpose(0, 1)).reshape(
+            c_flat = kunpeng.alloc_buffer(B * bs * n * 2).view(
+                torch.bfloat16
+            ).view(B, bs * n)
+            c_3d_t = c_flat.view(B, bs, n).transpose(0, 1)
+            kunpeng.batched_gemm_woqs8_allthreads_inplace_kunpeng(
+                pa_3d, self.w_vc_int8_packed, rscale_3d, None, c_3d_t)
+
+            attn_bmm_output = c_flat.reshape(
                 -1, self.num_local_heads * self.v_head_dim
             )
         else:

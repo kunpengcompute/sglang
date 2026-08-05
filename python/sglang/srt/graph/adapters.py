@@ -98,6 +98,18 @@ def _setup_batched_gemm_woqs8_allthreads_kunpeng():
     register_op('batched_gemm_woqs8_allthreads_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_batched_gemm_woqs8_allthreads_inplace_kunpeng():
+    def shape_infer(act, weight, rscale, cscale, out):
+        return []
+
+    def eager_fn(act, weight, rscale, cscale, out):
+        torch.ops.sgl_kernel.batched_gemm_woqs8_allthreads_kunpeng(
+            act, weight, rscale, cscale, out)
+        return None
+
+    register_op('batched_gemm_woqs8_allthreads_inplace_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_rope_kunpeng():
     def shape_infer(positions, q, k, cos_sin_cache):
         return [(q.shape, q.dtype), (k.shape, k.dtype)]
@@ -854,6 +866,7 @@ def setup():
     _setup_quant_inplace_kunpeng()
     _setup_batched_gemm_pack_allthreads_kunpeng()
     _setup_batched_gemm_woqs8_allthreads_kunpeng()
+    _setup_batched_gemm_woqs8_allthreads_inplace_kunpeng()
     _setup_rope_kunpeng()
     _setup_s8_gemm_pack_kunpeng()
     _setup_alloc_buffer()
