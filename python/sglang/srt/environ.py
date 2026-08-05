@@ -577,6 +577,7 @@ class Envs:
     SGLANG_KUNPENG_MAX_SEQ_NUM = EnvInt(128)
     SGLANG_FORWARD_ASYNC = EnvBool(True)
     SGLANG_KUNPENG_ENABLE_SHM_FENCE = EnvBool(False)
+    SGLANG_KUNPENG_RDMA_BCAST = EnvBool(False)
 
 
 envs = Envs()

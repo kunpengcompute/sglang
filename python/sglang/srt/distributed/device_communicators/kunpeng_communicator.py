@@ -19,13 +19,14 @@ import torch
 import torch.distributed as dist
 import logging
 
-from typing import Optional
+from typing import Any, Dict, Optional
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.distributed.parallel_state import (
     create_custom_parallel_group,
     get_attn_tp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_cpu_920f
 from sgl_kernel import pg_helper
 from sglang.srt.graph import ops as kunpeng
 
@@ -434,3 +435,107 @@ class KunpengPPCommunicator:
     def __del__(self):
         if hasattr(self, "buffer"):
             kernel.pp_comm_finalize_kunpeng()
+
+
+class KunpengBroadcast:
+    """Kunpeng broadcast with a fixed-cap persistent buffer in the C++ comm layer.
+
+    Scheme: pickle -> [u64 size][u64 mode][payload] in the C++ buffer, then kunpeng
+    broadcast; over-cap raises a uniform RuntimeError (never mixes in gloo).
+    """
+
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        pg_ptr: int,
+        max_buf_bytes: int = 64 * 1024 * 1024,
+    ):
+        self.group = group
+        self.pg_ptr = pg_ptr
+        self.comm_size = group.size()
+        self.comm_rank = group.rank()
+        self.max_buf_bytes = max_buf_bytes
+        self._initialized = False
+
+    def _ensure_comm(self) -> bool:
+        """Create the per-group kurmcl comm + C++ buffer (one-time); False = defer to gloo."""
+        if self._initialized:
+            return True
+        try:
+            kernel.broadcast_kunpeng_create(self.pg_ptr, self.max_buf_bytes)
+        except Exception:
+            logger.debug(
+                "[KunpengBroadcast] kurmcl domain not ready, falling back to gloo",
+                exc_info=True,
+            )
+            return False
+        self._initialized = True
+        return True
+
+    def broadcast_pyobj(self, data, src: int = 0):
+        """Broadcast a pickle object from group-local rank `src` (no gloo; over-cap raises)."""
+        if not self._ensure_comm():
+            raise RuntimeError(
+                "[KunpengBroadcast] kurmcl domain not ready "
+                "(moe_comm_create_all_kunpeng)"
+            )
+
+        if self.comm_rank == src:
+            payload = pickle.dumps(data)
+            payload_t = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        else:
+            payload_t = torch.empty(0, dtype=torch.uint8)
+
+        recv = kernel.broadcast_kunpeng_pyobj(
+            payload_t, self.comm_rank, src, self.pg_ptr
+        )
+
+        if self.comm_rank != src:
+            if recv.numel() == 0:
+                data = []
+            else:
+                data = pickle.loads(bytes(recv.numpy().tobytes()))
+        return data
+
+
+_kunpeng_broadcast_registry: Dict[int, KunpengBroadcast] = {}
+_bcast_fallback_logged = False  # log the gloo fallback only once per process
+
+
+def get_kunpeng_broadcast(
+    group: dist.ProcessGroup,
+) -> Optional[KunpengBroadcast]:
+    """Get (or create) the kunpeng broadcast for `group`; None when disabled."""
+    if not (is_cpu_920f() and envs.SGLANG_KUNPENG_RDMA_BCAST.get()):
+        return None
+    if group is None or group.size() <= 1:
+        return None
+    pg_ptr = pg_helper.get_process_group_ptr(group)
+    bcast = _kunpeng_broadcast_registry.get(pg_ptr)
+    if bcast is None:
+        bcast = KunpengBroadcast(group, pg_ptr)
+        _kunpeng_broadcast_registry[pg_ptr] = bcast
+    return bcast
+
+
+def kunpeng_broadcast_pyobj(
+    data: Any, dist_group: dist.ProcessGroup, src: int
+) -> Optional[Any]:
+    """Try the kunpeng broadcast; return None when not applicable (caller falls back to gloo)."""
+    bcast = get_kunpeng_broadcast(dist_group)
+    if bcast is None:
+        return None
+    if not bcast._ensure_comm():
+        global _bcast_fallback_logged
+        if not _bcast_fallback_logged:
+            _bcast_fallback_logged = True
+            logger.info(
+                "[KunpengBroadcast] kurmcl domain not ready, fallback to gloo"
+            )
+        return None  # not ready yet: defer to gloo
+    try:
+        ranks = dist.get_process_group_ranks(dist_group)
+        src_in_group = ranks.index(src)
+    except ValueError:
+        return None
+    return bcast.broadcast_pyobj(data, src=src_in_group)

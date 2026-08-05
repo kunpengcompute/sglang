@@ -157,6 +157,12 @@ void pp_send_msg_kunpeng(at::Tensor payload, int64_t kind, int64_t dest_rank);
 
 std::vector<at::Tensor> pp_recv_msg_kunpeng(int64_t src_rank);
 
+void broadcast_kunpeng_create(int64_t pg_ptr, int64_t max_buf_bytes);
+
+at::Tensor broadcast_kunpeng_pyobj(at::Tensor payload, int64_t rank, int64_t root, int64_t pg_ptr);
+
+void broadcast_kunpeng_finalize();
+
 void rdma_allgather_full_init_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size);
 
 void rdma_allgather_full_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size);
@@ -514,6 +520,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("pp_recv_msg_kunpeng(int src_rank) -> Tensor[]");
     m.impl("pp_recv_msg_kunpeng", pp_recv_msg_kunpeng);
+
+    // kunpeng broadcast (fixed-cap persistent buffer owned by the comm layer)
+    m.def("broadcast_kunpeng_create(int pg_ptr, int max_buf_bytes) -> ()");
+    m.impl("broadcast_kunpeng_create", broadcast_kunpeng_create);
+
+    m.def("broadcast_kunpeng_pyobj(Tensor payload, int rank, int root, int pg_ptr) -> Tensor");
+    m.impl("broadcast_kunpeng_pyobj", broadcast_kunpeng_pyobj);
+
+    m.def("broadcast_kunpeng_finalize() -> ()");
+    m.impl("broadcast_kunpeng_finalize", broadcast_kunpeng_finalize);
 
     // RDMA full-mesh allgather (reuses the comm created by moe_comm_create_kunpeng)
     m.def("rdma_allgather_full_init_kunpeng(Tensor send_buf, int send_size, Tensor recv_buf, int recv_size) -> ()");
