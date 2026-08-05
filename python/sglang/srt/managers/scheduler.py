@@ -1679,14 +1679,18 @@ class Scheduler(
                 recv_reqs = None
         else:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-                dp_offset = self.attn_dp_rank * self.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.pp_rank - 1) * self.tp_size + dp_offset,
-                    self.pp_rank * self.tp_size + dp_offset,
-                )
+                if self.pp_group.kunpeng_pp_communicator is not None:
+                    # Unified RDMA channel: pyobj demux, acks auto-consumed.
+                    recv_reqs = self._pp_recv_message("pyobj")["data"]
+                else:
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    recv_reqs = point_to_point_pyobj(
+                        [],
+                        self.pp_rank * self.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        (self.pp_rank - 1) * self.tp_size + dp_offset,
+                        self.pp_rank * self.tp_size + dp_offset,
+                    )
             else:
                 recv_reqs = None
 

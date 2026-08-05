@@ -139,7 +139,7 @@ void moe_comm_barrier_kunpeng();
 void shm_fence_kunpeng(int64_t attn_tp_size);
 
 // PP P2P communication (implemented in comm/pp_comm.cpp)
-void pp_comm_init_kunpeng(at::Tensor buffer, int64_t process_group_ptr);
+void pp_comm_init_kunpeng(at::Tensor buffer, int64_t process_group_ptr, at::Tensor pp_ranks);
 
 void pp_comm_finalize_kunpeng();
 
@@ -151,6 +151,17 @@ void pp_copy_from_buffer_kunpeng(at::Tensor tensor, int64_t offset);
 void pp_send_batch_kunpeng(int64_t dest_rank, int64_t total_size);
 
 void pp_recv_batch_kunpeng(int64_t src_rank, int64_t total_size);
+
+// Unified PP message channel (pyobj / tensor metadata / ack), see comm/pp_comm.cpp
+void pp_send_msg_kunpeng(at::Tensor payload, int64_t kind, int64_t dest_rank);
+
+std::vector<at::Tensor> pp_recv_msg_kunpeng(int64_t src_rank);
+
+void broadcast_kunpeng_create(int64_t pg_ptr, int64_t max_buf_bytes);
+
+at::Tensor broadcast_kunpeng_pyobj(at::Tensor payload, int64_t rank, int64_t root, int64_t pg_ptr);
+
+void broadcast_kunpeng_finalize();
 
 void rdma_allgather_full_init_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size);
 
@@ -484,13 +495,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("shm_fence_kunpeng", shm_fence_kunpeng);
 
     // PP P2P communication operators
-    m.def("pp_comm_init_kunpeng(Tensor buffer, int process_group_ptr) -> ()");
+    m.def("pp_comm_init_kunpeng(Tensor buffer, int process_group_ptr, Tensor pp_ranks) -> ()");
     m.impl("pp_comm_init_kunpeng", pp_comm_init_kunpeng);
 
     m.def("pp_comm_finalize_kunpeng() -> ()");
     m.impl("pp_comm_finalize_kunpeng", pp_comm_finalize_kunpeng);
 
-    // Batch mode PP communication
+    // Batch mode PP communication (tensor batch region)
     m.def("pp_copy_to_buffer_kunpeng(Tensor tensor, int offset) -> ()");
     m.impl("pp_copy_to_buffer_kunpeng", pp_copy_to_buffer_kunpeng);
 
@@ -502,6 +513,23 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("pp_recv_batch_kunpeng(int src_rank, int total_size) -> ()");
     m.impl("pp_recv_batch_kunpeng", pp_recv_batch_kunpeng);
+
+    // Unified PP message channel (pyobj / tensor metadata / ack)
+    m.def("pp_send_msg_kunpeng(Tensor payload, int kind, int dest_rank) -> ()");
+    m.impl("pp_send_msg_kunpeng", pp_send_msg_kunpeng);
+
+    m.def("pp_recv_msg_kunpeng(int src_rank) -> Tensor[]");
+    m.impl("pp_recv_msg_kunpeng", pp_recv_msg_kunpeng);
+
+    // kunpeng broadcast (fixed-cap persistent buffer owned by the comm layer)
+    m.def("broadcast_kunpeng_create(int pg_ptr, int max_buf_bytes) -> ()");
+    m.impl("broadcast_kunpeng_create", broadcast_kunpeng_create);
+
+    m.def("broadcast_kunpeng_pyobj(Tensor payload, int rank, int root, int pg_ptr) -> Tensor");
+    m.impl("broadcast_kunpeng_pyobj", broadcast_kunpeng_pyobj);
+
+    m.def("broadcast_kunpeng_finalize() -> ()");
+    m.impl("broadcast_kunpeng_finalize", broadcast_kunpeng_finalize);
 
     // RDMA full-mesh allgather (reuses the comm created by moe_comm_create_kunpeng)
     m.def("rdma_allgather_full_init_kunpeng(Tensor send_buf, int send_size, Tensor recv_buf, int recv_size) -> ()");

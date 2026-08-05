@@ -170,6 +170,7 @@ export SGLANG_USE_CPU_ENGINE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_WARMUP_TIMEOUT=1600
+export PYTHONWARNINGS="ignore::FutureWarning"
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
@@ -179,6 +180,7 @@ export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
 export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=0
 export SGLANG_KUNPENG_RDMA_ALLGATHER=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
+export SGLANG_KUNPENG_RDMA_BCAST=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_ENABLE_MTP=0
 # Kunpeng SHM pool
 export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476

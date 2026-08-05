@@ -1318,6 +1318,17 @@ def broadcast_pyobj(
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
     """
+    # kunpeng fast path: only when enabled (SGLANG_KUNPENG_RDMA_BCAST=1);
+    # otherwise fall through to Gloo.
+    if envs.SGLANG_KUNPENG_RDMA_BCAST.get():
+        from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
+            kunpeng_broadcast_pyobj,
+        )
+
+        ret = kunpeng_broadcast_pyobj(data, dist_group, src)
+        if ret is not None:
+            return ret
+
     device = torch.device(
         "cuda"
         if torch.cuda.is_available() and not force_cpu_device

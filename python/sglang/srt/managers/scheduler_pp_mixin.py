@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import pickle
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -863,10 +864,38 @@ class SchedulerPPMixin:
         return send_release_work, release_rids
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
+        if self.pp_group.kunpeng_pp_communicator is not None:
+            # RDMA path: the send is an async single-sided write; "commit"
+            # means waiting for the peer's acks so the ring slots are free.
+            self._pp_wait_acks()
+            work.clear()
+            return
         for p2p_work in work:
             if p2p_work.work is not None:
                 p2p_work.work.wait()
         work.clear()
+
+    def _pp_wait_acks(self: Scheduler) -> None:
+        """Wait until every posted message has been acked by its peer.
+
+        ACK messages come back from the downstream peer(s) on the same FIFO
+        as their data messages; while waiting we consume those messages and
+        stash them in the inbox for later demux.
+        """
+        comm = self.pp_group.kunpeng_pp_communicator
+        if comm is None:
+            return
+        all_gather_group = (
+            self.attn_tp_group if self.require_attn_tp_allgather else None
+        )
+        while True:
+            dsts = [d for d in range(comm.comm_size) if comm.inflight(d) > 0]
+            if not dsts:
+                return
+            msg = self._pp_consume_message(dsts[0], all_gather_group)
+            if msg is None:
+                continue  # ACK: inflight already decremented
+            self._pp_tensor_dict_inbox.setdefault(msg["kind"], deque()).append(msg)
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
@@ -896,27 +925,37 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
-            p2p_work = point_to_point_pyobj(
-                data,
-                self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.cpu_group,
-                self.pp_rank * self.tp_size + dp_offset,
-                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
-                async_send=async_send,
-            )
+            if self.pp_group.kunpeng_pp_communicator is not None:
+                # Unified RDMA message (async single-sided write); the peer
+                # acks on receive and the commit waits for the ack.
+                self.pp_group.kunpeng_pp_communicator.send_pyobj(
+                    data, (self.pp_rank + 1) % self.pp_size
+                )
+            else:
+                dp_offset = self.attn_dp_rank * self.attn_tp_size
+                p2p_work = point_to_point_pyobj(
+                    data,
+                    self.pp_rank * self.tp_size + dp_offset,
+                    self.world_group.cpu_group,
+                    self.pp_rank * self.tp_size + dp_offset,
+                    ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                    async_send=async_send,
+                )
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
-            data = point_to_point_pyobj(
-                [],
-                self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.cpu_group,
-                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
-                self.pp_rank * self.tp_size + dp_offset,
-            )
+            if self.pp_group.kunpeng_pp_communicator is not None:
+                data = self._pp_recv_message("pyobj")["data"]
+            else:
+                dp_offset = self.attn_dp_rank * self.attn_tp_size
+                data = point_to_point_pyobj(
+                    [],
+                    self.pp_rank * self.tp_size + dp_offset,
+                    self.world_group.cpu_group,
+                    ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
+                    self.pp_rank * self.tp_size + dp_offset,
+                )
         else:
             data = None
 
@@ -988,6 +1027,14 @@ class SchedulerPPMixin:
         If a message of the wrong kind is received, it's stashed in the queue
         and we continue receiving until we get the expected kind.
         """
+        if self.pp_group.kunpeng_pp_communicator is not None:
+            # Unified RDMA channel: recv_message consumes exactly one message
+            # (1 imm) per call and materializes it before stashing.
+            return self._pp_recv_message(expected_kind, all_gather_group)[
+                "tensor_dict"
+            ]
+
+        # Gloo fallback
         if expected_kind in self._pp_tensor_dict_inbox:
             inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
             if inbox_queue:
@@ -1010,6 +1057,103 @@ class SchedulerPPMixin:
                     f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
+
+    def _pp_consume_message(
+        self: Scheduler, src: int, all_gather_group: Optional = None
+    ) -> Optional[Dict[str, Any]]:
+        """Consume one FIFO message from `src` (kunpeng RDMA path).
+
+        Returns None if the message was an ACK (inflight already accounted),
+        otherwise a message dict: pyobj -> {"kind": "pyobj", "data": ...};
+        tensor -> {"kind": msg_type, "tensor_dict": {...}}.
+        """
+        from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
+            PP_KIND_PYOBJ,
+            PP_KIND_TENSOR,
+            PP_KIND_ACK,
+        )
+
+        comm = self.pp_group.kunpeng_pp_communicator
+        kind, payload = comm.recv_message(src)
+        if kind == PP_KIND_ACK:
+            comm.ack_received(src)
+            return None
+        if kind == PP_KIND_PYOBJ:
+            return {"kind": "pyobj", "data": pickle.loads(payload)}
+
+        # TENSOR: the metadata pickle already landed in the ring slot; wait for
+        # the data imm (sent right after the metadata imm in FIFO order) and
+        # rebuild the tensor dict from the batch region.
+        from sglang.srt.distributed.parallel_state import TensorMetadata
+
+        recv_metadata_list = pickle.loads(payload)
+        all_gather_size = (
+            1 if all_gather_group is None else all_gather_group.world_size
+        )
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+        comm.recv_batch(src, 0)
+        tensor_dict: Dict[str, Any] = {}
+        pp_offset = 0
+        for key, value in recv_metadata_list:
+            if not isinstance(value, TensorMetadata):
+                tensor_dict[key] = value
+                continue
+            tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+            if tensor.numel() == 0:
+                tensor_dict[key] = tensor
+                continue
+            use_all_gather = (
+                all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+            )
+            if use_all_gather:
+                orig_shape = tensor.shape
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+            else:
+                orig_shape = None
+            if not tensor.is_cpu:
+                raise RuntimeError("Kunpeng PP RDMA channel requires CPU tensors")
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            comm.copy_from_buffer(tensor, pp_offset)
+            pp_offset += tensor.nbytes
+            if use_all_gather:
+                tensor = all_gather_group.all_gather(tensor, dim=0)
+                tensor = tensor.reshape(orig_shape)
+            tensor_dict[key] = tensor
+        msg_type = tensor_dict.get("__msg_type__", "default")
+        return {"kind": msg_type, "tensor_dict": tensor_dict}
+
+    def _pp_recv_message(
+        self: Scheduler,
+        expected_kind: str,
+        all_gather_group: Optional = None,
+    ) -> Dict[str, Any]:
+        """Receive the next message of the expected kind over the unified RDMA
+        channel, stashing any other kind that arrives first (demux by kind).
+        """
+        if expected_kind in self._pp_tensor_dict_inbox:
+            inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
+            if inbox_queue:
+                return inbox_queue.popleft()
+
+        if all_gather_group is None:
+            all_gather_group = (
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            )
+        src = (self.pp_rank - 1) % self.pp_size
+        while True:
+            msg = self._pp_consume_message(src, all_gather_group)
+            if msg is None:
+                continue  # ACK consumed
+            if msg["kind"] == expected_kind:
+                return msg
+            logger.debug(
+                f"PP recv: expected {expected_kind}, got {msg['kind']}, stashing"
+            )
+            self._pp_tensor_dict_inbox.setdefault(msg["kind"], deque()).append(msg)
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
