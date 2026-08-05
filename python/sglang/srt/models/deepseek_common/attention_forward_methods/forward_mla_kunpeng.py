@@ -98,18 +98,11 @@ class DeepseekMLAKunpengForwardMixin:
         k_combined = kunpeng.cat_kunpeng(k_nope, k_pe, -1)  # (B, 1, D_kv+D_rope)
 
         if self.swap_mgr.enable_swap_kv_in:
-            # Block-wise (decode): out_cache_loc is remapped to HBM flat
-            # positions; k_combined must be sliced to this rank's Btp tokens
-            # to match (Btp == B when all2all is disabled).
-            if self.swap_mgr._blockwise_ddr_block_ids is not None:
-                cache_loc = self.swap_mgr._blockwise_hbw_cache_loc
-                cache_k = k_combined[
-                    self.swap_mgr._blockwise_token_slice_start : self.swap_mgr._blockwise_token_slice_start
-                    + cache_loc.shape[0]
-                ]
-            else:
-                cache_loc = forward_batch.out_cache_loc
-                cache_k = k_combined
+            # Block-wise (decode): the swap manager remaps out_cache_loc to
+            # HBM flat positions and slices k_combined to this rank's Btp
+            # tokens. Otherwise both are returned unchanged.
+            cache_loc = self.swap_mgr.get_cache_loc(forward_batch)
+            cache_k = self.swap_mgr.get_cache_k(k_combined, forward_batch)
             self.swap_mgr.set_kv_buffer(self.swap_mgr._cur_kv_hbm, cache_loc, cache_k)
 
             # DDR write keeps the original (un-remapped) out_cache_loc.
