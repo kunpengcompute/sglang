@@ -199,6 +199,74 @@ void kupl_sdma_set_kv_buffer(at::Tensor kv_buffer, at::Tensor loc, at::Tensor ca
     event_num_tensor.data_ptr<int>()[0] = next_slot;
 }
 
+void kupl_sdma_set_kv_buffer_2(at::Tensor kv_buffer, at::Tensor loc, at::Tensor k_nope, at::Tensor k_pe,
+                               at::Tensor event_tensor, at::Tensor event_num_tensor)
+{
+    TORCH_CHECK(kv_buffer.dim() == 2, "kv_buffer must be 2D");
+    TORCH_CHECK(loc.dim() == 1, "loc must be 1D");
+    TORCH_CHECK(k_nope.dim() == 2, "k_nope must be 2D");
+    TORCH_CHECK(k_pe.dim() == 2, "k_pe must be 2D");
+    TORCH_CHECK(k_nope.size(0) == loc.size(0) && k_pe.size(0) == loc.size(0),
+                "k_nope/k_pe and loc token count mismatch");
+    TORCH_CHECK(k_nope.size(1) + k_pe.size(1) == kv_buffer.size(1),
+                "k_nope dim-1 + k_pe dim-1 must match kv_buffer dim-1");
+    TORCH_CHECK(kv_buffer.stride(1) == 1 && k_nope.stride(1) == 1 && k_pe.stride(1) == 1,
+                "kv_buffer, k_nope and k_pe must have contiguous dim-1 (stride==1)");
+
+    int64_t kdim_n = k_nope.size(1);
+    int64_t kdim_p = k_pe.size(1);
+    int64_t tokens = loc.size(0);
+    if (tokens == 0) return;
+
+    int64_t elem_sz = kv_buffer.element_size();
+    int64_t dst_stride = kv_buffer.stride(0) * elem_sz;
+    int64_t nope_stride = k_nope.stride(0) * elem_sz;
+    int64_t pe_stride = k_pe.stride(0) * elem_sz;
+    int64_t nope_bytes = kdim_n * elem_sz;
+    int64_t pe_bytes = kdim_p * elem_sz;
+
+    uint8_t *buf = static_cast<uint8_t *>(kv_buffer.data_ptr());
+    uint8_t *nope = static_cast<uint8_t *>(k_nope.data_ptr());
+    uint8_t *pe = static_cast<uint8_t *>(k_pe.data_ptr());
+
+    int event_count = event_num_tensor.item<int>();
+    int next_slot = event_count;
+    int *event_ptr = event_tensor.data_ptr<int>();
+
+    if (loc.scalar_type() == at::kInt) {
+        int32_t *idx = loc.data_ptr<int32_t>();
+        for (int64_t i = 0; i < tokens; i++) {
+            uint8_t *dst = buf + static_cast<int64_t>(idx[i]) * dst_stride;
+            int event_id = utils::kupl_get_free_event_id();
+            utils::kupl_sdma_async(event_id, dst, nope + i * nope_stride,
+                                   static_cast<int>(nope_bytes), 0);
+            event_ptr[next_slot] = event_id;
+            next_slot++;
+            event_id = utils::kupl_get_free_event_id();
+            utils::kupl_sdma_async(event_id, dst + nope_bytes, pe + i * pe_stride,
+                                   static_cast<int>(pe_bytes), 0);
+            event_ptr[next_slot] = event_id;
+            next_slot++;
+        }
+    } else {
+        int64_t *idx = loc.data_ptr<int64_t>();
+        for (int64_t i = 0; i < tokens; i++) {
+            uint8_t *dst = buf + idx[i] * dst_stride;
+            int event_id = utils::kupl_get_free_event_id();
+            utils::kupl_sdma_async(event_id, dst, nope + i * nope_stride,
+                                   static_cast<int>(nope_bytes), 0);
+            event_ptr[next_slot] = event_id;
+            next_slot++;
+            event_id = utils::kupl_get_free_event_id();
+            utils::kupl_sdma_async(event_id, dst + nope_bytes, pe + i * pe_stride,
+                                   static_cast<int>(pe_bytes), 0);
+            event_ptr[next_slot] = event_id;
+            next_slot++;
+        }
+    }
+    event_num_tensor.data_ptr<int>()[0] = next_slot;
+}
+
 void kupl_sdma_kv_swapin(at::Tensor dst, at::Tensor src, at::Tensor event_tensor, at::Tensor event_num_tensor,
                          int64_t total_bytes)
 {
@@ -316,6 +384,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "kupl_sdma_set_kv_buffer(Tensor kv_buffer, Tensor loc, Tensor cache_k, "
         "Tensor(a!) event_tensor, Tensor(b!) event_num_tensor) -> ()");
     m.impl("kupl_sdma_set_kv_buffer", kupl_sdma_set_kv_buffer);
+
+    m.def(
+        "kupl_sdma_set_kv_buffer_2(Tensor kv_buffer, Tensor loc, "
+        "Tensor k_nope, Tensor k_pe, "
+        "Tensor(a!) event_tensor, Tensor(b!) event_num_tensor) -> ()");
+    m.impl("kupl_sdma_set_kv_buffer_2", kupl_sdma_set_kv_buffer_2);
 }
 
 // ==========================================================================
@@ -338,3 +412,6 @@ static KernelRegistrar _r_sdma_kv_block_swapin(
 
 static KernelRegistrar _r_sdma_set_kv_buffer(
     "kupl_sdma_set_kv_buffer", make_dispatch_v<decltype(&kupl_sdma_set_kv_buffer), &kupl_sdma_set_kv_buffer>);
+
+static KernelRegistrar _r_sdma_set_kv_buffer_2(
+    "kupl_sdma_set_kv_buffer_2", make_dispatch_v<decltype(&kupl_sdma_set_kv_buffer_2), &kupl_sdma_set_kv_buffer_2>);

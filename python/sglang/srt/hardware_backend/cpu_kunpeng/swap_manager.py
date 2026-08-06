@@ -525,6 +525,43 @@ class KunpengSwapManager:
             cache_k.reshape(-1, kdim),
         )
 
+    def set_kv_buffer_2(
+        self,
+        target_kv_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> None:
+        """Scatter-write computed K (two halves) into the current KV cache.
+
+        Same as :meth:`set_kv_buffer` but takes the nope/rope halves
+        separately, avoiding the k_combined assembly copy.
+        Routes through the graph-compatible ``set_kv_buffer_2_kunpeng`` op.
+        """
+        kunpeng.set_kv_buffer_2_kunpeng(
+            target_kv_buffer.squeeze(1),
+            loc,
+            k_nope.reshape(-1, k_nope.shape[-1]),
+            k_pe.reshape(-1, k_pe.shape[-1]),
+        )
+
+    def set_kv_buffer_2_sdma(self, loc: torch.Tensor, k_nope: torch.Tensor, k_pe: torch.Tensor) -> None:
+        """Scatter-write computed K (two halves) into DDR KV cache via SDMA.
+
+        Same as :meth:`set_kv_buffer_sdma` but takes the nope/rope halves
+        separately, avoiding the k_combined assembly copy.
+        Routes through the graph-compatible ``kupl_sdma_set_kv_buffer_2`` op.
+        Pending DDR write events are drained via :meth:`wait_kv_ddr`.
+        """
+        kunpeng.kupl_sdma_set_kv_buffer_2(
+            self._cur_kv_ddr.squeeze(1),
+            loc,
+            k_nope.reshape(-1, k_nope.shape[-1]),
+            k_pe.reshape(-1, k_pe.shape[-1]),
+            self._kv_ddr_event_tensor,
+            self._kv_ddr_event_num_tensor,
+        )
+
     def set_kv_buffer_sdma(self, loc: torch.Tensor, cache_k: torch.Tensor) -> None:
         """Scatter-write computed K into DDR KV cache via kupl_sdma_set_kv_buffer.
 

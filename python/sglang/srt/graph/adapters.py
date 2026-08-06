@@ -124,6 +124,18 @@ def _setup_rope_kunpeng():
     register_op('rope_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_rope_inplace_kunpeng():
+    def shape_infer(position_ids, q, k, q_out, k_out, cos_sin_cache):
+        return []
+
+    def eager_fn(position_ids, q, k, q_out, k_out, cos_sin_cache):
+        torch.ops.sgl_kernel.rope_kunpeng(
+            position_ids, q, k, q_out, k_out, cos_sin_cache)
+        return None
+
+    register_op('rope_inplace_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_s8_gemm_pack_kunpeng():
     def shape_infer(input, split_r, split_c):
         return [(input.shape, input.dtype)]
@@ -670,6 +682,30 @@ def _setup_set_kv_buffer_kunpeng():
     register_op('set_kv_buffer_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_set_kv_buffer_2_kunpeng():
+    def shape_infer(kv_buffer, loc, k_nope, k_pe):
+        return []
+
+    def eager_fn(kv_buffer, loc, k_nope, k_pe):
+        torch.ops.sgl_kernel.set_kv_buffer_2_kunpeng(
+            kv_buffer, loc, k_nope, k_pe)
+        return None
+
+    register_op('set_kv_buffer_2_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_kupl_sdma_set_kv_buffer_2():
+    def shape_infer(kv_buffer, loc, k_nope, k_pe, event_tensor, event_num_tensor):
+        return []
+
+    def eager_fn(kv_buffer, loc, k_nope, k_pe, event_tensor, event_num_tensor):
+        torch.ops.sgl_kernel.kupl_sdma_set_kv_buffer_2(
+            kv_buffer, loc, k_nope, k_pe, event_tensor, event_num_tensor)
+        return None
+
+    register_op('kupl_sdma_set_kv_buffer_2', shape_infer, eager_fn)
+
+
 def _setup_copy_kunpeng():
     def shape_infer(dst, src):
         return []
@@ -868,6 +904,7 @@ def setup():
     _setup_batched_gemm_woqs8_allthreads_kunpeng()
     _setup_batched_gemm_woqs8_allthreads_inplace_kunpeng()
     _setup_rope_kunpeng()
+    _setup_rope_inplace_kunpeng()
     _setup_s8_gemm_pack_kunpeng()
     _setup_alloc_buffer()
     _setup_zero_()
@@ -903,6 +940,8 @@ def setup():
     _setup_cat_kunpeng()
     _setup_contiguous_kunpeng()
     _setup_set_kv_buffer_kunpeng()
+    _setup_set_kv_buffer_2_kunpeng()
+    _setup_kupl_sdma_set_kv_buffer_2()
     _setup_copy_kunpeng()
     _setup_print_hash_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()

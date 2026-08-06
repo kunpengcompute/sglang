@@ -548,7 +548,7 @@ class KunpengCpuBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         meta = self.forward_metadata
-        q_heads = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_heads = q.view(-1, layer.tp_q_head_num, q.shape[-1])
         bs = meta.seq_lens.shape[0]
         max_ext_len = self.speculative_num_draft_tokens
 
@@ -558,7 +558,7 @@ class KunpengCpuBackend(AttentionBackend):
             )
         else:
             q_padded = q_heads.view(
-                bs, max_ext_len, layer.tp_q_head_num, layer.qk_head_dim
+                bs, max_ext_len, layer.tp_q_head_num, q_heads.shape[-1]
             )
 
         kv_buf = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
@@ -686,14 +686,15 @@ class KunpengCpuBackend(AttentionBackend):
         save_kv_cache: bool = False,
     ):
 
-        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        q_head_dim = q.shape[-1]
+        q = q.reshape(-1, layer.tp_q_head_num * q_head_dim)
 
         if layer.is_cross_attention:
             cache_loc = forward_batch.encoder_out_cache_loc
         else:
             cache_loc = forward_batch.out_cache_loc
 
-        q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_ = q.view(-1, layer.tp_q_head_num, q_head_dim)
 
         kv_k = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
         softmax_scale = (

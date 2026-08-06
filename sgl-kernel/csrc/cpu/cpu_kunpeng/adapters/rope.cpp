@@ -36,3 +36,16 @@ static void rope_graph(at::Tensor position_ids, at::Tensor q, at::Tensor k,
 static KernelRegistrar _r_rope(
     "rope_kunpeng",
     make_dispatch_v<decltype(&rope_graph), &rope_graph>);
+
+// In-place variant: q_out/k_out are caller-provided (recorded as inputs, no
+// outputs). Arg order follows the Python adapter: [pos, q, k, q_out, k_out, cos].
+static void rope_graph_inplace(at::Tensor position_ids, at::Tensor q, at::Tensor k,
+                               at::Tensor q_out, at::Tensor k_out,
+                               at::Tensor cos_sin_cache)
+{
+    rope_kunpeng(position_ids, q, k, q_out, k_out, cos_sin_cache);
+}
+
+static KernelRegistrar _r_rope_inplace(
+    "rope_inplace_kunpeng",
+    make_dispatch_v<decltype(&rope_graph_inplace), &rope_graph_inplace>);
