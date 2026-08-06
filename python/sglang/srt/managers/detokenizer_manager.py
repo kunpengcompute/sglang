@@ -433,7 +433,9 @@ def run_detokenizer_process(
             else:
                 # TODO (kunpeng): hard code here, should use a more elegant way.
                 p.cpu_affinity({96})  # 20
-                logger.info(os.sched_getaffinity(os.getpid()))
+                logger.info(
+                    f"Set Detokenizer affinity to {os.sched_getaffinity(os.getpid())}"
+                )
 
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")

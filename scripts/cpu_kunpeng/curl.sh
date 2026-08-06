@@ -54,6 +54,7 @@ DP_ENABLED=false
 DP_RANK=0
 CONCURRENCY=64
 PROMPT_FILE="prompts/128.txt"
+ROUND_ROBIN=false
 
 while getopts "d:hipsvn:m:c:f:" opt; do
   case $opt in
@@ -190,7 +191,13 @@ if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ]; then
       \"prompt\": $PROMPT_JSON,
       \"stream\": $STREAM,
       \"max_tokens\": $MAX_TOKENS,
-      \"temperature\": 0$DP_LINE
+      \"temperature\": 0$DP_LINE"
+
+  if [ "$STREAM" = true ]; then
+    BODY+=",\"stream_options\":{\"include_usage\":true}"
+  fi
+
+  BODY+="
     }"
 
   BODY_FILE=$(mktemp)
@@ -202,21 +209,28 @@ if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ]; then
         -H "Content-Type: application/json" \
         -d @"$BODY_FILE" | tee "$STREAM_FILE"
 
-      # Count streamed chunks: every "data:" line except the trailing [DONE].
-      CHUNK_COUNT=$(grep -c "^data:" "$STREAM_FILE")
-      DONE_COUNT=$(grep -c "\[DONE\]" "$STREAM_FILE")
-      CHUNK_COUNT=$((CHUNK_COUNT - DONE_COUNT))
+      # Extract actual token count from usage block (authoritative with MTP).
+      USAGE_RAW=$(grep -o '"usage":{[^}]*}' "$STREAM_FILE" | tail -n1)
+      COMP_TOKENS=$(echo "$USAGE_RAW" | grep -o '"completion_tokens":[0-9]*' | head -n1 | cut -d':' -f2)
+
+      # Count chunks that carry actual content. The completions endpoint puts
+      # the generated text in a "text" field; usage-only chunks have empty
+      # choices and no "text" field. Counting "text" occurrences avoids
+      # miscounting when continuous_usage_stats embeds usage in every chunk.
+      CHUNK_COUNT=$(grep -c '"text":' "$STREAM_FILE")
 
       rm -f "$STREAM_FILE"
 
       if [ "$CHUNK_COUNT" -gt 0 ]; then
-          RATE=$(awk -v m="$MAX_TOKENS" -v c="$CHUNK_COUNT" \
-              'BEGIN { printf "%.2f", m / c }')
+          TOKEN_COUNT="${COMP_TOKENS:-$MAX_TOKENS}"
+          RATE=$(awk -v n="$TOKEN_COUNT" -v c="$CHUNK_COUNT" \
+              'BEGIN { if (c>0) printf "%.2f", n / c; else print "0" }')
           echo "" >&2
           echo "===================================" >&2
-          echo "Receive rate: $RATE tokens/chunk" >&2
-          echo "  max_tokens: $MAX_TOKENS" >&2
-          echo "  chunks:     $CHUNK_COUNT" >&2
+          echo "Tokens: $TOKEN_COUNT | Chunks: $CHUNK_COUNT | Rate: $RATE" >&2
+          if [[ ! -z "$USAGE_RAW" ]]; then
+            echo "Usage: $USAGE_RAW" >&2
+          fi
           echo "===================================" >&2
       fi
   else
@@ -257,7 +271,13 @@ if [ "$ROUND_ROBIN" = true ]; then
         \"stream\": $STREAM,
         \"max_tokens\": $MAX_TOKENS,
         \"temperature\": 0,
-        \"routed_dp_rank\": $rank
+        \"routed_dp_rank\": $rank"
+
+    if [ "$STREAM" = true ]; then
+      body+=",\"stream_options\":{\"include_usage\":true}"
+    fi
+
+    body+="
       }"
 
     local body_file
@@ -283,12 +303,19 @@ if [ "$ROUND_ROBIN" = true ]; then
     echo "$start_ts $end_ts" > "$RESULT_DIR/time_${idx}"
 
     if [ "$STREAM" = true ]; then
-      local chunks done_count
+      local usage_raw comp_tokens chunks done_count
+      usage_raw=$(grep -o '"usage":{[^}]*}' "$resp_file" 2>/dev/null | tail -n1)
+      comp_tokens=$(echo "$usage_raw" | grep -o '"completion_tokens":[0-9]*' | head -n1 | cut -d':' -f2)
       chunks=$(grep -c "^data:" "$resp_file" 2>/dev/null || true)
       chunks="${chunks:-0}"
       done_count=$(grep -c "\[DONE\]" "$resp_file" 2>/dev/null || true)
       done_count="${done_count:-0}"
-      echo $((chunks - done_count)) > "$RESULT_DIR/tokens_${idx}"
+      # Prefer actual token count from usage; fall back to chunk count
+      if [[ ! -z "$comp_tokens" ]]; then
+        echo "$comp_tokens" > "$RESULT_DIR/tokens_${idx}"
+      else
+        echo $((chunks - done_count)) > "$RESULT_DIR/tokens_${idx}"
+      fi
     else
       local tokens
       tokens=$(grep -oP '"completion_tokens":\s*\K\d+' "$resp_file" 2>/dev/null | head -1)
@@ -440,6 +467,14 @@ if [ "$INTERACTIVE" = true ]; then
     MAX_TOKENS=1024
   fi
 
+  # In interactive mode, -d only supports a single rank. If a range is
+  # provided, pick the first rank to avoid emitting invalid JSON.
+  if [ "$DP_ENABLED" = true ] && [[ "$DP_RANK" =~ [-,] ]]; then
+    FIRST_RANK=$(parse_ranks "$DP_RANK" | tr ' ' '\n' | head -n1)
+    echo "Warning: interactive mode uses a single DP rank; using rank $FIRST_RANK (from '$DP_RANK')" >&2
+    DP_RANK="$FIRST_RANK"
+  fi
+
   echo "--- AI chat mode (Ctrl+C to exit) ---"
   echo "  URL: $CHAT_URL"
   echo "  Model: deepseek-v3, Max tokens: $MAX_TOKENS, Stream: true"
@@ -484,14 +519,32 @@ if [ "$INTERACTIVE" = true ]; then
       DP_LINE=",\"routed_dp_rank\":$DP_RANK"
     fi
 
-    BODY="{\"model\":\"DeepSeek-R1\",\"messages\":$MESSAGES,\"stream\":true,\"max_tokens\":$MAX_TOKENS,\"temperature\":0$DP_LINE}"
+    BODY="{"
+    BODY+="\"model\":\"DeepSeek-R1\","
+    BODY+="\"messages\":$MESSAGES,"
+    BODY+="\"stream\":true,"
+    BODY+="\"max_tokens\":$MAX_TOKENS,"
+    BODY+="\"temperature\":0"
+    BODY+="$DP_LINE"
+    BODY+=",\"stream_options\":{\"include_usage\":true}"
+    BODY+="}"
 
     BODY_FILE=$(mktemp)
     printf '%s' "$BODY" > "$BODY_FILE"
 
+    # Build curl header args; X-Data-Parallel-Rank has higher priority than
+    # the body field and survives proxy/router hops.
+    CURL_HEADERS=(-H "Content-Type: application/json")
+    if [ "$DP_ENABLED" = true ]; then
+      CURL_HEADERS+=(-H "X-Data-Parallel-Rank: $DP_RANK")
+    fi
+
     TURN_START=$(date +%s.%N)
     FIRST_TOKEN_TS=""
+    CHUNK_COUNT=0
     TOKEN_COUNT=0
+    USAGE_COMP_TOKENS=""
+    USAGE_RAW=""
     FULL_RESPONSE=""
     while read -r line; do
       CONTENT=$(echo "$line" | grep -o '"content":"[^"]*"' | cut -d'"' -f4)
@@ -501,12 +554,29 @@ if [ "$INTERACTIVE" = true ]; then
         fi
         printf "%b" "$CONTENT"
         FULL_RESPONSE+="$CONTENT"
-        TOKEN_COUNT=$((TOKEN_COUNT + 1))
+        CHUNK_COUNT=$((CHUNK_COUNT + 1))
+      fi
+      # Capture the usage block emitted in the final chunk when
+      # stream_options.include_usage is set.
+      USAGE_OBJ=$(echo "$line" | grep -o '"usage":{[^}]*}')
+      if [[ ! -z "$USAGE_OBJ" ]]; then
+        USAGE_RAW="$USAGE_OBJ"
+        COMP=$(echo "$USAGE_OBJ" | grep -o '"completion_tokens":[0-9]*' | head -n1 | cut -d':' -f2)
+        if [[ ! -z "$COMP" ]]; then
+          USAGE_COMP_TOKENS="$COMP"
+        fi
       fi
     done < <(curl --noproxy "*" -N -s -X POST "$CHAT_URL" \
-      -H "Content-Type: application/json" \
+      "${CURL_HEADERS[@]}" \
       -d @"$BODY_FILE")
     TURN_END=$(date +%s.%N)
+
+    # Prefer the real token count from usage when the server provided it
+    if [[ ! -z "$USAGE_COMP_TOKENS" ]]; then
+      TOKEN_COUNT="$USAGE_COMP_TOKENS"
+    else
+      TOKEN_COUNT="$CHUNK_COUNT"
+    fi
 
     rm -f "$BODY_FILE"
 
@@ -521,8 +591,12 @@ if [ "$INTERACTIVE" = true ]; then
       TTFT=$(awk -v s="$TURN_START" -v f="$FIRST_TOKEN_TS" 'BEGIN { printf "%.3f", f - s }')
       TOTAL=$(awk -v s="$TURN_START" -v e="$TURN_END" 'BEGIN { printf "%.3f", e - s }')
       TPOT=$(awk -v n="$TOKEN_COUNT" -v tt="$TTFT" -v total="$TOTAL" 'BEGIN { dn=n-1; if (dn>0) printf "%.1f", (total-tt)/dn*1000; else print "0" }')
+      RATE=$(awk -v n="$TOKEN_COUNT" -v c="$CHUNK_COUNT" 'BEGIN { if (c>0) printf "%.2f", n / c; else print "0" }')
       echo -e "\n---------------------------------------"
-      echo "TTFT: ${TTFT}s | Tokens: $TOKEN_COUNT | Total: ${TOTAL}s | TPOT: ${TPOT} ms/tok"
+      echo "TTFT: ${TTFT}s | Tokens: $TOKEN_COUNT | Chunks: $CHUNK_COUNT | Rate: $RATE | Total: ${TOTAL}s | TPOT: ${TPOT} ms/tok"
+      if [[ ! -z "$USAGE_RAW" ]]; then
+        echo "Usage: $USAGE_RAW"
+      fi
     else
       echo -e "\n---------------------------------------"
       echo "(no response)"
