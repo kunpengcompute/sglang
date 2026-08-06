@@ -254,6 +254,27 @@ def _setup_grouped_topk_kunpeng():
     register_op('grouped_topk_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_grouped_topk_inplace_kunpeng():
+    def shape_infer(router_logits, token_weights_out, token_ids_out, bias,
+                    topk, num_expert_group, topk_group,
+                    renormalize, scoring_func_sigmoid, moe_balance, v2):
+        return []
+
+    def eager_fn(router_logits, token_weights_out, token_ids_out, bias,
+                 topk, num_expert_group, topk_group,
+                 renormalize, scoring_func_sigmoid, moe_balance, v2):
+        torch.ops.sgl_kernel.grouped_topk_kunpeng(
+            router_logits, token_weights_out, token_ids_out,
+            topk, num_expert_group, topk_group,
+            bias=bias, experts_offset=None,
+            renormalize=bool(renormalize),
+            scoring_func_sigmoid=bool(scoring_func_sigmoid),
+            moe_balance=bool(moe_balance), v2=v2)
+        return None
+
+    register_op('grouped_topk_inplace_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_load_balance_padded_tokens_kunpeng():
     def shape_infer(topk_ids, topk_weights, num_token_non_padded, num_experts, topk):
         return []
@@ -913,6 +934,7 @@ def setup():
     _setup_bf16_gemm_pack_kunpeng()
     _setup_bf16_packed_gemm_kunpeng()
     _setup_grouped_topk_kunpeng()
+    _setup_grouped_topk_inplace_kunpeng()
     _setup_load_balance_padded_tokens_kunpeng()
     _setup_multinomial_kunpeng()
     _setup_shm_batched_allgather_kunpeng()

@@ -527,9 +527,6 @@ class KunpengDispatcher(BaseDispatcher):
         t_total_start = time.perf_counter()
 
         state = self._state
-        topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids
-        topk = topk_ids.shape[1]
         batch_size = hidden_states.shape[0]
         num_tokens = batch_size // self.attn_tp_size
 
@@ -552,10 +549,6 @@ class KunpengDispatcher(BaseDispatcher):
         kunpeng.quant_inplace_kunpeng(
             hidden_states[_tp_offset : _tp_offset + _tp_count], norm_int8, norm_scale
         )
-
-        if _tp_count > 0:
-            kunpeng.copy_kunpeng(state.topk_ids_index_buf[:batch_size, 0::2], topk_ids)
-            kunpeng.copy_kunpeng(state.topk_weights_buf[:batch_size], topk_weights)
 
         t_quant_and_copy_end = time.perf_counter()
 
