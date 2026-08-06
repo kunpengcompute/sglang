@@ -1649,7 +1649,7 @@ class KunpengStateLoader(BaseModelLoader):
         )
         for lid in range(metadata.num_layers):
             sample = metadata.physical_to_logical_map[lid, :8].tolist()
-            logger.info("  layer %d physical_to_logical[:8] = %s", lid, sample)
+            logger.debug("  layer %d physical_to_logical[:8] = %s", lid, sample)
         # ---------------------------
 
         experts_base = os.path.join(model_config.model_path, "experts")

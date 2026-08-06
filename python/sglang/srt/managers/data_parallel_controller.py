@@ -683,7 +683,9 @@ def run_data_parallel_controller_process(
             _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
             _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
             p.cpu_affinity({58 + 304 * _node_rank_in_node})  # 20
-            logger.info(os.sched_getaffinity(os.getpid()))
+            logger.info(
+                f"Set DataParallelController affinity to {os.sched_getaffinity(os.getpid())}"
+            )
 
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()

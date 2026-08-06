@@ -20,9 +20,11 @@ from collections import defaultdict
 def compute_stats(durs, num_runs):
     durs.sort()
     total_us = sum(durs)
-    assert len(durs) % num_runs == 0
+    # With MTP, the number of occurrences of an op per run may vary,
+    # so len(durs) is not guaranteed to be divisible by num_runs.
+    # Report the average count per run instead.
     return {
-        "count": len(durs) // num_runs,
+        "count": len(durs) / num_runs,
         "min_us": durs[0],
         "max_us": durs[-1],
         "avg_us": total_us / len(durs),
@@ -85,7 +87,7 @@ def to_csv(input_path, output_path):
             for name in op_order.get(mode_name, []):
                 s = stats[name]
                 f.write(
-                    f"{name},{s['count']},{s['min_us']:.1f},{s['max_us']:.1f},"
+                    f"{name},{s['count']:.1f},{s['min_us']:.1f},{s['max_us']:.1f},"
                     f"{s['avg_us']:.1f},{s['total_ms']:.3f},{s['percent']:.1f}%\n"
                 )
                 total_ms += s["total_ms"]

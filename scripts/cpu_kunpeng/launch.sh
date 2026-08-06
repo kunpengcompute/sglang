@@ -122,7 +122,7 @@ WORLD_SIZE=${#NODES[@]}
 
 if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" && "$ROLE" != "router" ]]; then
     echo "Update binary sglang..."
-    bash ./pyinstall/updata.sh
+    bash ./pyinstall/update.sh
 fi
 
 echo "Launching $ROLE on $WORLD_SIZE node(s)"
