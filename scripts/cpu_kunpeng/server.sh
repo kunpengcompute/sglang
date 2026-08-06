@@ -63,6 +63,9 @@ BASE_ARGS=(
     --enable-dp-attention-local-control-broadcast
     --quantization w8a8_int8
     ${LOAD_FORMAT:+--load-format "$LOAD_FORMAT"}
+    --chat-template  "$SGLANG_PATH/examples/chat_template/tool_chat_template_deepseekr1.jinja"
+    --tool-call-parser deepseekv3
+    --reasoning-parser deepseek-r1
 )
 
 if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
