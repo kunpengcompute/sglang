@@ -40,6 +40,11 @@ void mul_scalar_add_kunpeng(at::Tensor input, at::Tensor out, double alpha);
 
 void set_kv_buffer_kunpeng(at::Tensor kv_buffer, at::Tensor loc, at::Tensor cache_k);
 
+void set_kv_buffer_2_kunpeng(at::Tensor kv_buffer, at::Tensor loc, at::Tensor k_nope, at::Tensor k_pe);
+
+void kupl_sdma_set_kv_buffer_2(at::Tensor kv_buffer, at::Tensor loc, at::Tensor k_nope, at::Tensor k_pe,
+                               at::Tensor event_tensor, at::Tensor event_num_tensor);
+
 void copy_kunpeng(at::Tensor dst, at::Tensor src);
 
 void s8_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c, int64_t ldc,
@@ -725,6 +730,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     // set_kv_buffer (MLA KV cache write)
     m.def("set_kv_buffer_kunpeng(Tensor(a!) kv_buffer, Tensor loc, Tensor cache_k) -> ()");
     m.impl("set_kv_buffer_kunpeng", set_kv_buffer_kunpeng);
+
+    m.def("set_kv_buffer_2_kunpeng(Tensor(a!) kv_buffer, Tensor loc, Tensor k_nope, Tensor k_pe) -> ()");
+    m.impl("set_kv_buffer_2_kunpeng", set_kv_buffer_2_kunpeng);
 
     // copy (tensor copy for graph tracking)
     m.def("copy_kunpeng(Tensor(a!) dst, Tensor src) -> ()");

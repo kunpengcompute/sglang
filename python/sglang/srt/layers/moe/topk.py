@@ -664,6 +664,37 @@ def grouped_topk_cpu(
     )
 
 
+def _get_kunpeng_topk_buffers(batch_size: int, topk: int):
+    """Return SHM-backed topk output views for the Kunpeng RDMA dispatcher.
+
+    When the KunpengMoE dispatcher is active, the router writes topk results
+    directly into its persistent SHM buffers (topk_ids_index_buf /
+    topk_weights_buf), eliminating the two copy_kunpeng calls in
+    KunpengDispatcher.dispatch_send.  The ids view is strided (even columns
+    of the interleaved [max_tokens, 2*topk] buffer; odd columns hold the
+    per-expert token index written by the kutacc dispatch kernel).
+
+    Returns ``(topk_weights_out, topk_ids_out)`` or ``(None, None)`` when
+    the dispatcher is not initialized, in which case callers fall back to
+    allocating fresh tensors.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+        _KunpengDispatcherState,
+    )
+
+    state = _KunpengDispatcherState.get()
+    ids_buf = state.topk_ids_index_buf
+    w_buf = state.topk_weights_buf
+    if ids_buf is None or w_buf is None:
+        return None, None
+    if batch_size > ids_buf.shape[0] or ids_buf.shape[1] // 2 != topk:
+        raise ValueError(
+            f"Kunpeng topk buffer mismatch: batch={batch_size} > {ids_buf.shape[0]} "
+            f"or topk={topk} != {ids_buf.shape[1] // 2}"
+        )
+    return w_buf[:batch_size], ids_buf[:batch_size, 0::2]
+
+
 def grouped_topk_kunpeng(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -677,9 +708,20 @@ def grouped_topk_kunpeng(
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    token_weights, token_ids = kunpeng.grouped_topk_kunpeng(
-        gating_output, None, topk, num_expert_group, topk_group,
-        bool(renormalize), False, False, 0)
+    topk_weights_out, topk_ids_out = _get_kunpeng_topk_buffers(
+        hidden_states.shape[0], topk
+    )
+    if topk_ids_out is not None:
+        kunpeng.grouped_topk_inplace_kunpeng(
+            gating_output, topk_weights_out, topk_ids_out, None, topk,
+            num_expert_group, topk_group,
+            bool(renormalize), False, False, 0)
+        token_weights = topk_weights_out
+        token_ids = topk_ids_out
+    else:
+        token_weights, token_ids = kunpeng.grouped_topk_kunpeng(
+            gating_output, None, topk, num_expert_group, topk_group,
+            bool(renormalize), False, False, 0)
 
     topk_weights = token_weights
     topk_ids = token_ids
@@ -703,7 +745,7 @@ def grouped_topk_kunpeng(
             if num_fused_shared_experts == 0
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights /= topk_weights_sum
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -1125,9 +1167,20 @@ def biased_grouped_topk_kunpeng(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    token_weights, token_ids = kunpeng.grouped_topk_kunpeng(
-        gating_output, correction_bias, topk, num_expert_group, topk_group,
-        renormalize, True, False, 0)
+    topk_weights_out, topk_ids_out = _get_kunpeng_topk_buffers(
+        hidden_states.shape[0], topk
+    )
+    if topk_ids_out is not None:
+        kunpeng.grouped_topk_inplace_kunpeng(
+            gating_output, topk_weights_out, topk_ids_out, correction_bias,
+            topk, num_expert_group, topk_group,
+            renormalize, True, False, 0)
+        token_weights = topk_weights_out
+        token_ids = topk_ids_out
+    else:
+        token_weights, token_ids = kunpeng.grouped_topk_kunpeng(
+            gating_output, correction_bias, topk, num_expert_group, topk_group,
+            renormalize, True, False, 0)
 
     topk_weights = token_weights
     topk_ids = token_ids

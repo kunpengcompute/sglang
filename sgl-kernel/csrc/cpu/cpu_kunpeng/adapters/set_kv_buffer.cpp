@@ -62,3 +62,54 @@ static KernelRegistrar _r_set_kv_buffer(
     "set_kv_buffer_kunpeng",
     make_dispatch_v<decltype(&set_kv_buffer_kunpeng),
                     &set_kv_buffer_kunpeng>);
+
+void set_kv_buffer_2_kunpeng(at::Tensor kv_buffer, at::Tensor loc,
+                             at::Tensor k_nope, at::Tensor k_pe)
+{
+    TORCH_CHECK(kv_buffer.dim() == 2, "kv_buffer must be 2D");
+    TORCH_CHECK(loc.dim() == 1, "loc must be 1D");
+    TORCH_CHECK(k_nope.dim() == 2, "k_nope must be 2D");
+    TORCH_CHECK(k_pe.dim() == 2, "k_pe must be 2D");
+    TORCH_CHECK(k_nope.size(0) == loc.size(0) && k_pe.size(0) == loc.size(0),
+                "k_nope/k_pe and loc token count mismatch");
+    TORCH_CHECK(k_nope.size(1) + k_pe.size(1) == kv_buffer.size(1),
+                "k_nope dim-1 + k_pe dim-1 must match kv_buffer dim-1");
+    TORCH_CHECK(kv_buffer.stride(1) == 1 && k_nope.stride(1) == 1 &&
+                    k_pe.stride(1) == 1,
+                "kv_buffer, k_nope and k_pe must have contiguous dim-1 (stride==1)");
+
+    int64_t kdim_n = k_nope.size(1);
+    int64_t kdim_p = k_pe.size(1);
+    int64_t tokens = loc.size(0);
+    int64_t elem_sz = kv_buffer.element_size();
+    int64_t buf_stride_bytes = kv_buffer.stride(0) * elem_sz;
+    int64_t nope_stride_bytes = k_nope.stride(0) * elem_sz;
+    int64_t pe_stride_bytes = k_pe.stride(0) * elem_sz;
+    int64_t nope_bytes = kdim_n * elem_sz;
+    int64_t pe_bytes = kdim_p * elem_sz;
+
+    uint8_t* buf = static_cast<uint8_t*>(kv_buffer.data_ptr());
+    uint8_t* nope = static_cast<uint8_t*>(k_nope.data_ptr());
+    uint8_t* pe = static_cast<uint8_t*>(k_pe.data_ptr());
+
+    if (loc.scalar_type() == at::kInt) {
+        int32_t* idx = loc.data_ptr<int32_t>();
+        for (int64_t i = 0; i < tokens; i++) {
+            uint8_t* dst = buf + idx[i] * buf_stride_bytes;
+            std::memcpy(dst, nope + i * nope_stride_bytes, nope_bytes);
+            std::memcpy(dst + nope_bytes, pe + i * pe_stride_bytes, pe_bytes);
+        }
+    } else {
+        int64_t* idx = loc.data_ptr<int64_t>();
+        for (int64_t i = 0; i < tokens; i++) {
+            uint8_t* dst = buf + idx[i] * buf_stride_bytes;
+            std::memcpy(dst, nope + i * nope_stride_bytes, nope_bytes);
+            std::memcpy(dst + nope_bytes, pe + i * pe_stride_bytes, pe_bytes);
+        }
+    }
+}
+
+static KernelRegistrar _r_set_kv_buffer_2(
+    "set_kv_buffer_2_kunpeng",
+    make_dispatch_v<decltype(&set_kv_buffer_2_kunpeng),
+                    &set_kv_buffer_2_kunpeng>);

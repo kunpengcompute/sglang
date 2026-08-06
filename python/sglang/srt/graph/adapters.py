@@ -98,6 +98,18 @@ def _setup_batched_gemm_woqs8_allthreads_kunpeng():
     register_op('batched_gemm_woqs8_allthreads_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_batched_gemm_woqs8_allthreads_inplace_kunpeng():
+    def shape_infer(act, weight, rscale, cscale, out):
+        return []
+
+    def eager_fn(act, weight, rscale, cscale, out):
+        torch.ops.sgl_kernel.batched_gemm_woqs8_allthreads_kunpeng(
+            act, weight, rscale, cscale, out)
+        return None
+
+    register_op('batched_gemm_woqs8_allthreads_inplace_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_rope_kunpeng():
     def shape_infer(positions, q, k, cos_sin_cache):
         return [(q.shape, q.dtype), (k.shape, k.dtype)]
@@ -110,6 +122,18 @@ def _setup_rope_kunpeng():
         return q_out, k_out
 
     register_op('rope_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_rope_inplace_kunpeng():
+    def shape_infer(position_ids, q, k, q_out, k_out, cos_sin_cache):
+        return []
+
+    def eager_fn(position_ids, q, k, q_out, k_out, cos_sin_cache):
+        torch.ops.sgl_kernel.rope_kunpeng(
+            position_ids, q, k, q_out, k_out, cos_sin_cache)
+        return None
+
+    register_op('rope_inplace_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_s8_gemm_pack_kunpeng():
@@ -228,6 +252,27 @@ def _setup_grouped_topk_kunpeng():
         return tw, ti
 
     register_op('grouped_topk_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_grouped_topk_inplace_kunpeng():
+    def shape_infer(router_logits, token_weights_out, token_ids_out, bias,
+                    topk, num_expert_group, topk_group,
+                    renormalize, scoring_func_sigmoid, moe_balance, v2):
+        return []
+
+    def eager_fn(router_logits, token_weights_out, token_ids_out, bias,
+                 topk, num_expert_group, topk_group,
+                 renormalize, scoring_func_sigmoid, moe_balance, v2):
+        torch.ops.sgl_kernel.grouped_topk_kunpeng(
+            router_logits, token_weights_out, token_ids_out,
+            topk, num_expert_group, topk_group,
+            bias=bias, experts_offset=None,
+            renormalize=bool(renormalize),
+            scoring_func_sigmoid=bool(scoring_func_sigmoid),
+            moe_balance=bool(moe_balance), v2=v2)
+        return None
+
+    register_op('grouped_topk_inplace_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_load_balance_padded_tokens_kunpeng():
@@ -658,6 +703,30 @@ def _setup_set_kv_buffer_kunpeng():
     register_op('set_kv_buffer_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_set_kv_buffer_2_kunpeng():
+    def shape_infer(kv_buffer, loc, k_nope, k_pe):
+        return []
+
+    def eager_fn(kv_buffer, loc, k_nope, k_pe):
+        torch.ops.sgl_kernel.set_kv_buffer_2_kunpeng(
+            kv_buffer, loc, k_nope, k_pe)
+        return None
+
+    register_op('set_kv_buffer_2_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_kupl_sdma_set_kv_buffer_2():
+    def shape_infer(kv_buffer, loc, k_nope, k_pe, event_tensor, event_num_tensor):
+        return []
+
+    def eager_fn(kv_buffer, loc, k_nope, k_pe, event_tensor, event_num_tensor):
+        torch.ops.sgl_kernel.kupl_sdma_set_kv_buffer_2(
+            kv_buffer, loc, k_nope, k_pe, event_tensor, event_num_tensor)
+        return None
+
+    register_op('kupl_sdma_set_kv_buffer_2', shape_infer, eager_fn)
+
+
 def _setup_copy_kunpeng():
     def shape_infer(dst, src):
         return []
@@ -854,7 +923,9 @@ def setup():
     _setup_quant_inplace_kunpeng()
     _setup_batched_gemm_pack_allthreads_kunpeng()
     _setup_batched_gemm_woqs8_allthreads_kunpeng()
+    _setup_batched_gemm_woqs8_allthreads_inplace_kunpeng()
     _setup_rope_kunpeng()
+    _setup_rope_inplace_kunpeng()
     _setup_s8_gemm_pack_kunpeng()
     _setup_alloc_buffer()
     _setup_zero_()
@@ -863,6 +934,7 @@ def setup():
     _setup_bf16_gemm_pack_kunpeng()
     _setup_bf16_packed_gemm_kunpeng()
     _setup_grouped_topk_kunpeng()
+    _setup_grouped_topk_inplace_kunpeng()
     _setup_load_balance_padded_tokens_kunpeng()
     _setup_multinomial_kunpeng()
     _setup_shm_batched_allgather_kunpeng()
@@ -890,6 +962,8 @@ def setup():
     _setup_cat_kunpeng()
     _setup_contiguous_kunpeng()
     _setup_set_kv_buffer_kunpeng()
+    _setup_set_kv_buffer_2_kunpeng()
+    _setup_kupl_sdma_set_kv_buffer_2()
     _setup_copy_kunpeng()
     _setup_print_hash_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()

@@ -301,6 +301,8 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
     auto bias_data = (bias.has_value() && bias->defined()) ? bias->data_ptr<float>() : nullptr;
     int64_t token_weights_stride = token_weights.stride(0);
     int64_t token_ids_stride = token_ids.stride(0);
+    int64_t token_weights_stride1 = token_weights.stride(1);
+    int64_t token_ids_stride1 = token_ids.stride(1);
     struct Active {
         int index;
         float origin_score;
@@ -391,8 +393,10 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
         for (int i = 0; i < num_token; ++i) {
             Active *active_expert_data = active_expert + i * topk;
             for (int j = 0; j < topk; ++j) {
-                token_weights_data[i * token_weights_stride + j] = active_expert_data[j].origin_score;
-                token_ids_data[i * token_ids_stride + j] = active_expert_data[j].index;
+                token_weights_data[i * token_weights_stride + j * token_weights_stride1] =
+                    active_expert_data[j].origin_score;
+                token_ids_data[i * token_ids_stride + j * token_ids_stride1] =
+                    active_expert_data[j].index;
             }
         }
         return;
@@ -426,6 +430,10 @@ void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_wei
 
     int16_t *topk_ids_data = topk_ids.data_ptr<int16_t>();
     float *topk_weights_data = topk_weights.data_ptr<float>();
+    int64_t ids_stride = topk_ids.stride(0);
+    int64_t ids_stride1 = topk_ids.stride(1);
+    int64_t weights_stride = topk_weights.stride(0);
+    int64_t weights_stride1 = topk_weights.stride(1);
     int64_t num_total = topk_ids.size(0);
     int64_t pad_start = num_token_non_padded.data_ptr<int32_t>()[0];
     int64_t num_pad = num_total - pad_start;
@@ -438,7 +446,7 @@ void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_wei
 
     for (int64_t i = 0; i < pad_start; i++) {
         for (int64_t j = 0; j < topk; j++) {
-            int16_t expert_id = topk_ids_data[i * topk + j];
+            int16_t expert_id = topk_ids_data[i * ids_stride + j * ids_stride1];
             load[expert_id] += 1.0f;
         }
     }
@@ -453,8 +461,8 @@ void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_wei
                     min_idx = e;
                 }
             }
-            topk_ids_data[(pad_start + i) * topk + j] = min_idx;
-            topk_weights_data[(pad_start + i) * topk + j] = 0;
+            topk_ids_data[(pad_start + i) * ids_stride + j * ids_stride1] = min_idx;
+            topk_weights_data[(pad_start + i) * weights_stride + j * weights_stride1] = 0;
             load[min_idx] += 1.0f;
         }
     }

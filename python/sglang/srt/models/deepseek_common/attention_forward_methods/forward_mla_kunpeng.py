@@ -81,46 +81,81 @@ class DeepseekMLAKunpengForwardMixin:
             scale_3d = self.w_kc_scale.view(scale_shape)
 
             pa_3d = kunpeng.batched_gemm_pack_allthreads_kunpeng(a_3d)
-            q_nope_out = kunpeng.batched_gemm_woqs8_allthreads_kunpeng(
-                pa_3d, self.w_kc_int8_packed, None, scale_3d)
+
+            qk_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            rows = q_nope.size(0)
+            q_combined = kunpeng.alloc_buffer(rows * bs * qk_dim * 2).view(
+                torch.bfloat16
+            ).view(rows, bs, qk_dim)
+            kunpeng.batched_gemm_woqs8_allthreads_inplace_kunpeng(
+                pa_3d, self.w_kc_int8_packed, None, scale_3d,
+                q_combined.transpose(0, 1)[:, :, : self.kv_lora_rank])
+
+            if self.rotary_emb is not None:
+                k_pe_out = kunpeng.alloc_buffer(
+                    rows * self.qk_rope_head_dim * 2
+                ).view(torch.bfloat16).view(rows, 1, self.qk_rope_head_dim)
+                kunpeng.rope_inplace_kunpeng(
+                    positions, q_pe, k_pe,
+                    q_combined[:, :, self.kv_lora_rank:], k_pe_out,
+                    self.rotary_emb.cos_sin_cache)
+                k_pe = k_pe_out
 
         else:
             q_nope_input = q_nope.transpose(0, 1)
             q_nope_out = kunpeng.bmm_kunpeng(q_nope_input, self.w_kc_packed)
+            q_nope_out = q_nope_out.transpose(0, 1)
 
-        q_nope_out = q_nope_out.transpose(0, 1)
+            if self.rotary_emb is not None:
+                q_pe, k_pe = kunpeng.rope_kunpeng(
+                    positions, q_pe, k_pe, self.rotary_emb.cos_sin_cache)
 
-        if self.rotary_emb is not None:
-            q_pe, k_pe = kunpeng.rope_kunpeng(
-                positions, q_pe, k_pe, self.rotary_emb.cos_sin_cache)
-
-        q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
-        k_combined = kunpeng.cat_kunpeng(k_nope, k_pe, -1)  # (B, 1, D_kv+D_rope)
+            q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
 
         if self.swap_mgr.enable_swap_kv_in:
-            # Block-wise (decode): the swap manager remaps out_cache_loc to
-            # HBM flat positions and slices k_combined to this rank's Btp
-            # tokens. Otherwise both are returned unchanged.
-            cache_loc = self.swap_mgr.get_cache_loc(forward_batch)
-            cache_k = self.swap_mgr.get_cache_k(k_combined, forward_batch)
-            self.swap_mgr.set_kv_buffer(self.swap_mgr._cur_kv_hbm, cache_loc, cache_k)
+            # Block-wise (decode): out_cache_loc is remapped to HBM flat
+            # positions; k_nope/k_pe must be sliced to this rank's Btp tokens
+            # to match (Btp == B when all2all is disabled).
+            if self.swap_mgr._blockwise_ddr_block_ids is not None:
+                cache_loc = self.swap_mgr._blockwise_hbw_cache_loc
+                start = self.swap_mgr._blockwise_token_slice_start
+                end = start + cache_loc.shape[0]
+                self.swap_mgr.set_kv_buffer_2(
+                    self.swap_mgr._cur_kv_hbm, cache_loc,
+                    k_nope[start:end], k_pe[start:end],
+                )
+            else:
+                self.swap_mgr.set_kv_buffer_2(
+                    self.swap_mgr._cur_kv_hbm,
+                    forward_batch.out_cache_loc,
+                    k_nope,
+                    k_pe,
+                )
 
             # DDR write keeps the original (un-remapped) out_cache_loc.
             if self.swap_mgr.enable_swap_kv_out:
-                self.swap_mgr.set_kv_buffer_sdma(forward_batch.out_cache_loc, k_combined)
+                self.swap_mgr.set_kv_buffer_2_sdma(
+                    forward_batch.out_cache_loc, k_nope, k_pe
+                )
             else:
-                self.swap_mgr.set_kv_buffer(
-                    self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, k_combined
+                self.swap_mgr.set_kv_buffer_2(
+                    self.swap_mgr._cur_kv_ddr,
+                    forward_batch.out_cache_loc,
+                    k_nope,
+                    k_pe,
                 )
         else:
-            self.swap_mgr.set_kv_buffer(
-                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, k_combined
+            self.swap_mgr.set_kv_buffer_2(
+                self.swap_mgr._cur_kv_ddr,
+                forward_batch.out_cache_loc,
+                k_nope,
+                k_pe,
             )
 
         return (
             q_combined,
-            k_combined,
-            k_nope,
+            None,
+            None,
             forward_batch,
             zero_allocator,
             positions,
@@ -197,17 +232,22 @@ class DeepseekMLAKunpengForwardMixin:
         if self.q_lora_rank is not None:
             bs = attn_output.size(1)
             n = self.w_vc_int8.size(1)
+            B = attn_output.size(0)
 
             a_3d = attn_output.transpose(0, 1)
 
             rscale_3d = self.w_vc_scale.view(bs, n, 1)
 
             pa_3d = kunpeng.batched_gemm_pack_allthreads_kunpeng(a_3d)
-            c_tensor_3d = kunpeng.batched_gemm_woqs8_allthreads_kunpeng(
-                pa_3d, self.w_vc_int8_packed, rscale_3d, None)
 
-            attn_bmm_output = kunpeng.contiguous_kunpeng(
-                c_tensor_3d.transpose(0, 1)).reshape(
+            c_flat = kunpeng.alloc_buffer(B * bs * n * 2).view(
+                torch.bfloat16
+            ).view(B, bs * n)
+            c_3d_t = c_flat.view(B, bs, n).transpose(0, 1)
+            kunpeng.batched_gemm_woqs8_allthreads_inplace_kunpeng(
+                pa_3d, self.w_vc_int8_packed, rscale_3d, None, c_3d_t)
+
+            attn_bmm_output = c_flat.reshape(
                 -1, self.num_local_heads * self.v_head_dim
             )
         else:
