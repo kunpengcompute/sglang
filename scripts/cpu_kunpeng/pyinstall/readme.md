@@ -9,7 +9,7 @@
 ```
 pyinstall/
 ├── pyinstall.sh        # 首次全量打包脚本
-├── updata.sh           # 增量更新脚本（拷贝源码，不重新 PyInstaller）
+├── update.sh           # 增量更新脚本（拷贝源码，不重新 PyInstaller）
 ├── numa_duplication.sh # 将打包产物复制为 NUMA 多副本（0~15）
 └── readme.md
 ```
@@ -84,19 +84,19 @@ export SGLANG_ENABLE_BINARY_LAUNCH=1
 bash launch.sh native
 ```
 
-`launch.sh` 中的自动更新逻辑（`sh ./pyinstall/updata.sh`）会直接拷贝最新源码覆盖各 NUMA 副本的 `_internal` 目录，**无需重新执行 PyInstaller**，速度远快于全量打包。
+`launch.sh` 中的自动更新逻辑（`sh ./pyinstall/update.sh`）会直接拷贝最新源码覆盖各 NUMA 副本的 `_internal` 目录，**无需重新执行 PyInstaller**，速度远快于全量打包。
 
 也可以手动执行增量更新：
 
 ```bash
 # 更新所有（sglang + sgl_kernel）
-bash updata.sh
+bash update.sh
 
 # 只更新 sglang 源码
-bash updata.sh sglang
+bash update.sh sglang
 
 # 只更新 sgl_kernel 源码
-bash updata.sh kernel
+bash update.sh kernel
 ```
 
 > **注意**：增量更新只替换 Python 源码（`.py` 文件）。如果依赖库发生变化（如 PyTorch、Triton 升级），仍需重新执行 `pyinstall.sh` 全量打包或手动更新。
@@ -129,7 +129,7 @@ bash numa_duplication.sh
 | 场景 | 操作 | 耗时 |
 |---|---|---|
 | 首次部署 | 配置 `env.sh` → `bash pyinstall.sh` | 较长 |
-| 修改了 `.py` 源码 | 直接调用 `launch.sh`（自动增量更新）或 `bash updata.sh` | 较短 |
+| 修改了 `.py` 源码 | 直接调用 `launch.sh`（自动增量更新）或 `bash update.sh` | 较短 |
 | 新增/升级了 pip 依赖 | `bash pyinstall.sh` 全量打包 | 较长 |
 | 只想重新分发 NUMA 副本 | `bash numa_duplication.sh` | 较短 |
 
@@ -138,6 +138,6 @@ bash numa_duplication.sh
 ## 五、注意事项
 
 - `pyinstall.sh` 会将 Conda 环境中的标准库完整复制到 `_internal` 中，确保打包产物可在无标准库的目标机器上运行。
-- `updata.sh` 直接拷贝源码替换所有 NUMA 副本的 `_internal/sglang` 和 `_internal/sgl_kernel`，不重新编译 `.pyc`，因此速度极快。
+- `update.sh` 直接拷贝源码替换所有 NUMA 副本的 `_internal/sglang` 和 `_internal/sgl_kernel`，不重新编译 `.pyc`，因此速度极快。
 - 如果新增了 Python 依赖（`hidden-import` 或 `.so` 库），需要同步更新 `pyinstall.sh` 中的 `--add-binary` 和 `--hidden-import` 参数，然后执行全量打包。
 - `numa_duplication.sh` 的副本数量固定为 16 个（tp0 ~ tp15），如需调整，可手动修改脚本中的 `seq` 范围。
