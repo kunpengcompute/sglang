@@ -226,7 +226,6 @@ class KunpengCpuBackend(AttentionBackend):
             if model_runner.server_args.speculative_num_draft_tokens is not None
             else 1
         )
-        self.mla_padding_enable = False
 
         self._decode_meta = torch.ops.sgl_kernel.flash_mla_meta_create_kunpeng()
         self.swap_mgr = KunpengSwapManager.get_instance()
@@ -258,12 +257,9 @@ class KunpengCpuBackend(AttentionBackend):
         ):
             save_seq_lens = forward_batch.seq_lens
             if forward_batch.forward_mode.is_target_verify():
-                self.mla_padding_enable = False
                 forward_batch.seq_lens = (
                     save_seq_lens + self.speculative_num_draft_tokens
                 )
-            else:
-                self.mla_padding_enable = True
             self._init_decode_metadata(
                 forward_batch, seqlen_q=self.speculative_num_draft_tokens
             )
@@ -298,6 +294,7 @@ class KunpengCpuBackend(AttentionBackend):
 
         metadata.page_size = forward_batch.token_to_kv_pool.page_size
         seq_lens = forward_batch.seq_lens.to(torch.int32)
+        metadata.extend_seq_lens = forward_batch.extend_seq_lens
         req_to_token = forward_batch.req_to_token_pool.req_to_token.to(torch.int32)
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
 
@@ -315,6 +312,13 @@ class KunpengCpuBackend(AttentionBackend):
             seq_lens = seq_lens[
                 token_slice_start : token_slice_start + batchsize_per_tp
             ]
+            if forward_batch.forward_mode.is_draft_extend():
+                # Extend mode with MLA padding: slice extend_seq_lens to match
+                # the all2all group. The kernel will read the full extend_seq_lens
+                # but only write the Btp tokens in this rank's all2all group.
+                metadata.extend_seq_lens = metadata.extend_seq_lens[
+                    token_slice_start : token_slice_start + batchsize_per_tp
+                ]
             req_pool_indices = req_pool_indices[
                 token_slice_start : token_slice_start + batchsize_per_tp
             ]
@@ -337,11 +341,6 @@ class KunpengCpuBackend(AttentionBackend):
             req_pool_indices,
             seq_lens,
             enable_blockwise=enable_blockwise,
-        )
-
-        batch_size = metadata.seq_lens.shape[0]
-        metadata.extend_seq_lens = torch.full(
-            (batch_size,), seqlen_q, dtype=torch.int32
         )
 
         metadata.extra_bytes = (
@@ -552,7 +551,7 @@ class KunpengCpuBackend(AttentionBackend):
         bs = meta.seq_lens.shape[0]
         max_ext_len = self.speculative_num_draft_tokens
 
-        if self.mla_padding_enable:
+        if forward_batch.forward_mode.is_draft_extend():
             q_padded = kunpeng.pad_q_left_mtp_kunpeng(
                 q_heads, meta.extend_seq_lens, max_ext_len
             )
@@ -574,20 +573,23 @@ class KunpengCpuBackend(AttentionBackend):
             if meta.extra_bytes > 0
             else torch.empty(0, dtype=torch.uint8, device=q.device)
         )
+        block_table = self.swap_mgr.get_remapped_block_table()
+        if block_table is None:
+            block_table = meta.block_table
 
         o_padded, softmax_lse = kunpeng.flash_mla_dense_decode_kunpeng(
             q_padded,
             kvcache_paged,
-            meta.block_table,
+            block_table,
             meta.seq_lens,
             softmax_scale,
-            False,
+            not layer.is_cross_attention,
             extra_buffer,
             self._decode_meta,
             layer.v_head_dim,
         )
 
-        if self.mla_padding_enable:
+        if forward_batch.forward_mode.is_draft_extend():
             o_flat = kunpeng.unpad_o_right_mtp_kunpeng(
                 o_padded, meta.extend_seq_lens, q_heads.shape[0]
             )
@@ -732,7 +734,7 @@ class KunpengCpuBackend(AttentionBackend):
             block_table,
             seq_lens,
             softmax_scale,
-            False,
+            not layer.is_cross_attention,
             extra_buffer,
             self._decode_meta,
             head_dim_v,
