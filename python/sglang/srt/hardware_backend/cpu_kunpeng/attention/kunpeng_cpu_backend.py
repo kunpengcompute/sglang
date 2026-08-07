@@ -642,6 +642,50 @@ class KunpengCpuBackend(AttentionBackend):
 
         return o
 
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """Run forward on an attention layer.
+
+        Kunpeng-specific dispatch, replacing the base-class default:
+
+        - IDLE: no-op, matching base behaviour.
+        - DECODE (single token per sequence): forward_decode.
+        - Everything else (EXTEND, MIXED, DRAFT_EXTEND, DRAFT_EXTEND_V2,
+          TARGET_VERIFY): forward_extend. Note speculative modes are *not*
+          is_decode(), so they always land here; the draft-extend path relies
+          on this to run with seqlen_q = speculative_num_draft_tokens.
+        """
+        if forward_batch.forward_mode.is_idle():
+            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+        elif forward_batch.forward_mode.is_decode():
+            return self.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+        else:
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+
     def forward_extend(
         self,
         q,
