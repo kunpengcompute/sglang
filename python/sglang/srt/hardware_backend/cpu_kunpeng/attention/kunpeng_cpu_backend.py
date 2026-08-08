@@ -658,10 +658,12 @@ class KunpengCpuBackend(AttentionBackend):
 
         - IDLE: no-op, matching base behaviour.
         - DECODE (single token per sequence): forward_decode.
-        - Everything else (EXTEND, MIXED, DRAFT_EXTEND, DRAFT_EXTEND_V2,
-          TARGET_VERIFY): forward_extend. Note speculative modes are *not*
-          is_decode(), so they always land here; the draft-extend path relies
-          on this to run with seqlen_q = speculative_num_draft_tokens.
+        - MTP speculative modes (TARGET_VERIFY, DRAFT_EXTEND): forward_extend;
+          the draft-extend path relies on this to run with
+          seqlen_q = speculative_num_draft_tokens.
+        - EXTEND: forward_extend.
+        - Any other mode (MIXED, DRAFT_EXTEND_V2, PREBUILT, SPLIT_PREFILL,
+          DLLM_EXTEND): raise, since it is not supported by this backend.
         """
         if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
@@ -675,7 +677,27 @@ class KunpengCpuBackend(AttentionBackend):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
-        else:
+        elif forward_batch.forward_mode.is_target_verify():
+            return self.forward_target_verify(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+        elif forward_batch.forward_mode.is_draft_extend():
+            return self.forward_draft_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+        elif forward_batch.forward_mode == ForwardMode.EXTEND:
             return self.forward_extend(
                 q,
                 k,
@@ -685,6 +707,37 @@ class KunpengCpuBackend(AttentionBackend):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
+        else:
+            raise ValueError(
+                f"Unsupported forward mode {forward_batch.forward_mode} for "
+                "Kunpeng CPU attention backend"
+            )
+
+    def forward_target_verify(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = False,
+        **kwargs,
+    ):
+        """MTP target-verify forward, currently backed by the paged MLA path."""
+        return self._forward_extend_mla_paged(q, k, v, layer, forward_batch)
+
+    def forward_draft_extend(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = False,
+        **kwargs,
+    ):
+        """MTP draft-extend forward, currently backed by the paged MLA path."""
+        return self._forward_extend_mla_paged(q, k, v, layer, forward_batch)
 
     def forward_extend(
         self,
