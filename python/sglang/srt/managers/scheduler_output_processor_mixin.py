@@ -462,6 +462,15 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if is_spec_v1:
+                if (
+                    batch.pp_mtp_accepted_tokens is not None
+                    and not self.pp_group.is_last_rank
+                ):
+                    # PP+MTP: the verify phase (output_ids append, finish checks,
+                    # KV bookkeeping, rejected-slot eviction) ran on the last
+                    # rank; replicate it locally so every rank keeps the same
+                    # request state.
+                    self._pp_mtp_apply_verify_result(batch, result, i)
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finished_req(req, i, logits_output)
@@ -556,6 +565,73 @@ class SchedulerOutputProcessorMixin:
             running_batch=batch,
             num_accepted_drafts=result.num_accepted_drafts,
         )
+
+    def _pp_mtp_apply_verify_result(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult, i: int
+    ) -> None:
+        """Replicate the last rank's 1-step MTP verify updates for request i.
+
+        Mirrors the per-request updates of `EagleVerifyInput.verify()` so that
+        every PP rank keeps identical request state: the accepted tokens are
+        appended to output_ids, finish conditions are checked, KV bookkeeping
+        advances, and the rejected draft's KV slots are freed.
+        """
+        from sglang.srt.utils import is_cpu_920f
+
+        req = batch.reqs[i]
+        num_accepted = int(batch.pp_mtp_accepted_tokens[i])
+        if num_accepted < 1:
+            return
+
+        # The flattened accepted tokens (result.next_token_ids) split by the
+        # per-req accepted counts.
+        offset = sum(int(t) for t in batch.pp_mtp_accepted_tokens[:i])
+        accepted_tokens = result.next_token_ids[offset : offset + num_accepted]
+
+        think_end_id = batch.model_config.think_end_id
+        for tok in accepted_tokens.tolist():
+            req.output_ids.append(tok)
+            if req.require_reasoning and think_end_id is not None:
+                req.update_reasoning_tokens(tok, think_end_id)
+            req.check_finished()
+            if not req.finished() and req.grammar is not None:
+                try:
+                    req.grammar.accept_token(tok)
+                except ValueError as e:
+                    logger.info(f"{req=}\n{e}")
+                    raise e
+                req.check_finished()
+            if req.finished():
+                break
+
+        req.kv_committed_len += num_accepted
+        req.kv_allocated_len = req.kv_committed_len
+        req.spec_verify_ct += 1
+
+        # Evict the rejected draft KV slots (the trailing slots of this req).
+        draft_token_num = 2
+        if (
+            num_accepted < draft_token_num
+            and batch.out_cache_loc is not None
+            and batch.out_cache_loc.numel() >= (i + 1) * draft_token_num
+        ):
+            evict_mask = torch.zeros(
+                batch.out_cache_loc.numel(),
+                dtype=torch.bool,
+                device=batch.out_cache_loc.device,
+            )
+            evict_mask[i * draft_token_num + num_accepted : (i + 1) * draft_token_num] = (
+                True
+            )
+            if is_cpu_920f():
+                from sglang.srt.speculative.spec_utils import (
+                    align_evict_mask_to_page_size_native,
+                )
+
+                align_evict_mask_to_page_size_native(
+                    batch.seq_lens, evict_mask, self.page_size, draft_token_num
+                )
+            self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
 
     def _handle_finished_req(
         self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput

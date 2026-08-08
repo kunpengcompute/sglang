@@ -175,33 +175,40 @@ class EAGLEWorker(TpModelWorker):
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-
-        if self.speculative_algorithm.is_eagle3():
-            # most cases EAGLE3 models don't share lm_head
-            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
-            if (
-                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
-                and self.draft_model_runner.model.load_lm_head_from_target
-            ):
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
-            else:
-                self.draft_model_runner.model.set_embed(embed)
-
-            # grab hot token ids
-            if self.draft_model_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
-                    embed.device
-                )
-
+        if self.target_worker.pp_size > 1:
+            # Under PP, the draft model runs on the last PP rank and loads its
+            # own embed/lm_head from the checkpoint (the target's embed lives
+            # on the first rank and its lm_head on this rank, so neither can
+            # be shared the way the non-PP path does).
+            pass
         else:
-            if self.hot_token_id is not None:
-                head = head.clone()
-                self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
-            # Share the embedding and lm_head
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
+            if self.speculative_algorithm.is_eagle3():
+                # most cases EAGLE3 models don't share lm_head
+                # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+                if (
+                    hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                    and self.draft_model_runner.model.load_lm_head_from_target
+                ):
+                    self.draft_model_runner.model.set_embed_and_head(embed, head)
+                else:
+                    self.draft_model_runner.model.set_embed(embed)
+
+                # grab hot token ids
+                if self.draft_model_runner.model.hot_token_id is not None:
+                    self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+                        embed.device
+                    )
+
+            else:
+                if self.hot_token_id is not None:
+                    head = head.clone()
+                    self.hot_token_id = self.hot_token_id.to(head.device)
+                    head.data = head.data[self.hot_token_id]
+
+                # Share the embedding and lm_head
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (

@@ -661,6 +661,17 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        if self.pp_size > 1 and self.pp_rank != self.pp_size - 1:
+            # Under pipeline parallelism, the draft model (MTP) only runs on the
+            # last PP rank: it consumes the target's final hidden states, which
+            # are only produced there. Other ranks run the plain target worker
+            # and participate in the verify passes via the ring messages.
+            # NOTE: `self.pp_group` is not initialized yet at this point, so we
+            # compare `pp_rank` directly.
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -682,8 +693,20 @@ class Scheduler(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
 
+        if self.pp_size > 1:
+            # The draft worker is a local, single-layer model that is not part of
+            # the PP pipeline. Present it with pp_size=1 so its ModelRunner skips
+            # the PP support assertion and the per-rank layer splitting.
+            backup_pp_size = self.server_args.pp_size
+            self.server_args.pp_size = 1
+        else:
+            backup_pp_size = None
+
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+        if backup_pp_size is not None:
+            self.server_args.pp_size = backup_pp_size
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -705,7 +728,12 @@ class Scheduler(
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
         else:
-            self.model_worker = self.draft_worker
+            # Under PP, only the last rank hosts the draft worker; the other
+            # ranks use the plain target worker (verify passes are driven by
+            # the ring messages and the scheduler-side batch preparation).
+            self.model_worker = (
+                self.draft_worker if self.draft_worker is not None else self.tp_worker
+            )
 
         # Install device timer on model runners for fwd occupancy tracking
         if hasattr(self, "forward_pass_device_timer"):
@@ -2953,6 +2981,11 @@ class Scheduler(
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
+            elif self.pp_size > 1 and not self.pp_group.is_last_rank:
+                # PP + spec: non-last ranks run the plain target worker on a model
+                # worker batch; the verify batch was prepared by the scheduler
+                # (scheduler_pp_mixin), so no worker-side spec preparation happens.
+                worker_batch_or_batch = batch.get_model_worker_batch()
             else:
                 # In speculative decoding v1 (non-overlap) case, we use the batch directly.
                 # TODO(lsyin): delete this branch after unifying the abstraction.
@@ -3003,7 +3036,7 @@ class Scheduler(
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
+                    if (self.spec_algorithm.is_none() or self.pp_size > 1)
                     else {}
                 )
                 batch_result = self.model_worker.forward_batch_generation(

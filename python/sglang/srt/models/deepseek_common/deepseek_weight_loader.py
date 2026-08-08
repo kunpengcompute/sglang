@@ -222,18 +222,29 @@ class DeepseekV2WeightLoaderMixin:
                         nextn_layer_prefix=layer_prefix,
                         nextn_spec_weight_names=spec_weight_names,
                     ):
+                        # Under PP, the draft model runs on the last rank and cannot
+                        # share the target's embed/lm_head (they live on other ranks),
+                        # so it loads its own copies from the checkpoint.
+                        is_pp_draft = self.pp_group.world_size > 1
                         if not name.startswith(layer_prefix):
-                            continue
-
-                        # Use shared head and embed weights from target model
-                        if "shared_head.head" in name or "embed_tokens" in name:
-                            continue
-
-                        # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
-                        if any(s in name for s in spec_weight_names):
-                            name = name.replace(layer_prefix, "model")
+                            if is_pp_draft and (
+                                name.startswith("model.embed_tokens.")
+                                or name.startswith("model.shared_head.head.")
+                            ):
+                                pass  # fall through to the generic loading below
+                            else:
+                                continue
                         else:
-                            name = name.replace(layer_prefix, "model.decoder")
+                            # Use shared head and embed weights from target model
+                            if "shared_head.head" in name or "embed_tokens" in name:
+                                if is_pp_draft:
+                                    name = name.replace(layer_prefix, "model")
+                                else:
+                                    continue
+                            elif any(s in name for s in spec_weight_names):
+                                name = name.replace(layer_prefix, "model")
+                            else:
+                                name = name.replace(layer_prefix, "model.decoder")
                     case NextNDisabledConfig():
                         if hasattr(self.config, "num_nextn_predict_layers"):
                             num_nextn_layers = self.config.num_nextn_predict_layers
@@ -750,9 +761,10 @@ class DeepseekV2WeightLoaderMixin:
 
         # Prepack lm_head.weight for Kunpeng 920F CPU
         # Skip for MTP (is_nextn): lm_head will be replaced by set_embed_and_head()
-        # from the target model, so prepack happens there instead.
+        # from the target model, so prepack happens there instead. Under PP the
+        # draft loads its own lm_head, so it must be prepacked here.
         if (
-            not is_nextn
+            (not is_nextn or self.pp_group.world_size > 1)
             and _is_cpu_920f
             and hasattr(self, "lm_head")
             and hasattr(self.lm_head, "weight")

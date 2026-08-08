@@ -47,6 +47,12 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # PP + MTP (1-step): the draft tokens for the next verify round (per req,
+    # shape [n_reqs]) and the accepted token count per req (shape [n_reqs]).
+    # Produced by the last PP rank's MTP worker and consumed by the scheduler.
+    draft_tokens: Optional[torch.Tensor] = None
+    num_accepted_tokens: Optional[torch.Tensor] = None
+
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[RoutedExpertsOutput] = None
 
