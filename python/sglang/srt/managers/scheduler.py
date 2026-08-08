@@ -442,6 +442,14 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
+        if self.pp_size > 1:
+            # Under PP, the last rank may take longer to initialize (e.g.
+            # loading MTP draft model weights) while other ranks have already
+            # finished. Synchronize all PP ranks here so no rank proceeds to the
+            # event loop before every rank is ready — otherwise the ring
+            # communication in the event loop deadlocks.
+            barrier()
+
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
