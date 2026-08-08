@@ -79,6 +79,13 @@ class SpeculativeAlgorithm(Enum):
             # PP + MTP: the draft worker runs on the last PP rank only and
             # implements the 1-step MTP flow (draft predictions travel with the
             # ring messages; the verify batches are prepared by the scheduler).
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"Creating PPNextNWorker for PP+MTP (pp_size={server_args.pp_size}, "
+                f"spec_algorithm={self})"
+            )
             from sglang.srt.speculative.pp_nextn_worker import PPNextNWorker
 
             return PPNextNWorker

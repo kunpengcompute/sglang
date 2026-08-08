@@ -668,6 +668,10 @@ class Scheduler(
             # and participate in the verify passes via the ring messages.
             # NOTE: `self.pp_group` is not initialized yet at this point, so we
             # compare `pp_rank` directly.
+            logger.info(
+                f"[PP{self.pp_rank}] Skipping draft worker — only last "
+                f"PP rank hosts MTP (pp_size={self.pp_size})"
+            )
             self.draft_worker = None
             self.external_corpus_manager = None
             return
@@ -733,6 +737,10 @@ class Scheduler(
             # the ring messages and the scheduler-side batch preparation).
             self.model_worker = (
                 self.draft_worker if self.draft_worker is not None else self.tp_worker
+            )
+            logger.info(
+                f"[PP{self.pp_rank}] model_worker={'PPNextNWorker' if self.draft_worker else 'TpModelWorker'} "
+                f"(pp_size={self.pp_size}, spec={self.spec_algorithm})"
             )
 
         # Install device timer on model runners for fwd occupancy tracking
@@ -3039,6 +3047,17 @@ class Scheduler(
                     if (self.spec_algorithm.is_none() or self.pp_size > 1)
                     else {}
                 )
+                if (
+                    self.pp_size > 1
+                    and not self.spec_algorithm.is_none()
+                    and envs.SGLANG_DEBUG_PP_MTP.get()
+                ):
+                    logger.info(
+                        f"[PP{self.pp_rank}] run_batch: forward_mode={batch.forward_mode} "
+                        f"model_worker={type(self.model_worker).__name__} "
+                        f"batch_mode={type(worker_batch_or_batch).__name__} "
+                        f"has_pp_proxy={pp_proxy_tensors is not None}"
+                    )
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )

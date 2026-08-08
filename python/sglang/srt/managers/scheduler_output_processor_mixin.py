@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
+from sglang.srt.utils.common import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -32,6 +33,8 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
 
 # How often (in decoded tokens) the scheduler force-flushes an intermediate
 # output batch for non-streaming requests.
@@ -580,7 +583,18 @@ class SchedulerOutputProcessorMixin:
 
         req = batch.reqs[i]
         num_accepted = int(batch.pp_mtp_accepted_tokens[i])
+
+        if _DEBUG_PP_MTP:
+            pp_rank = getattr(self, "pp_rank", None)
+            logger.info(
+                f"[PP{pp_rank}] apply_verify: i={i} rid={req.rid} "
+                f"num_accepted={num_accepted}"
+            )
+
         if num_accepted < 1:
+            if _DEBUG_PP_MTP:
+                pp_rank = getattr(self, "pp_rank", None)
+                logger.info(f"[PP{pp_rank}] apply_verify: num_accepted < 1, skip")
             return
 
         # The flattened accepted tokens (result.next_token_ids) split by the
@@ -631,6 +645,15 @@ class SchedulerOutputProcessorMixin:
                 align_evict_mask_to_page_size_native(
                     batch.seq_lens, evict_mask, self.page_size, draft_token_num
                 )
+
+            if _DEBUG_PP_MTP:
+                pp_rank = getattr(self, "pp_rank", None)
+                n_evict = evict_mask.sum().item()
+                logger.info(
+                    f"[PP{pp_rank}] apply_verify: evicting {n_evict} "
+                    f"rejected draft KV slots for req {req.rid}"
+                )
+
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
 
     def _handle_finished_req(

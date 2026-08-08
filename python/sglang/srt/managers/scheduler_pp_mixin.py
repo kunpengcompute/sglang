@@ -38,11 +38,19 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu, is_cpu_920f
+from sglang.srt.utils.common import get_bool_env_var, get_device_module, is_xpu, is_cpu_920f
 
 logger = logging.getLogger(__name__)
 
 _is_cpu_920f = is_cpu_920f()
+_DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
+
+def _ppmtp_log(self, msg: str, *args) -> None:
+    """Log PP+MTP debug info with the pp_rank prefix."""
+    if not _DEBUG_PP_MTP:
+        return
+    pp_rank = getattr(self, "pp_rank", None)
+    logger.info(f"[PP{pp_rank}] {msg}", *args)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -569,6 +577,11 @@ class SchedulerPPMixin:
             and not self.spec_algorithm.is_none()
         )
         self._pp_pending_drafts: Dict[str, int] = {}
+        _ppmtp_log(
+            self,
+            f"init: pp_mtp_enabled={self._pp_mtp_enabled} "
+            f"pp_size={self.pp_size} spec={self.spec_algorithm}",
+        )
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1009,6 +1022,13 @@ class SchedulerPPMixin:
                 tensor_dict["num_accepted_tokens"] = result.num_accepted_tokens
             if result.draft_tokens is not None:
                 tensor_dict["draft_tokens"] = result.draft_tokens
+            _ppmtp_log(
+                self,
+                f"prepare_tensor_dict: sending "
+                f"num_accepted_tokens={'present' if result.num_accepted_tokens is not None else 'None'} "
+                f"draft_tokens={'present' if result.draft_tokens is not None else 'None'} "
+                f"tensor_dict_keys={list(tensor_dict.keys())}",
+            )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1237,6 +1257,19 @@ class SchedulerPPMixin:
                 batch.pp_mtp_accepted_tokens = pp_outputs.tensors.get(
                     "num_accepted_tokens", None
                 )
+                _ppmtp_log(
+                    self,
+                    f"recv_drafts_via_ring: stashed for "
+                    f"rids={[r.rid for r in batch.reqs]} "
+                    f"drafts={draft_tokens.tolist()} "
+                    f"accepted_tokens={batch.pp_mtp_accepted_tokens}",
+                )
+            else:
+                _ppmtp_log(
+                    self,
+                    f"recv_drafts_via_ring: no draft_tokens in pp_outputs "
+                    f"(n_reqs={batch.batch_size()})",
+                )
 
         output_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -1407,6 +1440,12 @@ class SchedulerPPMixin:
                             self.cur_batch.reqs, result.draft_tokens.tolist()
                         ):
                             self._pp_pending_drafts[req.rid] = int(tok)
+                        _ppmtp_log(
+                            self,
+                            f"last_rank_stash: stashed drafts for "
+                            f"rids={[r.rid for r in self.cur_batch.reqs]} "
+                            f"drafts={result.draft_tokens.tolist()}",
+                        )
         return result, event
 
     def _pp_maybe_prepare_mtp_batch(self: Scheduler, batch: Optional[ScheduleBatch]):
@@ -1418,8 +1457,25 @@ class SchedulerPPMixin:
         instead of silently degrading to a non-speculative round, so that the
         scheduling bug is exposed immediately.
         """
-        if batch is None or not batch.forward_mode.is_decode():
+        if batch is None:
+            _ppmtp_log(self, "maybe_prepare: batch is None, skip")
             return
+        if not batch.forward_mode.is_decode():
+            _ppmtp_log(
+                self,
+                f"maybe_prepare: skip (mode={batch.forward_mode}, "
+                f"n_reqs={batch.batch_size()})",
+            )
+            return
+
+        n_reqs = batch.batch_size()
+        pending_keys = list(self._pp_pending_drafts.keys())
+        _ppmtp_log(
+            self,
+            f"maybe_prepare: decode batch n_reqs={n_reqs} "
+            f"pending_drafts_count={len(pending_keys)} "
+            f"pending_rids={pending_keys}",
+        )
 
         missing = [
             req.rid for req in batch.reqs if req.rid not in self._pp_pending_drafts
@@ -1429,6 +1485,7 @@ class SchedulerPPMixin:
                 "PP+MTP: decode batch contains requests without a pending draft "
                 f"(rids={missing}); the MTP pipeline invariant is violated"
             )
+        _ppmtp_log(self, "maybe_prepare: all drafts present, preparing verify batch")
         self._pp_mtp_prepare_verify_batch(batch)
 
     def _pp_mtp_prepare_verify_batch(self: Scheduler, batch: ScheduleBatch):
@@ -1459,6 +1516,13 @@ class SchedulerPPMixin:
                 )
             input_ids.append(r.output_ids[-1])
             input_ids.append(draft)
+
+        _ppmtp_log(
+            self,
+            f"prepare_verify: bs={bs} seq_lens={seq_lens} "
+            f"roots={[i for i in input_ids[::2]]} "
+            f"drafts={[i for i in input_ids[1::2]]}",
+        )
 
         batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
@@ -1502,6 +1566,12 @@ class SchedulerPPMixin:
         )
         verify_input.prepare_for_verify(batch, self.page_size)
         batch.spec_info = verify_input
+
+        _ppmtp_log(
+            self,
+            f"prepare_verify: done, forward_mode={batch.forward_mode} "
+            f"has_spec_info={batch.spec_info is not None}",
+        )
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group

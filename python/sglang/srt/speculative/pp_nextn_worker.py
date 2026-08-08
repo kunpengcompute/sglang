@@ -50,8 +50,11 @@ from sglang.srt.speculative.spec_utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
 
 
 class PPNextNWorker(EAGLEWorker):
@@ -92,13 +95,26 @@ class PPNextNWorker(EAGLEWorker):
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
+            if _DEBUG_PP_MTP:
+                logger.info(f"[PP_LAST] forward_batch: IDLE mode, n_reqs={batch.batch_size()}")
             model_worker_batch = batch.get_model_worker_batch()
             return self.target_worker.forward_batch_generation(
                 model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
             )
         if batch.forward_mode.is_target_verify():
+            if _DEBUG_PP_MTP:
+                logger.info(
+                    f"[PP_LAST] forward_batch: TARGET_VERIFY mode, "
+                    f"n_reqs={batch.batch_size()} "
+                    f"has_spec_info={batch.spec_info is not None}"
+                )
             return self._pp_mtp_verify(batch, pp_proxy_tensors)
         if batch.forward_mode.is_extend():
+            if _DEBUG_PP_MTP:
+                logger.info(
+                    f"[PP_LAST] forward_batch: EXTEND mode, "
+                    f"n_reqs={batch.batch_size()}"
+                )
             return self._pp_mtp_prefill(batch, pp_proxy_tensors)
         raise RuntimeError(
             f"PPNextNWorker: unsupported forward mode {batch.forward_mode}"
@@ -111,6 +127,12 @@ class PPNextNWorker(EAGLEWorker):
     def _pp_mtp_prefill(
         self, batch: ScheduleBatch, pp_proxy_tensors
     ) -> GenerationBatchResult:
+        if _DEBUG_PP_MTP:
+            logger.info(
+                f"[PP_LAST] _pp_mtp_prefill: start, n_reqs={batch.batch_size()} "
+                f"seq_lens={batch.seq_lens.tolist() if batch.seq_lens is not None else 'N/A'}"
+            )
+
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_result = self.target_worker.forward_batch_generation(
@@ -118,6 +140,12 @@ class PPNextNWorker(EAGLEWorker):
         )
         logits_output = batch_result.logits_output
         next_token_ids = batch_result.next_token_ids
+
+        if _DEBUG_PP_MTP:
+            logger.info(
+                f"[PP_LAST] _pp_mtp_prefill: target forward done, "
+                f"next_token_ids={next_token_ids.tolist() if next_token_ids is not None else 'N/A'}"
+            )
 
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
@@ -133,6 +161,13 @@ class PPNextNWorker(EAGLEWorker):
         draft_tokens = self._next_draft_from_spec_info(
             batch, num_accepted_tokens_cpu=[1] * len(batch.reqs)
         )
+
+        if _DEBUG_PP_MTP:
+            logger.info(
+                f"[PP_LAST] _pp_mtp_prefill: done, "
+                f"draft_tokens={draft_tokens}"
+            )
+
         return GenerationBatchResult(
             logits_output=batch_result.logits_output,
             next_token_ids=next_token_ids,
@@ -155,6 +190,12 @@ class PPNextNWorker(EAGLEWorker):
         spec_info = batch.spec_info
         assert spec_info is not None, "PP+MTP: verify batch missing spec_info"
 
+        if _DEBUG_PP_MTP:
+            logger.info(
+                f"[PP_LAST] _pp_mtp_verify: start, n_reqs={batch.batch_size()} "
+                f"input_ids={batch.input_ids.tolist()}"
+            )
+
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
@@ -164,6 +205,12 @@ class PPNextNWorker(EAGLEWorker):
         )
         logits_output = batch_result.logits_output
 
+        if _DEBUG_PP_MTP:
+            logger.info(
+                f"[PP_LAST] _pp_mtp_verify: target forward done, "
+                f"has_hidden_states={logits_output.hidden_states is not None}"
+            )
+
         spec_info.hidden_states = logits_output.hidden_states
         res = spec_info.verify(
             batch,
@@ -172,6 +219,13 @@ class PPNextNWorker(EAGLEWorker):
             self.page_size,
             vocab_mask=None,
         )
+
+        if _DEBUG_PP_MTP:
+            logger.info(
+                f"[PP_LAST] _pp_mtp_verify: spec_info.verify done, "
+                f"verified_id={res.verified_id.tolist() if res.verified_id is not None else 'N/A'} "
+                f"num_accepted_drafts_per_req={res.num_accepted_drafts_per_req_cpu}"
+            )
 
         # Post process based on verified outputs.
         logits_output.next_token_logits = logits_output.next_token_logits[
@@ -198,6 +252,12 @@ class PPNextNWorker(EAGLEWorker):
         draft_tokens = self._next_draft_from_spec_info(
             batch, num_accepted_tokens_cpu=res.draft_input.num_accepted_tokens_cpu
         )
+
+        if _DEBUG_PP_MTP:
+            logger.info(
+                f"[PP_LAST] _pp_mtp_verify: done, draft_tokens={draft_tokens}"
+            )
+
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=res.verified_id,
