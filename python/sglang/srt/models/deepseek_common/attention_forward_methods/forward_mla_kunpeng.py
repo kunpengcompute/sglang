@@ -178,6 +178,18 @@ class DeepseekMLAKunpengForwardMixin:
         if llama_4_scaling is not None:
             q = q * llama_4_scaling
 
+        # MTP draft-extend: left-pad q to a fixed (bs, max_ext_len, H, D) shape
+        # BEFORE any all2all, so the all2all row-splitting lands on sequence
+        # boundaries. Uses the global (unsliced) extend_seq_lens.
+        is_draft_extend = forward_batch.forward_mode.is_draft_extend()
+        orig_rows = q.shape[0]
+        if is_draft_extend:
+            q = kunpeng.pad_q_left_mtp_kunpeng(
+                q,
+                forward_batch.extend_seq_lens,
+                forward_batch.attn_backend.speculative_num_draft_tokens,
+            )  # (bs, max_ext_len, H, D)
+
         tp_size = get_attention_tp_size()
         if tp_size > 1 and not _DISABLE_MLA_ALL2ALL:
             socket_group = get_socket_tp_group()
@@ -185,27 +197,33 @@ class DeepseekMLAKunpengForwardMixin:
 
             # All2All #1: kunpeng SHM operator
             # (B, numhead_local, D_qk) → (B/a2a, numhead_local*a2a, D_qk)
-            B_q, numhead_local_q, D_qk = q.shape
-            batchsize_per_tp = B_q // all2all_size
+            if is_draft_extend:
+                bs = q.shape[0]
+                max_ext_len = q.shape[1]
+                numhead_local_q = q.shape[2]
+                D_qk = q.shape[3]
+                q = q.view(-1, numhead_local_q, D_qk)
+            else:
+                B_q, numhead_local_q, D_qk = q.shape
+            batchsize_per_tp = q.shape[0] // all2all_size
             q = kunpeng.shm_mla_q_alltoall_kunpeng(q, all2all_size)
 
             # After all2all each rank holds all Nh = num_local_heads * a2a heads;
             # temporarily override tp_q_head_num for the reshape in
             # KunpengCpuBackend.forward_decode.
+            if is_draft_extend:
+                # (bs/a2a, max_ext_len, H*a2a, D_qk) for the paged MLA kernel
+                q = q.view(
+                    batchsize_per_tp // max_ext_len,
+                    max_ext_len,
+                    numhead_local_q * all2all_size,
+                    D_qk,
+                )
             saved_tp_q_head_num = self.attn_mqa.tp_q_head_num
             self.attn_mqa.tp_q_head_num = self.num_local_heads * all2all_size
             try:
-                attn_output = self.attn_mqa(
-                    q,
-                    k,
-                    k_nope,
-                    forward_batch,
-                    save_kv_cache=False,
-                    **(
-                        dict(topk_indices=topk_indices)
-                        if topk_indices is not None
-                        else {}
-                    ),
+                attn_output = self._call_attn_mqa(
+                    q, k, k_nope, forward_batch, topk_indices
                 )
             finally:
                 self.attn_mqa.tp_q_head_num = saved_tp_q_head_num
@@ -213,20 +231,26 @@ class DeepseekMLAKunpengForwardMixin:
             # All2All #2: kunpeng SHM operator
             # (B/a2a, Nh_in_group, D_kv) → (B, numhead_local, D_kv)
             all_heads_in_group = self.num_local_heads * all2all_size
-            attn_output = attn_output.view(batchsize_per_tp, all_heads_in_group, self.kv_lora_rank)
+            attn_output = attn_output.view(
+                batchsize_per_tp, all_heads_in_group, self.kv_lora_rank
+            )
             attn_output = kunpeng.shm_mla_o_alltoall_kunpeng(attn_output, all2all_size)
+            if is_draft_extend:
+                # unpad back to the flat (sum_seq_len, H, D_kv) form
+                attn_output = attn_output.view(
+                    bs, max_ext_len, numhead_local_q, self.kv_lora_rank
+                )
+                attn_output = kunpeng.unpad_o_right_mtp_kunpeng(
+                    attn_output, forward_batch.extend_seq_lens, orig_rows
+                )
             # reshape back to flattened for w_vc
             attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         else:
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-                save_kv_cache=False,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
-
+            attn_output = self._call_attn_mqa(q, k, k_nope, forward_batch, topk_indices)
+            if is_draft_extend:
+                attn_output = kunpeng.unpad_o_right_mtp_kunpeng(
+                    attn_output, forward_batch.extend_seq_lens, orig_rows
+                )
             attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.q_lora_rank is not None:
@@ -268,3 +292,21 @@ class DeepseekMLAKunpengForwardMixin:
             return output, None
         else:
             return output, topk_indices
+
+    def _call_attn_mqa(
+        self,
+        q,
+        k,
+        k_nope,
+        forward_batch,
+        topk_indices,
+    ):
+        """Call attn_mqa with the shared save_kv_cache/topk plumbing."""
+        return self.attn_mqa(
+            q,
+            k,
+            k_nope,
+            forward_batch,
+            save_kv_cache=False,
+            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        )

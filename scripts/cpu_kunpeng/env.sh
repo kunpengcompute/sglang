@@ -13,7 +13,7 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: source env.sh [prefill|decode|native|router]
+# Usage: source env.sh [prefill|decode|native|router|build]
 
 # ------------------------------------------------------------
 # Helper: expand IP range notation "base_ip | ranges"
@@ -274,6 +274,10 @@ router_config() {
     export SGLANG_LAUNCH_HTTP_ONLY=1
 }
 
+build_config() {
+    :
+}
+
 # ------------------------------------------------------------
 # Main: dispatch based on command-line argument
 # ------------------------------------------------------------
@@ -281,11 +285,11 @@ ACTION="${1:-native}"
 shift
 
 case "$ACTION" in
-    prefill|decode|native|router)
+    prefill|decode|native|router|build)
         "${ACTION}_config"
         ;;
     *)
-        echo "Usage: source env.sh [prefill|decode|native|router]" >&2
+        echo "Usage: source env.sh [prefill|decode|native|router|build]" >&2
         return 1
         ;;
 esac
@@ -302,7 +306,7 @@ else
     export SGLANG_KUNPENG_MAX_CUR_LEN=1
 fi
 
-if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]]; then
+if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]] || [[ "$ACTION" == "build" ]]; then
     source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 
     export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
