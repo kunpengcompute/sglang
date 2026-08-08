@@ -533,7 +533,7 @@ class KunpengCpuBackend(AttentionBackend):
 
         return o_3d.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def _forward_extend_mla_paged(
+    def _forward_mla_paged(
         self,
         q,
         k,
@@ -541,25 +541,19 @@ class KunpengCpuBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ):
+        """Paged MLA attention core shared by decode / MTP / EXTEND.
+
+        q must already be 4D (bs, seqlen_q, tp_q_head_num, head_dim); shaping
+        and padding are done by the callers (or by the model for MTP
+        draft-extend). Returns o as 4D
+        (bs, seqlen_q, tp_q_head_num, v_head_dim).
+        """
         if layer.is_cross_attention:
             cache_loc = forward_batch.encoder_out_cache_loc
         else:
             cache_loc = forward_batch.out_cache_loc
 
         meta = self.forward_metadata
-        q_heads = q.view(-1, layer.tp_q_head_num, q.shape[-1])
-        bs = meta.seq_lens.shape[0]
-        max_ext_len = self.speculative_num_draft_tokens
-
-        if forward_batch.forward_mode.is_draft_extend():
-            q_padded = kunpeng.pad_q_left_mtp_kunpeng(
-                q_heads, meta.extend_seq_lens, max_ext_len
-            )
-        else:
-            q_padded = q_heads.view(
-                bs, max_ext_len, layer.tp_q_head_num, q_heads.shape[-1]
-            )
-
         kv_buf = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
         kvcache_paged = kv_buf[:, 0, :].reshape(-1, meta.page_size, kv_buf.shape[-1])
 
@@ -578,7 +572,7 @@ class KunpengCpuBackend(AttentionBackend):
             block_table = meta.block_table
 
         o_padded, softmax_lse = kunpeng.flash_mla_dense_decode_kunpeng(
-            q_padded,
+            q,
             kvcache_paged,
             block_table,
             meta.seq_lens,
@@ -589,14 +583,27 @@ class KunpengCpuBackend(AttentionBackend):
             layer.v_head_dim,
         )
 
-        if forward_batch.forward_mode.is_draft_extend():
-            o_flat = kunpeng.unpad_o_right_mtp_kunpeng(
-                o_padded, meta.extend_seq_lens, q_heads.shape[0]
-            )
-        else:
-            o_flat = o_padded
+        return o_padded
 
-        return o_flat.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+    def _forward_extend_mla_paged(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        """MLA prefill with prefix: reshape q to (bs, max_ext_len, H, D)."""
+        meta = self.forward_metadata
+        q_heads = q.view(-1, layer.tp_q_head_num, q.shape[-1])
+        q_4d = q_heads.view(
+            meta.seq_lens.shape[0],
+            self.speculative_num_draft_tokens,
+            layer.tp_q_head_num,
+            q_heads.shape[-1],
+        )
+        o_4d = self._forward_mla_paged(q_4d, k, v, layer, forward_batch)
+        return o_4d.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend_native(
         self,
@@ -658,9 +665,8 @@ class KunpengCpuBackend(AttentionBackend):
 
         - IDLE: no-op, matching base behaviour.
         - DECODE (single token per sequence): forward_decode.
-        - MTP speculative modes (TARGET_VERIFY, DRAFT_EXTEND): forward_extend;
-          the draft-extend path relies on this to run with
-          seqlen_q = speculative_num_draft_tokens.
+        - MTP speculative modes: forward_target_verify (TARGET_VERIFY) and
+          forward_draft_extend (DRAFT_EXTEND); both run the paged MLA path.
         - EXTEND: forward_extend.
         - Any other mode (MIXED, DRAFT_EXTEND_V2, PREBUILT, SPLIT_PREFILL,
           DLLM_EXTEND): raise, since it is not supported by this backend.
@@ -723,8 +729,22 @@ class KunpengCpuBackend(AttentionBackend):
         save_kv_cache: bool = False,
         **kwargs,
     ):
-        """MTP target-verify forward, currently backed by the paged MLA path."""
-        return self._forward_extend_mla_paged(q, k, v, layer, forward_batch)
+        """MTP target-verify forward via the paged MLA path.
+
+        q has a fixed shape (sum_seq_len == bs * speculative_num_draft_tokens);
+        it is reshaped here to (bs, speculative_num_draft_tokens, H, D).
+        """
+        self.swap_mgr.get_kv_cache()
+
+        meta = self.forward_metadata
+        q_heads = q.view(-1, layer.tp_q_head_num, q.shape[-1])
+        q_4d = q_heads.view(
+            meta.seq_lens.shape[0],
+            self.speculative_num_draft_tokens,
+            layer.tp_q_head_num,
+            q_heads.shape[-1],
+        )
+        return self._forward_mla_paged(q_4d, k, v, layer, forward_batch)
 
     def forward_draft_extend(
         self,
@@ -736,8 +756,15 @@ class KunpengCpuBackend(AttentionBackend):
         save_kv_cache: bool = False,
         **kwargs,
     ):
-        """MTP draft-extend forward, currently backed by the paged MLA path."""
-        return self._forward_extend_mla_paged(q, k, v, layer, forward_batch)
+        """MTP draft-extend forward via the paged MLA path.
+
+        q is already left-padded by the model (forward_absorb_core_kunpeng) to
+        (bs, speculative_num_draft_tokens, H, D); the unpad happens there too,
+        so this only runs the paged MLA kernel.
+        """
+        self.swap_mgr.get_kv_cache()
+
+        return self._forward_mla_paged(q, k, v, layer, forward_batch)
 
     def forward_extend(
         self,
@@ -750,14 +777,6 @@ class KunpengCpuBackend(AttentionBackend):
     ):
 
         self.swap_mgr.get_kv_cache()
-
-        # MLA_KUNPENG with prefix — attn_mqa needs paged KV cache read.
-        if (
-            layer.tp_k_head_num == 1
-            and layer.tp_q_head_num != 1
-            and self.forward_metadata is not None
-        ):
-            return self._forward_extend_mla_paged(q, k, v, layer, forward_batch)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
         is_cross_attn = layer.is_cross_attention
@@ -787,59 +806,11 @@ class KunpengCpuBackend(AttentionBackend):
 
         q_head_dim = q.shape[-1]
         q = q.reshape(-1, layer.tp_q_head_num * q_head_dim)
-
-        if layer.is_cross_attention:
-            cache_loc = forward_batch.encoder_out_cache_loc
-        else:
-            cache_loc = forward_batch.out_cache_loc
-
         q_ = q.view(-1, layer.tp_q_head_num, q_head_dim)
 
-        kv_k = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
-        softmax_scale = (
-            layer.scaling
-            if layer.scaling is not None
-            else 1.0 / math.sqrt(layer.qk_head_dim)
-        )
+        o_4d = self._forward_mla_paged(q_.unsqueeze(1), k, v, layer, forward_batch)
 
-        batch_size = q_.shape[0]
-        num_q_heads = q_.shape[1]
-        head_dim = layer.qk_head_dim
-        head_dim_v = layer.v_head_dim
-        kv_cache_dim = kv_k.shape[-1]
-
-        metadata = self.forward_metadata
-        seq_lens = metadata.seq_lens
-        block_table = self.swap_mgr.get_remapped_block_table()
-        if block_table is None:
-            block_table = metadata.block_table
-        page_size = metadata.page_size
-
-        q_4d = q_.unsqueeze(1)
-
-        kvcache_paged = kv_k[:, 0, :].reshape(-1, page_size, kv_cache_dim)
-
-        extra_buffer = (
-            kunpeng.alloc_buffer(metadata.extra_bytes)
-            if metadata.extra_bytes > 0
-            else torch.empty(0, dtype=torch.uint8, device=q_.device)
-        )
-
-        o_graph, softmax_lse = kunpeng.flash_mla_dense_decode_kunpeng(
-            q_4d,
-            kvcache_paged,
-            block_table,
-            seq_lens,
-            softmax_scale,
-            not layer.is_cross_attention,
-            extra_buffer,
-            self._decode_meta,
-            head_dim_v,
-        )
-
-        o = o_graph.view(batch_size, -1)
-
-        return o
+        return o_4d.view(q_.shape[0], -1)
 
     def support_triton(self):
         return False
