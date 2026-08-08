@@ -669,20 +669,12 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
-        if self.pp_size > 1 and self.pp_rank != self.pp_size - 1:
-            # Under pipeline parallelism, the draft model (MTP) only runs on the
-            # last PP rank: it consumes the target's final hidden states, which
-            # are only produced there. Other ranks run the plain target worker
-            # and participate in the verify passes via the ring messages.
-            # NOTE: `self.pp_group` is not initialized yet at this point, so we
-            # compare `pp_rank` directly.
+        if self.pp_size > 1:
             logger.info(
-                f"[PP{self.pp_rank}] Skipping draft worker — only last "
-                f"PP rank hosts MTP (pp_size={self.pp_size})"
+                f"[PP{self.pp_rank}] Creating draft worker on all PP ranks "
+                f"to participate in init all_reduce (only last rank uses it "
+                f"for MTP; pp_size={self.pp_size})"
             )
-            self.draft_worker = None
-            self.external_corpus_manager = None
-            return
 
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
@@ -739,15 +731,20 @@ class Scheduler(
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
-        else:
-            # Under PP, only the last rank hosts the draft worker; the other
-            # ranks use the plain target worker (verify passes are driven by
-            # the ring messages and the scheduler-side batch preparation).
-            self.model_worker = (
-                self.draft_worker if self.draft_worker is not None else self.tp_worker
-            )
+        elif self.pp_size > 1 and self.pp_rank != self.pp_size - 1:
+            # Under PP, all ranks create the draft worker to participate in
+            # collective ops during init (see get_available_gpu_memory), but
+            # only the last rank uses it as model_worker — non-last ranks
+            # use the plain target worker.
+            self.model_worker = self.tp_worker
             logger.info(
-                f"[PP{self.pp_rank}] model_worker={'PPNextNWorker' if self.draft_worker else 'TpModelWorker'} "
+                f"[PP{self.pp_rank}] model_worker=TpModelWorker "
+                f"(draft_worker exists but unused, pp_size={self.pp_size})"
+            )
+        else:
+            self.model_worker = self.draft_worker
+            logger.info(
+                f"[PP{self.pp_rank}] model_worker={type(self.draft_worker).__name__} "
                 f"(pp_size={self.pp_size}, spec={self.spec_algorithm})"
             )
 
