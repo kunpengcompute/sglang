@@ -170,6 +170,7 @@ from sglang.srt.utils import (
     is_kunpeng_binary_launch,
     is_tokenizer_separate,
 )
+from sglang.srt.utils.common import is_http_only
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
@@ -2218,13 +2219,6 @@ def _setup_and_run_http_server(
             port_args, server_args, scheduler_infos[0]
         )
 
-    if envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
-        import psutil
-
-        p = psutil.Process(os.getpid())
-        # TODO (kunpeng): hard code here, should use a more elegant way.
-        if not envs.SGLANG_ENABLE_BINARY_LAUNCH.get():
-            p.cpu_affinity({34})  # 34
 
     _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
     if is_kunpeng_binary_launch() and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
@@ -2358,6 +2352,32 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    # Bind the main process (HTTP server + tokenizer) away from the scheduler
+    # main thread's core (*38+17) so tokenizer work cannot preempt it.  Kept
+    # in this add-data module (not the pyinstall entry script) so changes take
+    # effect by replacing the file instead of rebuilding the PYZ.
+    import psutil
+
+    if is_http_only():
+        p = psutil.Process(os.getpid())
+        if server_args.disaggregation_mode == "decode":
+            p.cpu_affinity(list(range(76, 151)))
+        else:
+            p.cpu_affinity(list(range(0, 75)))
+    elif envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
+        p = psutil.Process(os.getpid())
+        # TODO (kunpeng): hard code here, should use a more elegant way.
+        if envs.SGLANG_ENABLE_BINARY_LAUNCH.get():
+            # Main process (HTTP server + tokenizer) must NOT share the
+            # scheduler main thread's core (*38+17); bind it to the spare
+            # core *38+18 so tokenizer work cannot preempt the scheduler.
+            p.cpu_affinity({server_args.tp_rank_in_node * 38 + 18})
+            logger.info(
+                f"[pp-affinity] main process (http+tokenizer) cpus={p.cpu_affinity()}"
+            )
+        else:
+            p.cpu_affinity(list(range(1, 33)))
+
     # Launch subprocesses
     (
         tokenizer_manager,
