@@ -1056,6 +1056,29 @@ class GroupCoordinator:
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             elif (
                 self.use_kunpeng_communicator
+                and input_.dim() == 1
+                and input_.dtype == torch.bfloat16
+                and self.world_size in (8, 16)
+            ):
+                # PP passes 1D hidden shards (e.g. (7168,)) whose shape[0] the
+                # kunpeng branch below treats as batch (gated by shape[0] <=
+                # max_tokens), so they would fall back to Gloo; use the
+                # batched SHM allgather [1, dim] -> [1, dim * world_size].
+                out = torch.empty(
+                    (1, input_.numel() * self.world_size),
+                    dtype=input_.dtype,
+                    device=input_.device,
+                )
+                torch.ops.sgl_kernel.shm_batched_allgather_kunpeng(
+                    input_.unsqueeze(0), out, self.world_size
+                )
+                return out.reshape(
+                    input_size[:dim]
+                    + (world_size * input_size[dim],)
+                    + input_size[dim + 1 :]
+                )
+            elif (
+                self.use_kunpeng_communicator
                 and input_.shape[0] > 0
                 and input_.shape[0] <= self.kunpeng_communicator.max_tokens
             ):
