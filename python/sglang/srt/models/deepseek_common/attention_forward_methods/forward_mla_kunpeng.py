@@ -84,8 +84,8 @@ class DeepseekMLAKunpengForwardMixin:
 
             qk_dim = self.kv_lora_rank + self.qk_rope_head_dim
             rows = q_nope.size(0)
-            q_combined = kunpeng.alloc_buffer(rows * bs * qk_dim * 2).view(
-                torch.bfloat16
+            q_combined = kunpeng.alloc_buffer(
+                rows * bs * qk_dim, dtype=torch.bfloat16
             ).view(rows, bs, qk_dim)
             kunpeng.batched_gemm_woqs8_allthreads_inplace_kunpeng(
                 pa_3d, self.w_kc_int8_packed, None, scale_3d,
@@ -93,8 +93,8 @@ class DeepseekMLAKunpengForwardMixin:
 
             if self.rotary_emb is not None:
                 k_pe_out = kunpeng.alloc_buffer(
-                    rows * self.qk_rope_head_dim * 2
-                ).view(torch.bfloat16).view(rows, 1, self.qk_rope_head_dim)
+                    rows * self.qk_rope_head_dim, dtype=torch.bfloat16
+                ).view(rows, 1, self.qk_rope_head_dim)
                 kunpeng.rope_inplace_kunpeng(
                     positions, q_pe, k_pe,
                     q_combined[:, :, self.kv_lora_rank:], k_pe_out,
@@ -240,9 +240,9 @@ class DeepseekMLAKunpengForwardMixin:
 
             pa_3d = kunpeng.batched_gemm_pack_allthreads_kunpeng(a_3d)
 
-            c_flat = kunpeng.alloc_buffer(B * bs * n * 2).view(
-                torch.bfloat16
-            ).view(B, bs * n)
+            c_flat = kunpeng.alloc_buffer(B * bs * n, dtype=torch.bfloat16).view(
+                B, bs * n
+            )
             c_3d_t = c_flat.view(B, bs, n).transpose(0, 1)
             kunpeng.batched_gemm_woqs8_allthreads_inplace_kunpeng(
                 pa_3d, self.w_vc_int8_packed, rscale_3d, None, c_3d_t)

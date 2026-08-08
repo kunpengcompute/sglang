@@ -255,8 +255,11 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
             pack_a = kunpeng.s8_gemm_pack_kunpeng(norm_int8, tile_m, tile_k)
 
-            workspace = kunpeng.alloc_buffer(batch_size * n * 64,
-                                         dtype=torch.bfloat16)
+            blocks_in_k = k // tile_k
+            workspace = kunpeng.alloc_buffer(
+                blocks_in_k * n * batch_size * 2 if blocks_in_k > 1 else 0,
+                dtype=torch.bfloat16,
+            )
 
             output = kunpeng.s8_s8_packed_gemm_bf16_dq_kunpeng(
                 pack_a, layer.weight, layer.weight_scale.view(-1),

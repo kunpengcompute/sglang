@@ -150,11 +150,11 @@ def _setup_s8_gemm_pack_kunpeng():
 
 
 def _setup_alloc_buffer():
-    def shape_infer(size_bytes, dtype=torch.uint8):
-        return [((size_bytes,), dtype)]
+    def shape_infer(numel, dtype=torch.uint8):
+        return [((numel,), dtype)]
 
-    def eager_fn(size_bytes, dtype=torch.uint8):
-        return torch.empty(size_bytes, dtype=dtype)
+    def eager_fn(numel, dtype=torch.uint8):
+        return torch.empty(numel, dtype=dtype)
 
     register_op('alloc_buffer', shape_infer, eager_fn)
 

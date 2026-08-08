@@ -126,16 +126,16 @@ def kutacc_mha(
     # chunk header.
     sum_seq_len = max(bs * max_seq_len, kv_n_token)
     para_k = kunpeng.alloc_buffer(
-        sum_seq_len * num_heads * qk_head_dim * query.element_size()
+        sum_seq_len * num_heads * qk_head_dim, dtype=query.dtype
     )
     kunpeng.zero_(para_k)
-    para_k = para_k.view(query.dtype).view(sum_seq_len, num_heads, qk_head_dim)
+    para_k = para_k.view(sum_seq_len, num_heads, qk_head_dim)
     kunpeng.copy_kunpeng(para_k[:kv_n_token], key)
     para_v = kunpeng.alloc_buffer(
-        sum_seq_len * num_heads * vo_head_dim * value.element_size()
+        sum_seq_len * num_heads * vo_head_dim, dtype=value.dtype
     )
     kunpeng.zero_(para_v)
-    para_v = para_v.view(value.dtype).view(sum_seq_len, num_heads, vo_head_dim)
+    para_v = para_v.view(sum_seq_len, num_heads, vo_head_dim)
     kunpeng.copy_kunpeng(para_v[:kv_n_token], value)
 
     # Q/O: pad to n_token + BR. The kernel loads Q in BR=128 tiles and writes
@@ -144,10 +144,10 @@ def kutacc_mha(
     # tensors absorb the over-read/write; we have to pad explicitly.)
     padded_n_token = n_token + BR
     padded_q = kunpeng.alloc_buffer(
-        padded_n_token * num_heads * qk_head_dim * query.element_size()
+        padded_n_token * num_heads * qk_head_dim, dtype=query.dtype
     )
     kunpeng.zero_(padded_q)
-    padded_q = padded_q.view(query.dtype).view(padded_n_token, num_heads, qk_head_dim)
+    padded_q = padded_q.view(padded_n_token, num_heads, qk_head_dim)
     kunpeng.copy_kunpeng(padded_q[:n_token], query)
 
     # Workspace for all scratch tensors. C++ side bump-allocates contiguous
