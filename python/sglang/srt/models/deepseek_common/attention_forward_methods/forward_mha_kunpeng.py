@@ -88,6 +88,59 @@ class DeepseekMHAKunpengForwardMixin:
         v = kv[..., self.qk_nope_head_dim :]
         k = self._concat_and_cast_mha_k_kunpeng(k_nope, k_pe, forward_batch)
 
+        # Chunked prefill: load prefix KV from cache and prepend to k/v.
+        # In graph mode, prefix KV loading uses graph ops (gather_kv_kunpeng,
+        # kv_b_proj GEMM, cat_kunpeng) so prefix KV is re-read at replay.
+        # prefix_kv_indices is pre-built in _build_kunpeng_graph_inputs
+        # (graph mode) or built here (eager mode).
+        prefix_lens_cpu = (
+            forward_batch.extend_prefix_lens_cpu
+            if forward_batch.extend_prefix_lens_cpu is not None
+            else []
+        )
+        total_prefix = sum(prefix_lens_cpu) if prefix_lens_cpu else 0
+        if total_prefix > 0:
+            prefix_kv_indices = getattr(
+                forward_batch, "prefix_kv_indices", None
+            )
+            if prefix_kv_indices is None:
+                # Eager mode: build prefix_kv_indices here
+                req_to_token = forward_batch.req_to_token_pool.req_to_token
+                req_pool_indices = forward_batch.req_pool_indices
+                prefix_kv_indices_list = []
+                for i, req_idx in enumerate(req_pool_indices.tolist()):
+                    pfx_len = int(prefix_lens_cpu[i])
+                    if pfx_len > 0:
+                        prefix_kv_indices_list.append(
+                            req_to_token[req_idx, :pfx_len]
+                        )
+                if prefix_kv_indices_list:
+                    prefix_kv_indices = torch.cat(prefix_kv_indices_list)
+            kv_buf = self.swap_mgr.get_kv_cache()
+            # gather_kv_kunpeng: graph op that re-reads prefix KV at replay
+            prefix_latent = kunpeng.gather_kv_kunpeng(
+                kv_buf, prefix_kv_indices
+            ).to(k.dtype)
+            # split is a view op — shares storage with prefix_latent,
+            # so it reflects updated data at replay time.
+            prefix_kv_a, prefix_k_pe = prefix_latent.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            # Use contiguous_kunpeng (graph op) to ensure the GEMM input
+            # is contiguous and updated at replay time.
+            prefix_kv_a = kunpeng.contiguous_kunpeng(prefix_kv_a.squeeze(1))
+            prefix_out, _ = self.kv_b_proj(prefix_kv_a)
+            prefix_kv = prefix_out.view(
+                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            prefix_k_nope = prefix_kv[..., : self.qk_nope_head_dim]
+            prefix_v = prefix_kv[..., self.qk_nope_head_dim :]
+            prefix_k = self._concat_and_cast_mha_k_kunpeng(
+                prefix_k_nope, prefix_k_pe, forward_batch
+            )
+            k = kunpeng.cat_kunpeng(prefix_k, k, 0)
+            v = kunpeng.cat_kunpeng(prefix_v, v, 0)
+
         return q, k, v, forward_batch
 
     def forward_normal_core_kunpeng(

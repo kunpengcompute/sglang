@@ -97,6 +97,7 @@ def kutacc_mha(
     value,
     softmax_scale,
     extend_seq_lens,
+    extend_prefix_lens=None,
     is_causal=True,
 ):
     """Workspace-based flash attention mirroring DeepSeek-V3-Sample prefill.
@@ -105,11 +106,43 @@ def kutacc_mha(
     slices all scratch buffers from a single contiguous workspace tensor so the
     kernel's BR/BC tile over-reads stay inside the workspace instead of
     corrupting glibc heap metadata.
+
+    Args:
+        query: (n_token, num_heads, qk_head_dim) — Q for current chunk only.
+        key/value: (prefix_n_token + n_token, num_heads, ...) — K/V for
+            prefix + current chunk, already concatenated by the caller when
+            extend_prefix_lens is provided.
+        extend_seq_lens: (bs,) — current chunk length per request.
+        extend_prefix_lens: (bs,) — prefix KV length per request. When None
+            or all zeros, behavior is identical to the original (non-chunked).
     """
     bs = extend_seq_lens.shape[0]
     n_token = query.shape[0]
     kv_n_token = key.shape[0]  # K/V may be TP-padded beyond actual token count
     max_seq_len = extend_seq_lens.max().item()
+
+    # prefix_lens[i]: number of KV tokens from previous chunks for request i.
+    # When extend_prefix_lens is None or all zeros, prefix_lens is all zero
+    # and the kernel behaves exactly as the original (no prefix KV).
+    if extend_prefix_lens is None:
+        prefix_lens = [0] * bs
+    else:
+        prefix_lens = [
+            int(x) for x in extend_prefix_lens.tolist()
+        ]
+
+    # seq_lens[i] = prefix_len + extend_seq_len: total KV length per request.
+    # cur_lens[i] = extend_seq_len: current Q length per request.
+    # The C++ kernel uses seq_lens[i] - cur_lens[i] as the prefix offset and
+    # key_start_loc to locate the K/V slice for each request inside the
+    # concatenated K/V tensor.
+    seq_lens_list = [
+        prefix_lens[i] + int(extend_seq_lens[i].item())
+        for i in range(bs)
+    ]
+    cur_lens_list = [int(extend_seq_lens[i].item()) for i in range(bs)]
+    max_total_len = max(seq_lens_list) if seq_lens_list else 0
+
     num_heads = query.shape[1]
     qk_head_dim = query.shape[2]
     vo_head_dim = value.shape[2]
@@ -121,10 +154,10 @@ def kutacc_mha(
     BR, BC = torch.ops.sgl_kernel.get_flash_attention_block_kunpeng()
 
     # K/V buffer sized to hold the (possibly TP-padded) K/V data, with at
-    # least bs * max_seq_len slots so the kernel's BC=128 tile over-read past
+    # least bs * max_total_len slots so the kernel's BC=128 tile over-read past
     # any sequence end stays inside the buffer instead of hitting a glibc
-    # chunk header.
-    sum_seq_len = max(bs * max_seq_len, kv_n_token)
+    # chunk header. max_total_len covers prefix + chunk.
+    sum_seq_len = max(bs * max_total_len, kv_n_token)
     para_k = kunpeng.alloc_buffer(
         sum_seq_len * num_heads * qk_head_dim, dtype=query.dtype
     )
@@ -178,15 +211,8 @@ def kutacc_mha(
     workspace = kunpeng.alloc_buffer(ws_bytes)
 
     attn_out = kunpeng.flash_attention_with_workspace_kunpeng(
-        padded_q,
-        para_k,
-        para_v,
-        workspace,
-        extend_seq_lens,
-        is_causal,
-        softmax_scale,
-        max_seq_len,
-    )
+        padded_q, para_k, para_v, workspace, extend_seq_lens,
+        extend_prefix_lens, is_causal, softmax_scale, max_total_len)
 
     return attn_out[:n_token]
 
@@ -282,6 +308,15 @@ class KunpengCpuBackend(AttentionBackend):
                 enable_blockwise=True,
             )
             self._init_blockwise_swap_metadata(metadata, forward_batch)
+        elif forward_batch.forward_mode.is_extend():
+            # Chunked prefill: each request's total K/V length seen by
+            # attention is extend_prefix_lens + extend_seq_lens, and the
+            # page table must cover the full range (prefix pages already
+            # populated in KV cache + current chunk's out_cache_loc pages
+            # filled by this layer's KV write). The MLA paged kernel
+            # natively reads the prefix via block_table, so the same
+            # paged-MLA code path used for decode is reused here.
+            self._init_extend_metadata(forward_batch)
         return
 
     def _init_decode_metadata(
@@ -482,6 +517,201 @@ class KunpengCpuBackend(AttentionBackend):
             metadata.token_slice_start,
         )
 
+    def _init_extend_metadata(self, forward_batch: ForwardBatch):
+        """Build paged-MLA metadata for EXTEND (incl. chunked prefill).
+
+        The model's forward_absorb_core_kunpeng does a token-level
+        all2all on q: (B, numhead_local, D) → (B/a2a, Nh, D) where
+        B = sum(extend_seq_lens). Each rank only sees B/a2a tokens,
+        so we expand each request into a2a virtual sub-requests,
+        take this rank's slice, and build metadata accordingly.
+        """
+        metadata = KunpengCpuMetadata()
+
+        metadata.page_size = forward_batch.token_to_kv_pool.page_size
+        page_size = metadata.page_size
+
+        req_to_token = forward_batch.req_to_token_pool.req_to_token.to(torch.int32)
+        orig_req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+        out_cache_loc = forward_batch.out_cache_loc.to(torch.int64)
+
+        orig_extend_prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+        orig_extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+
+        device = orig_extend_seq_lens.device
+        orig_bs = orig_extend_seq_lens.shape[0]
+
+        # Flat offset of each original request's chunk in out_cache_loc.
+        orig_chunk_offsets = torch.zeros(
+            orig_bs + 1, dtype=torch.int64, device=device
+        )
+        orig_chunk_offsets[1:] = torch.cumsum(
+            orig_extend_seq_lens.to(torch.int64), dim=0
+        )
+
+        # MLA all2all: expand each request into a2a virtual sub-requests.
+        tp_size = get_attention_tp_size()
+        if tp_size > 1 and not _DISABLE_MLA_ALL2ALL:
+            socket_group = get_socket_tp_group()
+            all2all_size = socket_group.world_size
+            group_rank = socket_group.rank_in_group
+
+            # all2all flattens all tokens across requests into a single
+            # (B, numhead_local, D) tensor and splits by token:
+            #   (B, Nl, D) → (B//a2a, Nl*a2a, D)
+            # The C++ shm_alltoall2D scatters tokens CONTIGUOUSLY: rank r
+            # receives tokens [r*B//a2a, (r+1)*B//a2a). This matches the
+            # decode path which slices seq_lens the same way. We must
+            # build per-token virtual rows matching this contiguous split.
+            total_tokens = int(orig_extend_seq_lens.sum().item())
+            # Pad total_tokens up to a multiple of all2all_size (the C++
+            # all2all operator requires B % a2a == 0).  Padded slots get
+            # zero-length virtual rows that the kernel skips.
+            padded_total = (
+                (total_tokens + all2all_size - 1) // all2all_size
+            ) * all2all_size
+
+            # Build flat per-token arrays (length = total_tokens, pre-pad).
+            # For block_table construction we need, per token t in a chunk:
+            #   - real_pfx  : length of KV from PREVIOUS chunks (in req_to_token)
+            #   - chunk_off : start offset of the CURRENT chunk in out_cache_loc
+            #   - pos_in_chunk : t (0-indexed within current chunk)
+            #   - seq_len   : real_pfx + t + 1 (total KV positions to attend)
+            # block_table then covers:
+            #   [0, real_pfx)              -> req_to_token pages (previous chunks)
+            #   [real_pfx, real_pfx+t+1)   -> out_cache_loc[chunk_off : chunk_off+t+1] pages
+            tok_pfx = []        # = real_pfx + t (kept for seq_len compat / logging)
+            tok_seq = []        # = real_pfx + t + 1
+            tok_req = []
+            tok_c = []          # = chunk_off + t (kept for logging)
+            tok_real_pfx = []   # real prefix length (previous chunks only)
+            tok_chunk_off = []  # start offset of current chunk in out_cache_loc
+            tok_pos = []        # position t within current chunk
+            for b in range(orig_bs):
+                L = int(orig_extend_seq_lens[b].item())
+                if L == 0:
+                    continue
+                pfx = int(orig_extend_prefix_lens[b].item())
+                c_off = int(orig_chunk_offsets[b].item())
+                req_idx = int(orig_req_pool_indices[b].item())
+                for t in range(L):
+                    tok_pfx.append(pfx + t)
+                    tok_seq.append(pfx + t + 1)
+                    tok_req.append(req_idx)
+                    tok_c.append(c_off + t)
+                    tok_real_pfx.append(pfx)
+                    tok_chunk_off.append(c_off)
+                    tok_pos.append(t)
+
+            # Pad to padded_total with zero-length rows (harmless).
+            for _ in range(padded_total - total_tokens):
+                tok_pfx.append(0)
+                tok_seq.append(0)
+                tok_req.append(0)
+                tok_c.append(0)
+                tok_real_pfx.append(0)
+                tok_chunk_off.append(0)
+                tok_pos.append(0)
+
+            # rank r owns a CONTIGUOUS block of tokens
+            # [r*B//a2a, (r+1)*B//a2a), matching the C++ all2all operator.
+            batchsize_per_tp = padded_total // all2all_size
+            start = group_rank * batchsize_per_tp
+            end = start + batchsize_per_tp
+            idx = torch.arange(
+                start, end, dtype=torch.int64, device=device,
+            )
+            # Each token is its own virtual row with ext_len=1.
+            extend_seq_lens = torch.ones(
+                len(idx), dtype=torch.int32, device=device
+            )
+            extend_prefix_lens = torch.tensor(
+                tok_pfx, dtype=torch.int32, device=device
+            )[idx]
+            seq_lens = torch.tensor(
+                tok_seq, dtype=torch.int32, device=device
+            )[idx]
+            req_pool_indices = torch.tensor(
+                tok_req, dtype=torch.int32, device=device
+            )[idx]
+            c_starts = torch.tensor(
+                tok_c, dtype=torch.int64, device=device
+            )[idx]
+            # Per-token info for correct block_table construction:
+            #   real_prefix_lens : length of KV from previous chunks (req_to_token)
+            #   chunk_starts     : start offset of current chunk in out_cache_loc
+            #   token_pos_in_chunk: position t within current chunk
+            real_prefix_lens = torch.tensor(
+                tok_real_pfx, dtype=torch.int32, device=device
+            )[idx]
+            chunk_starts = torch.tensor(
+                tok_chunk_off, dtype=torch.int64, device=device
+            )[idx]
+            token_pos_in_chunk = torch.tensor(
+                tok_pos, dtype=torch.int32, device=device
+            )[idx]
+
+            # Per-token all2all split: build block_table per token.
+            num_heads_q = self.num_q_heads * all2all_size
+            is_per_token_split = True
+        else:
+            extend_seq_lens = orig_extend_seq_lens
+            extend_prefix_lens = orig_extend_prefix_lens
+            # seq_lens must reflect the TOTAL KV length per request (prefix
+            # already in cache + current chunk).  In non-chunked prefill
+            # extend_prefix_lens is all zeros, so seq_lens would only cover
+            # the current chunk and the block_table would miss prefix pages.
+            # Use forward_batch.seq_lens (which is prefix + chunk) instead.
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            req_pool_indices = orig_req_pool_indices
+            c_starts = orig_chunk_offsets[:-1]
+            num_heads_q = self.num_q_heads
+            is_per_token_split = False
+            # Dummy arrays (unused, for code symmetry).
+            real_prefix_lens = extend_prefix_lens
+            chunk_starts = c_starts
+            token_pos_in_chunk = torch.zeros_like(extend_seq_lens)
+
+        batch_size = extend_seq_lens.shape[0]
+        metadata.seq_lens = seq_lens
+        metadata.extend_seq_lens = extend_seq_lens
+
+        # Build block_table from req_to_token (prefix + chunk positions).
+        # Avoids duplicate page entries when prefix_len isn't page-aligned.
+        max_total_len = int(seq_lens.max().item()) if batch_size > 0 else 0
+        max_blocks = (max_total_len + page_size - 1) // page_size
+        metadata.block_table = torch.zeros(
+            (batch_size, max_blocks), dtype=torch.int32, device=device
+        )
+
+        for b in range(batch_size):
+            req_idx = int(req_pool_indices[b].item())
+            total_len = int(seq_lens[b].item())
+            if total_len == 0:
+                continue
+            num_blocks = (total_len + page_size - 1) // page_size
+            for j in range(num_blocks):
+                token_idx = req_to_token[req_idx, j * page_size].item()
+                metadata.block_table[b, j] = token_idx // page_size
+
+        max_ext_len = int(extend_seq_lens.max().item()) if batch_size > 0 else 0
+        seqlen_q = max_ext_len
+
+        metadata.extra_bytes = (
+            torch.ops.sgl_kernel.flash_mla_dense_decode_sched_kunpeng(
+                metadata.seq_lens,
+                seqlen_q=seqlen_q,
+                num_heads_q=num_heads_q,
+                head_dim=self.head_dim,
+                head_dim_v=self.head_dim_v,
+                page_block_size=metadata.page_size,
+                is_kv_packed=False,
+                meta=self._decode_meta,
+            )
+        )
+
+        self.forward_metadata = metadata
+
     def _get_kv_buffer(
         self,
         layer: RadixAttention,
@@ -522,12 +752,18 @@ class KunpengCpuBackend(AttentionBackend):
             else 1.0 / math.sqrt(layer.qk_head_dim)
         )
 
+        # Pass extend_prefix_lens so kutacc_mha can correctly set key_start_loc
+        # and seq_lens when there is prefix KV (chunked prefill). When None
+        # (non-chunked prefill) or all zeros, behavior is identical to original.
+        # K/V tensors already contain prefix + chunk concatenated by the
+        # caller (forward_normal_prepare_kunpeng) when prefix > 0.
         o_3d = kutacc_mha(
             query=q_3d,
             key=k_3d,
             value=v_3d,
             softmax_scale=softmax_scale,
             extend_seq_lens=forward_batch.extend_seq_lens,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
             is_causal=True,
         )
 
@@ -554,6 +790,82 @@ class KunpengCpuBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         meta = self.forward_metadata
+        q_heads = q.view(-1, layer.tp_q_head_num, q.shape[-1])
+        bs = meta.seq_lens.shape[0]
+
+        # Two callers reach this method:
+        #   1. target_verify / draft_extend — every request attends to its
+        #      current draft token (fixed seqlen_q == speculative_num_draft_tokens).
+        #   2. EXTEND (incl. chunked prefill) — each request attends to its
+        #      current chunk; seqlen_q per request is extend_seq_lens[b].
+        #   3. DECODE — single token per request, q already (bs, 1, H, D).
+        is_decode = forward_batch.forward_mode.is_decode()
+
+        # Decode fast path: original behaviour — pass q directly to the
+        # kernel and return o_padded without any view/reshape.  The extra
+        # q_heads.view + o_flat.view chain breaks graph replay because the
+        # intermediate shapes are captured at bs=1 and cannot adapt when
+        # the real batch size differs.
+        if is_decode:
+            kv_buf = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
+            kvcache_paged = kv_buf[:, 0, :].reshape(
+                -1, meta.page_size, kv_buf.shape[-1]
+            )
+            softmax_scale = (
+                layer.scaling
+                if layer.scaling is not None
+                else 1.0 / math.sqrt(layer.qk_head_dim)
+            )
+            extra_buffer = (
+                kunpeng.alloc_buffer(meta.extra_bytes)
+                if meta.extra_bytes > 0
+                else torch.empty(0, dtype=torch.uint8, device=q.device)
+            )
+            block_table = self.swap_mgr.get_remapped_block_table()
+            if block_table is None:
+                block_table = meta.block_table
+
+            o_padded, softmax_lse = kunpeng.flash_mla_dense_decode_kunpeng(
+                q,
+                kvcache_paged,
+                block_table,
+                meta.seq_lens,
+                softmax_scale,
+                not layer.is_cross_attention,
+                extra_buffer,
+                self._decode_meta,
+                layer.v_head_dim,
+            )
+            return o_padded
+
+        # Non-decode paths (target_verify / draft_extend / EXTEND)
+        if forward_batch.forward_mode.is_extend():
+            ext_lens = meta.extend_seq_lens
+            max_ext_len = int(ext_lens.max().item())
+            mla_padding_enable = True
+        else:
+            ext_lens = meta.extend_seq_lens
+            max_ext_len = self.speculative_num_draft_tokens
+            mla_padding_enable = getattr(self, "mla_padding_enable", False)
+
+        if mla_padding_enable:
+            q_padded = torch.zeros(
+                (bs, max_ext_len, layer.tp_q_head_num, layer.qk_head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            kunpeng.pad_q_left_mtp_kunpeng(
+                q_heads.contiguous(),
+                ext_lens,
+                max_ext_len,
+                q_padded,
+            )
+        else:
+            # target_verify path: q already (bs, max_ext_len, num_heads, D)
+            q_padded = q_heads.view(
+                bs, max_ext_len, layer.tp_q_head_num, q_heads.shape[-1]
+            )
+
         kv_buf = self._get_kv_buffer(layer, forward_batch, k, v, cache_loc)
         kvcache_paged = kv_buf[:, 0, :].reshape(-1, meta.page_size, kv_buf.shape[-1])
 
@@ -571,8 +883,8 @@ class KunpengCpuBackend(AttentionBackend):
         if block_table is None:
             block_table = meta.block_table
 
-        o_padded, softmax_lse = kunpeng.flash_mla_dense_decode_kunpeng(
-            q,
+        o_padded, softmax_lse = kunpeng.flash_mla_dense_extend_kunpeng(
+            q_padded,
             kvcache_paged,
             block_table,
             meta.seq_lens,
@@ -583,27 +895,24 @@ class KunpengCpuBackend(AttentionBackend):
             layer.v_head_dim,
         )
 
-        return o_padded
-
-    def _forward_extend_mla_paged(
-        self,
-        q,
-        k,
-        v,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-    ):
-        """MLA prefill with prefix: reshape q to (bs, max_ext_len, H, D)."""
-        meta = self.forward_metadata
-        q_heads = q.view(-1, layer.tp_q_head_num, q.shape[-1])
-        q_4d = q_heads.view(
-            meta.seq_lens.shape[0],
-            self.speculative_num_draft_tokens,
-            layer.tp_q_head_num,
-            q_heads.shape[-1],
-        )
-        o_4d = self._forward_mla_paged(q_4d, k, v, layer, forward_batch)
-        return o_4d.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        # Unpad path: chunked prefill (varlen rows) needs explicit unpad.
+        # Fast path: target_verify/draft_extend with equal chunk lengths.
+        if ext_lens is not None and (
+            forward_batch.forward_mode.is_extend() or ext_lens.unique().numel() > 1
+        ):
+            o_flat = torch.zeros(
+                (q_heads.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            kunpeng.unpad_o_right_mtp_kunpeng(
+                o_padded, ext_lens, max_ext_len, o_flat
+            )
+        else:
+            o_flat = o_padded.view(
+                q_heads.shape[0], layer.tp_q_head_num, layer.v_head_dim
+            )
+        return o_flat.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend_native(
         self,
