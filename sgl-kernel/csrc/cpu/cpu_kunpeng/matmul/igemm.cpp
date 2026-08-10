@@ -77,7 +77,9 @@ void s8_s8_packed_gemm_bf16_dq_kunpeng(at::Tensor input, at::Tensor weight, at::
 
     int64_t blocks_in_k = k / tile_k;
     if (blocks_in_k > 1) {
-        TORCH_CHECK(workspace.numel() >= blocks_in_k * n * m * 2, "workspace is out of memory");
+        // The +1024 margin covers the L2 prefetch over-read in reduce_filter
+        // (prefetch_dis <= 288 elements), which does not fault but must stay in-bounds.
+        TORCH_CHECK(workspace.numel() >= blocks_in_k * n * m + 1024, "workspace is out of memory");
     }
 
     kutacc::MatrixTilingBlock t = std::make_tuple(tile_m, tile_n, tile_k);

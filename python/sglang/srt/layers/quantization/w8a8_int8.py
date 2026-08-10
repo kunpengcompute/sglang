@@ -257,7 +257,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
             blocks_in_k = k // tile_k
             workspace = kunpeng.alloc_buffer(
-                blocks_in_k * n * batch_size * 2 if blocks_in_k > 1 else 0,
+                blocks_in_k * n * batch_size + 1024 if blocks_in_k > 1 else 0,
                 dtype=torch.bfloat16,
             )
 

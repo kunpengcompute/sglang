@@ -136,7 +136,9 @@ void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor ou
 
     int64_t blocks_in_k = k / tile_k;
     if (blocks_in_k > 1) {
-        TORCH_CHECK(workspace.numel() >= blocks_in_k * n * m * 2, "workspace is out of memory! shape=[", m, ", ", n,
+        // The +1024 margin covers the L2 prefetch over-read in reduce_filter
+        // (prefetch_dis <= 288 elements), which does not fault but must stay in-bounds.
+        TORCH_CHECK(workspace.numel() >= blocks_in_k * n * m + 1024, "workspace is out of memory! shape=[", m, ", ", n,
                     ", ", k, "], tile=[", tile_m, ", ", tile_n, ", ", tile_k,
                     "], workspace.numel()=", workspace.numel());
     }
@@ -180,7 +182,7 @@ at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight
     auto output = at::empty({m, n}, input.options());
 
     int64_t blocks_in_k = k / tile_k;
-    int64_t workspace_size = blocks_in_k * n * m * 2;
+    int64_t workspace_size = blocks_in_k * n * m + 1024;
     auto workspace = at::empty({workspace_size}, input.options());
 
     bf16_packed_gemm_kunpeng(pack_bf16, weight, output, workspace, kutacc::get_thread_num());
@@ -251,7 +253,7 @@ void bmm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output)
 
     int64_t blocks_in_k = K / tile_k;
 
-    int64_t workspace_size = blocks_in_k * N * M * 2;
+    int64_t workspace_size = blocks_in_k * N * M + 1024;
 
     int64_t grain = std::max(int64_t(1), B / at::get_num_threads());
     kutacc::parallel_for(0, B, grain, [&](int64_t start, int64_t end) {
