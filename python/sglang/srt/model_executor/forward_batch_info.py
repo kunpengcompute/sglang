@@ -64,7 +64,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_kunpeng_extend_pad
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+_is_kunpeng_extend_pad = is_kunpeng_extend_pad()
 
 
 class ForwardMode(IntEnum):
@@ -849,6 +850,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = self.global_num_tokens_cpu
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
+
+        if _is_kunpeng_extend_pad and self.forward_mode == ForwardMode.EXTEND:
+            for i in range(sync_group_size):
+                # make sure that the padded length is a power of 2.
+                global_num_tokens[i] = (
+                    1 << (global_num_tokens[i] - 1).bit_length()
+                    if global_num_tokens[i] > 0
+                    else 0
+                )
 
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
