@@ -697,6 +697,11 @@ class Scheduler(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
 
+        # Get the draft worker class FIRST, before overriding pp_size, so that
+        # create_worker() sees the original pp_size and correctly returns
+        # PPNextNWorker under PP (rather than falling through to EAGLEWorker).
+        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+
         if self.pp_size > 1:
             # The draft worker is a local, single-layer model that is not part of
             # the PP pipeline. Present it with pp_size=1 so its ModelRunner skips
@@ -706,7 +711,6 @@ class Scheduler(
         else:
             backup_pp_size = None
 
-        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
         if backup_pp_size is not None:
