@@ -1271,6 +1271,14 @@ class SchedulerPPMixin:
                     f"(n_reqs={batch.batch_size()})",
                 )
 
+        # After a TARGET_VERIFY round, reset forward_mode to DECODE so the
+        # batch does not match is_extend() in subsequent get_next_batch_to_run
+        # iterations (which would wrongly trigger merge_batch on stale
+        # EagleVerifyInput spec_info).  On the last rank _pp_mtp_verify
+        # already sets DECODE; this keeps non-last ranks consistent.
+        if batch.forward_mode.is_target_verify():
+            batch.forward_mode = ForwardMode.DECODE
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
