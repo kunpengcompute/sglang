@@ -312,10 +312,10 @@ def _current_affinity_numa_nodes() -> Set[int]:
 
 
 def _get_node_cpus(node: int) -> List[int]:
-    global _NODE_TO_CPUS_CACHE
-    if node not in _NODE_TO_CPUS_CACHE:
-        _NODE_TO_CPUS_CACHE[node] = sorted(_node_to_cpus(node))
-    return _NODE_TO_CPUS_CACHE[node]
+    global _node_to_cpus_cache
+    if node not in _node_to_cpus_cache:
+        _node_to_cpus_cache[node] = sorted(_node_to_cpus(node))
+    return _node_to_cpus_cache[node]
 
 
 def _resolve_offset_cpus(offset: int) -> List[int]:
