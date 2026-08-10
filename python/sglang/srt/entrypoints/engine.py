@@ -697,7 +697,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Start the engine info bootstrap server if per-rank info is needed.
         engine_info_bootstrap_server = None
-        _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+        _kunpeng_ranks_per_dp = max(1, server_args.tp_size // max(server_args.dp_size, 1))
         _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
         if (
             server_args.remote_instance_weight_loader_start_seed_via_transfer_engine

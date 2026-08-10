@@ -2132,7 +2132,7 @@ def _setup_and_run_http_server(
     Called by launch_server after subprocesses have been launched.
     """
     # Set global states
-    _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+    _kunpeng_ranks_per_dp = max(1, server_args.tp_size // max(server_args.dp_size, 1))
     if is_kunpeng_binary_launch() and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
         pass
     else:
@@ -2220,7 +2220,7 @@ def _setup_and_run_http_server(
         )
 
 
-    _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+    _kunpeng_ranks_per_dp = max(1, server_args.tp_size // max(server_args.dp_size, 1))
     if is_kunpeng_binary_launch() and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
         logger.info("HTTP server disabled (not first TP rank of DP group).")
         threading.Event().wait()
@@ -2361,9 +2361,9 @@ def launch_server(
     if is_http_only():
         p = psutil.Process(os.getpid())
         if server_args.disaggregation_mode == "decode":
-            p.cpu_affinity(list(range(76, 151)))
+            p.cpu_affinity(list(range(76, 113)) + list(range(114, 151)))
         else:
-            p.cpu_affinity(list(range(0, 75)))
+            p.cpu_affinity(list(range(0, 37)) + list(range(38, 75)))
     elif envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
         p = psutil.Process(os.getpid())
         # TODO (kunpeng): hard code here, should use a more elegant way.
