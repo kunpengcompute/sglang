@@ -205,6 +205,8 @@ impl ConfigValidator {
                 balance_abs_threshold: _,
                 balance_rel_threshold,
                 bucket_adjust_interval_secs,
+                prefill_short_count: _,
+                prefill_length_threshold: _,
             } => {
                 if *balance_rel_threshold < 1.0 {
                     return Err(ConfigError::InvalidValue {
@@ -581,7 +583,7 @@ impl ConfigValidator {
                 // Check bucket for decode
                 if let Some(PolicyConfig::Bucket { .. }) = decode_policy {
                     return Err(ConfigError::IncompatibleConfig {
-                        reason: "Decode policy should not be allowed to be bucket".to_string(),
+                        reason: "Decode policy should not use bucket".to_string(),
                     });
                 }
             }
@@ -882,6 +884,8 @@ mod tests {
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
                     bucket_adjust_interval_secs: 5,
+                    prefill_short_count: 0,
+                    prefill_length_threshold: 4096,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
@@ -910,11 +914,15 @@ mod tests {
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
                     bucket_adjust_interval_secs: 5,
+                    prefill_short_count: 0,
+                    prefill_length_threshold: 4096,
                 }),
                 decode_policy: Some(PolicyConfig::Bucket {
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
                     bucket_adjust_interval_secs: 5,
+                    prefill_short_count: 0,
+                    prefill_length_threshold: 4096,
                 }),
             },
             PolicyConfig::Random, // Main policy as fallback
