@@ -300,12 +300,10 @@ class PPNextNWorker(EAGLEWorker):
         self, batch: ScheduleBatch, num_accepted_tokens_cpu: List[int]
     ) -> List[int]:
         """Extract the next round's draft token per req from the draft model's
-        last forward (stored in batch.spec_info.topk_index / topk_p)."""
-        spec_info = batch.spec_info
-        topk_index = spec_info.topk_index
-        cum = 0
-        drafts = []
-        for n in num_accepted_tokens_cpu:
-            cum += n
-            drafts.append(int(topk_index[cum - 1, 0]))
-        return drafts
+        last forward (stored in batch.spec_info.topk_index / topk_p).
+
+        topk_index has shape (bs, topk) — each row already corresponds to one
+        request's prediction, so no splitting by accepted-token count is needed.
+        """
+        topk_index = batch.spec_info.topk_index
+        return [int(topk_index[i, 0]) for i in range(topk_index.shape[0])]
