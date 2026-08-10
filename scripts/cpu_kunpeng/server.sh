@@ -149,7 +149,7 @@ case "$ROLE" in
             --host "$ROUTER_IP"
             --disaggregation-bootstrap-port 9001
             --nnodes 1 --node-rank 0 --dist-timeout 600
-            --dp-size "$DP_SIZE" --tp-size 1
+            --tp-size 1
             --max-total-tokens 64
             --skip-server-warmup
         )
@@ -168,6 +168,7 @@ if [[ "$ROLE" == "router" ]]; then
         LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
         python -m sglang.launch_server \
             "${HTTP_COMMON_ARGS[@]}" \
+            --dp-size "$PREFILL_DP_SIZE" \
             --port 30001 \
             --dist-init-addr "$PREFILL_MASTER_ADDR:$PREFILL_MASTER_PORT" \
             --disaggregation-mode prefill \
@@ -178,6 +179,7 @@ if [[ "$ROLE" == "router" ]]; then
         LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
         python -m sglang.launch_server \
             "${HTTP_COMMON_ARGS[@]}" \
+            --dp-size "$DECODE_DP_SIZE" \
             --port 30002 \
             --dist-init-addr "$DECODE_MASTER_ADDR:$DECODE_MASTER_PORT" \
             --disaggregation-mode decode \
