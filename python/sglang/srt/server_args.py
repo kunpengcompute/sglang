@@ -7398,7 +7398,7 @@ class PortArgs:
             # With binary launch, only the first TP rank of each DP group runs HTTP.
             # E.g. TP=256 DP=32 WORLD=16 → 2 DP groups/node, 8 TP ranks/DP group.
             # tp_rank_in_node 0..7 → DP0, 8..15 → DP1. Only 0 and 8 run HTTP.
-            _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
+            _kunpeng_ranks_per_dp = max(1, server_args.tp_size // max(server_args.dp_size, 1))
             _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
                 na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
