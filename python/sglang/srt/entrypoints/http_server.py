@@ -2361,9 +2361,9 @@ def launch_server(
     if is_http_only():
         p = psutil.Process(os.getpid())
         if server_args.disaggregation_mode == "decode":
-            p.cpu_affinity(list(range(76, 151)))
+            p.cpu_affinity(list(range(76, 113)) + list(range(114, 151)))
         else:
-            p.cpu_affinity(list(range(0, 75)))
+            p.cpu_affinity(list(range(0, 75)) + list(range(76, 113)))
     elif envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
         p = psutil.Process(os.getpid())
         # TODO (kunpeng): hard code here, should use a more elegant way.
