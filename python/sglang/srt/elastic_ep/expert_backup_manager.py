@@ -18,6 +18,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 
 PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
 logger = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ class ExpertBackupManager:
         self.expert_num = self.model_config.hf_config.n_routed_experts
         self.idmn = (self.expert_num // self.engine_num) * self.engine_rank
         self.idmx = (self.expert_num // self.engine_num) * (self.engine_rank + 1)
-        context = zmq.Context(2)
+        context = zmq_context_core_binding(zmq.Context(2), ZmqOffset.EXPERT_BACKUP_MANAGER)
         # Synchronization socket to avoid PUB/SUB slow joiner issues.
         self.recv_from_expert_backup_client = context.socket(zmq.PULL)
         self.recv_from_expert_backup_client.bind(

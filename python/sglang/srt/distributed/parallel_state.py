@@ -270,6 +270,7 @@ class GroupCoordinator:
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
+        zmq_core_binding_offset: int = 0,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -522,7 +523,7 @@ class GroupCoordinator:
         if use_message_queue_broadcaster and self.world_size > 1 and not recovered_rank:
             # Recovered ranks create their mq_broadcaster in elastic_ep.py
             self.mq_broadcaster = MessageQueue.create_from_process_group(
-                self.cpu_group, 1 << 22, 6
+                self.cpu_group, 1 << 22, 6, zmq_core_binding_offset=zmq_core_binding_offset
             )
 
     def __repr__(self):
@@ -1666,6 +1667,7 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
+    zmq_core_binding_offset: int = 0,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1691,6 +1693,7 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
+        zmq_core_binding_offset=zmq_core_binding_offset,
     )
 
 
@@ -2050,6 +2053,8 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    from sglang.srt.utils.numa_utils import ZmqOffset
+
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -2096,6 +2101,7 @@ def initialize_model_parallel(
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
         recovered_rank=recovered_rank,
+        zmq_core_binding_offset=ZmqOffset.TP,
     )
 
     if duplicate_tp_group:
@@ -2163,6 +2169,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
             recovered_rank=recovered_rank,
+            zmq_core_binding_offset=ZmqOffset.ATTN_CP,
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -2213,6 +2220,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
             recovered_rank=recovered_rank,
+            zmq_core_binding_offset=ZmqOffset.ATTN_TP,
         )
 
     global _SOCKET_TP
@@ -2236,6 +2244,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="socket_tp",
             recovered_rank=recovered_rank,
+            zmq_core_binding_offset=ZmqOffset.SOCKET_TP,
         )
 
     moe_ep_size = expert_model_parallel_size
@@ -2287,6 +2296,7 @@ def initialize_model_parallel(
             backend,
             group_name="moe_dp",
             recovered_rank=recovered_rank,
+            zmq_core_binding_offset=ZmqOffset.MOE_DP,
         )
 
     global _MOE_EP
@@ -2328,6 +2338,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_ep",
             recovered_rank=recovered_rank,
+            zmq_core_binding_offset=ZmqOffset.MOE_EP,
         )
 
     global _MOE_TP
@@ -2370,6 +2381,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_tp",
             recovered_rank=recovered_rank,
+            zmq_core_binding_offset=ZmqOffset.MOE_TP,
         )
 
     # Build the pipeline model-parallel groups.
@@ -2399,6 +2411,7 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
         recovered_rank=recovered_rank,
+        zmq_core_binding_offset=ZmqOffset.PP,
     )
 
 

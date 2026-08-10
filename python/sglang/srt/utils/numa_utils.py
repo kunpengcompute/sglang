@@ -1,4 +1,5 @@
 import ctypes
+import enum
 import glob
 import logging
 import math
@@ -9,9 +10,10 @@ import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Set
 
 import psutil
+from zmq import THREAD_AFFINITY_CPU_ADD
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -20,6 +22,46 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
+
+libnuma = None
+
+for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
+    try:
+        libnuma = ctypes.CDLL(libnuma_so)
+    except OSError as e:
+        logger.debug(f"{e}")
+        libnuma = None
+    if libnuma is not None:
+        break
+
+if libnuma is None:
+    logger.warning("libnuma is None")
+else:
+    from ctypes import *
+
+    class bitmask_t(Structure):
+        _fields_ = [
+            ('size', c_ulong),
+            ('maskp', POINTER(c_ulong)),
+        ]
+
+    libnuma.numa_max_node.argtypes = []
+    libnuma.numa_max_node.restype = c_int
+
+    libnuma.numa_allocate_cpumask.argtypes = []
+    libnuma.numa_allocate_cpumask.restype = POINTER(bitmask_t)
+
+    libnuma.numa_node_to_cpus.argtypes = [c_int, POINTER(bitmask_t)]
+    libnuma.numa_node_to_cpus.restype = ctypes.c_int
+
+    libnuma.numa_bitmask_free.argtypes = [POINTER(bitmask_t)]
+    libnuma.numa_bitmask_free.restype = c_void_p
+
+    libnuma.numa_num_configured_cpus.argtypes = []
+    libnuma.numa_num_configured_cpus.restype = c_int
+
+    libnuma.numa_bitmask_isbitset.argtypes = [POINTER(bitmask_t), c_uint]
+    libnuma.numa_bitmask_isbitset.restype = c_int
 
 
 @contextmanager
@@ -95,23 +137,7 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
     return None
 
 
-def get_libnuma():
-    libnuma = None
-
-    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
-        try:
-            libnuma = ctypes.CDLL(libnuma_so)
-        except OSError as e:
-            logger.debug(f"{e}")
-            libnuma = None
-        if libnuma is not None:
-            break
-    return libnuma
-
-
 def numa_bind_to_node(node: int):
-    libnuma = get_libnuma()
-
     if libnuma is None or libnuma.numa_available() < 0:
         logger.warning("numa not available on this system, skip bind action")
     else:
@@ -122,7 +148,6 @@ def numa_bind_to_node(node: int):
 def _can_set_mempolicy() -> bool:
     """Check if the process has permission to use NUMA memory policy syscalls."""
     try:
-        libnuma = get_libnuma()
         if libnuma is None or libnuma.numa_available() < 0:
             return False
         mode = ctypes.c_int()
@@ -219,3 +244,204 @@ def _query_numa_node_for_gpu(device_id: int):
             pynvml.nvmlShutdown()
         except Exception:
             pass  # Ignore shutdown errors
+
+
+# region core binding
+_cpu_to_node_cache = None
+_node_to_cpus_cache = {}
+_zmq_global_offset: int = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
+
+
+def _get_max_node():
+    """
+    Maximum number of NUMA node.
+
+    @rtype: C{int}
+    """
+    return libnuma.numa_max_node()
+
+
+def _node_to_cpus(node):
+    """
+    Get CPUs available on C{node}.
+
+    @return: set of CPU ids
+    @rtype: C{set}
+    """
+    result = set()
+
+    if node < 0 or node > _get_max_node():
+        raise ValueError(node)
+
+    mask = libnuma.numa_allocate_cpumask()
+
+    if libnuma.numa_node_to_cpus(node, mask) < 0:
+        libnuma.numa_bitmask_free(mask)
+        raise RuntimeError(node)
+
+    ncpus = libnuma.numa_num_configured_cpus()
+    for i in range(0, ncpus):
+        if libnuma.numa_bitmask_isbitset(mask, ctypes.c_uint(i)):
+            result.add(i)
+
+    libnuma.numa_bitmask_free(mask)
+    return result
+
+
+def _get_cpu_to_node_map() -> Dict[int, int]:
+    global _cpu_to_node_cache
+    if _cpu_to_node_cache is not None:
+        return _cpu_to_node_cache
+    mapping = {}
+    for node in range(_get_max_node() + 1):
+        for cpu in _node_to_cpus(node):
+            mapping[cpu] = node
+    _cpu_to_node_cache = mapping
+    return mapping
+
+
+def _current_affinity_numa_nodes() -> Set[int]:
+    my_cpus = os.sched_getaffinity(0)
+    cpu_to_node = _get_cpu_to_node_map()
+    nodes: Set[int] = set()
+    for cpu in my_cpus:
+        node = cpu_to_node.get(cpu)
+        if node is not None:
+            nodes.add(node)
+    return nodes
+
+
+def _get_node_cpus(node: int) -> List[int]:
+    global _NODE_TO_CPUS_CACHE
+    if node not in _NODE_TO_CPUS_CACHE:
+        _NODE_TO_CPUS_CACHE[node] = sorted(_node_to_cpus(node))
+    return _NODE_TO_CPUS_CACHE[node]
+
+
+def _resolve_offset_cpus(offset: int) -> List[int]:
+    nodes = _current_affinity_numa_nodes()
+    result = []
+    for node in sorted(nodes):
+        sorted_cpus = _get_node_cpus(node)
+        if offset < 0:
+            idx = len(sorted_cpus) + offset
+        else:
+            idx = offset
+        if 0 <= idx < len(sorted_cpus):
+            result.append(sorted_cpus[idx])
+    return result
+
+
+def _process_core_binding(offset: Optional[int], pid: Optional[int] = None) -> None:
+    if offset is None:
+        return
+
+    if pid is None or pid == 0:
+        pid = os.getpid()
+    cpu_list = _resolve_offset_cpus(offset)
+    if not cpu_list:
+        return
+
+    os.sched_setaffinity(pid, cpu_list)
+
+
+class ZmqOffset(enum.IntEnum):
+    """CPU affinity offset for ZMQ sockets, organized by core buckets.
+
+    Each bucket is an independent CPU offset (relative to BASE). Multiple names
+    within the same bucket are aliases (IntEnum semantics), meaning those sockets
+    intentionally share one core -- they do not run hot simultaneously, or benefit
+    from sharing cache. Changing a bucket's offset propagates to all its aliases.
+    Iterating ZmqOffset yields only canonical bucket members; aliases are skipped.
+    """
+
+    BASE = 0 if _zmq_global_offset is None else _zmq_global_offset
+
+    # ===== Core buckets (canonical, one independent offset each) =====
+    TOKENIZER_MANAGER        = BASE  # bucket 0: tokenizer entry side
+    DETOKENIZER_MANAGER      = BASE  # bucket 1: detokenizer
+    DATA_PARALLEL_CONTROLLER = BASE  # bucket 2: dp control plane
+    SCHEDULER                = BASE  # bucket 3: scheduler
+    MODEL_PARALLEL_COMM      = BASE  # bucket 4: model parallel comm groups
+    PD_KV_TRANSPORT          = BASE  # bucket 5: pd kv transport
+    PD_ENCODE_SERVER         = BASE  # bucket 6: pd encode server (grpc / mm receiver / mm encoder)
+    SGLANG_ENGINE            = BASE  # bucket 7: engine request/response path
+    MISC                     = BASE  # bucket 8: maintenance ops (expert backup / checkpoint / dumper)
+
+    # ===== Aliases (reference a bucket above to share its core) =====
+    # tokenizer entry side (shares bucket 0)
+    SOCKET_MAPPING           = TOKENIZER_MANAGER
+    MULTI_TOKENIZER_ROUTER   = TOKENIZER_MANAGER
+
+    # model parallel comm groups (share bucket 4)
+    TP                       = MODEL_PARALLEL_COMM
+    ATTN_CP                  = MODEL_PARALLEL_COMM
+    ATTN_TP                  = MODEL_PARALLEL_COMM
+    SOCKET_TP                = MODEL_PARALLEL_COMM
+    MOE_DP                   = MODEL_PARALLEL_COMM
+    MOE_EP                   = MODEL_PARALLEL_COMM
+    MOE_TP                   = MODEL_PARALLEL_COMM
+    PP                       = MODEL_PARALLEL_COMM
+
+    # pd kv transport (shares bucket 5)
+    PD_COMMON_KV_MANAGER     = PD_KV_TRANSPORT
+    PD_COMMON_KV_RECEIVER    = PD_KV_TRANSPORT
+    PD_KV_EVENT              = PD_KV_TRANSPORT
+    PD_PREFETCH              = PD_KV_TRANSPORT
+
+    # pd encode server (shares bucket 6)
+    PD_ENCODE_GRPC_SERVER    = PD_ENCODE_SERVER
+    PD_WAITING_IMAGE_REQUEST = PD_ENCODE_SERVER
+    PD_MM_RECEIVER_BASE      = PD_ENCODE_SERVER
+    PD_MM_ENCODER_ASYNC      = PD_ENCODE_SERVER
+    PD_MM_ENCODER            = PD_ENCODE_SERVER
+    PD_ENCODER_LAUNCH_SERVER = PD_ENCODE_SERVER
+
+    # maintenance ops (shares bucket 8)
+    EXPERT_BACKUP_CLIENT     = MISC
+    EXPERT_BACKUP_MANAGER    = MISC
+    CHECKPOINT_ENGINE        = MISC
+    DUMPER                   = MISC
+
+
+def _validate_zmq_offset_range() -> None:
+    """Check that the max relative offset of ZmqOffset fits within the available
+    CPUs of each NUMA node in the current affinity.
+
+    Emits only a warning when exceeded: _resolve_offset_cpus silently skips nodes
+    that are too short, leaving the corresponding socket unbound on that node.
+    Early warning helps the user tune SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.
+    """
+    if _zmq_global_offset is None:
+        return
+    if libnuma is None or libnuma.numa_available() < 0:
+        return
+    try:
+        max_relative_offset = max(int(member) - int(ZmqOffset.BASE) for member in ZmqOffset)
+        for node in sorted(_current_affinity_numa_nodes()):
+            cpu_count = len(_get_node_cpus(node))
+            if cpu_count <= max_relative_offset:
+                logger.warning(
+                    f"NUMA node {node} has {cpu_count} CPUs, but ZmqOffset requires "
+                    f"offset up to {max_relative_offset} (BASE={int(ZmqOffset.BASE)}). "
+                    f"Sockets with offset >= {cpu_count} on this node will not be bound. "
+                    f"Consider reducing SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET or increasing node CPU count."
+                )
+    except Exception as e:
+        logger.debug(f"validate zmq offset range failed: {e}")
+
+
+_validate_zmq_offset_range()
+
+
+def zmq_context_core_binding(ctx, offset: int):
+    if _zmq_global_offset is None:
+        return ctx
+
+    if libnuma is None:
+        return ctx
+
+    cpu_list = _resolve_offset_cpus(offset)
+    for cpu in cpu_list:
+        ctx.set(THREAD_AFFINITY_CPU_ADD, cpu)
+    return ctx

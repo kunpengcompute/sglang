@@ -17,6 +17,7 @@ from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto, get_open_port
+from sglang.srt.utils.numa_utils import zmq_context_core_binding
 
 # SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
 SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
@@ -176,6 +177,7 @@ class MessageQueue:
         max_chunk_bytes: int = 1024 * 1024 * 10,
         max_chunks: int = 10,
         connect_ip: Optional[str] = None,
+        zmq_core_binding_offset = 0,
     ):
         if local_reader_ranks is None:
             local_reader_ranks = list(range(n_local_reader))
@@ -190,7 +192,7 @@ class MessageQueue:
                 get_local_ip_auto("0.0.0.0") if n_remote_reader > 0 else "127.0.0.1"
             )
 
-        context = Context()
+        context = zmq_context_core_binding(Context(), zmq_core_binding_offset)
 
         if n_local_reader > 0:
             # for local readers, we will:
@@ -255,12 +257,16 @@ class MessageQueue:
         return self.handle
 
     @staticmethod
-    def create_from_handle(handle: Handle, rank) -> "MessageQueue":
+    def create_from_handle(
+        handle: Handle,
+        rank,
+        zmq_core_binding_offset: int = 0
+    ) -> "MessageQueue":
         self = MessageQueue.__new__(MessageQueue)
         self.handle = handle
         self._is_writer = False
 
-        context = Context()
+        context = zmq_context_core_binding(Context(), zmq_core_binding_offset)
 
         if rank in handle.local_reader_ranks:
             assert handle.buffer is not None
@@ -470,7 +476,11 @@ class MessageQueue:
 
     @staticmethod
     def create_from_process_group(
-        pg: ProcessGroup, max_chunk_bytes, max_chunks, writer_rank=0
+        pg: ProcessGroup,
+        max_chunk_bytes,
+        max_chunks,
+        writer_rank=0,
+        zmq_core_binding_offset=0
     ) -> "MessageQueue":
         group_rank = dist.get_rank(pg)
         group_world_size = dist.get_world_size(pg)
@@ -491,6 +501,7 @@ class MessageQueue:
                 local_reader_ranks=local_reader_ranks,
                 max_chunk_bytes=max_chunk_bytes,
                 max_chunks=max_chunks,
+                zmq_core_binding_offset=zmq_core_binding_offset,
             )
             handle = buffer_io.export_handle()
             dist.broadcast_object_list(
@@ -500,6 +511,10 @@ class MessageQueue:
             recv = [None]
             dist.broadcast_object_list(recv, src=global_ranks[writer_rank], group=pg)
             handle = recv[0]  # type: ignore
-            buffer_io = MessageQueue.create_from_handle(handle, group_rank)
+            buffer_io = MessageQueue.create_from_handle(
+                handle,
+                group_rank,
+                zmq_core_binding_offset=zmq_core_binding_offset,
+            )
         buffer_io.wait_until_ready()
         return buffer_io

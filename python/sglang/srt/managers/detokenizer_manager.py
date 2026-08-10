@@ -51,6 +51,7 @@ from sglang.utils import (
     get_exception_traceback,
 )
 from sglang.srt.utils.common import is_cpu_920f, is_http_only
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.init_request_dispatcher()
 
     def init_ipc_channels(self, port_args: PortArgs):
-        context = zmq.Context(2)
+        context = zmq_context_core_binding(zmq.Context(2), ZmqOffset.DETOKENIZER_MANAGER)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )

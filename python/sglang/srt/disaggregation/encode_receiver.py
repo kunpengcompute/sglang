@@ -35,6 +35,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 
 logger = logging.getLogger(__name__)
 
@@ -424,7 +425,9 @@ class WaitingImageRequest:
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
         self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
-            zmq.Context(), zmq.PULL, host=host_name
+            zmq_context_core_binding(zmq.Context(), ZmqOffset.PD_WAITING_IMAGE_REQUEST),
+            zmq.PULL,
+            host=host_name,
         )
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
@@ -631,7 +634,7 @@ class MMReceiverBase(ABC):
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
     ):
-        self.context = zmq.asyncio.Context(20)
+        self.context = zmq_context_core_binding(zmq.asyncio.Context(20), ZmqOffset.PD_MM_RECEIVER_BASE)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
         self.host = get_local_ip_auto(server_args.host)

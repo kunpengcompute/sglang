@@ -105,6 +105,7 @@ from sglang.srt.utils import (
     is_skip_http,
 )
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -227,7 +228,7 @@ class Engine(EngineScoreMixin, EngineBase):
             )
 
         # Initialize ZMQ sockets
-        context = zmq.Context(2)
+        context = zmq_context_core_binding(zmq.Context(2), ZmqOffset.SGLANG_ENGINE)
         _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
         _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
         if self.server_args.node_rank == 0 and _node_rank_in_node == 0:

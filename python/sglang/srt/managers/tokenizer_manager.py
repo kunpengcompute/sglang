@@ -117,6 +117,7 @@ from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -342,7 +343,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.async_dynamic_batch_tokenizer = None
 
     def init_ipc_channels(self, port_args: PortArgs):
-        context = zmq.asyncio.Context(2)
+        context = zmq_context_core_binding(zmq.asyncio.Context(2), ZmqOffset.TOKENIZER_MANAGER)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )

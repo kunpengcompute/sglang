@@ -63,6 +63,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -146,7 +147,10 @@ class DataParallelController:
         self.global_balance_id = 0
 
         # Init inter-process communication
-        self.context = zmq.Context(1 + server_args.dp_size)
+        self.context = zmq_context_core_binding(
+            zmq.Context(1 + server_args.dp_size),
+            ZmqOffset.DATA_PARALLEL_CONTROLLER,
+        )
         _kunpeng_ranks_per_dp = server_args.tp_size // max(server_args.dp_size, 1)
         _node_rank_in_node = server_args.tp_rank_in_node // _kunpeng_ranks_per_dp
         if server_args.node_rank == 0 and _node_rank_in_node == 0:
@@ -346,7 +350,7 @@ class DataParallelController:
         else:
             na = NetworkAddress.parse(server_args.dist_init_addr)
             na = NetworkAddress(
-                na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA 
+                na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
             )
         endpoint = na.to_tcp()
 
