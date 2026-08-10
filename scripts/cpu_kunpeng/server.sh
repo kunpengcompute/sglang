@@ -68,6 +68,17 @@ BASE_ARGS=(
     --reasoning-parser deepseek-r1
 )
 
+# Add redundant experts only when enabled (REDUNDANT_EXPERTS > 0)
+if [[ "${REDUNDANT_EXPERTS:-0}" -gt 0 ]]; then
+    BASE_ARGS+=(--ep-num-redundant-experts "$REDUNDANT_EXPERTS")
+    BASE_ARGS+=(--ep-dispatch-algorithm static)
+fi
+
+# Pass expert-location mapping file (JSON/PT) to --init-expert-location when set
+if [[ -n "${INIT_EXPERT_LOCATION:-}" ]]; then
+    BASE_ARGS+=(--init-expert-location "$INIT_EXPERT_LOCATION")
+fi
+
 if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
     BASE_ARGS+=(
         --speculative-algorithm NEXTN
