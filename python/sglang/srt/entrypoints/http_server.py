@@ -2363,7 +2363,7 @@ def launch_server(
         if server_args.disaggregation_mode == "decode":
             p.cpu_affinity(list(range(76, 113)) + list(range(114, 151)))
         else:
-            p.cpu_affinity(list(range(0, 75)) + list(range(76, 113)))
+            p.cpu_affinity(list(range(0, 37)) + list(range(38, 75)))
     elif envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
         p = psutil.Process(os.getpid())
         # TODO (kunpeng): hard code here, should use a more elegant way.
