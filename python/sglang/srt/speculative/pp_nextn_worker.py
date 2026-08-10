@@ -96,11 +96,26 @@ class PPNextNWorker(EAGLEWorker):
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if _DEBUG_PP_MTP:
-                logger.info(f"[PP_LAST] forward_batch: IDLE mode, n_reqs={batch.batch_size()}")
+                logger.info(
+                    f"[PP_LAST] forward_batch: IDLE mode, "
+                    f"n_reqs={batch.batch_size()}"
+                )
             model_worker_batch = batch.get_model_worker_batch()
-            return self.target_worker.forward_batch_generation(
+            result = self.target_worker.forward_batch_generation(
                 model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
             )
+            # The parent EAGLEWorker never skips the draft forward for idle
+            # batches: it always runs draft() → verify() → draft_extend under
+            # draft_tp_context + speculative_moe contexts.  The draft model
+            # forward may trigger collective ops (alltoall on EP group,
+            # allreduce on DP group) that require ALL ranks to participate.
+            # Skipping the draft forward on any rank causes a collective hang.
+            self._draft_preprocess_idle(batch)
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                self.forward_draft_extend_after_decode(batch)
+            return result
         if batch.forward_mode.is_target_verify():
             if _DEBUG_PP_MTP:
                 logger.info(
