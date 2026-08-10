@@ -358,15 +358,15 @@ class ZmqOffset(enum.IntEnum):
     BASE = 0 if _zmq_global_offset is None else _zmq_global_offset
 
     # ===== Core buckets (canonical, one independent offset each) =====
-    TOKENIZER_MANAGER        = BASE          # bucket 0: tokenizer entry side
-    DETOKENIZER_MANAGER      = BASE + 1      # bucket 1: detokenizer
-    DATA_PARALLEL_CONTROLLER = BASE + 2      # bucket 2: dp control plane
-    SCHEDULER                = BASE + 3      # bucket 3: scheduler
-    MODEL_PARALLEL_COMM      = BASE + 4      # bucket 4: model parallel comm groups
-    PD_KV_TRANSPORT          = BASE + 5      # bucket 5: pd kv transport
-    PD_ENCODE_SERVER         = BASE + 6      # bucket 6: pd encode server (grpc / mm receiver / mm encoder)
-    SGLANG_ENGINE            = BASE + 7      # bucket 7: engine request/response path
-    MISC                     = BASE + 8      # bucket 8: maintenance ops (expert backup / checkpoint / dumper)
+    TOKENIZER_MANAGER        = BASE  # bucket 0: tokenizer entry side
+    DETOKENIZER_MANAGER      = BASE  # bucket 1: detokenizer
+    DATA_PARALLEL_CONTROLLER = BASE  # bucket 2: dp control plane
+    SCHEDULER                = BASE  # bucket 3: scheduler
+    MODEL_PARALLEL_COMM      = BASE  # bucket 4: model parallel comm groups
+    PD_KV_TRANSPORT          = BASE  # bucket 5: pd kv transport
+    PD_ENCODE_SERVER         = BASE  # bucket 6: pd encode server (grpc / mm receiver / mm encoder)
+    SGLANG_ENGINE            = BASE  # bucket 7: engine request/response path
+    MISC                     = BASE  # bucket 8: maintenance ops (expert backup / checkpoint / dumper)
 
     # ===== Aliases (reference a bucket above to share its core) =====
     # tokenizer entry side (shares bucket 0)
