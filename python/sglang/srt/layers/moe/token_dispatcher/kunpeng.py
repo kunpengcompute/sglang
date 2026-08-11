@@ -33,10 +33,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
-from sglang.srt.graph import ops as kunpeng
 
 kernel = torch.ops.sgl_kernel
 
@@ -246,7 +246,8 @@ def _ensure_rdma_initialized(
 
 def _init_rdma_comm(group: dist.ProcessGroup, ep_size: int, ep_rank: int):
     from sgl_kernel import pg_helper
-    from sglang.srt.distributed.parallel_state import get_world_group, get_pp_group
+
+    from sglang.srt.distributed.parallel_state import get_pp_group, get_world_group
 
     pg_ptr = pg_helper.get_process_group_ptr(group)
     logger.info(
@@ -293,7 +294,10 @@ def _init_buffers(state: _KunpengDispatcherState):
 
     if state.is_prefill:
         state.dispatch_recv_size = (
-            multiple * state.max_tokens * (state.hidden_size + 4)
+            state.num_local_experts
+            * multiple
+            * state.max_tokens
+            * (state.hidden_size + 4)
             + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
         )
     else:

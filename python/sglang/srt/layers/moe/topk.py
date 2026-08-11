@@ -52,6 +52,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
@@ -71,7 +72,6 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
-from sglang.srt.graph import ops as kunpeng
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -678,9 +678,7 @@ def _get_kunpeng_topk_buffers(batch_size: int, topk: int):
     the dispatcher is not initialized, in which case callers fall back to
     allocating fresh tensors.
     """
-    from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
-        _KunpengDispatcherState,
-    )
+    from sglang.srt.layers.moe.token_dispatcher.kunpeng import _KunpengDispatcherState
 
     state = _KunpengDispatcherState.get()
     ids_buf = state.topk_ids_index_buf
@@ -1154,6 +1152,82 @@ def _load_balance_padded_tokens_kunpeng(
     return topk_ids, topk_weights
 
 
+def _remap_topk_ids_logical_to_physical_kunpeng(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    layer_id: int,
+    num_fused_shared_experts: int,
+    num_token_non_padded: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Remap logical topk ids to physical weight-slot ids on Kunpeng.
+
+    Kunpeng loads routed-expert weights into physical slots following the
+    expert-location mapping (``physical_to_logical_map`` set via
+    ``--init-expert-location``), but the router outputs logical expert ids.
+    Without this remap, a non-trivial expert layout (``map[p] != p``) would
+    compute with the wrong weights. This is the CPU counterpart of
+    ``expert_location_dispatch.topk_ids_logical_to_physical`` on the GPU path.
+
+    The remap happens before ``_load_balance_padded_tokens_kunpeng`` so that
+    padding tokens are load-balanced directly in physical-id space.
+    """
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+    metadata = get_global_expert_location_metadata()
+    if metadata is None:
+        return topk_ids, topk_weights
+
+    num_physical = metadata.num_physical_experts
+    num_logical = metadata.num_logical_experts
+    if num_physical != num_logical:
+        # Redundant experts are not supported on the Kunpeng weight layout.
+        logger.warning(
+            "[Kunpeng] expert-location remap requires num_physical == num_logical, "
+            "got %s != %s; skipping logical->physical remap",
+            num_physical,
+            num_logical,
+        )
+        return topk_ids, topk_weights
+
+    physical_to_logical = metadata.physical_to_logical_map_cpu[layer_id].long()
+    assert physical_to_logical.shape[0] == num_physical, (
+        f"physical_to_logical_map layer {layer_id} size {physical_to_logical.shape[0]} "
+        f"!= num_physical_experts {num_physical}"
+    )
+
+    # Invert physical->logical into logical->physical (weight slot index).
+    logical_to_physical = torch.full((num_logical,), -1, dtype=torch.int64)
+    logical_to_physical[physical_to_logical] = torch.arange(
+        num_physical, dtype=torch.int64
+    )
+    if (logical_to_physical == -1).any():
+        # Not a permutation; leave unmapped logical experts as-is (identity).
+        logger.warning(
+            "[Kunpeng] expert-location map is not a permutation; "
+            "unmapped logical experts keep their original id"
+        )
+        logical_to_physical = torch.where(
+            logical_to_physical == -1,
+            torch.arange(num_logical, dtype=torch.int64),
+            logical_to_physical,
+        )
+
+    # Padding rows (beyond num_token_non_padded) may hold garbage ids from the
+    # topk kernel; they are overwritten by load-balancing afterwards, so only
+    # remap the real-token region.
+    num_real = (
+        min(int(num_token_non_padded.item()), topk_ids.shape[0])
+        if num_token_non_padded is not None
+        else topk_ids.shape[0]
+    )
+    routed = topk_ids[:num_real, : topk_ids.shape[1] - num_fused_shared_experts]
+    if routed.numel() == 0:
+        return topk_ids, topk_weights
+
+    routed.copy_(logical_to_physical[routed.to(torch.int64)].to(topk_ids.dtype))
+    return topk_ids, topk_weights
+
+
 def biased_grouped_topk_kunpeng(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1294,6 +1368,13 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_cpu_920f:
+        topk_ids, topk_weights = _remap_topk_ids_logical_to_physical_kunpeng(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            layer_id=layer_id,
+            num_fused_shared_experts=num_fused_shared_experts,
+            num_token_non_padded=num_token_non_padded,
+        )
         topk_ids, topk_weights = _load_balance_padded_tokens_kunpeng(
             topk_ids=topk_ids,
             topk_weights=topk_weights,

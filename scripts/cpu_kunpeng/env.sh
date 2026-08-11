@@ -123,18 +123,24 @@ export TP_SIZE=256
 export DP_SIZE=16
 export EP_SIZE=${TP_SIZE}
 export PP_SIZE=1  # >1 enable pp  eg: 2
+export REDUNDANT_EXPERTS=0
+export INIT_EXPERT_LOCATION=""
 
 # Prefill TP/EP/PP size
 export PREFILL_TP_SIZE=${TP_SIZE}
 export PREFILL_DP_SIZE=${DP_SIZE}
 export PREFILL_EP_SIZE=${PREFILL_TP_SIZE}
 export PREFILL_PP_SIZE=${PP_SIZE}
+export PREFILL_REDUNDANT_EXPERTS=0
+export PREFILL_INIT_EXPERT_LOCATION=""
 
 # Decode TP/EP/PP size
 export DECODE_TP_SIZE=${TP_SIZE}
 export DECODE_DP_SIZE=${DP_SIZE}
 export DECODE_EP_SIZE=${DECODE_TP_SIZE}
 export DECODE_PP_SIZE=${PP_SIZE}
+export DECODE_REDUNDANT_EXPERTS=0
+export DECODE_INIT_EXPERT_LOCATION=""
 
 # PP size and chunked prefill size can be configured independently
 export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size
@@ -239,6 +245,8 @@ _export_pd_vars() {
     _var="${prefix}_DP_SIZE";    export DP_SIZE="${!_var}"
     _var="${prefix}_EP_SIZE";    export EP_SIZE="${!_var}"
     _var="${prefix}_PP_SIZE";    export PP_SIZE="${!_var}"
+    _var="${prefix}_REDUNDANT_EXPERTS"; export REDUNDANT_EXPERTS="${!_var}"
+    _var="${prefix}_INIT_EXPERT_LOCATION"; export INIT_EXPERT_LOCATION="${!_var}"
     _var="MODEL_PATH_${prefix}"; export MODEL_PATH="${!_var}"
 }
 
