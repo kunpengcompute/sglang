@@ -118,6 +118,15 @@ void flash_attention_with_workspace(at::Tensor q, at::Tensor k, at::Tensor v, at
                                     at::Tensor key_start_loc, int64_t chunked_prefill_size,
                                     std::vector<int64_t> seq_lens, std::vector<int64_t> cur_lens);
 
+void flash_attention_paged_kunpeng(at::Tensor q, at::Tensor latent_cache, at::Tensor kv_b_weight,
+                                   at::Tensor kv_b_weight_scale,
+                                   at::Tensor out, at::Tensor workspace, at::Tensor block_table,
+                                   at::Tensor seq_lens, at::Tensor cur_lens,
+                                   at::Tensor query_start_loc, int64_t page_size,
+                                   int64_t kv_lora_rank, int64_t qk_nope_head_dim,
+                                   int64_t qk_rope_head_dim, int64_t v_head_dim,
+                                   bool causal, double softmax_scale);
+
 // === Memory 算子声明 ===
 at::Tensor hbw_allocator_kunpeng(int64_t size);
 
@@ -454,6 +463,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int chunked_prefill_size, "
         "int[] seq_lens, int[] cur_lens) -> ()");
     m.impl("flash_attention_with_workspace", flash_attention_with_workspace);
+
+    m.def(
+        "flash_attention_paged_kunpeng("
+        "Tensor q, Tensor latent_cache, Tensor kv_b_weight, "
+        "Tensor kv_b_weight_scale, "
+        "Tensor out, Tensor workspace, Tensor block_table, "
+        "Tensor seq_lens, Tensor cur_lens, Tensor query_start_loc, "
+        "int page_size, int kv_lora_rank, int qk_nope_head_dim, "
+        "int qk_rope_head_dim, int v_head_dim, "
+        "bool causal, float softmax_scale) -> ()");
+    m.impl("flash_attention_paged_kunpeng", flash_attention_paged_kunpeng);
 
     // hbw_allocator
     m.def("hbw_allocator_kunpeng(int size) -> Tensor");

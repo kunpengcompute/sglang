@@ -258,9 +258,7 @@ class KunpengGraphRunner:
                 kwargs["get_embedding"] = True
 
             output = self._forward_extend(forward_batch, **kwargs)
-            result = self._wrap_output(output)
-            self._dump_prefill_logits(forward_batch, result)
-            return result
+            return self._wrap_output(output)
 
         elif forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.forward_mode.is_idle():
@@ -325,58 +323,6 @@ class KunpengGraphRunner:
             next_token_logits=logits, hidden_states=hidden_states
         )
 
-    # ── Prefill logits dump (debug) ─────────────────────────────────────
-
-    _dump_prefill_logits_enabled = (
-        os.environ.get("SGLANG_DUMP_PREFILL_LOGITS") == "1"
-    )
-
-    def _dump_prefill_logits(
-        self,
-        forward_batch: ForwardBatch,
-        result: Union[LogitsProcessorOutput, PPProxyTensors],
-    ) -> None:
-        """Dump prefill logits for the last chunk of each request.
-
-        Set SGLANG_DUMP_PREFILL_LOGITS=1 to enable.  The log line format:
-        [PREFILL_LOGITS_DUMP] prefix_len=.. chunk_len=.. total_len=.. idx=.. \
-        vocab=.. abs_sum=.. abs_max=.. top10_ids=.. top10_vals=..
-        """
-        if not self._dump_prefill_logits_enabled:
-            return
-        if isinstance(result, PPProxyTensors):
-            return
-        if result.next_token_logits is None:
-            return
-
-        logits = result.next_token_logits  # (batch_size, vocab_size) for extend
-        extend_seq_lens = forward_batch.extend_seq_lens
-        extend_prefix_lens = forward_batch.extend_prefix_lens
-        if extend_seq_lens is None:
-            return
-
-        for i in range(extend_seq_lens.shape[0]):
-            chunk_len = int(extend_seq_lens[i].item())
-            prefix_len = (
-                int(extend_prefix_lens[i].item())
-                if extend_prefix_lens is not None
-                else 0
-            )
-            total_len = prefix_len + chunk_len
-            row = logits[i]  # (vocab_size,)
-            abs_sum = float(row.abs().sum().item())
-            abs_max = float(row.abs().max().item())
-            top10_vals, top10_ids = torch.topk(row, k=10)
-            top10_ids = top10_ids.tolist()
-            top10_vals = [round(v, 4) for v in top10_vals.tolist()]
-            logger.info(
-                f"[PREFILL_LOGITS_DUMP] prefix_len={prefix_len} "
-                f"chunk_len={chunk_len} total_len={total_len} "
-                f"req={i} vocab={row.shape[0]} "
-                f"abs_sum={abs_sum:.2f} abs_max={abs_max:.4f} "
-                f"top10_ids={top10_ids} top10_vals={top10_vals}"
-            )
-
     # ── Mode-specific forward (internal) ─────────────────────────────────
 
     def _forward_decode(
@@ -411,10 +357,6 @@ class KunpengGraphRunner:
                 **kwargs,
             )
 
-        # All chunked prefill chunks go through graph mode. K/V sizes are
-        # fixed at capture time (max_prefix + chunk_size); extend_prefix_lens
-        # is passed as a graph input so the attention op knows the actual
-        # valid prefix length at replay time.
         inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
         return self._graph_forward(
             forward_batch,
@@ -501,26 +443,6 @@ class KunpengGraphRunner:
                 inputs.append(self.swap_mgr._blockwise_hbw_cache_loc)
             if forward_batch.extend_prefix_lens is not None:
                 inputs.append(forward_batch.extend_prefix_lens)
-                # Build prefix_kv_indices for chunked prefill: gather prefix
-                # token positions from req_to_token for each request. This
-                # tensor is a graph input so gather_kv_kunpeng can re-read
-                # prefix KV from the cache at replay time.
-                prefix_lens = forward_batch.extend_prefix_lens.tolist()
-                if any(p > 0 for p in prefix_lens):
-                    req_to_token = forward_batch.req_to_token_pool.req_to_token
-                    req_pool_indices = forward_batch.req_pool_indices
-                    prefix_kv_indices_list = []
-                    for i, req_idx in enumerate(req_pool_indices.tolist()):
-                        pfx_len = int(prefix_lens[i])
-                        if pfx_len > 0:
-                            prefix_kv_indices_list.append(
-                                req_to_token[req_idx, :pfx_len]
-                            )
-                    if prefix_kv_indices_list:
-                        forward_batch.prefix_kv_indices = torch.cat(
-                            prefix_kv_indices_list
-                        )
-                        inputs.append(forward_batch.prefix_kv_indices)
 
         spec_info = getattr(forward_batch, "spec_info", None)
         if self.model_runner.is_draft_worker and spec_info is not None:
@@ -626,11 +548,9 @@ class KunpengGraphRunner:
         # last_tokens, MTP pad/unpad) fix their output shape at capture, so two
         # batches with equal total_tokens but different sequence counts must
         # not share a graph.
-        # For chunked prefill extend, total KV tokens (prefix + chunk) and
-        # max per-request KV length must also be part of the key:
-        # cat_kunpeng output size and alloc_buffer in kutacc_mha are fixed
-        # at capture, so chunks with different prefix lengths must use
-        # separate graphs.
+        # For chunked prefill extend, total KV tokens and max per-request KV
+        # length are also part of the key (sizes fixed at capture, so chunks
+        # with different prefix lengths need separate graphs).
         total_kv_tokens = total_tokens
         max_total_len = total_tokens
         if (

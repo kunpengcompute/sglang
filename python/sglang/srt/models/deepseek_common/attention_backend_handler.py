@@ -192,11 +192,8 @@ def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 def handle_attention_kunpeng_cpu(attn, forward_batch):
-    # All prefill (including chunked prefill) uses MHA_KUNPENG to keep
-    # the same attention op as non-chunked mode. MLA_KUNPENG uses the
-    # absorbed q (q @ w_kc) which is numerically different from MHA's
-    # full kv_b_proj path, causing output divergence between chunked
-    # and non-chunked prefill.
+    # Use MHA_KUNPENG for all prefill so chunked and non-chunked match;
+    # MLA_KUNPENG's absorbed-q path diverges numerically.
     if forward_batch.forward_mode.is_extend_without_speculative():
         return AttnForwardMethod.MHA_KUNPENG
     else:

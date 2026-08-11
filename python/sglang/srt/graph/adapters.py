@@ -727,21 +727,6 @@ def _setup_kupl_sdma_set_kv_buffer_2():
     register_op('kupl_sdma_set_kv_buffer_2', shape_infer, eager_fn)
 
 
-def _setup_gather_kv_kunpeng():
-    """Gather KV cache entries by index for chunked prefill prefix loading.
-
-    Output shape: (num_indices, kv_buffer.shape[1:]) — fixed at capture
-    time by the index tensor size, which is part of the graph cache key.
-    """
-    def shape_infer(kv_buffer, indices):
-        return [((indices.shape[0],) + tuple(kv_buffer.shape[1:]), kv_buffer.dtype)]
-
-    def eager_fn(kv_buffer, indices):
-        return kv_buffer[indices].contiguous()
-
-    register_op('gather_kv_kunpeng', shape_infer, eager_fn)
-
-
 def _setup_copy_kunpeng():
     def shape_infer(dst, src):
         return []
@@ -766,57 +751,78 @@ def _setup_print_hash_kunpeng():
 
 
 def _setup_flash_attention_with_workspace_kunpeng():
-    # Used by the MHA prefill path (_forward_extend_kutacc → kutacc_mha).
-    # Supports both non-chunked prefill (extend_prefix_lens is None or all
-    # zeros) and chunked prefill (extend_prefix_lens[i] > 0 indicates KV
-    # from previous chunks). When there is a prefix, the caller (kutacc_mha)
-    # concatenates prefix K/V and current chunk K/V into a single tensor and
-    # passes extend_prefix_lens so this op can build the correct
-    # key_start_loc / seq_lens / cur_lens.
-    def shape_infer(q, k, v, workspace, extend_seq_lens, extend_prefix_lens,
-                    causal, softmax_scale, max_total_len):
+    def shape_infer(q, k, v, workspace, extend_seq_lens,
+                    causal, softmax_scale, chunked_prefill_size):
         return [((q.shape[0], q.shape[1], v.shape[2]), q.dtype)]
 
-    def eager_fn(q, k, v, workspace, extend_seq_lens, extend_prefix_lens,
-                 causal, softmax_scale, max_total_len):
-        bs = extend_seq_lens.shape[0]
-        # query_start_loc: cumsum of extend_seq_lens (Q tokens per request)
-        qsl = torch.zeros(bs + 1, dtype=torch.int32, device=extend_seq_lens.device)
+    def eager_fn(q, k, v, workspace, extend_seq_lens,
+                 causal, softmax_scale, chunked_prefill_size):
+        qsl = torch.zeros(extend_seq_lens.shape[0] + 1,
+                          dtype=torch.int32, device=extend_seq_lens.device)
         qsl[1:] = torch.cumsum(extend_seq_lens, dim=0)
-
-        # prefix_lens: KV tokens from previous chunks per request.
-        # When None (non-chunked path) all zeros → behavior unchanged.
-        if extend_prefix_lens is None:
-            prefix_lens = torch.zeros(bs, dtype=torch.int32,
-                                       device=extend_seq_lens.device)
-        else:
-            prefix_lens = extend_prefix_lens.to(torch.int32)
-
-        # key_start_loc: cumsum of (prefix + chunk) tokens per request.
-        # K/V tensor layout is [prefix_req0, chunk_req0, prefix_req1,
-        # chunk_req1, ...] so the key_start_loc matches the Q layout when
-        # prefix is zero, but differs when prefix > 0.
-        total_lens = prefix_lens + extend_seq_lens
-        ksl = torch.zeros(bs + 1, dtype=torch.int32, device=extend_seq_lens.device)
-        ksl[1:] = torch.cumsum(total_lens, dim=0)
-
-        # seq_lens[i] = total KV length (prefix + chunk) per request.
-        # cur_lens[i] = current chunk Q length per request.
-        # The C++ kernel uses (seq_lens[i] - cur_lens[i]) as the prefix
-        # offset to skip prefix KV when computing causal mask.
-        cur_lens = extend_seq_lens.tolist()
-        seq_lens = total_lens.tolist()
+        ksl = qsl.clone()
+        cur_lens = (qsl[1:] - qsl[:-1]).tolist()
+        seq_lens = cur_lens
 
         out = torch.empty(q.shape[0], q.shape[1], v.shape[2], dtype=q.dtype)
         torch.ops.sgl_kernel.flash_attention_with_workspace(
             q=q, k=k, v=v, out=out, workspace=workspace,
             causal=causal, softmax_scale=softmax_scale,
             query_start_loc=qsl, key_start_loc=ksl,
-            chunked_prefill_size=int(max_total_len),
+            chunked_prefill_size=chunked_prefill_size,
             cur_lens=cur_lens, seq_lens=seq_lens)
         return out
 
     register_op('flash_attention_with_workspace_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_flash_attention_paged_kunpeng():
+    # Paged MHA for chunked prefill: reads latent via block_table, applies
+    # kv_b_proj internally.
+    def shape_infer(q, latent_cache, kv_b_weight, kv_b_weight_scale,
+                    workspace, block_table,
+                    extend_seq_lens, extend_prefix_lens,
+                    page_size, kv_lora_rank, qk_nope_head_dim,
+                    qk_rope_head_dim, v_head_dim, causal, softmax_scale):
+        return [((q.shape[0], q.shape[1], v_head_dim), q.dtype)]
+
+    def eager_fn(q, latent_cache, kv_b_weight, kv_b_weight_scale,
+                 workspace, block_table,
+                 extend_seq_lens, extend_prefix_lens,
+                 page_size, kv_lora_rank, qk_nope_head_dim,
+                 qk_rope_head_dim, v_head_dim, causal, softmax_scale):
+        bs = extend_seq_lens.shape[0]
+        qsl = torch.zeros(bs + 1, dtype=torch.int32,
+                           device=extend_seq_lens.device)
+        qsl[1:] = torch.cumsum(extend_seq_lens, dim=0)
+
+        if extend_prefix_lens is None:
+            prefix_lens = torch.zeros(bs, dtype=torch.int32,
+                                       device=extend_seq_lens.device)
+        else:
+            prefix_lens = extend_prefix_lens.to(torch.int32)
+
+        seq_lens = (prefix_lens + extend_seq_lens).to(torch.int32)
+        cur_lens = extend_seq_lens.to(torch.int32)
+
+        out = torch.empty(q.shape[0], q.shape[1], v_head_dim,
+                           dtype=q.dtype)
+        torch.ops.sgl_kernel.flash_attention_paged_kunpeng(
+            q=q, latent_cache=latent_cache, kv_b_weight=kv_b_weight,
+            kv_b_weight_scale=kv_b_weight_scale,
+            out=out, workspace=workspace, block_table=block_table,
+            seq_lens=seq_lens, cur_lens=cur_lens,
+            query_start_loc=qsl,
+            page_size=int(page_size),
+            kv_lora_rank=int(kv_lora_rank),
+            qk_nope_head_dim=int(qk_nope_head_dim),
+            qk_rope_head_dim=int(qk_rope_head_dim),
+            v_head_dim=int(v_head_dim),
+            causal=bool(causal),
+            softmax_scale=float(softmax_scale))
+        return out
+
+    register_op('flash_attention_paged_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_flash_mla_dense_decode_kunpeng():
@@ -848,70 +854,36 @@ def _setup_flash_mla_dense_decode_kunpeng():
     register_op('flash_mla_dense_decode_kunpeng', shape_infer, eager_fn)
 
 
-def _setup_flash_mla_dense_extend_kunpeng():
-    """MLA paged attention kernel for EXTEND (incl. chunked prefill).
-
-    q shape: (bs, max_ext_len, n_heads, qk_head_dim)
-    seqlens_kv: per-request total context length (prefix + chunk)
-    head_dim_v: output dim per head (= layer.v_head_dim = kv_lora_rank),
-                NOT kcache.shape[-1] which includes qk_rope_head_dim.
-    """
-    def shape_infer(q, kcache, block_table, seqlens_kv,
-                    softmax_scale, is_causal, extra_buffer, meta,
-                    head_dim_v):
-        bsz, max_ext_len, n_heads, _ = q.shape
-        return [((bsz, max_ext_len, n_heads, head_dim_v), torch.bfloat16),
-                ((bsz, max_ext_len, n_heads), torch.float32)]
-
-    def eager_fn(q, kcache, block_table, seqlens_kv,
-                 softmax_scale, is_causal, extra_buffer, meta,
-                 head_dim_v):
-        bsz, max_ext_len, n_heads, _ = q.shape
-        o = torch.empty((bsz, max_ext_len, n_heads, head_dim_v), dtype=torch.bfloat16)
-        softmax_lse = torch.empty((bsz, max_ext_len, n_heads), dtype=torch.float32)
-        torch.ops.sgl_kernel.flash_mla_dense_decode_kunpeng(
-            q, kcache, None,
-            block_table, seqlens_kv,
-            o, softmax_lse,
-            float(softmax_scale), bool(is_causal),
-            extra_buffer, meta)
-        return o, softmax_lse
-
-    register_op('flash_mla_dense_extend_kunpeng', shape_infer, eager_fn)
-
-
 def _setup_pad_q_left_mtp_kunpeng():
-    """Pad a flat (num_tokens, n_heads, D) q into (bs, max_len, n_heads, D).
+    def shape_infer(q, seq_lens, max_seq_len):
+        bsz = seq_lens.shape[0]
+        n_heads = q.shape[1]
+        head_dim = q.shape[2]
+        return [((bsz, max_seq_len, n_heads, head_dim), q.dtype)]
 
-    Reads each request's first ``ext_lens[b]`` tokens and zero-pads the rest
-    on the right. Used to feed the MLA paged attention kernel which expects
-    a (bs, max_ext_len, ...) layout.
-    """
-    def shape_infer(q, ext_lens, max_ext_len, out):
-        return [out.shape]
-
-    def eager_fn(q, ext_lens, max_ext_len, out):
-        torch.ops.sgl_kernel.pad_q_left_mtp_kunpeng(
-            q.contiguous(), ext_lens, int(max_ext_len), out)
-        return out
+    def eager_fn(q, seq_lens, max_seq_len):
+        bsz = seq_lens.shape[0]
+        n_heads = q.shape[1]
+        head_dim = q.shape[2]
+        q_padded = torch.empty((bsz, max_seq_len, n_heads, head_dim), dtype=q.dtype)
+        torch.ops.sgl_kernel.pad_q_left_mtp_kunpeng(q, seq_lens, q_padded)
+        return q_padded
 
     register_op('pad_q_left_mtp_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_unpad_o_right_mtp_kunpeng():
-    """Unpad a (bs, max_ext_len, n_heads, D) MLA output to (num_tokens, n_heads, D).
+    def shape_infer(o, seq_lens, sum_seq_len):
+        n_heads = o.shape[2]
+        head_dim = o.shape[3]
+        return [((sum_seq_len, n_heads, head_dim), o.dtype)]
 
-    Picks the first ``ext_lens[b]`` tokens from each request's row, discarding
-    the right-padded tail. Used to flatten MLA paged attention output back
-    to the model's expected (num_total_tokens, ...) layout.
-    """
-    def shape_infer(o_padded, ext_lens, max_ext_len, out):
-        return [out.shape]
-
-    def eager_fn(o_padded, ext_lens, max_ext_len, out):
-        torch.ops.sgl_kernel.unpad_o_right_mtp_kunpeng(
-            o_padded, ext_lens, int(max_ext_len), out)
-        return out
+    def eager_fn(o, seq_lens, sum_seq_len):
+        n_heads = o.shape[2]
+        head_dim = o.shape[3]
+        o_flat = torch.empty((sum_seq_len, n_heads, head_dim), dtype=o.dtype)
+        torch.ops.sgl_kernel.unpad_o_right_mtp_kunpeng(o, seq_lens, o_flat)
+        return o_flat
 
     register_op('unpad_o_right_mtp_kunpeng', shape_infer, eager_fn)
 
@@ -1041,14 +1013,11 @@ def setup():
     _setup_set_kv_buffer_kunpeng()
     _setup_set_kv_buffer_2_kunpeng()
     _setup_kupl_sdma_set_kv_buffer_2()
-    _setup_gather_kv_kunpeng()
     _setup_copy_kunpeng()
     _setup_print_hash_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()
-    _setup_flash_mla_dense_extend_kunpeng()
-    _setup_pad_q_left_mtp_kunpeng()
-    _setup_unpad_o_right_mtp_kunpeng()
     _setup_flash_attention_with_workspace_kunpeng()
+    _setup_flash_attention_paged_kunpeng()
     _setup_pad_q_left_mtp_kunpeng()
     _setup_unpad_o_right_mtp_kunpeng()
     _setup_topk_convert_kunpeng()
