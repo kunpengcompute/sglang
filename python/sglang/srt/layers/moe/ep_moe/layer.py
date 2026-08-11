@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.graph import ops as kunpeng
+from sglang.srt.hardware_backend.cpu_kunpeng.expert_load_debug import record_layer_seq
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
@@ -766,6 +767,9 @@ class KunpengMoE(FusedMoE):
         scale = packed_recv_x[:, hidden : hidden + 4].view(torch.float32)
 
         t_gateup_start = time.perf_counter()
+        # Record the layer of this gateup call for the expert load debug
+        # dumps (capture-time layer sequence, no-op when not compiled in)
+        record_layer_seq(self.layer_id)
         kunpeng.igemm_fusedmoe_gateup_kunpeng(
             act,
             scale,
