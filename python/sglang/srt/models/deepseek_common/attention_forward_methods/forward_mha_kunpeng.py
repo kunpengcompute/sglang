@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -81,6 +82,10 @@ class DeepseekMHAKunpengForwardMixin:
         kunpeng.copy_kunpeng(q[..., self.qk_nope_head_dim :], q_pe)
         self._set_mla_kv_buffer_kunpeng(latent_cache, kv_a, k_pe, forward_batch)
 
+        cps = get_global_server_args().chunked_prefill_size
+        if cps is not None and cps > 0:
+            return q, None, None, forward_batch
+
         # kv_b
         out, _ = self.kv_b_proj(kv_a)
         kv = out.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -97,12 +102,81 @@ class DeepseekMHAKunpengForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        cps = get_global_server_args().chunked_prefill_size
+        if cps is not None and cps > 0:
+            attn_output = self._forward_mha_chunked_prefill_kunpeng(q, forward_batch)
+        else:
+            attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
 
         # o_proj
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _forward_mha_chunked_prefill_kunpeng(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Run paged MHA attention via the C++ kernel.
+
+        Reads latent via block_table, applies kv_b_proj internally, runs
+        flash_attention. Requires block_table/seq_lens metadata from
+        init_forward_metadata.
+        """
+        meta = forward_batch.attn_backend.forward_metadata
+
+        # Get the paged MLA latent KV cache.
+        latent_cache = self.swap_mgr.get_kv_cache()
+
+        # kv_b_proj: int8 weight + per-row scale; C++ quantizes kv_a and runs int8 GEMM.
+        kv_b_weight = self.kv_b_proj.weight
+        kv_b_weight_scale = self.kv_b_proj.weight_scale.view(-1)
+
+        # Build workspace for kutacc internal scratch tensors.
+        softmax_scale = (
+            self.scaling
+            if self.scaling is not None
+            else 1.0 / math.sqrt(self.qk_head_dim)
+        )
+        BR, BC = torch.ops.sgl_kernel.get_flash_attention_block_kunpeng()
+        threads_num = torch.ops.sgl_kernel.get_flash_attention_thread_num()
+        
+        MAX_SEQ_LEN_SUPPORTED = 2048
+        dtype_size = q.element_size()
+        f32_size = 4
+
+        def align64(x):
+            return (x + 63) // 64 * 64
+
+        ws_bytes = 0
+        ws_bytes += align64(threads_num * MAX_SEQ_LEN_SUPPORTED * self.qk_head_dim * dtype_size)
+        ws_bytes += align64(threads_num * MAX_SEQ_LEN_SUPPORTED * self.v_head_dim * dtype_size)
+        ws_bytes += align64(threads_num * BR * self.qk_head_dim * dtype_size)
+        ws_bytes += align64(threads_num * BC * BR * f32_size)
+        ws_bytes += align64(threads_num * BR * self.v_head_dim * f32_size) * 2
+        ws_bytes += align64(threads_num * BR * f32_size) * 4
+        workspace = kunpeng.alloc_buffer(ws_bytes)
+
+        block_table = meta.block_table
+        page_size = meta.page_size
+
+        attn_out = kunpeng.flash_attention_paged_kunpeng(
+            q, latent_cache, kv_b_weight, kv_b_weight_scale, workspace,
+            block_table,
+            forward_batch.extend_seq_lens,
+            forward_batch.extend_prefix_lens,
+            page_size,
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+            True,  # causal
+            softmax_scale,
+        )
+
+        return attn_out
 
     def _set_mla_kv_buffer_kunpeng(
         self: DeepseekV2AttentionMLA,

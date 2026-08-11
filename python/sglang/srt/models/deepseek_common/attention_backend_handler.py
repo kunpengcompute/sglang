@@ -192,10 +192,9 @@ def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 def handle_attention_kunpeng_cpu(attn, forward_batch):
-    if (
-        forward_batch.forward_mode.is_extend_without_speculative()
-        and sum(forward_batch.extend_prefix_lens_cpu) == 0
-    ):
+    # Use MHA_KUNPENG for all prefill so chunked and non-chunked match;
+    # MLA_KUNPENG's absorbed-q path diverges numerically.
+    if forward_batch.forward_mode.is_extend_without_speculative():
         return AttnForwardMethod.MHA_KUNPENG
     else:
         return AttnForwardMethod.MLA_KUNPENG

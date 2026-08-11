@@ -776,6 +776,55 @@ def _setup_flash_attention_with_workspace_kunpeng():
     register_op('flash_attention_with_workspace_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_flash_attention_paged_kunpeng():
+    # Paged MHA for chunked prefill: reads latent via block_table, applies
+    # kv_b_proj internally.
+    def shape_infer(q, latent_cache, kv_b_weight, kv_b_weight_scale,
+                    workspace, block_table,
+                    extend_seq_lens, extend_prefix_lens,
+                    page_size, kv_lora_rank, qk_nope_head_dim,
+                    qk_rope_head_dim, v_head_dim, causal, softmax_scale):
+        return [((q.shape[0], q.shape[1], v_head_dim), q.dtype)]
+
+    def eager_fn(q, latent_cache, kv_b_weight, kv_b_weight_scale,
+                 workspace, block_table,
+                 extend_seq_lens, extend_prefix_lens,
+                 page_size, kv_lora_rank, qk_nope_head_dim,
+                 qk_rope_head_dim, v_head_dim, causal, softmax_scale):
+        bs = extend_seq_lens.shape[0]
+        qsl = torch.zeros(bs + 1, dtype=torch.int32,
+                           device=extend_seq_lens.device)
+        qsl[1:] = torch.cumsum(extend_seq_lens, dim=0)
+
+        if extend_prefix_lens is None:
+            prefix_lens = torch.zeros(bs, dtype=torch.int32,
+                                       device=extend_seq_lens.device)
+        else:
+            prefix_lens = extend_prefix_lens.to(torch.int32)
+
+        seq_lens = (prefix_lens + extend_seq_lens).to(torch.int32)
+        cur_lens = extend_seq_lens.to(torch.int32)
+
+        out = torch.empty(q.shape[0], q.shape[1], v_head_dim,
+                           dtype=q.dtype)
+        torch.ops.sgl_kernel.flash_attention_paged_kunpeng(
+            q=q, latent_cache=latent_cache, kv_b_weight=kv_b_weight,
+            kv_b_weight_scale=kv_b_weight_scale,
+            out=out, workspace=workspace, block_table=block_table,
+            seq_lens=seq_lens, cur_lens=cur_lens,
+            query_start_loc=qsl,
+            page_size=int(page_size),
+            kv_lora_rank=int(kv_lora_rank),
+            qk_nope_head_dim=int(qk_nope_head_dim),
+            qk_rope_head_dim=int(qk_rope_head_dim),
+            v_head_dim=int(v_head_dim),
+            causal=bool(causal),
+            softmax_scale=float(softmax_scale))
+        return out
+
+    register_op('flash_attention_paged_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_flash_mla_dense_decode_kunpeng():
     def shape_infer(q, kcache, block_table, seqlens_kv,
                     softmax_scale, is_causal, extra_buffer, meta,
@@ -968,6 +1017,7 @@ def setup():
     _setup_print_hash_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()
     _setup_flash_attention_with_workspace_kunpeng()
+    _setup_flash_attention_paged_kunpeng()
     _setup_pad_q_left_mtp_kunpeng()
     _setup_unpad_o_right_mtp_kunpeng()
     _setup_topk_convert_kunpeng()

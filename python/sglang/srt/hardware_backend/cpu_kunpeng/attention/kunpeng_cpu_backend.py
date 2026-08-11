@@ -282,7 +282,36 @@ class KunpengCpuBackend(AttentionBackend):
                 enable_blockwise=True,
             )
             self._init_blockwise_swap_metadata(metadata, forward_batch)
+        elif forward_batch.forward_mode.is_extend():
+            # Chunked prefill: build per-request block_table covering
+            # prefix pages (in cache) + current chunk pages. The paged MHA
+            # kernel (MHA_KUNPENG) reads latent via this block_table.
+            self._init_extend_mha_metadata(forward_batch)
         return
+
+    def _init_extend_mha_metadata(self, forward_batch: ForwardBatch):
+        """Build block_table for the paged MHA extend (chunked prefill).
+
+        seq_lens = prefix + chunk per request; block_table covers prefix
+        pages and current chunk pages.
+        """
+        metadata = self.forward_metadata
+        metadata.page_size = forward_batch.token_to_kv_pool.page_size
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        metadata.seq_lens = seq_lens
+        metadata.extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        metadata.all2all_size = 1
+        metadata.batchsize_per_tp = seq_lens.shape[0]
+        metadata.token_slice_start = 0
+
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+        self._init_block_table(
+            metadata,
+            forward_batch,
+            req_pool_indices,
+            seq_lens,
+            enable_blockwise=False,
+        )
 
     def _init_decode_metadata(
         self,
