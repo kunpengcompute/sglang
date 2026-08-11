@@ -64,6 +64,7 @@ class SpeculativeAlgorithm(Enum):
         ), "Cannot create worker for NONE speculative algorithm."
 
         enable_overlap = not server_args.disable_overlap_schedule
+        is_pp = server_args.pp_size > 1
 
         if self.is_dflash():
             if enable_overlap:
@@ -73,6 +74,21 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker
+
+        if self.is_eagle() and is_pp and not server_args.enable_multi_layer_eagle:
+            # PP + MTP: the draft worker runs on the last PP rank only and
+            # implements the 1-step MTP flow (draft predictions travel with the
+            # ring messages; the verify batches are prepared by the scheduler).
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"Creating PPNextNWorker for PP+MTP (pp_size={server_args.pp_size}, "
+                f"spec_algorithm={self})"
+            )
+            from sglang.srt.speculative.pp_nextn_worker import PPNextNWorker
+
+            return PPNextNWorker
 
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
             # FIXME: migrate to EagleWorker

@@ -1412,6 +1412,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
 
+    # PP + MTP: set by the scheduler (scheduler_pp_mixin) to carry the per-req
+    # accepted token count for the result processing on non-last PP ranks.
+    pp_mtp_accepted_tokens: Optional[torch.Tensor] = None
+
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None

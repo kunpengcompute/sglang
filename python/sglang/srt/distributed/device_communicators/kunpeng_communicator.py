@@ -207,7 +207,7 @@ class KunpengCommunicator:
 
         if shm_tensor is None:
             shm_tensor = kernel.create_shm_tensor_kunpeng(
-                torch.bfloat16, [self.max_tokens * self.comm_size, dim]
+                torch.bfloat16, [self.max_tokens, dim]
             )
             self.shm_tensors[dim] = shm_tensor
 
@@ -221,18 +221,28 @@ class KunpengCommunicator:
 
     @KunpengProfiler(depth=3)
     def shm_all_gather_into_tensor(self, input: torch.Tensor, output: torch.Tensor):
-        local_batch = input.size(0)
-        global_batch = output.size(0)
-        dim = input.size(1) if input.dim() > 1 else 1
+        if input.dim() == 1:
+            dim = self.max_elements / self.max_tokens
+            assert input.size(0) % dim == 0 and output.size(0) % dim == 0, {
+                f"shm_all_gather_into_tensor: input.size(0)({input.size(0)}) % {dim} != 0 "
+                f"shm_all_gather_into_tensor: output.size(0)({output.size(0)}) % {dim} != 0 "
+            }
+            local_batch = input.size(0) // dim
+            global_batch = output.size(0) // dim
+            input_2d = input.view(local_batch, dim)
+            output_2d = output.view(global_batch, dim)
+        else:
+            dim = input.size(1)
+            local_batch = input.size(0)
+            global_batch = output.size(0)
+            input_2d = input
+            output_2d = output
 
         shm_tensor = self.get_shm_tensor(dim)
-
         src0 = shm_tensor[
             self.comm_rank * local_batch : (self.comm_rank + 1) * local_batch, :
         ]
         dst0 = shm_tensor[:global_batch, :]
-
-        input_2d = input.unsqueeze(1) if input.dim() == 1 else input
 
         t_copy_in_start = time.perf_counter()
         src0.copy_(input_2d)
@@ -246,10 +256,7 @@ class KunpengCommunicator:
         t_ag_end = time.perf_counter()
 
         t_copy_out_start = time.perf_counter()
-        if output.dim() == 1:
-            output.copy_(dst0.view(-1))
-        else:
-            output.copy_(dst0)
+        output_2d.copy_(dst0)
         t_copy_out_end = time.perf_counter()
 
         if envs.SGLANG_KUNPENG_PROFILE.get():

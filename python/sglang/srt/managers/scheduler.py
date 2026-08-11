@@ -442,6 +442,14 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
+        if self.pp_size > 1:
+            # Under PP, the last rank may take longer to initialize (e.g.
+            # loading MTP draft model weights) while other ranks have already
+            # finished. Synchronize all PP ranks here so no rank proceeds to the
+            # event loop before every rank is ready — otherwise the ring
+            # communication in the event loop deadlocks.
+            barrier()
+
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
@@ -661,6 +669,13 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        if self.pp_size > 1:
+            logger.info(
+                f"[PP{self.pp_rank}] Creating draft worker on all PP ranks "
+                f"to participate in init all_reduce (only last rank uses it "
+                f"for MTP; pp_size={self.pp_size})"
+            )
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -682,8 +697,24 @@ class Scheduler(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
 
+        # Get the draft worker class FIRST, before overriding pp_size, so that
+        # create_worker() sees the original pp_size and correctly returns
+        # PPNextNWorker under PP (rather than falling through to EAGLEWorker).
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+
+        if self.pp_size > 1:
+            # The draft worker is a local, single-layer model that is not part of
+            # the PP pipeline. Present it with pp_size=1 so its ModelRunner skips
+            # the PP support assertion and the per-rank layer splitting.
+            backup_pp_size = self.server_args.pp_size
+            self.server_args.pp_size = 1
+        else:
+            backup_pp_size = None
+
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+        if backup_pp_size is not None:
+            self.server_args.pp_size = backup_pp_size
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -704,8 +735,22 @@ class Scheduler(
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
+        elif self.pp_size > 1 and self.pp_rank != self.pp_size - 1:
+            # Under PP, all ranks create the draft worker to participate in
+            # collective ops during init (see get_available_gpu_memory), but
+            # only the last rank uses it as model_worker — non-last ranks
+            # use the plain target worker.
+            self.model_worker = self.tp_worker
+            logger.info(
+                f"[PP{self.pp_rank}] model_worker=TpModelWorker "
+                f"(draft_worker exists but unused, pp_size={self.pp_size})"
+            )
         else:
             self.model_worker = self.draft_worker
+            logger.info(
+                f"[PP{self.pp_rank}] model_worker={type(self.draft_worker).__name__} "
+                f"(pp_size={self.pp_size}, spec={self.spec_algorithm})"
+            )
 
         # Install device timer on model runners for fwd occupancy tracking
         if hasattr(self, "forward_pass_device_timer"):
@@ -2953,6 +2998,11 @@ class Scheduler(
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
+            elif self.pp_size > 1 and not self.pp_group.is_last_rank:
+                # PP + spec: non-last ranks run the plain target worker on a model
+                # worker batch; the verify batch was prepared by the scheduler
+                # (scheduler_pp_mixin), so no worker-side spec preparation happens.
+                worker_batch_or_batch = batch.get_model_worker_batch()
             else:
                 # In speculative decoding v1 (non-overlap) case, we use the batch directly.
                 # TODO(lsyin): delete this branch after unifying the abstraction.
@@ -3003,9 +3053,20 @@ class Scheduler(
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
+                    if (self.spec_algorithm.is_none() or self.pp_size > 1)
                     else {}
                 )
+                if (
+                    self.pp_size > 1
+                    and not self.spec_algorithm.is_none()
+                    and envs.SGLANG_DEBUG_PP_MTP.get()
+                ):
+                    logger.info(
+                        f"[PP{self.pp_rank}] run_batch: forward_mode={batch.forward_mode} "
+                        f"model_worker={type(self.model_worker).__name__} "
+                        f"batch_mode={type(worker_batch_or_batch).__name__} "
+                        f"has_pp_proxy={pp_proxy_tensors is not None}"
+                    )
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )

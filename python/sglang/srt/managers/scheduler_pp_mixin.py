@@ -29,15 +29,28 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu, is_cpu_920f
+from sglang.srt.utils.common import get_bool_env_var, get_device_module, is_xpu, is_cpu_920f
 
 logger = logging.getLogger(__name__)
 
 _is_cpu_920f = is_cpu_920f()
+_DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
+
+def _ppmtp_log(self, msg: str, *args) -> None:
+    """Log PP+MTP debug info with the pp_rank prefix."""
+    if not _DEBUG_PP_MTP:
+        return
+    pp_rank = getattr(self, "pp_rank", None)
+    logger.info(f"[PP{pp_rank}] {msg}", *args)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -94,6 +107,8 @@ class SchedulerPPMixin:
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
+                    if self._pp_mtp_enabled:
+                        self._pp_maybe_prepare_mtp_batch(self.mbs[mb_id])
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
@@ -552,6 +567,22 @@ class SchedulerPPMixin:
             defaultdict(deque)
         )
 
+        # PP + MTP (1-step): the draft token of every req that is about to be
+        # verified in the next decode round, keyed by req.rid. Filled on the
+        # last rank right after its worker produces the drafts, and on the
+        # other ranks when the output message circulates back.
+        self._pp_mtp_enabled = (
+            self.pp_size > 1
+            and self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+        )
+        self._pp_pending_drafts: Dict[str, int] = {}
+        _ppmtp_log(
+            self,
+            f"init: pp_mtp_enabled={self._pp_mtp_enabled} "
+            f"pp_size={self.pp_size} spec={self.spec_algorithm}",
+        )
+
     def profile_and_init_predictor(self: Scheduler):
         """
         Profile prefill latency for dynamic chunk sizing.
@@ -984,6 +1015,21 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
+        if self._pp_mtp_enabled:
+            # PP + MTP: carry the accepted-token counts (per req) and the draft
+            # tokens for the next verify round (per req) along with the result.
+            if result.num_accepted_tokens is not None:
+                tensor_dict["num_accepted_tokens"] = result.num_accepted_tokens
+            if result.draft_tokens is not None:
+                tensor_dict["draft_tokens"] = result.draft_tokens
+            _ppmtp_log(
+                self,
+                f"prepare_tensor_dict: sending "
+                f"num_accepted_tokens={'present' if result.num_accepted_tokens is not None else 'None'} "
+                f"draft_tokens={'present' if result.draft_tokens is not None else 'None'} "
+                f"tensor_dict_keys={list(tensor_dict.keys())}",
+            )
+
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
@@ -1197,6 +1243,42 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
         batch.output_ids = pp_outputs["next_token_ids"]
+
+        if self._pp_mtp_enabled:
+            # PP + MTP: stash the per-req drafts for the next verify round and
+            # the accepted-token counts for the result processing. This runs on
+            # the non-last ranks, which learn the drafts from the ring message;
+            # the last rank stashes them in `_pp_launch_batch` right after its
+            # worker produces them (the ring would be one full loop too late).
+            draft_tokens = pp_outputs.tensors.get("draft_tokens", None)
+            if draft_tokens is not None:
+                for req, tok in zip(batch.reqs, draft_tokens.tolist()):
+                    self._pp_pending_drafts[req.rid] = int(tok)
+                batch.pp_mtp_accepted_tokens = pp_outputs.tensors.get(
+                    "num_accepted_tokens", None
+                )
+                _ppmtp_log(
+                    self,
+                    f"recv_drafts_via_ring: stashed for "
+                    f"rids={[r.rid for r in batch.reqs]} "
+                    f"drafts={draft_tokens.tolist()} "
+                    f"accepted_tokens={batch.pp_mtp_accepted_tokens}",
+                )
+            else:
+                _ppmtp_log(
+                    self,
+                    f"recv_drafts_via_ring: no draft_tokens in pp_outputs "
+                    f"(n_reqs={batch.batch_size()})",
+                )
+
+        # After a TARGET_VERIFY round, reset forward_mode to DECODE so the
+        # batch does not match is_extend() in subsequent get_next_batch_to_run
+        # iterations (which would wrongly trigger merge_batch on stale
+        # EagleVerifyInput spec_info).  On the last rank _pp_mtp_verify
+        # already sets DECODE; this keeps non-last ranks consistent.
+        if batch.forward_mode.is_target_verify():
+            batch.forward_mode = ForwardMode.DECODE
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1354,7 +1436,150 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+                    if (
+                        self._pp_mtp_enabled
+                        and result.draft_tokens is not None
+                        and self.cur_batch is not None
+                    ):
+                        # PP + MTP: the last rank produces the next round's
+                        # drafts locally; stash them before the ring brings the
+                        # message back (one full loop too late).
+                        for req, tok in zip(
+                            self.cur_batch.reqs, result.draft_tokens.tolist()
+                        ):
+                            self._pp_pending_drafts[req.rid] = int(tok)
+                        _ppmtp_log(
+                            self,
+                            f"last_rank_stash: stashed drafts for "
+                            f"rids={[r.rid for r in self.cur_batch.reqs]} "
+                            f"drafts={result.draft_tokens.tolist()}",
+                        )
         return result, event
+
+    def _pp_maybe_prepare_mtp_batch(self: Scheduler, batch: Optional[ScheduleBatch]):
+        """Prepare a PP decode batch for 1-step MTP (TARGET_VERIFY round).
+
+        Every decode req must carry a pending draft from the previous round
+        (the last rank's worker or the ring message). If the invariant is ever
+        violated (e.g. a subtle transition or timing edge case), fail loudly
+        instead of silently degrading to a non-speculative round, so that the
+        scheduling bug is exposed immediately.
+        """
+        if batch is None:
+            _ppmtp_log(self, "maybe_prepare: batch is None, skip")
+            return
+        if not batch.forward_mode.is_decode():
+            _ppmtp_log(
+                self,
+                f"maybe_prepare: skip (mode={batch.forward_mode}, "
+                f"n_reqs={batch.batch_size()})",
+            )
+            return
+
+        n_reqs = batch.batch_size()
+        pending_keys = list(self._pp_pending_drafts.keys())
+        _ppmtp_log(
+            self,
+            f"maybe_prepare: decode batch n_reqs={n_reqs} "
+            f"pending_drafts_count={len(pending_keys)} "
+            f"pending_rids={pending_keys}",
+        )
+
+        missing = [
+            req.rid for req in batch.reqs if req.rid not in self._pp_pending_drafts
+        ]
+        if missing:
+            raise RuntimeError(
+                "PP+MTP: decode batch contains requests without a pending draft "
+                f"(rids={missing}); the MTP pipeline invariant is violated"
+            )
+        _ppmtp_log(self, "maybe_prepare: all drafts present, preparing verify batch")
+        self._pp_mtp_prepare_verify_batch(batch)
+
+    def _pp_mtp_prepare_verify_batch(self: Scheduler, batch: ScheduleBatch):
+        """Turn a decode batch into a 1-step TARGET_VERIFY batch.
+
+        input_ids = [root, draft] per req, where the root is the last confirmed
+        token (req.output_ids[-1]) and the draft comes from the scheduler's
+        pending per-req state. KV locations are allocated extend-style via the
+        same prepare_for_verify logic used in non-PP EAGLE, and the batch's
+        spec_info carries the linear 1-step tree so that the forward path and
+        the last-rank acceptance machinery see the same structures.
+        """
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        reqs = batch.reqs
+        bs = len(reqs)
+        device = self.device
+        draft_token_num = 2  # [root, draft]
+
+        seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
+        input_ids = []
+        positions = []
+        for r in reqs:
+            draft = self._pp_pending_drafts.pop(r.rid, None)
+            if draft is None:
+                raise RuntimeError(
+                    f"PP+MTP: missing pending draft for req {r.rid} during verify prep"
+                )
+            input_ids.append(r.output_ids[-1])
+            input_ids.append(draft)
+
+        _ppmtp_log(
+            self,
+            f"prepare_verify: bs={bs} seq_lens={seq_lens} "
+            f"roots={[i for i in input_ids[::2]]} "
+            f"drafts={[i for i in input_ids[1::2]]}",
+        )
+
+        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        batch.seq_lens_sum = sum(seq_lens)
+        batch.input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
+        batch.input_embeds = None
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+
+        # Linear 1-step tree: positions [seq_len, seq_len+1] per req and the
+        # corresponding retrieve structures (mirrors build_tree_kernel_kunpeng
+        # for topk=1, spec_steps=1).
+        positions = [
+            pos for seq_len in seq_lens for pos in (seq_len, seq_len + 1)
+        ]
+        retrieve_index = torch.arange(
+            bs * draft_token_num, dtype=torch.long, device=device
+        ).reshape(bs, draft_token_num)
+        retrieve_next_token = torch.tensor(
+            [[1, -1]] * bs, dtype=torch.long, device=device
+        )
+        retrieve_next_sibling = torch.full(
+            (bs, draft_token_num), -1, dtype=torch.long, device=device
+        )
+
+        verify_input = EagleVerifyInput(
+            draft_token=batch.input_ids,
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.tensor(positions, dtype=torch.int64, device=device),
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=1,
+            topk=1,
+            draft_token_num=draft_token_num,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            grammar=None,
+        )
+        verify_input.prepare_for_verify(batch, self.page_size)
+        batch.spec_info = verify_input
+
+        _ppmtp_log(
+            self,
+            f"prepare_verify: done, forward_mode={batch.forward_mode} "
+            f"has_spec_info={batch.spec_info is not None}",
+        )
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group
