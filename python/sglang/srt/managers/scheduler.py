@@ -67,6 +67,10 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.cpu_kunpeng.expert_load_debug import (
+    DUMP_INTERVAL,
+    maybe_dump_periodic,
+)
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
@@ -2978,6 +2982,11 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+
+        # Periodically dump the compiled-in expert load stats (no-op when the
+        # debug recording is not enabled in the sgl-kernel build).
+        if _is_cpu_920f and self.forward_ct % DUMP_INTERVAL == 0:
+            maybe_dump_periodic()
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)

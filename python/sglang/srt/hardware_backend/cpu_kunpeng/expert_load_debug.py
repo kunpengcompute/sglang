@@ -20,20 +20,23 @@ igemm_fusedmoe_gateup call and hands it out through
 ``get_expert_load_stats_kunpeng()`` (fetch-and-reset semantics: the internal
 state is cleared after each call).
 
-This module pulls the raw ``[num_calls, num_experts]`` snapshots, aggregates
-them (totals, call counts, averages, peaks), saves the summary to a JSON file
-and prints a log digest.  Call the getter once after warmup to discard warmup
-records, run the benchmark, then call ``save_expert_load_stats`` to collect.
+The scheduler loop calls ``maybe_dump_periodic()`` every ``DUMP_INTERVAL``
+forward steps: the raw ``[num_calls, num_experts]`` snapshots are aggregated
+(totals, call counts, averages, peaks), the summary is saved to a per-rank
+JSON file in ``DUMP_DIR`` and a log digest is printed.  When the macro is not
+compiled in (or nothing was recorded yet) the hook is a no-op.
 """
 
 import json
 import logging
 import os
+from typing import Optional
 
 import torch
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
+    get_pipeline_model_parallel_rank,
     get_tensor_model_parallel_rank,
 )
 
@@ -44,22 +47,31 @@ logger = logging.getLogger(__name__)
 # model config instead.
 NUM_LAYERS = 58
 
+# Periodic dump from the scheduler loop: every DUMP_INTERVAL forward steps
+# the recorded snapshots are fetched (fetch-and-reset) and saved to JSON.
+DUMP_INTERVAL = 32
+
+# Directory for the periodic dumps (created on demand).
+DUMP_DIR = os.environ.get("SGLANG_KUNPENG_DEBUG_EXPERT_LOAD_DIR", "expert_load_debug")
+
 
 def _rank_id() -> dict:
     try:
         return {
             "tp": int(get_tensor_model_parallel_rank()),
             "ep": int(get_moe_expert_parallel_rank()),
+            "pp": int(get_pipeline_model_parallel_rank()),
         }
     except AssertionError:
-        return {"tp": 0, "ep": 0}
+        return {"tp": 0, "ep": 0, "pp": 0}
 
 
 def make_path(directory: str) -> str:
     """Build a per-rank JSON path so multi-rank dumps do not collide."""
     rank = _rank_id()
     return os.path.join(
-        directory, f"expert_load_tp{rank['tp']}_ep{rank['ep']}.json"
+        directory,
+        f"expert_load_tp{rank['tp']}_ep{rank['ep']}_pp{rank['pp']}.json",
     )
 
 
@@ -117,10 +129,12 @@ def _log_summary(summary: dict) -> None:
     )
 
 
-def save_expert_load_stats(path: str) -> dict:
+def save_expert_load_stats(path: str, stats: Optional[torch.Tensor] = None) -> dict:
     """Pull the recorded snapshots, save the aggregate summary to ``path``
-    (JSON) and print a log digest.  Returns the summary dict."""
-    stats = get_expert_load_stats()
+    (JSON) and print a log digest.  Returns the summary dict.  ``stats`` may
+    be passed in when the snapshots were already fetched."""
+    if stats is None:
+        stats = get_expert_load_stats()
     num_calls, num_experts = stats.shape
     summary = {
         "rank": _rank_id(),
@@ -165,3 +179,18 @@ def save_expert_load_stats(path: str) -> dict:
     _log_summary(summary)
     logger.info("[ExpertLoad] summary saved to %s", path)
     return summary
+
+
+def maybe_dump_periodic() -> None:
+    """Periodic dump hook called from the scheduler loop.
+
+    Fetches the recorded snapshots once; when the debug recording is not
+    compiled in (or nothing was recorded yet) the fetch returns an empty
+    tensor and this is a no-op.  Otherwise the snapshots (covering the last
+    DUMP_INTERVAL forward steps) are saved to a per-rank JSON file.
+    """
+    stats = get_expert_load_stats()
+    if stats.numel() == 0:
+        return
+    os.makedirs(DUMP_DIR, exist_ok=True)
+    save_expert_load_stats(make_path(DUMP_DIR), stats)
