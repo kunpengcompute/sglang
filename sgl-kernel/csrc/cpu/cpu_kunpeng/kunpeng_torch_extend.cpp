@@ -225,7 +225,10 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info, at::Tensor s
                              int64_t num_max_dispatch_tokens_per_rank, bool is_prefill);
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
-                                        int64_t num_experts, int64_t topk);
+                                        int64_t num_experts, int64_t topk, bool force_balance,
+                                        int64_t expert_offset);
+
+at::Tensor get_expert_load_stats_kunpeng();
 
 void multinomial_kunpeng(const at::Tensor &probs, at::Tensor out, int64_t num_samples, bool replacement);
 
@@ -501,8 +504,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def(
         "load_balance_padded_tokens_kunpeng("
         "Tensor(a!) topk_ids, Tensor(b!) topk_weights, Tensor num_token_non_padded, "
-        "int num_experts, int topk) -> ()");
+        "int num_experts, int topk, bool force_balance, int expert_offset) -> ()");
     m.impl("load_balance_padded_tokens_kunpeng", load_balance_padded_tokens_kunpeng);
+
+    m.def("get_expert_load_stats_kunpeng() -> Tensor");
+    m.impl("get_expert_load_stats_kunpeng", get_expert_load_stats_kunpeng);
 
     m.def("moe_comm_create_kunpeng(int process_group_ptr) -> ()");
     m.impl("moe_comm_create_kunpeng", moe_comm_create_kunpeng);

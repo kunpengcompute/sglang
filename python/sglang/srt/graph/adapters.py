@@ -276,12 +276,13 @@ def _setup_grouped_topk_inplace_kunpeng():
 
 
 def _setup_load_balance_padded_tokens_kunpeng():
-    def shape_infer(topk_ids, topk_weights, num_token_non_padded, num_experts, topk):
+    def shape_infer(topk_ids, topk_weights, num_token_non_padded, num_experts, topk, force_balance, expert_offset):
         return []
 
-    def eager_fn(topk_ids, topk_weights, num_token_non_padded, num_experts, topk):
+    def eager_fn(topk_ids, topk_weights, num_token_non_padded, num_experts, topk, force_balance, expert_offset):
         torch.ops.sgl_kernel.load_balance_padded_tokens_kunpeng(
-            topk_ids, topk_weights, num_token_non_padded, num_experts, topk)
+            topk_ids, topk_weights, num_token_non_padded, num_experts, topk,
+            bool(force_balance), int(expert_offset))
         return None
 
     register_op('load_balance_padded_tokens_kunpeng', shape_infer, eager_fn)
