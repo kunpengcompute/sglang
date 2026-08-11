@@ -51,8 +51,9 @@ NUM_LAYERS = 58
 # the recorded snapshots are fetched (fetch-and-reset) and saved to JSON.
 DUMP_INTERVAL = 32
 
-# Directory for the periodic dumps (created on demand).
-DUMP_DIR = os.environ.get("SGLANG_KUNPENG_DEBUG_EXPERT_LOAD_DIR", "expert_load_debug")
+# Directory for the periodic dumps, unified with the deployment log dir
+# (exported by scripts/cpu_kunpeng/env.sh); created on demand.
+DUMP_DIR = os.environ.get("LOG_DIR", "expert_load_debug")
 
 
 def _rank_id() -> dict:
