@@ -25,6 +25,7 @@
 #include <iostream>
 #include <arm_bf16.h>
 #include <arm_neon.h>
+#include <arm_sve.h>
 
 #include "sgl_kernel_ops.h"
 #include "kunpeng_comm.h"
@@ -116,6 +117,67 @@ void shm_allreduce_init_kunpeng(int64_t max_num_elements)
               << std::endl;
 }
 
+// ── shm_allreduce_naive ──────────────────────────────────────────────────
+// TEMP: kutacc::shm_allreduce equivalent (SGLANG_KUNPENG_ALLREDUCE_NAIVE=1).
+// Same contract: in-place reduce of shared buffers, no allocation, no copy.
+// Single-writer scheme: rank 0 sums all peers into its own buffer, then the
+// fence makes it visible and non-zero ranks copy the result into their own
+// buffers. kupl_shm_fence is a window barrier (kutacc allgather passes it as
+// its barrier callback), so no flag memory is needed.
+void shm_allreduce_naive(void **buffers, int64_t num_elements)
+{
+    int rank = get_intra_node_rank();
+    bfloat16_t **b = reinterpret_cast<bfloat16_t **>(buffers);
+
+    // single writer: rank 0 sums all peers (incl. itself) into its own buffer.
+    // Two-phase parallel reduce: threads first SVE-accumulate their segment
+    // into a private tmp (shared input stays read-only), parallel_barrier,
+    // then copy tmp into b[0] (no thread reads b[0] during the writes).
+    if (rank == 0) {
+        kutacc::parallel_for(0, num_elements, 1,
+                             [&](int64_t start, int64_t end) {
+            static thread_local std::vector<bfloat16_t> tmp;
+            int64_t seg = end - start;
+            tmp.resize(seg);
+            svbfloat16_t sve_zero = svdup_bf16(0);
+            for (int64_t i = start; i < end; i += 32) {
+                svbool_t pred = svwhilelt_b16(i, end);
+                svfloat32_t sve0 = svdup_f32(0);
+                svfloat32_t sve1 = svdup_f32(0);
+                for (int r = 0; r < intra_node_size; ++r) {
+                    svbfloat16_t sve = svld1(pred, b[r] + i);
+                    sve0 = svadd_m(svptrue_b32(), sve0,
+                                   svreinterpret_f32(svzip1(sve_zero, sve)));
+                    sve1 = svadd_m(svptrue_b32(), sve1,
+                                   svreinterpret_f32(svzip2(sve_zero, sve)));
+                }
+                svbfloat16_t out = svuzp1(svcvt_bf16_x(svptrue_b32(), sve0),
+                                          svcvt_bf16_x(svptrue_b32(), sve1));
+                svst1(pred, tmp.data() + (i - start), out);
+            }
+            kutacc::parallel_barrier();
+            std::memcpy(b[0] + start, tmp.data(),
+                        static_cast<size_t>(seg) * sizeof(bfloat16_t));
+            kutacc::parallel_barrier();
+        });
+    }
+
+    // fence: rank 0's result is ready before anyone reads it
+    kupl_shm_fence(kupl_win_intra_node);
+
+    // non-zero ranks: copy rank 0's result into their own buffer
+    // (the caller's copy-out then sees the result on every rank)
+    if (rank != 0) {
+        kutacc::parallel_for(0, num_elements, 1, [&](int64_t start, int64_t end) {
+            std::memcpy(b[rank] + start, b[0] + start,
+                        static_cast<size_t>(end - start) * sizeof(bfloat16_t));
+        });
+    }
+
+    // fence: all writes done before the next call's copy-in races them
+    kupl_shm_fence(kupl_win_intra_node);
+}
+
 void shm_allreduce_kunpeng(at::Tensor input)
 {
     TORCH_CHECK(g_ar_initialized, "shm_allreduce_kunpeng called before shm_allreduce_init_kunpeng");
@@ -151,7 +213,17 @@ void shm_allreduce_kunpeng(at::Tensor input)
 
     // allreduce in-place on the SHM buffer
     size_t num_elements = input.numel();
-    kutacc::shm_allreduce((void **)remote_buffers_ptr, num_elements, g_ar_request);
+    // TEMP: SGLANG_KUNPENG_ALLREDUCE_NAIVE=1 dispatches to the equivalent
+    // non-kutacc implementation instead of kutacc::shm_allreduce.
+    static const bool use_naive = [] {
+        const char *env = std::getenv("SGLANG_KUNPENG_ALLREDUCE_NAIVE");
+        return env != nullptr && std::strcmp(env, "1") == 0;
+    }();
+    if (use_naive) {
+        shm_allreduce_naive((void **)remote_buffers_ptr, num_elements);
+    } else {
+        kutacc::shm_allreduce((void **)remote_buffers_ptr, num_elements, g_ar_request);
+    }
 
     // copy out: SHM buffer -> user input (only for the eager fallback path)
     if (!input_in_shm)
