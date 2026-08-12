@@ -928,7 +928,7 @@ class LogitsProcessor(nn.Module):
                     torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
                 )
                 blocks_in_k = K // tile_k
-                ws_numel = blocks_in_k * N * M * 2 if blocks_in_k > 1 else 0
+                ws_numel = blocks_in_k * N * M + 1024 if blocks_in_k > 1 else 0
                 packed_hs = kunpeng.bf16_gemm_pack_kunpeng(hs, tile_m, tile_k)
                 logits = kunpeng.bf16_packed_gemm_kunpeng(
                     packed_hs,
