@@ -846,4 +846,4 @@ class KunpengCpuBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         # 多节点prepare_mlp_sync会调用到
-        return 0
+        return 1
