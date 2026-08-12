@@ -22,7 +22,8 @@ aggregates the per-layer per-expert stats across all ranks.
 
 Layer attribution is derived from the deployment options, not from the dump:
 
-  - ``--num-layers`` (default 58): total main-model layer count
+  - ``--num-layers`` (default 61): total main-model layer count; 61 = 3
+    dense head layers + 58 MoE layers, so the MoE layer ids are 3..60
   - ``--moe-start-layer`` (default 3): first main-model MoE layer (earlier
     layers are dense and produce no gateup calls)
   - ``--pp-size`` (default 1): pipeline parallel size; each PP rank owns the
@@ -42,16 +43,17 @@ placeholders (empty experts are not loaded) so that the logical expert id
 offset ``logical = ep_rank * padded_num_local + local_idx`` stays uniform
 across ranks.
 
-Mapping file format (JSON):
+Mapping file format (JSON, optional): when omitted, experts are kept as-is
+(rank-even split) instead of being remapped:
     {"default": {"<virtual_id>": <physical_id>, ...},
      "<layer_id>": {"<virtual_id>": <physical_id>, ...}, ...}
 Per layer the resolution chain per expert entry is: layer-specific map ->
 "default" -> identity, so different layers may use different mappings.
 
 Usage:
-    python3 expert_load_stats.py --dump-dir "$LOG_DIR" --expert-map map.json \
-        [--num-layers 58] [--moe-start-layer 3] [--pp-size 1] [--mtp-steps 0] \
-        [--output report.json]
+    python3 expert_load_stats.py --dump-dir "$LOG_DIR" \
+        [--num-layers 61] [--moe-start-layer 3] [--pp-size 1] [--mtp-steps 0] \
+        [--expert-map map.json] [--output report.json]
 """
 
 import argparse
@@ -78,16 +80,11 @@ def parse_args():
         "(default: $LOG_DIR or the current directory)",
     )
     parser.add_argument(
-        "--expert-map",
-        required=True,
-        help="JSON file mapping virtual expert ids to physical expert ids, "
-        'e.g. {"default": {"0": 12, ...}, "3": {...}}',
-    )
-    parser.add_argument(
         "--num-layers",
         type=int,
-        default=58,
-        help="total main-model layer count (default: 58)",
+        default=61,
+        help="total main-model layer count; 61 = 3 dense head layers + 58 MoE "
+        "layers, so the MoE layer ids are 3..60 (default: 61)",
     )
     parser.add_argument(
         "--moe-start-layer",
@@ -114,6 +111,14 @@ def parse_args():
         "--output",
         default=None,
         help="report JSON path (default: printed to stdout only)",
+    )
+    parser.add_argument(
+        "--expert-map",
+        default=None,
+        help="optional JSON file mapping virtual expert ids to physical "
+        "expert ids, e.g. {\"default\": {\"0\": 12, ...}, \"3\": {...}}; "
+        "when omitted experts are kept as-is (rank-even split, "
+        "logical = ep_rank * padded + local_idx)",
     )
     return parser.parse_args()
 
@@ -270,7 +275,7 @@ def print_digest(report: dict) -> None:
 
 def main():
     args = parse_args()
-    expert_map = load_expert_map(args.expert_map)
+    expert_map = load_expert_map(args.expert_map) if args.expert_map else {}
 
     files = sorted(glob.glob(os.path.join(args.dump_dir, DUMP_PREFIX + "*.json")))
     if not files:
@@ -302,7 +307,7 @@ def main():
         "mtp_steps": args.mtp_steps,
         "num_ranks": len(ranks),
         "padded_num_local_experts": padded,
-        "expert_map": args.expert_map,
+        "expert_map": args.expert_map if args.expert_map else "identity",
         "layer_attribution": unattributed_ranks == 0,
         "ranks": [
             {

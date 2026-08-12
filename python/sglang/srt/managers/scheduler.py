@@ -2984,8 +2984,14 @@ class Scheduler(
         self.forward_ct += 1
 
         # Periodically dump the compiled-in expert load stats (no-op when the
-        # debug recording is not enabled in the sgl-kernel build).
-        if _is_cpu_920f and self.forward_ct % DUMP_INTERVAL == 0:
+        # debug recording is not enabled in the sgl-kernel build).  The
+        # fetch-and-reset runs before this step's forward, so trigger one
+        # step late to make every window cover exactly DUMP_INTERVAL steps.
+        if (
+            _is_cpu_920f
+            and self.forward_ct > 1
+            and (self.forward_ct - 1) % DUMP_INTERVAL == 0
+        ):
             maybe_dump_periodic()
 
         # Whether to run the profiler
