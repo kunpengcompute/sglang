@@ -59,7 +59,6 @@ BASE_ARGS=(
     --enable-dp-attention
     --enable-dp-lm-head
     --enable-dp-mlp
-    --disable-overlap-schedule
     --enable-dp-attention-local-control-broadcast
     --quantization w8a8_int8
     ${LOAD_FORMAT:+--load-format "$LOAD_FORMAT"}
@@ -77,6 +76,13 @@ fi
 # Pass expert-location mapping file (JSON/PT) to --init-expert-location when set
 if [[ -n "${INIT_EXPERT_LOCATION:-}" ]]; then
     BASE_ARGS+=(--init-expert-location "$INIT_EXPERT_LOCATION")
+fi
+
+# Disable overlap schedule
+if [[ "$SGLANG_ENABLE_OVERLAP" == "0" ]]; then
+    BASE_ARGS+=(
+        --disable-overlap-schedule
+    )
 fi
 
 if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
@@ -226,8 +232,27 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     for ((RANK_IN_NODE=0; RANK_IN_NODE < (TP_SIZE * PP_SIZE / WORLD_SIZE); RANK_IN_NODE++)); do
         if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" ]]; then
             SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/sglang_server"
+            # Point kuccl runtime plugin paths to this rank's NUMA-local copy.
+            # kuccl_pg.py fallback: _internal/kuccl/install/{hucx,xucg}/
+            if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
+                INTERNAL_DIR="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/_internal"
+                KUCCL_INSTALL="$INTERNAL_DIR/kuccl/install"
+                # Unset HUCX_DIR/XUCG_DIR so kuccl_pg.py uses fallback path
+                # (_internal/kuccl/install/{hucx,xucg}/) instead of HPCKit paths
+                unset HUCX_DIR
+                unset XUCG_DIR
+                export UCX_COMPONENT_PATH="$KUCCL_INSTALL/hucx/lib/ucx"
+                export UCG_PLANC_PATH="$KUCCL_INSTALL/xucg/lib/planc"
+                export UCG_PLANM_PATH="$KUCCL_INSTALL/xucg/lib/planc"
+                # Remove HPCKit paths from LD_LIBRARY_PATH, prepend _internal/
+                LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v 'HPCKit' | paste -sd:)
+                export LD_LIBRARY_PATH="$INTERNAL_DIR:${LD_LIBRARY_PATH}"
+            fi
         else
             SERVER_BIN="python -m sglang.launch_server"
+            if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
+                export PYTHONPATH="$KUCCL_PATH:${PYTHONPATH}"
+            fi
         fi
 
         ON_PACKAGE_MEMORY_NODE=$((RANK_IN_NODE +16))
@@ -266,6 +291,9 @@ else
         IB_ARGS=()
     fi
 
+    if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
+        export PYTHONPATH="$KUCCL_PATH:${PYTHONPATH}"
+    fi
     python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
       --port 30000 \
       > "$LOG_PATH/${DP_RANK}_$IP.log" 2>&1 &

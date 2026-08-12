@@ -15,7 +15,7 @@
 #!/bin/bash
 set -e
 
-# ===================== 路径定义 =====================
+# ===================== Path definitions =====================
 PYTHON_VERSION=3.12
 source ../env.sh native
 
@@ -33,7 +33,36 @@ SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_path('purelib')
 
 rm -rf $PYINSTALL_PATH/dist
 
-# ===================== PyInstaller 打包 =====================
+# ===================== kuccl binary dependencies =====================
+# kuccl_pg.py fallback: _kuccl_dir/install/{hucx,xucg}/
+# .so files must be placed under kuccl/install/{hucx,xucg}/ to match fallback path
+KUCCL_FLAGS=()
+if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
+    echo "[pyinstall] SGLANG_ENABLE_KUCCL=1, adding kuccl binaries..."
+    KUCCL_FLAGS=(
+      --add-binary "/usr/lib64/libnuma.so:."
+      --add-binary "/usr/lib64/librdmacm.so.1:."
+      --add-binary "$HUCX_DIR/lib/libsdma_dk.so:."
+      # UCX direct deps -> kuccl/install/hucx/lib/
+      --add-binary "$HUCX_DIR/lib/libucs.so:kuccl/install/hucx/lib"
+      --add-binary "$HUCX_DIR/lib/libucm.so.0:kuccl/install/hucx/lib"
+      --add-binary "$HUCX_DIR/lib/libucp.so:kuccl/install/hucx/lib"
+      --add-binary "$HUCX_DIR/lib/libuct.so.0:kuccl/install/hucx/lib"
+      # UCX transport plugins -> kuccl/install/hucx/lib/ucx/
+      --add-binary "$HUCX_DIR/lib/ucx/libuct_ib.so:kuccl/install/hucx/lib/ucx"
+      --add-binary "$HUCX_DIR/lib/ucx/libuct_rdmacm.so:kuccl/install/hucx/lib/ucx"
+      --add-binary "$HUCX_DIR/lib/ucx/libuct_cma.so:kuccl/install/hucx/lib/ucx"
+      --add-binary "$HUCX_DIR/lib/ucx/libuct_sdma.so:kuccl/install/hucx/lib/ucx"
+      # UCG direct dep -> kuccl/install/xucg/lib/
+      --add-binary "$XUCG_DIR/lib/libucg.so:kuccl/install/xucg/lib"
+      # UCG plan plugins -> kuccl/install/xucg/lib/planc/
+      --add-binary "$XUCG_DIR/lib/planc/libucg_planc_ucx.so:kuccl/install/xucg/lib/planc"
+      --add-binary "$XUCG_DIR/lib/planc/libucg_planc_stars.so:kuccl/install/xucg/lib/planc"
+      --add-binary "$XUCG_DIR/lib/planc/libucg_planm_ucx_hicoll.so:kuccl/install/xucg/lib/planc"
+    )
+fi
+
+# ===================== PyInstaller packaging =====================
 if [ ! -f sglang_server.spec ]; then
     echo "[pyinstall] generate spec file..."
     pyi-makespec \
@@ -43,6 +72,8 @@ if [ ! -f sglang_server.spec ]; then
       --add-binary "$CONDA_ENV_PATH/lib/libpython$PYTHON_VERSION.so.1.0:." \
       --add-binary "$KUPL_LIB/libkupl.so.1:." \
       --add-binary "$KUTACC_LIB/libkutacc.so.25.1.RC1:." \
+      --add-binary "$SITE_PACKAGES/kuccl_backend_pg*.so:kuccl/" \
+      --add-data "$KUCCL_PATH/kuccl_pg.py:kuccl/" \
       --add-binary "$SITE_PACKAGES/torch/lib/*.so:torch/lib" \
       --add-binary "$BISHENG_LIB/libomp.so:." \
       --add-binary "$CONDA_ENV_PATH/lib/libstdc++.so.6:." \
@@ -65,6 +96,8 @@ if [ ! -f sglang_server.spec ]; then
       --hidden-import triton \
       --hidden-import sglang \
       --hidden-import sgl_kernel \
+      --hidden-import kuccl_pg \
+      --hidden-import kuccl_backend_pg \
       --hidden-import pybase64 \
       --hidden-import zmq \
       --hidden-import zmq.asyncio \
@@ -87,20 +120,21 @@ if [ ! -f sglang_server.spec ]; then
       --collect-all vllm \
       --collect-all torch \
       --collect-binaries torch \
+      "${KUCCL_FLAGS[@]}" \
       $SGLANG_SRC/sglang/launch_server.py
 fi
 
-# ===================== 自动修改 spec 文件 =====================
-echo "[pyinstall] modify spec file, move sglang/sgl_kernel out of PYZ..."
+# ===================== Auto-modify spec file =====================
+echo "[pyinstall] modify spec file, move sglang/sgl_kernel/kuccl_pg out of PYZ..."
 python - <<EOF
 with open('sglang_server.spec', 'r') as f:
     content = f.read()
 
-filter_code = "a.pure = [m for m in a.pure if not m[0].startswith('sglang') and not m[0].startswith('sgl_kernel')]\n"
+filter_code = "a.pure = [m for m in a.pure if not m[0].startswith('sglang') and not m[0].startswith('sgl_kernel') and not m[0].startswith('kuccl_pg')]\n"
 if filter_code in content:
     print("Spec already contains filter code, no need to modify")
 else:
-    # 匹配 pyz = PYZ(a.pure) 并替换
+    # Match pyz = PYZ(a.pure) and replace
     import re
     new_content, count = re.subn(
         r'pyz = PYZ\(a\.pure.*?\)',
@@ -115,7 +149,7 @@ else:
         print("Warning: not found expected pyz = PYZ(...) line, please modify spec file manually")
 EOF
 
-# ===================== 用修改后的 spec 打包 =====================
+# ===================== Build with modified spec =====================
 echo "[pyinstall] start build..."
 pyinstaller sglang_server.spec --distpath ./dist --workpath ./build --noconfirm
 

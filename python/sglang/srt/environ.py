@@ -577,9 +577,10 @@ class Envs:
     SGLANG_ENABLE_BINARY_LAUNCH = EnvBool(True)
     SGLANG_KUNPENG_RDMA_ALLGATHER = EnvBool(True)
     SGLANG_KUNPENG_MAX_SEQ_NUM = EnvInt(128)
-    SGLANG_FORWARD_ASYNC = EnvBool(True)
+    KUTACC_ASYNC_LAUNCH = EnvBool(True)
     SGLANG_KUNPENG_ENABLE_SHM_FENCE = EnvBool(False)
     SGLANG_KUNPENG_RDMA_BCAST = EnvBool(False)
+    SGLANG_ENABLE_KUCCL = EnvBool(False)
 
 
 envs = Envs()

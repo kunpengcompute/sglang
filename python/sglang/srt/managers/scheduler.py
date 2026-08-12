@@ -3963,7 +3963,7 @@ def configure_scheduler_process(
             ) // server_args.nnodes
             tp_rank_in_node = tp_rank % tp_ranks_in_node
             # TODO (kunpeng): hard code here, should use a more elegant way.
-            if envs.SGLANG_FORWARD_ASYNC.get():
+            if envs.KUTACC_ASYNC_LAUNCH.get():
                 p.cpu_affinity(
                     list(range(tp_rank_in_node * 38, tp_rank_in_node * 38 + 17))
                     + list(range(tp_rank_in_node * 38 + 21, tp_rank_in_node * 38 + 37))
@@ -3973,7 +3973,9 @@ def configure_scheduler_process(
                     list(range(tp_rank_in_node * 38, tp_rank_in_node * 38 + 16))
                     + list(range(tp_rank_in_node * 38 + 21, tp_rank_in_node * 38 + 37))
                 )  # 0~15, 21~36
-            logger.info(os.sched_getaffinity(os.getpid()))
+            logger.info(
+                f"Set Scheduler affinity to {os.sched_getaffinity(os.getpid())}"
+            )
         else:
             set_gpu_proc_affinity(
                 server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
@@ -4041,7 +4043,9 @@ def run_scheduler_process(
         if pipe_writer is not None:
             pipe_writer.send(scheduler.get_init_info())
 
-        # Isolate the main process from communication threads.
+        # Isolate the main process from communication threads and pin
+        # non-compute threads (rayon tokenizers, kuccl async, etc.) to the
+        # base CPU so they don't land on kupl-exclusive compute cores.
         if envs.SGLANG_SET_CPU_AFFINITY.get():
             if _is_cpu_920f:
                 p = psutil.Process(os.getpid())
@@ -4049,8 +4053,61 @@ def run_scheduler_process(
                     server_args.tp_size * server_args.pp_size
                 ) // server_args.nnodes
                 tp_rank_in_node = tp_rank % tp_ranks_in_node
+                base_cpu = tp_rank_in_node * 38
+
+                # Pin non-compute threads to base CPU to keep kupl cores exclusive.
+                # Only affects threads that still hold the inherited process mask
+                # (i.e. were not explicitly pinned by kupl/disagg/zmq).
+                if envs.KUTACC_ASYNC_LAUNCH.get():
+                    inherited_mask = set(range(base_cpu, base_cpu + 17)) | set(
+                        range(base_cpu + 21, base_cpu + 37)
+                    )
+                else:
+                    inherited_mask = set(range(base_cpu, base_cpu + 16)) | set(
+                        range(base_cpu + 21, base_cpu + 37)
+                    )
+
+                main_tid = os.getpid()
+                repinned = 0
+                skipped_main = 0
+                skipped_pinned = 0
+                errors = 0
+                for t in p.threads():
+                    tid = t.id
+                    if tid == main_tid:
+                        skipped_main += 1
+                        continue
+                    try:
+                        cur_affinity = os.sched_getaffinity(tid)
+                        thread_name = ""
+                        try:
+                            with open(f"/proc/self/task/{tid}/comm") as f:
+                                thread_name = f.read().strip()
+                        except OSError:
+                            pass
+                        if cur_affinity == inherited_mask:
+                            os.sched_setaffinity(tid, {base_cpu})
+                            repinned += 1
+                        else:
+                            skipped_pinned += 1
+                    except OSError as e:
+                        logger.warning(
+                            "PinNonComputeThreads: ERROR tid=%d errno=%s", tid, e
+                        )
+                        errors += 1
+
+                logger.info(
+                    "PinNonComputeThreads: summary repinned=%d skipped_main=%d "
+                    "skipped_pinned=%d errors=%d total_threads=%d",
+                    repinned,
+                    skipped_main,
+                    skipped_pinned,
+                    errors,
+                    len(p.threads()),
+                )
+
                 # TODO (kunpeng): hard code here, should use a more elegant way.
-                p.cpu_affinity({tp_rank_in_node * 38 + 17})
+                p.cpu_affinity({base_cpu + 17})
 
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()

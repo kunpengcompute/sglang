@@ -1508,14 +1508,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
-        if self.server_args.elastic_ep_backend == "mooncake":
-            # Mooncake does not support `monitored_barrier`
-            dist.barrier(group=get_tp_group().cpu_group)
+        tp_cpu_group = get_tp_group().cpu_group
+        backend_name = str(dist.get_backend(group=tp_cpu_group)).lower()
+        if self.server_args.elastic_ep_backend == "mooncake" or backend_name != "gloo":
+            # Mooncake and kuccl backends do not support `monitored_barrier`;
+            # fall back to a plain barrier (kuccl implements a store barrier).
+            dist.barrier(group=tp_cpu_group)
         else:
             # Handle the case where some ranks do not finish loading.
             try:
                 dist.monitored_barrier(
-                    group=get_tp_group().cpu_group,
+                    group=tp_cpu_group,
                     timeout=datetime.timedelta(
                         seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
                     ),

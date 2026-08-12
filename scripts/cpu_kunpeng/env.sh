@@ -117,6 +117,8 @@ export LIBPTHREAD_HOOK_PATH="/path/to/libpthread_hook.so"
 export GEMM_TILING_PLAN_FILE="$SGLANG_PATH/scripts/cpu_kunpeng/configs"
 # Kunpeng SDMA driver
 export SDMA_KO_PATH="/path-to-sdma-ko"
+# Required when SGLANG_ENABLE_KUCCL=1
+export KUCCL_PATH="/path-to-KUCCL"
 
 # Native TP/EP size
 export TP_SIZE=256
@@ -163,11 +165,11 @@ export MV2_COMM_WORLD_LOCAL_SIZE=16
 # Thread
 export OMP_NUM_THREADS=1
 export OMP_PROC_BIND=false
+export RAYON_NUM_THREADS=1
 export KUPL_EXECUTOR_BACKEND=pthread
-export KUPL_EXECUTOR_COUNT=33  # set to 32 when SGLANG_FORWARD_ASYNC=0
-export SGLANG_FORWARD_ASYNC=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
+export KUPL_EXECUTOR_COUNT=33  # set to 32 when KUTACC_ASYNC_LAUNCH=0
+export KUTACC_ASYNC_LAUNCH=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export TORCH_COMPILE_DISABLE=1
-export SGLANG_ENABLE_TORCH_COMPILE=0
 export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=4
 export SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET=0
 
@@ -189,14 +191,16 @@ export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=0
 export SGLANG_KUNPENG_RDMA_ALLGATHER=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_KUNPENG_RDMA_BCAST=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_ENABLE_MTP=0
+export SGLANG_ENABLE_OVERLAP=0
+export SGLANG_ENABLE_OVERLAP_TRACE=0
+export SGLANG_ENABLE_KUCCL=0  # set to 1 to use kuccl backend instead of gloo
 # Kunpeng SHM pool
 export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476
 export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=50
 export SGLANG_KUNPENG_ENABLE_SHM_FENCE=0
 # Kunpeng HBW pool
 export SGLANG_ENABLE_HBW_POOL=1
-export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=4000
-export SGLANG_KUNPENG_SWAP_EXPERT=0
+export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=3900
 export SGLANG_KUNPENG_SWAP_KV_IN=0
 export SGLANG_KUNPENG_SWAP_KV_OUT=0
 export SGLANG_KUNPENG_SWAP_KV_BLOCKWISE=0
@@ -316,6 +320,16 @@ if [[ "$IS_PREFILL" == "1" ]]; then
 else
     export SGLANG_KUNPENG_MAX_SEQ_NUM=128
     export SGLANG_KUNPENG_MAX_CUR_LEN=1
+fi
+
+# Kuccl backend (UCX + UCG) environment
+if [[ "$SGLANG_ENABLE_KUCCL" == "1" ]]; then
+    export UCG_PLANC_UCX_BCAST_ATTR=I:1
+    export UCX_MEM_EVENTS=no
+    export UCX_UD_VERBS_ALLOC=thp,md,mmap,heap
+    export UCX_RC_VERBS_ALLOC=thp,md,mmap,heap
+    export HUCX_DIR="$HPCKIT_PATH/latest/hmpi/bisheng/release/hucx"
+    export XUCG_DIR="$HPCKIT_PATH/latest/hmpi/bisheng/release/xucg"
 fi
 
 if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]] || [[ "$ACTION" == "build" ]]; then
