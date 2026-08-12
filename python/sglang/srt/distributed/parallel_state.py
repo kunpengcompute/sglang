@@ -329,10 +329,13 @@ class GroupCoordinator:
                         pg_options=pg_options,
                         timeout=subgroup_timeout,
                     )
-                # a group with `gloo` backend, to allow direct coordination
-                # between processes through the CPU.
+                # a group with `gloo`/`kuccl` backend, to allow direct
+                # coordination between processes through the CPU.
+                cpu_group_backend = (
+                    "kuccl" if envs.SGLANG_ENABLE_KUCCL.get() else "gloo"
+                )
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
+                    ranks, backend=cpu_group_backend, timeout=gloo_timeout
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -1828,6 +1831,8 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
 
 
 def get_default_distributed_backend(device: str) -> str:
+    if device == "cpu" and envs.SGLANG_ENABLE_KUCCL.get():
+        return "kuccl"
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
@@ -1938,6 +1943,14 @@ def init_distributed_environment(
             pg_options = get_torch_distributed_pg_options()
 
         # this backend is used for WORLD
+        if backend == "kuccl":
+            # PyInstaller frozen binary ignores PYTHONPATH; add kuccl dir manually
+            import os, sys
+
+            _d = os.path.join(os.path.dirname(sys.executable), "_internal", "kuccl")
+            if os.path.isdir(_d) and _d not in sys.path:
+                sys.path.insert(0, _d)
+            import kuccl_pg  # noqa: F401  registers "kuccl" backend
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,

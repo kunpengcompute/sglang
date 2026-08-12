@@ -80,8 +80,9 @@ def init_oob_comms(intra_node_size: int = 16):
     start_die = (rank // intra_die_size) * intra_die_size
     ranks_die = list(range(start_die, start_die + intra_die_size))
 
-    _INTRA_SOCKET = create_custom_parallel_group(ranks_socket)
-    _INTRA_DIE = create_custom_parallel_group(ranks_die)
+    oob_backend = "kuccl" if envs.SGLANG_ENABLE_KUCCL.get() else "gloo"
+    _INTRA_SOCKET = create_custom_parallel_group(ranks_socket, backend=oob_backend)
+    _INTRA_DIE = create_custom_parallel_group(ranks_die, backend=oob_backend)
 
     if _INTRA_SOCKET is not None:
         actual_size = dist.get_world_size(group=_INTRA_SOCKET)

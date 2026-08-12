@@ -1981,10 +1981,14 @@ def _execute_server_warmup(server_args: ServerArgs):
                 "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": 0 if is_tokenizer_separate() else [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
-                    for i in range(server_args.dp_size)
-                ],
+                "bootstrap_room": (
+                    0
+                    if is_tokenizer_separate()
+                    else [
+                        i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                        for i in range(server_args.dp_size)
+                    ]
+                ),
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
             res = requests.post(
@@ -2133,7 +2137,10 @@ def _setup_and_run_http_server(
     """
     # Set global states
     _kunpeng_ranks_per_dp = max(1, server_args.tp_size // max(server_args.dp_size, 1))
-    if is_kunpeng_binary_launch() and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
+    if (
+        is_kunpeng_binary_launch()
+        and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1
+    ):
         pass
     else:
         set_global_state(
@@ -2219,9 +2226,11 @@ def _setup_and_run_http_server(
             port_args, server_args, scheduler_infos[0]
         )
 
-
     _kunpeng_ranks_per_dp = max(1, server_args.tp_size // max(server_args.dp_size, 1))
-    if is_kunpeng_binary_launch() and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1:
+    if (
+        is_kunpeng_binary_launch()
+        and (server_args.tp_rank_in_node % _kunpeng_ranks_per_dp) >= 1
+    ):
         logger.info("HTTP server disabled (not first TP rank of DP group).")
         threading.Event().wait()
     else:

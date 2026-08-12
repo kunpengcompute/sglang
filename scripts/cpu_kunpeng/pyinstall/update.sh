@@ -18,9 +18,15 @@ SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_path('purelib')
 UPDATE_SGLANG=false
 UPDATE_KERNEL=false
 UPDATE_TORCH=false
-# KUTACC/KUPL .so are symlinks, so -nt timestamp check is unreliable; cheap to copy, force always
+# KUTACC/KUPL .so: only 2 files, cheap to copy, force always
 UPDATE_KUTACC=true
 UPDATE_KUPL=true
+# KUCCL .so: only update when SGLANG_ENABLE_KUCCL=1
+if [ "${SGLANG_ENABLE_KUCCL:-0}" = "1" ]; then
+    UPDATE_KUCCL=true
+else
+    UPDATE_KUCCL=false
+fi
 
 case "$1" in
     sglang)
@@ -47,12 +53,23 @@ MARKER_FILE="$PYINSTALL_PATH/dist/.updated_marker"
 
 mkdir -p "$PYINSTALL_PATH/dist"
 
+# Resolve kuccl backend .so and .py paths from KUCCL_PATH (only if enabled)
+if [ "${UPDATE_KUCCL}" != "false" ]; then
+    KUCCL_SO=$(ls "$KUCCL_PATH"/kuccl_backend_pg*.so 2>/dev/null | head -n1)
+    KUCCL_PY="$KUCCL_PATH/kuccl_pg.py"
+    if [ -z "$KUCCL_SO" ] || [ ! -f "$KUCCL_PY" ]; then
+        echo "[update] WARNING: kuccl_backend_pg*.so or kuccl_pg.py not found in $KUCCL_PATH, kuccl update will be skipped"
+        UPDATE_KUCCL=false
+    fi
+fi
+
 # Returns 0 if update is needed, 1 otherwise. Sets the N*_DIRTY flags so the
 # copy loop below only copies components that were actually changed.
 NSGLANG=false
 NKERNEL=false
 NKUTACC=false
 NKUPL=false
+NKUCCL=false
 NTORCH=false
 
 check_if_update_needed() {
@@ -62,6 +79,7 @@ check_if_update_needed() {
         NKERNEL="${UPDATE_KERNEL}"
         NKUTACC="${UPDATE_KUTACC}"
         NKUPL="${UPDATE_KUPL}"
+        NKUCCL="${UPDATE_KUCCL}"
         NTORCH="${UPDATE_TORCH}"
         return 0
     fi
@@ -72,11 +90,14 @@ check_if_update_needed() {
     if [ "${UPDATE_KERNEL}" = "true" ] && [ -n "$(find "$SITE_PACKAGES/sgl_kernel" -newer "$MARKER_FILE" -print -quit 2>/dev/null)" ]; then
         NKERNEL=true; needed=0
     fi
-    if [ "${UPDATE_KUTACC}" = "true" ] && [ "$KUTACC_PATH/lib/libkutacc.so.25.1.RC1" -nt "$MARKER_FILE" ]; then
+    if [ "${UPDATE_KUTACC}" = "true" ]; then
         NKUTACC=true; needed=0
     fi
-    if [ "${UPDATE_KUPL}" = "true" ] && [ "$KUPL_PATH/lib/libkupl.so.1" -nt "$MARKER_FILE" ]; then
+    if [ "${UPDATE_KUPL}" = "true" ]; then
         NKUPL=true; needed=0
+    fi
+    if [ "${UPDATE_KUCCL}" = "true" ] && [ -n "$KUCCL_SO" ]; then
+        NKUCCL=true; needed=0
     fi
     if [ "${UPDATE_TORCH}" = "true" ] && [ -n "$(find "$SITE_PACKAGES/torch" -newer "$MARKER_FILE" -print -quit 2>/dev/null)" ]; then
         NTORCH=true; needed=0
@@ -142,6 +163,11 @@ for i in $(seq 0 15); do
         fi
         if [ "${NKUPL}" = "true" ]; then
             swap_file "$KUPL_PATH/lib/libkupl.so.1" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/libkupl.so.1"
+        fi
+        if [ "${NKUCCL}" = "true" ]; then
+            mkdir -p "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/kuccl"
+            swap_file "$KUCCL_SO" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/kuccl/$(basename "$KUCCL_SO")"
+            swap_file "$KUCCL_PY" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/kuccl/kuccl_pg.py"
         fi
         if [ "${NTORCH}" = "true" ]; then
             swap_dir "$SITE_PACKAGES/torch" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/torch"

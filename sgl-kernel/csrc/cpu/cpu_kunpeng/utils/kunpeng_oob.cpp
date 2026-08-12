@@ -113,9 +113,11 @@ static int do_alltoall(c10d::ProcessGroup *pg, const void *sendbuf, int sendcoun
     auto opts = at::TensorOptions().device(at::kCPU).dtype(send_dtype);
     auto send_tensor = at::from_blob(const_cast<void *>(sendbuf), {comm_size * sendcount}, opts);
     auto recv_tensor = at::from_blob(recvbuf, {comm_size * recvcount}, opts);
-    std::vector<int64_t> send_list(comm_size, sendcount);
-
-    auto work = pg->alltoall_base(recv_tensor, send_tensor, send_list, send_list);
+    // kuccl backend only supports equal-length alltoall (empty split sizes
+    // means equal split). sendcount/recvcount are identical across all peers
+    // here, so pass empty lists — same semantics on both gloo and kuccl.
+    std::vector<int64_t> empty_list;
+    auto work = pg->alltoall_base(recv_tensor, send_tensor, empty_list, empty_list);
     if (!work) return -1;
     work->wait();
     return 0;
