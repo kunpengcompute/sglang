@@ -75,7 +75,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils import get_num_new_pages, is_cpu_920f
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -87,6 +87,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+_is_cpu_920f = is_cpu_920f()
+kunpeng_max_seq_num = envs.SGLANG_KUNPENG_MAX_SEQ_NUM.get()
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -1486,9 +1489,13 @@ class SchedulerDisaggregationDecodeMixin:
 
         curr_batch_size = self.running_batch.batch_size()
 
-        batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
-
-        num_not_used_batch = batch_size - curr_batch_size
+        if _is_cpu_920f:
+            num_not_used_batch = (
+                kunpeng_max_seq_num - curr_batch_size
+            )  # kunpeng_max_seq_num: default 128
+        else:
+            batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
+            num_not_used_batch = batch_size - curr_batch_size
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
