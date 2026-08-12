@@ -570,8 +570,6 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     int64_t N = experts_w13.size(1);   // 2 * inter_dim
     int64_t ne = experts_w13.size(0);  // num_local_experts
 
-    if (bs == 0) return;
-
     int8_t *acts_data = act.data_ptr<int8_t>();
     int8_t *weights_data = experts_w13.data_ptr<int8_t>();
     float *acts_scale_data = scale.data_ptr<float>();
@@ -587,7 +585,9 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     int64_t acts_scale_stride = scale.stride(0);
 
 #ifdef SGLANG_KUNPENG_DEBUG_EXPERT_LOAD
-    // Record the per-expert activation distribution of this call
+    // Record the per-expert activation distribution of this call.  Also
+    // record empty (idle, bs == 0) calls as all-zero rows so that every
+    // rank records the same number of calls per step.
     if (g_expert_load_stats.num_experts == 0) {
         g_expert_load_stats.num_experts = ne;
     }
@@ -597,6 +597,8 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
             (int32_t)(experts_offset_data[e + 1] - experts_offset_data[e]));
     }
 #endif
+
+    if (bs == 0) return;
 
     auto t = igemm_find_optimal_tiling_plan(bs, N, K);
     int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
