@@ -86,6 +86,11 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
+if("$ENV{SGLANG_KUNPENG_DEBUG_EXPERT_LOAD}" STREQUAL "1")
+    message(STATUS "Enabling macro: SGLANG_KUNPENG_DEBUG_EXPERT_LOAD")
+    add_compile_definitions(SGLANG_KUNPENG_DEBUG_EXPERT_LOAD)
+endif()
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     add_compile_options(
         -O3

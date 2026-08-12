@@ -47,6 +47,38 @@ int g_comm_rank = 0;
 c10d::ProcessGroup *g_process_group = nullptr;
 static bool g_is_prefill = true;
 
+#ifdef SGLANG_KUNPENG_DEBUG_EXPERT_LOAD
+namespace {
+
+// Records the per-local-expert activation distribution of every
+// igemm_fusedmoe_gateup call as one flat row.  The Python side pulls the
+// whole snapshot list through get_expert_load_stats_kunpeng() (fetch-and-
+// reset semantics) and derives aggregates (totals, call counts, averages).
+struct ExpertLoadStats {
+    std::vector<int32_t> data;  // flattened [num_calls, num_experts] rows
+    int64_t num_experts = 0;
+    int64_t num_calls = 0;
+};
+
+ExpertLoadStats g_expert_load_stats;
+
+}  // namespace
+
+at::Tensor get_expert_load_stats_kunpeng()
+{
+    int64_t rows = g_expert_load_stats.num_calls;
+    int64_t cols = g_expert_load_stats.num_experts;
+    auto out = torch::zeros({rows, cols}, at::TensorOptions().dtype(at::kInt));
+    if (rows > 0) {
+        std::memcpy(out.data_ptr<int32_t>(), g_expert_load_stats.data.data(),
+                    g_expert_load_stats.data.size() * sizeof(int32_t));
+    }
+    // fetch-and-reset: return accumulated stats, then clear internal state
+    g_expert_load_stats = ExpertLoadStats();
+    return out;
+}
+#endif
+
 template <typename T, int64_t N>
 struct SmallVector {
     T array[N];
@@ -422,11 +454,12 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
 }
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
-                                        int64_t num_experts, int64_t topk)
+                                        int64_t num_experts, int64_t topk, bool force_balance, int64_t expert_offset)
 {
     TORCH_CHECK(topk_ids.scalar_type() == at::kShort, "topk_ids must be int16");
     TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D");
     TORCH_CHECK(topk_ids.size(1) == topk, "topk_ids.size(1) must equal topk");
+    TORCH_CHECK(num_experts > 0, "num_experts must be positive");
 
     int16_t *topk_ids_data = topk_ids.data_ptr<int16_t>();
     float *topk_weights_data = topk_weights.data_ptr<float>();
@@ -438,32 +471,70 @@ void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_wei
     int64_t pad_start = num_token_non_padded.data_ptr<int32_t>()[0];
     int64_t num_pad = num_total - pad_start;
 
-    if (num_pad <= 0) return;
+    if (num_pad <= 0 && !force_balance) return;
 
     SmallVector<float, 512> load_(num_experts);
     float *load = load_.data();
     memset(load, 0, num_experts * sizeof(float));
 
+    // Per-expert histogram from real tokens (skip non-routed slots, e.g. shared experts)
     for (int64_t i = 0; i < pad_start; i++) {
         for (int64_t j = 0; j < topk; j++) {
             int16_t expert_id = topk_ids_data[i * ids_stride + j * ids_stride1];
-            load[expert_id] += 1.0f;
+            if (expert_id >= 0 && expert_id < num_experts) {
+                load[expert_id] += 1.0f;
+            }
         }
     }
 
-    for (int64_t i = 0; i < num_pad; i++) {
+    // Target load pattern: every expert should carry target[e] slots, with
+    // the t_high window [offset, offset + r) rotated per DP rank so that
+    // aggregated loads stay uniform across DP ranks.  Deterministic integer
+    // arithmetic and a fixed scan order keep the result bit-identical on all
+    // attention-TP ranks that share topk_ids.
+    int64_t total_slots = num_total * topk;
+    int64_t t_high = (total_slots + num_experts - 1) / num_experts;
+    int64_t t_low = total_slots / num_experts;
+    int64_t r = total_slots % num_experts;
+    int64_t off = expert_offset % num_experts;
+    if (off < 0) off += num_experts;
+
+    auto target = [&](int64_t e) {
+        int64_t rotated = (e - off) % num_experts;
+        if (rotated < 0) rotated += num_experts;
+        return t_low + (rotated < r ? 1 : 0);
+    };
+    auto under_target = [&](int64_t e) { return (int64_t)load[e] < target(e); };
+
+    // One two-pointer fill: `def` always advances to the next expert below
+    // its target and receives the next slot.  force_balance only changes
+    // where the scan starts: forced mode also scans the real-token region
+    // (moving overloaded slots, weights zeroed, correctness not preserved),
+    // soft mode fills padding slots only.  The total deficit is exactly
+    // consumed by the moved + padding slots, so the scan never runs dry.
+    int64_t def = off;
+    auto next_deficit = [&]() {
+        while (!under_target(def)) {
+            def = (def + 1) % num_experts;
+        }
+    };
+
+    int64_t start = force_balance ? 0 : pad_start;
+    for (int64_t i = start; i < num_total; i++) {
         for (int64_t j = 0; j < topk; j++) {
-            float min_val = std::numeric_limits<float>::max();
-            int16_t min_idx = 0;
-            for (int16_t e = 0; e < num_experts; e++) {
-                if (load[e] < min_val) {
-                    min_val = load[e];
-                    min_idx = e;
+            int64_t e = topk_ids_data[i * ids_stride + j * ids_stride1];
+            if (i < pad_start) {
+                // Real slot: rebalanced only in forced mode and only when
+                // its expert is still overloaded; otherwise it stays put.
+                if (e < 0 || e >= num_experts || (int64_t)load[e] <= target(e)) {
+                    continue;
                 }
+                load[e] -= 1.0f;
             }
-            topk_ids_data[(pad_start + i) * ids_stride + j * ids_stride1] = min_idx;
-            topk_weights_data[(pad_start + i) * weights_stride + j * weights_stride1] = 0;
-            load[min_idx] += 1.0f;
+            next_deficit();
+            topk_ids_data[i * ids_stride + j * ids_stride1] = (int16_t)def;
+            topk_weights_data[i * weights_stride + j * weights_stride1] = 0;
+            load[def] += 1.0f;
         }
     }
 }
@@ -499,8 +570,6 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     int64_t N = experts_w13.size(1);   // 2 * inter_dim
     int64_t ne = experts_w13.size(0);  // num_local_experts
 
-    if (bs == 0) return;
-
     int8_t *acts_data = act.data_ptr<int8_t>();
     int8_t *weights_data = experts_w13.data_ptr<int8_t>();
     float *acts_scale_data = scale.data_ptr<float>();
@@ -514,6 +583,22 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
 
     int64_t acts_stride = act.stride(0);
     int64_t acts_scale_stride = scale.stride(0);
+
+#ifdef SGLANG_KUNPENG_DEBUG_EXPERT_LOAD
+    // Record the per-expert activation distribution of this call.  Also
+    // record empty (idle, bs == 0) calls as all-zero rows so that every
+    // rank records the same number of calls per step.
+    if (g_expert_load_stats.num_experts == 0) {
+        g_expert_load_stats.num_experts = ne;
+    }
+    g_expert_load_stats.num_calls++;
+    for (int64_t e = 0; e < ne; e++) {
+        g_expert_load_stats.data.push_back(
+            (int32_t)(experts_offset_data[e + 1] - experts_offset_data[e]));
+    }
+#endif
+
+    if (bs == 0) return;
 
     auto t = igemm_find_optimal_tiling_plan(bs, N, K);
     int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;

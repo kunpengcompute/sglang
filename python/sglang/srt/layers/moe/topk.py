@@ -39,8 +39,11 @@ except ImportError:
     pass
 
 from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_world_size,
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1147,8 +1150,20 @@ def _load_balance_padded_tokens_kunpeng(
     num_experts: int,
     topk: int,
 ) -> torch.Tensor:
+    force_balance = get_bool_env_var("SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE")
+    # Rotate the t_high target window per DP rank so aggregated loads stay
+    # uniform across DP ranks, in both soft and forced modes (the kernel
+    # shares one fill path).  The DP identity matches KunpengDispatcher
+    # (tp // attn_tp): ranks that share identical topk_ids (same attn_tp
+    # group) always derive the same offset.
+    tp_size = get_tensor_model_parallel_world_size()
+    attn_tp_size = get_attn_tensor_model_parallel_world_size()
+    dp_size = max(1, tp_size // attn_tp_size)
+    dp_rank = get_tensor_model_parallel_rank() // attn_tp_size
+    expert_offset = (dp_rank * max(1, num_experts // dp_size)) % num_experts
     kunpeng.load_balance_padded_tokens_kunpeng(
-        topk_ids, topk_weights, num_token_non_padded, num_experts, topk)
+        topk_ids, topk_weights, num_token_non_padded, num_experts, topk,
+        force_balance, expert_offset)
     return topk_ids, topk_weights
 
 
