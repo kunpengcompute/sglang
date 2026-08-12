@@ -235,18 +235,10 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
             # Point kuccl runtime plugin paths to this rank's NUMA-local copy.
             # kuccl_pg.py fallback: _internal/kuccl/install/{hucx,xucg}/
             if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
-                INTERNAL_DIR="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/_internal"
-                KUCCL_INSTALL="$INTERNAL_DIR/kuccl/install"
-                # Unset HUCX_DIR/XUCG_DIR so kuccl_pg.py uses fallback path
-                # (_internal/kuccl/install/{hucx,xucg}/) instead of HPCKit paths
+                KUCCL_INSTALL="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/_internal/kuccl/install"
                 unset HUCX_DIR
                 unset XUCG_DIR
-                export UCX_COMPONENT_PATH="$KUCCL_INSTALL/hucx/lib/ucx"
-                export UCG_PLANC_PATH="$KUCCL_INSTALL/xucg/lib/planc"
-                export UCG_PLANM_PATH="$KUCCL_INSTALL/xucg/lib/planc"
-                # Remove HPCKit paths from LD_LIBRARY_PATH, prepend _internal/
-                LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v 'HPCKit' | paste -sd:)
-                export LD_LIBRARY_PATH="$INTERNAL_DIR:${LD_LIBRARY_PATH}"
+                export LD_LIBRARY_PATH="$KUCCL_INSTALL:${LD_LIBRARY_PATH}"
             fi
         else
             SERVER_BIN="python -m sglang.launch_server"
