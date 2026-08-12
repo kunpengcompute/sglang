@@ -204,34 +204,53 @@ if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ]; then
   printf '%s' "$BODY" > "$BODY_FILE"
 
   if [ "$STREAM" = true ]; then
-      STREAM_FILE=$(mktemp)
-      time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
+      TURN_START=$(date +%s.%N)
+      FIRST_TOKEN_TS=""
+      CHUNK_COUNT=0
+      USAGE_COMP_TOKENS=""
+      USAGE_RAW=""
+
+      while read -r line; do
+        echo "$line"
+        # Count chunks that carry actual content. The completions endpoint
+        # puts the generated text in a "text" field; usage-only chunks have
+        # empty choices and no "text" field. Counting "text" occurrences
+        # avoids miscounting when continuous_usage_stats embeds usage in
+        # every chunk.
+        TEXT=$(echo "$line" | grep -o '"text":"[^"]*"' | cut -d'"' -f4)
+        if [[ ! -z "$TEXT" ]]; then
+          if [ -z "$FIRST_TOKEN_TS" ]; then
+            FIRST_TOKEN_TS=$(date +%s.%N)
+          fi
+          CHUNK_COUNT=$((CHUNK_COUNT + 1))
+        fi
+        # Capture the usage block emitted in the final chunk when
+        # stream_options.include_usage is set.
+        USAGE_OBJ=$(echo "$line" | grep -o '"usage":{[^}]*}')
+        if [[ ! -z "$USAGE_OBJ" ]]; then
+          USAGE_RAW="$USAGE_OBJ"
+          COMP=$(echo "$USAGE_OBJ" | grep -o '"completion_tokens":[0-9]*' | head -n1 | cut -d':' -f2)
+          if [[ ! -z "$COMP" ]]; then
+            USAGE_COMP_TOKENS="$COMP"
+          fi
+        fi
+      done < <(curl --noproxy "*" -N -s http://${IP}:${PORT}/v1/completions \
         -H "Content-Type: application/json" \
-        -d @"$BODY_FILE" | tee "$STREAM_FILE"
-
-      # Extract actual token count from usage block (authoritative with MTP).
-      USAGE_RAW=$(grep -o '"usage":{[^}]*}' "$STREAM_FILE" | tail -n1)
-      COMP_TOKENS=$(echo "$USAGE_RAW" | grep -o '"completion_tokens":[0-9]*' | head -n1 | cut -d':' -f2)
-
-      # Count chunks that carry actual content. The completions endpoint puts
-      # the generated text in a "text" field; usage-only chunks have empty
-      # choices and no "text" field. Counting "text" occurrences avoids
-      # miscounting when continuous_usage_stats embeds usage in every chunk.
-      CHUNK_COUNT=$(grep -c '"text":' "$STREAM_FILE")
-
-      rm -f "$STREAM_FILE"
+        -d @"$BODY_FILE")
+      TURN_END=$(date +%s.%N)
 
       if [ "$CHUNK_COUNT" -gt 0 ]; then
-          TOKEN_COUNT="${COMP_TOKENS:-$MAX_TOKENS}"
+          TOKEN_COUNT="${USAGE_COMP_TOKENS:-$MAX_TOKENS}"
+          TTFT=$(awk -v s="$TURN_START" -v f="$FIRST_TOKEN_TS" 'BEGIN { printf "%.3f", f - s }')
+          TOTAL=$(awk -v s="$TURN_START" -v e="$TURN_END" 'BEGIN { printf "%.3f", e - s }')
+          TPOT=$(awk -v n="$TOKEN_COUNT" -v tt="$TTFT" -v total="$TOTAL" 'BEGIN { dn=n-1; if (dn>0) printf "%.1f", (total-tt)/dn*1000; else print "0" }')
           RATE=$(awk -v n="$TOKEN_COUNT" -v c="$CHUNK_COUNT" \
               'BEGIN { if (c>0) printf "%.2f", n / c; else print "0" }')
           echo "" >&2
-          echo "===================================" >&2
-          echo "Tokens: $TOKEN_COUNT | Chunks: $CHUNK_COUNT | Rate: $RATE" >&2
-          if [[ ! -z "$USAGE_RAW" ]]; then
-            echo "Usage: $USAGE_RAW" >&2
-          fi
-          echo "===================================" >&2
+          echo "==================================================" >&2
+          echo "TTFT: ${TTFT}s | Total: ${TOTAL}s | TPOT: ${TPOT} ms/tok" >&2
+          echo "Output Tokens: $TOKEN_COUNT | Chunks: $CHUNK_COUNT | Accept Rate: $RATE" >&2
+          echo "==================================================" >&2
       fi
   else
       time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
@@ -592,14 +611,17 @@ if [ "$INTERACTIVE" = true ]; then
       TOTAL=$(awk -v s="$TURN_START" -v e="$TURN_END" 'BEGIN { printf "%.3f", e - s }')
       TPOT=$(awk -v n="$TOKEN_COUNT" -v tt="$TTFT" -v total="$TOTAL" 'BEGIN { dn=n-1; if (dn>0) printf "%.1f", (total-tt)/dn*1000; else print "0" }')
       RATE=$(awk -v n="$TOKEN_COUNT" -v c="$CHUNK_COUNT" 'BEGIN { if (c>0) printf "%.2f", n / c; else print "0" }')
-      echo -e "\n---------------------------------------"
-      echo "TTFT: ${TTFT}s | Tokens: $TOKEN_COUNT | Chunks: $CHUNK_COUNT | Rate: $RATE | Total: ${TOTAL}s | TPOT: ${TPOT} ms/tok"
+      echo -e "\n=================================================="
+      echo "TTFT: ${TTFT}s | Total: ${TOTAL}s | TPOT: ${TPOT} ms/tok"
+      echo "Output Tokens: $TOKEN_COUNT | Chunks: $CHUNK_COUNT | Accept Rate: $RATE"
       if [[ ! -z "$USAGE_RAW" ]]; then
-        echo "Usage: $USAGE_RAW"
+        echo "$USAGE_RAW"
       fi
+      echo "=================================================="
     else
-      echo -e "\n---------------------------------------"
+      echo -e "\n=================================================="
       echo "(no response)"
+      echo "=================================================="
     fi
   done
 
