@@ -77,6 +77,11 @@ at::Tensor get_expert_load_stats_kunpeng()
     g_expert_load_stats = ExpertLoadStats();
     return out;
 }
+#else
+at::Tensor get_expert_load_stats_kunpeng()
+{
+    return at::empty({0});
+}
 #endif
 
 template <typename T, int64_t N>
@@ -427,8 +432,7 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
             for (int j = 0; j < topk; ++j) {
                 token_weights_data[i * token_weights_stride + j * token_weights_stride1] =
                     active_expert_data[j].origin_score;
-                token_ids_data[i * token_ids_stride + j * token_ids_stride1] =
-                    active_expert_data[j].index;
+                token_ids_data[i * token_ids_stride + j * token_ids_stride1] = active_expert_data[j].index;
             }
         }
         return;
@@ -593,8 +597,7 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     }
     g_expert_load_stats.num_calls++;
     for (int64_t e = 0; e < ne; e++) {
-        g_expert_load_stats.data.push_back(
-            (int32_t)(experts_offset_data[e + 1] - experts_offset_data[e]));
+        g_expert_load_stats.data.push_back((int32_t)(experts_offset_data[e + 1] - experts_offset_data[e]));
     }
 #endif
 
