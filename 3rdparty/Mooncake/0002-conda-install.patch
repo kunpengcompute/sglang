@@ -1,0 +1,577 @@
+From 9d491ff65d53d74d27575c5a2d6b6e5a7d1afdd8 Mon Sep 17 00:00:00 2001
+From: xjwei <mccllm@qq.com>
+Date: Fri, 14 Aug 2026 11:24:14 +0800
+Subject: [PATCH] Conda adapt
+
+---
+ dependencies.sh                               | 373 +++++++-----------
+ mooncake-common/common.cmake                  |  13 +
+ .../benchmarks/oplog_batch_bench.cpp          |   6 +-
+ .../ha/oplog/oplog_batch_auditor_test.cpp     |   6 +-
+ mooncake-store/tools/oplog_batch_auditor.cpp  |   6 +-
+ .../tools/oplog_batch_inspector.cpp           |   6 +-
+ 6 files changed, 183 insertions(+), 227 deletions(-)
+
+diff --git a/dependencies.sh b/dependencies.sh
+index c1e42a77..0f91ee56 100755
+--- a/dependencies.sh
++++ b/dependencies.sh
+@@ -24,7 +24,6 @@ NC="\033[0m" # No Color
+ REPO_ROOT=`pwd`
+ GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
+ GOVER=1.25.9
+-OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
+ 
+ # Function to print section headers
+ print_section() {
+@@ -49,39 +48,6 @@ check_success() {
+     fi
+ }
+ 
+-read_os_release_value() {
+-    local key="$1"
+-    awk -F= -v key="$key" '
+-        $1 == key {
+-            value = $0
+-            sub(/^[^=]*=/, "", value)
+-            gsub(/^"|"$/, "", value)
+-            print value
+-            exit
+-        }
+-    ' "$OS_RELEASE_FILE"
+-}
+-
+-# Function to detect OS
+-detect_os() {
+-    if [ -f "$OS_RELEASE_FILE" ]; then
+-        ID=$(read_os_release_value ID)
+-        VERSION_ID=$(read_os_release_value VERSION_ID)
+-        OS=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
+-        OS_VERSION=$VERSION_ID
+-    elif [ -f /etc/redhat-release ]; then
+-        OS="centos"
+-    else
+-        print_error "Cannot detect OS. Supported OS: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, EulerOS, and openEuler."
+-    fi
+-
+-    echo -e "${GREEN}Detected OS: $OS ${OS_VERSION:-unknown}${NC}"
+-}
+-
+-if [ $(id -u) -ne 0 ]; then
+-	print_error "Require root permission, try sudo ./dependencies.sh"
+-fi
+-
+ # Parse command line arguments
+ SKIP_CONFIRM=false
+ INSTALL_SPDK=false
+@@ -100,18 +66,34 @@ for arg in "$@"; do
+             echo -e "  -y, --yes       Skip confirmation and install all dependencies"
+             echo -e "  --with-spdk     Install SPDK for NVMe-oF support"
+             echo -e "  -h, --help      Show this help message and exit"
++            echo -e "\nThis script requires an activated Conda environment."
+             exit 0
+             ;;
+     esac
+ done
+ 
++# This script installs all dependencies into the active Conda environment
++# ($CONDA_PREFIX). It must be run with a Conda environment activated, and
++# does not require root privileges.
++if [ -z "${CONDA_PREFIX}" ]; then
++    print_error "Conda environment not detected. Please activate a Conda environment first, e.g.:
++    conda activate mooncake
++Then re-run this script."
++fi
++
++if ! command -v conda >/dev/null 2>&1; then
++    print_error "conda command not found. Please install Miniconda/Anaconda and activate an environment."
++fi
++
+ # Print welcome message
+ echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
+ echo -e "This script will install all required dependencies for Mooncake."
+-echo -e "The following components will be installed:"
+-echo -e "  - System packages (build tools, libraries)"
++echo -e "All components will be installed into the active Conda environment:"
++echo -e "  ${GREEN}${CONDA_PREFIX}${NC}"
++echo -e "\nThe following components will be installed:"
++echo -e "  - Conda packages (build tools, libraries) via conda-forge"
+ echo -e "  - Git submodules (including pybind11 and yalantinglibs)"
+-echo -e "  - Go $GOVER"
++echo -e "  - Go $GOVER (1.25.x series, via conda-forge)"
+ if [ "$INSTALL_SPDK" = true ]; then
+     echo -e "  - SPDK (for NVMe-oF support)"
+ fi
+@@ -127,101 +109,87 @@ if [ "$SKIP_CONFIRM" = false ]; then
+     fi
+ fi
+ 
+-# Detect OS
+-detect_os
+-
+-# Update package lists
+-print_section "Updating package lists"
+-if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+-    apt-get update
+-    check_success "Failed to update package lists"
+-elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ]; then
+-    yum install -y dnf-plugins-core epel-release || true
+-    yum config-manager --set-enabled powertools || yum config-manager --set-enabled crb || true
+-    yum clean all
+-    yum makecache
+-    check_success "Failed to update package lists"
+-else
+-    print_error "Unsupported OS: $OS"
+-fi
+-
+-# Install system packages
+-print_section "Installing system packages"
++# Install packages via conda
++print_section "Installing packages via conda"
+ echo -e "${YELLOW}This may take a few minutes...${NC}"
+ 
+-if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+-    SYSTEM_PACKAGES="build-essential \
+-                     cmake \
+-                     ninja-build \
+-                     git \
+-                     wget \
+-                     unzip \
+-                     libibverbs-dev \
+-                     libgoogle-glog-dev \
+-                     libjsoncpp-dev \
+-                     libunwind-dev \
+-                     libnuma-dev \
+-                     libpython3-dev \
+-                     libboost-all-dev \
+-                     libssl-dev \
+-                     libgrpc-dev \
+-                     libgrpc++-dev \
+-                     libprotobuf-dev \
+-                     libyaml-cpp-dev \
+-                     protobuf-compiler-grpc \
+-                     libcurl4-openssl-dev \
+-                     libhiredis-dev \
+-                     liburing-dev \
+-                     libjemalloc-dev \
+-                     libmsgpack-dev \
+-                     libzmq3-dev \
+-                     libzstd-dev \
+-                     libasio-dev \
+-                     libxxhash-dev \
+-                     pkg-config \
+-                     patchelf \
+-                     libc6-dev \
+-                     libc-bin"
+-
+-    apt-get install -y $SYSTEM_PACKAGES
+-    check_success "Failed to install system packages"
+-
+-elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ]; then
+-    SYSTEM_PACKAGES="@development \
+-                     cmake \
+-                     ninja-build \
+-                     git \
+-                     wget \
+-                     rdma-core-devel \
+-                     glog-devel \
+-                     gflags-devel \
+-                     jsoncpp-devel \
+-                     libunwind-devel \
+-                     numactl-devel \
+-                     python3-devel \
+-                     boost1.78-devel \
+-                     openssl-devel \
+-                     protobuf-devel \
+-                     yaml-cpp-devel \
+-                     libcurl-devel \
+-                     hiredis-devel \
+-                     liburing-devel \
+-                     jemalloc-devel \
+-                     msgpack-devel \
+-                     libzstd-devel \
+-                     pkgconf-pkg-config \
+-                     elfutils-libelf-devel \
+-                     patchelf  \
+-                     xxhash-devel \
+-                     libbsd-devel"
+-
+-    yum install -y $SYSTEM_PACKAGES
+-    check_success "Failed to install system packages"
+-else
+-    print_error "Unsupported OS: $OS"
++# Conda-forge equivalents of the system packages previously installed with
++# apt-get/yum. Note: python (with its development headers) is already part
++# of the active Conda environment, so no separate python-dev package is
++# needed; grpc-cpp provides grpc_cpp_plugin and libprotobuf provides protoc.
++CONDA_PACKAGES="python=3.12 \
++                cxx-compiler \
++                make \
++                cmake \
++                ninja \
++                git \
++                wget \
++                unzip \
++                glog \
++                jsoncpp \
++                libunwind \
++                numactl \
++                boost-cpp \
++                openssl \
++                grpc-cpp \
++                libprotobuf \
++                yaml-cpp \
++                libcurl \
++                hiredis \
++                liburing \
++                jemalloc \
++                msgpack-c \
++                zeromq \
++                zstd \
++                asio \
++                xxhash \
++                pkg-config \
++                patchelf \
++                libnl"
++
++# C standard library headers (libc6-dev equivalent). cxx-compiler pulls the
++# matching sysroot in automatically, but install it explicitly to be clear.
++SYSROOT_PKG="sysroot_linux-64"
++if [ "$(uname -m)" = "aarch64" ]; then
++    SYSROOT_PKG="sysroot_linux-aarch64"
+ fi
+ 
+-print_success "System packages installed successfully"
++conda install -y -c conda-forge $CONDA_PACKAGES $SYSROOT_PKG
++check_success "Failed to install packages via conda"
++
++print_success "Conda packages installed successfully"
++
++# conda-forge's msgpack-c ships only the C library headers (msgpack.h,
++# msgpack/*.h). Mooncake's store uses the C++ header <msgpack.hpp>, which
++# lives in the separate cpp branch of the same upstream project and is not
++# packaged on conda-forge, so install it headers-only into the Conda
++# environment. Pin to the same version as the conda msgpack-c package so the
++# C and C++ headers stay consistent.
++print_section "Installing msgpack C++ headers"
++
++MSGPACK_C_VERSION=$(conda list -f msgpack-c 2>/dev/null | awk '$1=="msgpack-c" {print $2; exit}')
++if [ -z "${MSGPACK_C_VERSION}" ]; then
++    MSGPACK_C_VERSION="6.1.0"
++fi
++echo "Fetching msgpack-cpp ${MSGPACK_C_VERSION} headers from ${GITHUB_PROXY}..."
++MSGPACK_CPP_TGZ="$(mktemp --suffix=.tar.gz)"
++MSGPACK_TMP="$(mktemp -d)"
++curl -fsSL -o "${MSGPACK_CPP_TGZ}" \
++    "${GITHUB_PROXY}/msgpack/msgpack-c/archive/refs/tags/cpp-${MSGPACK_C_VERSION}.tar.gz"
++check_success "Failed to download msgpack-cpp ${MSGPACK_C_VERSION} headers"
++tar -xzf "${MSGPACK_CPP_TGZ}" -C "${MSGPACK_TMP}"
++check_success "Failed to extract msgpack-cpp headers"
++# Replace the C-only msgpack/ directory with the cpp branch's complete
++# header set (C + C++), so <msgpack.hpp> resolves.
++rm -rf "${CONDA_PREFIX}/include/msgpack"
++cp -r "${MSGPACK_TMP}"/msgpack-c-cpp-*/include/msgpack.hpp \
++      "${MSGPACK_TMP}"/msgpack-c-cpp-*/include/msgpack \
++      "${CONDA_PREFIX}/include/"
++check_success "Failed to install msgpack C++ headers into ${CONDA_PREFIX}/include"
++rm -f "${MSGPACK_CPP_TGZ}"
++rm -rf "${MSGPACK_TMP}"
++
++print_success "msgpack C++ headers installed into ${CONDA_PREFIX}/include"
+ 
+ # Initialize and update git submodules
+ print_section "Initializing Git Submodules"
+@@ -254,8 +222,14 @@ check_success "Failed to create build directory"
+ cd build
+ check_success "Failed to change to build directory"
+ 
+-echo "Configuring yalantinglibs..."
+-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
++# Install yalantinglibs into the Conda environment: headers go to
++# ${CONDA_PREFIX}/include and libraries to ${CONDA_PREFIX}/lib. Make sure
++# CMake can find the conda-installed dependencies (asio, glog, ...).
++export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:+${CMAKE_PREFIX_PATH}:}${CONDA_PREFIX}"
++
++echo "Configuring yalantinglibs (install prefix: ${CONDA_PREFIX})..."
++cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF \
++         -DCMAKE_INSTALL_PREFIX="${CONDA_PREFIX}"
+ check_success "Failed to configure yalantinglibs"
+ 
+ echo "Building yalantinglibs (using $(nproc) cores)..."
+@@ -266,106 +240,44 @@ echo "Installing yalantinglibs..."
+ cmake --install .
+ check_success "Failed to install yalantinglibs"
+ 
+-print_success "yalantinglibs installed successfully"
++print_success "yalantinglibs installed into ${CONDA_PREFIX}/include and ${CONDA_PREFIX}/lib"
+ cd "${REPO_ROOT}"
+ 
+ print_section "Verifying essential build tools"
+ 
+ # Verify getconf and ldd (required for glibc version detection in build_wheel.sh)
+-if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+-    if ! command -v getconf >/dev/null 2>&1; then
+-        print_error "getconf not found after installing system packages. This should not happen."
+-    fi
+-    if ! command -v ldd >/dev/null 2>&1; then
+-        print_error "ldd not found after installing system packages. This should not happen."
+-    fi
+-    print_success "getconf found: $(getconf --version 2>&1 | head -1)"
+-    print_success "ldd found: $(ldd --version 2>&1 | head -1)"
++if ! command -v getconf >/dev/null 2>&1; then
++    print_error "getconf not found. This should not happen."
++fi
++if ! command -v ldd >/dev/null 2>&1; then
++    print_error "ldd not found. This should not happen."
+ fi
++print_success "getconf found: $(getconf --version 2>&1 | head -1)"
++print_success "ldd found: $(ldd --version 2>&1 | head -1)"
+ 
+ print_section "Installing Go $GOVER"
+ 
+-USED_CN_MIRROR=false
+-
+-install_go() {
+-    ARCH=$(uname -m)
+-    if [ "$ARCH" = "aarch64" ]; then
+-        ARCH="arm64"
+-    elif [ "$ARCH" = "x86_64" ]; then
+-        ARCH="amd64"
+-    else
+-        echo "Unsupported architecture: $ARCH"
+-        exit 1
+-    fi
+-
+-    GO_TARBALL="go$GOVER.linux-$ARCH.tar.gz"
+-
+-    # Try multiple download mirrors with fallback
+-    GO_DOWNLOAD_URLS=(
+-        "https://go.dev/dl/${GO_TARBALL}"
+-        "https://golang.google.cn/dl/${GO_TARBALL}"
+-        "https://mirrors.aliyun.com/golang/${GO_TARBALL}"
+-    )
+-
+-    DOWNLOAD_SUCCESS=false
+-    for url in "${GO_DOWNLOAD_URLS[@]}"; do
+-        echo "Downloading Go $GOVER from ${url}..."
+-        if wget -q --show-progress --timeout=30 --tries=2 -O "${GO_TARBALL}" "${url}"; then
+-            DOWNLOAD_SUCCESS=true
+-            if [[ "$url" != "https://go.dev/dl/${GO_TARBALL}" ]]; then
+-                USED_CN_MIRROR=true
+-            fi
+-            print_success "Downloaded Go $GOVER from ${url}"
+-            break
+-        else
+-            echo -e "${YELLOW}Failed to download from ${url}, trying next mirror...${NC}"
+-            rm -f "${GO_TARBALL}"
+-        fi
+-    done
+-
+-    if [ "$DOWNLOAD_SUCCESS" = false ]; then
+-        print_error "Failed to download Go $GOVER from all mirrors"
+-    fi
+-
+-    echo "Installing Go $GOVER..."
+-    tar -C /usr/local -xzf "${GO_TARBALL}"
+-    check_success "Failed to install Go $GOVER"
+-
+-    rm -f "${GO_TARBALL}"
+-    check_success "Failed to clean up Go installation file"
+-
+-    print_success "Go $GOVER installed successfully"
+-}
+-
+-if command -v go &> /dev/null; then
+-    GO_VERSION=$(go version | awk '{print $3}')
+-    if [[ "$GO_VERSION" == "go$GOVER" ]]; then
+-        echo -e "${YELLOW}Go $GOVER is already installed. Skipping...${NC}"
+-    else
+-        echo -e "${YELLOW}Found Go $GO_VERSION. Will install Go $GOVER...${NC}"
+-        install_go
+-    fi
++# conda-forge does not ship go 1.25.9 (that release was skipped upstream),
++# so use the compatible-release spec `go~=1.25.9` (>= 1.25.9, < 1.26),
++# which resolves to the newest 1.25.x patch release (e.g. 1.25.11).
++if command -v go >/dev/null 2>&1 && [[ "$(go version | awk '{print $3}')" == go1.25* ]]; then
++    echo -e "${YELLOW}Go $(go version | awk '{print $3}') is already installed. Skipping...${NC}"
+ else
+-    install_go
++    echo "Installing Go ${GOVER} (1.25.x series) via conda..."
++    conda install -y -c conda-forge "go~=${GOVER}"
++    check_success "Failed to install Go via conda"
++    print_success "Go installed successfully"
+ fi
+ 
+-# Add Go to PATH if not already there
+-if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
+-    echo -e "${YELLOW}Adding Go to your PATH in ~/.bashrc${NC}"
+-    echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+-    echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
+-fi
++# Go is installed into the Conda environment, so $CONDA_PREFIX/bin is
++# already on PATH; no shell profile changes are needed.
+ 
+-# Set GOPROXY only if Go download fell back to a CN mirror
+-if [ "$USED_CN_MIRROR" = true ] && [ -z "$GOPROXY" ]; then
++# Set GOPROXY for the Go module builds (mooncake-store etc.) if not set
++if [ -z "$GOPROXY" ]; then
+     export GOPROXY=https://goproxy.cn,https://goproxy.io,direct
+-    echo -e "${YELLOW}Detected restricted network (Go was downloaded from a CN mirror).${NC}"
+-    echo -e "${YELLOW}GOPROXY set to: ${GOPROXY}${NC}"
+-    if ! grep -q "export GOPROXY=" ~/.bashrc; then
+-        echo 'export GOPROXY=https://goproxy.cn,https://goproxy.io,direct' >> ~/.bashrc
+-        echo -e "${YELLOW}GOPROXY added to ~/.bashrc for future sessions${NC}"
+-    fi
+-elif [ -n "$GOPROXY" ]; then
++    echo -e "${YELLOW}GOPROXY not set; using: ${GOPROXY}${NC}"
++    echo -e "${YELLOW}To persist it for this environment, run: conda env config vars set GOPROXY=${GOPROXY}${NC}"
++else
+     echo -e "${GREEN}GOPROXY already set to: ${GOPROXY}${NC}"
+ fi
+ 
+@@ -421,10 +333,10 @@ if [ "$INSTALL_SPDK" = true ]; then
+     make install
+     check_success "Failed to install SPDK"
+ 
+-    # Copy DPDK libraries to system library path
++    # Copy DPDK libraries to the Conda environment's library path
+     if ls dpdk/build/lib/*.a >/dev/null 2>&1; then
+-        echo "Copying DPDK libraries to /usr/local/lib..."
+-        cp dpdk/build/lib/*.a /usr/local/lib/
++        echo "Copying DPDK libraries to ${CONDA_PREFIX}/lib..."
++        cp dpdk/build/lib/*.a "${CONDA_PREFIX}/lib/"
+         check_success "Failed to copy DPDK libraries"
+     fi
+ 
+@@ -435,20 +347,35 @@ fi
+ # Return to the repository root
+ cd "${REPO_ROOT}"
+ 
++# Make binaries built against the conda-installed libraries runnable: conda
++# does not add ${CONDA_PREFIX}/lib to the loader path by default. Export it
++# for this shell and persist it for future activations of this environment.
++export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
++conda env config vars set LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" >/dev/null 2>&1 \
++    && print_success "LD_LIBRARY_PATH persisted for this Conda environment"
++
+ # Print summary
+ print_section "Installation Complete"
+-echo -e "${GREEN}All dependencies have been successfully installed!${NC}"
++echo -e "${GREEN}All dependencies have been successfully installed into:${NC}"
++echo -e "  ${GREEN}${CONDA_PREFIX}${NC}"
+ echo -e "The following components were installed:"
+-echo -e "  ${GREEN}✓${NC} System packages"
++echo -e "  ${GREEN}✓${NC} Conda packages (via conda-forge)"
+ echo -e "  ${GREEN}✓${NC} yalantinglibs"
+ echo -e "  ${GREEN}✓${NC} Git submodules"
+-echo -e "  ${GREEN}✓${NC} Go $GOVER"
++echo -e "  ${GREEN}✓${NC} Go $GOVER (1.25.x series)"
+ if [ "$INSTALL_SPDK" = true ]; then
+     echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"
+ fi
+ echo
+ echo -e "You can now build and run Mooncake."
+-echo -e "${YELLOW}Note: You may need to restart your terminal or run 'source ~/.bashrc' to use Go.${NC}"
++echo -e "${YELLOW}Note: Go is already on PATH in the active Conda environment.${NC}"
++echo -e "${YELLOW}Note: When building Mooncake, CMAKE_PREFIX_PATH includes ${CONDA_PREFIX}${NC}"
++echo -e "${YELLOW}      (the conda compiler activation sets it automatically; this script${NC}"
++echo -e "${YELLOW}      also exports it for its own builds), and LD_LIBRARY_PATH is exported${NC}"
++echo -e "${YELLOW}      for this shell and persisted for future activations. Re-activate the${NC}"
++echo -e "${YELLOW}      environment (conda activate) for the persisted variables to apply.${NC}"
++echo -e "${YELLOW}On memory-constrained machines, configure with:${NC}"
++echo -e "${YELLOW}      cmake .. -DENABLE_DEBUG_SYMBOLS=OFF   # avoids -g (lower peak RAM)${NC}"
+ 
+ if [ "$INSTALL_SPDK" = true ]; then
+     echo -e "${YELLOW}Note: SPDK requires hugepages and RDMA configuration. Please refer to SPDK documentation for setup.${NC}"
+diff --git a/mooncake-common/common.cmake b/mooncake-common/common.cmake
+index 0b801728..06a93549 100644
+--- a/mooncake-common/common.cmake
++++ b/mooncake-common/common.cmake
+@@ -11,6 +11,19 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter -fPIC")
+ if(ENABLE_DEBUG_SYMBOLS)
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
+   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g")
++else()
++  # CMake's built-in per-config defaults (e.g. RelWithDebInfo = "-O2 -g
++  # -DNDEBUG") re-introduce -g after the block above, so ENABLE_DEBUG_SYMBOLS=OFF
++  # alone would not actually drop debug info.  Strip -g from the per-config
++  # flags as well so the knob really disables debug symbols (this also greatly
++  # reduces peak compiler memory, which matters on memory-constrained build
++  # machines).
++  foreach(_debug_config RELWITHDEBINFO DEBUG RELEASE MINSIZEREL)
++    string(REGEX REPLACE "(^| )-g( |$)" " "
++           CMAKE_CXX_FLAGS_${_debug_config} "${CMAKE_CXX_FLAGS_${_debug_config}}")
++    string(REGEX REPLACE "(^| )-g( |$)" " "
++           CMAKE_C_FLAGS_${_debug_config} "${CMAKE_C_FLAGS_${_debug_config}}")
++  endforeach()
+ endif()
+ 
+ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+diff --git a/mooncake-store/benchmarks/oplog_batch_bench.cpp b/mooncake-store/benchmarks/oplog_batch_bench.cpp
+index 7993c751..ec76588b 100644
+--- a/mooncake-store/benchmarks/oplog_batch_bench.cpp
++++ b/mooncake-store/benchmarks/oplog_batch_bench.cpp
+@@ -1,6 +1,10 @@
+ #include <gflags/gflags.h>
+ #include <glog/logging.h>
+-#include <jsoncpp/json/json.h>
++#if __has_include(<jsoncpp/json/json.h>)
++#include <jsoncpp/json/json.h>  // Ubuntu/Debian style path
++#else
++#include <json/json.h>  // Conda/sysroot style path
++#endif
+ 
+ #include <algorithm>
+ #include <atomic>
+diff --git a/mooncake-store/tests/ha/oplog/oplog_batch_auditor_test.cpp b/mooncake-store/tests/ha/oplog/oplog_batch_auditor_test.cpp
+index b01c6fa6..cfaf312d 100644
+--- a/mooncake-store/tests/ha/oplog/oplog_batch_auditor_test.cpp
++++ b/mooncake-store/tests/ha/oplog/oplog_batch_auditor_test.cpp
+@@ -1,6 +1,10 @@
+ #include <gtest/gtest.h>
+ 
+-#include <jsoncpp/json/json.h>
++#if __has_include(<jsoncpp/json/json.h>)
++#include <jsoncpp/json/json.h>  // Ubuntu/Debian style path
++#else
++#include <json/json.h>  // Conda/sysroot style path
++#endif
+ 
+ #include <algorithm>
+ #include <sstream>
+diff --git a/mooncake-store/tools/oplog_batch_auditor.cpp b/mooncake-store/tools/oplog_batch_auditor.cpp
+index 74c09046..a44c0928 100644
+--- a/mooncake-store/tools/oplog_batch_auditor.cpp
++++ b/mooncake-store/tools/oplog_batch_auditor.cpp
+@@ -6,7 +6,11 @@
+ #include <map>
+ #include <string_view>
+ 
+-#include <jsoncpp/json/json.h>
++#if __has_include(<jsoncpp/json/json.h>)
++#include <jsoncpp/json/json.h>  // Ubuntu/Debian style path
++#else
++#include <json/json.h>  // Conda/sysroot style path
++#endif
+ 
+ #include "ha/oplog/oplog_batch_codec.h"
+ #include "ha/oplog/oplog_types.h"
+diff --git a/mooncake-store/tools/oplog_batch_inspector.cpp b/mooncake-store/tools/oplog_batch_inspector.cpp
+index f8dd0178..bcd3a634 100644
+--- a/mooncake-store/tools/oplog_batch_inspector.cpp
++++ b/mooncake-store/tools/oplog_batch_inspector.cpp
+@@ -1,6 +1,10 @@
+ #include <gflags/gflags.h>
+ #include <glog/logging.h>
+-#include <jsoncpp/json/json.h>
++#if __has_include(<jsoncpp/json/json.h>)
++#include <jsoncpp/json/json.h>  // Ubuntu/Debian style path
++#else
++#include <json/json.h>  // Conda/sysroot style path
++#endif
+ 
+ #include <chrono>
+ #include <cstdint>
+-- 
+2.52.0
+
