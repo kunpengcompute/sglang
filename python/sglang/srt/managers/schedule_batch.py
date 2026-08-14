@@ -2499,8 +2499,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
-        if self.spec_info:
+        if self.spec_info and other.spec_info is not None:
             self.spec_info.merge_batch(other.spec_info)
+        # Note: when other.spec_info is None (e.g. PP+MTP prebuilt batches,
+        # which skip the eagle simulation), the running batch's spec_info is
+        # left untouched. It is rebuilt by the PP+MTP verify-batch preparation
+        # (_pp_mtp_prepare_verify_batch) before the next forward, and the new
+        # requests' drafts are tracked by the scheduler's pending-draft state.
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None

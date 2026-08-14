@@ -133,7 +133,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
         # Simulate the eagle run.
-        if self.spec_algorithm.is_eagle():
+        # Under PP, this simulation is skipped: the first verify batch is
+        # constructed by the scheduler's PP+MTP hook
+        # (`_pp_maybe_prepare_mtp_batch` -> `_pp_mtp_prepare_verify_batch`),
+        # which builds its own EagleVerifyInput and allocates the draft KV
+        # extend-style. Re-running prepare_for_extend here would allocate
+        # draft-pool slots a second time (perturbing the deterministic
+        # allocation sequence shared with the prefill-side transfer indices)
+        # and the simulated spec_info would be discarded anyway.
+        if self.spec_algorithm.is_eagle() and server_args.pp_size <= 1:
             num_states = server_args.speculative_eagle_topk
             if server_args.enable_multi_layer_eagle:
                 num_states *= server_args.speculative_num_steps

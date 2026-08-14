@@ -36,12 +36,14 @@ from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
+import math
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
+    get_socket_tensor_model_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.dp_attention import (
@@ -64,7 +66,11 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_kunpeng_extend_pad
+from sglang.srt.utils.common import (
+    ceil_align,
+    is_cpu_920f,
+    is_kunpeng_extend_pad,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -77,6 +83,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+_is_cpu_920f = is_cpu_920f()
 _is_kunpeng_extend_pad = is_kunpeng_extend_pad()
 
 
@@ -860,15 +867,42 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     else 0
                 )
 
+        # On 920F, spec batches (TARGET_VERIFY / DRAFT_EXTEND) derive their
+        # batch size as `num_tokens // spec_info.num_tokens_per_req`, and the
+        # kunpeng MLA all2all scatters rows across the socket tp group. So:
+        #   * num_tokens must be divisible by num_tokens_per_req (exact bs
+        #     recovery) and by attn_tp_size (reduce-scatter across attn_tp);
+        #   * the all2all input rows (bs * per_req, after the draft-extend
+        #     left-pad) must be divisible by the socket tp size, and the
+        #     draft-extend reshape (batchsize_per_tp // max_ext_len)
+        #     additionally requires bs % socket_tp_size == 0.
+        # lcm(tp, per_req) alone is insufficient when gcd(tp, per_req) > 1
+        # (e.g. per_req=4 gives bs ≡ 0 mod 4, but 8 ∤ 4). Aligning num_tokens
+        # to lcm(tp, per_req * socket_tp_size) makes bs a multiple of
+        # socket_tp_size for every per_req (MTP=1..7); per_req coprime with tp
+        # keeps the exact previous padding. Other backends keep the original
+        # alignment.
+        attn_cp_size = get_attention_cp_size()
+        align_tp = attn_tp_size
+        align_cp = attn_cp_size
+        if (
+            _is_cpu_920f
+            and self.spec_info is not None
+            and getattr(self.spec_info, "num_tokens_per_req", 1) > 1
+        ):
+            per_req = self.spec_info.num_tokens_per_req
+            socket_tp_size = get_socket_tensor_model_parallel_world_size()
+            align_tp = math.lcm(attn_tp_size, per_req * socket_tp_size)
+            align_cp = math.lcm(attn_cp_size, per_req)
+
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], align_tp)
 
         # make sure that each rank has the same number of tokens to do collective communication.
-        attn_cp_size = get_attention_cp_size()
         for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], align_cp)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens

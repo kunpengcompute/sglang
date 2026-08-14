@@ -541,7 +541,31 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
-                if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
+                # PP+MTP: batch.spec_info (and its topk) is only produced
+                # on the last rank (_pp_mtp_prefill), so it cannot be used
+                # to fill the transfer metadata on every rank. Instead each
+                # rank learns the first draft from its pending-draft state,
+                # which is synchronized across ranks by the output ring
+                # message. The draft travels to the decode server inside
+                # the KV-transfer metadata (topk only; the h condition of
+                # the next draft-extend is re-captured by the decode-side
+                # verify forward, so hidden states are not transferred).
+                if getattr(self, "_pp_mtp_enabled", False):
+                    draft = self._pp_pending_drafts.get(req.rid)
+                    if draft is not None:
+                        req.output_topk_p = torch.tensor(
+                            [1.0], dtype=torch.float32
+                        )
+                        req.output_topk_index = torch.tensor(
+                            [draft], dtype=torch.int64
+                        )
+                    else:
+                        logger.debug(
+                            f"[PP{getattr(self, 'pp_rank', None)}] "
+                            f"rid={req.rid}: no pending draft at prefill transfer"
+                        )
+                    req.hidden_states_tensor = None
+                elif self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]
                     req.hidden_states_tensor = (
@@ -663,6 +687,12 @@ class SchedulerDisaggregationPrefillMixin:
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
+                # PP+MTP: the prefill server never consumes pending drafts (it
+                # has no decode batches); drop them once the request has been
+                # handed over so the dict does not grow unboundedly.
+                pending = getattr(self, "_pp_pending_drafts", None)
+                if pending is not None:
+                    pending.pop(req.rid, None)
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:

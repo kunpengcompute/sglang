@@ -403,6 +403,13 @@ class SchedulerPPMixin:
 
                 # get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
+                if self._pp_mtp_enabled:
+                    # PP+MTP (disaggregated decode): the decode batch is
+                    # turned into a TARGET_VERIFY batch exactly like the
+                    # collocated path (event_loop_pp). The first-verify
+                    # drafts come from the KV-transfer metadata via the
+                    # pending-draft fallback in _pp_maybe_prepare_mtp_batch.
+                    self._pp_maybe_prepare_mtp_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -1278,6 +1285,15 @@ class SchedulerPPMixin:
         # already sets DECODE; this keeps non-last ranks consistent.
         if batch.forward_mode.is_target_verify():
             batch.forward_mode = ForwardMode.DECODE
+            if not self.pp_group.is_last_rank:
+                # Non-last ranks never run the draft worker, so their spec_info
+                # stays the stale EagleVerifyInput (which has neither
+                # filter_batch nor merge_batch). Drop it so the downstream
+                # update_running_batch/filter_batch and merge_batch paths never
+                # touch verify-only methods; the next verify round rebuilds it
+                # via _pp_mtp_prepare_verify_batch anyway. The last rank keeps
+                # its EagleDraftInput (the next draft-extend input).
+                batch.spec_info = None
 
         output_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -1460,10 +1476,14 @@ class SchedulerPPMixin:
         """Prepare a PP decode batch for 1-step MTP (TARGET_VERIFY round).
 
         Every decode req must carry a pending draft from the previous round
-        (the last rank's worker or the ring message). If the invariant is ever
-        violated (e.g. a subtle transition or timing edge case), fail loudly
-        instead of silently degrading to a non-speculative round, so that the
-        scheduling bug is exposed immediately.
+        (the last rank's worker or the ring message). In disaggregated
+        deployment, the drafts of the first verify round arrive via the
+        KV-transfer metadata (`req.output_topk_index`, restored on every rank
+        in `_commit_transfer_to_req`); they are materialized here through
+        `_pp_pd_extract_transferred_draft` before the invariant check. If the
+        invariant is ever violated (e.g. a subtle transition or timing edge
+        case), fail loudly instead of silently degrading to a non-speculative
+        round, so that the scheduling bug is exposed immediately.
         """
         if batch is None:
             _ppmtp_log(self, "maybe_prepare: batch is None, skip")
@@ -1489,12 +1509,46 @@ class SchedulerPPMixin:
             req.rid for req in batch.reqs if req.rid not in self._pp_pending_drafts
         ]
         if missing:
+            # PD disagg fallback: the first verify round's drafts are carried
+            # by the KV-transfer metadata instead of the output ring message.
+            for req in batch.reqs:
+                if req.rid not in self._pp_pending_drafts:
+                    tok = self._pp_pd_extract_transferred_draft(req)
+                    if tok is not None:
+                        self._pp_pending_drafts[req.rid] = tok
+                        _ppmtp_log(
+                            self,
+                            f"maybe_prepare: rid={req.rid} fallback draft={tok} "
+                            f"from req.output_topk_index",
+                        )
+            missing = [
+                req.rid for req in batch.reqs if req.rid not in self._pp_pending_drafts
+            ]
+        if missing:
             raise RuntimeError(
                 "PP+MTP: decode batch contains requests without a pending draft "
                 f"(rids={missing}); the MTP pipeline invariant is violated"
             )
         _ppmtp_log(self, "maybe_prepare: all drafts present, preparing verify batch")
         self._pp_mtp_prepare_verify_batch(batch)
+
+    @staticmethod
+    def _pp_pd_extract_transferred_draft(req) -> Optional[int]:
+        """Extract the first transferred draft token from a request.
+
+        In disaggregated deployment the first draft of a request is produced
+        on the prefill server and travels inside the KV-transfer metadata
+        (`req.output_topk_index`, restored by `_commit_transfer_to_req` on
+        every PP rank). Returns None when no metadata is attached.
+        """
+        idx = getattr(req, "output_topk_index", None)
+        if idx is None:
+            return None
+        try:
+            tok = int(idx[0])
+        except (TypeError, IndexError):
+            return None
+        return tok
 
     def _pp_mtp_prepare_verify_batch(self: Scheduler, batch: ScheduleBatch):
         """Turn a decode batch into a 1-step TARGET_VERIFY batch.
