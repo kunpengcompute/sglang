@@ -315,6 +315,17 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+        elif req.output_topk_index is not None and req.output_topk_p is not None:
+            # PP+MTP: only the first draft (topk) is transferred; hidden
+            # states are re-captured by the decode-side verify forward, so
+            # they are not attached to the request.
+            topk = req.output_topk_p.size(0)
+            self.output_topk_p[req.metadata_buffer_index, :topk].copy_(
+                req.output_topk_p
+            )
+            self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
+                req.output_topk_index
+            )
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
