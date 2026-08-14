@@ -548,33 +548,11 @@ class KunpengGraphRunner:
         # last_tokens, MTP pad/unpad) fix their output shape at capture, so two
         # batches with equal total_tokens but different sequence counts must
         # not share a graph.
-        # For chunked prefill extend, total KV tokens and max per-request KV
-        # length are also part of the key (sizes fixed at capture, so chunks
-        # with different prefix lengths need separate graphs).
-        total_kv_tokens = total_tokens
-        max_total_len = total_tokens
-        if (
-            forward_batch.forward_mode.is_extend()
-            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.extend_prefix_lens is not None
-            and forward_batch.extend_seq_lens is not None
-        ):
-            total_kv_tokens = int(
-                (forward_batch.extend_prefix_lens.sum()
-                 + forward_batch.extend_seq_lens.sum()).item()
-            )
-            max_total_len = int(
-                (forward_batch.extend_prefix_lens
-                 + forward_batch.extend_seq_lens).max().item()
-            )
         graph_cache_key = (
             forward_batch.forward_mode,
             total_tokens,
             forward_batch.batch_size,
             is_pp_graph,
-            total_kv_tokens,
-            max_total_len,
         )
 
         if graph_cache_key not in self._sglang_graph_cache:
