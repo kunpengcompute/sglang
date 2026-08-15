@@ -175,7 +175,16 @@ class KunpengGraphRunner:
     def move_weights_to_hbw(self):
         """Move model parameters to HBW memory pool."""
         if self.model_runner.is_draft_worker:
-            return
+            if (
+                self.model_runner.server_args.disaggregation_mode == "decode"
+                and int(os.environ.get("DECODE_PP_SIZE", "1")) > 1
+            ):
+                logger.info(
+                    "[weight load] decode (DECODE_PP_SIZE=%s): draft weights placed on HBW",
+                    os.environ.get("DECODE_PP_SIZE", "1"),
+                )
+            else:
+                return
 
         for name, param in self.model_runner.model.named_parameters():
             if "embed_tokens" in name:

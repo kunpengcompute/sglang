@@ -103,7 +103,9 @@ CONDA_BASE_PATH="/path-to-conda"
 MODEL_PATH="/path-to-deepseek-r1-channel-int8"
 MODEL_PATH_PREFILL=$MODEL_PATH
 MODEL_PATH_DECODE=$MODEL_PATH
-SPECULATIVE_DRAFT_MODEL_PATH=""
+SPECULATIVE_DRAFT_MODEL_PATH="/path-to-deepseek-r1-channel-int8_mtp"
+SPECULATIVE_DRAFT_MODEL_PATH_PREFILL=$SPECULATIVE_DRAFT_MODEL_PATH
+SPECULATIVE_DRAFT_MODEL_PATH_DECODE=$SPECULATIVE_DRAFT_MODEL_PATH
 
 export HPCKIT_PATH="/path-to-HPCKit"
 export OpenBLAS_PATH="/path-to-OpenBLAS"
@@ -255,6 +257,7 @@ _export_pd_vars() {
     _var="${prefix}_REDUNDANT_EXPERTS"; export REDUNDANT_EXPERTS="${!_var}"
     _var="${prefix}_INIT_EXPERT_LOCATION"; export INIT_EXPERT_LOCATION="${!_var}"
     _var="MODEL_PATH_${prefix}"; export MODEL_PATH="${!_var}"
+    _var="SPECULATIVE_DRAFT_MODEL_PATH_${prefix}"; export SPECULATIVE_DRAFT_MODEL_PATH="${!_var}"
 }
 
 # ------------------------------------------------------------
@@ -321,7 +324,7 @@ if [[ "$IS_PREFILL" == "1" ]]; then
     export SGLANG_KUNPENG_MAX_SEQ_NUM=4
     export SGLANG_KUNPENG_MAX_CUR_LEN=1024
 else
-    export SGLANG_KUNPENG_MAX_SEQ_NUM=128
+    export SGLANG_KUNPENG_MAX_SEQ_NUM=64
     export SGLANG_KUNPENG_MAX_CUR_LEN=1
 fi
 
