@@ -239,9 +239,10 @@ def _patch_removed_symbols():
         if not hasattr(modeling_llama, "LlamaFlashAttention2"):
             if hasattr(modeling_llama, "LlamaAttention"):
                 modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
-    except ImportError:
-        logger.warning(
-            "Could not import transformers.models.llama.modeling_llama; "
+    except Exception:
+        logger.debug(
+            "Could not import transformers.models.llama.modeling_llama "
+            "(a broken optional dependency such as torchvision is a common cause); "
             "LlamaFlashAttention2 compat patch not applied."
         )
 
@@ -306,7 +307,7 @@ def _patch_image_processor_kwargs():
                 return original(self, images, *args, **valid)
 
         BaseImageProcessor.__call__ = safe_call
-    except ImportError:
+    except Exception:
         logger.debug(
             "_patch_image_processor_kwargs: BaseImageProcessor not importable, patch skipped"
         )
@@ -339,7 +340,7 @@ def _patch_image_process_cuda_tensor():
                 return _orig(self, image, *args, **kwargs)
 
             cls.process_image = patched_process_image
-    except ImportError:
+    except Exception:
         logger.debug(
             "_patch_image_process_cuda_tensor: required modules not importable, patch skipped"
         )

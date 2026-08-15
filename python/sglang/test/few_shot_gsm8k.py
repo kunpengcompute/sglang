@@ -12,20 +12,25 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 
 import argparse
 import ast
+import logging
+import os
 import re
 import time
-import warnings
 
 import numpy as np
 
 from sglang.lang.api import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.utils import (
-    download_and_cache_file,
-    dump_state_text,
-    normalize_base_url,
-    read_jsonl,
-)
+from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
+
+from transformers import AutoTokenizer
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+
+# Tokenizer path comes from the MODEL_PATH env var (set by scripts/cpu_kunpeng/env.sh)
+model_path = os.environ.get("MODEL_PATH")
+tokenizer = AutoTokenizer.from_pretrained(model_path) if model_path else None
 
 INVALID = -9999999
 
@@ -56,14 +61,8 @@ def get_answer_value(answer_str):
 
 
 def run_eval(args):
-    warnings.warn(
-        "sglang.test.few_shot_gsm8k is deprecated. "
-        "Use sglang.test.run_eval with eval_name='gsm8k' instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
     # Select backend
-    set_default_backend(RuntimeEndpoint(normalize_base_url(args.host, args.port)))
+    set_default_backend(RuntimeEndpoint(f"{args.host}:{args.port}"))
 
     if args.data_path is None:
         # Read data
@@ -86,6 +85,12 @@ def run_eval(args):
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
     arguments = [{"question": q} for q in questions]
+    logger.info(
+        "Prepared %d questions (num_shots=%d, max_new_tokens=%d)",
+        len(arguments),
+        num_shots,
+        args.max_new_tokens,
+    )
 
     #####################################
     ######### SGL Program Begin #########
@@ -118,12 +123,32 @@ def run_eval(args):
     )
     latency = time.perf_counter() - tic
 
+    # Per-request results
     preds = []
     for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
+        answer_text = states[i]["answer"]
+        pred = get_answer_value(answer_text)
+        preds.append(pred)
 
-    # print(f"{preds=}")
-    # print(f"{labels=}")
+        if pred == INVALID:
+            judge = "INVALID (no number extracted)"
+        elif pred == labels[i]:
+            judge = "RIGHT"
+        else:
+            judge = "ERROR"
+
+        logger.info("===== Request %d =====", i)
+        logger.info("[Question] %s", questions[i])
+        logger.info("[Model answer] %s", " ".join(answer_text.split()))
+        if tokenizer is not None:
+            logger.info("[Output tokens] %d", len(tokenizer.encode(answer_text)))
+        logger.info(
+            "[Extracted answer] %s | [Expected answer] %s | [Judgment] %s",
+            pred,
+            labels[i],
+            judge,
+        )
+        logger.info("")
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
@@ -135,11 +160,25 @@ def run_eval(args):
     )
     output_throughput = num_output_tokens / latency
 
+    # Summary of all answers
+    logger.info("========== Results ==========")
+    logger.info("%-5s %-15s %-15s %-8s", "#", "expected", "obtained", "correct")
+    for i in range(len(preds)):
+        logger.info(
+            "%-5d %-15s %-15s %-8s",
+            i,
+            labels[i],
+            preds[i],
+            str(preds[i] == labels[i]),
+        )
+
     # Print results
-    print(f"Accuracy: {acc:.3f}")
-    print(f"Invalid: {invalid:.3f}")
-    print(f"Latency: {latency:.3f} s")
-    print(f"Output throughput: {output_throughput:.3f} token/s")
+    logger.info("========== Summary ==========")
+    logger.info("num_output_tokens: %d", num_output_tokens)
+    logger.info("Accuracy: %.3f", acc)
+    logger.info("Invalid: %.3f", invalid)
+    logger.info("Latency: %.3f s", latency)
+    logger.info("Output throughput: %.3f token/s", output_throughput)
 
     # Dump results
     dump_state_text("tmp_output_gsm8k.txt", states)
@@ -159,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-questions", type=int, default=200)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=128)
-    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()

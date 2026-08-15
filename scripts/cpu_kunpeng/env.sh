@@ -110,6 +110,7 @@ export OpenBLAS_PATH="/path-to-OpenBLAS"
 export KUPL_PATH="/path-to-KUPL"
 export KUTACC_PATH="/path-to-KUTACC"
 export SGLANG_PATH="/path-to-SGLang"
+export DATASET_PATH="/path-to-dataset"
 export CONDA_ENV_PATH="$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME"
 export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
 # Required when SGLANG_ENABLE_TOKENIZER_SEPERATE=1 (used by tokenizer-side HTTP servers)

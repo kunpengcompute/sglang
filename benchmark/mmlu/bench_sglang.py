@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import subprocess
 import tarfile
@@ -8,18 +9,59 @@ import time
 import numpy as np
 import pandas as pd
 import tiktoken
+from transformers import AutoTokenizer
 
-from sglang.test.test_utils import (
-    add_common_sglang_args_and_parse,
-    dump_bench_raw_result,
-    select_sglang_backend,
-)
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 
 choices = ["A", "B", "C", "D"]
 
-tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
+# Tokenizer path comes from the MODEL_PATH env var (set by scripts/cpu_kunpeng/env.sh);
+# fall back to tiktoken (gpt-3.5-turbo) when not set.
+model_dir = os.environ.get("MODEL_PATH")
+if model_dir:
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+else:
+    tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
+    logger.warning("MODEL_PATH not set, falling back to tiktoken gpt-3.5-turbo")
+
+
+def normalize_base_url(host: str, port: int) -> str:
+    if host.startswith("http://") or host.startswith("https://"):
+        return f"{host}:{port}"
+    return f"http://{host}:{port}"
+
+def select_sglang_backend(args):
+    from sglang.lang.backend.openai import OpenAI
+    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+
+    if args.backend.startswith("srt"):
+        return RuntimeEndpoint(normalize_base_url(args.host, args.port))
+    if args.backend.startswith("gpt-"):
+        return OpenAI(args.backend)
+    raise ValueError(f"Invalid backend: {args.backend}")
+
+
+def dump_bench_raw_result(path: str, states, preds, labels):
+    if not path:
+        return
+    from pathlib import Path
+
+    rows = []
+    for i in range(len(states)):
+        state = states[i]
+        output = state["answer"]
+        prompt = state.text().removesuffix(output)
+        rows.append(
+            dict(
+                prompt_id=i,
+                prompt=prompt,
+                output=output,
+                correct=bool(preds[i] == labels[i]),
+            )
+        )
+    logger.info("BenchRawResultDumper save results to %s", path)
+    Path(path).write_text("\n".join(json.dumps(row) for row in rows))
 
 
 def format_subject(subject):
@@ -56,7 +98,7 @@ def download_data(data_dir):
     """Download and extract MMLU data if it doesn't exist."""
     if os.path.isdir(os.path.join(data_dir, "test")):
         return
-    print(f"Data not found at {data_dir}. Downloading...")
+    logger.info("Data not found at %s. Downloading...", data_dir)
     os.makedirs(data_dir, exist_ok=True)
     tar_path = os.path.join(data_dir, "data.tar")
     subprocess.check_call(
@@ -71,10 +113,15 @@ def download_data(data_dir):
             os.rename(os.path.join(nested, item), os.path.join(data_dir, item))
         os.rmdir(nested)
     os.remove(tar_path)
-    print("Download complete.")
+    logger.info("Download complete.")
 
 
 def main(args):
+    # Only auto-download when --data_dir is not explicitly provided
+    if args.data_dir is None:
+        args.data_dir = "data"
+        download_data(args.data_dir)
+
     subjects = sorted(
         [
             f.split("_test.csv")[0]
@@ -99,6 +146,8 @@ def main(args):
 
         k = args.ntrain
         few_shot_examples = gen_prompt(dev_df, subject, k)
+        logger.debug("few_shot_examples:\n%s", few_shot_examples)
+
         while len(tokenizer.encode(few_shot_examples)) > 1536:
             k -= 1
             few_shot_examples = gen_prompt(dev_df, subject, k)
@@ -115,6 +164,12 @@ def main(args):
 
             label = test_df.iloc[i, test_df.shape[1] - 1]
             labels.append(label)
+
+    logger.info(
+        "Prepared %d questions across %d subject(s)",
+        len(arguments),
+        len(subjects[: args.nsub]),
+    )
 
     #####################################
     ######### SGL Program Begin #########
@@ -157,13 +212,19 @@ def main(args):
     ]
     latency = time.perf_counter() - tic
 
-    # Compute accuracy
+    # Per-request results
     cors = [pred == label for pred, label in zip(preds, labels)]
+    for pred, label, cor in zip(preds, labels, cors):
+        logger.info("pred: %s | label: %s | correct: %s", pred, label, cor)
 
+    # Per-subject accuracy
     pt = 0
     for subject, num_qs in zip(subjects[: args.nsub], num_questions):
-        print(
-            f"subject: {subject}, #q:{num_qs}, acc: {np.mean(cors[pt: pt + num_qs]):.3f}"
+        logger.info(
+            "subject: %s | #q: %d | acc: %.3f",
+            subject,
+            num_qs,
+            np.mean(cors[pt : pt + num_qs]),
         )
         pt += num_qs
     assert pt == len(cors)
@@ -177,8 +238,9 @@ def main(args):
     )
 
     # Print results
-    print("Total latency: {:.3f}".format(latency))
-    print("Average accuracy: {:.3f}".format(weighted_acc))
+    logger.info("========== Summary ==========")
+    logger.info("Total latency: %.3f s", latency)
+    logger.info("Average accuracy: %.3f", weighted_acc)
 
     # Write results
     with open(args.result_file, "a") as fout:
@@ -199,12 +261,16 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.print_help = lambda: print(parser.format_usage(), end="")
     parser.add_argument("--ntrain", "-k", type=int, default=5)
-    parser.add_argument(
-        "--data_dir", "-d", type=str, default=os.path.join(SCRIPT_DIR, "data")
-    )
+    parser.add_argument("--data_dir", "-d", type=str, default=None)
     parser.add_argument("--save_dir", "-s", type=str, default="results")
     parser.add_argument("--nsub", type=int, default=60)
-    args = add_common_sglang_args_and_parse(parser)
-    download_data(args.data_dir)
+    parser.add_argument("--parallel", type=int, default=64)
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument("--backend", type=str, default="srt")
+    parser.add_argument("--result-file", type=str, default="result.jsonl")
+    parser.add_argument("--raw-result-file", type=str)
+    args = parser.parse_args()
     main(args)

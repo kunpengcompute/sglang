@@ -217,9 +217,9 @@ if [[ "$ROLE" == "router" ]]; then
         done
     fi
     
-    # Launch sglang_router ----
+    # Launch sgl-model-gateway (Rust router) ----
     echo "Launching PD disaggregation router..."
-    taskset -c 228 python -m sglang_router.launch_router "${SPECIFIC_ARGS[@]}" \
+    taskset -c 228 sgl-model-gateway "${SPECIFIC_ARGS[@]}" \
         > "$LOG_PATH/router_$IP.log" 2>&1 &
 
     exit 0
