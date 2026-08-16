@@ -270,6 +270,7 @@ python/kernel.lock
 sgl-kernel/csrc_musa/
 sgl-kernel/include_musa/
 sgl-kernel/csrc/**/*_musa/
+sgl-kernel/.ccache
 
 # MUSA core dump files
 *.mudmp

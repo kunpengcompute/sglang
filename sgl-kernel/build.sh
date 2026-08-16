@@ -4,8 +4,12 @@ set -eux
 # ccache configuration
 USE_CCACHE="${USE_CCACHE:-1}"
 
+# Keep the ccache dir inside the sgl-kernel source tree (shared storage) so it
+# survives node reboots / rebuilds on a different node. Override via CCACHE_DIR.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 if [ "${USE_CCACHE}" = "1" ] && command -v ccache &>/dev/null; then
-  export CCACHE_DIR="${CCACHE_DIR:-${HOME}/.cache/sgl-kernel/ccache}"
+  export CCACHE_DIR="${CCACHE_DIR:-${SCRIPT_DIR}/.ccache}"
   export CCACHE_BASEDIR="$(pwd)"
   export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-10G}"
   export CCACHE_COMPILERCHECK=content
