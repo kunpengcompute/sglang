@@ -22,8 +22,8 @@ if [[ $# -gt 1 ]]; then
 fi
 
 ROLE="${1:-native}"
-if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" && "$ROLE" != "router" ]]; then
-    echo "Error: ROLE must be 'prefill', 'decode', 'native', or 'router'" >&2
+if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" && "$ROLE" != "router" && "$ROLE" != "all" ]]; then
+    echo "Error: ROLE must be 'prefill', 'decode', 'native', 'router', or 'all'" >&2
     exit 1
 fi
 
@@ -34,16 +34,16 @@ cd "$SCRIPT_DIR"
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
 source ./env.sh "$ROLE"
 
-# Router mode: kill router and HTTP server processes on the configured router node
+# Router mode: kill gateway and HTTP server processes on the configured router node
 if [[ "$ROLE" == "router" ]]; then
-    echo "Killing router on $ROUTER_IP"
+    echo "Killing router/gateway on $ROUTER_IP"
     ssh "root@$ROUTER_IP" '
-        MAIN_PIDS=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
+        MAIN_PIDS=$(ps aux | grep -E "sgl-model-gateway|sglang" | grep -v grep | awk "{print \$2}")
         if [ -n "$MAIN_PIDS" ]; then
             echo "Killing process(es): $MAIN_PIDS"
             kill -15 $MAIN_PIDS 2>/dev/null
             sleep 5
-            REMAINING=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
+            REMAINING=$(ps aux | grep -E "sgl-model-gateway|sglang" | grep -v grep | awk "{print \$2}")
             if [ -n "$REMAINING" ]; then
                 kill -9 $REMAINING 2>/dev/null
             fi
@@ -52,6 +52,14 @@ if [[ "$ROLE" == "router" ]]; then
             echo "No router process found."
         fi
     '
+    exit 0
+fi
+
+# "all" mode: stop every role (router + prefill + decode + native)
+if [[ "$ROLE" == "all" ]]; then
+    for _role in router prefill decode; do
+        ./stop.sh "$_role"
+    done
     exit 0
 fi
 

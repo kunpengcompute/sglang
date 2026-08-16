@@ -89,8 +89,11 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
+try:
+    from torchvision.io import decode_jpeg
+except Exception:
+    decode_jpeg = None
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
