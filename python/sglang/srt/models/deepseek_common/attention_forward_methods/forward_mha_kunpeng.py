@@ -73,14 +73,21 @@ class DeepseekMHAKunpengForwardMixin:
         latent_cache = latent_cache.unsqueeze(1)
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
-        # Apply RoPE
+        # Apply RoPE (in-place variant writes roped q_pe directly into q's
+        # strided tail, avoiding a separate copy-back op)
         if self.rotary_emb is not None:
-            q_pe, k_pe = kunpeng.rope_kunpeng(
-                positions, q_pe, k_pe, self.rotary_emb.cos_sin_cache
+            k_pe_out = kunpeng.alloc_buffer(
+                q_pe.shape[0] * self.qk_rope_head_dim, dtype=torch.bfloat16
+            ).view(q_pe.shape[0], 1, self.qk_rope_head_dim)
+            kunpeng.rope_inplace_kunpeng(
+                positions, q_pe, k_pe,
+                q[..., self.qk_nope_head_dim :],
+                k_pe_out,
+                self.rotary_emb.cos_sin_cache,
             )
+            k_pe = k_pe_out
 
-        kunpeng.copy_kunpeng(q[..., self.qk_nope_head_dim :], q_pe)
-        self._set_mla_kv_buffer_kunpeng(latent_cache, kv_a, k_pe, forward_batch)
+        self._set_mla_kv_buffer_kunpeng(kv_a, k_pe, forward_batch)
 
         cps = get_global_server_args().chunked_prefill_size
         if cps is not None and cps > 0:
@@ -180,29 +187,25 @@ class DeepseekMHAKunpengForwardMixin:
 
     def _set_mla_kv_buffer_kunpeng(
         self: DeepseekV2AttentionMLA,
-        latent_cache: torch.Tensor,
         kv_a: torch.Tensor,
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        kunpeng.copy_kunpeng(latent_cache[:, :, : self.kv_lora_rank], kv_a.unsqueeze(1))
-        kunpeng.copy_kunpeng(latent_cache[:, :, self.kv_lora_rank :], k_pe)
-
         if self.swap_mgr.enable_swap_kv_in:
-            self.swap_mgr.set_kv_buffer(
-                self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, latent_cache
+            self.swap_mgr.set_kv_buffer_2(
+                self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, kv_a, k_pe
             )
             if self.swap_mgr.enable_swap_kv_out:
-                self.swap_mgr.set_kv_buffer_sdma(
-                    forward_batch.out_cache_loc, latent_cache
+                self.swap_mgr.set_kv_buffer_2_sdma(
+                    forward_batch.out_cache_loc, kv_a, k_pe
                 )
             else:
-                self.swap_mgr.set_kv_buffer(
-                    self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, latent_cache
+                self.swap_mgr.set_kv_buffer_2(
+                    self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, kv_a, k_pe
                 )
         else:
-            self.swap_mgr.set_kv_buffer(
-                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, latent_cache
+            self.swap_mgr.set_kv_buffer_2(
+                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, kv_a, k_pe
             )
 
     def _get_mla_kv_buffer_kunpeng(
