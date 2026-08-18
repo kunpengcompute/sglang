@@ -123,6 +123,7 @@ case "$ROLE" in
             --load-balance-method round_robin
             --decode-log-interval 10
             --num-reserved-decode-tokens 256
+            --max-running-requests  $((SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
         )
         ;;
     native)
