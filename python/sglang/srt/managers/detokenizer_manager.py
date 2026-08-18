@@ -63,6 +63,24 @@ DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 <
 
 _is_cpu_920f = is_cpu_920f()
 
+# Kunpeng timeline stamping is mounted via a mixin (following the
+# mlx/scheduler_mixin.py pattern); class-body methods shadow base-class
+# implementations, so the generic event_loop only calls hook methods.
+if _is_cpu_920f:
+    from sglang.srt.hardware_backend.cpu_kunpeng.managers.detokenizer_mixin import (
+        DetokenizerManagerKunpengMixin,
+    )
+else:
+
+    class DetokenizerManagerKunpengMixin:
+        """No-op timeline hooks for non-Kunpeng platforms."""
+
+        def _timeline_stamp_recv(self, recv_obj):
+            pass
+
+        def _timeline_stamp_send(self, recv_obj, output):
+            pass
+
 
 @dataclasses.dataclass
 class DecodeStatus:
@@ -76,7 +94,10 @@ class DecodeStatus:
     sent_offset: int = 0
 
 
-class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+class DetokenizerManager(
+    DetokenizerManagerKunpengMixin,
+    MultiHttpWorkerDetokenizerMixin,
+):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -146,8 +167,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
+            self._timeline_stamp_recv(recv_obj)
             output = self._request_dispatcher(recv_obj)
             if output is not None:
+                self._timeline_stamp_send(recv_obj, output)
                 self.send_to_tokenizer.send_pyobj(output)
             self.soft_watchdog.feed()
 

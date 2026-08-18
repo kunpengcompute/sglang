@@ -174,7 +174,7 @@ export KUPL_EXECUTOR_COUNT=33  # set to 32 when KUTACC_ASYNC_LAUNCH=0
 export KUTACC_ASYNC_LAUNCH=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export TORCH_COMPILE_DISABLE=1
 export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=4
-export SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET=0
+export SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET=18
 
 # SGLang
 export SGLANG_LOG_MS=1
@@ -183,6 +183,8 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_WARMUP_TIMEOUT=1600
 export PYTHONWARNINGS="ignore::FutureWarning"
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=300
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=30
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
@@ -224,6 +226,10 @@ export LOAD_FORMAT=""
 export IS_PREFILL="1"
 # Other options
 export DROP_CACHES=0
+# Tokenizer-side cross-process batch timeline logging
+export SGLANG_TOKENIZER_TIMELINE_LOG=0
+# Retry the bootstrap-server route query on transient failures (timeout / non-200).
+export SGLANG_DISAGG_BOOTSTRAP_RETRY=1
 
 # ------------------------------------------------------------
 # Load local config
@@ -314,6 +320,10 @@ case "$ACTION" in
         return 1
         ;;
 esac
+
+if [[ "$ACTION" == "router" && "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
+    export RAYON_NUM_THREADS=64
+fi
 
 source "${SCRIPT_DIR}/.time_env.sh"
 export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/$ACTION/${LOG_TIME}"

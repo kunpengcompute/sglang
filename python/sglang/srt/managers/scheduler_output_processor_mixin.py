@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -35,6 +36,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
+
+# Cross-process batch timeline switch (scheduler -> detokenizer -> router ->
+# tokenizer worker); see SGLANG_TOKENIZER_TIMELINE_LOG in environ.py.
+_tokenizer_timeline_enabled = envs.SGLANG_TOKENIZER_TIMELINE_LOG.get()
 
 # How often (in decoded tokens) the scheduler force-flushes an intermediate
 # output batch for non-streaming requests.
@@ -1321,6 +1326,11 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                     dp_ranks=dp_ranks,
+                    # Skip idle batches (rids empty): they are heartbeat noise,
+                    # not request data.
+                    scheduler_send_time=(
+                        time.time() if _tokenizer_timeline_enabled and rids else None
+                    ),
                 )
             )
 
