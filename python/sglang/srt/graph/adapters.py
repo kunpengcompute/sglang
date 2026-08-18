@@ -891,14 +891,14 @@ def _setup_unpad_o_right_mtp_kunpeng():
 
 def _setup_topk_convert_kunpeng():
     def shape_infer(count, src_info, src_info_bak, token_ids, experts_offset, num_ranks,
-                    num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill):
+                    num_local_experts, num_max_dispatch_tokens_per_rank, max_tokens, is_prefill):
         return []
 
     def eager_fn(count, src_info, src_info_bak, token_ids, experts_offset, num_ranks,
-                 num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill):
+                 num_local_experts, num_max_dispatch_tokens_per_rank, max_tokens, is_prefill):
         torch.ops.sgl_kernel.topk_convert_kunpeng(
             count, src_info, src_info_bak, token_ids, experts_offset, num_ranks,
-            num_local_experts, num_max_dispatch_tokens_per_rank, is_prefill)
+            num_local_experts, num_max_dispatch_tokens_per_rank, max_tokens, is_prefill)
         return None
 
     register_op('topk_convert_kunpeng', shape_infer, eager_fn)

@@ -382,7 +382,7 @@ def _init_buffers(state: _KunpengDispatcherState):
 
     if state.is_prefill:
         state.recv_token_ids_buf = torch.zeros(
-            multiple * state.max_tokens, dtype=torch.int32
+            state.num_local_experts * multiple * state.max_tokens, dtype=torch.int32
         )
     else:
         state.recv_token_ids_buf = torch.zeros(
@@ -619,6 +619,7 @@ class KunpengDispatcher(BaseDispatcher):
             state.ep_size,
             state.num_local_experts,
             state.num_max_dispatch_tokens_per_rank,
+            state.max_tokens,
             state.is_prefill,
         )
         t_convert_end = time.perf_counter()
