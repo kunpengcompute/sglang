@@ -1131,6 +1131,13 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    # Batch-level timeline timestamps (wall clock, seconds) for cross-process
+    # latency analysis. Filled hop by hop only when
+    # SGLANG_TOKENIZER_TIMELINE_LOG is enabled.
+    scheduler_send_time: Optional[float] = None
+    detokenizer_recv_time: Optional[float] = None
+    detokenizer_send_time: Optional[float] = None
+
 
 @dataclass
 class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
@@ -1194,6 +1201,12 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+    # Batch-level timeline timestamps (wall clock, seconds), copied from
+    # BatchTokenIDOutput by the detokenizer. See the note there.
+    scheduler_send_time: Optional[float] = None
+    detokenizer_recv_time: Optional[float] = None
+    detokenizer_send_time: Optional[float] = None
 
 
 @dataclass

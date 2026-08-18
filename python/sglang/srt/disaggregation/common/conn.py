@@ -716,21 +716,30 @@ class CommonKVReceiver(BaseKVReceiver):
     def _get_bootstrap_info_from_server(
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
     ):
-        """Fetch the bootstrap info from the bootstrap server."""
-        try:
-            url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                bootstrap_info = response.json()
-                return bootstrap_info
-            else:
-                logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
-                )
-                return None
-        except Exception as e:
-            logger.error(f"Error fetching prefill info from bootstrap: {e}")
-            return None
+        """Fetch the bootstrap info from the bootstrap server.
+
+        Retries a few times before giving up (controlled by
+        SGLANG_DISAGG_BOOTSTRAP_RETRY, on by default): a single failed fetch
+        kills the request on every rank of the TP group, and transient
+        timeouts under high concurrency (many decode ranks querying at once)
+        must not fail requests permanently.
+        """
+        url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
+        max_retries = 3 if envs.SGLANG_DISAGG_BOOTSTRAP_RETRY.get() else 1
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    logger.error(
+                        f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                    )
+            except Exception as e:
+                logger.error(f"Error fetching prefill info from bootstrap: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+        return None
 
     @staticmethod
     def query_prefill_dp_ranks(

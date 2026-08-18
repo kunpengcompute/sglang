@@ -112,7 +112,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
-from sglang.srt.utils.common import is_http_only
+from sglang.srt.utils.common import is_cpu_920f, is_http_only
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
@@ -130,6 +130,32 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_top_logprobs",
     "output_token_ids_logprobs",
 )
+
+_is_cpu_920f = is_cpu_920f()
+
+# Kunpeng timeline recording is mounted via a mixin (following the
+# mlx/scheduler_mixin.py pattern); class-body methods shadow base-class
+# implementations, so the generic _handle_batch_output only calls hooks.
+if _is_cpu_920f:
+    from sglang.srt.hardware_backend.cpu_kunpeng.managers.tokenizer_mixin import (
+        TokenizerManagerKunpengMixin,
+    )
+else:
+
+    class TokenizerManagerKunpengMixin:
+        """No-op timeline hooks for non-Kunpeng platforms."""
+
+        def _timeline_batch_enter(self, recv_obj):
+            return None, None
+
+        def _timeline_on_chunk(self, state, batch_pc_start):
+            pass
+
+        def _timeline_on_finish(self, state, recv_obj, i):
+            pass
+
+        def _timeline_batch_exit(self, recv_obj, tok_recv_time):
+            pass
 
 
 @dataclasses.dataclass
@@ -214,7 +240,11 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
-class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+class TokenizerManager(
+    TokenizerManagerKunpengMixin,
+    TokenizerControlMixin,
+    TokenizerManagerScoreMixin,
+):
     """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(
@@ -1654,6 +1684,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
+        # Batch-level timeline: stamp arrival and return
+        # (tok_recv_time, batch_pc_start); see the cpu_kunpeng mixin.
+        tok_recv_time, batch_pc_start = self._timeline_batch_enter(recv_obj)
+
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
@@ -1821,6 +1855,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
 
+            # Accumulate the per-chunk lag (event-loop queueing delay);
+            # see the cpu_kunpeng mixin.
+            self._timeline_on_chunk(state, batch_pc_start)
+
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:
                     state.time_stats.trace_ctx.trace_set_root_attrs(
@@ -1828,6 +1866,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+
+                # Per-request finish stats: the text log is gated by
+                # --enable-request-time-stats-logging, the JSONL record by
+                # the timeline env var (see the cpu_kunpeng mixin).
+                self._timeline_on_finish(state, recv_obj, i)
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
@@ -1884,6 +1927,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
             self.send_to_scheduler.send_pyobj(load_update_req)
+
+        # Write the batch timeline record after all chunks are ready and the
+        # yield coroutines have been woken (so it carries tok_send); see the
+        # cpu_kunpeng mixin.
+        self._timeline_batch_exit(recv_obj, tok_recv_time)
 
     def add_logprob_to_meta_info(
         self,
