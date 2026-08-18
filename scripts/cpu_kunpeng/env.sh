@@ -151,7 +151,7 @@ export EP_SIZE=${TP_SIZE}
 export PP_SIZE=1  # >1 enable pp  eg: 2
 export REDUNDANT_EXPERTS=0
 export INIT_EXPERT_LOCATION=""
-export EP_DISPATCH_ALGORITHM=""  # e.g. static, dynamic
+export EP_DISPATCH_ALGORITHM="static"  # e.g. static, dynamic
 
 # Prefill TP/EP/PP size
 export PREFILL_TP_SIZE=${TP_SIZE}
@@ -160,7 +160,7 @@ export PREFILL_EP_SIZE=${PREFILL_TP_SIZE}
 export PREFILL_PP_SIZE=${PP_SIZE}
 export PREFILL_REDUNDANT_EXPERTS=0
 export PREFILL_INIT_EXPERT_LOCATION=""
-export PREFILL_EP_DISPATCH_ALGORITHM=""
+export PREFILL_EP_DISPATCH_ALGORITHM="static"
 
 # Decode TP/EP/PP size
 export DECODE_TP_SIZE=${TP_SIZE}
@@ -169,7 +169,7 @@ export DECODE_EP_SIZE=${DECODE_TP_SIZE}
 export DECODE_PP_SIZE=${PP_SIZE}
 export DECODE_REDUNDANT_EXPERTS=0
 export DECODE_INIT_EXPERT_LOCATION=""
-export DECODE_EP_DISPATCH_ALGORITHM=""
+export DECODE_EP_DISPATCH_ALGORITHM="static"
 
 # PP size and chunked prefill size can be configured independently
 export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size

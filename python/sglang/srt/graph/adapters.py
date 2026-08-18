@@ -288,6 +288,19 @@ def _setup_load_balance_padded_tokens_kunpeng():
     register_op('load_balance_padded_tokens_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_remap_topk_ids_to_rank_slot_kunpeng():
+    def shape_infer(topk_ids, full_buf, dispatch_map, num_physical_experts, ep_size):
+        return []
+
+    def eager_fn(topk_ids, full_buf, dispatch_map, num_physical_experts, ep_size):
+        torch.ops.sgl_kernel.remap_topk_ids_to_rank_slot_kunpeng(
+            topk_ids, full_buf, dispatch_map,
+            int(num_physical_experts), int(ep_size))
+        return None
+
+    register_op('remap_topk_ids_to_rank_slot_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_multinomial_kunpeng():
     def shape_infer(probs, num_samples, replacement):
         batch = probs.shape[0]
@@ -986,6 +999,7 @@ def setup():
     _setup_grouped_topk_kunpeng()
     _setup_grouped_topk_inplace_kunpeng()
     _setup_load_balance_padded_tokens_kunpeng()
+    _setup_remap_topk_ids_to_rank_slot_kunpeng()
     _setup_multinomial_kunpeng()
     _setup_shm_batched_allgather_kunpeng()
     _setup_shm_mla_q_alltoall_kunpeng()

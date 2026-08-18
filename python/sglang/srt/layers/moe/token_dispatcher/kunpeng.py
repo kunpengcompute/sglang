@@ -97,6 +97,12 @@ class _KunpengDispatcherState:
 
         self.topk_weights_buf: Optional[torch.Tensor] = None
         self.topk_ids_index_buf: Optional[torch.Tensor] = None
+        # Contiguous [max_tokens, router_topk] int16 SHM buffer holding the
+        # router's topk ids.  The router computes each rank's token slice
+        # into this buffer, then shm_dual_allgather merges all slices into
+        # one consistent full table; afterwards the ids are copied into the
+        # even columns of topk_ids_index_buf for the RDMA dispatcher.
+        self.topk_ids_flat_buf: Optional[torch.Tensor] = None
 
         # Size info
         self.dispatch_recv_size: int = 0
@@ -399,6 +405,9 @@ def _init_buffers(state: _KunpengDispatcherState):
     state.topk_weights_buf = kernel.create_shm_tensor_kunpeng(
         torch.float32, [state.max_tokens, state.router_topk]
     )
+    state.topk_ids_flat_buf = kernel.create_shm_tensor_kunpeng(
+        torch.int16, [state.max_tokens, state.router_topk]
+    )
     state.topk_ids_index_buf = kernel.create_shm_tensor_kunpeng(
         torch.int16, [state.max_tokens, state.router_topk * 2]
     )
@@ -555,6 +564,8 @@ class KunpengDispatcher(BaseDispatcher):
         )
 
         t_quant_and_copy_end = time.perf_counter()
+
+        kunpeng.moe_comm_barrier_kunpeng()
 
         # Dispatch send
         t_send_start = time.perf_counter()
