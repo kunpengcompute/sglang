@@ -449,11 +449,12 @@ def run_detokenizer_process(
 
             p = psutil.Process(os.getpid())
             if is_http_only():
-                # Bind CPU for HTTP-only (tokenizer) processes
+                # Router-node detokenizer. NUMA 8 (304-341) for prefill,
+                # NUMA 9 (342-379) for decode; last core of each NUMA isolated.
                 if server_args.disaggregation_mode == "prefill":
-                    p.cpu_affinity(list(range(152, 189)))
+                    p.cpu_affinity(list(range(304, 341)))
                 elif server_args.disaggregation_mode == "decode":
-                    p.cpu_affinity(list(range(190, 227)))
+                    p.cpu_affinity(list(range(342, 379)))
             else:
                 # TODO (kunpeng): hard code here, should use a more elegant way.
                 p.cpu_affinity({96})  # 20
