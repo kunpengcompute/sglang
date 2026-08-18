@@ -1,0 +1,185 @@
+From df1ee7f3a19f9a57d60f5cd032ebec6d253d48b9 Mon Sep 17 00:00:00 2001
+From: xjwei <mccllm@qq.com>
+Date: Thu, 13 Aug 2026 17:07:28 +0800
+Subject: [PATCH] [cpu] bind transfer engine threads to offset cpu of affinity
+ numa
+
+Support SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET: bind the calling thread
+to the offset-th CPU of the full CPU list of every NUMA node overlapping
+the current affinity, so the engine and the threads it spawns inherit the
+expected NUMA affinity (python-style offset, negative counts from the
+end).
+
+Do not filter the node CPU list by numa_all_cpus_ptr: that mask is
+derived from Cpus_allowed at libnuma init and shrinks to the inherited
+subset when the launcher restricts affinity (e.g. taskset -c 0, or
+psutil.cpu_affinity([0]) before import), which made the offset relative
+to the inherited cores instead of the whole NUMA node and failed with
+"no matching NUMA nodes, fallback".
+---
+ mooncake-transfer-engine/include/common.h     | 101 +++++++++++++++++-
+ .../src/transfer_engine_impl.cpp              |   6 ++
+ .../transport/tcp_transport/tcp_transport.cpp |   3 +
+ 3 files changed, 107 insertions(+), 3 deletions(-)
+
+diff --git a/mooncake-transfer-engine/include/common.h b/mooncake-transfer-engine/include/common.h
+index aa3437bf..a3387065 100644
+--- a/mooncake-transfer-engine/include/common.h
++++ b/mooncake-transfer-engine/include/common.h
+@@ -76,18 +76,113 @@ static inline std::string getHostname() {
+     return hostname;
+ }
+ 
++static inline bool cpuAffinityOffsetEnabled() {
++    const char* env = getenv("SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET");
++    return env != nullptr && env[0] != '\0';
++}
++
+ static inline int bindToSocket(int socket_id) {
+     if (unlikely(numa_available() < 0)) {
+         LOG(WARNING) << "The platform does not support NUMA";
+         return ERR_NUMA;
+     }
+-    cpu_set_t cpu_set;
+-    CPU_ZERO(&cpu_set);
+     if (socket_id < 0 || socket_id >= numa_num_configured_nodes())
+         socket_id = 0;
++
+     struct bitmask *cpu_list = numa_allocate_cpumask();
+     numa_node_to_cpus(socket_id, cpu_list);
+     int nr_possible_cpus = numa_num_possible_cpus();
++
++    const char* offset_env =
++        getenv("SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET");
++
++    if (offset_env && offset_env[0] != '\0') {
++        char* endptr = nullptr;
++        long offset_raw = std::strtol(offset_env, &endptr, 10);
++        if (endptr == offset_env || *endptr != '\0') {
++            LOG(WARNING) << "bindToSocket: invalid offset value '"
++                         << offset_env << "', fallback to full bind";
++        } else {
++            int offset = static_cast<int>(offset_raw);
++
++            // Get current thread's CPU affinity
++            cpu_set_t current_affinity;
++            CPU_ZERO(&current_affinity);
++            if (sched_getaffinity(0, sizeof(current_affinity),
++                                  &current_affinity) != 0) {
++                LOG(WARNING) << "bindToSocket: sched_getaffinity failed, "
++                             << "errno=" << errno << ", fallback to full bind";
++            } else {
++                // Find which NUMA nodes overlap with current affinity,
++                // then pick one CPU per node using Python-style offset
++                int num_nodes = numa_num_configured_nodes();
++                std::vector<int> target_cpus;
++                for (int node = 0; node < num_nodes; ++node) {
++                    struct bitmask* node_mask = numa_allocate_cpumask();
++                    numa_node_to_cpus(node, node_mask);
++
++                    std::vector<int> node_cpus;
++                    for (int cpu = 0; cpu < nr_possible_cpus; ++cpu) {
++                        if (numa_bitmask_isbitset(node_mask, cpu)) {
++                            node_cpus.push_back(cpu);
++                        }
++                    }
++                    numa_free_cpumask(node_mask);
++
++                    if (node_cpus.empty()) continue;
++
++                    // Only consider nodes that overlap with current affinity
++                    bool overlaps = false;
++                    for (int cpu : node_cpus) {
++                        if (CPU_ISSET(cpu, &current_affinity)) {
++                            overlaps = true;
++                            break;
++                        }
++                    }
++                    if (!overlaps) continue;
++
++                    int n = static_cast<int>(node_cpus.size());
++                    int idx = (offset >= 0) ? offset : n + offset;
++                    if (idx >= 0 && idx < n) {
++                        target_cpus.push_back(node_cpus[idx]);
++                    }
++                }
++
++                if (!target_cpus.empty()) {
++                    cpu_set_t cpu_set;
++                    CPU_ZERO(&cpu_set);
++                    for (int cpu : target_cpus) {
++                        CPU_SET(cpu, &cpu_set);
++                    }
++
++                    if (pthread_setaffinity_np(pthread_self(),
++                                               sizeof(cpu_set_t),
++                                               &cpu_set)) {
++                        LOG(ERROR)
++                            << "bindToSocket: pthread_setaffinity_np failed";
++                        return ERR_NUMA;
++                    }
++
++                    std::stringstream log_ss;
++                    for (size_t i = 0; i < target_cpus.size(); i++) {
++                        if (i > 0) log_ss << ",";
++                        log_ss << target_cpus[i];
++                    }
++                    LOG(INFO) << "bindToSocket: offset " << offset
++                              << " -> bound to CPUs [" << log_ss.str() << "]";
++                    return 0;
++                } else {
++                    LOG(WARNING) << "bindToSocket: offset " << offset
++                                 << ", no matching NUMA nodes, fallback";
++                }
++            }
++        }
++        // Fall through to original behavior
++    }
++
++    // Original behavior: bind to all CPUs in this NUMA node
++    cpu_set_t cpu_set;
++    CPU_ZERO(&cpu_set);
+     int nr_cpus = 0;
+     for (int cpu = 0; cpu < nr_possible_cpus; ++cpu) {
+         if (numa_bitmask_isbitset(cpu_list, cpu) &&
+@@ -742,4 +837,4 @@ class SimpleRandom {
+ };
+ }  // namespace mooncake
+ 
+-#endif  // COMMON_H
++#endif  // COMMON_H
+\ No newline at end of file
+diff --git a/mooncake-transfer-engine/src/transfer_engine_impl.cpp b/mooncake-transfer-engine/src/transfer_engine_impl.cpp
+index fc1cc2f9..2302ff1c 100644
+--- a/mooncake-transfer-engine/src/transfer_engine_impl.cpp
++++ b/mooncake-transfer-engine/src/transfer_engine_impl.cpp
+@@ -81,6 +81,12 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
+     TransferMetadata::RpcMetaDesc desc;
+     std::string rpc_binding_method;
+ 
++    // When SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET is set, bind the calling
++    // thread to the offset CPU of the current affinity NUMA nodes, so that
++    // the engine and the threads it spawns inherit the expected NUMA
++    // affinity. Without the env var keep the historical behavior.
++    if (cpuAffinityOffsetEnabled()) bindToSocket(0);
++
+     if (!setFilesLimit()) {
+         LOG(WARNING) << "Failed to set file descriptor limit. Continuing "
+                         "initialization, but this may cause issues if too many "
+diff --git a/mooncake-transfer-engine/src/transport/tcp_transport/tcp_transport.cpp b/mooncake-transfer-engine/src/transport/tcp_transport/tcp_transport.cpp
+index 9cf906a0..427462be 100644
+--- a/mooncake-transfer-engine/src/transport/tcp_transport/tcp_transport.cpp
++++ b/mooncake-transfer-engine/src/transport/tcp_transport/tcp_transport.cpp
+@@ -1069,6 +1069,9 @@ Status TcpTransport::submitTransferTask(
+ }
+ 
+ void TcpTransport::worker() {
++    // When SGLANG_SET_MOONCAKE_CPU_AFFINITY_OFFSET is set, bind this worker
++    // thread to the offset CPU of the current affinity NUMA nodes.
++    if (cpuAffinityOffsetEnabled()) bindToSocket(0);
+     while (running_) {
+         try {
+             context_->doAccept();
+-- 
+2.53.0
+
