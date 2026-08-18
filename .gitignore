@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+hostfile*
 3rdparty/
 
 # C extensions

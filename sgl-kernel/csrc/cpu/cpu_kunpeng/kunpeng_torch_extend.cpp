@@ -222,7 +222,7 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8, at::Tensor experts_w2
 
 int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info, at::Tensor src_info_bak, at::Tensor token_ids,
                              at::Tensor experts_offset, int64_t num_ranks, int64_t num_local_experts,
-                             int64_t num_max_dispatch_tokens_per_rank, bool is_prefill);
+                             int64_t num_max_dispatch_tokens_per_rank, int64_t max_tokens, bool is_prefill);
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
                                         int64_t num_experts, int64_t topk, bool force_balance,
@@ -631,7 +631,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def(
         "topk_convert_kunpeng("
         "Tensor(a!) count, Tensor src_info, Tensor src_info_bak, Tensor(b!) token_ids, Tensor(c!) experts_offset, "
-        "int num_ranks, int num_local_experts, int num_max_dispatch_tokens_per_rank, bool is_prefill) -> int");
+        "int num_ranks, int num_local_experts, int num_max_dispatch_tokens_per_rank, int max_tokens, "
+        "bool is_prefill) -> int");
     m.impl("topk_convert_kunpeng", topk_convert_kunpeng);
 
     // multinomial sampling

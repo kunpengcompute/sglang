@@ -192,8 +192,96 @@ class KunpengGraphRunner:
             if "mlp.experts" in name:
                 if _is_kunpeng_swap_expert:
                     continue
-            tensor_hbw = self.weight_hbw_pool.move_to_hbw(param)
+                tensor_hbw = self._move_expert_weights_to_hbw(name, param)
+            else:
+                tensor_hbw = self.weight_hbw_pool.move_to_hbw(param)
             param.data = tensor_hbw
+
+    def _move_expert_weights_to_hbw(
+        self, name: str, param: torch.nn.Parameter
+    ) -> torch.Tensor:
+        """Move one MoE expert weight param to HBW, dropping invalid (-1) slots.
+
+        Mirrors the reference implementation: expert weights are stored only
+        for the actual per-layer/per-rank expert count, so redundant/invalid
+        (-1) slots never occupy HBM.
+
+        Requires all valid slots to be a leading prefix ([0..k-1]) of the
+        local slot range so the router's local expert index maps 1:1 onto
+        the compressed tensor.
+        """
+        logger.info(f"moe weight {name}")
+
+        import re
+        import math
+
+
+        from sglang.srt.distributed.parallel_state import (
+            get_moe_expert_parallel_rank,
+            get_moe_expert_parallel_world_size,
+        )
+        from sglang.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+        )
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return self.weight_hbw_pool.move_to_hbw(param)
+
+        m = re.match(r"^model\.layers\.(\d+)\.mlp\.experts\.\S+$", name)
+        if m is None:
+            logger.info(f"non-moe weight {name}")
+            return self.weight_hbw_pool.move_to_hbw(param)
+
+        layer_id = int(m.group(1))
+        ep_rank = get_moe_expert_parallel_rank()
+        # Use the MOE EP world size (not metadata.ep_size, which is the global
+        # world size and differs under PP), consistent with the routing remap.
+        slots_per_rank = (
+            metadata.num_physical_experts // get_moe_expert_parallel_world_size()
+        )
+        slots = metadata.physical_to_logical_map[
+            layer_id,
+            ep_rank * slots_per_rank : (ep_rank + 1) * slots_per_rank,
+        ].tolist()
+        logger.info(
+            "[KunpengHBW] %s param_shape=%s layer_id=%d ep_rank=%d "
+            "ep_world=%d num_physical=%d slots_per_rank=%d slots=%s",
+            name, tuple(param.shape), layer_id, ep_rank,
+            get_moe_expert_parallel_world_size(), metadata.num_physical_experts,
+            slots_per_rank, slots,
+        )
+
+        valid_local = [i for i, s in enumerate(slots) if s != -1]
+        logger.info("[KunpengHBW] %s valid_local=%s", name, valid_local)
+        if len(valid_local) == len(slots):
+            # No invalid slot on this layer/rank: plain move.
+            return self.weight_hbw_pool.move_to_hbw(param)
+
+        if valid_local != list(range(len(valid_local))):
+            raise ValueError(
+                f"Kunpeng HBW: invalid expert slot in the middle of layer "
+                f"{layer_id} rank {ep_rank} slots={slots}; valid slots must "
+                f"be a leading prefix for compressed expert storage."
+            )
+
+        compressed_shape = (len(valid_local),) + tuple(param.shape[1:])
+        logger.info(
+            "[KunpengHBW] %s compressed_shape=%s numel=%d bytes=%d",
+            name,
+            compressed_shape,
+            math.prod(compressed_shape),
+            math.prod(compressed_shape) * param.dtype.itemsize,
+        )
+        hbw_tensor = self.weight_hbw_pool.alloc(compressed_shape, param.dtype)
+        hbw_tensor.copy_(param[: len(valid_local)])
+        logger.info(
+            "Kunpeng HBW: compressed %s %s -> %s",
+            name,
+            tuple(param.shape),
+            tuple(hbw_tensor.shape),
+        )
+        return hbw_tensor
 
     def init_graph_capture(self):
         """Initialize graph capture by collecting model fixed weights."""
@@ -524,11 +612,31 @@ class KunpengGraphRunner:
                 "recv_experts_offset",
                 "combined_x",
                 "topk_weights_buf",
+                "topk_ids_flat_buf",
                 "topk_ids_index_buf",
             ):
                 t = getattr(state, attr, None)
                 if t is not None:
                     fixed.append(t)
+        except Exception:
+            pass
+        # EPLB static dispatch map (logical -> physical expert per layer),
+        # consumed by remap_topk_ids_to_rank_slot_kunpeng during graph
+        # capture.  Each MoE layer reads its own `[layer_id, :]` slice view,
+        # so the FULL tensor must be registered as a fixed storage or the
+        # slice lookup fails with "non-return-value parameter tensor not
+        # registered".
+        try:
+            from sglang.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            metadata = get_global_expert_location_metadata()
+            if (
+                metadata is not None
+                and metadata.logical_to_rank_dispatch_physical_map is not None
+            ):
+                fixed.append(metadata.logical_to_rank_dispatch_physical_map)
         except Exception:
             pass
         return fixed

@@ -675,7 +675,7 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info,
                              at::Tensor token_ids,       // [recv_dense_size] int32 (output)
                              at::Tensor experts_offset,  // [num_local_experts + 1] int32 (output)
                              int64_t num_ranks, int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank,
-                             bool is_prefill)
+                             int64_t max_tokens, bool is_prefill)
 {
     TORCH_CHECK(experts_offset.size(0) == num_local_experts + 1, "experts_offset size must be num_local_experts + 1");
 
@@ -687,7 +687,6 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info,
     int32_t *experts_offset_data = experts_offset.data_ptr<int32_t>();
 
     int64_t ti = 0;
-    int64_t max_tokens = num_max_dispatch_tokens_per_rank * 16;
     if (is_prefill) {
         for (int64_t ei = 0; ei < num_local_experts; ei++) {
             experts_offset_data[ei] = ti;

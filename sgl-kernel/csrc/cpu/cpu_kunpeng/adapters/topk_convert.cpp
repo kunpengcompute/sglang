@@ -20,7 +20,7 @@
 
 int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info, at::Tensor src_info_bak, at::Tensor token_ids,
                              at::Tensor experts_offset, int64_t num_ranks, int64_t num_local_experts,
-                             int64_t num_max_dispatch_tokens_per_rank, bool is_prefill);
+                             int64_t num_max_dispatch_tokens_per_rank, int64_t max_tokens, bool is_prefill);
 
 static KernelRegistrar _r_topk_convert("topk_convert_kunpeng",
                                        make_dispatch_v<decltype(&topk_convert_kunpeng), &topk_convert_kunpeng>);

@@ -18,10 +18,25 @@
 # ------------------------------------------------------------
 # Helper: expand IP range notation "base_ip | ranges"
 # Example: "192.168.1. | 1-3,5" -> "192.168.1.1 192.168.1.2 192.168.1.3 192.168.1.5"
+# If a second argument (IP_FILE) is given and the file exists,
+# read one IP per line instead (empty lines and '#' comments are skipped).
 # ------------------------------------------------------------
 expand_ip_range() {
     local spec="$1"
+    local ip_file="$2"
     local ips=()
+
+    # If an IP file is provided, read one IP per line
+    if [[ -n "$ip_file" ]] && [[ -f "$ip_file" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line//[$'\r' ]/}"  # strip CR and spaces
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* ]] && continue
+            ips+=("$line")
+        done < "$ip_file"
+        echo "${ips[@]}"
+        return 0
+    fi
 
     # Collect all IP-base prefixes (e.g. "10.36.182.") in order
     local bases=() temp="$spec"
@@ -73,7 +88,10 @@ expand_ip_range() {
 # Configuration variables (edit these as needed)
 # ------------------------------------------------------------
 # IP range, Master address/port for prefill nodes
-PREFILL_IP_SPEC="xxx.xxx.xxx. | 1-16"
+# IP_FILE: file with one IP per line (e.g. "192.168.1.1" per line)
+# IP_SPEC: alternative range notation, e.g. "192.168.1. | 1-3,5" (used only when IP_FILE is empty)
+PREFILL_IP_SPEC=""
+PREFILL_IP_FILE=""
 PREFILL_MASTER_ADDR="xxx.xxx.xxx.1"
 PREFILL_MASTER_PORT="5000"
 
@@ -81,15 +99,18 @@ PREFILL_MASTER_PORT="5000"
 export PREFILL_BUCKET=0
 
 # Prefill long prompt instance
-PREFILL_LONG_PROMPT_IP_SPEC="xxx.xxx.xxx. | 17-32"
+PREFILL_LONG_PROMPT_IP_SPEC=""
+PREFILL_LONG_PROMPT_IP_FILE=""
 PREFILL_LONG_PROMPT_MASTER_ADDR="xxx.xxx.xxx.17"
 PREFILL_LONG_PROMPT_MASTER_PORT="5020"
 
-DECODE_IP_SPEC="xxx.xxx.xxx. | 17-32"
+DECODE_IP_SPEC=""
+DECODE_IP_FILE=""
 DECODE_MASTER_ADDR="xxx.xxx.xxx.17"
 DECODE_MASTER_PORT="5010"
 
-NATIVE_IP_SPEC="xxx.xxx.xxx. | 17-32"
+NATIVE_IP_SPEC=""
+NATIVE_IP_FILE=""
 NATIVE_MASTER_ADDR="xxx.xxx.xxx.1"
 NATIVE_MASTER_PORT="5010"
 
@@ -130,6 +151,7 @@ export EP_SIZE=${TP_SIZE}
 export PP_SIZE=1  # >1 enable pp  eg: 2
 export REDUNDANT_EXPERTS=0
 export INIT_EXPERT_LOCATION=""
+export EP_DISPATCH_ALGORITHM="static"  # e.g. static, dynamic
 
 # Prefill TP/EP/PP size
 export PREFILL_TP_SIZE=${TP_SIZE}
@@ -138,6 +160,7 @@ export PREFILL_EP_SIZE=${PREFILL_TP_SIZE}
 export PREFILL_PP_SIZE=${PP_SIZE}
 export PREFILL_REDUNDANT_EXPERTS=0
 export PREFILL_INIT_EXPERT_LOCATION=""
+export PREFILL_EP_DISPATCH_ALGORITHM="static"
 
 # Decode TP/EP/PP size
 export DECODE_TP_SIZE=${TP_SIZE}
@@ -146,6 +169,7 @@ export DECODE_EP_SIZE=${DECODE_TP_SIZE}
 export DECODE_PP_SIZE=${PP_SIZE}
 export DECODE_REDUNDANT_EXPERTS=0
 export DECODE_INIT_EXPERT_LOCATION=""
+export DECODE_EP_DISPATCH_ALGORITHM="static"
 
 # PP size and chunked prefill size can be configured independently
 export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size
@@ -246,7 +270,8 @@ fi
 _export_node_config() {
     local prefix="$1"
     local _var
-    _var="${prefix}_IP_SPEC";     NODE_IPS=($(expand_ip_range "${!_var}"))
+    _var="${prefix}_IP_FILE"; local _ip_file="${!_var:-}"
+    _var="${prefix}_IP_SPEC"; NODE_IPS=($(expand_ip_range "${!_var}" "$_ip_file"))
     _var="${prefix}_MASTER_ADDR"; export MASTER_ADDR="${!_var}"
     _var="${prefix}_MASTER_PORT"; export MASTER_PORT="${!_var}"
     export WORLD_SIZE=${#NODE_IPS[@]}
@@ -262,6 +287,7 @@ _export_pd_vars() {
     _var="${prefix}_PP_SIZE";    export PP_SIZE="${!_var}"
     _var="${prefix}_REDUNDANT_EXPERTS"; export REDUNDANT_EXPERTS="${!_var}"
     _var="${prefix}_INIT_EXPERT_LOCATION"; export INIT_EXPERT_LOCATION="${!_var}"
+    _var="${prefix}_EP_DISPATCH_ALGORITHM"; export EP_DISPATCH_ALGORITHM="${!_var}"
     _var="MODEL_PATH_${prefix}"; export MODEL_PATH="${!_var}"
     _var="SPECULATIVE_DRAFT_MODEL_PATH_${prefix}"; export SPECULATIVE_DRAFT_MODEL_PATH="${!_var}"
 }

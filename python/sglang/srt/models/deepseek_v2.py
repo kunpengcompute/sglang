@@ -447,10 +447,14 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
 
-        if self.tp_size > config.n_routed_experts:
+        num_experts_for_tp_check = (
+            config.n_routed_experts
+            + get_global_server_args().ep_num_redundant_experts
+        )
+        if self.tp_size > num_experts_for_tp_check:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.n_routed_experts}."
+                f"the number of experts {num_experts_for_tp_check}."
             )
 
         if config.hidden_act != "silu":
