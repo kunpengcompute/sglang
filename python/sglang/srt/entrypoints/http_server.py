@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -146,6 +147,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
+    get_tokenizer_worker_cpusets,
     monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
@@ -240,50 +242,59 @@ async def init_multi_tokenizer() -> ServerArgs:
     Initialization function for multi-process tokenizer mode.
     It read args information from shm and inits tokenizer manager for current process.
     """
-
-    # Read configuration from shared memory
     main_pid = get_main_process_id()
-    port_args, server_args, scheduler_info = read_from_shared_memory(
-        f"multi_tokenizer_args_{main_pid}"
-    )
-    server_args: ServerArgs
-    port_args: PortArgs
-
-    # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        server_args.api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
-
-    # Create a new ipc name for the current process
-    port_args.tokenizer_ipc_name = (
-        f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-    )
-    logger.info(
-        f"Start multi-tokenizer worker process {os.getpid()}, "
-        f"ipc_name={port_args.tokenizer_ipc_name}"
-    )
-
-    # Launch multi-tokenizer manager process
-    tokenizer_manager = TokenizerWorker(server_args, port_args)
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
-    )
-
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-
-    set_global_state(
-        _GlobalState(
-            tokenizer_manager=tokenizer_manager,
-            template_manager=template_manager,
-            scheduler_info=scheduler_info,
+    try:
+        # Read configuration from shared memory
+        port_args, server_args, scheduler_info = read_from_shared_memory(
+            f"multi_tokenizer_args_{main_pid}"
         )
-    )
+        server_args: ServerArgs
+        port_args: PortArgs
 
-    return server_args
+        # API key authentication is not supported in multi-tokenizer mode
+        assert (
+            server_args.api_key is None
+        ), "API key is not supported in multi-tokenizer mode"
+
+        # Create a new ipc name for the current process
+        port_args.tokenizer_ipc_name = (
+            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        )
+        logger.info(
+            f"Start multi-tokenizer worker process {os.getpid()}, "
+            f"ipc_name={port_args.tokenizer_ipc_name}, "
+            f"send_to_router={port_args.tokenizer_worker_ipc_name}"
+        )
+
+        # Launch multi-tokenizer manager process
+        tokenizer_manager = TokenizerWorker(server_args, port_args)
+        template_manager = TemplateManager()
+        template_manager.initialize_templates(
+            tokenizer_manager=tokenizer_manager,
+            model_path=server_args.model_path,
+            chat_template=server_args.chat_template,
+            completion_template=server_args.completion_template,
+        )
+
+        tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
+        set_global_state(
+            _GlobalState(
+                tokenizer_manager=tokenizer_manager,
+                template_manager=template_manager,
+                scheduler_info=scheduler_info,
+            )
+        )
+        return server_args
+    except Exception:
+        logger.error(
+            f"[init_multi_tokenizer] Worker {os.getpid()} (parent={main_pid}) "
+            f"initialization FAILED, traceback:\n{get_exception_traceback()}"
+        )
+        # Keep the process alive briefly so the traceback is flushed to the log
+        # before uvicorn's supervisor reports this child as dead.
+        time.sleep(30)
+        sys.exit(1)
 
 
 @asynccontextmanager
@@ -2300,9 +2311,19 @@ def _setup_and_run_http_server(
                     )
             else:
                 # Multiple tokenizer and http processes
+                logger.info(
+                    f"Launching {server_args.tokenizer_worker_num} tokenizer "
+                    f"HTTP workers (uvicorn workers) on "
+                    f"{server_args.host}:{server_args.port} ..."
+                )
                 from uvicorn.config import LOGGING_CONFIG
 
                 LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
+                    "handlers": ["default"],
+                    "level": "INFO",
+                    "propagate": False,
+                }
+                LOGGING_CONFIG["loggers"]["sglang.srt.managers.multi_tokenizer_mixin"] = {
                     "handlers": ["default"],
                     "level": "INFO",
                     "propagate": False,
@@ -2334,7 +2355,11 @@ def _setup_and_run_http_server(
             if server_args.tokenizer_worker_num > 1:
                 if multi_tokenizer_args_shm is not None:
                     multi_tokenizer_args_shm.unlink()
-                if _global_state is not None:
+                if (
+                    _global_state is not None
+                    and _global_state.tokenizer_manager is not None
+                    and hasattr(_global_state.tokenizer_manager, "socket_mapping")
+                ):
                     _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
@@ -2368,11 +2393,20 @@ def launch_server(
     import psutil
 
     if is_http_only():
+        # Router-node tokenizer HTTP server. Each NUMA has 38 cores, the last
+        # core of each NUMA is isolated and must not be used. The parent binds
+        # the union of the NUMA nodes its workers will use (computed from the
+        # actual tokenizer_worker_num); each spawn'd worker later narrows down
+        # to its own single NUMA in TokenizerWorker.
         p = psutil.Process(os.getpid())
-        if server_args.disaggregation_mode == "decode":
-            p.cpu_affinity(list(range(76, 113)) + list(range(114, 151)))
-        else:
-            p.cpu_affinity(list(range(0, 37)) + list(range(38, 75)))
+        affinity = [
+            cpu for cpuset in get_tokenizer_worker_cpusets(server_args) for cpu in cpuset
+        ]
+        p.cpu_affinity(affinity)
+        logger.info(
+            f"[pp-affinity] http-only {server_args.disaggregation_mode} "
+            f"cpus={p.cpu_affinity()}"
+        )
     elif envs.SGLANG_SET_CPU_AFFINITY.get() and envs.SGLANG_USE_CPU_920F.get():
         p = psutil.Process(os.getpid())
         # TODO (kunpeng): hard code here, should use a more elegant way.

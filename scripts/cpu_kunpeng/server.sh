@@ -174,6 +174,7 @@ case "$ROLE" in
             --nnodes 1 --node-rank 0 --dist-timeout 600
             --tp-size 1
             --max-total-tokens 64
+            --tokenizer-worker-num "$TOKENIZER_WORKER_NUM"
             --skip-server-warmup
         )
         ;;
@@ -210,13 +211,17 @@ if [[ "$ROLE" == "router" ]]; then
 
         # Poll until both HTTP servers are ready (up to 2 minutes each)
         for port in 30001 30002; do
-            echo "Waiting for HTTP server on port $port..."
-            for i in $(seq 1 60); do
-                ss -tlnp 2>/dev/null | grep -q ":$port " && break
+            echo "Waiting for HTTP server on port $port to be ready..."
+            ready=0
+            for i in $(seq 1 900); do  # up to 30 minutes
+                if curl -sf --max-time 2 "http://${ROUTER_IP}:${port}/health" >/dev/null 2>&1; then
+                    ready=1
+                    break
+                fi
                 sleep 2
             done
-            ss -tlnp 2>/dev/null | grep -q ":$port " || {
-                echo "ERROR: HTTP server on port $port failed to start within 120 seconds"
+            [[ "$ready" -eq 1 ]] || {
+                echo "ERROR: HTTP server on port $port not ready within 30 minutes" >&2
                 exit 1
             }
             echo "HTTP server on port $port ready"
@@ -225,7 +230,17 @@ if [[ "$ROLE" == "router" ]]; then
     
     # Launch sgl-model-gateway (Rust router) ----
     echo "Launching PD disaggregation router..."
-    taskset -c 228 sgl-model-gateway "${SPECIFIC_ARGS[@]}" \
+    # Prefer the absolute path from .user_env.sh (MODEL_GATEWAY_BIN);
+    # fall back to the bare command name if the variable is not set.
+    GATEWAY_BIN="${MODEL_GATEWAY_BIN:-sgl-model-gateway}"
+    if [[ ! -x "$GATEWAY_BIN" ]] && ! command -v "$GATEWAY_BIN" >/dev/null 2>&1; then
+        echo "ERROR: sgl-model-gateway not found (MODEL_GATEWAY_BIN=${MODEL_GATEWAY_BIN:-<unset>})" >&2
+        exit 1
+    fi
+    # Bind gateway to a dedicated core (NUMA 10, first core) so it does not
+    # collide with the tokenizer workers (decode tokenizer now owns NUMA 4-7,
+    # i.e. cores 152-303; detokenizer owns NUMA 8-9, i.e. 304-379).
+    taskset -c 380 "$GATEWAY_BIN" "${SPECIFIC_ARGS[@]}" \
         > "$LOG_PATH/router_$IP.log" 2>&1 &
 
     exit 0

@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import is_http_only
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 from sglang.utils import get_exception_traceback
@@ -324,15 +325,30 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
+        logger.info(
+            f"[MultiTokenizer] Router started pid={os.getpid()} "
+            f"tokenizer_worker_num={server_args.tokenizer_worker_num} "
+            f"recv_worker={port_args.tokenizer_worker_ipc_name} "
+            f"send_scheduler={port_args.scheduler_input_ipc_name}"
+        )
         context = zmq_context_core_binding(
             zmq.asyncio.Context(3), ZmqOffset.MULTI_TOKENIZER_ROUTER
         )
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-        )
+        if is_http_only():
+            # Tokenizer-separate mode: the scheduler (DP controller) runs on a
+            # remote node and binds scheduler_input_ipc_name, so this router
+            # must connect to it instead of binding.
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, False
+            )
+            logger.info(f"[MultiTokenizer] TokenizerRouter connected to scheduler at {port_args.scheduler_input_ipc_name}")
+        else:
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
         self.receive_from_worker = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_worker_ipc_name, True
         )
@@ -386,25 +402,44 @@ class TokenizerWorker(TokenizerManager):
         port_args: PortArgs,
     ):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
+        # Each spawn'd worker binds to its own NUMA node in tokenizer-separate
+        # mode. Do this before TokenizerManager init so threads are created on
+        # the right cores.
+        bind_tokenizer_worker_cpu(server_args)
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
         server_args.disaggregation_mode = "null"
-        super().__init__(server_args, port_args)
+        try:
+            super().__init__(server_args, port_args)
 
-        self.worker_id = os.getpid()
-        self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
+            self.worker_id = os.getpid()
+            self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
-        # For PD disaggregtion
-        self.server_args.disaggregation_mode = disaggregation_mode
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
-        self.disaggregation_transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
-        # Communicator
-        self.register_multi_tokenizer_communicator = FanOutCommunicator(
-            self.send_to_scheduler, 2
+            # For PD disaggregtion
+            self.server_args.disaggregation_mode = disaggregation_mode
+            self.disaggregation_mode = DisaggregationMode(
+                self.server_args.disaggregation_mode
+            )
+            self.disaggregation_transfer_backend = TransferBackend(
+                self.server_args.disaggregation_transfer_backend
+            )
+            # Communicator
+            self.register_multi_tokenizer_communicator = FanOutCommunicator(
+                self.send_to_scheduler, 2
+            )
+        except Exception:
+            logger.error(
+                f"[TokenizerWorker] pid={os.getpid()} TokenizerManager init FAILED, "
+                f"traceback:\n{get_exception_traceback()}"
+            )
+            import time
+
+            time.sleep(30)
+            sys.exit(1)
+        logger.info(
+            f"[MultiTokenizer] TokenizerWorker started pid={os.getpid()} "
+            f"ipc={self.tokenizer_ipc_name} "
+            f"send_to_router={port_args.tokenizer_worker_ipc_name}"
         )
 
     def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
@@ -477,36 +512,172 @@ def read_from_shared_memory(name: str) -> Any:
         shm.close()
         return data
     except FileNotFoundError:
+        import glob
+        import tempfile
+
+        candidates = []
+        for base_dir in ("/dev/shm", tempfile.gettempdir()):
+            candidates.extend(
+                glob.glob(os.path.join(base_dir, "multi_tokenizer_args_*"))
+            )
+        logger.error(
+            f"[read_from_shared_memory] {name} not found! current pid={os.getpid()}, "
+            f"existing multi_tokenizer_args files="
+            f"{[os.path.basename(p) for p in candidates]}"
+        )
         raise FileNotFoundError(f"Shared memory {name} not found")
+
+
+def get_tokenizer_worker_cpusets(server_args: ServerArgs) -> "list[list[int]]":
+    """Per-worker CPU sets for the tokenizer HTTP server.
+
+    Layout (920F, each NUMA has 38 cores, the last core of each NUMA is
+    isolated and must not be used):
+      - prefill tokenizer workers: NUMA 0-3  -> cores 0-36, 38-74, 76-112, 114-150
+      - decode  tokenizer workers: NUMA 4-7  -> cores 152-188, 190-226, 228-264, 266-302
+    Only the first `tokenizer_worker_num` NUMA nodes are used, capped at 4:
+    NUMA 8-9 are reserved for the detokenizers, so more than 4 workers per
+    server would overlap them.
+    """
+    n = server_args.tokenizer_worker_num
+    if n > 4:
+        logger.warning(
+            f"[MultiTokenizer] tokenizer_worker_num={n} > 4, capping per-server "
+            f"worker cpusets to 4 (NUMA 0-7 are the only tokenizer NUMA nodes)."
+        )
+        n = 4
+    base_numa = 4 if server_args.disaggregation_mode == "decode" else 0
+    return [
+        list(range((base_numa + i) * 38, (base_numa + i) * 38 + 37))
+        for i in range(n)
+    ]
+
+
+def _create_worker_counter_shm(current_pid: int):
+    """Create (or reset) the 8-byte worker-claim counter shared memory."""
+    name = f"multi_tokenizer_worker_counter_{current_pid}"
+    try:
+        shm = shared_memory.SharedMemory(name=name)
+        shm.unlink()
+        shm.close()
+    except FileNotFoundError:
+        pass
+    shm = shared_memory.SharedMemory(create=True, size=8, name=name)
+    shm.buf[:8] = (0).to_bytes(8, "little")
+    shm.close()
+
+
+def write_worker_plan(server_args: ServerArgs, current_pid: int):
+    """Write per-worker NUMA binding plan and claim counter to shared memory."""
+    cpusets = get_tokenizer_worker_cpusets(server_args)
+    plan_shm = write_to_shared_memory(
+        {"cpusets": cpusets}, f"multi_tokenizer_worker_plan_{current_pid}"
+    )
+    plan_shm.close()
+    _create_worker_counter_shm(current_pid)
+
+
+def claim_worker_index(main_pid: int) -> int:
+    """Atomically claim the next worker index (0..N-1) across spawn workers."""
+    import fcntl
+
+    counter_name = f"multi_tokenizer_worker_counter_{main_pid}"
+    lock_path = f"/tmp/sgl_multi_tokenizer_worker_lock_{main_pid}"
+    with open(lock_path, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            shm = shared_memory.SharedMemory(name=counter_name)
+            idx = int.from_bytes(shm.buf[:8], "little")
+            shm.buf[:8] = (idx + 1).to_bytes(8, "little")
+            shm.close()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    return idx
+
+
+def bind_tokenizer_worker_cpu(server_args: ServerArgs):
+    """Bind the current tokenizer worker process to its dedicated NUMA node."""
+    if not (is_http_only() and server_args.tokenizer_worker_num > 1):
+        return
+    try:
+        main_pid = get_main_process_id()
+        plan = read_from_shared_memory(f"multi_tokenizer_worker_plan_{main_pid}")
+        cpusets = plan["cpusets"]
+        idx = claim_worker_index(main_pid)
+        if idx >= len(cpusets):
+            # A worker was restarted by uvicorn's supervisor: the counter only
+            # increases, so a restarted worker would claim an out-of-range idx.
+            # Reuse (idx % len) so it still gets a valid NUMA instead of none.
+            logger.warning(
+                f"[MultiTokenizer] worker idx={idx} >= cpusets={len(cpusets)} "
+                f"(worker restarted?), reusing idx={idx % len(cpusets)}"
+            )
+            idx = idx % len(cpusets)
+        cpuset = cpusets[idx]
+        os.sched_setaffinity(0, cpuset)
+        logger.info(f"[MultiTokenizer] worker idx={idx} bound to cpus={cpuset}")
+    except Exception:
+        logger.error(
+            f"[MultiTokenizer] worker cpu binding FAILED pid={os.getpid()} "
+            f"traceback:\n{get_exception_traceback()}"
+        )
 
 
 def write_data_for_multi_tokenizer(
     port_args: PortArgs, server_args: ServerArgs, scheduler_info: Dict
 ):
-    """Write args information to share memory for multi-tokenizer"""
-    # get main process ID
-    main_pid = get_main_process_id()
+    """Write args + per-worker NUMA plan to shared memory for multi-tokenizer."""
     current_pid = os.getpid()
-    logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
+    logger.info(
+        f"main process ID: {get_main_process_id()}, current process ID: {current_pid}"
+    )
     args = (port_args, server_args, scheduler_info)
     args_shm = write_to_shared_memory(args, f"multi_tokenizer_args_{current_pid}")
     args_shm.close()
 
+    if server_args.tokenizer_worker_num > 1:
+        write_worker_plan(server_args, current_pid)
+        logger.info(
+            f"[write_data_for_multi_tokenizer] worker_plan written for "
+            f"{server_args.tokenizer_worker_num} workers "
+            f"(mode={server_args.disaggregation_mode})"
+        )
+
+    logger.info(
+        f"[write_data_for_multi_tokenizer] wrote shared memory "
+        f"name=multi_tokenizer_args_{current_pid} size={args_shm.size} "
+        f"tokenizer_worker_ipc_name={port_args.tokenizer_worker_ipc_name} "
+        f"scheduler_input_ipc_name={port_args.scheduler_input_ipc_name} "
+        f"tokenizer_ipc_name={port_args.tokenizer_ipc_name}"
+    )
+
     return args_shm
 
 
-def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
-    """Monkey patch uvicorn multiprocessing is_alive timeout"""
-    # from default 5s -> 10s
+def monkey_patch_uvicorn_multiprocessing(timeout: float = 600):
+    """Force a long uvicorn healthcheck ping timeout.
+
+    Multi-tokenizer workers are spawn'd (uvicorn 0.40 uses spawn), so each one
+    imports the full sglang stack + native libs from scratch before it can
+    answer uvicorn's healthcheck ping. The default 5s
+    (timeout_worker_healthcheck) makes uvicorn SIGKILL the still-initializing
+    worker as "hung"; we ignore the passed timeout and use our own long value.
+    """
+    _ping_timeout = timeout
     try:
         from uvicorn.supervisors.multiprocess import Process
 
-        Process.is_alive = partialmethod(Process.is_alive, timeout=timeout)
+        _orig_is_alive = Process.is_alive
 
+        def _is_alive_with_timeout(self, timeout=None):
+            # uvicorn 0.40 passes timeout=timeout_worker_healthcheck (5s)
+            # explicitly by keyword; ignore it and force our long value.
+            return _orig_is_alive(self, timeout=_ping_timeout)
+
+        _is_alive_with_timeout._sgl_is_alive_patched = True
+        Process.is_alive = _is_alive_with_timeout
     except ImportError:
-        logger.warning(
-            "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
-        )
+        pass
 
 
 class SenderWrapper:

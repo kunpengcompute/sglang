@@ -7411,12 +7411,13 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
+            tokenizer_worker_port = port_base + 4
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
-                scheduler_input_port = port_base + 4
+                scheduler_input_port = port_base + 5
             else:
                 if _is_kunpeng_binary_launch and server_args.tp_rank_in_node % _kunpeng_ranks_per_dp >= 1:
-                    scheduler_input_port = port_base + 4 + 1 + dp_rank
+                    scheduler_input_port = port_base + 5 + 1 + dp_rank
                 else:
                     assert worker_ports is not None
                     scheduler_input_port = worker_ports[dp_rank]
@@ -7455,7 +7456,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
-                tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                tokenizer_worker_ipc_name=NetworkAddress(http_host, tokenizer_worker_port).to_tcp(),
             )
 
 
