@@ -581,7 +581,18 @@ class Envs:
     SGLANG_KUNPENG_ENABLE_SHM_FENCE = EnvBool(False)
     SGLANG_KUNPENG_RDMA_BCAST = EnvBool(False)
     SGLANG_ENABLE_KUCCL = EnvBool(False)
-
+    # Tokenizer-side cross-process batch timeline (scheduler -> detokenizer ->
+    # router -> tokenizer worker), used to locate pipeline latency. When
+    # enabled, each BatchTokenIDOutput carries wall-clock timestamps and the
+    # tokenizer worker appends one JSON line per batch to the log file.
+    SGLANG_TOKENIZER_TIMELINE_LOG = EnvBool(False)
+    SGLANG_TOKENIZER_TIMELINE_PATH = EnvStr(
+        ""
+    )  # empty = /tmp/sglang_tokenizer_timeline_{pid}.jsonl
+    # Retry the bootstrap-server route query on transient failures (timeout /
+    # non-200). A single failed fetch kills the request on every rank of the
+    # TP group, so retries are on by default.
+    SGLANG_DISAGG_BOOTSTRAP_RETRY = EnvBool(True)
 
 envs = Envs()
 EnvField._allow_set_name = False
