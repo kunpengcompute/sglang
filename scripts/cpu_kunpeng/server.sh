@@ -70,7 +70,12 @@ BASE_ARGS=(
 # Add redundant experts only when enabled (REDUNDANT_EXPERTS > 0)
 if [[ "${REDUNDANT_EXPERTS:-0}" -gt 0 ]]; then
     BASE_ARGS+=(--ep-num-redundant-experts "$REDUNDANT_EXPERTS")
-    BASE_ARGS+=(--ep-dispatch-algorithm static)
+fi
+
+# Redundant experts require a dispatch algorithm; default to static
+# when EP_DISPATCH_ALGORITHM is not set.
+if [[ -n "${EP_DISPATCH_ALGORITHM:-}" ]] || [[ "${REDUNDANT_EXPERTS:-0}" -gt 0 ]]; then
+    BASE_ARGS+=(--ep-dispatch-algorithm "${EP_DISPATCH_ALGORITHM:-static}")
 fi
 
 # Pass expert-location mapping file (JSON/PT) to --init-expert-location when set

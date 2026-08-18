@@ -1683,6 +1683,17 @@ class KunpengStateLoader(BaseModelLoader):
                     metadata.physical_to_logical_map[layer_id, global_phys].item()
                 )
 
+                # Invalid (-1) slots are never routed to, so their weights are
+                # not loaded. This is what lets the deployment skip storing
+                # expert weights for redundant/invalid slots.
+                if logical_id == -1:
+                    logger.info(
+                        "KunpengStateLoader: layer %d slot %d is invalid (-1), skipping",
+                        layer_id,
+                        global_phys,
+                    )
+                    continue
+
                 filepath = os.path.join(layer_dir, f"expert_{logical_id}.safetensors")
                 if not os.path.isfile(filepath):
                     raise RuntimeError(f"Cannot find expert weight file `{filepath}`")

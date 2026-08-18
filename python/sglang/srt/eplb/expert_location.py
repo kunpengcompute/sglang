@@ -385,6 +385,8 @@ def _compute_logical_to_all_physical_map(
             logical_expert_id = physical_to_logical_map[
                 layer_id, physical_expert_id
             ].item()
+            if logical_expert_id == -1:
+                continue
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )
