@@ -751,7 +751,8 @@ class KunpengGraphRunner:
         t0 = time.time()
         outputs = graph.run(inputs)
         t1 = time.time()
-        logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
+        if os.environ.get("SGLANG_KUNPENG_PP_PROFILE", "0") == "0":
+            logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")   
 
         if _is_kunpeng_graph_profile:
             from sglang.srt.graph.profile import write_profile

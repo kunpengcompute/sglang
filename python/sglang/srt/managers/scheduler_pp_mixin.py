@@ -24,6 +24,12 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import (
+    Kunpeng_PP_Profiler,
+    pp_perf_affinity,
+    pp_perf_report,
+    pp_perf_start,
+)
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -38,7 +44,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_bool_env_var, get_device_module, is_xpu, is_cpu_920f
+from sglang.srt.utils.common import get_bool_env_var, get_device_module, is_xpu, is_cpu_920f, is_shm_available
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +373,8 @@ class SchedulerPPMixin:
         send_consensus_prealloc_work = []
         send_release_work = []
 
+        pp_perf_affinity("scheduler main thread")
+
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -382,13 +390,15 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
+                pp_perf_start(f"mb{mb_id}", tag=f"pp{self.pp_group.rank_in_group}")
+                # ① recv_requests / proc_input (decorated methods)
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                # reaching consensus through PP ranks
+                # ② PD consensus (retract / prealloc / transfer)
                 retract_rids = self._pp_pd_get_retract_ids(mb_id)
                 rmbs[mb_id] = retract_rids
                 self._pp_commit_comm_work(send_retract_work)
@@ -401,7 +411,7 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
 
-                # get batch to run and proxy tensors if needed
+                # ③ get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
                 if self._pp_mtp_enabled:
                     # PP+MTP (disaggregated decode): the decode batch is
@@ -418,9 +428,10 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if not self.cur_batch.forward_mode.is_prebuilt():
+                        # ④ recv proxy (PP1)
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                # early send output if possible
+                # ⑤ early send output if possible (async depth > 0)
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -430,6 +441,7 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
 
+                # ⑥ model execution
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -438,6 +450,7 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
+                # ⑤ early send output (async depth == 0)
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -446,8 +459,7 @@ class SchedulerPPMixin:
                         )
                     )
 
-                # reach consensus on last rank and send to PP=0
-                # otherwise, just pass along previous consensus
+                # ⑦ reach consensus on last rank and send to PP=0
                 send_consensus_retract_work, consensus_retract_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         rmbs,
@@ -475,6 +487,7 @@ class SchedulerPPMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
+                # ⑧ consensus sync: recv from prev stage + local processing
                 if rmbs[next_mb_id] is not None:
                     next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
                     next_consensus_retract_rids = self.process_retract_queue(
@@ -496,7 +509,7 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(send_release_work)
 
-                # post-process the coming microbatch
+                # ⑨ post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
                         if not _is_cpu_920f:
@@ -507,6 +520,8 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
+                # ⑩ mb tail: batch completion bookkeeping + transition to the
+                # next micro-batch iteration (spans send_pyobj / send_proxy).
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -537,6 +552,17 @@ class SchedulerPPMixin:
                 consensus_prealloc_rids = next_consensus_prealloc_rids
 
                 self.running_batch.batch_is_full = False
+
+                # Print whenever this iteration does real work: a local batch to
+                # run (cur_batch) or post-processing an incoming micro-batch's
+                # results (mbs[next_mb_id] is not None, e.g. PP0's mb0 consuming
+                # PP1's mb1 output in process_batch_result).
+                pp_perf_report(
+                    print_report=(
+                        self.cur_batch is not None
+                        or self.mbs[next_mb_id] is not None
+                    )
+                )
 
             # When the server is idle, self-check and re-init some states
             queue_size = (
@@ -856,6 +882,7 @@ class SchedulerPPMixin:
             )
         return transferred_rids
 
+    @Kunpeng_PP_Profiler(depth=1, name="send_consensus")
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
         bmbs: List[List[str]],
@@ -981,6 +1008,7 @@ class SchedulerPPMixin:
                 )
         return p2p_work
 
+    @Kunpeng_PP_Profiler(depth=1, name="recv_pyobj")
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             if self.pp_group.kunpeng_pp_communicator is not None:
@@ -1347,6 +1375,7 @@ class SchedulerPPMixin:
                     )
         return send_output_work
 
+    @Kunpeng_PP_Profiler(depth=2, name="send_res")
     def _pp_send_recv_and_preprocess_output_tensors(
         self: Scheduler,
         next_first_rank_mb_id: int,
@@ -1417,6 +1446,7 @@ class SchedulerPPMixin:
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
+    @Kunpeng_PP_Profiler(depth=2, name="launch_batch")
     def _pp_launch_batch(
         self: Scheduler,
         mb_id: int,
@@ -1662,6 +1692,7 @@ class SchedulerPPMixin:
             )
         return tuple(rids) if len(rids) > 1 else rids[0]
 
+    @Kunpeng_PP_Profiler(depth=1, name="pd_retract")
     def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int):
         # communicate pre-consensus retracted reqs
         for req in self.disagg_decode_prealloc_queue.retracted_queue:
@@ -1681,6 +1712,7 @@ class SchedulerPPMixin:
             prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
             return list(set(prev_retract_rids) & set(curr_retract_rids))
 
+    @Kunpeng_PP_Profiler(depth=1, name="pd_prealloc")
     def _pp_pd_get_prealloc_ids(self: Scheduler):
         # communicate pre-consensus prealloc reqs
         if self.pp_group.is_first_rank:
@@ -1709,6 +1741,7 @@ class SchedulerPPMixin:
             )
         return [good_prealloc_rids, bad_prealloc_rids]
 
+    @Kunpeng_PP_Profiler(depth=1, name="pd_transfer")
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
@@ -1765,6 +1798,7 @@ class SchedulerPPMixin:
             ]
         return None
 
+    @Kunpeng_PP_Profiler(depth=1)
     def process_decode_transfer_queue(
         self: Scheduler, release_rids: Optional[List[str]]
     ):
