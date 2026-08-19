@@ -19,6 +19,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -201,16 +202,22 @@ void flash_attention_with_workspace(at::Tensor q, at::Tensor k, at::Tensor v, at
                                     at::Tensor key_start_loc, int64_t chunked_prefill_size,
                                     std::vector<int64_t> seq_lens, std::vector<int64_t> cur_lens)
 {
-    constexpr int64_t MAX_SEQ_LEN_SUPPORTED = 2048;
+    // Max total KV length (prefix + extend) from SGLANG_KUNPENG_MAX_SEQ_LEN.
+    const char* max_len_env = std::getenv("SGLANG_KUNPENG_MAX_SEQ_LEN");
+    const int64_t MAX_SEQ_LEN_SUPPORTED =
+        max_len_env ? std::strtoll(max_len_env, nullptr, 10) : 4096;
     auto [BR, BC] = kutacc::get_flash_attention_block();
 
     int64_t qk_head_dim = q.size(2);
     int64_t vo_head_dim = v.size(2);
 
-    // PARAMETER_CHECK (matching sample L95-98)
-    for (auto x : cur_lens) {
-        TORCH_CHECK(x <= MAX_SEQ_LEN_SUPPORTED, "cur_lens must be <= ", MAX_SEQ_LEN_SUPPORTED,
+    // Size the pack buffers to the max total seq_len (rounded to the BC tile)
+    // and guard against overflow, which would silently corrupt memory.
+    int64_t pack_len = 0;
+    for (auto x : seq_lens) {
+        TORCH_CHECK(x <= MAX_SEQ_LEN_SUPPORTED, "seq_lens must be <= ", MAX_SEQ_LEN_SUPPORTED,
                     " (MAX_SEQ_LEN_SUPPORTED), got ", x);
+        pack_len = std::max(pack_len, (x + BC - 1) / BC * BC);
     }
 
     auto threads_num = kutacc::get_thread_num();
@@ -237,8 +244,8 @@ void flash_attention_with_workspace(at::Tensor q, at::Tensor k, at::Tensor v, at
         return t;
     };
 
-    auto pack_attn_k = alloc(dtype, {threads_num, MAX_SEQ_LEN_SUPPORTED, qk_head_dim});
-    auto pack_attn_v = alloc(dtype, {threads_num, MAX_SEQ_LEN_SUPPORTED, vo_head_dim});
+    auto pack_attn_k = alloc(dtype, {threads_num, pack_len, qk_head_dim});
+    auto pack_attn_v = alloc(dtype, {threads_num, pack_len, vo_head_dim});
     auto pack_attn_q = alloc(dtype, {threads_num, BR * qk_head_dim});
     auto attn_s = alloc(f32, {threads_num, BC * BR});
     auto attn_out_block_old = alloc(f32, {threads_num, BR, vo_head_dim});
@@ -272,7 +279,9 @@ void flash_attention_paged_kunpeng(
     int64_t qk_rope_head_dim, int64_t v_head_dim,
     bool causal, double softmax_scale)
 {
-    constexpr int64_t MAX_SEQ_LEN_SUPPORTED = 2048;
+    const char* max_len_env = std::getenv("SGLANG_KUNPENG_MAX_SEQ_LEN");
+    const int64_t MAX_SEQ_LEN_SUPPORTED =
+        max_len_env ? std::strtoll(max_len_env, nullptr, 10) : 4096;
     auto [BR, BC] = kutacc::get_flash_attention_block();
 
     int64_t num_heads = q.size(1);
@@ -373,9 +382,17 @@ void flash_attention_paged_kunpeng(
         cur_lens_vec[i] = cl_a[i];
     }
 
+    // seq_lens = total KV length (prefix + extend). Size the pack buffers to
+    // the max total seq_len (rounded to the BC tile) and guard against
+    // overflow, which would otherwise silently corrupt memory (garbled output).
     int64_t max_total_len = 0;
-    for (auto x : seq_lens_vec)
+    int64_t pack_len = 0;
+    for (auto x : seq_lens_vec) {
         max_total_len = std::max(max_total_len, x);
+        TORCH_CHECK(x <= MAX_SEQ_LEN_SUPPORTED, "seq_lens must be <= ", MAX_SEQ_LEN_SUPPORTED,
+                    " (MAX_SEQ_LEN_SUPPORTED), got ", x);
+        pack_len = std::max(pack_len, (x + BC - 1) / BC * BC);
+    }
 
     auto dtype = q.scalar_type();
     auto f32 = at::kFloat;
@@ -397,8 +414,8 @@ void flash_attention_paged_kunpeng(
         return t;
     };
 
-    auto pack_attn_k = alloc(dtype, {threads_num, MAX_SEQ_LEN_SUPPORTED, qk_head_dim});
-    auto pack_attn_v = alloc(dtype, {threads_num, MAX_SEQ_LEN_SUPPORTED, vo_head_dim});
+    auto pack_attn_k = alloc(dtype, {threads_num, pack_len, qk_head_dim});
+    auto pack_attn_v = alloc(dtype, {threads_num, pack_len, vo_head_dim});
     auto pack_attn_q = alloc(dtype, {threads_num, BR * qk_head_dim});
     auto attn_s = alloc(f32, {threads_num, BC * BR});
     auto attn_out_block_old = alloc(f32, {threads_num, BR, vo_head_dim});

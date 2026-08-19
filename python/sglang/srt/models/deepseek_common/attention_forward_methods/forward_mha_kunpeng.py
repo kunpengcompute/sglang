@@ -149,10 +149,24 @@ class DeepseekMHAKunpengForwardMixin:
         )
         BR, BC = torch.ops.sgl_kernel.get_flash_attention_block_kunpeng()
         threads_num = torch.ops.sgl_kernel.get_flash_attention_thread_num()
-        
-        MAX_SEQ_LEN_SUPPORTED = 2048
+
+        # Max total KV length (prefix + extend); must match the C++ kernel.
+        MAX_SEQ_LEN_SUPPORTED = envs.SGLANG_KUNPENG_MAX_SEQ_LEN.get()
         dtype_size = q.element_size()
         f32_size = 4
+
+        # Fail loudly instead of letting the kernel overflow silently.
+        prefix_lens = forward_batch.extend_prefix_lens
+        if prefix_lens is None:
+            prefix_lens = torch.zeros_like(forward_batch.extend_seq_lens)
+        total_lens = forward_batch.extend_seq_lens + prefix_lens
+        if total_lens.numel() > 0 and int(total_lens.max()) > MAX_SEQ_LEN_SUPPORTED:
+            raise RuntimeError(
+                f"flash_attention_paged_kunpeng: max total seq_len "
+                f"{int(total_lens.max())} exceeds MAX_SEQ_LEN_SUPPORTED "
+                f"({MAX_SEQ_LEN_SUPPORTED}). Increase "
+                f"SGLANG_KUNPENG_MAX_SEQ_LEN."
+            )
 
         def align64(x):
             return (x + 63) // 64 * 64
