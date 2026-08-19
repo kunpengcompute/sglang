@@ -239,7 +239,7 @@ if [[ "$ROLE" == "router" ]]; then
     # Bind gateway to a dedicated core (NUMA 10, first core) so it does not
     # collide with the tokenizer workers (decode tokenizer now owns NUMA 4-7,
     # i.e. cores 152-303; detokenizer owns NUMA 8-9, i.e. 304-379).
-    taskset -c 380 "$GATEWAY_BIN" "${SPECIFIC_ARGS[@]}" \
+    taskset -c 380-416 "$GATEWAY_BIN" "${SPECIFIC_ARGS[@]}" \
         > "$LOG_PATH/router_$IP.log" 2>&1 &
 
     exit 0
