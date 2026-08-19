@@ -14,6 +14,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.utils.common import is_cpu_920f, require_mlp_tp_gather
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -205,6 +206,7 @@ def _update_gather_batch(
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
 
 
+@Kunpeng_PP_Profiler(depth=1, name="prepare_mlp_sync")
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     dp_size: int,
@@ -324,6 +326,7 @@ class SchedulerDPAttnMixin:
             offload_tags=self.offload_tags,
         )
 
+    @Kunpeng_PP_Profiler(depth=1, name="mlp_sync")
     def maybe_prepare_mlp_sync_batch(
         self: Scheduler,
         batch: Optional[ScheduleBatch],

@@ -72,6 +72,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.graph import ops as kunpeng
 
@@ -1407,6 +1408,7 @@ class GroupCoordinator:
                 async_handle.wait()
         return tensor_dict
 
+    @Kunpeng_PP_Profiler(depth=1, name="send_tensor_dict")
     def send_tensor_dict(
         self,
         tensor_dict: Dict[str, Union[torch.Tensor, Any]],
@@ -1468,7 +1470,6 @@ class GroupCoordinator:
             return []
         else:
             p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
-
             for tensor in tensor_list:
                 if tensor.numel() == 0:
                     continue
@@ -1483,6 +1484,7 @@ class GroupCoordinator:
                     p2p_works.append(P2PWork(work, tensor))
         return p2p_works
 
+    @Kunpeng_PP_Profiler(depth=2, name="recv_tensor_dict")
     def recv_tensor_dict(
         self,
         src: Optional[int] = None,

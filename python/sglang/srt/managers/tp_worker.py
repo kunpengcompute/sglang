@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -442,6 +443,7 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    @Kunpeng_PP_Profiler(depth=2, name="forward_batch")
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

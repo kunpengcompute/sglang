@@ -243,6 +243,7 @@ from sglang.srt.utils.numa_utils import (
     zmq_context_core_binding,
     ZmqOffset,
 )
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler 
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -1695,7 +1696,7 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
-    @KunpengProfiler
+    @Kunpeng_PP_Profiler(depth=1, name="recv_requests")
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1886,7 +1887,7 @@ class Scheduler(
         ]
         return work_reqs, control_reqs
 
-    @KunpengProfiler
+    @Kunpeng_PP_Profiler(depth=1, name="proc_input")
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
@@ -2877,6 +2878,7 @@ class Scheduler(
 
         return new_batch
 
+    @Kunpeng_PP_Profiler(depth=2, name="update_running")
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -2892,7 +2894,8 @@ class Scheduler(
             self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
@@ -2975,6 +2978,7 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    @Kunpeng_PP_Profiler(depth=2, name="run_batch")
     def run_batch(
         self,
         batch: ScheduleBatch,

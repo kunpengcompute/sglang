@@ -209,6 +209,7 @@ from sglang.srt.utils.patch_torch import (
     register_sgl_tp_rank,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler
 from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -2980,6 +2981,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    @Kunpeng_PP_Profiler(depth=1, name="forward_decode")
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -3016,6 +3018,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 **kwargs,
             )
 
+    @Kunpeng_PP_Profiler(depth=1, name="forward_extend")
     def forward_extend(
         self,
         forward_batch: ForwardBatch,
@@ -3142,6 +3145,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.split_index = next_split_index
         return ret
 
+    @Kunpeng_PP_Profiler(depth=3, name="model_runner.forward")
     def forward(
         self,
         forward_batch: ForwardBatch,
