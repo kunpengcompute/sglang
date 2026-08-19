@@ -43,6 +43,8 @@ PP_KIND_TENSOR = 1
 PP_KIND_ACK = 2
 PP_MSG_SLOTS = 8  # must match PP_MSG_SLOTS in pp_comm.cpp
 
+SHM_ALIGN_SIZE = 7168
+
 _INTRA_SOCKET: Optional[dist.ProcessGroup] = None
 _INTRA_DIE: Optional[dist.ProcessGroup] = None
 _SHM_POOL_INITIALIZED: bool = False
@@ -173,7 +175,7 @@ class KunpengCommunicator:
         # TODO(kunpeng): 7168 is the hidden size of DeepSeek V3, used to
         # pre-allocate SHM buffer for allreduce. This is hardcoded
         # and should be derived from model config in the future.
-        self.max_elements = self.max_tokens * 7168
+        self.max_elements = self.max_tokens * SHM_ALIGN_SIZE
 
         init_oob_comms(self.comm_size)
         init_shm_pool(self.group)
@@ -410,6 +412,10 @@ class KunpengPPCommunicator:
             if (
                 all_gather_group is not None
                 and tensor.numel() % all_gather_size == 0
+                and (
+                    tensor.dim() != 1
+                    or (tensor.numel() // all_gather_size) % SHM_ALIGN_SIZE == 0
+                )
             ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
             if not tensor.is_cpu:

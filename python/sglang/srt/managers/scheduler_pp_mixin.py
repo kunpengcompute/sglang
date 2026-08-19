@@ -1124,6 +1124,7 @@ class SchedulerPPMixin:
             PP_KIND_PYOBJ,
             PP_KIND_TENSOR,
             PP_KIND_ACK,
+            SHM_ALIGN_SIZE,
         )
 
         comm = self.pp_group.kunpeng_pp_communicator
@@ -1160,6 +1161,10 @@ class SchedulerPPMixin:
             use_all_gather = (
                 all_gather_group is not None
                 and tensor.numel() % all_gather_size == 0
+                and (
+                    tensor.dim() != 1
+                    or (tensor.numel() // all_gather_size) % SHM_ALIGN_SIZE == 0
+                )
             )
             if use_all_gather:
                 orig_shape = tensor.shape
