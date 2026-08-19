@@ -116,6 +116,7 @@ class KunpengSwapManager:
         self._cur_kv_hbm: Optional[torch.Tensor] = None
         self._kv_start_layer: int = 0
         self._kv_end_layer: int = 0
+        self._idle_forward: bool = False
 
         # Block-wise KV swap: DDR->HBM block mapping for the current decode
         # step (computed by the attention backend, cached here for all layers).
@@ -454,6 +455,14 @@ class KunpengSwapManager:
             return cache_k[start : start + n]
         return cache_k
 
+    def set_idle_forward(self, is_idle: bool) -> None:
+        """Mark the current forward as idle (no tokens) or not.
+
+        Idle forwards must skip KV swap entirely; this flag is refreshed
+        per forward by the attention backend / graph runner entry points.
+        """
+        self._idle_forward = bool(is_idle)
+
     def swap_kv_layer(self, layer_id: int, kv_buffer: torch.Tensor) -> None:
         """Populate KV HBM buffer for *layer_id* via SDMA async copy.
 
@@ -472,6 +481,12 @@ class KunpengSwapManager:
             kv_buffer: DDR KV cache tensor for the current layer.
         """
         self._cur_kv_ddr = kv_buffer
+
+        # Idle forward (no tokens): nothing to swap. Skip both block-wise and
+        # full-layer swap so a stale/absent block mapping never triggers a
+        # swap against an undersized HBM buffer.
+        if self._idle_forward:
+            return
 
         if not self.enable_swap_kv_in:
             return
@@ -499,6 +514,9 @@ class KunpengSwapManager:
                 self._kv_swap_in_event_tensor,
                 self._kv_swap_in_event_num_tensor,
             )
+            return
+
+        if self.enable_swap_kv_blockwise:
             return
 
         total_bytes = kv_buffer.numel() * kv_buffer.element_size()
