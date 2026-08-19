@@ -237,6 +237,14 @@ export SGLANG_KUNPENG_SWAP_KV_IN=0
 export SGLANG_KUNPENG_SWAP_KV_OUT=0
 export SGLANG_KUNPENG_SWAP_KV_BLOCKWISE=0
 export SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS=512
+export PREFILL_WEIGTHS_HBW_POOL_SIZE_MB=3900
+export PREFILL_SWAP_KV_IN=0
+export PREFILL_SWAP_KV_OUT=0
+export PREFILL_SWAP_KV_BLOCKWISE=0
+export DECODE_WEIGTHS_HBW_POOL_SIZE_MB=3900
+export DECODE_SWAP_KV_IN=0
+export DECODE_SWAP_KV_OUT=0
+export DECODE_SWAP_KV_BLOCKWISE=0
 # Kunpeng SDMA parameters
 export SGLANG_KUNPENG_SDMA_MAX_EVENTS=10
 export SGLANG_KUNPENG_SDMA_THRESHOLD=5
@@ -291,6 +299,10 @@ _export_pd_vars() {
     _var="${prefix}_EP_DISPATCH_ALGORITHM"; export EP_DISPATCH_ALGORITHM="${!_var}"
     _var="MODEL_PATH_${prefix}"; export MODEL_PATH="${!_var}"
     _var="SPECULATIVE_DRAFT_MODEL_PATH_${prefix}"; export SPECULATIVE_DRAFT_MODEL_PATH="${!_var}"
+    _var="${prefix}_WEIGTHS_HBW_POOL_SIZE_MB"; export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB="${!_var}"
+    _var="${prefix}_SWAP_KV_IN"; export SGLANG_KUNPENG_SWAP_KV_IN="${!_var}"
+    _var="${prefix}_SWAP_KV_OUT"; export SGLANG_KUNPENG_SWAP_KV_OUT="${!_var}"
+    _var="${prefix}_SWAP_KV_BLOCKWISE"; export SGLANG_KUNPENG_SWAP_KV_BLOCKWISE="${!_var}"
 }
 
 # ------------------------------------------------------------
