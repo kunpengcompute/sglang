@@ -326,6 +326,8 @@ class KunpengGraphRunner:
         then dispatches to the correct mode-specific forward.
         """
 
+        self.swap_mgr.set_idle_forward(forward_batch.forward_mode.is_idle())
+
         # Build common kwargs (mirrors forward_decode/forward_extend/forward_idle)
         kwargs: dict = {}
         if self.model_runner.support_pp:
@@ -534,6 +536,8 @@ class KunpengGraphRunner:
             ]
             if meta is not None:
                 inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
+                if self.swap_mgr._blockwise_ddr_block_ids is not None:
+                    inputs[-3] = self.swap_mgr._blockwise_remapped_block_table
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)

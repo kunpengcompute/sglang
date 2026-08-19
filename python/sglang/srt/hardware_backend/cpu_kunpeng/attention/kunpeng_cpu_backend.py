@@ -237,6 +237,9 @@ class KunpengCpuBackend(AttentionBackend):
             torch.ops.sgl_kernel.flash_mla_meta_destroy_kunpeng(self._decode_meta)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # Idle forwards carry no tokens: KV swap must be skipped entirely.
+        self.swap_mgr.set_idle_forward(forward_batch.forward_mode.is_idle())
+
         # Reset metadata view fields so extend mode (which doesn't call
         # _init_decode_metadata) doesn't carry stale data from prior forwards.
         self.forward_metadata.seq_lens = None
@@ -261,7 +264,9 @@ class KunpengCpuBackend(AttentionBackend):
                     save_seq_lens + self.speculative_num_draft_tokens
                 )
             self._init_decode_metadata(
-                forward_batch, seqlen_q=self.speculative_num_draft_tokens
+                forward_batch,
+                seqlen_q=self.speculative_num_draft_tokens,
+                enable_blockwise=self.swap_mgr.enable_swap_kv_blockwise,
             )
             forward_batch.seq_lens = save_seq_lens
         elif self.swap_mgr.enable_swap_kv_blockwise:
