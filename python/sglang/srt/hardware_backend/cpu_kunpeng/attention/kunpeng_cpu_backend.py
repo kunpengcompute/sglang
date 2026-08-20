@@ -394,6 +394,80 @@ class KunpengCpuBackend(AttentionBackend):
         if enable_blockwise:
             self._init_blockwise_swap_metadata(metadata, forward_batch)
 
+    def _blockwise_token_row_slice(
+        self, forward_batch: ForwardBatch
+    ) -> Tuple[int, int]:
+        """Return the [start, end) row range of out_cache_loc / k_nope / k_pe
+        that this rank's HBM write covers for this forward step.
+
+        The returned range must have a FIXED length for every step that shares
+        a graph (same forward mode + padded token count + batch size), because
+        the graph capture bakes the k_nope[start:end] slice shape in; a
+        variable-length slice crashes at replay ("k_nope/k_pe and loc token
+        count mismatch").
+
+        - TARGET_VERIFY / DECODE: each sequence contributes a fixed number of
+          rows (draft_token_num / 1), and the MLA all2all scatters whole
+          sequences, so the rank's share is a fixed sequence-aligned range.
+        - DRAFT_EXTEND: the per-sequence row counts (num_accepted_tokens) vary
+          and the batch is padded to a fixed aligned token count; the real rows
+          of a rank are NOT aligned with the padded per-rank shares (see
+          ``_blockwise_real_new_token_range``).  The write therefore covers the
+          FULL padded range (fixed length); rows that do not belong to this
+          rank are routed away in :meth:`_init_blockwise_swap_metadata`.
+
+        Returns:
+            (start_row, end_row): half-open row range into the flat token
+            tensors (out_cache_loc, k_nope, k_pe).
+        """
+        ts = self.forward_metadata.token_slice_start
+        bpt = self.forward_metadata.batchsize_per_tp
+        mode = forward_batch.forward_mode
+        if mode.is_draft_extend() or mode == ForwardMode.EXTEND:
+            # Full padded range: fixed per (mode, padded token count, bs).
+            return 0, forward_batch.input_ids.shape[0]
+        num = 1 if mode.is_decode() else self.speculative_num_draft_tokens
+        return ts * num, (ts + bpt) * num
+
+    def _blockwise_real_new_token_range(
+        self, forward_batch: ForwardBatch
+    ) -> Tuple[int, int]:
+        """Return the [rs, re) flat row range of the REAL new tokens that
+        belong to this rank (the rows whose K/V must be written to HBM at
+        their remapped slots).
+
+        - TARGET_VERIFY / DECODE: the rank's sequence-aligned share, capped by
+          the real (unpadded) token count so padding rows of a partially-real
+          rank are not treated as its own.
+        - DRAFT_EXTEND: cumulative sum of the (padded) per-sequence accepted
+          counts over the rank's sequences.
+
+        Returns:
+            (rs, re): half-open range into the flat (unpadded) token rows.
+        """
+        ts = self.forward_metadata.token_slice_start
+        bpt = self.forward_metadata.batchsize_per_tp
+        mode = forward_batch.forward_mode
+        if mode.is_draft_extend():
+            # Per-rank real rows via cumulative sum over the (padded)
+            # per-sequence accepted counts; exact for both tp=1 and tp>1.
+            ext = forward_batch.extend_seq_lens
+            start = int(ext[:ts].sum().item()) if ts > 0 else 0
+            end = int(ext[: ts + bpt].sum().item())
+            return start, end
+        if mode == ForwardMode.EXTEND:
+            real_total = getattr(forward_batch, "num_token_non_padded", None)
+            if real_total is not None:
+                return 0, int(real_total.item())
+            return 0, forward_batch.out_cache_loc.shape[0]
+        num = 1 if mode.is_decode() else self.speculative_num_draft_tokens
+        start = ts * num
+        end = (ts + bpt) * num
+        real_total = getattr(forward_batch, "num_token_non_padded", None)
+        if real_total is not None:
+            end = min(end, int(real_total.item()))
+        return start, end
+
     def _init_block_table(
         self,
         metadata: KunpengCpuMetadata,
@@ -442,15 +516,14 @@ class KunpengCpuBackend(AttentionBackend):
         device = metadata.block_table.device
         max_blocks_on_package = self.swap_mgr.max_blocks_on_package
 
-        # out_cache_loc is sliced to match the all2all group (geometry already
-        # computed once in _init_decode_metadata) so the block set only
-        # covers this rank's Btp tokens.
-        cache_loc = forward_batch.out_cache_loc
-        if metadata.all2all_size > 1:
-            cache_loc = cache_loc[
-                metadata.token_slice_start : metadata.token_slice_start
-                + metadata.batchsize_per_tp
-            ]
+        # The dirty-block set must cover ONLY this rank's real new tokens (the
+        # blocks it will write this step), so the swap-in stays minimal.  MTP
+        # batches have more than one token row per sequence and DRAFT_EXTEND
+        # batches are padded, so the slice must use the real flat token rows of
+        # this rank (see _blockwise_real_new_token_range) — sequence indices or
+        # the padded range would select foreign/padding rows.
+        rs, re = self._blockwise_real_new_token_range(forward_batch)
+        cache_loc = forward_batch.out_cache_loc[rs:re]
         ddr_block_of_new_tokens = cache_loc // page_size
 
         unique_table_blocks = torch.unique(metadata.block_table)
@@ -496,25 +569,66 @@ class KunpengCpuBackend(AttentionBackend):
         The DDR block set (``ddr_block_ids`` / ``hbw_block_ids`` /
         ``ddr_to_hbw`` / ``remapped_block_table`` / ``new-token blocks``)
         has already been computed and stored in the swap manager by
-        :meth:`_init_block_table`.  This method only derives the
-        remapped ``hbw_cache_loc`` for writing new K/V, then publishes
-        the final metadata to the swap manager.
+        :meth:`_init_block_table` (covering this rank's REAL new tokens).
+        This method derives the remapped ``hbw_cache_loc`` over the WRITE
+        slice (fixed length per graph key) and publishes it, together with
+        the token-row start, to the swap manager.
+
+        Rows of the write slice that are NOT this rank's real new tokens
+        (DRAFT_EXTEND foreign/padding rows, or padding rows of a partially
+        padded verify/decode rank) are routed to a reserved safe block at the
+        end of the HBM buffer — they carry garbage K/V and must never land on
+        a position the attention reads (e.g. block-0 slot-0, which every
+        sequence attends to).
         """
         page_size = metadata.page_size
         ddr_to_hbw = self.swap_mgr._blockwise_ddr_to_hbw
         ddr_block_of_new_tokens = self.swap_mgr._blockwise_ddr_new_token_blocks
         offset_in_block = self.swap_mgr._blockwise_offset_in_block
 
-        # The new-token block ids and offsets were already sliced to
-        # all2all group in _init_block_table.
-        hbw_block_of_new_tokens = ddr_to_hbw[ddr_block_of_new_tokens]
-        hbw_cache_loc = (hbw_block_of_new_tokens * page_size + offset_in_block).to(
-            torch.int64
+        write_start, write_end = self._blockwise_token_row_slice(forward_batch)
+        real_start, real_end = self._blockwise_real_new_token_range(forward_batch)
+
+        # hbw positions for the write slice, defaulting to the safe block.
+        safe_block = self.swap_mgr.max_blocks_on_package - 1
+        n_write = write_end - write_start
+        hbw_cache_loc = torch.full(
+            (n_write,),
+            safe_block * page_size,
+            dtype=torch.int64,
+            device=ddr_to_hbw.device,
         )
+
+        # Real rows of this rank lie in [max(write_start, real_start) :
+        # min(write_end, real_end)]; their new-token block/offset metadata was
+        # computed over the real range [real_start : real_end], so index the
+        # stored arrays by (row - real_start).
+        lo = max(write_start, real_start)
+        hi = min(write_end, real_end)
+        if lo < hi:
+            seg_start = lo - real_start
+            seg_end = hi - real_start
+            seg = (
+                ddr_to_hbw[ddr_block_of_new_tokens[seg_start:seg_end]] * page_size
+                + offset_in_block[seg_start:seg_end]
+            )
+            hbw_cache_loc[lo - write_start : hi - write_start] = seg
+
+        if hi < write_end:
+            # Some rows are routed to the safe block: it must not collide with
+            # the blocks used by the swap-in (hbw ids 0..num_unique-1).
+            num_unique = self.swap_mgr._blockwise_ddr_block_ids.shape[0]
+            if num_unique + 1 > self.swap_mgr.max_blocks_on_package:
+                raise RuntimeError(
+                    "Block-wise swap: routing padding/foreign rows needs one "
+                    "reserved HBM block but the package only holds "
+                    f"{self.swap_mgr.max_blocks_on_package} blocks. "
+                    "Increase SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS."
+                )
 
         self.swap_mgr.set_blockwise_swap_cache_loc(
             hbw_cache_loc,
-            metadata.token_slice_start,
+            write_start,
         )
 
     def _get_kv_buffer(

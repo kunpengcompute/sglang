@@ -417,15 +417,25 @@ class KunpengSwapManager:
     def set_blockwise_swap_cache_loc(
         self,
         hbw_cache_loc: torch.Tensor,
-        token_slice_start: int,
+        token_row_start: int,
     ) -> None:
         """Store the remapped cache_loc for writing new K/V into HBM.
 
         Called by :meth:`_init_blockwise_swap_metadata` once per forward
         step, after :meth:`set_blockwise_block_ids`.
+
+        Args:
+            hbw_cache_loc: remapped HBM flat positions for this rank's write
+                slice (one entry per row the HBM write covers; entries that do
+                not belong to this rank's real new tokens point at a reserved
+                safe block and are never read).
+            token_row_start: flat token-row offset where this rank's write
+                slice starts in out_cache_loc / k_nope / k_pe.  The HBM write
+                path slices k_nope/k_pe by
+                [token_row_start : token_row_start + hbw_cache_loc.shape[0]].
         """
         self._blockwise_hbw_cache_loc = hbw_cache_loc
-        self._blockwise_token_slice_start = token_slice_start
+        self._blockwise_token_slice_start = token_row_start
 
     def get_remapped_block_table(self) -> Optional[torch.Tensor]:
         """Return the block_table remapped to HBM slots, or None when not
