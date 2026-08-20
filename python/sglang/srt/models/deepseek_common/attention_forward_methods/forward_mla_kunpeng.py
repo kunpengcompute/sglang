@@ -115,7 +115,11 @@ class DeepseekMLAKunpengForwardMixin:
         if self.swap_mgr.enable_swap_kv_in:
             # Block-wise (decode): out_cache_loc is remapped to HBM flat
             # positions; k_nope/k_pe must be sliced to this rank's Btp tokens
-            # to match (Btp == B when all2all is disabled).
+            # to match (Btp == B when all2all is disabled). token_slice_start
+            # is the flat TOKEN-row offset (for MTP batches it covers the
+            # rank's draft_token_num rows per sequence), so the slice
+            # [start : start + len(hbw_cache_loc)] picks exactly the new K/V
+            # rows that belong to this rank's hbw_cache_loc.
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 cache_loc = self.swap_mgr._blockwise_hbw_cache_loc
                 start = self.swap_mgr._blockwise_token_slice_start
