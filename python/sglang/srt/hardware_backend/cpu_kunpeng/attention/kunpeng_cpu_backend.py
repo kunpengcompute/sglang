@@ -24,6 +24,7 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.distributed import get_socket_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import *
 from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
@@ -154,7 +155,7 @@ def kutacc_mha(
     # slices from this buffer (pack_attn_k/v/q, attn_s, out/max/base block
     # old/new), matching sample prefill_model.cpp L101-113. Any kernel
     # over-read/write past a scratch tensor lands inside the workspace.
-    MAX_SEQ_LEN_SUPPORTED = 2048
+    MAX_SEQ_LEN_SUPPORTED = envs.SGLANG_KUNPENG_MAX_SEQ_LEN.get()
     dtype_size = query.element_size()
     f32_size = 4
 
