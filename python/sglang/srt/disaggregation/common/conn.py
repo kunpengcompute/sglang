@@ -36,7 +36,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import is_tokenizer_separate
+from sglang.srt.utils.common import is_http_only, is_tokenizer_separate
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -47,6 +47,7 @@ from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
 logger = logging.getLogger(__name__)
 
 _is_tokenizer_separate = is_tokenizer_separate()
+_is_http_only = is_http_only()
 
 @dataclasses.dataclass
 class PrefillServerInfo:
@@ -205,18 +206,17 @@ class CommonKVManager(BaseKVManager):
             self.failure_records[bootstrap_room] = failure_reason
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
-        """Single non-blocking attempt to fetch and cache prefill parallel info.
-        Returns True if info is available (cached or freshly fetched)."""
+        """Fetch and cache prefill parallel info.
+        Returns True if info is available (cached or freshly fetched).
+        """
         if bootstrap_addr in self.prefill_info_table:
             return True
 
-        info: PrefillServerInfo = None
+        url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
         try:
-            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
-                data = response.json()
-                info = PrefillServerInfo(**data)
+                info: PrefillServerInfo = PrefillServerInfo(**response.json())
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -716,29 +716,17 @@ class CommonKVReceiver(BaseKVReceiver):
     def _get_bootstrap_info_from_server(
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
     ):
-        """Fetch the bootstrap info from the bootstrap server.
-
-        Retries a few times before giving up (controlled by
-        SGLANG_DISAGG_BOOTSTRAP_RETRY, on by default): a single failed fetch
-        kills the request on every rank of the TP group, and transient
-        timeouts under high concurrency (many decode ranks querying at once)
-        must not fail requests permanently.
-        """
         url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
-        max_retries = 3 if envs.SGLANG_DISAGG_BOOTSTRAP_RETRY.get() else 1
-        for attempt in range(max_retries):
-            try:
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    return response.json()
-                else:
-                    logger.error(
-                        f"Failed to get prefill server info: {response.status_code}, {response.text}"
-                    )
-            except Exception as e:
-                logger.error(f"Error fetching prefill info from bootstrap: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(1)
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(
+                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                )
+        except Exception as e:
+            logger.error(f"Error fetching prefill info from bootstrap: {e}")
         return None
 
     @staticmethod
@@ -1043,6 +1031,28 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 )
 
     def _run_server(self):
+        # Bind the bootstrap server thread to a dedicated CPU list when
+        # configured (http-only router process).
+        if _is_http_only:
+            spec = envs.SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU.get()
+            if spec:
+                try:
+                    cpus = set()
+                    for part in spec.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        start, _, end = part.partition("-")
+                        if end:
+                            cpus.update(range(int(start), int(end) + 1))
+                        else:
+                            cpus.add(int(start))
+                    os.sched_setaffinity(0, cpus)
+                    logger.info(f"Bootstrap server thread bound to cpus={sorted(cpus)}")
+                except (ValueError, OSError) as e:
+                    logger.warning(
+                        f"Failed to bind bootstrap server thread to '{spec}': {e}"
+                    )
         try:
             # Event Loop
             self._loop = asyncio.new_event_loop()
@@ -1057,7 +1067,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._runner = web.AppRunner(self.app, access_log=access_log)
             self._loop.run_until_complete(self._runner.setup())
 
-            site = web.TCPSite(self._runner, host=self.host, port=self.port)
+            # DeepSeek V3 PD-disaggregation on Kunpeng: deepen the listen
+            # backlog so bursty route/query requests from decode ranks queue
+            # up instead of timing out.
+            backlog = 1024 if envs.SGLANG_USE_CPU_920F.get() else 128
+            site = web.TCPSite(
+                self._runner, host=self.host, port=self.port, backlog=backlog
+            )
             self._loop.run_until_complete(site.start())
             logger.info(
                 f"CommonKVBootstrapServer started successfully on {self.host}:{self.port}"

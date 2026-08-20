@@ -589,10 +589,9 @@ class Envs:
     SGLANG_TOKENIZER_TIMELINE_PATH = EnvStr(
         ""
     )  # empty = /tmp/sglang_tokenizer_timeline_{pid}.jsonl
-    # Retry the bootstrap-server route query on transient failures (timeout /
-    # non-200). A single failed fetch kills the request on every rank of the
-    # TP group, so retries are on by default.
-    SGLANG_DISAGG_BOOTSTRAP_RETRY = EnvBool(True)
+    # Dedicated CPU list for the disaggregation bootstrap server thread. Only
+    # takes effect in http-only mode (tokenizer-separate router process),
+    SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU = EnvStr("")
 
 envs = Envs()
 EnvField._allow_set_name = False

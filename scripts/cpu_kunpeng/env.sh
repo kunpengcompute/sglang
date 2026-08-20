@@ -207,8 +207,8 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_WARMUP_TIMEOUT=1600
 export PYTHONWARNINGS="ignore::FutureWarning"
-export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=300
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=30
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
@@ -262,8 +262,11 @@ export IS_PREFILL="1"
 export DROP_CACHES=0
 # Tokenizer-side cross-process batch timeline logging
 export SGLANG_TOKENIZER_TIMELINE_LOG=0
-# Retry the bootstrap-server route query on transient failures (timeout / non-200).
-export SGLANG_DISAGG_BOOTSTRAP_RETRY=1
+# Scheduler stream interval (--stream-interval): flush a request's output every N tokens
+export STREAM_INTERVAL=1
+# Dedicated CPU list for the disaggregation bootstrap server thread (only
+# effective in tokenizer-separate mode). 
+export SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU=418-422
 
 # ------------------------------------------------------------
 # Load local config
@@ -362,7 +365,7 @@ case "$ACTION" in
 esac
 
 if [[ "$ACTION" == "router" && "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
-    export RAYON_NUM_THREADS=64
+    export RAYON_NUM_THREADS=32
 fi
 
 source "${SCRIPT_DIR}/.time_env.sh"
