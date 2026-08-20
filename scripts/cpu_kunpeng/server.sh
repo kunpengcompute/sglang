@@ -110,7 +110,7 @@ case "$ROLE" in
             --disaggregation-mode prefill
             --disaggregation-bootstrap-port 9001
             --max-prefill-tokens $((SGLANG_KUNPENG_MAX_SEQ_NUM * SGLANG_KUNPENG_MAX_CUR_LEN))
-            --max-total-tokens 18496
+            --max-total-tokens 139328
             --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
             --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
