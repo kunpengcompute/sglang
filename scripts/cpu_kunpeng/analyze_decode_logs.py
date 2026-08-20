@@ -61,6 +61,10 @@ def parse_log_line(line):
     )
     queue_match = re.search(r"#queue-req:\s*(\d+)", line)
     metrics["queue_req"] = int(queue_match.group(1)) if queue_match else None
+    graph_run_match = re.search(r"\[graph\] run ([0-9.]+) ms", line)
+    metrics["graph_run_ms"] = (
+        float(graph_run_match.group(1)) if graph_run_match else None
+    )
     return timestamp, metrics
 
 
@@ -78,6 +82,7 @@ def analyze_metrics(metrics_data, tp_num):
         "transfer_req": {"avg": 0, "max": 0, "min": 0, "std": 0},
         "queue_req": {"avg": 0, "max": 0, "min": 0, "std": 0},
         "gen_throughput": {"avg": 0, "max": 0, "min": 0, "std": 0, "total_tokens": 0},
+        "graph_run_ms": {"avg": 0, "max": 0, "min": 0, "std": 0},
         "correlations": {},
     }
     # Collect valid samples per metric (skip missing entries)
@@ -105,6 +110,11 @@ def analyze_metrics(metrics_data, tp_num):
         item["metrics"]["gen_throughput"]
         for item in metrics_data
         if item["metrics"]["gen_throughput"] is not None
+    ]
+    graph_run_values = [
+        item["metrics"]["graph_run_ms"]
+        for item in metrics_data
+        if item["metrics"]["graph_run_ms"] is not None
     ]
     timestamps = [item["timestamp"] for item in metrics_data]
     if len(timestamps) > 1:
@@ -167,6 +177,16 @@ def analyze_metrics(metrics_data, tp_num):
                 "std": np.std(throughput_values),
                 "count": len(throughput_values),
                 "total_tokens": total_tokens,
+            }
+        )
+    if graph_run_values:
+        analysis["graph_run_ms"].update(
+            {
+                "avg": np.mean(graph_run_values),
+                "max": max(graph_run_values),
+                "min": min(graph_run_values),
+                "std": np.std(graph_run_values),
+                "count": len(graph_run_values),
             }
         )
 
@@ -246,6 +266,13 @@ def generate_analysis_report(analyses, plot_dir):
                     f"  Estimated Total Tokens: {analysis['gen_throughput']['total_tokens']:.0f}\n"
                 )
                 f.write(f"  Samples: {analysis['gen_throughput']['count']}\n\n")
+            if analysis["graph_run_ms"]["count"] > 0:
+                f.write("Graph Run Time (ms):\n")
+                f.write(f"  Average: {analysis['graph_run_ms']['avg']:.2f}\n")
+                f.write(f"  Maximum: {analysis['graph_run_ms']['max']:.2f}\n")
+                f.write(f"  Minimum: {analysis['graph_run_ms']['min']:.2f}\n")
+                f.write(f"  Std Dev: {analysis['graph_run_ms']['std']:.2f}\n")
+                f.write(f"  Samples: {analysis['graph_run_ms']['count']}\n\n")
             if analysis["correlations"]:
                 f.write("Correlations:\n")
                 if "running_throughput" in analysis["correlations"]:
@@ -265,8 +292,26 @@ def generate_analysis_report(analyses, plot_dir):
     return report_file
 
 
+# Gap threshold (seconds): consecutive log points farther apart than this are
+# treated as a test pause, and the timeline is split into separate columns.
+SEGMENT_GAP_THRESHOLD_S = 30.0
+
+
+def split_into_segments(timestamps, gap_threshold=SEGMENT_GAP_THRESHOLD_S):
+    """Split point indices into segments separated by gaps > gap_threshold."""
+    segments = [[0]]
+    for i in range(1, len(timestamps)):
+        if (timestamps[i] - timestamps[i - 1]).total_seconds() > gap_threshold:
+            segments.append([i])
+        else:
+            segments[-1].append(i)
+    return segments
+
+
 def plot_combined_metrics(metrics_data, plot_dir, tp_num, first_decode_time):
-    """Plot combined metric charts (top: request stats, bottom: throughput)."""
+    """Plot combined metric charts, one column of 3 subplots per time segment
+    (segments are auto-split at gaps > SEGMENT_GAP_THRESHOLD_S so test pauses
+    do not leave long blank regions on the shared time axis)."""
     if not metrics_data:
         print(f"TP{tp_num} has no data, skipping plotting")
         return
@@ -278,6 +323,7 @@ def plot_combined_metrics(metrics_data, plot_dir, tp_num, first_decode_time):
     transfer_reqs = [item["metrics"]["transfer_req"] for item in metrics_data]
     throughputs = [item["metrics"]["gen_throughput"] for item in metrics_data]
     queue_reqs = [item["metrics"]["queue_req"] for item in metrics_data]
+    graph_runs = [item["metrics"]["graph_run_ms"] for item in metrics_data]
 
     if not timestamps:
         print(f"TP{tp_num} has empty timestamps, skipping plotting")
@@ -290,8 +336,18 @@ def plot_combined_metrics(metrics_data, plot_dir, tp_num, first_decode_time):
 
     relative_times = [(ts - first_decode_time).total_seconds() for ts in timestamps]
 
-    # Create a figure with two vertically stacked subplots
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12), dpi=300, sharex=True)
+    # Split the timeline into segments at long gaps (test pauses)
+    segments = split_into_segments(timestamps)
+    ncols = len(segments)
+
+    # Create a 3 x ncols grid of subplots
+    fig, axes = plt.subplots(
+        3,
+        ncols,
+        figsize=(max(24, 13 * ncols), 16),
+        dpi=300,
+        squeeze=False,
+    )
     fig.suptitle(
         f"TP{tp_num} - Performance Metrics Over Time",
         fontsize=16,
@@ -299,101 +355,101 @@ def plot_combined_metrics(metrics_data, plot_dir, tp_num, first_decode_time):
         y=0.98,
     )
 
-    # Top subplot: request statistics
-    ax1.set_title("Request Queue Statistics", fontsize=14, pad=10)
-    ax1.set_ylabel("Request Count", fontsize=12)
-    ax1.grid(True, alpha=0.3, linestyle="--", linewidth=0.5)
-    if any(r is not None for r in running_reqs):
-        ax1.plot(
-            relative_times,
-            running_reqs,
-            "o-",
-            label="Running Requests",
-            markersize=3,
-            linewidth=1.5,
-            color="#1f77b4",
-            alpha=0.8,
-        )
-    if any(p is not None for p in prealloc_reqs):
-        ax1.plot(
-            relative_times,
-            prealloc_reqs,
-            "s-",
-            label="Prealloc Requests",
-            markersize=3,
-            linewidth=1.5,
-            color="#ff7f0e",
-            alpha=0.8,
-        )
-    if any(t is not None for t in transfer_reqs):
-        ax1.plot(
-            relative_times,
-            transfer_reqs,
-            "^-",
-            label="Transfer Requests",
-            markersize=3,
-            linewidth=1.5,
-            color="#2ca02c",
-            alpha=0.8,
-        )
-    if any(q is not None for q in queue_reqs):
-        ax1.plot(
-            relative_times,
-            queue_reqs,
-            "v-",
-            label="Queue Requests",
-            markersize=3,
-            linewidth=1.5,
-            color="#d62728",
-            alpha=0.8,
-        )
-    ax1.legend(loc="upper right", fontsize=10, framealpha=0.9)
-    ax1.tick_params(axis="both", labelsize=10)
+    for col, seg in enumerate(segments):
+        seg_times = [relative_times[i] for i in seg]
+        ax1, ax2, ax3 = axes[0][col], axes[1][col], axes[2][col]
+        seg_title = f"Segment {col + 1} [{seg_times[0]:.0f}s ~ {seg_times[-1]:.0f}s]"
 
-    # Bottom subplot: generation throughput
-    ax2.set_title("Generation Throughput", fontsize=14, pad=10)
-    ax2.set_xlabel("Time (seconds since first decode)", fontsize=12)
-    ax2.set_ylabel("Throughput (tokens/s)", fontsize=12)
-    ax2.grid(True, alpha=0.3, linestyle="--", linewidth=0.5)
-    # Throughput samples may be missing; plot only valid ones
-    throughput_valid_indices = [i for i, t in enumerate(throughputs) if t is not None]
-    if throughput_valid_indices:
-        throughput_valid_times = [relative_times[i] for i in throughput_valid_indices]
-        throughput_valid_values = [throughputs[i] for i in throughput_valid_indices]
-        ax2.plot(
-            throughput_valid_times,
-            throughput_valid_values,
-            "s-",
-            label="Generation Throughput",
-            markersize=4,
-            linewidth=2,
-            color="blue",
-            alpha=0.8,
-        )
-        # Overlay a moving average when enough samples are available
-        if len(throughput_valid_values) > 5:
-            window = min(5, len(throughput_valid_values) // 3)
-            if window > 1:
-                weights = np.ones(window) / window
-                smoothed = np.convolve(throughput_valid_values, weights, mode="valid")
-                smoothed_times = throughput_valid_times[window - 1 :]
-                ax2.plot(
-                    smoothed_times,
-                    smoothed,
-                    "--",
+        # --- Top subplot: request statistics ---
+        # Filter to valid samples: graph-run log lines produce data points whose
+        # request-count metrics are None, which would break the line into dots.
+        ax1.set_title(f"Request Queue Statistics - {seg_title}", fontsize=12, pad=10)
+        ax1.set_ylabel("Request Count", fontsize=12)
+        ax1.grid(True, alpha=0.3, linestyle="--", linewidth=0.5)
+        series = [
+            (running_reqs, "Running Requests", "o-", "#1f77b4"),
+            (prealloc_reqs, "Prealloc Requests", "s-", "#ff7f0e"),
+            (transfer_reqs, "Transfer Requests", "^-", "#2ca02c"),
+            (queue_reqs, "Queue Requests", "v-", "#d62728"),
+        ]
+        for values, label, style, color in series:
+            valid = [i for i in seg if values[i] is not None]
+            if valid:
+                ax1.plot(
+                    [relative_times[i] for i in valid],
+                    [values[i] for i in valid],
+                    style,
+                    label=label,
+                    markersize=3,
                     linewidth=1.5,
-                    color="red",
-                    alpha=0.6,
-                    label=f"{window}-point Moving Average",
+                    color=color,
+                    alpha=0.8,
                 )
-    ax2.legend(loc="upper right", fontsize=10, framealpha=0.9)
-    ax2.tick_params(axis="both", labelsize=10)
+        ax1.legend(loc="upper right", fontsize=10, framealpha=0.9)
+        ax1.tick_params(axis="both", labelsize=10)
 
-    # Add 2% horizontal padding so points do not touch the edges
-    if relative_times:
-        x_min, x_max = min(relative_times), max(relative_times)
+        # --- Middle subplot: generation throughput ---
+        ax2.set_title("Generation Throughput", fontsize=12, pad=10)
+        ax2.set_ylabel("Throughput (tokens/s)", fontsize=12)
+        ax2.grid(True, alpha=0.3, linestyle="--", linewidth=0.5)
+        # Throughput samples may be missing; plot only valid ones
+        valid = [i for i in seg if throughputs[i] is not None]
+        if valid:
+            ax2.plot(
+                [relative_times[i] for i in valid],
+                [throughputs[i] for i in valid],
+                "s-",
+                label="Generation Throughput",
+                markersize=4,
+                linewidth=2,
+                color="blue",
+                alpha=0.8,
+            )
+        ax2.legend(loc="upper right", fontsize=10, framealpha=0.9)
+        ax2.tick_params(axis="both", labelsize=10)
+
+        # --- Bottom subplot: graph run time ---
+        ax3.set_title("Graph Run Time", fontsize=12, pad=10)
+        ax3.set_xlabel("Time (seconds since first decode)", fontsize=12)
+        ax3.set_ylabel("Graph Run Time (ms)", fontsize=12)
+        ax3.grid(True, alpha=0.3, linestyle="--", linewidth=0.5)
+        # Graph run samples may be missing; plot only valid ones
+        valid = [i for i in seg if graph_runs[i] is not None]
+        if valid:
+            graph_values = [graph_runs[i] for i in valid]
+            ax3.plot(
+                [relative_times[i] for i in valid],
+                graph_values,
+                ".-",
+                label="Graph Run Time",
+                markersize=3,
+                linewidth=1,
+                color="#9467bd",
+                alpha=0.8,
+            )
+            # Reference line for the segment mean
+            graph_mean = np.mean(graph_values)
+            ax3.axhline(
+                graph_mean,
+                color="green",
+                linestyle=":",
+                linewidth=1.5,
+                alpha=0.8,
+                label=f"Mean: {graph_mean:.1f} ms",
+            )
+        ax3.legend(loc="upper right", fontsize=10, framealpha=0.9)
+        ax3.tick_params(axis="both", labelsize=10)
+
+        # Add 2% horizontal padding so points do not touch the edges
+        x_min, x_max = min(seg_times), max(seg_times)
         x_padding = (x_max - x_min) * 0.02 if x_max != x_min else 1.0
-        ax2.set_xlim(x_min - x_padding, x_max + x_padding)
+        for ax in (ax1, ax2, ax3):
+            ax.set_xlim(x_min - x_padding, x_max + x_padding)
+
+    if ncols > 1:
+        print(
+            f"TP{tp_num}: timeline split into {ncols} segments (gap > {SEGMENT_GAP_THRESHOLD_S:.0f}s)"
+        )
 
     plt.tight_layout()
     plt.subplots_adjust(top=0.94, hspace=0.15)

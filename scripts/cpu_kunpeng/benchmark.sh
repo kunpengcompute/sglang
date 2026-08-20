@@ -56,6 +56,7 @@ DEFAULT_AIS_IN_LEN_MAX=             # (aisbench) input length max (empty = fixed
 DEFAULT_AIS_OUT_LEN=384             # (aisbench) output length min (string mode)
 DEFAULT_AIS_OUT_LEN_MAX=            # (aisbench) output length max (empty = fixed length)
 DEFAULT_AIS_MAX_OUT_LEN=384         # (aisbench) model-side max_out_len
+DEFAULT_AIS_REQUEST_RATE=32         # (aisbench) request_rate (0 = burst, >0 = req/s)
 DEFAULT_AIS_TASKSET_CPUS=266-302    # (aisbench) CPU range for taskset (empty = no binding)
 
 # Load environment: conda env + SGLANG_PATH / ROUTER_IP / MODEL_PATH / DATASET_PATH
@@ -93,6 +94,7 @@ Env overrides (runtime): HOST PORT PARALLEL
             AIS_TYPE AIS_REQUESTS AIS_IN_LEN AIS_IN_LEN_MAX
             AIS_OUT_LEN AIS_OUT_LEN_MAX AIS_MAX_OUT_LEN AIS_BATCH
             AIS_TEMPERATURE AIS_IGNORE_EOS(0/1) AIS_TRUST_REMOTE_CODE(0/1)
+            AIS_REQUEST_RATE (0=burst, >0 = req/s)
             AIS_REQUEST_SIZE AIS_PREFIX_LEN (tokenid mode)
             AIS_MODEL_CFG AIS_DATASET_CFG AIS_WORK_DIR
             AIS_TASKSET_CPUS (default 266-302, empty = no taskset binding)
@@ -158,6 +160,7 @@ case "$SUITE" in
         AIS_OUT_LEN_MAX="${AIS_OUT_LEN_MAX:-$DEFAULT_AIS_OUT_LEN_MAX}"
         [[ -z "$AIS_OUT_LEN_MAX" ]] && AIS_OUT_LEN_MAX="$AIS_OUT_LEN"
         AIS_MAX_OUT_LEN="${AIS_MAX_OUT_LEN:-$DEFAULT_AIS_MAX_OUT_LEN}"
+        AIS_REQUEST_RATE="${AIS_REQUEST_RATE:-$DEFAULT_AIS_REQUEST_RATE}"
         AIS_BATCH="${AIS_BATCH:-$AIS_REQUESTS}"
         AIS_HOST="${AIS_HOST:-$GATEWAY_HOST}"
         AIS_PORT="${AIS_PORT:-$GATEWAY_PORT}"
@@ -188,13 +191,14 @@ case "$SUITE" in
         echo "[aisbench] base:     $AIS_BASE"
         echo "[aisbench] target:   $AIS_HOST:$AIS_PORT"
         echo "[aisbench] dataset:  type=$AIS_TYPE requests=$AIS_REQUESTS in=$AIS_IN_LEN..$AIS_IN_LEN_MAX out=$AIS_OUT_LEN..$AIS_OUT_LEN_MAX"
-        echo "[aisbench] model:    batch_size=$AIS_BATCH max_out_len=$AIS_MAX_OUT_LEN"
+        echo "[aisbench] model:    batch_size=$AIS_BATCH max_out_len=$AIS_MAX_OUT_LEN request_rate=$AIS_REQUEST_RATE"
 
         # --- Patch model-side config (rewrites the whole `key=...,` line) ---
         sed -i -E "s/(host_ip=).*/\1\"$AIS_HOST\",/" "$AIS_MODEL_CFG_PATH"
         sed -i -E "s/(host_port=).*/\1$AIS_PORT,/" "$AIS_MODEL_CFG_PATH"
         sed -i -E "s/(batch_size=).*/\1$AIS_BATCH,/" "$AIS_MODEL_CFG_PATH"
         sed -i -E "s/(max_out_len=).*/\1$AIS_MAX_OUT_LEN,/" "$AIS_MODEL_CFG_PATH"
+        sed -i -E "s/(request_rate=).*/\1$AIS_REQUEST_RATE,/" "$AIS_MODEL_CFG_PATH"
         if [[ -n "${AIS_TEMPERATURE:-}" ]]; then
             sed -i -E "s/(temperature=).*/\1$AIS_TEMPERATURE,/" "$AIS_MODEL_CFG_PATH"
         fi

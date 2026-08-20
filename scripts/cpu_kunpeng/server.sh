@@ -65,6 +65,7 @@ BASE_ARGS=(
     --chat-template  "$SGLANG_PATH/examples/chat_template/tool_chat_template_deepseekr1.jinja"
     --tool-call-parser deepseekv3
     --reasoning-parser deepseek-r1
+    --stream-interval "$STREAM_INTERVAL"
 )
 
 # Add redundant experts only when enabled (REDUNDANT_EXPERTS > 0)
@@ -121,7 +122,7 @@ case "$ROLE" in
             --disaggregation-mode decode
             --max-total-tokens 139328
             --load-balance-method round_robin
-            --decode-log-interval 10
+            --decode-log-interval 2
             --num-reserved-decode-tokens 256
             --max-running-requests  $((SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
         )
@@ -176,6 +177,8 @@ case "$ROLE" in
             --max-total-tokens 64
             --tokenizer-worker-num "$TOKENIZER_WORKER_NUM"
             --skip-server-warmup
+            --enable-dynamic-batch-tokenizer
+            --batch-notify-size "$SGLANG_KUNPENG_MAX_SEQ_NUM"
         )
         ;;
     *)
@@ -255,7 +258,7 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
             SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/sglang_server"
             # Point kuccl runtime plugin paths to this rank's NUMA-local copy.
             # kuccl_pg.py fallback: _internal/kuccl/install/{hucx,xucg}/
-            if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
+            if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "0" ]]; then
                 KUCCL_INSTALL="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/_internal/kuccl/install"
                 unset HUCX_DIR
                 unset XUCG_DIR
