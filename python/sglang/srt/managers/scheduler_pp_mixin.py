@@ -839,15 +839,15 @@ class SchedulerPPMixin:
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
-            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids
-            )
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
                 self.disagg_prefill_bootstrap_queue.queue,
                 True,
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
+            )
+            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
+                prev_bootstrapped_rids
             )
             good_bootstrapped_rids = list(
                 set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
@@ -867,16 +867,15 @@ class SchedulerPPMixin:
             )
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
+            # Run the poll all-reduce BEFORE the blocking pp_recv to avoid
+            # the fence/pp_recv circular deadlock.
             curr_transferred_rids = self.get_rids(
                 self.disagg_prefill_inflight_queue,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            # new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
             )
@@ -1725,14 +1724,14 @@ class SchedulerPPMixin:
             )
         else:
             # Other ranks, receive the preallocated reqs info from the previous rank and ensure the consensus
-            prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
-            prev_good_prealloc_rids, prev_bad_prealloc_rids = prev_prealloc_rids
             curr_good_prealloc_rids, curr_bad_prealloc_rids = self.get_rids(
                 self.disagg_decode_prealloc_queue.queue,
                 False,
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
+            prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_good_prealloc_rids, prev_bad_prealloc_rids = prev_prealloc_rids
             good_prealloc_rids = list(
                 set(prev_good_prealloc_rids) & set(curr_good_prealloc_rids)
             )
@@ -1752,15 +1751,14 @@ class SchedulerPPMixin:
             )
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
+            # Run the poll all-reduce BEFORE the blocking pp_recv to avoid
+            # the fence/pp_recv circular deadlock (see _pp_pd_get_prealloc_ids).
             curr_transferred_rids = self.get_rids(
                 self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
             )
+            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
