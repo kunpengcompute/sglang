@@ -388,8 +388,16 @@ if [[ "$SGLANG_ENABLE_KUCCL" == "1" ]]; then
     export UCX_MEM_EVENTS=no
     export UCX_UD_VERBS_ALLOC=thp,md,mmap,heap
     export UCX_RC_VERBS_ALLOC=thp,md,mmap,heap
-    export HUCX_DIR="$HPCKIT_PATH/latest/hmpi/bisheng/release/hucx"
-    export XUCG_DIR="$HPCKIT_PATH/latest/hmpi/bisheng/release/xucg"
+
+    if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]]; then
+        export HUCX_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/bisheng/release/hucx"
+        export XUCG_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/bisheng/release/xucg"
+        export UCX_MODULE_DIR="${HUCX_DIR}/lib/ucx"
+        export UCX_PLANC=ucx
+        export UCG_PLANC_PATH="${XUCG_DIR}/lib/planc"
+        export LD_LIBRARY_PATH="${HUCX_DIR}/lib:${XUCG_DIR}/lib:${XUCG_DIR}/lib/planc:${LD_LIBRARY_PATH:-}"
+        export PYTHONPATH="${KUCCL_PATH}:${PYTHONPATH:-}" 
+    fi
 fi
 
 if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]] || [[ "$ACTION" == "build" ]]; then

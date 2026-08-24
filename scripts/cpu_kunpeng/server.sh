@@ -258,11 +258,19 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
             SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/sglang_server"
             # Point kuccl runtime plugin paths to this rank's NUMA-local copy.
             # kuccl_pg.py fallback: _internal/kuccl/install/{hucx,xucg}/
-            if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "0" ]]; then
-                KUCCL_INSTALL="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/_internal/kuccl/install"
-                unset HUCX_DIR
-                unset XUCG_DIR
-                export LD_LIBRARY_PATH="$KUCCL_INSTALL:${LD_LIBRARY_PATH}"
+            if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
+                KUCCL_LOCAL_DIR="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/_internal/kuccl"
+                KUCCL_INSTALL="$KUCCL_LOCAL_DIR/install"
+
+                export HUCX_DIR="$KUCCL_INSTALL/hucx"
+                export XUCG_DIR="$KUCCL_INSTALL/xucg"
+
+                export UCX_MODULE_DIR="${HUCX_DIR}/lib/ucx"
+
+                export UCX_PLANC=ucx
+                export UCG_PLANC_PATH="${XUCG_DIR}/lib/planc"
+            
+                export LD_LIBRARY_PATH="${HUCX_DIR}/lib:${XUCG_DIR}/lib:${XUCG_DIR}/lib/planc:${LD_LIBRARY_PATH:-}"
             fi
         else
             SERVER_BIN="python -m sglang.launch_server"
