@@ -55,32 +55,21 @@ for i in $(seq 0 15); do
 
         if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
             HUCX_DIR="${HUCX_DIR:-$KUCCL_PATH/hucx}"
-            XUCG_DIR="${XUCG_DIR:-$KUCCL_PATH/xucg}"
 
-            # Copy UCX/UCG libs to kuccl/install/ to match kuccl_pg.py fallback path:
-            #   _kuccl_dir = dirname(kuccl_pg.py) = _internal/kuccl/
-            #   fallback HUCX_DIR = _kuccl_dir/install/hucx
-            #   fallback XUCG_DIR = _kuccl_dir/install/xucg
-            KUCCL_INSTALL="$TARGET/kuccl/install"
+            if [ -d "$TARGET/kuccl" ]; then
+                rm -rf "$TARGET/kuccl"
+            fi
 
-            # UCX direct deps + plugins -> kuccl/install/hucx/lib/
-            mkdir -p "$KUCCL_INSTALL/hucx/lib/ucx"
-            cp -f "$HUCX_DIR/lib/libucs.so"      "$KUCCL_INSTALL/hucx/lib/"
-            cp -f "$HUCX_DIR/lib/libucm.so.0"    "$KUCCL_INSTALL/hucx/lib/"
-            cp -f "$HUCX_DIR/lib/libucp.so"      "$KUCCL_INSTALL/hucx/lib/"
-            cp -f "$HUCX_DIR/lib/libuct.so.0"    "$KUCCL_INSTALL/hucx/lib/"
-            cp -f "$HUCX_DIR/lib/ucx/libuct_ib.so"     "$KUCCL_INSTALL/hucx/lib/ucx/"
-            cp -f "$HUCX_DIR/lib/ucx/libuct_rdmacm.so" "$KUCCL_INSTALL/hucx/lib/ucx/"
-            cp -f "$HUCX_DIR/lib/ucx/libuct_cma.so"    "$KUCCL_INSTALL/hucx/lib/ucx/"
-            cp -f "$HUCX_DIR/lib/ucx/libuct_sdma.so"   "$KUCCL_INSTALL/hucx/lib/ucx/"
+            mkdir -p "$TARGET/kuccl/install"
 
-            # UCG direct dep + plugins -> kuccl/install/xucg/lib/
-            mkdir -p "$KUCCL_INSTALL/xucg/lib/planc"
-            cp -f "$XUCG_DIR/lib/libucg.so" "$KUCCL_INSTALL/xucg/lib/"
-            cp -f "$XUCG_DIR/lib/planc/libucg_planc_ucx.so"        "$KUCCL_INSTALL/xucg/lib/planc/"
-            cp -f "$XUCG_DIR/lib/planc/libucg_planc_stars.so"      "$KUCCL_INSTALL/xucg/lib/planc/"
-            cp -f "$XUCG_DIR/lib/planc/libucg_planm_ucx_hicoll.so" "$KUCCL_INSTALL/xucg/lib/planc/"
+            SOURCE_KPCKIT_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/hmpi/bisheng/release"
 
+            if [ -d "$SOURCE_KPCKIT_DIR" ]; then
+                cp -a "$SOURCE_KPCKIT_DIR"/. "$TARGET/kuccl/install"
+                echo "[copy_syslibs] KUCCL libs copied from HPCKIT to tp$i"
+            else
+                echo "[copy_syslibs] WARNING: HPCKIT source directory $SOURCE_KPCKIT_DIR does not exit, skipping KUCCL copy for tp$i"
+            fi    
             # libsdma_dk.so: direct dep of libuct_sdma.so plugin -> _internal/
             if [ -f "$HUCX_DIR/lib/libsdma_dk.so" ]; then
                 cp -f "$HUCX_DIR/lib/libsdma_dk.so" "$TARGET/"
