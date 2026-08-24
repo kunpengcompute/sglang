@@ -323,7 +323,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+            if is_cpu_920f():
+                # C++ argmax: batch-parallel SVE scan, avoids the single-threaded
+                # torch.argmax on the (M, vocab) logits.
+                next_token_logits = logits_output.next_token_logits
+                target_predict = torch.empty(
+                    (next_token_logits.shape[0],),
+                    dtype=torch.int64,
+                    device=next_token_logits.device,
+                )
+                torch.ops.sgl_kernel.argmax_last_dim_kunpeng(
+                    next_token_logits.contiguous(), target_predict
+                )
+            else:
+                target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_accepted_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable

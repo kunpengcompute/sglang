@@ -170,6 +170,20 @@ def assign_req_to_token_pool_native(
     device = req_pool_indices.device
     lens = end_offset - start_offset
 
+    if _is_cpu_920f:
+        # C++ kernel: batch-parallel memcpy of each request's out_cache_loc
+        # segment into req_to_token, avoiding the per-element `.item()` syncs
+        # of the Python loop below under single-threaded torch.
+        torch.ops.sgl_kernel.assign_req_to_token_pool_native_kunpeng(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            batch_size,
+        )
+        return
+
     out_start = torch.zeros(batch_size, dtype=torch.long, device=device)
     if batch_size > 1:
         out_start[1:] = torch.cumsum(lens[:-1], dim=0)

@@ -888,8 +888,7 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            topk_p, topk_index = self._softmax_topk(logits_output.next_token_logits)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -1228,11 +1227,27 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
         batch.return_logprob = return_logprob_backup
 
+    def _softmax_topk(self, logits: torch.Tensor):
+        """Softmax + topk, accelerated by the C++ kernel when topk==1 on 920F."""
+        if _is_cpu_920f and self.topk == 1:
+            logits = logits.contiguous()
+            topk_p = torch.empty(
+                (logits.shape[0], 1), dtype=torch.float32, device=logits.device
+            )
+            topk_index = torch.empty(
+                (logits.shape[0], 1), dtype=torch.int64, device=logits.device
+            )
+            torch.ops.sgl_kernel.softmax_topk_kunpeng(logits, topk_p, topk_index)
+            return topk_p, topk_index
+        probs = torch.softmax(logits, dim=-1)
+        return fast_topk(probs, self.topk, dim=-1)
+
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        draft_input.topk_p, draft_input.topk_index = self._softmax_topk(
+            logits_output.next_token_logits
+        )
         draft_input.hidden_states = logits_output.hidden_states
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
