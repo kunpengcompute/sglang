@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_hip, support_triton
+from sglang.srt.utils import get_bool_env_var, is_cpu_920f, is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
 
 _is_hip = is_hip()
@@ -156,6 +156,13 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
+    if is_cpu_920f():
+        out = torch.empty_like(prefix_lens_tensor)
+        torch.ops.sgl_kernel.get_last_loc_kunpeng(
+            req_to_token, req_pool_indices_tensor, prefix_lens_tensor, out
+        )
+        return out
+
     attn_backend = get_global_server_args().attention_backend
     uses_triton_dispatch = attn_backend not in ("ascend", "torch_native", "kunpeng_cpu")
 

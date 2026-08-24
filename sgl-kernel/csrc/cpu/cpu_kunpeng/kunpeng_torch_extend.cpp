@@ -291,7 +291,8 @@ at::Tensor embedding_kunpeng(at::Tensor indices, at::Tensor weight, at::Tensor o
 void build_tree_kernel_kunpeng(at::Tensor parent_list, at::Tensor top_scores_index, at::Tensor seq_lens,
                                at::Tensor tree_mask, at::Tensor positions, at::Tensor retrieve_index,
                                at::Tensor retrieve_next_token, at::Tensor retrieve_next_sibling, int64_t topk,
-                               int64_t spec_steps, int64_t num_verify_tokens, int64_t tree_mask_mode);
+                               int64_t spec_steps, int64_t num_verify_tokens, int64_t tree_mask_mode,
+                               int64_t seq_lens_sum);
 
 void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at::Tensor accept_token_num,
                                 at::Tensor candidates, at::Tensor retrieve_index, at::Tensor retrieve_next_token,
@@ -300,6 +301,32 @@ void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at
 void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded);
 
 void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Tensor o_flat);
+
+// MTP performance kernels (kutacc::parallel_for, not graph ops)
+void softmax_topk_kunpeng(at::Tensor logits, at::Tensor topk_p, at::Tensor topk_index);
+
+void argmax_last_dim_kunpeng(at::Tensor logits, at::Tensor out);
+
+void alloc_extend_kernel_kunpeng(at::Tensor prefix_lens, at::Tensor seq_lens, at::Tensor last_loc,
+                                 at::Tensor free_pages, at::Tensor out_indices, int64_t page_size);
+
+void assign_req_to_token_pool_native_kunpeng(at::Tensor req_pool_indices, at::Tensor req_to_token,
+                                             at::Tensor start_offset, at::Tensor end_offset,
+                                             at::Tensor out_cache_loc, int64_t batch_size);
+
+void get_last_loc_kunpeng(at::Tensor req_to_token, at::Tensor req_pool_indices,
+                          at::Tensor prefix_lens, at::Tensor out);
+
+void assign_draft_cache_locs_kunpeng(at::Tensor req_pool_indices, at::Tensor req_to_token,
+                                     at::Tensor seq_lens, at::Tensor out_cache_loc,
+                                     int64_t speculative_num_steps);
+
+void create_extend_after_decode_kunpeng(at::Tensor verified_id, at::Tensor seq_lens,
+                                        at::Tensor accept_lens, at::Tensor positions,
+                                        at::Tensor new_verified_id);
+
+void compute_position_kunpeng(at::Tensor extend_prefix_lens, at::Tensor extend_seq_lens,
+                              at::Tensor positions, at::Tensor extend_start_loc);
 
 void register_graph_kernels();
 
@@ -738,7 +765,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor parent_list, Tensor top_scores_index, Tensor seq_lens, "
         "Tensor tree_mask, Tensor positions, Tensor retrieve_index, "
         "Tensor retrieve_next_token, Tensor retrieve_next_sibling, "
-        "int topk, int spec_steps, int num_verify_tokens, int tree_mask_mode) -> ()");
+        "int topk, int spec_steps, int num_verify_tokens, int tree_mask_mode, "
+        "int seq_lens_sum) -> ()");
     m.impl("build_tree_kernel_kunpeng", build_tree_kernel_kunpeng);
 
     m.def(
@@ -753,6 +781,45 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("unpad_o_right_mtp_kunpeng(Tensor o_padded, Tensor ext_lens, Tensor o_flat) -> ()");
     m.impl("unpad_o_right_mtp_kunpeng", unpad_o_right_mtp_kunpeng);
+
+    // MTP performance kernels (kutacc::parallel_for based; not graph ops)
+    m.def(
+        "softmax_topk_kunpeng(Tensor logits, Tensor(a!) topk_p, Tensor(b!) topk_index) -> ()");
+    m.impl("softmax_topk_kunpeng", softmax_topk_kunpeng);
+
+    m.def("argmax_last_dim_kunpeng(Tensor logits, Tensor(a!) out) -> ()");
+    m.impl("argmax_last_dim_kunpeng", argmax_last_dim_kunpeng);
+
+    m.def(
+        "alloc_extend_kernel_kunpeng(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, "
+        "Tensor free_pages, Tensor(a!) out_indices, int page_size) -> ()");
+    m.impl("alloc_extend_kernel_kunpeng", alloc_extend_kernel_kunpeng);
+
+    m.def(
+        "assign_req_to_token_pool_native_kunpeng(Tensor req_pool_indices, Tensor(a!) req_to_token, "
+        "Tensor start_offset, Tensor end_offset, Tensor out_cache_loc, int batch_size) -> ()");
+    m.impl("assign_req_to_token_pool_native_kunpeng", assign_req_to_token_pool_native_kunpeng);
+
+    // Second-round MTP performance kernels
+    m.def(
+        "get_last_loc_kunpeng(Tensor req_to_token, Tensor req_pool_indices, "
+        "Tensor prefix_lens, Tensor(a!) out) -> ()");
+    m.impl("get_last_loc_kunpeng", get_last_loc_kunpeng);
+
+    m.def(
+        "assign_draft_cache_locs_kunpeng(Tensor req_pool_indices, Tensor(a!) req_to_token, "
+        "Tensor seq_lens, Tensor out_cache_loc, int speculative_num_steps) -> ()");
+    m.impl("assign_draft_cache_locs_kunpeng", assign_draft_cache_locs_kunpeng);
+
+    m.def(
+        "create_extend_after_decode_kunpeng(Tensor verified_id, Tensor seq_lens, "
+        "Tensor accept_lens, Tensor(a!) positions, Tensor(b!) new_verified_id) -> ()");
+    m.impl("create_extend_after_decode_kunpeng", create_extend_after_decode_kunpeng);
+
+    m.def(
+        "compute_position_kunpeng(Tensor extend_prefix_lens, Tensor extend_seq_lens, "
+        "Tensor(a!) positions, Tensor(b!) extend_start_loc) -> ()");
+    m.impl("compute_position_kunpeng", compute_position_kunpeng);
 
     // set_kv_buffer (MLA KV cache write)
     m.def("set_kv_buffer_kunpeng(Tensor(a!) kv_buffer, Tensor loc, Tensor cache_k) -> ()");

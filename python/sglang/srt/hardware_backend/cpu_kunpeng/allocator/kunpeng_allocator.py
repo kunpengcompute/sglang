@@ -18,7 +18,7 @@ import torch
 import logging
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.utils import get_bool_env_var, get_num_new_pages
+from sglang.srt.utils import get_bool_env_var, get_num_new_pages, is_cpu_920f
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,19 @@ def alloc_extend_kernel_kunpeng(
     page_size,
     device,
 ):
+    if is_cpu_920f():
+        # C++ kernel: single batch-parallel pass over the three segments,
+        # avoiding the per-element `.item()` synchronizations of the Python
+        # loop below when torch runs single-threaded.
+        torch.ops.sgl_kernel.alloc_extend_kernel_kunpeng(
+            prefix_lens,
+            seq_lens,
+            last_loc,
+            free_pages,
+            out_indices,
+            page_size,
+        )
+        return
     extend_lens = seq_lens - prefix_lens
     end_pos = torch.cumsum(extend_lens, 0)
     start_pos = end_pos - extend_lens

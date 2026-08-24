@@ -1178,6 +1178,16 @@ def compute_position(
             extend_seq_lens,
             extend_seq_lens_sum,
         )
+    elif _is_cpu_920f:
+        positions = torch.empty(
+            extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
+        )
+        extend_start_loc = torch.empty(
+            extend_seq_lens.shape[0], dtype=torch.int32, device=extend_seq_lens.device
+        )
+        torch.ops.sgl_kernel.compute_position_kunpeng(
+            extend_prefix_lens, extend_seq_lens, positions, extend_start_loc
+        )
     else:
         positions, extend_start_loc = compute_position_torch(
             extend_prefix_lens, extend_seq_lens
