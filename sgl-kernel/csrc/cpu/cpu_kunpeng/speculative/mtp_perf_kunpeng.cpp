@@ -32,8 +32,8 @@
 // Replaces the Python per-request loop (with `.item()` syncs) with a
 // kutacc::parallel_for over the batch.
 void assign_req_to_token_pool_native_kunpeng(at::Tensor req_pool_indices, at::Tensor req_to_token,
-                                             at::Tensor start_offset, at::Tensor end_offset,
-                                             at::Tensor out_cache_loc, int64_t batch_size)
+                                             at::Tensor start_offset, at::Tensor end_offset, at::Tensor out_cache_loc,
+                                             int64_t batch_size)
 {
     CHECK_INPUT(req_pool_indices);
     CHECK_INPUT(req_to_token);
@@ -89,9 +89,8 @@ void assign_req_to_token_pool_native_kunpeng(at::Tensor req_pool_indices, at::Te
 // Mirrors `spec_utils.py::assign_draft_cache_locs_native` topk=1 branch:
 // for each request i, writes out_cache_loc[i*steps + j] into
 // req_to_token[req_pool_indices[i], seq_lens[i] + j] for j in [0, steps).
-void assign_draft_cache_locs_kunpeng(at::Tensor req_pool_indices, at::Tensor req_to_token,
-                                     at::Tensor seq_lens, at::Tensor out_cache_loc,
-                                     int64_t speculative_num_steps)
+void assign_draft_cache_locs_kunpeng(at::Tensor req_pool_indices, at::Tensor req_to_token, at::Tensor seq_lens,
+                                     at::Tensor out_cache_loc, int64_t speculative_num_steps)
 {
     CHECK_INPUT(req_pool_indices);
     CHECK_INPUT(req_to_token);
@@ -131,9 +130,8 @@ void assign_draft_cache_locs_kunpeng(at::Tensor req_pool_indices, at::Tensor req
 // - new_verified_id[i] = verified_id[cumsum_before[i] + accept_lens[i] - 1]
 //   (when accept_lens[i] >= 1)
 // Eliminates .item() sync and mask-based scatter from the Python version.
-void create_extend_after_decode_kunpeng(at::Tensor verified_id, at::Tensor seq_lens,
-                                        at::Tensor accept_lens, at::Tensor positions,
-                                        at::Tensor new_verified_id)
+void create_extend_after_decode_kunpeng(at::Tensor verified_id, at::Tensor seq_lens, at::Tensor accept_lens,
+                                        at::Tensor positions, at::Tensor new_verified_id)
 {
     CHECK_INPUT(verified_id);
     CHECK_INPUT(seq_lens);
@@ -144,10 +142,10 @@ void create_extend_after_decode_kunpeng(at::Tensor verified_id, at::Tensor seq_l
     TORCH_CHECK(positions.scalar_type() == at::kLong, "positions must be int64");
     TORCH_CHECK(accept_lens.scalar_type() == at::kInt || accept_lens.scalar_type() == at::kLong,
                 "accept_lens must be int32 or int64");
-    TORCH_CHECK(verified_id.scalar_type() == new_verified_id.scalar_type(),
-                "verified_id and new_verified_id must have the same dtype");
     TORCH_CHECK(verified_id.scalar_type() == at::kInt || verified_id.scalar_type() == at::kLong,
                 "verified_id must be int32 or int64");
+    TORCH_CHECK(new_verified_id.scalar_type() == at::kInt || new_verified_id.scalar_type() == at::kLong,
+                "new_verified_id must be int32 or int64");
 
     int64_t B = seq_lens.size(0);
     const int64_t *seq_ptr = seq_lens.data_ptr<int64_t>();
@@ -164,6 +162,7 @@ void create_extend_after_decode_kunpeng(at::Tensor verified_id, at::Tensor seq_l
     }
 
     bool vid_is_i32 = (verified_id.scalar_type() == at::kInt);
+    bool nvid_is_i32 = (new_verified_id.scalar_type() == at::kInt);
     const void *vid_raw = verified_id.data_ptr();
     void *nvid_raw = new_verified_id.data_ptr();
 
@@ -177,11 +176,17 @@ void create_extend_after_decode_kunpeng(at::Tensor verified_id, at::Tensor seq_l
             }
             if (alen >= 1) {
                 if (vid_is_i32) {
-                    static_cast<int32_t *>(nvid_raw)[i] =
-                        static_cast<const int32_t *>(vid_raw)[cb + alen - 1];
+                    if (nvid_is_i32) {
+                        static_cast<int32_t *>(nvid_raw)[i] = static_cast<const int32_t *>(vid_raw)[cb + alen - 1];
+                    } else {
+                        static_cast<int64_t *>(nvid_raw)[i] = static_cast<const int32_t *>(vid_raw)[cb + alen - 1];
+                    }
                 } else {
-                    static_cast<int64_t *>(nvid_raw)[i] =
-                        static_cast<const int64_t *>(vid_raw)[cb + alen - 1];
+                    if (nvid_is_i32) {
+                        static_cast<int32_t *>(nvid_raw)[i] = static_cast<const int64_t *>(vid_raw)[cb + alen - 1];
+                    } else {
+                        static_cast<int64_t *>(nvid_raw)[i] = static_cast<const int64_t *>(vid_raw)[cb + alen - 1];
+                    }
                 }
             }
         }
