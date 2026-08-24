@@ -120,3 +120,41 @@ void alloc_extend_kernel_kunpeng(at::Tensor prefix_lens, at::Tensor seq_lens, at
         }
     });
 }
+
+// Get last token location for each request from req_to_token table.
+//
+// Mirrors `mem_cache/common.py::get_last_loc_torch`: for each request i,
+// if prefix_lens[i] > 0, out[i] = req_to_token[req_pool_indices[i], prefix_lens[i]-1];
+// otherwise out[i] = -1. Output is int64 (matching torch.where promote).
+void get_last_loc_kunpeng(at::Tensor req_to_token, at::Tensor req_pool_indices,
+                          at::Tensor prefix_lens, at::Tensor out)
+{
+    CHECK_INPUT(req_to_token);
+    CHECK_INPUT(req_pool_indices);
+    CHECK_INPUT(prefix_lens);
+    CHECK_INPUT(out);
+    TORCH_CHECK(req_to_token.scalar_type() == at::kInt, "req_to_token must be int32");
+    TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong, "req_pool_indices must be int64");
+    TORCH_CHECK(prefix_lens.scalar_type() == at::kLong, "prefix_lens must be int64");
+    TORCH_CHECK(out.scalar_type() == at::kLong, "out must be int64");
+
+    int64_t B = prefix_lens.size(0);
+    int64_t max_ctx = req_to_token.size(1);
+
+    const int32_t *token_ptr = req_to_token.data_ptr<int32_t>();
+    const int64_t *pool_ptr = req_pool_indices.data_ptr<int64_t>();
+    const int64_t *pref_ptr = prefix_lens.data_ptr<int64_t>();
+    int64_t *out_ptr = out.data_ptr<int64_t>();
+
+    kutacc::parallel_for(0, B, 1, [&](int64_t start, int64_t end) {
+        for (int64_t i = start; i < end; i++) {
+            int64_t pref = pref_ptr[i];
+            if (pref > 0) {
+                int64_t row = pool_ptr[i];
+                out_ptr[i] = (int64_t)token_ptr[row * max_ctx + pref - 1];
+            } else {
+                out_ptr[i] = -1;
+            }
+        }
+    });
+}

@@ -70,36 +70,27 @@ def build_tree_kernel_efficient(
     # if use_partial_packed_tree_mask is True, tree_mask: num_draft_token (flattened, packed)
     if tree_mask_buf is not None:
         tree_mask = tree_mask_buf
-        if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
-            tree_mask.fill_(True)
-        elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
-            tree_mask.fill_(0)
-        elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-            tree_mask.fill_(True)
-        else:
-            raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
-        tree_mask = torch.full(
+        tree_mask = torch.empty(
             (num_verify_tokens * bs * num_verify_tokens,),
-            True,
             dtype=torch.bool,
             device=device,
         )
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
         packed_dtypes = [torch.uint8, torch.uint16, torch.uint32]
         packed_dtype_idx = int(math.ceil(math.log2((num_verify_tokens + 7) // 8)))
-        tree_mask = torch.zeros(
+        tree_mask = torch.empty(
             (num_verify_tokens * bs,),
             dtype=packed_dtypes[packed_dtype_idx],
             device=device,
         )
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-        tree_mask = torch.full(
+        tree_mask = torch.empty(
             (
                 seq_lens_sum * num_verify_tokens
                 + num_verify_tokens * num_verify_tokens * bs,
             ),
-            True,
+            dtype=torch.bool,
             device=device,
         )
     else:
@@ -134,6 +125,7 @@ def build_tree_kernel_efficient(
             spec_steps,
             num_verify_tokens,
             tree_mask_mode,
+            seq_lens_sum,
         )
     elif _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(

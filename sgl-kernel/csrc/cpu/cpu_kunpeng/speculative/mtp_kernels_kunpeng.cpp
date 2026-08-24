@@ -26,37 +26,43 @@
 void build_tree_kernel_kunpeng(at::Tensor parent_list, at::Tensor top_scores_index, at::Tensor seq_lens,
                                at::Tensor tree_mask, at::Tensor positions, at::Tensor retrieve_index,
                                at::Tensor retrieve_next_token, at::Tensor retrieve_next_sibling, int64_t topk,
-                               int64_t spec_steps, int64_t num_verify_tokens, int64_t tree_mask_mode)
+                               int64_t spec_steps, int64_t num_verify_tokens, int64_t tree_mask_mode,
+                               int64_t seq_lens_sum)
 {
     int64_t bs = seq_lens.size(0);
-    auto seq_lens_a = seq_lens.accessor<int64_t, 1>();
-    auto positions_a = positions.accessor<int64_t, 1>();
-    auto retrieve_index_a = retrieve_index.accessor<int64_t, 2>();
-    auto retrieve_next_token_a = retrieve_next_token.accessor<int64_t, 2>();
-    auto retrieve_next_sibling_a = retrieve_next_sibling.accessor<int64_t, 2>();
+    const int64_t *seq_lens_ptr = seq_lens.data_ptr<int64_t>();
+    int64_t *positions_ptr = positions.data_ptr<int64_t>();
+    int64_t *retrieve_index_ptr = retrieve_index.data_ptr<int64_t>();
+    int64_t *retrieve_next_token_ptr = retrieve_next_token.data_ptr<int64_t>();
+    int64_t *retrieve_next_sibling_ptr = retrieve_next_sibling.data_ptr<int64_t>();
 
-    for (int64_t b = 0; b < bs; b++) {
-        int64_t seq_len = seq_lens_a[b];
-        int64_t base = b * num_verify_tokens;
-        for (int64_t t = 0; t < num_verify_tokens; t++) {
-            int64_t idx = base + t;
-            positions_a[idx] = seq_len + t;
-            retrieve_index_a[b][t] = idx;
-            if (t + 1 < num_verify_tokens) {
-                retrieve_next_token_a[b][t] = t + 1;
-            } else {
-                retrieve_next_token_a[b][t] = -1;
+    // Fill positions, retrieve_index, retrieve_next_token, retrieve_next_sibling
+    // (batch-parallel, replaces serial Python loop)
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        for (int64_t b = start; b < end; b++) {
+            int64_t seq_len = seq_lens_ptr[b];
+            int64_t base = b * num_verify_tokens;
+            for (int64_t t = 0; t < num_verify_tokens; t++) {
+                int64_t idx = base + t;
+                positions_ptr[idx] = seq_len + t;
+                retrieve_index_ptr[idx] = idx;
+                retrieve_next_token_ptr[idx] = (t + 1 < num_verify_tokens) ? (t + 1) : -1;
+                retrieve_next_sibling_ptr[idx] = -1;
             }
-            retrieve_next_sibling_a[b][t] = -1;
         }
-    }
+    });
 
-    if (tree_mask_mode == 0) {
-        int64_t total = seq_lens.sum().item<int64_t>() * num_verify_tokens + num_verify_tokens * num_verify_tokens * bs;
-        auto tree_mask_a = tree_mask.accessor<bool, 1>();
-        for (int64_t i = 0; i < total; i++) {
-            tree_mask_a[i] = true;
-        }
+    // Fill tree_mask (fused from Python fill_ logic, avoids aten call)
+    // tree_mask_mode: 0=FULL_MASK, 1=QLEN_ONLY, 2=QLEN_ONLY_BITPACKING
+    int64_t total = tree_mask.numel();
+    if (tree_mask_mode == 0 || tree_mask_mode == 1) {
+        // FULL_MASK or QLEN_ONLY: fill true (bool, sizeof(bool)==1)
+        kutacc::parallel_for(0, total, 1024, [&](int64_t s, int64_t e) {
+            std::memset(static_cast<char *>(tree_mask.data_ptr()) + s, 1, e - s);
+        });
+    } else if (tree_mask_mode == 2) {
+        // QLEN_ONLY_BITPACKING: fill 0 (uint8/uint16/uint32, zero bit pattern)
+        std::memset(tree_mask.data_ptr(), 0, total * tree_mask.element_size());
     }
 }
 

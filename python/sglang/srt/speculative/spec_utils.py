@@ -102,6 +102,12 @@ def create_extend_after_decode_spec_info_native(
     positions: torch.Tensor,  # (total_accepted,)
     new_verified_id: torch.Tensor,  # (batch_size,)
 ):
+    if _is_cpu_920f:
+        torch.ops.sgl_kernel.create_extend_after_decode_kunpeng(
+            verified_id, seq_lens, accept_lens, positions, new_verified_id
+        )
+        return positions, new_verified_id
+
     B = seq_lens.size(0)
     device = accept_lens.device
 
@@ -241,6 +247,16 @@ def assign_draft_cache_locs_native(
     topk: int = 1,
 ):
     if topk == 1:
+        if _is_cpu_920f:
+            torch.ops.sgl_kernel.assign_draft_cache_locs_kunpeng(
+                req_pool_indices,
+                req_to_token,
+                seq_lens,
+                out_cache_loc,
+                speculative_num_steps,
+            )
+            return
+
         B = req_pool_indices.shape[0]
 
         row_idx = req_pool_indices.unsqueeze(1).expand(B, speculative_num_steps)
