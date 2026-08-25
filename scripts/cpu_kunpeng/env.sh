@@ -278,31 +278,33 @@ export SGLANG_TOKENIZER_BACKEND="huggingface"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_ENV_ROLE="${1:-native}"
 
-# IS_PREFILL (PD disaggregation mode for kutacc) is derived from the role:
-# decode/router -> 0, others (prefill/native/build) -> 1.
-case "$USER_ENV_ROLE" in
-    decode|router) export IS_PREFILL="0" ;;
-    *) export IS_PREFILL="1" ;;
-esac
-if [[ "$IS_PREFILL" == "1" ]]; then
-    export SGLANG_KUNPENG_SWAP_EXPERT=1
-    export SGLANG_KUNPENG_MAX_SEQ_NUM=8
-    export SGLANG_KUNPENG_MAX_CUR_LEN=512
-    export SGLANG_KUNPENG_MAX_SEQ_LEN=4096
-else
-    export SGLANG_KUNPENG_MAX_SEQ_NUM=64
-fi
-
 if [[ -f "$SCRIPT_DIR/.user_env.sh" ]]; then
     source "$SCRIPT_DIR/.user_env.sh" "$USER_ENV_ROLE"
 fi
 
-# Decode MTP speculates 1 extra token per step: cur len must be 2
-if [[ "$IS_PREFILL" == "0" ]]; then
-    if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
-        export SGLANG_KUNPENG_MAX_CUR_LEN=2
-    else
-        export SGLANG_KUNPENG_MAX_CUR_LEN=1
+if [[ -z "${IS_PREFILL:-}" ]]; then
+    case "$USER_ENV_ROLE" in
+        decode|router) IS_PREFILL=0 ;;
+        *) IS_PREFILL=1 ;;
+    esac
+fi
+export IS_PREFILL
+
+# Defaults below use ":-" so explicit .user_env.sh overrides still win.
+if [[ "$IS_PREFILL" == "1" ]]; then
+    export SGLANG_KUNPENG_SWAP_EXPERT="${SGLANG_KUNPENG_SWAP_EXPERT:-1}"
+    export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-8}"
+    export SGLANG_KUNPENG_MAX_CUR_LEN="${SGLANG_KUNPENG_MAX_CUR_LEN:-512}"
+    export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-4096}"
+else
+    export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-64}"
+    # Decode MTP speculates 1 extra token per step: cur len must be 2
+    if [[ -z "${SGLANG_KUNPENG_MAX_CUR_LEN:-}" ]]; then
+        if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
+            export SGLANG_KUNPENG_MAX_CUR_LEN=2
+        else
+            export SGLANG_KUNPENG_MAX_CUR_LEN=1
+        fi
     fi
 fi
 
