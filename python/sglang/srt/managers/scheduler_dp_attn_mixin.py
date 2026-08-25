@@ -189,7 +189,11 @@ def _update_gather_batch(
     skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
-    if not require_mlp_tp_gather:
+    # 920F: with skip_all_gather, feed the local token count so that
+    # ForwardBatch.prepare_mlp_sync_batch() still pads local tokens to a
+    # multiple of attn_tp_size; otherwise dispatch_send fails on
+    # non-attn_tp-multiple batch sizes (e.g. the 1-token health-check).
+    if not require_mlp_tp_gather or (skip_all_gather and _is_cpu_920f):
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
     else:
