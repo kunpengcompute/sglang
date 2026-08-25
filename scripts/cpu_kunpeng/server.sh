@@ -122,8 +122,8 @@ case "$ROLE" in
             --disaggregation-mode decode
             --max-total-tokens 139328
             --load-balance-method round_robin
-            --decode-log-interval 2
-            --num-reserved-decode-tokens 256
+            --decode-log-interval 1
+            --num-reserved-decode-tokens 1024
             --max-running-requests $((4 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
         )
         ;;
