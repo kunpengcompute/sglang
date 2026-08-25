@@ -26,6 +26,7 @@ from sglang.srt.distributed.parallel_state import (
     get_attn_tp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_cpu_920f
 from sgl_kernel import pg_helper
 from sglang.srt.graph import ops as kunpeng
@@ -188,15 +189,16 @@ class KunpengCommunicator:
         kernel.shm_allreduce_min_int8_init_kunpeng(1024)
 
         # SHM MLA alltoall (DeepSeek-V3 params); num_heads = 128.
-        num_heads = 128
-        kernel.shm_mla_alltoall_init_kunpeng(
-            self.comm_size,
-            self.max_tokens,
-            192,   # qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-            512,   # kv_lora_rank
-            num_heads // self.comm_size,  # num_local_heads
-            num_heads,
-        )
+        if not get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL"):
+            num_heads = 128
+            kernel.shm_mla_alltoall_init_kunpeng(
+                self.comm_size,
+                self.max_tokens,
+                192,   # qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+                512,   # kv_lora_rank
+                num_heads // self.comm_size,  # num_local_heads
+                num_heads,
+            )
 
         self.dummy_tensor = kernel.create_shm_tensor_kunpeng(
             torch.uint8, [self.comm_size, 1]
