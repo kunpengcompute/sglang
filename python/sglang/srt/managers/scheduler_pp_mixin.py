@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import pickle
 import time
 from collections import defaultdict, deque
@@ -50,6 +51,23 @@ logger = logging.getLogger(__name__)
 
 _is_cpu_920f = is_cpu_920f()
 _DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
+_is_scheduler_skip_all_gather = (
+    os.environ.get("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "0") == "1"
+)
+
+
+def _is_idle_only_batch(batch: Optional[ScheduleBatch]) -> bool:
+    """True when the batch carries no real work for this rank.
+
+    With SGLANG_SCHEDULER_SKIP_ALL_GATHER the scheduler returns an idle batch
+    every iteration even when no requests arrive; such batches must not be
+    treated as real work (e.g. for pp-perf report printing), otherwise an
+    idle server floods the log file.
+    """
+    return batch is None or (
+        _is_scheduler_skip_all_gather and batch.forward_mode.is_idle()
+    )
+
 
 def _ppmtp_log(self, msg: str, *args) -> None:
     """Log PP+MTP debug info with the pp_rank prefix."""
@@ -556,11 +574,13 @@ class SchedulerPPMixin:
                 # Print whenever this iteration does real work: a local batch to
                 # run (cur_batch) or post-processing an incoming micro-batch's
                 # results (mbs[next_mb_id] is not None, e.g. PP0's mb0 consuming
-                # PP1's mb1 output in process_batch_result).
+                # PP1's mb1 output in process_batch_result). Idle-only batches
+                # (issued every iteration under SGLANG_SCHEDULER_SKIP_ALL_GATHER)
+                # do not count as real work.
                 pp_perf_report(
-                    print_report=(
-                        self.cur_batch is not None
-                        or self.mbs[next_mb_id] is not None
+                    print_report=not (
+                        _is_idle_only_batch(self.cur_batch)
+                        and _is_idle_only_batch(self.mbs[next_mb_id])
                     )
                 )
 
@@ -927,6 +947,7 @@ class SchedulerPPMixin:
                 )
         return send_release_work, release_rids
 
+    @Kunpeng_PP_Profiler(depth=1, name="commit_comm")
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         if self.pp_group.kunpeng_pp_communicator is not None:
             # RDMA path: the send is an async single-sided write; "commit"
@@ -1138,6 +1159,12 @@ class SchedulerPPMixin:
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
+    @Kunpeng_PP_Profiler(depth=1, name="allgather")
+    def _pp_all_gather_shard(self, tensor: torch.Tensor, all_gather_group):
+        """Rebuild the full tensor from this rank's shard; the fence wait for
+        all attn_tp ranks to arrive lands inside this span."""
+        return all_gather_group.all_gather(tensor, dim=0)
+
     def _pp_consume_message(
         self: Scheduler, src: int, all_gather_group: Optional = None
     ) -> Optional[Dict[str, Any]]:
@@ -1205,7 +1232,7 @@ class SchedulerPPMixin:
             comm.copy_from_buffer(tensor, pp_offset)
             pp_offset += tensor.nbytes
             if use_all_gather:
-                tensor = all_gather_group.all_gather(tensor, dim=0)
+                tensor = self._pp_all_gather_shard(tensor, all_gather_group)
                 tensor = tensor.reshape(orig_shape)
             tensor_dict[key] = tensor
         msg_type = tensor_dict.get("__msg_type__", "default")
@@ -1240,6 +1267,7 @@ class SchedulerPPMixin:
             )
             self._pp_tensor_dict_inbox.setdefault(msg["kind"], deque()).append(msg)
 
+    @Kunpeng_PP_Profiler(depth=1, name="recv_proxy")
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:

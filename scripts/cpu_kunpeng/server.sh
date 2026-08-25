@@ -124,7 +124,7 @@ case "$ROLE" in
             --load-balance-method round_robin
             --decode-log-interval 2
             --num-reserved-decode-tokens 256
-            --max-running-requests  $((SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
+            --max-running-requests $((4 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
         )
         ;;
     native)
@@ -179,6 +179,7 @@ case "$ROLE" in
             --skip-server-warmup
             --enable-dynamic-batch-tokenizer
             --batch-notify-size "$SGLANG_KUNPENG_MAX_SEQ_NUM"
+            --tokenizer-backend "${SGLANG_TOKENIZER_BACKEND:-huggingface}"
         )
         ;;
     *)

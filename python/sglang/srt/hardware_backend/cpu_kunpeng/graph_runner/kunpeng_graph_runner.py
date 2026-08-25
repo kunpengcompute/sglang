@@ -48,6 +48,9 @@ _is_kunpeng_hbw_pool = is_kunpeng_hbw_pool()
 _is_kunpeng_swap_expert = is_kunpeng_swap_expert()
 _is_kunpeng_graph_capture = is_kunpeng_graph_capture()
 _is_kunpeng_graph_profile = is_kunpeng_graph_profile()
+_is_scheduler_skip_all_gather = (
+    os.environ.get("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "0") == "1"
+)
 
 
 class KunpengGraphRunner:
@@ -755,8 +758,17 @@ class KunpengGraphRunner:
         t0 = time.time()
         outputs = graph.run(inputs)
         t1 = time.time()
-        if os.environ.get("SGLANG_KUNPENG_PP_PROFILE", "0") == "0":
-            logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")   
+        # With SGLANG_SCHEDULER_SKIP_ALL_GATHER the scheduler issues an idle
+        # forward every iteration even when no requests arrive; skip logging
+        # those replays so an idle server does not flood the log file.
+        skip_idle_log = (
+            _is_scheduler_skip_all_gather and forward_batch.forward_mode.is_idle()
+        )
+        if (
+            not skip_idle_log
+            and os.environ.get("SGLANG_KUNPENG_PP_PROFILE", "0") == "0"
+        ):
+            logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
 
         if _is_kunpeng_graph_profile:
             from sglang.srt.graph.profile import write_profile

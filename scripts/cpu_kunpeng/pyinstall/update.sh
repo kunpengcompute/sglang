@@ -18,7 +18,9 @@ SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_path('purelib')
 UPDATE_SGLANG=false
 UPDATE_KERNEL=false
 UPDATE_TORCH=false
-# KUTACC/KUPL .so: only 2 files, cheap to copy, force always
+# KUTACC/KUPL .so: only 2 files, cheap to copy. Copied only when content
+# differs (cmp below) — never blindly swap: unlinking a .so that running
+# processes have mmap'ed causes SIGBUS on page-in after eviction.
 UPDATE_KUTACC=true
 UPDATE_KUPL=true
 # KUCCL .so: only update when SGLANG_ENABLE_KUCCL=1
@@ -63,6 +65,10 @@ if [ "${UPDATE_KUCCL}" != "false" ]; then
     fi
 fi
 
+# KUTACC/KUPL source .so paths (also used for change detection below)
+KUTACC_SO="$KUTACC_PATH/lib/libkutacc.so.25.1.RC1"
+KUPL_SO="$KUPL_PATH/lib/libkupl.so.1"
+
 # Returns 0 if update is needed, 1 otherwise. Sets the N*_DIRTY flags so the
 # copy loop below only copies components that were actually changed.
 NSGLANG=false
@@ -90,10 +96,12 @@ check_if_update_needed() {
     if [ "${UPDATE_KERNEL}" = "true" ] && [ -n "$(find "$SITE_PACKAGES/sgl_kernel" -newer "$MARKER_FILE" -print -quit 2>/dev/null)" ]; then
         NKERNEL=true; needed=0
     fi
-    if [ "${UPDATE_KUTACC}" = "true" ]; then
+    if [ "${UPDATE_KUTACC}" = "true" ] && [ -f "$KUTACC_SO" ] && \
+       ! cmp -s "$KUTACC_SO" "$PYINSTALL_PATH/dist/sglang_server_tp0/_internal/libkutacc.so.25.1.RC1"; then
         NKUTACC=true; needed=0
     fi
-    if [ "${UPDATE_KUPL}" = "true" ]; then
+    if [ "${UPDATE_KUPL}" = "true" ] && [ -f "$KUPL_SO" ] && \
+       ! cmp -s "$KUPL_SO" "$PYINSTALL_PATH/dist/sglang_server_tp0/_internal/libkupl.so.1"; then
         NKUPL=true; needed=0
     fi
     if [ "${UPDATE_KUCCL}" = "true" ] && [ -n "$KUCCL_SO" ]; then
@@ -159,10 +167,10 @@ for i in $(seq 0 15); do
             swap_dir "$SITE_PACKAGES/sgl_kernel" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/sgl_kernel"
         fi
         if [ "${NKUTACC}" = "true" ]; then
-            swap_file "$KUTACC_PATH/lib/libkutacc.so.25.1.RC1" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/libkutacc.so.25.1.RC1"
+            swap_file "$KUTACC_SO" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/libkutacc.so.25.1.RC1"
         fi
         if [ "${NKUPL}" = "true" ]; then
-            swap_file "$KUPL_PATH/lib/libkupl.so.1" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/libkupl.so.1"
+            swap_file "$KUPL_SO" "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/libkupl.so.1"
         fi
         if [ "${NKUCCL}" = "true" ]; then
             mkdir -p "$PYINSTALL_PATH/dist/sglang_server_tp$i/_internal/kuccl"

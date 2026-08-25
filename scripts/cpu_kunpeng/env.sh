@@ -172,7 +172,7 @@ export DECODE_INIT_EXPERT_LOCATION=""
 export DECODE_EP_DISPATCH_ALGORITHM="static"
 
 # PP size and chunked prefill size can be configured independently
-export CHUNKED_PREFILL_SIZE=-1  # must be divisible by page_size * dp_size
+export CHUNKED_PREFILL_SIZE=65536  # must be divisible by page_size * dp_size
 export PREFILL_LONG_PROMPT_PP_SIZE=2
 
 # Optional second argument: prefill instance name (e.g. "long_prompt")
@@ -209,6 +209,7 @@ export SGLANG_WARMUP_TIMEOUT=1600
 export PYTHONWARNINGS="ignore::FutureWarning"
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300
+export SGLANG_SCHEDULER_SKIP_ALL_GATHER=0
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
@@ -252,12 +253,11 @@ export SGLANG_KUNPENG_SDMA_THRESHOLD=5
 # Kunpeng graph capture
 export SGLANG_ENABLE_GRAPH_CAPTURE=1
 export SGLANG_ENABLE_GRAPH_PROFILE=0
+export SGLANG_KUNPENG_GRAPH_CACHE_SIZE=8
 # Kunpeng prefill graph padding to power 2 size
 export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=0
 # Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
-# PD disaggregation mode for kutacc
-export IS_PREFILL="1"
 # Other options
 export DROP_CACHES=0
 # Tokenizer-side cross-process batch timeline logging
@@ -267,14 +267,43 @@ export STREAM_INTERVAL=1
 # Dedicated CPU list for the disaggregation bootstrap server thread (only
 # effective in tokenizer-separate mode). 
 export SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU=418-422
+# Tokenizer backend: "huggingface" (default) or "fastokens"
+# (fastokens requires transformers >= 5.12; on 5.6.0 it hits a Metaspace
+#  pre-tokenizer error with DeepSeek-R1)
+export SGLANG_TOKENIZER_BACKEND="huggingface"
 
 # ------------------------------------------------------------
 # Load local config
 # ------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_ENV_ROLE="${1:-native}"
+
+# IS_PREFILL (PD disaggregation mode for kutacc) is derived from the role:
+# decode/router -> 0, others (prefill/native/build) -> 1.
+case "$USER_ENV_ROLE" in
+    decode|router) export IS_PREFILL="0" ;;
+    *) export IS_PREFILL="1" ;;
+esac
+if [[ "$IS_PREFILL" == "1" ]]; then
+    export SGLANG_KUNPENG_SWAP_EXPERT=1
+    export SGLANG_KUNPENG_MAX_SEQ_NUM=8
+    export SGLANG_KUNPENG_MAX_CUR_LEN=512
+    export SGLANG_KUNPENG_MAX_SEQ_LEN=4096
+else
+    export SGLANG_KUNPENG_MAX_SEQ_NUM=64
+fi
+
 if [[ -f "$SCRIPT_DIR/.user_env.sh" ]]; then
     source "$SCRIPT_DIR/.user_env.sh" "$USER_ENV_ROLE"
+fi
+
+# Decode MTP speculates 1 extra token per step: cur len must be 2
+if [[ "$IS_PREFILL" == "0" ]]; then
+    if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
+        export SGLANG_KUNPENG_MAX_CUR_LEN=2
+    else
+        export SGLANG_KUNPENG_MAX_CUR_LEN=1
+    fi
 fi
 
 # ------------------------------------------------------------
@@ -323,14 +352,12 @@ prefill_config() {
         _prefix="PREFILL"
     fi
     _export_node_config "$_prefix"
-    export IS_PREFILL="1"
     export SGLANG_SKIP_HTTP=1
 }
 
 decode_config() {
     _export_pd_vars "DECODE"
     _export_node_config "DECODE"
-    export IS_PREFILL="0"
     export SGLANG_SKIP_HTTP=1
 }
 
@@ -340,7 +367,6 @@ native_config() {
 
 router_config() {
     export NODE_IPS_LIST="$ROUTER_IP"
-    export IS_PREFILL="0"
     export SGLANG_LAUNCH_HTTP_ONLY=1
 }
 
@@ -371,16 +397,6 @@ fi
 source "${SCRIPT_DIR}/.time_env.sh"
 export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/$ACTION/${LOG_TIME}"
 export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
-
-if [[ "$IS_PREFILL" == "1" ]]; then
-    export SGLANG_KUNPENG_SWAP_EXPERT=1
-    export SGLANG_KUNPENG_MAX_SEQ_NUM=4
-    export SGLANG_KUNPENG_MAX_CUR_LEN=1024
-    export SGLANG_KUNPENG_MAX_SEQ_LEN=4096
-else
-    export SGLANG_KUNPENG_MAX_SEQ_NUM=64
-    export SGLANG_KUNPENG_MAX_CUR_LEN=1
-fi
 
 # Kuccl backend (UCX + UCG) environment
 if [[ "$SGLANG_ENABLE_KUCCL" == "1" ]]; then
