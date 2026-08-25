@@ -217,10 +217,14 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata = None
 
         model_config = model_runner.model_config
-        self.num_q_heads = model_config.num_attention_heads // model_runner.tp_size
+        self.num_q_heads = (
+            model_config.num_attention_heads // get_attention_tp_size()
+        )
         self.head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
         self.head_dim_v = model_config.v_head_dim
         self.kv_cache_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
+        self.decode_head_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
+        self.decode_head_dim_v = model_config.kv_lora_rank
         self.num_layers = model_runner.num_effective_layers
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -383,8 +387,8 @@ class KunpengCpuBackend(AttentionBackend):
                 metadata.seq_lens,
                 seqlen_q=seqlen_q,
                 num_heads_q=num_heads_q,
-                head_dim=self.head_dim,
-                head_dim_v=self.head_dim_v,
+                head_dim=self.decode_head_dim,
+                head_dim_v=self.decode_head_dim_v,
                 page_block_size=metadata.page_size,
                 is_kv_packed=False,
                 meta=self._decode_meta,
