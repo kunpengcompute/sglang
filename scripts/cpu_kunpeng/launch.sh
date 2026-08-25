@@ -77,7 +77,7 @@ if [[ "$ROLE" == "all" ]]; then
 
     bash ./stop.sh router
     bash ./launch.sh prefill --no-log
-    bash ./launch.sh decode --no-log
+    SGLANG_SKIP_UPDATE=1 bash ./launch.sh decode --no-log
 
     source ./env.sh native
     # Wait for prefill and decode HTTP servers to be ready (up to 20 minutes total)
@@ -120,7 +120,9 @@ sh stop.sh "$ROLE"
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
 WORLD_SIZE=${#NODES[@]}
 
-if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" && "$ROLE" != "router" ]]; then
+# SGLANG_SKIP_UPDATE=1 skips the binary update (set for the decode phase of
+# `launch.sh all` so it never re-swaps .so files under running prefill processes).
+if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" && "$ROLE" != "router" && "${SGLANG_SKIP_UPDATE:-0}" != "1" ]]; then
     echo "Update binary sglang..."
     bash ./pyinstall/update.sh
 fi

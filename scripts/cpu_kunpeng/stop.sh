@@ -30,6 +30,15 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# "all" mode: stop every role (router + prefill + decode + native)
+# Handle this before sourcing env.sh, which does not support an "all" role.
+if [[ "$ROLE" == "all" ]]; then
+    for _role in router prefill decode; do
+        bash ./stop.sh "$_role"
+    done
+    exit 0
+fi
+
 # Source config for the specified role
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
 source ./env.sh "$ROLE"
@@ -55,14 +64,6 @@ if [[ "$ROLE" == "router" ]]; then
     exit 0
 fi
 
-# "all" mode: stop every role (router + prefill + decode + native)
-if [[ "$ROLE" == "all" ]]; then
-    for _role in router prefill decode; do
-        ./stop.sh "$_role"
-    done
-    exit 0
-fi
-
 # Convert space-separated IP list to array
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
 WORLD_SIZE=${#NODES[@]}
@@ -82,7 +83,7 @@ for i in "${!NODES[@]}"; do
                 kill -15 $pid 2>/dev/null
             done
 
-            sleep 10
+            sleep 15
 
             REMAINING=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
             if [ -n "$REMAINING" ]; then
