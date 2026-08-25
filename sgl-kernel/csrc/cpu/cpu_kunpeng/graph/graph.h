@@ -26,50 +26,53 @@
 #include "op_record.h"
 #include "memory_pool.h"
 
-class Graph {
+class Graph
+{
 public:
-    Graph(std::vector<StorageBuf> storages,
-          std::vector<TensorView> views,
-          std::vector<OpRecord> ops,
-          std::vector<int> output_view_ids,
-          int num_inputs,
-          const std::unordered_map<int, torch::Tensor>& fixed,
-          torch::Tensor external_pool = {},
-          torch::Tensor external_shm_pool = {});
+    Graph(std::vector<StorageBuf> storages, std::vector<TensorView> views, std::vector<OpRecord> ops,
+          std::vector<int> output_view_ids, int num_inputs, const std::unordered_map<int, torch::Tensor> &fixed,
+          torch::Tensor external_pool = {}, torch::Tensor external_shm_pool = {}, int memory_alignment = 4096);
 
     bool has_hidden_states = false;
     // Backward-compatible: hold fixed tensor references to keep memory alive.
     // data_ptr is already set during begin_capture; this only stores references.
-    void set_fixed(const std::unordered_map<int, torch::Tensor>& fixed) {
+    void set_fixed(const std::unordered_map<int, torch::Tensor> &fixed)
+    {
         hold_fixed(fixed);
     }
-    std::vector<torch::Tensor> run(const std::vector<torch::Tensor>& inputs);
+    std::vector<torch::Tensor> run(const std::vector<torch::Tensor> &inputs);
 
     void enable_profile(bool enable);
-    std::vector<uint64_t> get_profile_row() const { return profile_row_; }
-    const std::vector<std::string>& profile_op_names() const { return op_names_; }
+    std::vector<uint64_t> get_profile_row() const
+    {
+        return profile_row_;
+    }
+    const std::vector<std::string> &profile_op_names() const
+    {
+        return op_names_;
+    }
 
 private:
-    void finalize(const std::unordered_map<int, torch::Tensor>& fixed,
-                  torch::Tensor external_pool, torch::Tensor external_shm_pool);
+    void finalize(const std::unordered_map<int, torch::Tensor> &fixed, torch::Tensor external_pool,
+                  torch::Tensor external_shm_pool, int memory_alignment);
     void compute_death_ops();
-    void plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_pool);
+    void plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_pool, int memory_alignment);
     void detect_outputs();
     void precompute_replay();
-    void hold_fixed(const std::unordered_map<int, torch::Tensor>& fixed);
+    void hold_fixed(const std::unordered_map<int, torch::Tensor> &fixed);
 
     int num_inputs_ = 0;
-    std::vector<int> input_storage_ids_;          // runtime input storage IDs (first N)
-    std::vector<int> fixed_storage_ids_;           // fixed tensor storage IDs
-    std::vector<at::Tensor> fixed_tensors_;        // live Python tensor refs for fixed (GC guard)
-    std::vector<std::vector<int>> input_alias_vids_; // per-input alias view IDs
+    std::vector<int> input_storage_ids_;              // runtime input storage IDs (first N)
+    std::vector<int> fixed_storage_ids_;              // fixed tensor storage IDs
+    std::vector<at::Tensor> fixed_tensors_;           // live Python tensor refs for fixed (GC guard)
+    std::vector<std::vector<int>> input_alias_vids_;  // per-input alias view IDs
 
     std::vector<StorageBuf> storages_;
     std::vector<TensorView> views_;
     std::vector<OpRecord> op_records_;
     MemoryPool pool_;
     MemoryPool shm_pool_;
-    std::vector<int> input_view_ids_;             // = input_storage_ids_ (primary view == storage_id)
+    std::vector<int> input_view_ids_;  // = input_storage_ids_ (primary view == storage_id)
     std::vector<int> output_view_ids_;
     std::vector<std::string> op_names_;
     int total_ops_ = 0;

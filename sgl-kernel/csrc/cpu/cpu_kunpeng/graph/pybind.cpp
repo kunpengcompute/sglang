@@ -202,18 +202,19 @@ void init_graph_cpp(py::module& m)
                          int num_inputs,
                          const std::unordered_map<int, torch::Tensor>& fixed,
                          py::object external_pool,
-                         py::object external_shm_pool) {
+                         py::object external_shm_pool,
+                         int memory_alignment) {
             torch::Tensor pool_tensor;
             if (!external_pool.is_none()) pool_tensor = external_pool.cast<torch::Tensor>();
             torch::Tensor shm_pool_tensor;
             if (!external_shm_pool.is_none()) shm_pool_tensor = external_shm_pool.cast<torch::Tensor>();
             return std::make_unique<Graph>(storages, views, ops,
                                            output_view_ids, num_inputs, fixed,
-                                           pool_tensor, shm_pool_tensor);
+                                           pool_tensor, shm_pool_tensor, memory_alignment);
         }), py::arg("storages"), py::arg("views"), py::arg("ops"),
             py::arg("output_view_ids"), py::arg("num_inputs"),
             py::arg("fixed"), py::arg("external_pool") = py::none(),
-            py::arg("external_shm_pool") = py::none())
+            py::arg("external_shm_pool") = py::none(), py::arg("memory_alignment") = 4096)
         .def_readwrite("has_hidden_states", &Graph::has_hidden_states)
         .def("run", &Graph::run)
         .def("set_fixed", &Graph::set_fixed)
