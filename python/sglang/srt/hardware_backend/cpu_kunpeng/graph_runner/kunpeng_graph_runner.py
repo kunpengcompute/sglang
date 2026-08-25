@@ -213,7 +213,7 @@ class KunpengGraphRunner:
         local slot range so the router's local expert index maps 1:1 onto
         the compressed tensor.
         """
-        logger.info(f"moe weight {name}")
+        logger.debug("moe weight %s", name)
 
         import re
         import math
@@ -233,7 +233,7 @@ class KunpengGraphRunner:
 
         m = re.match(r"^model\.layers\.(\d+)\.mlp\.experts\.\S+$", name)
         if m is None:
-            logger.info(f"non-moe weight {name}")
+            logger.info("non-moe weight %s", name)
             return self.weight_hbw_pool.move_to_hbw(param)
 
         layer_id = int(m.group(1))
@@ -247,7 +247,7 @@ class KunpengGraphRunner:
             layer_id,
             ep_rank * slots_per_rank : (ep_rank + 1) * slots_per_rank,
         ].tolist()
-        logger.info(
+        logger.debug(
             "[KunpengHBW] %s param_shape=%s layer_id=%d ep_rank=%d "
             "ep_world=%d num_physical=%d slots_per_rank=%d slots=%s",
             name, tuple(param.shape), layer_id, ep_rank,
@@ -256,7 +256,7 @@ class KunpengGraphRunner:
         )
 
         valid_local = [i for i, s in enumerate(slots) if s != -1]
-        logger.info("[KunpengHBW] %s valid_local=%s", name, valid_local)
+        logger.debug("[KunpengHBW] %s valid_local=%s", name, valid_local)
         if len(valid_local) == len(slots):
             # No invalid slot on this layer/rank: plain move.
             return self.weight_hbw_pool.move_to_hbw(param)
@@ -269,7 +269,7 @@ class KunpengGraphRunner:
             )
 
         compressed_shape = (len(valid_local),) + tuple(param.shape[1:])
-        logger.info(
+        logger.debug(
             "[KunpengHBW] %s compressed_shape=%s numel=%d bytes=%d",
             name,
             compressed_shape,
@@ -278,7 +278,7 @@ class KunpengGraphRunner:
         )
         hbw_tensor = self.weight_hbw_pool.alloc(compressed_shape, param.dtype)
         hbw_tensor.copy_(param[: len(valid_local)])
-        logger.info(
+        logger.debug(
             "Kunpeng HBW: compressed %s %s -> %s",
             name,
             tuple(param.shape),
