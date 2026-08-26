@@ -372,6 +372,25 @@ void create_extend_after_decode_kunpeng(at::Tensor verified_id, at::Tensor seq_l
 void compute_position_kunpeng(at::Tensor extend_prefix_lens, at::Tensor extend_seq_lens,
                               at::Tensor positions, at::Tensor extend_start_loc);
 
+// Fused MTP verify helpers (kutacc::parallel_for, not graph ops).
+// verify_finish_kunpeng: per-request finished detection + accept_index
+// truncation + per-req counts/tokens/unfinished lists.
+void verify_finish_kunpeng(
+    at::Tensor predict, at::Tensor accept_index, at::Tensor output_ids_len,
+    at::Tensor max_new_tokens, at::Tensor vocab_size,
+    at::Tensor stop_ids_flat, at::Tensor stop_ids_off,
+    at::Tensor eos_ids_flat, at::Tensor eos_ids_off,
+    int64_t tokenizer_eos, int64_t nv, bool use_tokenizer_eos,
+    at::Tensor num_accepted, at::Tensor finished, at::Tensor finish_reason,
+    at::Tensor finish_matched, at::Tensor finish_len,
+    at::Tensor accepted_tokens, at::Tensor accepted_offsets,
+    at::Tensor unfinished_index, at::Tensor unfinished_acc_idx);
+
+// gather_index_kunpeng: parallel row gather replacing the two aten::index ops.
+void gather_index_kunpeng(at::Tensor src_logits, at::Tensor src_hidden,
+                          at::Tensor indices, at::Tensor out_logits,
+                          at::Tensor out_hidden);
+
 void register_graph_kernels();
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
@@ -930,6 +949,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "compute_position_kunpeng(Tensor extend_prefix_lens, Tensor extend_seq_lens, "
         "Tensor(a!) positions, Tensor(b!) extend_start_loc) -> ()");
     m.impl("compute_position_kunpeng", compute_position_kunpeng);
+
+    // Fused MTP verify helpers (kutacc::parallel_for, not graph ops)
+    m.def(
+        "verify_finish_kunpeng("
+        "Tensor predict, Tensor(a!) accept_index, Tensor output_ids_len, "
+        "Tensor max_new_tokens, Tensor vocab_size, "
+        "Tensor stop_ids_flat, Tensor stop_ids_off, "
+        "Tensor eos_ids_flat, Tensor eos_ids_off, "
+        "int tokenizer_eos, int nv, bool use_tokenizer_eos, "
+        "Tensor(b!) num_accepted, Tensor(c!) finished, Tensor(d!) finish_reason, "
+        "Tensor(e!) finish_matched, Tensor(f!) finish_len, "
+        "Tensor(g!) accepted_tokens, Tensor(h!) accepted_offsets, "
+        "Tensor(i!) unfinished_index, Tensor(j!) unfinished_acc_idx) -> ()");
+    m.impl("verify_finish_kunpeng", verify_finish_kunpeng);
+
+    m.def(
+        "gather_index_kunpeng(Tensor src_logits, Tensor src_hidden, "
+        "Tensor indices, Tensor(a!) out_logits, Tensor(b!) out_hidden) -> ()");
+    m.impl("gather_index_kunpeng", gather_index_kunpeng);
 
     // set_kv_buffer (MLA KV cache write)
     m.def("set_kv_buffer_kunpeng(Tensor(a!) kv_buffer, Tensor loc, Tensor cache_k) -> ()");

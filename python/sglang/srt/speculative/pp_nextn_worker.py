@@ -45,7 +45,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.speculative.eagle_worker import EAGLEWorker, gather_index_cpu
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -243,12 +243,13 @@ class PPNextNWorker(EAGLEWorker):
             )
 
         # Post process based on verified outputs.
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
-        ]
-        logits_output.hidden_states = logits_output.hidden_states[
-            res.accepted_indices
-        ]
+        if not gather_index_cpu(logits_output, res.accepted_indices):
+            logits_output.next_token_logits = logits_output.next_token_logits[
+                res.accepted_indices
+            ]
+            logits_output.hidden_states = logits_output.hidden_states[
+                res.accepted_indices
+            ]
         if batch.return_logprob:
             from sglang.srt.speculative.spec_utils import (
                 add_output_logprobs_for_spec_v1,

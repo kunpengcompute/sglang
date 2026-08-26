@@ -18,7 +18,12 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    FINISH_MATCHED_STR,
+    FINISH_MATCHED_TOKEN,
+    ScheduleBatch,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -59,6 +64,20 @@ if is_cuda() or is_musa():
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _pack_id_sets(seqs, device):
+    """Pack a list of per-request id sets into (flat, offsets) int32 tensors."""
+    offsets = [0]
+    total = 0
+    for s in seqs:
+        total += len(s)
+        offsets.append(total)
+    flat = torch.tensor(
+        [x for s in seqs for x in s], dtype=torch.int32, device=device
+    )
+    off = torch.tensor(offsets, dtype=torch.int32, device=device)
+    return flat, off
 
 
 @dataclass
@@ -259,6 +278,164 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
+
+    def _finish_check_cpu(
+        self,
+        batch: ScheduleBatch,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+    ):
+        """Fused per-request finished detection for the 920F pure-token MTP path.
+
+        Runs the per-token finished check, accept_index truncation and
+        per-request counting in a multi-core C++ kernel (GIL released), then
+        writes the per-request Req state in a thin Python shell.
+
+        Returns the same values the Python B-section loop produces:
+          unfinished_index: List[int]
+          unfinished_accept_index: List[torch.Tensor]
+          has_finished: bool
+          num_accepted_drafts_list: List[int]
+          num_accepted_tokens_list: List[int]
+          num_accepted_drafts: torch.Tensor  (per-req accepted draft count)
+        """
+        device = batch.device
+        bs = self.retrieve_index.shape[0]
+        nv = self.draft_token_num
+        total = predict.shape[0]
+
+        # ── Pack per-request pure-token finish parameters ─────────────────
+        output_ids_len = torch.tensor(
+            [len(r.output_ids) for r in batch.reqs],
+            dtype=torch.int64,
+            device=device,
+        )
+        max_new_tokens = torch.tensor(
+            [r.sampling_params.max_new_tokens for r in batch.reqs],
+            dtype=torch.int32,
+            device=device,
+        )
+        vocab_size = torch.tensor(
+            [r.vocab_size for r in batch.reqs], dtype=torch.int32, device=device
+        )
+        stop_flat, stop_off = _pack_id_sets(
+            [
+                list(r.sampling_params.stop_token_ids or [])
+                for r in batch.reqs
+            ],
+            device,
+        )
+        eos_flat, eos_off = _pack_id_sets(
+            [list(r.eos_token_ids or []) for r in batch.reqs], device
+        )
+        use_tokenizer_eos = batch.reqs[0].tokenizer is not None
+        tokenizer_eos = (
+            batch.reqs[0].tokenizer.eos_token_id if use_tokenizer_eos else -1
+        )
+
+        # ── Pre-allocate outputs ─────────────────────────────────────────
+        num_accepted = torch.empty((bs,), dtype=torch.int32, device=device)
+        finished = torch.empty((bs,), dtype=torch.int32, device=device)
+        finish_reason = torch.empty((bs,), dtype=torch.int32, device=device)
+        finish_matched = torch.empty((bs,), dtype=torch.int64, device=device)
+        finish_len = torch.empty((bs,), dtype=torch.int32, device=device)
+        accepted_tokens = torch.full(
+            (bs * nv,), -1, dtype=torch.int32, device=device
+        )
+        accepted_offsets = torch.empty((bs + 1,), dtype=torch.int32, device=device)
+        unfinished_index_t = torch.empty((bs,), dtype=torch.int32, device=device)
+        unfinished_acc_idx = torch.full(
+            (bs * nv,), -1, dtype=torch.int32, device=device
+        )
+
+        # ── Stage 1: fused C++ kernel (GIL released, multi-core) ─────────
+        torch.ops.sgl_kernel.verify_finish_kunpeng(
+            predict,
+            accept_index,
+            output_ids_len,
+            max_new_tokens,
+            vocab_size,
+            stop_flat,
+            stop_off,
+            eos_flat,
+            eos_off,
+            tokenizer_eos,
+            nv,
+            use_tokenizer_eos,
+            num_accepted,
+            finished,
+            finish_reason,
+            finish_matched,
+            finish_len,
+            accepted_tokens,
+            accepted_offsets,
+            unfinished_index_t,
+            unfinished_acc_idx,
+        )
+
+        # ── Stage 2: thin Python shell (per-req Req state only) ──────────
+        num_accepted_cpu = num_accepted.tolist()
+        accepted_tokens_cpu = accepted_tokens.tolist()
+        accepted_offsets_cpu = accepted_offsets.tolist()
+        finished_cpu = finished.tolist()
+        finish_reason_cpu = finish_reason.tolist()
+        finish_matched_cpu = finish_matched.tolist()
+        finish_len_cpu = finish_len.tolist()
+        unfinished_index_t_cpu = unfinished_index_t.tolist()
+
+        has_finished = False
+        unfinished_index = []
+        unfinished_accept_index = []
+        num_accepted_drafts_list = []
+        num_accepted_tokens_list = []
+
+        for i, req in enumerate(batch.reqs):
+            num_acc = num_accepted_cpu[i]
+            off0 = accepted_offsets_cpu[i]
+            # Only the first `num_acc` entries of the row are valid; the rest
+            # of the fixed-size row is -1 padding.
+            tok = accepted_tokens_cpu[off0 : off0 + num_acc]
+            if tok:
+                req.output_ids.extend(tok)
+            if finished_cpu[i]:
+                has_finished = True
+                reason = finish_reason_cpu[i]
+                if reason == 0:
+                    req.finished_reason = FINISH_LENGTH(length=finish_matched_cpu[i])
+                elif reason == 1:
+                    req.finished_reason = FINISH_MATCHED_TOKEN(
+                        matched=finish_matched_cpu[i]
+                    )
+                else:
+                    req.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+                req.finished_len = finish_len_cpu[i]
+            # KV tracking (num_accepted includes the root, matching Python)
+            req.kv_committed_len += num_acc
+            req.kv_allocated_len = req.kv_committed_len
+            if not req.finished():
+                unfinished_index.append(i)
+                unfinished_accept_index.append(
+                    accept_index[i, :num_acc]
+                )
+            req.spec_verify_ct += 1
+            accepted_draft_tokens = num_acc - 1
+            req.spec_accepted_drafts += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
+            num_accepted_drafts_list.append(accepted_draft_tokens)
+            num_accepted_tokens_list.append(num_acc)
+
+        # Recompute the per-req accepted draft counts after truncation as a
+        # tensor (matches the `has_finished` branch which re-derives it).
+        num_accepted_drafts = num_accepted - 1
+
+        return (
+            unfinished_index,
+            unfinished_accept_index,
+            has_finished,
+            num_accepted_drafts_list,
+            num_accepted_tokens_list,
+            num_accepted_drafts,
+        )
 
     def verify(
         self,
@@ -469,63 +646,96 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         has_finished = False
         think_end_id = batch.model_config.think_end_id
 
-        # Iterate every accepted token and check if req has finished after append the token
-        # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            num_accepted = 0
-            for j, idx in enumerate(accept_index_row):
-                if idx == -1:
-                    break
-                num_accepted += 1
-                id = predict_cpu[idx]
-                req.output_ids.append(id)
-                if req.require_reasoning and think_end_id is not None:
-                    req.update_reasoning_tokens(id, think_end_id)
-                req.check_finished()
-                if not req.finished() and req.grammar is not None:
-                    try:
-                        req.grammar.accept_token(id)
-                    except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                        )
-                        raise e
+        # ── Fused CPU finish-check path (replaces the Python double loop) ──
+        # Active only for the 920F pure-token MTP config: topk==1 chain, single
+        # speculative step, greedy verify, no grammar / stop-strs / regex /
+        # reasoning.  The per-token finished detection, accept_index
+        # truncation and per-request counts run in a multi-core C++ kernel with
+        # the GIL released; this Python block only writes per-request Req state.
+        if (
+            is_cpu_920f()
+            and self.topk == 1
+            and self.spec_steps == 1
+            and not any(r.grammar is not None for r in batch.reqs)
+            and not any(r.require_reasoning for r in batch.reqs)
+            and not any(
+                r.sampling_params.stop_strs or r.sampling_params.stop_regex_strs
+                for r in batch.reqs
+            )
+        ):
+            (
+                unfinished_index,
+                unfinished_accept_index,
+                has_finished,
+                num_accepted_drafts_list,
+                num_accepted_tokens_list,
+                num_accepted_drafts,
+            ) = self._finish_check_cpu(
+                batch,
+                predict,
+                accept_index,
+            )
+        else:
+            # Iterate every accepted token and check if req has finished after append the token
+            # should be checked BEFORE free kv cache slots
+            for i, (req, accept_index_row) in enumerate(
+                zip(batch.reqs, accept_index_cpu)
+            ):
+                num_accepted = 0
+                for j, idx in enumerate(accept_index_row):
+                    if idx == -1:
+                        break
+                    num_accepted += 1
+                    id = predict_cpu[idx]
+                    req.output_ids.append(id)
+                    if req.require_reasoning and think_end_id is not None:
+                        req.update_reasoning_tokens(id, think_end_id)
                     req.check_finished()
-                if req.finished():
-                    has_finished = True
-                    # set all tokens after finished token to -1 and break
-                    accept_index[i, j + 1 :] = -1
-                    break
-            # Update KV cache tracking for the accepted tokens
-            req.kv_committed_len += num_accepted
-            req.kv_allocated_len = req.kv_committed_len
-            if not req.finished():
-                unfinished_index.append(i)
-                if idx == -1:
-                    unfinished_accept_index.append(accept_index[i, :j])
-                else:
-                    unfinished_accept_index.append(accept_index[i])
-            req.spec_verify_ct += 1
-            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
-            req.spec_accepted_drafts += accepted_draft_tokens
-            req.update_spec_acceptance_histogram(accepted_draft_tokens)
+                    if not req.finished() and req.grammar is not None:
+                        try:
+                            req.grammar.accept_token(id)
+                        except ValueError as e:
+                            logger.info(
+                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                            )
+                            raise e
+                        req.check_finished()
+                    if req.finished():
+                        has_finished = True
+                        # set all tokens after finished token to -1 and break
+                        accept_index[i, j + 1 :] = -1
+                        break
+                # Update KV cache tracking for the accepted tokens
+                req.kv_committed_len += num_accepted
+                req.kv_allocated_len = req.kv_committed_len
+                if not req.finished():
+                    unfinished_index.append(i)
+                    if idx == -1:
+                        unfinished_accept_index.append(accept_index[i, :j])
+                    else:
+                        unfinished_accept_index.append(accept_index[i])
+                req.spec_verify_ct += 1
+                accepted_draft_tokens = (
+                    sum(1 for idx in accept_index_row if idx != -1) - 1
+                )
+                req.spec_accepted_drafts += accepted_draft_tokens
+                req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
-        if has_finished:
-            num_accepted_drafts = (accept_index != -1).sum(dim=1) - 1
+            if has_finished:
+                num_accepted_drafts = (accept_index != -1).sum(dim=1) - 1
 
-        # Free the KV cache for unaccepted tokens
-        # TODO: fuse them
+        # ── shared compaction + KV eviction ──
+        num_accepted_drafts_cpu = num_accepted_drafts.cpu()
+        num_accepted_tokens_cpu = num_accepted_drafts_cpu + 1
+        num_accepted_drafts_list = num_accepted_drafts_cpu.tolist()
+        num_accepted_tokens_list = num_accepted_tokens_cpu.tolist()
+
         accept_index = accept_index[accept_index != -1]
         verified_id = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
-        num_accepted_drafts_cpu = num_accepted_drafts.cpu()
-        num_accepted_tokens_cpu = num_accepted_drafts_cpu + 1
-        # FIXME: this `tolist()` fixes the numerical calculation consistency
-        # try to unify the tensor representation and list representation
-        num_accepted_drafts_list = num_accepted_drafts_cpu.tolist()
-        num_accepted_tokens_list = num_accepted_tokens_cpu.tolist()
 
+        # Free the KV cache for unaccepted tokens
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             free_loc = batch.out_cache_loc[evict_mask]
@@ -571,13 +781,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
-                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    accept_index,
-                    num_accepted_drafts,
-                    self.draft_token_num,
-                    page_size,
+                src_cache_loc, tgt_cache_loc, to_free_num_slots = (
+                    get_src_tgt_cache_loc(
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        accept_index,
+                        num_accepted_drafts,
+                        self.draft_token_num,
+                        page_size,
+                    )
                 )
                 to_free_slots = torch.empty(
                     (to_free_num_slots.sum().item(),),

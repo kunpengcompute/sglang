@@ -89,6 +89,46 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+def gather_index_cpu(logits_output, accepted_indices):
+    """Parallel row gather for the two aten::index ops on 920F.
+
+    Replaces
+        logits_output.next_token_logits = logits_output.next_token_logits[accepted_indices]
+        logits_output.hidden_states = logits_output.hidden_states[accepted_indices]
+    with a multi-core `gather_index_kunpeng` kernel (GIL released).  Only used
+    on the Kunpeng CPU 920F path; other platforms keep the aten::index form.
+    """
+    if not _is_cpu_920f or accepted_indices is None:
+        return False
+    indices = accepted_indices
+    if indices.numel() == 0:
+        # Empty gather: keep the empty shapes identical to aten::index.
+        logits_output.next_token_logits = logits_output.next_token_logits[indices]
+        logits_output.hidden_states = logits_output.hidden_states[indices]
+        return True
+    k = indices.shape[0]
+    out_logits = torch.empty(
+        (k, logits_output.next_token_logits.shape[-1]),
+        dtype=logits_output.next_token_logits.dtype,
+        device=logits_output.next_token_logits.device,
+    )
+    out_hidden = torch.empty(
+        (k, logits_output.hidden_states.shape[-1]),
+        dtype=logits_output.hidden_states.dtype,
+        device=logits_output.hidden_states.device,
+    )
+    torch.ops.sgl_kernel.gather_index_kunpeng(
+        logits_output.next_token_logits,
+        logits_output.hidden_states,
+        indices,
+        out_logits,
+        out_hidden,
+    )
+    logits_output.next_token_logits = out_logits
+    logits_output.hidden_states = out_hidden
+    return True
+
+
 class EAGLEWorker(TpModelWorker):
 
     def __init__(
@@ -975,10 +1015,13 @@ class EAGLEWorker(TpModelWorker):
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
-        ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        if not gather_index_cpu(logits_output, res.accepted_indices):
+            logits_output.next_token_logits = logits_output.next_token_logits[
+                res.accepted_indices
+            ]
+            logits_output.hidden_states = logits_output.hidden_states[
+                res.accepted_indices
+            ]
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
