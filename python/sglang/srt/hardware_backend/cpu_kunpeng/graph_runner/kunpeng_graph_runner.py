@@ -218,7 +218,6 @@ class KunpengGraphRunner:
         import re
         import math
 
-
         from sglang.srt.distributed.parallel_state import (
             get_moe_expert_parallel_rank,
             get_moe_expert_parallel_world_size,
@@ -770,7 +769,8 @@ class KunpengGraphRunner:
         ):
             logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
 
-        if _is_kunpeng_graph_profile:
+        # Idle replays would grow the profile jsonl unboundedly.
+        if _is_kunpeng_graph_profile and not skip_idle_log:
             from sglang.srt.graph.profile import write_profile
 
             profile_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
@@ -788,6 +788,7 @@ class KunpengGraphRunner:
                     "forward_mode": forward_mode,
                     "count": len(op_names),
                     "total_tokens": total_tokens,
+                    "batch_size": forward_batch.batch_size,
                 },
             )
 

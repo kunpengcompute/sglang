@@ -278,17 +278,33 @@ export SGLANG_TOKENIZER_BACKEND="huggingface"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_ENV_ROLE="${1:-native}"
 
+case "$USER_ENV_ROLE" in
+    decode|router) IS_PREFILL=0 ;;
+    *) IS_PREFILL=1 ;;
+esac
+export IS_PREFILL
+
 if [[ -f "$SCRIPT_DIR/.user_env.sh" ]]; then
     source "$SCRIPT_DIR/.user_env.sh" "$USER_ENV_ROLE"
 fi
 
-if [[ -z "${IS_PREFILL:-}" ]]; then
-    case "$USER_ENV_ROLE" in
-        decode|router) IS_PREFILL=0 ;;
-        *) IS_PREFILL=1 ;;
-    esac
+# Kuccl backend (UCX + UCG) environment
+if [[ "$SGLANG_ENABLE_KUCCL" == "1" ]]; then
+    export UCG_PLANC_UCX_BCAST_ATTR=I:1
+    export UCX_MEM_EVENTS=no
+    export UCX_UD_VERBS_ALLOC=thp,md,mmap,heap
+    export UCX_RC_VERBS_ALLOC=thp,md,mmap,heap
+
+    if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]]; then
+        export HUCX_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/bisheng/release/hucx"
+        export XUCG_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/bisheng/release/xucx"
+        export UCX_MODULE_DIR="${HUCX_DIR}/lib/ucx"
+        export UCX_PLANC=ucx
+        export UCG_PLANC_PATH="${XUCG_DIR}/lib/planc"
+        export LD_LIBRARY_PATH="${HUCX_DIR}/lib:${XUCG_DIR}/lib:${XUCG_DIR}/lib/planc:${LD_LIBRARY_PATH:-}"
+        export PYTHONPATH="${KUCCL_PATH}:${PYTHONPATH:-}"
+    fi
 fi
-export IS_PREFILL
 
 # Defaults below use ":-" so explicit .user_env.sh overrides still win.
 if [[ "$IS_PREFILL" == "1" ]]; then
@@ -399,24 +415,6 @@ fi
 source "${SCRIPT_DIR}/.time_env.sh"
 export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/$ACTION/${LOG_TIME}"
 export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
-
-# Kuccl backend (UCX + UCG) environment
-if [[ "$SGLANG_ENABLE_KUCCL" == "1" ]]; then
-    export UCG_PLANC_UCX_BCAST_ATTR=I:1
-    export UCX_MEM_EVENTS=no
-    export UCX_UD_VERBS_ALLOC=thp,md,mmap,heap
-    export UCX_RC_VERBS_ALLOC=thp,md,mmap,heap
-
-    if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]]; then
-        export HUCX_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/bisheng/release/hucx"
-        export XUCG_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/bisheng/release/xucg"
-        export UCX_MODULE_DIR="${HUCX_DIR}/lib/ucx"
-        export UCG_PLANC=ucx
-        export UCG_PLANC_PATH="${XUCG_DIR}/lib/planc"
-        export LD_LIBRARY_PATH="${HUCX_DIR}/lib:${XUCG_DIR}/lib:${XUCG_DIR}/lib/planc:${LD_LIBRARY_PATH:-}"
-        export PYTHONPATH="${KUCCL_PATH}:${PYTHONPATH:-}"
-    fi
-fi
 
 if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]] || [[ "$ACTION" == "build" ]]; then
     source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
