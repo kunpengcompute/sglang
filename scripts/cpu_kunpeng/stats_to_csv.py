@@ -32,7 +32,7 @@ def compute_stats(durs, num_runs):
     }
 
 
-def to_csv(input_path, output_path):
+def to_csv(input_path, output_path, bs_filter=None):
     modes = []
     current_mode = None
     current_run = []
@@ -43,7 +43,13 @@ def to_csv(input_path, output_path):
         if obj["_type"] == "meta":
             if current_run and current_mode is not None:
                 runs_by_mode[-1][1].append(current_run)
-            current_mode = obj.get("forward_mode", "unknown")
+            # Group by (forward_mode, batch_size): graphs are captured per
+            # (mode, total_tokens, batch_size), so runs of different batch
+            # sizes must not be averaged together.
+            current_mode = (
+                obj.get("forward_mode", "unknown"),
+                obj.get("batch_size"),
+            )
             current_run = []
             if not runs_by_mode or runs_by_mode[-1][0] != current_mode:
                 runs_by_mode.append((current_mode, []))
@@ -56,6 +62,9 @@ def to_csv(input_path, output_path):
     op_stats = {}
     op_order = {}
     for mode_name, all_runs in runs_by_mode:
+        # Optional filter: only keep runs matching a given batch size
+        if bs_filter is not None and mode_name[1] != bs_filter:
+            continue
         if len(all_runs) > 1:
             all_runs = all_runs[1:]
         groups = defaultdict(list)
@@ -81,7 +90,11 @@ def to_csv(input_path, output_path):
 
     with open(output_path, "w") as f:
         for mode_name, stats in op_stats.items():
-            f.write(f"## {mode_name}\n")
+            mode, batch_size = mode_name
+            title = (
+                f"{mode} (batch_size={batch_size})" if batch_size is not None else mode
+            )
+            f.write(f"## {title}\n")
             f.write(",count,min_us,max_us,avg_us,total_ms,percent\n")
             total_ms = 0
             for name in op_order.get(mode_name, []):
@@ -96,4 +109,6 @@ def to_csv(input_path, output_path):
 
 
 if __name__ == "__main__":
-    to_csv(sys.argv[1], sys.argv[2])
+    # Optional third argument: filter by batch size (e.g. 64)
+    bs = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    to_csv(sys.argv[1], sys.argv[2], bs_filter=bs)
