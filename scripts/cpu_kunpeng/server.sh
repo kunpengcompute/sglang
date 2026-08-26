@@ -267,7 +267,7 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
 
                 export UCX_MODULE_DIR="${HUCX_DIR}/lib/ucx"
 
-                export UCX_PLANC=ucx
+                export UCG_PLANC=ucx
                 export UCG_PLANC_PATH="${XUCG_DIR}/lib/planc"
             
                 export LD_LIBRARY_PATH="${HUCX_DIR}/lib:${XUCG_DIR}/lib:${XUCG_DIR}/lib/planc:${LD_LIBRARY_PATH:-}"

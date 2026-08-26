@@ -62,14 +62,14 @@ for i in $(seq 0 15); do
 
             mkdir -p "$TARGET/kuccl/install"
 
-            SOURCE_KPCKIT_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/hmpi/bisheng/release"
+            SOURCE_HPCKIT_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/bisheng/release"
 
-            if [ -d "$SOURCE_KPCKIT_DIR" ]; then
-                cp -a "$SOURCE_KPCKIT_DIR"/. "$TARGET/kuccl/install"
+            if [ -d "$SOURCE_HPCKIT_DIR" ]; then
+                cp -a "$SOURCE_HPCKIT_DIR"/. "$TARGET/kuccl/install/"
                 echo "[copy_syslibs] KUCCL libs copied from HPCKIT to tp$i"
             else
-                echo "[copy_syslibs] WARNING: HPCKIT source directory $SOURCE_KPCKIT_DIR does not exit, skipping KUCCL copy for tp$i"
-            fi    
+                echo "[copy_syslibs] WARNING: HPCKIT source directory $SOURCE_HPCKIT_DIR does not exist, skipping KUCCL copy for tp$i"
+            fi
             # libsdma_dk.so: direct dep of libuct_sdma.so plugin -> _internal/
             if [ -f "$HUCX_DIR/lib/libsdma_dk.so" ]; then
                 cp -f "$HUCX_DIR/lib/libsdma_dk.so" "$TARGET/"
