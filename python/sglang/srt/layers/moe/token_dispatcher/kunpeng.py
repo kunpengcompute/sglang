@@ -119,6 +119,11 @@ class _KunpengDispatcherState:
         self.num_max_dispatch_tokens_per_rank: int = 0
 
         self.dispatch_call_count: torch.Tensor = torch.tensor([0], dtype=torch.int64)
+        # Persistent per-logical-expert counter for the dynamic redundant-expert
+        # remap (round-robin advance / LCG RNG state).  Allocated once so its
+        # address is stable across graph captures; sized to the full logical
+        # expert count (>= the routed rows of the EPLB all-physical map).
+        self.dynamic_remap_counter: Optional[torch.Tensor] = None
         self.router_topk: int = 0
         self.attn_tp_size: int = 0
         self.attn_tp_rank: int = 0
@@ -188,6 +193,10 @@ def _ensure_rdma_initialized(
 
         # Step 2: Buffers
         _init_buffers(state)
+
+        # Dynamic redundant-expert remap counter: one int64 slot per logical
+        # expert, allocated once so the address stays stable for graph capture.
+        state.dynamic_remap_counter = torch.zeros(state.num_experts, dtype=torch.int64)
 
         # Step 3: Dispatch & combine init
         torch.ops.sgl_kernel.moe_dispatch_init_kunpeng(
