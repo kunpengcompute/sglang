@@ -156,7 +156,7 @@ std::vector<PlaceEntry> pack_intervals(std::vector<Interval> intervals, int memo
 
 }  // namespace
 
-void Graph::plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_pool)
+void Graph::plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_pool, int memory_alignment)
 {
     std::vector<Interval> regular_intervals;
     std::vector<Interval> shm_intervals;
