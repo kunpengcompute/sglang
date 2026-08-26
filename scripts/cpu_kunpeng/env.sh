@@ -411,10 +411,10 @@ if [[ "$SGLANG_ENABLE_KUCCL" == "1" ]]; then
         export HUCX_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/bisheng/release/hucx"
         export XUCG_DIR="${HPCKIT_PATH}/26.1.RC1/hmpi/bisheng/release/xucg"
         export UCX_MODULE_DIR="${HUCX_DIR}/lib/ucx"
-        export UCX_PLANC=ucx
+        export UCG_PLANC=ucx
         export UCG_PLANC_PATH="${XUCG_DIR}/lib/planc"
         export LD_LIBRARY_PATH="${HUCX_DIR}/lib:${XUCG_DIR}/lib:${XUCG_DIR}/lib/planc:${LD_LIBRARY_PATH:-}"
-        export PYTHONPATH="${KUCCL_PATH}:${PYTHONPATH:-}" 
+        export PYTHONPATH="${KUCCL_PATH}:${PYTHONPATH:-}"
     fi
 fi
 
