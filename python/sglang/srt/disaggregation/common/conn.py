@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import queue
 import threading
 import time
 from collections import defaultdict
@@ -423,14 +424,24 @@ class CommonKVManager(BaseKVManager):
         return socket
 
     def get_mha_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        decode_start_layer: Optional[int] = None,
+        decode_num_layers: Optional[int] = None,
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
         end_layer = start_layer + num_kv_layers
         dst_num_total_layers = len(dst_kv_ptrs) // 2
-        decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
-        decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
+        # NOTE: decode_start_layer/decode_num_layers MUST be passed per-request by
+        # the caller (transfer_worker). Reading them from the shared self.kv_args
+        # is a data race when multiple transfer threads serve rooms targeting
+        # different decode PP stages concurrently (decode pp>1, prefill pp=1).
+        if decode_start_layer is None:
+            decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
+        if decode_num_layers is None:
+            decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
 
         # prefill pp_size < decode pp_size: slice src to decode's layer range
         if decode_num_layers > 0 and decode_num_layers < num_kv_layers:
@@ -481,11 +492,19 @@ class CommonKVManager(BaseKVManager):
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        decode_start_layer: Optional[int] = None,
+        decode_num_layers: Optional[int] = None,
     ) -> Tuple[List[int], List[int], int]:
         start_layer = self.kv_args.prefill_start_layer
-        decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
-        decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
+        # See NOTE in get_mha_kv_ptrs_with_pp: per-request values must be passed
+        # explicitly; the shared self.kv_args fallback is only for legacy callers.
+        if decode_start_layer is None:
+            decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
+        if decode_num_layers is None:
+            decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
         num_prefill_layers = len(src_kv_ptrs)
 
         # prefill pp_size < decode pp_size: slice src to decode's layer range
@@ -717,16 +736,39 @@ class CommonKVReceiver(BaseKVReceiver):
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
     ):
         url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
-        try:
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
+        # Retry transient failures: 503 (prefill ranks still registering at
+        # startup) and timeouts (the bootstrap server lives in the http-only
+        # router process and can stall for seconds under GIL contention when
+        # all decode ranks fetch simultaneously — observed: Read timed out
+        # killing the request permanently after a single attempt).
+        # 404 fails fast: the rank is absent from the table (dead prefill rank
+        # or topology mismatch) and retrying cannot help.
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    return response.json()
+                if response.status_code == 404:
+                    logger.error(
+                        f"Bootstrap info not found (will NOT retry): "
+                        f"dp_rank={prefill_dp_rank} cp_rank={prefill_cp_rank} "
+                        f"tp_rank={target_tp_rank} pp_rank={target_pp_rank}, "
+                        f"{response.text}"
+                    )
+                    return None
+                logger.warning(
+                    f"Failed to get prefill server info "
+                    f"(attempt {attempt}/{max_attempts}): "
+                    f"{response.status_code}, {response.text}"
                 )
-        except Exception as e:
-            logger.error(f"Error fetching prefill info from bootstrap: {e}")
+            except Exception as e:
+                logger.warning(
+                    f"Error fetching prefill info from bootstrap "
+                    f"(attempt {attempt}/{max_attempts}): {e}"
+                )
+            if attempt < max_attempts:
+                time.sleep(2)
         return None
 
     @staticmethod
@@ -1070,7 +1112,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             # DeepSeek V3 PD-disaggregation on Kunpeng: deepen the listen
             # backlog so bursty route/query requests from decode ranks queue
             # up instead of timing out.
-            backlog = 1024 if envs.SGLANG_USE_CPU_920F.get() else 128
+            backlog = 133928 if envs.SGLANG_USE_CPU_920F.get() else 128
             site = web.TCPSite(
                 self._runner, host=self.host, port=self.port, backlog=backlog
             )

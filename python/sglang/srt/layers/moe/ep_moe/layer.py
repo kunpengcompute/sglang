@@ -657,7 +657,6 @@ class KunpengMoE(FusedMoE):
             **kwargs,
         )
         self.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
-        self.moe_token_multiple = 2
         # Shared-experts output produced during the dispatch send/recv gap
         # when a shared_experts_fn callback is supplied to forward().
         self._shared_output: Optional[torch.Tensor] = None
@@ -714,7 +713,10 @@ class KunpengMoE(FusedMoE):
         self,
         dispatch_output: KunpengDispatchOutput,
     ) -> KunpengCombineInput:
-        from sglang.srt.layers.moe.token_dispatcher.kunpeng import KunpengCombineInput
+        from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+            _KunpengDispatcherState,
+            KunpengCombineInput,
+        )
 
         t_total_start = time.perf_counter()
 
@@ -727,8 +729,11 @@ class KunpengMoE(FusedMoE):
         max_tokens = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")) * int(
             os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024")
         )
+        # single source of truth = dispatcher state.moe_token_multiple
+        # (must match token_ids/packed_recv_x sizing in token_dispatcher/kunpeng.py)
+        dispatch_multiple = _KunpengDispatcherState.get().moe_token_multiple
         recv_dense_size = (
-            self.moe_token_multiple * max_tokens
+            dispatch_multiple * max_tokens
             if self.is_prefill
             else max_dispatch_tokens * self.moe_ep_size * num_local_experts
         )

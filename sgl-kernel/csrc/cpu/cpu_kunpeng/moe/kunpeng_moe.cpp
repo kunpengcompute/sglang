@@ -200,7 +200,7 @@ void moe_comm_finalize_kunpeng()
 
 void moe_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor recv_src_info, at::Tensor recv_src_info_bak,
                                int64_t num_experts, int64_t num_max_dispatch_tokens_per_rank, int64_t hidden,
-                               int64_t num_tokens, int64_t recv_src_info_count, int64_t dtp,
+                               int64_t num_tokens, int64_t recv_src_info_count, int64_t dtp, int64_t multiple,
                                at::Tensor dispatch_recv_buf)
 {
     TORCH_CHECK(g_comm_initialized, "RDMA communication domain not initialized");
@@ -211,7 +211,8 @@ void moe_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor recv_src
     int16_t *src_info_data = recv_src_info_data_bak + recv_src_info_count;
     void *dispatch_recv_buf_data = reinterpret_cast<void *>(dispatch_recv_buf.data_ptr());
 
-    kutacc::moe_dispatch_init(x_data, recv_src_info_data, recv_src_info_data_bak, num_experts, 2,
+    // per-expert capacity multiplier `multiple` is the RUNTIME value
+    kutacc::moe_dispatch_init(x_data, recv_src_info_data, recv_src_info_data_bak, num_experts, multiple,
                               num_max_dispatch_tokens_per_rank, hidden, num_tokens, dtp, src_info_data,
                               dispatch_recv_buf_data, g_moe_comm_h->local_ds_conn_info);
 }
@@ -675,7 +676,7 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info,
                              at::Tensor token_ids,       // [recv_dense_size] int32 (output)
                              at::Tensor experts_offset,  // [num_local_experts + 1] int32 (output)
                              int64_t num_ranks, int64_t num_local_experts, int64_t num_max_dispatch_tokens_per_rank,
-                             int64_t max_tokens, bool is_prefill)
+                             int64_t max_tokens, int64_t multiple, bool is_prefill)
 {
     TORCH_CHECK(experts_offset.size(0) == num_local_experts + 1, "experts_offset size must be num_local_experts + 1");
 
@@ -690,10 +691,11 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info,
     if (is_prefill) {
         for (int64_t ei = 0; ei < num_local_experts; ei++) {
             experts_offset_data[ei] = ti;
-            int token_bias = ei * 2 * max_tokens;
-            int bias_bound = token_bias + 2 * max_tokens;
+            int token_bias = ei * multiple * max_tokens;
+            int bias_bound = token_bias + multiple * max_tokens;
             for (int64_t ri = 0; ri < num_ranks; ri++) {
-                int size = src_info_data[(ei * num_ranks + ri) * (num_max_dispatch_tokens_per_rank * 2 + 1)];
+                int64_t slot_idx = (ei * num_ranks + ri) * (num_max_dispatch_tokens_per_rank * 2 + 1);
+                int size = src_info_data[slot_idx];
                 for (int64_t i = 0; i < size; i++) {
                     token_ids_data[ti] = token_bias;
                     token_bias++;

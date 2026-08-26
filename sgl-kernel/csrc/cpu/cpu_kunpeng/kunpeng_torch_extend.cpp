@@ -192,7 +192,7 @@ void rdma_allgather_full_finalize_kunpeng();
 
 void moe_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor recv_src_info, at::Tensor recv_src_info_bak,
                                int64_t num_experts, int64_t num_max_dispatch_tokens_per_rank, int64_t hidden,
-                               int64_t num_tokens, int64_t recv_src_info_count, int64_t dtp,
+                               int64_t num_tokens, int64_t recv_src_info_count, int64_t dtp, int64_t multiple,
                                at::Tensor dispatch_recv_buf);
 
 void moe_combine_init_kunpeng(at::Tensor combine_send_buf, at::Tensor combined_x, int64_t num_tokens,
@@ -229,7 +229,8 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8, at::Tensor experts_w2
 
 int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info, at::Tensor src_info_bak, at::Tensor token_ids,
                              at::Tensor experts_offset, int64_t num_ranks, int64_t num_local_experts,
-                             int64_t num_max_dispatch_tokens_per_rank, int64_t max_tokens, bool is_prefill);
+                             int64_t num_max_dispatch_tokens_per_rank, int64_t max_tokens, int64_t multiple,
+                             bool is_prefill);
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
                                         int64_t num_experts, int64_t topk, bool force_balance,
@@ -637,7 +638,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def(
         "moe_dispatch_init_kunpeng(Tensor dispatch_send_buf, Tensor recv_src_info, Tensor recv_src_info_bak, "
         "int num_experts, int num_max_dispatch_tokens_per_rank, int hidden, int num_tokens, "
-        "int recv_src_info_count, int dtp, Tensor dispatch_recv_buf) -> ()");
+        "int recv_src_info_count, int dtp, int multiple, Tensor dispatch_recv_buf) -> ()");
     m.impl("moe_dispatch_init_kunpeng", moe_dispatch_init_kunpeng);
 
     m.def(
@@ -694,7 +695,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "topk_convert_kunpeng("
         "Tensor(a!) count, Tensor src_info, Tensor src_info_bak, Tensor(b!) token_ids, Tensor(c!) experts_offset, "
         "int num_ranks, int num_local_experts, int num_max_dispatch_tokens_per_rank, int max_tokens, "
-        "bool is_prefill) -> int");
+        "int multiple, bool is_prefill) -> int");
     m.impl("topk_convert_kunpeng", topk_convert_kunpeng);
 
     // multinomial sampling
