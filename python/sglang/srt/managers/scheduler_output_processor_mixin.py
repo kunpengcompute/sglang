@@ -400,6 +400,16 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        # Idle-batch output only carries the DP load report, which round_robin
+        # dispatch never reads. With SGLANG_SCHEDULER_SKIP_ALL_GATHER an idle
+        # batch runs every loop iteration, so per-iteration sends would flood
+        # the detokenizer/tokenizer managers and bury real outputs — skip them.
+        if (
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+            and self.server_args.load_balance_method.upper() == "ROUND_ROBIN"
+        ):
+            return
+
         self.stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
