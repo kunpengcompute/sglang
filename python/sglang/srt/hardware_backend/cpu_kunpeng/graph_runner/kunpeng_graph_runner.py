@@ -517,6 +517,17 @@ class KunpengGraphRunner:
             inputs.extend(
                 [forward_batch.out_cache_loc, self.model_runner.attn_backend._decode_meta]
             )
+            if getattr(self.model_runner.attn_backend, "_lc_enabled", False):
+                # Long-context decode CP: per-step sparse-attention metadata
+                # (local KV indices + per-sequence counts) consumed by the
+                # graph ops. Shapes vary per step, so they must be graph inputs.
+                inputs.extend(
+                    [
+                        meta.long_context_indices,
+                        meta.long_context_topk_length,
+                        meta.long_context_real_topk_length,
+                    ]
+                )
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 # Block-wise swap: the block_table passed to the attention
                 # kernel is the remapped (HBM slot) version; the per-step

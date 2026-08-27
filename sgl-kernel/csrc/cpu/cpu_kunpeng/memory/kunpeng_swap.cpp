@@ -236,6 +236,10 @@ void kupl_sdma_set_kv_buffer_2(at::Tensor kv_buffer, at::Tensor loc, at::Tensor 
     if (loc.scalar_type() == at::kInt) {
         int32_t *idx = loc.data_ptr<int32_t>();
         for (int64_t i = 0; i < tokens; i++) {
+            // Long-context decode CP: foreign pages carry slot -1 and must be
+            // skipped (they used to be dropped by an eager boolean-mask filter,
+            // which is not graph-capture safe).
+            if (idx[i] < 0) continue;
             uint8_t *dst = buf + static_cast<int64_t>(idx[i]) * dst_stride;
             int event_id = utils::kupl_get_free_event_id();
             utils::kupl_sdma_async(event_id, dst, nope + i * nope_stride,
@@ -251,6 +255,7 @@ void kupl_sdma_set_kv_buffer_2(at::Tensor kv_buffer, at::Tensor loc, at::Tensor 
     } else {
         int64_t *idx = loc.data_ptr<int64_t>();
         for (int64_t i = 0; i < tokens; i++) {
+            if (idx[i] < 0) continue;
             uint8_t *dst = buf + idx[i] * dst_stride;
             int event_id = utils::kupl_get_free_event_id();
             utils::kupl_sdma_async(event_id, dst, nope + i * nope_stride,

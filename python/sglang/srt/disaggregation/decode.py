@@ -59,6 +59,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
+    alloc_decode_cp_interleaved,
+    get_lc_cp_info,
+    is_lc_cp_enabled,
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
@@ -91,6 +94,23 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 _is_cpu_920f = is_cpu_920f()
 kunpeng_max_seq_num = envs.SGLANG_KUNPENG_MAX_SEQ_NUM.get()
+
+
+def _lc_cp_size() -> int:
+    """KV sharding factor under long-context decode CP (>= 1)."""
+    if is_lc_cp_enabled():
+        return max(1, get_lc_cp_info()[0])
+    return 1
+
+
+def _lc_scale_tokens(n: int) -> int:
+    """Scale a full token count down to this rank's 1/cp share.
+
+    Round up so the admission charge never under-estimates the actual local
+    allocation. Returns ``n`` unchanged when interleaved allocation is off.
+    """
+    cp = _lc_cp_size()
+    return (n + cp - 1) // cp if cp > 1 else n
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -524,8 +544,12 @@ class DecodePreallocQueue:
         return decode_req
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        # Under long-context decode CP every rank stores only 1/cp of a
+        # sequence's KV, so the effective per-sequence capacity is the
+        # per-rank pool size multiplied by cp_size.
+        max_total = self.max_total_num_tokens * _lc_cp_size()
+        if len(req.origin_input_ids) > max_total:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {max_total}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
@@ -554,7 +578,7 @@ class DecodePreallocQueue:
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            required_tokens_for_request = (
+            required_tokens_for_request = _lc_scale_tokens(
                 len(req.origin_input_ids)
                 + len(req.output_ids)
                 + self.num_reserved_decode_tokens
@@ -798,22 +822,24 @@ class DecodePreallocQueue:
             else:
                 prefix_indices = None
                 prefix_len = 0
-                required_alloc_tokens = origin_input_len
+                required_alloc_tokens = _lc_scale_tokens(origin_input_len)
 
             required_tokens_for_request = (
-                required_alloc_tokens + self.num_reserved_decode_tokens
+                required_alloc_tokens + _lc_scale_tokens(self.num_reserved_decode_tokens)
             )
 
             if (
                 max(
                     required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
+                    _lc_scale_tokens(
+                        origin_input_len
+                        - prefix_len
+                        + min(
+                            decode_req.req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKEN,
+                        )
+                        - retractable_tokens
+                    ),
                 )
                 > allocatable_tokens
             ):
@@ -938,7 +964,7 @@ class DecodePreallocQueue:
         count_retracted: bool = True,
         extra_reserved_reqs: int = 0,
     ) -> int:
-        need_space_for_single_req = (
+        need_space_for_single_req = _lc_scale_tokens(
             max(
                 [
                     min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
@@ -965,7 +991,7 @@ class DecodePreallocQueue:
                 available_size += self.tree_cache.evictable_size()
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
-            self.num_reserved_decode_tokens
+            _lc_scale_tokens(self.num_reserved_decode_tokens)
             * (
                 len(self.scheduler.running_batch.reqs)
                 + len(self.transfer_queue.queue)
@@ -982,16 +1008,18 @@ class DecodePreallocQueue:
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
-            allocatable_tokens -= self.num_reserved_decode_tokens * len(
+            allocatable_tokens -= _lc_scale_tokens(self.num_reserved_decode_tokens) * len(
                 self.scheduler.last_batch.reqs
             )
 
         if count_retracted:
             allocatable_tokens -= sum(
                 [
-                    len(req.origin_input_ids)
-                    + len(req.output_ids)
-                    + self.num_reserved_decode_tokens
+                    _lc_scale_tokens(
+                        len(req.origin_input_ids)
+                        + len(req.output_ids)
+                        + self.num_reserved_decode_tokens
+                    )
                     for req in self.retracted_queue
                 ]
             )
@@ -1000,13 +1028,16 @@ class DecodePreallocQueue:
     def _required_alloc_tokens(self, *, fill_len: int, prefix_len: int) -> int:
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
-            return fill_len - prefix_len
+            return _lc_scale_tokens(fill_len - prefix_len)
 
         num_new_pages = get_num_new_pages(
             seq_lens=torch.tensor([fill_len], dtype=torch.int64),
             prefix_lens=torch.tensor([prefix_len], dtype=torch.int64),
             page_size=page_size,
         )
+        # Each rank owns only ~1/cp of the new pages; round up so this rank's
+        # admission charge never under-estimates its actual allocation.
+        num_new_pages = _lc_scale_tokens(num_new_pages)
         return num_new_pages * page_size
 
     def _pre_alloc(
@@ -1091,6 +1122,16 @@ class DecodePreallocQueue:
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
+        elif is_lc_cp_enabled():
+            # Long-context decode CP (step 2): PD-disaggregated decode instance
+            # keeps only its own 1/cp share of every sequence's pages
+            # (page p -> rank p % attn_tp_size); foreign positions get -1.
+            kv_loc = alloc_decode_cp_interleaved(
+                tree_cache=self.tree_cache,
+                prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                extend_num_tokens=delta_len,
+            )
         else:
             device = self.token_to_kv_pool_allocator.device
             last_loc = (

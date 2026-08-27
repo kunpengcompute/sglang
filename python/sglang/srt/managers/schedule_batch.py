@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
+    is_lc_cp_enabled,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -1267,6 +1268,11 @@ class Req(ReqDllmMixin):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
+        # Long-context decode CP interleaves KV pages across ranks, leaving -1
+        # holes for non-local tokens. Skip them to avoid negative-index
+        # wraparound in get_cpu_copy.
+        if is_lc_cp_enabled():
+            token_indices = token_indices[token_indices >= 0]
         # Copies over both the kv cache and mamba state if available
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
             token_indices, mamba_indices=self.mamba_pool_idx
@@ -1276,6 +1282,10 @@ class Req(ReqDllmMixin):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
+        # Must apply the same -1 filtering as offload_kv_cache so the host copy
+        # length matches the target indices.
+        if is_lc_cp_enabled():
+            token_indices = token_indices[token_indices >= 0]
         # Loads both the kv cache and mamba state if exists
         token_to_kv_pool_allocator.load_cpu_copy(
             self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx

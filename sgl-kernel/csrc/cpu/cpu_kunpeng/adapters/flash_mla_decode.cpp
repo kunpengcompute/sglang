@@ -47,3 +47,30 @@ static KernelRegistrar _r_flash_mla_dense_decode(
     "flash_mla_dense_decode_kunpeng",
     make_dispatch_v<decltype(&flash_mla_dense_decode_graph),
                     &flash_mla_dense_decode_graph>);
+
+// Long-context decode CP: sparse paged MLA over the rank's local KV shard.
+// The kernel's c10::optional<at::Tensor> meta is exposed as a plain tensor
+// in the graph dispatch signature (the graph engine does not handle
+// optional-tensor argument types).
+void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache,
+                                     at::Tensor indices, at::Tensor topk_length,
+                                     at::Tensor o, at::Tensor softmax_lse,
+                                     double softmax_scale, at::Tensor extra_buffer,
+                                     c10::optional<at::Tensor> meta);
+
+void flash_mla_sparse_decode_graph(at::Tensor q, at::Tensor kcache,
+                                   at::Tensor indices, at::Tensor topk_length,
+                                   at::Tensor extra_buffer, at::Tensor meta,
+                                   at::Tensor o, at::Tensor softmax_lse,
+                                   double softmax_scale, int64_t head_dim_v)
+{
+    (void)head_dim_v;
+    flash_mla_sparse_decode_kunpeng(
+        q, kcache, indices, topk_length, o, softmax_lse,
+        softmax_scale, extra_buffer, meta);
+}
+
+static KernelRegistrar _r_flash_mla_sparse_decode(
+    "flash_mla_sparse_decode_kunpeng",
+    make_dispatch_v<decltype(&flash_mla_sparse_decode_graph),
+                    &flash_mla_sparse_decode_graph>);

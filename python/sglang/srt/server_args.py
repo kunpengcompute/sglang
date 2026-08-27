@@ -49,6 +49,7 @@ from sglang.srt.utils.common import (
     human_readable_int,
     is_blackwell_supported,
     is_cpu,
+    is_cpu_920f,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -3769,6 +3770,16 @@ class ServerArgs:
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with --enable-hisparse"
+                    )
+                if (
+                    is_cpu_920f() and
+                    envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
+                ):
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache is incompatible "
+                        "with long-context decode CP (interleaved KV layout). The "
+                        "cross-request prefix-sharing path has not been validated "
+                        "against -1 KV holes."
                     )
                 if self.disaggregation_transfer_backend != "nixl":
                     raise ValueError(
