@@ -84,7 +84,7 @@ if [[ "$ROLE" == "all" ]]; then
     endpoints=("${PREFILL_MASTER_ADDR}:30000" "${DECODE_MASTER_ADDR}:30000")
     echo "[$(date +%T)] Waiting for prefill and decode servers to be ready (up to 20 minutes)..."
     ready=(0 0)
-    for i in $(seq 1 600); do
+    for i in $(seq 1 12000); do
         for j in 0 1; do
             if [[ "${ready[$j]}" -eq 0 ]] &&
                 curl -sf --max-time 2 "http://${endpoints[$j]}/health" >/dev/null 2>&1; then
@@ -93,7 +93,7 @@ if [[ "$ROLE" == "all" ]]; then
             fi
         done
         [[ "${ready[0]}" -eq 1 && "${ready[1]}" -eq 1 ]] && break
-        sleep 2
+        sleep 0.1
     done
     for j in 0 1; do
         if [[ "${ready[$j]}" -eq 0 ]]; then

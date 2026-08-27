@@ -21,11 +21,13 @@
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <fstream>
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <arm_bf16.h>
 #include <arm_fp16.h>
 
@@ -139,6 +141,14 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
 
     memset(kupl_shm_baseptr, 0, g_shm_size);
 
+    // Pre-mark the whole pool MADV_DONTFORK: later DONTFORK calls from
+    // ibv_reg_mr then hit the kernel no-op path (vma flags unchanged)
+    // instead of misaligned hugetlb VMA splits (EINVAL).
+    if (madvise(kupl_shm_baseptr, g_shm_size, MADV_DONTFORK) != 0) {
+        std::cout << "[KuTACC] WARNING: madvise(MADV_DONTFORK) on shm pool failed: " << strerror(errno)
+                  << ", RDMA reg_mr on hugepage-backed shm buffers may need RDMAV_HUGEPAGES_SAFE=1" << std::endl;
+    }
+
     auto work = g_intra_node_group->barrier();
     work->wait();
 
@@ -217,9 +227,14 @@ at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t
         numel *= s;
     int64_t total_bytes = numel * element_size;
 
-    int64_t alignment = 1;
+    // 64B (cache line) alignment for memcpy fast paths; fall back to
+    // unaligned if padding would overflow the pool.
+    constexpr int64_t alignment = 64;
     uint8_t *cur_ptr = reinterpret_cast<uint8_t *>(shm_available.ptr);
     int64_t align_gap = alignup(cur_ptr, alignment) - cur_ptr;
+    if (total_bytes + align_gap > static_cast<int64_t>(shm_available.size)) {
+        align_gap = 0;
+    }
     uint8_t *allocated_ptr = cur_ptr + align_gap;
     int64_t needed = total_bytes + align_gap;
 
