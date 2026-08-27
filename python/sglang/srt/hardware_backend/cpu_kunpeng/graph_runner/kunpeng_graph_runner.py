@@ -620,6 +620,7 @@ class KunpengGraphRunner:
                 "topk_weights_buf",
                 "topk_ids_flat_buf",
                 "topk_ids_index_buf",
+                "dynamic_remap_counter",
             ):
                 t = getattr(state, attr, None)
                 if t is not None:
@@ -638,11 +639,15 @@ class KunpengGraphRunner:
             )
 
             metadata = get_global_expert_location_metadata()
-            if (
-                metadata is not None
-                and metadata.logical_to_rank_dispatch_physical_map is not None
-            ):
-                fixed.append(metadata.logical_to_rank_dispatch_physical_map)
+            if metadata is not None:
+                if metadata.logical_to_rank_dispatch_physical_map is not None:
+                    fixed.append(metadata.logical_to_rank_dispatch_physical_map)
+                # Dynamic redundant-expert maps, consumed by
+                # remap_topk_ids_to_rank_slot_dynamic_kunpeng during capture.
+                # Like the static map, each MoE layer reads a `[layer_id, :]`
+                # slice, so the FULL tensors must be registered as fixed storage.
+                fixed.append(metadata.logical_to_all_physical_map)
+                fixed.append(metadata.logical_to_all_physical_map_num_valid)
         except Exception:
             pass
         return fixed

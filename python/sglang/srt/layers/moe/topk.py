@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import (
@@ -1253,23 +1254,17 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
     physical slots first.  This mirrors the CUDA ``topk_ids_logical_to_physical``
     step and the reference ``topk_ids2rank_slot`` op.
 
-    The actual remap runs in the ``remap_topk_ids_to_rank_slot_kunpeng`` C++
-    kernel, which is graph-capture friendly (explicit tensor/scalar inputs, no
-    global-state access).  Only the static EPLB algorithm is supported; the
-    dynamic/fake algorithms rely on ``torch.randint`` randomness that is not
-    reproducible under graph replay.
+    The actual remap runs in a C++ kernel (``remap_topk_ids_to_rank_slot_kunpeng``
+    for static EPLB, ``remap_topk_ids_to_rank_slot_dynamic_kunpeng`` for the
+    dynamic/fake redundant-expert algorithms), which is graph-capture friendly
+    (explicit tensor/scalar inputs, no hidden global-state).  The dynamic kernel
+    mirrors the reference ``topk_ids2rank_slot`` / ``RedundantExpertGroup``:
+    mode 0 = round-robin (deterministic, copies evenly balanced, per-logical-
+    expert counter), mode 1 = random over the copies via a thread-local
+    std::mt19937 seeded with 123 (same as reference shuffle_mode == 2).
     """
     assert expert_location_dispatch_info is not None
-    assert expert_location_dispatch_info.ep_dispatch_algorithm == "static", (
-        "remap_topk_ids_to_rank_slot_kunpeng only supports static EPLB dispatch, "
-        f"got {expert_location_dispatch_info.ep_dispatch_algorithm}"
-    )
-    dispatch_map = (
-        expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
-    )
-    assert dispatch_map is not None, (
-        "static EPLB requires partial_logical_to_rank_dispatch_physical_map"
-    )
+    algorithm = expert_location_dispatch_info.ep_dispatch_algorithm
 
     from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
         _KunpengDispatcherState,
@@ -1277,17 +1272,53 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
 
     state = _KunpengDispatcherState.get()
     full_buf = state.topk_ids_index_buf[: topk_ids.shape[0]]
+    ep_size = get_moe_expert_parallel_world_size()
 
-    # --- [KunpengDBG] remap consistency: are topk_ids / dispatch_map the same
-    # across ranks?  ep_rank, attn_tp_rank and dp_rank are printed so that the
-    # per-rank logs can be cross-referenced.
-    kunpeng.remap_topk_ids_to_rank_slot_kunpeng(
-        topk_ids,
-        full_buf,
-        dispatch_map,
-        expert_location_dispatch_info.num_physical_experts,
-        get_moe_expert_parallel_world_size(),
-    )
+    if algorithm == "static":
+        dispatch_map = (
+            expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
+        )
+        assert dispatch_map is not None, (
+            "static EPLB requires partial_logical_to_rank_dispatch_physical_map"
+        )
+        # --- [KunpengDBG] remap consistency: are topk_ids / dispatch_map the
+        # same across ranks?  ep_rank, attn_tp_rank and dp_rank are printed so
+        # that the per-rank logs can be cross-referenced.
+        kunpeng.remap_topk_ids_to_rank_slot_kunpeng(
+            topk_ids,
+            full_buf,
+            dispatch_map,
+            expert_location_dispatch_info.num_physical_experts,
+            ep_size,
+        )
+    elif algorithm in ("dynamic", "fake"):
+        # Every logical expert has a group of physical copies; pick one per
+        # (token, topk) at runtime with a persistent counter (graph-safe).
+        all_physical_map = (
+            expert_location_dispatch_info.partial_logical_to_all_physical_map
+        )
+        num_valid = (
+            expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid
+        )
+        assert state.dynamic_remap_counter is not None, (
+            "dynamic remap requires _KunpengDispatcherState.dynamic_remap_counter"
+        )
+        # 0 = round-robin, 1 = random (reference mt19937, seed 123).
+        shuffle_mode = int(os.environ.get("SGLANG_KUNPENG_MOE_SHUFFLE_MODE", "0"))
+        kunpeng.remap_topk_ids_to_rank_slot_dynamic_kunpeng(
+            topk_ids,
+            full_buf,
+            all_physical_map,
+            num_valid,
+            state.dynamic_remap_counter,
+            shuffle_mode,
+            expert_location_dispatch_info.num_physical_experts,
+            ep_size,
+        )
+    else:
+        raise NotImplementedError(
+            f"Unknown EP dispatch algorithm for Kunpeng remap: {algorithm}"
+        )
 
     # The remap input (topk_ids) may differ across ranks (e.g. after the
     # rank-local load-balance fill step), so the resulting (rank, local)

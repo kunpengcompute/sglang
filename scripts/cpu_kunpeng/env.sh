@@ -151,7 +151,9 @@ export EP_SIZE=${TP_SIZE}
 export PP_SIZE=1  # >1 enable pp  eg: 2
 export REDUNDANT_EXPERTS=0
 export INIT_EXPERT_LOCATION=""
-export EP_DISPATCH_ALGORITHM="static"  # e.g. static, dynamic
+export EP_DISPATCH_ALGORITHM=""  # e.g. static, dynamic
+# Dynamic redundant-expert remap shuffle mode: 0 = round-robin, 1 = random
+export SGLANG_KUNPENG_MOE_SHUFFLE_MODE=0
 
 # Prefill TP/EP/PP size
 export PREFILL_TP_SIZE=${TP_SIZE}
@@ -161,6 +163,7 @@ export PREFILL_PP_SIZE=${PP_SIZE}
 export PREFILL_REDUNDANT_EXPERTS=0
 export PREFILL_INIT_EXPERT_LOCATION=""
 export PREFILL_EP_DISPATCH_ALGORITHM="static"
+export PREFILL_SGLANG_KUNPENG_MOE_SHUFFLE_MODE=0
 
 # Decode TP/EP/PP size
 export DECODE_TP_SIZE=${TP_SIZE}
@@ -170,6 +173,7 @@ export DECODE_PP_SIZE=${PP_SIZE}
 export DECODE_REDUNDANT_EXPERTS=0
 export DECODE_INIT_EXPERT_LOCATION=""
 export DECODE_EP_DISPATCH_ALGORITHM="static"
+export DECODE_SGLANG_KUNPENG_MOE_SHUFFLE_MODE=0
 
 # PP size and chunked prefill size can be configured independently
 export CHUNKED_PREFILL_SIZE=65536  # must be divisible by page_size * dp_size
@@ -348,6 +352,7 @@ _export_pd_vars() {
     _var="${prefix}_REDUNDANT_EXPERTS"; export REDUNDANT_EXPERTS="${!_var}"
     _var="${prefix}_INIT_EXPERT_LOCATION"; export INIT_EXPERT_LOCATION="${!_var}"
     _var="${prefix}_EP_DISPATCH_ALGORITHM"; export EP_DISPATCH_ALGORITHM="${!_var}"
+    _var="${prefix}_SGLANG_KUNPENG_MOE_SHUFFLE_MODE"; export SGLANG_KUNPENG_MOE_SHUFFLE_MODE="${!_var}"
     _var="MODEL_PATH_${prefix}"; export MODEL_PATH="${!_var}"
     _var="SPECULATIVE_DRAFT_MODEL_PATH_${prefix}"; export SPECULATIVE_DRAFT_MODEL_PATH="${!_var}"
     _var="${prefix}_WEIGTHS_HBW_POOL_SIZE_MB"; export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB="${!_var}"
