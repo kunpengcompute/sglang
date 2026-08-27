@@ -224,6 +224,7 @@ export SGLANG_KUNPENG_PP_PROFILE=0  # 1 = enable decode pipeline profiling
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
 export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=0
+export SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE=0
 export SGLANG_KUNPENG_RDMA_ALLGATHER=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_KUNPENG_RDMA_BCAST=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE=0  # 1 = forced MoE load balancing (perf-test only, correctness not preserved)

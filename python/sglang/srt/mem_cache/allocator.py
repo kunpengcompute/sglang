@@ -169,6 +169,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        # Long-context decode CP keeps -1 holes in req_to_token (pages owned by
+        # other ranks); never release them. No-op for the dense layout.
+        free_index = free_index[free_index >= 0]
+        if free_index.numel() == 0:
+            return
 
         if self.is_not_in_free_group:
             if self.need_sort:
@@ -504,6 +509,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return out_indices
 
     def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        # Long-context decode CP keeps -1 holes in req_to_token (pages owned by
+        # other ranks); never release them. No-op for the dense layout.
+        free_index = free_index[free_index >= 0]
         if free_index.numel() == 0:
             return
 

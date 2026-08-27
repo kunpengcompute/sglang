@@ -112,6 +112,37 @@ int64_t flash_mla_dense_decode_sched_kunpeng(const at::Tensor &seqlens_kv, int64
     return extra_bytes_sizes;
 }
 
+int64_t flash_mla_sparse_decode_sched_kunpeng(const at::Tensor &topk_length, int64_t seqlen_q, int64_t num_heads_q,
+                                              int64_t head_dim, int64_t head_dim_v, c10::optional<at::Tensor> meta)
+{
+    kutacc::Tensor<int, 1> kt_topk_length = to_kutacc<int, 1>(topk_length);
+    kutacc::FlashMLAMetaHandle meta_handle = reinterpret_cast<kutacc::FlashMLAMetaHandle>(meta.value().item<int64_t>());
+    int64_t extra_bytes_sizes = 0;
+
+    kutacc::flash_mla_sparse_decode_sched(kt_topk_length.size(0), seqlen_q, num_heads_q, head_dim, head_dim_v, 1, 0,
+                                          kt_topk_length, std::nullopt, extra_bytes_sizes, meta_handle);
+    return extra_bytes_sizes;
+}
+
+void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache, at::Tensor indices, at::Tensor topk_length,
+                                     at::Tensor o, at::Tensor softmax_lse, double softmax_scale,
+                                     at::Tensor extra_buffer, c10::optional<at::Tensor> meta)
+{
+    auto kt_q = to_kutacc<bfloat16_t, 4>(q);
+    auto kt_kcache = to_kutacc<bfloat16_t, 3>(kcache);
+    auto kt_indices = to_kutacc<int, 3>(indices);
+    auto kt_topk_length = to_kutacc<int, 1>(topk_length);
+    auto kt_o = to_kutacc<bfloat16_t, 4>(o);
+    auto kt_softmax_lse = to_kutacc<float, 3>(softmax_lse);
+
+    void *extra_ptr = extra_buffer.data_ptr();
+    kutacc::FlashMLAMetaHandle meta_handle = reinterpret_cast<kutacc::FlashMLAMetaHandle>(meta.value().item<int64_t>());
+
+    kutacc::flash_mla_sparse_decode(kt_q, kt_kcache, kt_indices, kt_topk_length, std::nullopt, std::nullopt,
+                                    std::nullopt, std::nullopt, kt_o, kt_softmax_lse,
+                                    static_cast<float>(softmax_scale), extra_ptr, meta_handle);
+}
+
 std::tuple<int64_t, int64_t> get_flash_attention_block_kunpeng()
 {
     return kutacc::get_flash_attention_block();

@@ -582,6 +582,7 @@ class Envs:
     SGLANG_KUNPENG_ENABLE_SHM_FENCE = EnvBool(False)
     SGLANG_KUNPENG_RDMA_BCAST = EnvBool(False)
     SGLANG_ENABLE_KUCCL = EnvBool(False)
+    SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE = EnvBool(False)
     # Tokenizer-side cross-process batch timeline (scheduler -> detokenizer ->
     # router -> tokenizer worker), used to locate pipeline latency. When
     # enabled, each BatchTokenIDOutput carries wall-clock timestamps and the

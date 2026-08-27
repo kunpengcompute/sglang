@@ -200,6 +200,21 @@ class KunpengCommunicator:
                 num_heads,
             )
 
+        # SHM MLA long-context alltoall (decode CP; comm8 only, matching the
+        # tp=8 single-socket long-context decode constraint).
+        if (
+            envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
+            and self.comm_size == 8
+        ):
+            num_heads = 128
+            kernel.shm_mla_alltoall_long_context_init_kunpeng(
+                self.comm_size,
+                self.max_tokens,  # per-step decode batch budget
+                512,   # kv_lora_rank (v_head_dim)
+                num_heads // self.comm_size,  # num_local_heads
+                num_heads,
+            )
+
         self.dummy_tensor = kernel.create_shm_tensor_kunpeng(
             torch.uint8, [self.comm_size, 1]
         )
@@ -277,6 +292,7 @@ class KunpengCommunicator:
         kernel.shm_allgather_finalize_kunpeng()
         kernel.shm_allreduce_finalize_kunpeng()
         kernel.shm_allreduce_min_int8_finalize_kunpeng()
+        kernel.shm_mla_alltoall_long_context_finalize_kunpeng()
         kernel.shm_pool_destroy_kunpeng()
 
 

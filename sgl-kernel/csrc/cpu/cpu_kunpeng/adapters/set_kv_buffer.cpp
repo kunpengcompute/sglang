@@ -95,6 +95,10 @@ void set_kv_buffer_2_kunpeng(at::Tensor kv_buffer, at::Tensor loc,
     if (loc.scalar_type() == at::kInt) {
         int32_t* idx = loc.data_ptr<int32_t>();
         for (int64_t i = 0; i < tokens; i++) {
+            // Long-context decode CP: foreign pages carry slot -1 and must be
+            // skipped (they used to be dropped by an eager boolean-mask filter,
+            // which is not graph-capture safe).
+            if (idx[i] < 0) continue;
             uint8_t* dst = buf + idx[i] * buf_stride_bytes;
             std::memcpy(dst, nope + i * nope_stride_bytes, nope_bytes);
             std::memcpy(dst + nope_bytes, pe + i * pe_stride_bytes, pe_bytes);
@@ -102,6 +106,7 @@ void set_kv_buffer_2_kunpeng(at::Tensor kv_buffer, at::Tensor loc,
     } else {
         int64_t* idx = loc.data_ptr<int64_t>();
         for (int64_t i = 0; i < tokens; i++) {
+            if (idx[i] < 0) continue;
             uint8_t* dst = buf + idx[i] * buf_stride_bytes;
             std::memcpy(dst, nope + i * nope_stride_bytes, nope_bytes);
             std::memcpy(dst + nope_bytes, pe + i * pe_stride_bytes, pe_bytes);

@@ -606,6 +606,11 @@ class MooncakeKVManager(CommonKVManager):
         Generic KV cache transfer supporting both MHA and MLA architectures.
         This method is used by both send_kvcache (full pool) and maybe_send_extra.
         """
+        valid_dst = dst_data_indices >= 0
+        if not valid_dst.all():
+            prefill_data_indices = prefill_data_indices[valid_dst]
+            dst_data_indices = dst_data_indices[valid_dst]
+
         # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices

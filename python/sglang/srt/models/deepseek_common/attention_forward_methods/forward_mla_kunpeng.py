@@ -17,8 +17,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.distributed import get_socket_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.graph import ops as kunpeng
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -32,12 +34,80 @@ if TYPE_CHECKING:
 _DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
 
 
+def _lc_exchange_partial_o(o, lse, real_topk_length, cp_size, num_local_heads):
+    """Exchange partial attention outputs across the cp group.
+
+    o:             (B, Nh_all, D) bf16, partial attention of EVERY head over
+                   this rank's local KV shard (head block i belongs to cp
+                   rank i).
+    lse:           (B, Nh_all) fp32, log-sum-exp of the partial attention.
+    real_topk_length: (B,) int32, this rank's per-sequence local KV counts.
+
+    Returns:
+        o_contrib:   (cp_size, B, Nh_local, D) bf16, o_contrib[p] is the
+                     partial output contributed by cp rank p for this rank's
+                     local heads.
+        lse_contrib: (cp_size, B, Nh_local) fp32, matching LSEs.
+        topk_out:    (cp_size*B,) int32, topk_out[p*B+b] is cp rank p's local
+                     KV count for sequence b (0 => empty shard, weight 0).
+    """
+    B, Nh_all, D = o.shape
+
+    # kutacc SHM exchange: every rank stages O/LSE/topk into a dedicated SHM
+    # region, barriers (kupl_shm_fence), then reads its own head block from
+    # every peer (pure read; no cross-rank writes). This replaces the gloo
+    # all_to_all x2 + all_gather.
+    o_out = kunpeng.alloc_buffer(
+        cp_size * B * num_local_heads * D, dtype=o.dtype
+    ).view(cp_size * B, num_local_heads, D)
+    lse_out = kunpeng.alloc_buffer(
+        cp_size * B * num_local_heads, dtype=lse.dtype
+    ).view(cp_size * B, num_local_heads)
+    topk_out = kunpeng.alloc_buffer(cp_size * B, dtype=torch.int32)
+    kunpeng.shm_mla_o_alltoall_long_context_kunpeng(
+        o.contiguous(),
+        lse.contiguous(),
+        real_topk_length.contiguous(),
+        o_out,
+        lse_out,
+        topk_out,
+    )
+
+    # o_out (cp*B, Nh_local, D): o_out[p*B+b] = shard p's partial output for
+    # this rank's head block. -> (cp, B, Nh_local, D)
+    o_contrib = o_out.view(cp_size, B, num_local_heads, D)
+    lse_contrib = lse_out.view(cp_size, B, num_local_heads)
+
+    return o_contrib, lse_contrib, topk_out
+
+
+def _lc_reduce_partial_o(o_contrib, lse_contrib, topk_out, cp_size):
+    """Merge per-shard partial attention outputs (online-softmax reduction).
+
+    o_contrib:   (cp_size, B, Nh_local, D) bf16
+    lse_contrib: (cp_size, B, Nh_local) fp32
+    topk_out:    (cp_size*B,) int32, per-(shard, seq) local KV counts (0 =>
+                 empty shard contributes weight 0).
+
+    Runs entirely inside the graph-compatible ``flash_mla_reduce_kunpeng`` op
+    (max-based online-softmax merge accumulated in fp32, written as bf16).
+    Returns merged (B, Nh_local, D).
+    """
+    B, Nh_local, D = o_contrib.shape[1], o_contrib.shape[2], o_contrib.shape[3]
+    out = kunpeng.alloc_buffer(B * Nh_local * D, dtype=torch.bfloat16).view(
+        B, Nh_local, D
+    )
+    kunpeng.flash_mla_reduce_kunpeng(o_contrib, lse_contrib, topk_out, out)
+    return out
+
+
 class DeepseekMLAKunpengForwardMixin:
 
     def init_mla_forward_kunpeng(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
+        self._lc_enabled = envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
 
     def forward_absorb_prepare_kunpeng(
         self: DeepseekV2AttentionMLA,
@@ -112,6 +182,14 @@ class DeepseekMLAKunpengForwardMixin:
 
             q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
 
+        def _lc_filter(loc, kk, pp):
+            """Long-context decode CP (step 2): foreign pages carry slot -1 in
+            out_cache_loc. The kunpeng write kernels skip ``loc < 0`` rows, so
+            the non-local rows no longer need to be dropped eagerly here
+            (boolean-mask filtering allocates new tensors and is not
+            graph-capture safe)."""
+            return loc, kk, pp
+
         if self.swap_mgr.enable_swap_kv_in:
             # Block-wise (decode): out_cache_loc is remapped to HBM flat
             # positions; k_nope/k_pe must be sliced to this rank's Btp tokens
@@ -129,31 +207,32 @@ class DeepseekMLAKunpengForwardMixin:
                     k_nope[start:end], k_pe[start:end],
                 )
             else:
+                loc_w, k_w, p_w = _lc_filter(
+                    forward_batch.out_cache_loc, k_nope, k_pe
+                )
                 self.swap_mgr.set_kv_buffer_2(
-                    self.swap_mgr._cur_kv_hbm,
-                    forward_batch.out_cache_loc,
-                    k_nope,
-                    k_pe,
+                    self.swap_mgr._cur_kv_hbm, loc_w, k_w, p_w
                 )
 
             # DDR write keeps the original (un-remapped) out_cache_loc.
             if self.swap_mgr.enable_swap_kv_out:
-                self.swap_mgr.set_kv_buffer_2_sdma(
+                loc_w, k_w, p_w = _lc_filter(
                     forward_batch.out_cache_loc, k_nope, k_pe
                 )
+                self.swap_mgr.set_kv_buffer_2_sdma(loc_w, k_w, p_w)
             else:
+                loc_w, k_w, p_w = _lc_filter(
+                    forward_batch.out_cache_loc, k_nope, k_pe
+                )
                 self.swap_mgr.set_kv_buffer_2(
-                    self.swap_mgr._cur_kv_ddr,
-                    forward_batch.out_cache_loc,
-                    k_nope,
-                    k_pe,
+                    self.swap_mgr._cur_kv_ddr, loc_w, k_w, p_w
                 )
         else:
+            loc_w, k_w, p_w = _lc_filter(
+                forward_batch.out_cache_loc, k_nope, k_pe
+            )
             self.swap_mgr.set_kv_buffer_2(
-                self.swap_mgr._cur_kv_ddr,
-                forward_batch.out_cache_loc,
-                k_nope,
-                k_pe,
+                self.swap_mgr._cur_kv_ddr, loc_w, k_w, p_w
             )
 
         return (
@@ -195,7 +274,58 @@ class DeepseekMLAKunpengForwardMixin:
             )  # (bs, max_ext_len, H, D)
 
         tp_size = get_attention_tp_size()
-        if tp_size > 1 and not _DISABLE_MLA_ALL2ALL:
+        if self._lc_enabled:
+            # ---- Long-context decode CP ----
+            # Every rank keeps the FULL batch and attends only to its local
+            # 1/cp KV shard (sparse flash MLA). Q is all-gathered so each rank
+            # holds all heads of the cp group; the partial attention outputs
+            # (plus LSE) are exchanged back with all_to_all and merged.
+            assert not is_draft_extend, (
+                "long-context decode CP does not support MTP draft-extend"
+            )
+            socket_group = get_socket_tp_group()
+            cp_size = socket_group.world_size
+            B_q, numhead_local_q, D_qk = q.shape
+
+            # Q allgather: (B, Nh_local, D) -> (B, Nh_local*cp_size, D)
+            q_flat = q.contiguous().view(B_q, -1)
+            if envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get():
+                kunpeng.shm_fence_kunpeng(cp_size)
+            q_all = kunpeng.shm_batched_allgather_kunpeng(q_flat, cp_size)
+            # (B, Nh_local*D*cp): head block r sits at column
+            # [r*Nh_local*D, (r+1)*Nh_local*D) of every row.
+            q = (
+                q_all.view(B_q, cp_size, numhead_local_q, D_qk)
+                .reshape(B_q, numhead_local_q * cp_size, D_qk)
+            )
+
+            saved_tp_q_head_num = self.attn_mqa.tp_q_head_num
+            self.attn_mqa.tp_q_head_num = numhead_local_q * cp_size
+            try:
+                attn_output, softmax_lse = self._call_attn_mqa(
+                    q, k, k_nope, forward_batch, topk_indices
+                )
+            finally:
+                self.attn_mqa.tp_q_head_num = saved_tp_q_head_num
+
+            # Partial attention over this rank's local KV shard:
+            # attn_output (B, 1, Nh_all, D), softmax_lse (B, 1, Nh_all).
+            attn_output = attn_output[:, 0, :, :]  # (B, Nh_all, D)
+            softmax_lse = softmax_lse[:, 0, :]  # (B, Nh_all)
+            real_topk_length = (
+                forward_batch.attn_backend.forward_metadata.long_context_real_topk_length
+            )
+            o_contrib, lse_contrib, topk_out = _lc_exchange_partial_o(
+                attn_output,
+                softmax_lse,
+                real_topk_length,
+                cp_size,
+                numhead_local_q,
+            )
+            attn_output = _lc_reduce_partial_o(
+                o_contrib, lse_contrib, topk_out, cp_size
+            )
+        elif tp_size > 1 and not _DISABLE_MLA_ALL2ALL:
             socket_group = get_socket_tp_group()
             all2all_size = socket_group.world_size
 

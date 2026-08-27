@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.common import is_lc_cp_enabled
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -152,6 +153,11 @@ class DecodeKVCacheOffloadManager:
         end = start + incremental_aligned_len
         incremental_tokens = all_tokens[start:end]
         incremental_indices = token_indices[start:end]
+        # Long-context decode CP interleaves KV pages across ranks, leaving -1
+        # holes for non-local tokens. Skip them before backup so the host copy
+        # count matches the valid device slots.
+        if is_lc_cp_enabled():
+            incremental_indices = incremental_indices[incremental_indices >= 0]
 
         # Early free prefill-offloaded GPU memory
         if state.prefill_len > 0 and state.inc_len == 0:

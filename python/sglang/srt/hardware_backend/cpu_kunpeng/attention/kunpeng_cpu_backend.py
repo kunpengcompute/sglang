@@ -34,7 +34,10 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.common import is_kunpeng_hbw_pool
+from sglang.srt.utils.common import (
+    is_kunpeng_hbw_pool,
+    is_kunpeng_swap_kv_blockwise,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -209,12 +212,28 @@ class KunpengCpuMetadata:
         self.batchsize_per_tp: int = 0
         self.token_slice_start: int = 0
 
+        # Long-context decode CP metadata (sparse flash MLA over the local
+        # 1/cp KV shard). Built once per decode step, reused across layers.
+        # ``long_context_indices`` is a PERSISTENT fixed-shape (B, 1, MAX_TOPK)
+        # buffer (MAX_TOPK derived from the model context length) so the shape
+        # stays constant across steps and the tensor can be a graph input; only
+        # the real prefix [0, fill_len[b]) is valid per step. ``last_req_idx`` /
+        # ``last_seq_len`` track per-row continuation so a row is incrementally
+        # appended on a normal step and fully rebuilt after a batch reshuffle.
+        self.long_context_topk_length: Optional[torch.Tensor] = None
+        self.long_context_real_topk_length: Optional[torch.Tensor] = None
+        self.long_context_indices: Optional[torch.Tensor] = None
+        self.long_context_fill_len: Optional[torch.Tensor] = None
+        self.long_context_last_req_idx: Optional[torch.Tensor] = None
+        self.long_context_last_seq_len: Optional[torch.Tensor] = None
+
 
 class KunpengCpuBackend(AttentionBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.forward_metadata = None
+        self.model_runner = model_runner
 
         model_config = model_runner.model_config
         self.num_q_heads = (
@@ -235,6 +254,29 @@ class KunpengCpuBackend(AttentionBackend):
         self._decode_meta = torch.ops.sgl_kernel.flash_mla_meta_create_kunpeng()
         self.swap_mgr = KunpengSwapManager.get_instance()
 
+        # Long-context decode CP (decode context parallelism). When enabled,
+        # every rank keeps the full batch and attends only to its local 1/cp
+        # KV shard; partial attention outputs are merged via the SHM exchange
+        # (Q allgather + O/LSE/topk pure-read exchange + online-softmax reduce).
+        # Decode only, MTP off, no blockwise KV swap.
+        self._lc_enabled = envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
+        self._lc_cp_size: int = 0
+        self._lc_cp_rank: int = -1
+        # Fixed top-k bound of the sparse-attention metadata (see
+        # _init_long_context_metadata); 0 until the first LC decode step.
+        self._lc_max_topk: int = 0
+        if self._lc_enabled:
+            assert (
+                self.speculative_num_draft_tokens == 1
+            ), "long-context decode CP requires MTP/speculation disabled"
+            assert not is_kunpeng_swap_kv_blockwise(), (
+                "long-context decode CP conflicts with blockwise KV swap"
+            )
+            logger.info(
+                "Long-context decode CP enabled "
+                "(SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE=1)"
+            )
+
         self.forward_metadata = KunpengCpuMetadata()
 
     def __del__(self):
@@ -253,6 +295,14 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata.all2all_size = 1
         self.forward_metadata.batchsize_per_tp = 0
         self.forward_metadata.token_slice_start = 0
+        self.forward_metadata.long_context_topk_length = None
+        self.forward_metadata.long_context_real_topk_length = None
+        # long_context_indices / fill_len / last_req_idx / last_seq_len are
+        # PERSISTENT fixed-shape buffers (re)allocated and refilled by
+        # _init_long_context_metadata every decode step; they must survive
+        # across steps so the fixed (B, 1, MAX_TOPK) shape can be reused as a
+        # graph input. They are not reset here (idle/extend forwards never
+        # read them).
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_decode_metadata(
@@ -337,6 +387,47 @@ class KunpengCpuBackend(AttentionBackend):
         req_to_token = forward_batch.req_to_token_pool.req_to_token.to(torch.int32)
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
 
+        if self._lc_enabled:
+            # Long-context decode CP: every rank keeps the FULL batch (no
+            # batch slicing) and attends only to its local 1/cp KV shard via
+            # the sparse flash MLA kernel. Eager decode without MTP only.
+            assert (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_idle()
+            ), "long-context decode CP supports plain DECODE mode only (MTP off)"
+            assert seqlen_q == 1, "long-context decode CP supports seqlen_q == 1 only"
+            socket_group = get_socket_tp_group()
+            cp_size = socket_group.world_size
+            assert cp_size == 8 and get_attention_tp_size() == 8, (
+                "long-context decode CP requires tp=8 single socket, got "
+                f"cp_size={cp_size} attn_tp_size={get_attention_tp_size()}"
+            )
+            self._lc_cp_size = cp_size
+            self._lc_cp_rank = socket_group.rank_in_group
+            metadata.all2all_size = 1
+            metadata.batchsize_per_tp = seq_lens.shape[0]
+            metadata.token_slice_start = 0
+            metadata.seq_lens = seq_lens
+            if seq_lens.shape[0] == 0:
+                # Idle forward: no attention work, skip sched (kernel rejects
+                # batch_size == 0).
+                metadata.extra_bytes = 0
+                return
+            self._init_long_context_metadata(
+                metadata, forward_batch, seq_lens, req_pool_indices
+            )
+            metadata.extra_bytes = (
+                torch.ops.sgl_kernel.flash_mla_sparse_decode_sched_kunpeng(
+                    metadata.long_context_topk_length,
+                    seqlen_q=seqlen_q,
+                    num_heads_q=self.num_q_heads * cp_size,
+                    head_dim=self.decode_head_dim,
+                    head_dim_v=self.decode_head_dim_v,
+                    meta=self._decode_meta,
+                )
+            )
+            return
+
         tp_size = get_attention_tp_size()
         if tp_size > 1 and not _DISABLE_MLA_ALL2ALL:
             # All2All over per-socket sub-group (e.g. 8 ranks per socket).
@@ -397,6 +488,145 @@ class KunpengCpuBackend(AttentionBackend):
 
         if enable_blockwise:
             self._init_blockwise_swap_metadata(metadata, forward_batch)
+
+    def _init_long_context_metadata(
+        self,
+        metadata: KunpengCpuMetadata,
+        forward_batch: ForwardBatch,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        """Build sparse-attention metadata for long-context decode CP.
+
+        KV pages are assigned to ranks round-robin: page ``p`` of a sequence
+        belongs to rank ``p % cp_size`` (page granularity == the KV pool page
+        size). Each rank keeps the FULL batch and attends only to its local
+        pages through the sparse flash MLA kernel.
+
+        Built once per decode step and reused across all layers:
+        - ``long_context_indices``: absolute pool slots (block*page+offset)
+          of every local KV token, shape [B, 1, MAX_TOPK] FIXED (MAX_TOPK is
+          derived from the model context length / cp_size + page slack), -1
+          padded. The shape is constant across steps so the tensor can be a
+          graph input; the sparse kernel scans only ``topk_length`` entries
+          per sequence and natively trims trailing -1 padding.
+        - ``long_context_topk_length``: per-sequence local token counts
+          clamped to >= 1 (the sparse sched/kernel reject 0-length rows; the
+          dummy slot is masked out during the cross-rank LSE reduction).
+        - ``long_context_real_topk_length``: the unclamped counts, used to
+          build the per-(shard, sequence) validity mask in the reduction.
+
+        Rows are updated incrementally: on a normal continuation step only the
+        new token's slot (when it lands on a local page) is appended; a row is
+        rebuilt from req_to_token whenever the sequence is new or the batch
+        reshuffled (detected via last_req_idx / last_seq_len). The persistent
+        buffers live on ``metadata`` and are reused across steps (and across
+        graph captures of the same batch size).
+        """
+        cp_size = self._lc_cp_size
+        cp_rank = self._lc_cp_rank
+        page_size = metadata.page_size
+        req_to_token = forward_batch.req_to_token_pool.req_to_token.to(
+            torch.int32
+        )
+        B = seq_lens.shape[0]
+
+        # Fixed top-k bound: the longest sequence the model can ever decode
+        # under LC is context_len, of which this rank stores ~1/cp.
+        if self._lc_max_topk <= 0:
+            self._lc_max_topk = (
+                (self.model_runner.model_config.context_len + cp_size - 1)
+                // cp_size
+                + page_size
+            )
+        max_topk = self._lc_max_topk
+
+        indices = metadata.long_context_indices
+        fill_len = metadata.long_context_fill_len
+        last_req_idx = metadata.long_context_last_req_idx
+        last_seq_len = metadata.long_context_last_seq_len
+        if (
+            indices is None
+            or indices.shape[0] != B
+            or indices.shape[-1] != max_topk
+        ):
+            # (Re)allocate the fixed-shape persistent buffers; all rows are
+            # rebuilt below (last_req_idx starts at -1).
+            device = req_to_token.device
+            indices = torch.full(
+                (B, 1, max_topk), -1, dtype=torch.int32, device=device
+            )
+            fill_len = torch.zeros(B, dtype=torch.int32, device=device)
+            last_req_idx = torch.full(
+                (B,), -1, dtype=torch.int64, device=device
+            )
+            last_seq_len = torch.zeros(B, dtype=torch.int64, device=device)
+            metadata.long_context_indices = indices
+            metadata.long_context_fill_len = fill_len
+            metadata.long_context_last_req_idx = last_req_idx
+            metadata.long_context_last_seq_len = last_seq_len
+
+        for b in range(B):
+            seq_len = int(seq_lens[b])
+            req_idx = int(req_pool_indices[b])
+            # A row continues iff the same sequence occupies this row, the
+            # length advanced by exactly one, AND the last stored local slot
+            # still matches req_to_token (guards against retraction /
+            # req_pool_idx reuse where the underlying slots changed but the
+            # length happened to be contiguous).
+            cont = (
+                last_req_idx[b] == req_idx
+                and last_seq_len[b] == seq_len - 1
+                and (
+                    fill_len[b] == 0
+                    or seq_len < 2
+                    or int(indices[b, 0, fill_len[b] - 1])
+                    == int(req_to_token[req_idx, seq_len - 2])
+                )
+            )
+            if cont:
+                # Normal continuation: append the new token's slot when it
+                # lands on a local page (foreign pages carry -1 and are
+                # skipped by the KV write path as well).
+                pos = seq_len - 1
+                p = pos // page_size
+                if p % cp_size == cp_rank:
+                    slot = int(req_to_token[req_idx, pos])
+                    if slot >= 0 and fill_len[b] < max_topk:
+                        indices[b, 0, fill_len[b]] = slot
+                        fill_len[b] += 1
+                last_seq_len[b] = seq_len
+            else:
+                # New / reshuffled / non-contiguous sequence: rebuild the row
+                # from req_to_token over this rank's local pages.
+                n_local = 0
+                n_pages = (seq_len + page_size - 1) // page_size
+                for p in range(n_pages):
+                    if p % cp_size != cp_rank:
+                        continue
+                    s = p * page_size
+                    e = min(s + page_size, seq_len)
+                    n = e - s
+                    positions = torch.arange(
+                        s, e, dtype=torch.int64, device=req_to_token.device
+                    )
+                    indices[b, 0, n_local : n_local + n] = req_to_token[
+                        req_idx, positions
+                    ]
+                    n_local += n
+                fill_len[b] = n_local
+                last_req_idx[b] = req_idx
+                last_seq_len[b] = seq_len
+
+        real_topk_t = fill_len.clone()
+        # Sparse sched/kernel require topk_length >= 1 with valid slot ids;
+        # the dummy entry is masked out in the cross-rank LSE reduction.
+        topk_t = torch.clamp(real_topk_t, min=1)
+        dummy = real_topk_t == 0
+        if bool(dummy.any()):
+            indices[dummy, 0, 0] = 0
+        metadata.long_context_topk_length = topk_t
+        metadata.long_context_real_topk_length = real_topk_t
 
     def _blockwise_token_row_slice(
         self, forward_batch: ForwardBatch
@@ -738,6 +968,55 @@ class KunpengCpuBackend(AttentionBackend):
 
         return o_padded
 
+    def _forward_mla_paged_cp(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        """Sparse paged MLA over the local KV shard (long-context decode CP).
+
+        q is 4D (B, seqlen_q, num_heads_q*cp_size, head_dim) after the Q
+        allgather in the model. Returns (o, softmax_lse) of the PARTIAL
+        attention over this rank's local 1/cp KV shard; the model merges the
+        per-rank partials (O alltoall + LSE reduction).
+        """
+        assert not layer.is_cross_attention, (
+            "long-context decode CP does not support cross attention"
+        )
+        meta = self.forward_metadata
+        kv_buf = self._get_kv_buffer(
+            layer, forward_batch, k, v, forward_batch.out_cache_loc
+        )
+        kvcache_paged = kv_buf[:, 0, :].reshape(
+            -1, meta.page_size, kv_buf.shape[-1]
+        )
+
+        softmax_scale = (
+            layer.scaling
+            if layer.scaling is not None
+            else 1.0 / math.sqrt(layer.qk_head_dim)
+        )
+        extra_buffer = (
+            kunpeng.alloc_buffer(meta.extra_bytes)
+            if meta.extra_bytes > 0
+            else torch.empty(0, dtype=torch.uint8, device=q.device)
+        )
+
+        o, softmax_lse = kunpeng.flash_mla_sparse_decode_kunpeng(
+            q,
+            kvcache_paged,
+            meta.long_context_indices,
+            meta.long_context_topk_length,
+            softmax_scale,
+            extra_buffer,
+            self._decode_meta,
+            layer.v_head_dim,
+        )
+        return o, softmax_lse
+
     def _forward_extend_mla_paged(
         self,
         q,
@@ -960,6 +1239,15 @@ class KunpengCpuBackend(AttentionBackend):
         q_head_dim = q.shape[-1]
         q = q.reshape(-1, layer.tp_q_head_num * q_head_dim)
         q_ = q.view(-1, layer.tp_q_head_num, q_head_dim)
+
+        if self._lc_enabled:
+            # Long-context decode CP: run the sparse flash MLA over the local
+            # KV shard and return (partial o, softmax_lse); the model merges
+            # the partials across the cp group.
+            o_4d, softmax_lse = self._forward_mla_paged_cp(
+                q_.unsqueeze(1), k, v, layer, forward_batch
+            )
+            return o_4d, softmax_lse
 
         o_4d = self._forward_mla_paged(q_.unsqueeze(1), k, v, layer, forward_batch)
 

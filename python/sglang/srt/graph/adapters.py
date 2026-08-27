@@ -883,6 +883,58 @@ def _setup_flash_mla_dense_decode_kunpeng():
     register_op('flash_mla_dense_decode_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_flash_mla_sparse_decode_kunpeng():
+    def shape_infer(q, kcache, indices, topk_length, softmax_scale,
+                    extra_buffer, meta, head_dim_v):
+        bsz = q.shape[0]
+        seq_len = q.shape[1]
+        n_heads = q.shape[2]
+        return [((bsz, seq_len, n_heads, head_dim_v), torch.bfloat16),
+                ((bsz, seq_len, n_heads), torch.float32)]
+
+    def eager_fn(q, kcache, indices, topk_length, softmax_scale,
+                 extra_buffer, meta, head_dim_v):
+        bsz = q.shape[0]
+        seq_len = q.shape[1]
+        n_heads = q.shape[2]
+        o = torch.empty((bsz, seq_len, n_heads, head_dim_v), dtype=torch.bfloat16)
+        softmax_lse = torch.empty((bsz, seq_len, n_heads), dtype=torch.float32)
+        torch.ops.sgl_kernel.flash_mla_sparse_decode_kunpeng(
+            q, kcache, indices, topk_length, o, softmax_lse,
+            float(softmax_scale), extra_buffer, meta)
+        return o, softmax_lse
+
+    register_op('flash_mla_sparse_decode_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_shm_mla_o_alltoall_long_context_kunpeng():
+    def shape_infer(o, lse, real_topk_length, o_out, lse_out, topk_out):
+        return []
+
+    def eager_fn(o, lse, real_topk_length, o_out, lse_out, topk_out):
+        torch.ops.sgl_kernel.shm_mla_o_alltoall_long_context_kunpeng(
+            o, lse, real_topk_length, o_out, lse_out, topk_out)
+        return None
+
+    register_op(
+        'shm_mla_o_alltoall_long_context_kunpeng',
+        shape_infer,
+        eager_fn,
+    )
+
+
+def _setup_flash_mla_reduce_kunpeng():
+    def shape_infer(o_contrib, lse_contrib, topk_length, out):
+        return []
+
+    def eager_fn(o_contrib, lse_contrib, topk_length, out):
+        torch.ops.sgl_kernel.flash_mla_reduce_kunpeng(
+            o_contrib, lse_contrib, topk_length, out)
+        return None
+
+    register_op('flash_mla_reduce_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_pad_q_left_mtp_kunpeng():
     def shape_infer(q, seq_lens, max_seq_len):
         bsz = seq_lens.shape[0]
@@ -1047,6 +1099,9 @@ def setup():
     _setup_copy_kunpeng()
     _setup_print_hash_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()
+    _setup_flash_mla_sparse_decode_kunpeng()
+    _setup_shm_mla_o_alltoall_long_context_kunpeng()
+    _setup_flash_mla_reduce_kunpeng()
     _setup_flash_attention_with_workspace_kunpeng()
     _setup_flash_attention_paged_kunpeng()
     _setup_pad_q_left_mtp_kunpeng()

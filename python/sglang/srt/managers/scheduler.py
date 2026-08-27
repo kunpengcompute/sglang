@@ -843,6 +843,22 @@ class Scheduler(
 
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
+
+        if envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get() and _is_cpu_920f:
+            from sglang.srt.mem_cache.common import set_lc_cp_info
+
+            set_lc_cp_info(self.attn_tp_size, self.attn_tp_rank)
+
+            # Each rank stores only 1/cp of every sequence's KV, so the
+            # effective per-request length bound is the per-rank pool size
+            # times cp_size (still capped by the model context length). This
+            # also lifts the validate_input_length admission gate.
+            cp_size = self.attn_tp_size
+            self.max_req_len = min(
+                self.model_config.context_len - 1,
+                self.max_total_num_tokens * cp_size - 1,
+            )
+            self.max_req_input_len = self.max_req_len - 5
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )

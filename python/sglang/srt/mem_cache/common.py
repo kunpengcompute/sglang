@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -26,6 +27,40 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Long-context decode CP (step 2): interleaved KV page allocation.
+# When enabled, every rank allocates only the pages it owns (page p of a
+# sequence belongs to rank p % group_size), so each rank stores 1/group_size
+# of every sequence's KV -> the aggregate pool supports group_size x longer
+# sequences. The group here IS the attention-tp group (tp=8 single socket),
+# not the regular sglang attn_cp group. The scheduler process sets these
+# globals via set_lc_cp_info(); the model worker's attention backend reads
+# the same env flag for the sparse kernel.
+# ---------------------------------------------------------------------------
+_lc_cp_enabled = False
+_lc_cp_size = 1
+_lc_cp_rank = 0
+
+
+def set_lc_cp_info(cp_size: int, cp_rank: int):
+    """Enable interleaved KV allocation and record this rank's group geometry.
+
+    ``cp_size`` / ``cp_rank`` are the attention-tp group's size and rank.
+    Called once by the scheduler when long-context decode CP is active.
+    """
+    global _lc_cp_enabled, _lc_cp_size, _lc_cp_rank
+    _lc_cp_enabled = True
+    _lc_cp_size = cp_size
+    _lc_cp_rank = cp_rank
+
+
+def is_lc_cp_enabled() -> bool:
+    return _lc_cp_enabled
+
+
+def get_lc_cp_info() -> tuple[int, int]:
+    return _lc_cp_size, _lc_cp_rank
 
 
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
@@ -371,6 +406,9 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     backup_state: bool = False,
 ):
+    # NOTE: long-context decode CP is used in PD-disaggregated deployments where
+    # the decode instance never runs prefill, so extend keeps its original
+    # full-layout allocation (prefill computation is untouched).
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
@@ -399,6 +437,76 @@ def alloc_paged_token_slots_extend(
         if tree_cache is not None:
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
+
+    return (out_cache_loc, state) if backup_state else out_cache_loc
+
+
+def alloc_decode_cp_interleaved(
+    tree_cache: BasePrefixCache,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    extend_num_tokens: int,
+    backup_state: bool = False,
+):
+    """Interleaved extend allocation for long-context decode CP (step 2).
+
+    Used by the PD-disaggregated DECODE instance when receiving KV from the
+    prefill instance: every rank allocates ONLY the pages it owns (page ``p``
+    of a sequence belongs to rank ``p % cp_size``). Foreign positions get -1
+    in the returned ``out_cache_loc``; the model's KV write path skips them.
+    The aggregate pool therefore stores 1/cp of every sequence's KV.
+    """
+    cp_size, cp_rank = get_lc_cp_info()
+    allocator = tree_cache.token_to_kv_pool_allocator
+    page_size = allocator.page_size
+    bs = len(seq_lens_cpu)
+
+    # Count local pages over [prefix_len, seq_len) of every request.
+    local_pages_per_req = []
+    n_local_pages = 0
+    for i in range(bs):
+        pre = int(prefix_lens_cpu[i])
+        seq = int(seq_lens_cpu[i])
+        p0 = (pre + page_size - 1) // page_size
+        p1 = (seq + page_size - 1) // page_size
+        local = [p for p in range(p0, p1) if p % cp_size == cp_rank]
+        local_pages_per_req.append(local)
+        n_local_pages += len(local)
+
+    evict_from_tree_cache(tree_cache, max(n_local_pages, 1) * page_size)
+    # need_sort pools release freed pages into release_pages; fold them back
+    # into free_pages before the OOM check so we don't spuriously return None.
+    allocator.merge_and_sort_free()
+
+    state = None
+    if backup_state:
+        state = allocator.backup_state()
+
+    if n_local_pages > len(allocator.free_pages):
+        return None
+
+    pages = allocator.free_pages[:n_local_pages]
+    allocator.free_pages = allocator.free_pages[n_local_pages:]
+
+    out_cache_loc = torch.full(
+        (extend_num_tokens,), -1, dtype=torch.int64, device=allocator.device
+    )
+    pos_in_page = torch.arange(page_size, device=allocator.device, dtype=torch.int64)
+    flat_offset = 0
+    k = 0
+    for i in range(bs):
+        pre = int(prefix_lens_cpu[i])
+        seq = int(seq_lens_cpu[i])
+        for p in local_pages_per_req[i]:
+            s = max(p * page_size, pre)
+            e = min((p + 1) * page_size, seq)
+            n = e - s
+            base = flat_offset + (s - pre)
+            out_cache_loc[base : base + n] = (
+                pages[k] * page_size + pos_in_page[s - p * page_size : s - p * page_size + n]
+            )
+            k += 1
+        flat_offset += seq - pre
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
@@ -508,6 +616,14 @@ def alloc_paged_token_slots_decode(
     token_per_req: int = 1,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
+    if is_lc_cp_enabled():
+        assert token_per_req == 1, "long-context decode CP supports token_per_req == 1"
+        return alloc_paged_token_slots_decode_cp(
+            tree_cache=tree_cache,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+        )
+
     allocator = tree_cache.token_to_kv_pool_allocator
     # Over estimate the number of tokens: assume each request needs a new page.
     num_tokens = len(seq_lens) * allocator.page_size
@@ -525,6 +641,65 @@ def alloc_paged_token_slots_decode(
         if tree_cache is not None:
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
+
+    return out_cache_loc
+
+
+def alloc_paged_token_slots_decode_cp(
+    tree_cache: BasePrefixCache,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+) -> torch.Tensor:
+    """Interleaved decode allocation for long-context decode CP (step 2).
+
+    The new token sits at position ``pos = seq_len - 1`` (seq_lens already
+    include it). If page ``pos // page_size`` is not owned by this rank, the
+    slot is -1 (the KV write is skipped). If it is owned and the previous
+    token was in the same page, the slot continues from ``last_loc + 1``;
+    otherwise a new local page is allocated.
+    """
+    cp_size, cp_rank = get_lc_cp_info()
+    allocator = tree_cache.token_to_kv_pool_allocator
+    page_size = allocator.page_size
+    bs = len(seq_lens_cpu)
+
+    out_cache_loc = torch.full((bs,), -1, dtype=torch.int64, device=allocator.device)
+    need_new_pages = 0
+    for i in range(bs):
+        pos = int(seq_lens_cpu[i]) - 1
+        p = pos // page_size
+        if p % cp_size != cp_rank:
+            continue
+        prev_pos = pos - 1
+        if prev_pos >= 0 and prev_pos // page_size == p:
+            out_cache_loc[i] = last_loc[i] + 1
+        else:
+            need_new_pages += 1
+
+    if need_new_pages > len(allocator.free_pages):
+        # Free pages may sit in release_pages (need_sort pools) or be held by
+        # evictable radix-cache entries. Evict first (frees evictable pages
+        # into release_pages), then merge release_pages back into free_pages
+        # before re-checking, mirroring the dense alloc_decode path.
+        evict_from_tree_cache(tree_cache, need_new_pages * page_size)
+        allocator.merge_and_sort_free()
+
+    if need_new_pages > len(allocator.free_pages):
+        return None
+    pages = allocator.free_pages[:need_new_pages]
+    allocator.free_pages = allocator.free_pages[need_new_pages:]
+
+    k = 0
+    for i in range(bs):
+        pos = int(seq_lens_cpu[i]) - 1
+        p = pos // page_size
+        if p % cp_size != cp_rank:
+            continue
+        prev_pos = pos - 1
+        if prev_pos >= 0 and prev_pos // page_size == p:
+            continue
+        out_cache_loc[i] = pages[k] * page_size + pos % page_size
+        k += 1
 
     return out_cache_loc
 
