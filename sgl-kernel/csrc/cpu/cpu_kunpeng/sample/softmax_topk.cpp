@@ -23,6 +23,7 @@
 #include <cmath>
 
 #include "common.h"
+#include "../utils/math.h"  // For kmath::fast_exp (SVE fast exponential)
 
 // Fused softmax + topk=1 for Kunpeng CPU (SVE).
 //
@@ -34,9 +35,14 @@
 //
 // Pass 1 finds the row max + first-max index using the same bf16 -> fp32 SVE
 // lane-expansion pattern as sample/argmax.cpp. Pass 2 accumulates
-// sum(exp(x - row_max)) scalarly (stable max subtraction). Rows are
-// parallelized with kutacc::parallel_for.
-void softmax_topk_kunpeng(at::Tensor logits, at::Tensor topk_p, at::Tensor topk_index)
+// sum(exp(x - row_max)) with the SVE-vectorized kmath::fast_exp (stable max
+// subtraction). Rows are parallelized with kutacc::parallel_for.
+//
+// prf_vecs: software prefetch distance in SVE vectors ahead of the sequential
+// bf16 row scan. Distance in bytes = prf_vecs * vector width (e.g. 8 vectors *
+// 64B = 512B). Runtime-tunable so Python can sweep it for validation.
+void softmax_topk_kunpeng(at::Tensor logits, at::Tensor topk_p, at::Tensor topk_index,
+                          int64_t prf_vecs)
 {
     CHECK_LAST_DIM_CONTIGUOUS_INPUT(logits);
     CHECK_DIM(2, logits);
@@ -61,8 +67,15 @@ void softmax_topk_kunpeng(at::Tensor logits, at::Tensor topk_p, at::Tensor topk_
         auto pg = svptrue_b8();
         svbfloat16_t zero_b = svdup_bf16(0);
         int64_t vec_end = (vocab / vl) * vl;
+        // Software prefetch distance (bytes) ahead of the sequential bf16 row
+        // scan.  920F disables hardware prefetch, so explicit SVE prefetch is
+        // required to hide DRAM latency on the large vocab rows (vocab=129k,
+        // 258KB/row exceeds L2).  Runtime-tunable via prf_vecs; both passes
+        // re-scan the same row, so PLDL1KEEP keeps prefetched lines resident.
+        const int64_t prf_bytes = (int64_t)svcntb() * prf_vecs;
         for (int64_t r = start; r < end; r++) {
             const auto *row = reinterpret_cast<const bfloat16_t *>(logits_ptr) + r * vocab;
+            const char *row_bytes = reinterpret_cast<const char *>(row);
 
             // Pass 1: row max + first-max index (SVE, argmax.cpp pattern).
             svint32_t index0 = svdup_s32(0);
@@ -70,6 +83,8 @@ void softmax_topk_kunpeng(at::Tensor logits, at::Tensor topk_p, at::Tensor topk_
             svint32_t index1 = svdup_s32(0);
             svfloat32_t max1 = svdup_f32(-INFINITY);
             for (int64_t wi = 0; wi < vec_end; wi += vl) {
+                svprfb(svwhilelt_b8(wi * 2 + prf_bytes, vocab * 2),
+                       row_bytes + wi * 2 + prf_bytes, SV_PLDL1KEEP);
                 svbfloat16_t v = svld1(pg, row + wi);
                 svfloat32_t t0 = svreinterpret_f32(svzip1(zero_b, v));
                 svfloat32_t t1 = svreinterpret_f32(svzip2(zero_b, v));
@@ -98,9 +113,32 @@ void softmax_topk_kunpeng(at::Tensor logits, at::Tensor topk_p, at::Tensor topk_
             }
 
             // Pass 2: stable sum(exp(x - row_max)).
+            // SVE vectorized with kmath::fast_exp (svexpa + polynomial), the
+            // same primitive kunpeng_moe.cpp uses for softmax.  bf16 -> fp32
+            // lane expansion mirrors Pass 1 (same `vl` step = bf16 elems per
+            // vector).  One prefetch per vector, and the per-vector fp32 sum
+            // is accumulated into a double to keep the 129k-term reduction
+            // accurate.
             double sumexp = 0.0;
-            for (int64_t wi = 0; wi < vocab; wi++) {
-                sumexp += std::exp((double)((float)row[wi] - row_max));
+            const svfloat32_t row_max_v = svdup_f32(row_max);
+            for (int64_t wi = 0; wi < vec_end; wi += vl) {
+                svprfb(svwhilelt_b8(wi * 2 + prf_bytes, vocab * 2),
+                       row_bytes + wi * 2 + prf_bytes, SV_PLDL1KEEP);
+                svbfloat16_t v = svld1(pg, row + wi);
+                svfloat32_t t0 = svreinterpret_f32(svzip1(zero_b, v));
+                svfloat32_t t1 = svreinterpret_f32(svzip2(zero_b, v));
+                t0 = kmath::fast_exp(svptrue_b32(), svsub_x(svptrue_b32(), t0, row_max_v));
+                t1 = kmath::fast_exp(svptrue_b32(), svsub_x(svptrue_b32(), t1, row_max_v));
+                sumexp += svaddv(svptrue_b32(), t0) + svaddv(svptrue_b32(), t1);
+            }
+            // Scalar tail of pass 2 (also covers vocab < vl).
+            for (int64_t wi = vec_end; wi < vocab; wi++) {
+                svprfb(svwhilelt_b8(wi * 2 + prf_bytes, vocab * 2),
+                       row_bytes + wi * 2 + prf_bytes, SV_PLDL1KEEP);
+                float e = svaddv(svptrue_b32(),
+                                 kmath::fast_exp(svptrue_b32(),
+                                                 svdup_f32((float)row[wi] - row_max)));
+                sumexp += (double)e / (double)svcntw();
             }
 
             topk_p_ptr[r] = (float)(1.0 / sumexp);

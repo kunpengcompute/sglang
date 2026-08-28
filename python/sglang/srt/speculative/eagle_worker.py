@@ -67,6 +67,7 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
@@ -770,7 +771,12 @@ class EAGLEWorker(TpModelWorker):
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
-        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
+        if _is_cpu_920f and self.topk == 1:
+            # topk==1: repeat_interleave(1) is an identity copy of seq_lens
+            # (both int64). Reuse seq_lens directly to skip the aten op.
+            spec_info.positions = batch.seq_lens
+        else:
+            spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
@@ -896,10 +902,37 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
+        topk1 = _is_cpu_920f and self.topk == 1
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
+            if topk1:
+                # Inline topk==1 simplification: repeat_interleave(1),
+                # fast_topk, torch.gather and the hidden-states index are all
+                # identity under a single candidate, so they are elided.
+                input_ids = topk_index.view(-1)
+                if i == 0:
+                    scores = topk_p
+                    parents = torch.full(
+                        (topk_p.shape[0], 2),
+                        -1,
+                        dtype=torch.long,
+                        device=topk_p.device,
+                    )
+                    parents[:, 1] = 0
+                else:
+                    # scores = topk_p * scores (cumulative prob), (b, 1)
+                    scores = topk_p * scores if scores is not None else topk_p
+                    parents = torch.full(
+                        (topk_p.shape[0], 1),
+                        i,
+                        dtype=torch.long,
+                        device=topk_p.device,
+                    )
+                # hidden_states stays unchanged (repeat_interleave(1) identity)
+                tree_info = (scores.unsqueeze(1), topk_index, parents)
+            else:
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -939,9 +972,24 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
-        )
+        if topk1 and self.speculative_num_steps == 1:
+            # 1-step + topk==1: score_list/token_list/parents_list are
+            # single-element. torch.topk of a length-1 row, sort of a single
+            # index and gather of column 0 are all identity, so pass through.
+            parent_list = torch.empty(
+                parents_list[0].shape[0],
+                0,
+                dtype=torch.long,
+                device=parents_list[0].device,
+            )
+            top_scores_index = torch.zeros_like(
+                token_list[0], dtype=torch.long, device=token_list[0].device
+            )
+            draft_tokens = token_list[0]
+        else:
+            parent_list, top_scores_index, draft_tokens = organize_draft_results(
+                score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            )
 
         return parent_list, top_scores_index, draft_tokens
 
@@ -1280,7 +1328,9 @@ class EAGLEWorker(TpModelWorker):
             topk_index = torch.empty(
                 (logits.shape[0], 1), dtype=torch.int64, device=logits.device
             )
-            torch.ops.sgl_kernel.softmax_topk_kunpeng(logits, topk_p, topk_index)
+            torch.ops.sgl_kernel.softmax_topk_kunpeng(
+                logits, topk_p, topk_index, envs.SGLANG_KUNPENG_SOFTMAX_TOPK_PRF_VECS
+            )
             return topk_p, topk_index
         probs = torch.softmax(logits, dim=-1)
         return fast_topk(probs, self.topk, dim=-1)
