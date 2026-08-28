@@ -1354,6 +1354,8 @@ class SchedulerPPMixin:
                 # via _pp_mtp_prepare_verify_batch anyway. The last rank keeps
                 # its EagleDraftInput (the next draft-extend input).
                 batch.spec_info = None
+        elif self._pp_mtp_enabled and self.pp_group.is_last_rank:
+            batch.spec_info = None
 
         output_result = GenerationBatchResult(
             logits_output=logits_output,
