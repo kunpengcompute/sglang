@@ -537,6 +537,10 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    if self._pp_mtp_enabled:
+                        for req in self.mbs[next_mb_id].reqs:
+                            if req.finished():
+                                self._pp_pending_drafts.pop(req.rid, None)
 
                 # ⑩ mb tail: batch completion bookkeeping + transition to the
                 # next micro-batch iteration (spans send_pyobj / send_proxy).
