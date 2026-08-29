@@ -721,6 +721,22 @@ def _setup_contiguous_kunpeng():
     register_op('contiguous_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_repeat_interleave_kunpeng():
+    def shape_infer(x, repeats):
+        # torch.repeat_interleave(x, repeats) with dim=None flattens then
+        # repeats, producing a 1-D output of numel * repeats entries. The
+        # output shape must be fixed per (input shape, repeats) so it can be
+        # baked into a captured graph.
+        return [((x.numel() * repeats,), x.dtype)]
+
+    def eager_fn(x, repeats):
+        out = torch.empty((x.numel() * repeats,), dtype=x.dtype)
+        torch.ops.sgl_kernel.repeat_interleave_kunpeng(x, out, repeats)
+        return out
+
+    register_op('repeat_interleave_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_set_kv_buffer_kunpeng():
     def shape_infer(kv_buffer, loc, cache_k):
         return []
@@ -1093,6 +1109,7 @@ def setup():
     _setup_kupl_sdma_set_kv_buffer()
     _setup_cat_kunpeng()
     _setup_contiguous_kunpeng()
+    _setup_repeat_interleave_kunpeng()
     _setup_set_kv_buffer_kunpeng()
     _setup_set_kv_buffer_2_kunpeng()
     _setup_kupl_sdma_set_kv_buffer_2()

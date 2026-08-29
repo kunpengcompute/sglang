@@ -214,12 +214,13 @@ class KunpengCpuMetadata:
 
         # Long-context decode CP metadata (sparse flash MLA over the local
         # 1/cp KV shard). Built once per decode step, reused across layers.
-        # ``long_context_indices`` is a PERSISTENT fixed-shape (B, 1, MAX_TOPK)
-        # buffer (MAX_TOPK derived from the model context length) so the shape
-        # stays constant across steps and the tensor can be a graph input; only
-        # the real prefix [0, fill_len[b]) is valid per step. ``last_req_idx`` /
-        # ``last_seq_len`` track per-row continuation so a row is incrementally
-        # appended on a normal step and fully rebuilt after a batch reshuffle.
+        # ``long_context_indices`` is a PERSISTENT fixed-shape
+        # (B, seqlen_q, MAX_TOPK) buffer (MAX_TOPK derived from the model
+        # context length) so the shape stays constant across steps and the
+        # tensor can be a graph input; only the real prefix [0, fill_len[b, j])
+        # of each row is valid per step. ``last_req_idx`` / ``last_seq_len``
+        # track per-row continuation so a row is incrementally appended on a
+        # normal step and fully rebuilt after a batch reshuffle.
         self.long_context_topk_length: Optional[torch.Tensor] = None
         self.long_context_real_topk_length: Optional[torch.Tensor] = None
         self.long_context_indices: Optional[torch.Tensor] = None
@@ -258,7 +259,9 @@ class KunpengCpuBackend(AttentionBackend):
         # every rank keeps the full batch and attends only to its local 1/cp
         # KV shard; partial attention outputs are merged via the SHM exchange
         # (Q allgather + O/LSE/topk pure-read exchange + online-softmax reduce).
-        # Decode only, MTP off, no blockwise KV swap.
+        # MTP is supported: TARGET_VERIFY / DRAFT_EXTEND run the same sparse
+        # path with seqlen_q = speculative_num_draft_tokens rows per sequence.
+        # No blockwise KV swap.
         self._lc_enabled = envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
         self._lc_cp_size: int = 0
         self._lc_cp_rank: int = -1
@@ -266,9 +269,6 @@ class KunpengCpuBackend(AttentionBackend):
         # _init_long_context_metadata); 0 until the first LC decode step.
         self._lc_max_topk: int = 0
         if self._lc_enabled:
-            assert (
-                self.speculative_num_draft_tokens == 1
-            ), "long-context decode CP requires MTP/speculation disabled"
             assert not is_kunpeng_swap_kv_blockwise(), (
                 "long-context decode CP conflicts with blockwise KV swap"
             )
@@ -300,9 +300,9 @@ class KunpengCpuBackend(AttentionBackend):
         # long_context_indices / fill_len / last_req_idx / last_seq_len are
         # PERSISTENT fixed-shape buffers (re)allocated and refilled by
         # _init_long_context_metadata every decode step; they must survive
-        # across steps so the fixed (B, 1, MAX_TOPK) shape can be reused as a
-        # graph input. They are not reset here (idle/extend forwards never
-        # read them).
+        # across steps so the fixed (B, speculative_num_draft_tokens,
+        # MAX_TOPK) shape can be reused as a graph input. They are not reset
+        # here (idle/extend forwards never read them).
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_decode_metadata(
@@ -390,12 +390,23 @@ class KunpengCpuBackend(AttentionBackend):
         if self._lc_enabled:
             # Long-context decode CP: every rank keeps the FULL batch (no
             # batch slicing) and attends only to its local 1/cp KV shard via
-            # the sparse flash MLA kernel. Eager decode without MTP only.
+            # the sparse flash MLA kernel. MTP modes (TARGET_VERIFY /
+            # DRAFT_EXTEND) run the same sparse path with
+            # seqlen_q = speculative_num_draft_tokens query rows per sequence.
             assert (
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_idle()
-            ), "long-context decode CP supports plain DECODE mode only (MTP off)"
-            assert seqlen_q == 1, "long-context decode CP supports seqlen_q == 1 only"
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend()
+            ), (
+                "long-context decode CP supports DECODE / TARGET_VERIFY / "
+                "DRAFT_EXTEND only"
+            )
+            assert seqlen_q in (1, self.speculative_num_draft_tokens), (
+                "long-context decode CP: seqlen_q must be 1 (decode) or "
+                "speculative_num_draft_tokens "
+                f"({self.speculative_num_draft_tokens}), got {seqlen_q}"
+            )
             socket_group = get_socket_tp_group()
             cp_size = socket_group.world_size
             assert cp_size == 8 and get_attention_tp_size() == 8, (
@@ -414,7 +425,11 @@ class KunpengCpuBackend(AttentionBackend):
                 metadata.extra_bytes = 0
                 return
             self._init_long_context_metadata(
-                metadata, forward_batch, seq_lens, req_pool_indices
+                metadata,
+                forward_batch,
+                seq_lens,
+                req_pool_indices,
+                seqlen_q=seqlen_q,
             )
             metadata.extra_bytes = (
                 torch.ops.sgl_kernel.flash_mla_sparse_decode_sched_kunpeng(
@@ -495,6 +510,7 @@ class KunpengCpuBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        seqlen_q: int = 1,
     ) -> None:
         """Build sparse-attention metadata for long-context decode CP.
 
@@ -505,23 +521,43 @@ class KunpengCpuBackend(AttentionBackend):
 
         Built once per decode step and reused across all layers:
         - ``long_context_indices``: absolute pool slots (block*page+offset)
-          of every local KV token, shape [B, 1, MAX_TOPK] FIXED (MAX_TOPK is
+          of the local KV tokens each query row attends, shape
+          [B, speculative_num_draft_tokens, MAX_TOPK] FIXED (MAX_TOPK is
           derived from the model context length / cp_size + page slack), -1
-          padded. The shape is constant across steps so the tensor can be a
-          graph input; the sparse kernel scans only ``topk_length`` entries
-          per sequence and natively trims trailing -1 padding.
+          padded. The row count is the RUN-WIDE maximum seqlen_q (MTP);
+          each step fills the first ``seqlen_q`` rows (1 for plain decode,
+          speculative_num_draft_tokens for MTP modes) and the kernel is
+          called with that step's seqlen_q. The shape is constant across
+          steps so the tensor can be a graph input; the sparse kernel scans
+          only ``topk_length`` entries per sequence and natively trims
+          trailing -1 padding.
         - ``long_context_topk_length``: per-sequence local token counts
           clamped to >= 1 (the sparse sched/kernel reject 0-length rows; the
           dummy slot is masked out during the cross-rank LSE reduction).
         - ``long_context_real_topk_length``: the unclamped counts, used to
           build the per-(shard, sequence) validity mask in the reduction.
 
-        Rows are updated incrementally: on a normal continuation step only the
-        new token's slot (when it lands on a local page) is appended; a row is
-        rebuilt from req_to_token whenever the sequence is new or the batch
-        reshuffled (detected via last_req_idx / last_seq_len). The persistent
-        buffers live on ``metadata`` and are reused across steps (and across
-        graph captures of the same batch size).
+        Causal scope: the ``seqlen_q`` query rows of a sequence sit at
+        positions [seq_len - seqlen_q, seq_len); row ``j`` attends the local
+        slots of positions [0, seq_len - seqlen_q + j) -- a row never attends
+        its own position, matching the dense decode kernel's ``is_causal``
+        masking (the sparse kernel applies no mask itself, so the caller must
+        not hand it the query's own slot). Rows are ordered so row ``j``'s
+        valid prefix is a prefix of row ``j + 1``'s; trailing -1 padding then
+        trims each row to its own length inside the kernel (kv_back_check),
+        while ``topk_length`` stays per-sequence (= the fill of the last
+        FILLED row, i.e. row ``seqlen_q - 1``).
+
+        For ``seqlen_q == 1`` (plain decode) row 0 is updated incrementally:
+        on a normal continuation step only the slot of position ``seq_len - 2``
+        (the PREVIOUS step's query token, which becomes attendable only now) is
+        appended when it lands on a local page; a row is rebuilt from
+        req_to_token whenever the sequence is new or the batch reshuffled
+        (detected via last_req_idx / last_seq_len). For ``seqlen_q > 1`` every
+        filled row is rebuilt from req_to_token each step (correctness first;
+        the incremental multi-row update is deferred to the MTP driver work).
+        The persistent buffers live on ``metadata`` and are reused across
+        steps (and across graph captures of the same batch size).
         """
         cp_size = self._lc_cp_size
         cp_rank = self._lc_cp_rank
@@ -545,18 +581,26 @@ class KunpengCpuBackend(AttentionBackend):
         fill_len = metadata.long_context_fill_len
         last_req_idx = metadata.long_context_last_req_idx
         last_seq_len = metadata.long_context_last_seq_len
+        # The buffer row count is the RUN-WIDE maximum seqlen_q (MTP); a step
+        # fills the first ``seqlen_q`` rows only, so the shape stays constant
+        # across decode (seqlen_q == 1) and verify/draft-extend (seqlen_q ==
+        # speculative_num_draft_tokens) steps and can be a graph input.
+        buf_rows = self.speculative_num_draft_tokens
         if (
             indices is None
             or indices.shape[0] != B
+            or indices.shape[1] != buf_rows
             or indices.shape[-1] != max_topk
         ):
             # (Re)allocate the fixed-shape persistent buffers; all rows are
             # rebuilt below (last_req_idx starts at -1).
             device = req_to_token.device
             indices = torch.full(
-                (B, 1, max_topk), -1, dtype=torch.int32, device=device
+                (B, buf_rows, max_topk), -1, dtype=torch.int32, device=device
             )
-            fill_len = torch.zeros(B, dtype=torch.int32, device=device)
+            fill_len = torch.zeros(
+                (B, buf_rows), dtype=torch.int32, device=device
+            )
             last_req_idx = torch.full(
                 (B,), -1, dtype=torch.int64, device=device
             )
@@ -566,65 +610,142 @@ class KunpengCpuBackend(AttentionBackend):
             metadata.long_context_last_req_idx = last_req_idx
             metadata.long_context_last_seq_len = last_seq_len
 
-        for b in range(B):
-            seq_len = int(seq_lens[b])
-            req_idx = int(req_pool_indices[b])
-            # A row continues iff the same sequence occupies this row, the
-            # length advanced by exactly one, AND the last stored local slot
-            # still matches req_to_token (guards against retraction /
-            # req_pool_idx reuse where the underlying slots changed but the
-            # length happened to be contiguous).
-            cont = (
-                last_req_idx[b] == req_idx
-                and last_seq_len[b] == seq_len - 1
-                and (
-                    fill_len[b] == 0
-                    or seq_len < 2
-                    or int(indices[b, 0, fill_len[b] - 1])
-                    == int(req_to_token[req_idx, seq_len - 2])
+        if seqlen_q == 1:
+            # Plain decode: a single query row per sequence. Row 0 holds the
+            # local slots of [0, seq_len - 1) (the query's own position is
+            # excluded), maintained incrementally (see the causal-scope note in
+            # the docstring).
+            for b in range(B):
+                seq_len = int(seq_lens[b])
+                req_idx = int(req_pool_indices[b])
+                # A row continues iff the same sequence occupies this row, the
+                # length advanced by exactly one, AND the last stored local
+                # slot still matches req_to_token (guards against retraction /
+                # req_pool_idx reuse where the underlying slots changed but
+                # the length happened to be contiguous).
+                #
+                # Causal scope: the row holds the local slots of positions
+                # [0, seq_len - 1). The CURRENT query token sits at seq_len - 1
+                # and must NOT attend to itself (the sparse kernel applies no
+                # mask; the dense kernel does this via is_causal). The slot of
+                # position seq_len - 2 (the previous step's query token)
+                # becomes attendable only now, so the continuation path appends
+                # exactly that slot, and the continuity guard checks the slot
+                # of position seq_len - 3 (the last position the previous row
+                # covered).
+                cont = (
+                    last_req_idx[b] == req_idx
+                    and last_seq_len[b] == seq_len - 1
+                    and (
+                        fill_len[b, 0] == 0
+                        or seq_len < 3
+                        or int(indices[b, 0, fill_len[b, 0] - 1])
+                        == int(req_to_token[req_idx, seq_len - 3])
+                    )
                 )
-            )
-            if cont:
-                # Normal continuation: append the new token's slot when it
-                # lands on a local page (foreign pages carry -1 and are
-                # skipped by the KV write path as well).
-                pos = seq_len - 1
-                p = pos // page_size
-                if p % cp_size == cp_rank:
-                    slot = int(req_to_token[req_idx, pos])
-                    if slot >= 0 and fill_len[b] < max_topk:
-                        indices[b, 0, fill_len[b]] = slot
-                        fill_len[b] += 1
-                last_seq_len[b] = seq_len
-            else:
-                # New / reshuffled / non-contiguous sequence: rebuild the row
-                # from req_to_token over this rank's local pages.
-                n_local = 0
-                n_pages = (seq_len + page_size - 1) // page_size
+                if cont:
+                    # Normal continuation: append the slot of position
+                    # seq_len - 2 (the previous step's query token) when it
+                    # lands on a local page (foreign pages carry -1 and are
+                    # skipped by the KV write path as well).
+                    pos = seq_len - 2
+                    if pos >= 0:
+                        p = pos // page_size
+                        if p % cp_size == cp_rank:
+                            slot = int(req_to_token[req_idx, pos])
+                            if slot >= 0 and fill_len[b, 0] < max_topk:
+                                indices[b, 0, fill_len[b, 0]] = slot
+                                fill_len[b, 0] += 1
+                    last_seq_len[b] = seq_len
+                else:
+                    # New / reshuffled / non-contiguous sequence: rebuild the
+                    # row from req_to_token over this rank's local pages in
+                    # [0, seq_len - 1) (the query's own position is excluded).
+                    n_local = 0
+                    n_pages = (seq_len - 1 + page_size - 1) // page_size
+                    for p in range(n_pages):
+                        if p % cp_size != cp_rank:
+                            continue
+                        s = p * page_size
+                        e = min(s + page_size, seq_len - 1)
+                        n = e - s
+                        positions = torch.arange(
+                            s, e, dtype=torch.int64, device=req_to_token.device
+                        )
+                        indices[b, 0, n_local : n_local + n] = req_to_token[
+                            req_idx, positions
+                        ]
+                        n_local += n
+                    fill_len[b, 0] = n_local
+                    last_req_idx[b] = req_idx
+                    last_seq_len[b] = seq_len
+        else:
+            # seqlen_q > 1 (MTP verify/draft-extend style): every query row of
+            # a sequence is rebuilt from req_to_token each step (correctness
+            # first; an incremental multi-row update is deferred to the MTP
+            # driver work). Row j attends the local slots of [0, base + j)
+            # with base = seq_len - seqlen_q, so it never attends its own
+            # position.
+            indices.fill_(-1)
+            for b in range(B):
+                seq_len = int(seq_lens[b])
+                req_idx = int(req_pool_indices[b])
+                base = seq_len - seqlen_q
+                # Gather this rank's local slots of [0, seq_len - 1) ONCE, in
+                # position order (this is exactly the last row's content).
+                spans = []
+                n_pages = (seq_len - 1 + page_size - 1) // page_size
                 for p in range(n_pages):
                     if p % cp_size != cp_rank:
                         continue
                     s = p * page_size
-                    e = min(s + page_size, seq_len)
-                    n = e - s
-                    positions = torch.arange(
-                        s, e, dtype=torch.int64, device=req_to_token.device
+                    spans.append((s, min(s + page_size, seq_len - 1)))
+                if spans:
+                    positions = torch.cat(
+                        [
+                            torch.arange(
+                                s, e, dtype=torch.int64, device=req_to_token.device
+                            )
+                            for s, e in spans
+                        ]
                     )
-                    indices[b, 0, n_local : n_local + n] = req_to_token[
-                        req_idx, positions
-                    ]
-                    n_local += n
-                fill_len[b] = n_local
-                last_req_idx[b] = req_idx
-                last_seq_len[b] = seq_len
+                    slots = req_to_token[req_idx, positions]
+                    # Keep only REAL slots: a local page may carry -1 entries
+                    # (positions never written by this rank, e.g. leftover
+                    # holes), which must not be counted into any row's fill or
+                    # copied into indices (the sparse kernel would otherwise
+                    # scan them and its trailing--1 trim only handles -1s at
+                    # the very end of a row).
+                    valid = slots >= 0
+                    if bool(valid.any()):
+                        valid_positions = positions[valid]
+                        valid_slots = slots[valid]
+                        for j in range(seqlen_q):
+                            # Row j attends [0, base + j): its fill is the
+                            # number of valid local positions strictly below
+                            # base + j (valid_positions is sorted ascending).
+                            f = int(
+                                torch.searchsorted(valid_positions, base + j).item()
+                            )
+                            if f > 0:
+                                indices[b, j, :f] = valid_slots[:f]
+                            fill_len[b, j] = f
+                    else:
+                        fill_len[b, :seqlen_q] = 0
+                else:
+                    fill_len[b, :] = 0
 
-        real_topk_t = fill_len.clone()
+        # Per-sequence top-k length = the fill of the last FILLED row
+        # (row seqlen_q - 1; rows are ordered so the fills are non-decreasing;
+        # the kernel scans the same topk_length for every row of a sequence,
+        # and trailing -1 padding trims each row to its own length).
+        real_topk_t = fill_len[:, seqlen_q - 1].clone()
         # Sparse sched/kernel require topk_length >= 1 with valid slot ids;
         # the dummy entry is masked out in the cross-rank LSE reduction.
         topk_t = torch.clamp(real_topk_t, min=1)
         dummy = real_topk_t == 0
         if bool(dummy.any()):
-            indices[dummy, 0, 0] = 0
+            indices[dummy, :seqlen_q, 0] = 0
         metadata.long_context_topk_length = topk_t
         metadata.long_context_real_topk_length = real_topk_t
 
@@ -1005,10 +1126,15 @@ class KunpengCpuBackend(AttentionBackend):
             else torch.empty(0, dtype=torch.uint8, device=q.device)
         )
 
+        # The persistent indices buffer has speculative_num_draft_tokens rows
+        # (fixed graph-input shape), but the kernel requires indices.shape[1]
+        # == this step's seqlen_q; slice the filled leading rows. Decode steps
+        # (seqlen_q == 1) read row 0 only.
+        seqlen_q = q.shape[1]
         o, softmax_lse = kunpeng.flash_mla_sparse_decode_kunpeng(
             q,
             kvcache_paged,
-            meta.long_context_indices,
+            meta.long_context_indices[:, :seqlen_q, :],
             meta.long_context_topk_length,
             softmax_scale,
             extra_buffer,
@@ -1176,6 +1302,11 @@ class KunpengCpuBackend(AttentionBackend):
             layer.tp_q_head_num,
             q_heads.shape[-1],
         )
+        if self._lc_enabled:
+            # Long-context decode CP: sparse paged MLA over the local KV
+            # shard. The model already all-gathered Q and merges the partial
+            # (o, softmax_lse) across the cp group after this call.
+            return self._forward_mla_paged_cp(q_4d, k, v, layer, forward_batch)
         return self._forward_mla_paged(q_4d, k, v, layer, forward_batch)
 
     def forward_draft_extend(
@@ -1196,6 +1327,10 @@ class KunpengCpuBackend(AttentionBackend):
         """
         self.swap_mgr.get_kv_cache()
 
+        if self._lc_enabled:
+            # Long-context decode CP: sparse paged MLA over the local KV
+            # shard; the model merges the partials across the cp group.
+            return self._forward_mla_paged_cp(q, k, v, layer, forward_batch)
         return self._forward_mla_paged(q, k, v, layer, forward_batch)
 
     def forward_extend(

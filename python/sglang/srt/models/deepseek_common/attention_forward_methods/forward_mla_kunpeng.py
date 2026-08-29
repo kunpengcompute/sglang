@@ -275,56 +275,121 @@ class DeepseekMLAKunpengForwardMixin:
 
         tp_size = get_attention_tp_size()
         if self._lc_enabled:
-            # ---- Long-context decode CP ----
-            # Every rank keeps the FULL batch and attends only to its local
-            # 1/cp KV shard (sparse flash MLA). Q is all-gathered so each rank
-            # holds all heads of the cp group; the partial attention outputs
-            # (plus LSE) are exchanged back with all_to_all and merged.
-            assert not is_draft_extend, (
-                "long-context decode CP does not support MTP draft-extend"
-            )
-            socket_group = get_socket_tp_group()
-            cp_size = socket_group.world_size
-            B_q, numhead_local_q, D_qk = q.shape
-
-            # Q allgather: (B, Nh_local, D) -> (B, Nh_local*cp_size, D)
-            q_flat = q.contiguous().view(B_q, -1)
-            if envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get():
-                kunpeng.shm_fence_kunpeng(cp_size)
-            q_all = kunpeng.shm_batched_allgather_kunpeng(q_flat, cp_size)
-            # (B, Nh_local*D*cp): head block r sits at column
-            # [r*Nh_local*D, (r+1)*Nh_local*D) of every row.
-            q = (
-                q_all.view(B_q, cp_size, numhead_local_q, D_qk)
-                .reshape(B_q, numhead_local_q * cp_size, D_qk)
-            )
-
-            saved_tp_q_head_num = self.attn_mqa.tp_q_head_num
-            self.attn_mqa.tp_q_head_num = numhead_local_q * cp_size
-            try:
-                attn_output, softmax_lse = self._call_attn_mqa(
+            if forward_batch.forward_mode.is_idle():
+                # Idle forward (no tokens, e.g. the MTP draft model's idle
+                # round when nothing was accepted): the backend's idle path
+                # returns a single 2D empty tensor (rows, tp_q_head_num *
+                # v_head_dim) -- no Q allgather / exchange / reduce (the
+                # metadata path already skips the sparse sched). Normalize to
+                # (rows, num_local_heads, kv_lora_rank) like the dense paths
+                # do, so the shared w_vc projection tail below sees the
+                # expected 3D shape.
+                attn_output = self._call_attn_mqa(
                     q, k, k_nope, forward_batch, topk_indices
                 )
-            finally:
-                self.attn_mqa.tp_q_head_num = saved_tp_q_head_num
+                attn_output = attn_output.view(
+                    -1, self.num_local_heads, self.kv_lora_rank
+                )
+            else:
+                # ---- Long-context decode CP ----
+                # Every rank keeps the FULL batch and attends only to its local
+                # 1/cp KV shard (sparse flash MLA). Q is all-gathered so each
+                # rank holds all heads of the cp group; the partial attention
+                # outputs (plus LSE) are exchanged back with all_to_all and
+                # merged. MTP (TARGET_VERIFY / DRAFT_EXTEND) contributes
+                # seqlen_q = speculative_num_draft_tokens query rows per
+                # sequence; for DRAFT_EXTEND q is already left-padded by
+                # pad_q_left_mtp above and the padding rows are unpad'ed after
+                # the exchange/reduce.
+                seqlen_q = (
+                    forward_batch.attn_backend.speculative_num_draft_tokens
+                    if (
+                        forward_batch.forward_mode.is_target_verify()
+                        or forward_batch.forward_mode.is_draft_extend()
+                    )
+                    else 1
+                )
+                socket_group = get_socket_tp_group()
+                cp_size = socket_group.world_size
+                numhead_local_q = q.shape[-2]
+                D_qk = q.shape[-1]
+                # Normalize to flat rows (B*seqlen_q, Nh_local, D): decode
+                # passes (B, Nh_local, D), TARGET_VERIFY passes (B*n,
+                # Nh_local, D), DRAFT_EXTEND passes the padded
+                # (B, n, Nh_local, D).
+                q_3d = q.reshape(-1, numhead_local_q, D_qk)
+                B_q = q_3d.shape[0]
+                assert B_q % seqlen_q == 0, (
+                    f"long-context decode CP: q rows {B_q} not divisible by "
+                    f"seqlen_q {seqlen_q}"
+                )
+                B = B_q // seqlen_q
 
-            # Partial attention over this rank's local KV shard:
-            # attn_output (B, 1, Nh_all, D), softmax_lse (B, 1, Nh_all).
-            attn_output = attn_output[:, 0, :, :]  # (B, Nh_all, D)
-            softmax_lse = softmax_lse[:, 0, :]  # (B, Nh_all)
-            real_topk_length = (
-                forward_batch.attn_backend.forward_metadata.long_context_real_topk_length
-            )
-            o_contrib, lse_contrib, topk_out = _lc_exchange_partial_o(
-                attn_output,
-                softmax_lse,
-                real_topk_length,
-                cp_size,
-                numhead_local_q,
-            )
-            attn_output = _lc_reduce_partial_o(
-                o_contrib, lse_contrib, topk_out, cp_size
-            )
+                # Q allgather over the flattened (B*seqlen_q) rows:
+                # (B', Nh_local, D) -> (B', Nh_local*cp_size, D); head block r
+                # sits at columns [r*Nh_local*D, (r+1)*Nh_local*D) of every
+                # row.
+                q_flat = q_3d.contiguous().view(B_q, -1)
+                if envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get():
+                    kunpeng.shm_fence_kunpeng(cp_size)
+                q_all = kunpeng.shm_batched_allgather_kunpeng(q_flat, cp_size)
+                q = (
+                    q_all.view(B, seqlen_q, cp_size, numhead_local_q, D_qk)
+                    .reshape(B, seqlen_q, numhead_local_q * cp_size, D_qk)
+                )
+
+                saved_tp_q_head_num = self.attn_mqa.tp_q_head_num
+                self.attn_mqa.tp_q_head_num = numhead_local_q * cp_size
+                try:
+                    attn_output, softmax_lse = self._call_attn_mqa(
+                        q, k, k_nope, forward_batch, topk_indices
+                    )
+                finally:
+                    self.attn_mqa.tp_q_head_num = saved_tp_q_head_num
+
+                # Partial attention over this rank's local KV shard:
+                # attn_output (B, seqlen_q, Nh_all, D), softmax_lse
+                # (B, seqlen_q, Nh_all). The exchange/reduce operate on
+                # flattened rows, so flatten to (B*seqlen_q, ...) here.
+                attn_output = attn_output.reshape(
+                    B_q, numhead_local_q * cp_size, -1
+                )  # (B', Nh_all, D)
+                softmax_lse = softmax_lse.reshape(
+                    B_q, numhead_local_q * cp_size
+                )  # (B', Nh_all)
+                real_topk_length = (
+                    forward_batch.attn_backend.forward_metadata.long_context_real_topk_length
+                )
+                if seqlen_q > 1:
+                    # The exchange stores one local-KV count per row; broadcast
+                    # the per-sequence count to every query row. Use the
+                    # registered graph op: a plain torch repeat_interleave
+                    # allocates a NEW storage mid-capture that the graph
+                    # engine does not track, failing with "non-return-value
+                    # parameter tensor not registered".
+                    real_topk_length = kunpeng.repeat_interleave_kunpeng(
+                        real_topk_length, seqlen_q
+                    )
+                o_contrib, lse_contrib, topk_out = _lc_exchange_partial_o(
+                    attn_output,
+                    softmax_lse,
+                    real_topk_length,
+                    cp_size,
+                    numhead_local_q,
+                )
+                attn_output = _lc_reduce_partial_o(
+                    o_contrib, lse_contrib, topk_out, cp_size
+                )  # (B', Nh_local, D)
+
+                if is_draft_extend:
+                    # Unpad back to the flat (sum_seq_len, H, D_kv) form; the
+                    # padding rows' (real-looking) partials are discarded here.
+                    attn_output = attn_output.view(
+                        B, seqlen_q, numhead_local_q, self.kv_lora_rank
+                    )
+                    attn_output = kunpeng.unpad_o_right_mtp_kunpeng(
+                        attn_output, forward_batch.extend_seq_lens, orig_rows
+                    )
         elif tp_size > 1 and not _DISABLE_MLA_ALL2ALL:
             socket_group = get_socket_tp_group()
             all2all_size = socket_group.world_size
