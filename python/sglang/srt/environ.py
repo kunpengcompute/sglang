@@ -582,7 +582,15 @@ class Envs:
     SGLANG_KUNPENG_ENABLE_SHM_FENCE = EnvBool(False)
     SGLANG_KUNPENG_RDMA_BCAST = EnvBool(False)
     SGLANG_ENABLE_KUCCL = EnvBool(False)
-    SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE = EnvBool(False)
+    # Mixed long-context (LC) mode: comma-separated DP ranks that run LC
+    # decode-CP (e.g. "14,15"). Empty string = no LC rank (all regular).
+    # Must be identical between prefill and decode instances (declared in
+    # env.sh). Ranks are validated at scheduler startup.
+    SGLANG_KUNPENG_LC_DP_RANKS = EnvStr("")
+    # Requests whose input_len + max_new_tokens >= this threshold are routed
+    # to LC DP ranks; the rest go to regular ranks. Must be strictly greater
+    # than every regular rank's max_req_len (validated at scheduler startup).
+    SGLANG_KUNPENG_LC_MIN_SEQ_LEN = EnvInt(32768)
     # Tokenizer-side cross-process batch timeline (scheduler -> detokenizer ->
     # router -> tokenizer worker), used to locate pipeline latency. When
     # enabled, each BatchTokenIDOutput carries wall-clock timestamps and the

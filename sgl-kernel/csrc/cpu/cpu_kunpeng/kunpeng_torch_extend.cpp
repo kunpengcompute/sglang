@@ -323,6 +323,8 @@ void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor 
 
 void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Tensor o_flat);
 
+void repeat_interleave_kunpeng(at::Tensor x, at::Tensor out, int64_t repeats);
+
 // MTP performance kernels (kutacc::parallel_for, not graph ops)
 void softmax_topk_kunpeng(at::Tensor logits, at::Tensor topk_p, at::Tensor topk_index);
 
@@ -835,6 +837,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("unpad_o_right_mtp_kunpeng(Tensor o_padded, Tensor ext_lens, Tensor o_flat) -> ()");
     m.impl("unpad_o_right_mtp_kunpeng", unpad_o_right_mtp_kunpeng);
+
+    m.def("repeat_interleave_kunpeng(Tensor x, Tensor(a!) out, int repeats) -> ()");
+    m.impl("repeat_interleave_kunpeng", repeat_interleave_kunpeng);
 
     // MTP performance kernels (kutacc::parallel_for based; not graph ops)
     m.def(

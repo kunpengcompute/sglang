@@ -1,4 +1,5 @@
 import logging
+import os
 from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -22,7 +23,9 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    alloc_verify_cp_interleaved,
     get_last_loc,
+    is_lc_cp_enabled,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
@@ -125,6 +128,37 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 len(batch.input_ids),
             )
             end_offset = batch.seq_lens + self.draft_token_num
+        elif is_lc_cp_enabled():
+            # Long-context decode CP: the verify draft tokens must follow the
+            # interleaved KV layout (page p -> rank p % cp_size) so each draft
+            # K/V lands on exactly one rank; foreign positions get -1 and the
+            # KV write skips them. The new range [prefix_len, seq_len) usually
+            # falls INSIDE the prefix's last page, so the slots must CONTINUE
+            # that page (alloc_verify_cp_interleaved). Using the receive-style
+            # alloc_decode_cp_interleaved (ceil page arithmetic) would skip
+            # those positions and leave the draft K/V unallocated
+            # (req_to_token = -1), corrupting every later attention.
+            prefix_lens_cpu = batch.seq_lens_cpu
+            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
+            end_offset = batch.seq_lens + self.draft_token_num
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                batch.seq_lens,
+            )
+            batch.out_cache_loc = alloc_verify_cp_interleaved(
+                tree_cache=batch.tree_cache,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens_cpu=end_offset_cpu,
+                last_loc=last_loc,
+                extend_num_tokens=len(batch.input_ids),
+            )
+            self.last_loc = last_loc
+            if batch.out_cache_loc is None:
+                raise RuntimeError(
+                    "Long-context decode CP: verify KV allocation failed "
+                    "(out of memory)"
+                )
         else:
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
@@ -494,17 +528,36 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
-            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            free_loc = batch.out_cache_loc[evict_mask]
+            if is_lc_cp_enabled():
+                # Interleaved layout: foreign positions carry -1 and were
+                # never written on this rank; only its own slots can be freed.
+                free_loc = free_loc[free_loc >= 0]
+            token_to_kv_pool_allocator.free(free_loc)
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
                 if is_cpu_920f():
-                    align_evict_mask_to_page_size_native(
-                        batch.seq_lens,
-                        evict_mask,
-                        page_size,
-                        self.draft_token_num,
-                    )
+                    if is_lc_cp_enabled():
+                        # Interleaved layout: rejected draft slots share their
+                        # physical page with LIVE prefix/accepted tokens (the
+                        # whole logical page belongs to one rank), and free()
+                        # releases WHOLE pages -- freeing here would recycle
+                        # pages whose other slots are still referenced by
+                        # req_to_token and later overwrite live KV when the page
+                        # is re-allocated. The rejected slots are re-assigned to
+                        # the same values next round anyway (last_loc + 1
+                        # continuation in alloc_verify_cp_interleaved), and the
+                        # pages are released when the request finishes. Skip the
+                        # free entirely.
+                        pass
+                    else:
+                        align_evict_mask_to_page_size_native(
+                            batch.seq_lens,
+                            evict_mask,
+                            page_size,
+                            self.draft_token_num,
+                        )
                 else:
                     align_evict_mask_to_page_size[len(batch.seq_lens),](
                         batch.seq_lens,

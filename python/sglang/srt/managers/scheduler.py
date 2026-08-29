@@ -190,7 +190,14 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    get_lc_dp_ranks,
+    is_lc_cp_enabled,
+    is_lc_dp_rank,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+    set_lc_cp_info,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -440,6 +447,12 @@ class Scheduler(
 
         # Init mamba backend
         self.init_mamba_backend()
+
+        # Early long-context (LC) determination. Must run before the model
+        # worker is constructed: the attention backend and the MLA forward
+        # mixin read is_lc_cp_enabled() at construction time, before
+        # init_cache_with_memory_pool() runs.
+        self._maybe_init_lc_cp()
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
@@ -841,13 +854,64 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+    def _maybe_init_lc_cp(self):
+        """Early long-context (LC) determination for mixed LC/regular mode.
+
+        A DP rank runs LC decode CP iff its DP rank is listed in
+        SGLANG_KUNPENG_LC_DP_RANKS (e.g. "14,15"). An empty list keeps every
+        rank regular, which is equivalent to the old global off switch.
+        Prefill schedulers never run LC (prefill does not support the mode);
+        the variable only drives request routing on the prefill instance.
+        """
+        lc_dp_ranks = get_lc_dp_ranks()
+        if not lc_dp_ranks:
+            return
+
+        if not _is_cpu_920f:
+            raise ValueError(
+                "SGLANG_KUNPENG_LC_DP_RANKS requires the Kunpeng 920F CPU backend"
+            )
+        if self.server_args.disaggregation_mode == "prefill":
+            logger.info(
+                "Prefill instance ignores SGLANG_KUNPENG_LC_DP_RANKS "
+                "(long-context decode CP is decode-only)"
+            )
+            return
+        if self.server_args.dp_size <= 1:
+            raise ValueError(
+                "SGLANG_KUNPENG_LC_DP_RANKS is set but dp_size <= 1; "
+                "mixed LC mode requires --enable-dp-attention with dp_size > 1"
+            )
+        out_of_range = sorted(r for r in lc_dp_ranks if r >= self.server_args.dp_size)
+        if out_of_range:
+            raise ValueError(
+                f"SGLANG_KUNPENG_LC_DP_RANKS contains out-of-range DP ranks "
+                f"{out_of_range} (dp_size={self.server_args.dp_size})"
+            )
+
+        if not is_lc_dp_rank(self.dp_rank):
+            return
+
+        # This rank runs LC decode CP: the attention-tp group acts as the
+        # CP group (interleaved KV layout, 1/cp of every sequence per rank).
+        if self.attn_tp_size != 8:
+            raise ValueError(
+                f"Long-context decode CP requires attn_tp_size == 8, "
+                f"got {self.attn_tp_size}"
+            )
+        set_lc_cp_info(self.attn_tp_size, self.attn_tp_rank)
+        logger.info(
+            f"Long-context decode CP enabled on DP rank {self.dp_rank} "
+            f"(cp_size={self.attn_tp_size}, cp_rank={self.attn_tp_rank})"
+        )
+
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
 
-        if envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get() and _is_cpu_920f:
-            from sglang.srt.mem_cache.common import set_lc_cp_info
-
-            set_lc_cp_info(self.attn_tp_size, self.attn_tp_rank)
+        if is_lc_cp_enabled():
+            # set_lc_cp_info was already called in _maybe_init_lc_cp (before
+            # model load, because the attention backend reads
+            # is_lc_cp_enabled() at construction time).
 
             # Each rank stores only 1/cp of every sequence's KV, so the
             # effective per-request length bound is the per-rank pool size
@@ -859,6 +923,20 @@ class Scheduler(
                 self.max_total_num_tokens * cp_size - 1,
             )
             self.max_req_input_len = self.max_req_len - 5
+        elif get_lc_dp_ranks():
+            # Mixed mode and this rank is regular: the router sends every
+            # request with input_len + max_new_tokens < LC_MIN_SEQ_LEN to
+            # regular ranks, so the threshold must be admissible here.
+            min_seq_len = envs.SGLANG_KUNPENG_LC_MIN_SEQ_LEN.get()
+            if min_seq_len - 1 > self.max_req_input_len:
+                raise ValueError(
+                    f"SGLANG_KUNPENG_LC_MIN_SEQ_LEN={min_seq_len} exceeds this "
+                    f"regular rank's capacity (max_req_input_len="
+                    f"{self.max_req_input_len}); requests just below the "
+                    f"threshold would be rejected. Raise the threshold above "
+                    f"{self.max_req_input_len + 1} or give regular ranks more "
+                    f"KV memory."
+                )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )

@@ -3773,7 +3773,7 @@ class ServerArgs:
                     )
                 if (
                     is_cpu_920f() and
-                    envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
+                    envs.SGLANG_KUNPENG_LC_DP_RANKS.get().strip()
                 ):
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache is incompatible "

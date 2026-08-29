@@ -26,6 +26,8 @@ from sglang.srt.distributed.parallel_state import (
     get_attn_tp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.common import is_lc_cp_enabled
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_cpu_920f
 from sgl_kernel import pg_helper
@@ -202,14 +204,23 @@ class KunpengCommunicator:
 
         # SHM MLA long-context alltoall (decode CP; comm8 only, matching the
         # tp=8 single-socket long-context decode constraint).
-        if (
-            envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
-            and self.comm_size == 8
-        ):
+        if is_lc_cp_enabled() and self.comm_size == 8:
             num_heads = 128
+            # The exchange stages B' = B * speculative_num_draft_tokens rows
+            # per call, where B (concurrent sequences) is bounded by
+            # SGLANG_KUNPENG_MAX_SEQ_NUM (the decode batch size is
+            # min(req_to_token_pool.size, max_running_requests) capped by
+            # kunpeng_max_seq_num). Use max_seq_num * spec_draft_tokens as the
+            # row budget -- NOT self.max_tokens (= max_seq_num * MAX_CUR_LEN),
+            # which would oversize the SHM region by ~MAX_CUR_LEN and exhaust
+            # the decode SHM pool (b is B' rows, not a token count).
+            max_seq_num = envs.SGLANG_KUNPENG_MAX_SEQ_NUM.get()
+            spec_draft_tokens = (
+                get_global_server_args().speculative_num_draft_tokens or 1
+            )
             kernel.shm_mla_alltoall_long_context_init_kunpeng(
                 self.comm_size,
-                self.max_tokens,  # per-step decode batch budget
+                max_seq_num * spec_draft_tokens,  # per-step row budget
                 512,   # kv_lora_rank (v_head_dim)
                 num_heads // self.comm_size,  # num_local_heads
                 num_heads,

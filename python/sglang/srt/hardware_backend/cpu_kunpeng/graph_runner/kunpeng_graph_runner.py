@@ -551,6 +551,25 @@ class KunpengGraphRunner:
                 inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
                 if self.swap_mgr._blockwise_ddr_block_ids is not None:
                     inputs[-3] = self.swap_mgr._blockwise_remapped_block_table
+            if getattr(self.model_runner.attn_backend, "_lc_enabled", False) and (
+                forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+            ):
+                # Long-context decode CP + MTP: the sparse LC metadata
+                # (persistent indices buffer + per-step topk lengths) is read
+                # inside the captured forward (flash_mla_sparse_decode / LC
+                # partial-O exchange), so it must be registered as graph
+                # inputs here, mirroring the DECODE capture above. The shapes
+                # are constant for a given batch size (the indices buffer is
+                # fixed at (B, speculative_num_draft_tokens, MAX_TOPK)), so
+                # the same tensors can back TARGET_VERIFY / DRAFT_EXTEND
+                # captures as well.
+                inputs.extend(
+                    [
+                        meta.long_context_indices,
+                        meta.long_context_topk_length,
+                        meta.long_context_real_topk_length,
+                    ]
+                )
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)

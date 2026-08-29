@@ -126,7 +126,7 @@ celerybeat.pid
 
 # Environments
 .env
-.user_env.sh
+.user_env*.sh
 .time_env.sh
 .venv
 env/

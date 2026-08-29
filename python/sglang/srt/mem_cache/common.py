@@ -63,6 +63,28 @@ def get_lc_cp_info() -> tuple[int, int]:
     return _lc_cp_size, _lc_cp_rank
 
 
+def get_lc_dp_ranks() -> set[int]:
+    """Parse SGLANG_KUNPENG_LC_DP_RANKS into a set of DP ranks.
+
+    Empty string (or unset) means no DP rank runs long-context mode.
+    Malformed entries raise ValueError so bad config fails fast.
+    """
+    raw = envs.SGLANG_KUNPENG_LC_DP_RANKS.get().strip()
+    if not raw:
+        return set()
+    ranks = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        ranks.add(int(part))  # raises ValueError on malformed input
+    return ranks
+
+
+def is_lc_dp_rank(dp_rank: int) -> bool:
+    return dp_rank in get_lc_dp_ranks()
+
+
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
     # The page is guaranteed to be full except the last page.
     if page_size == 1:
@@ -509,6 +531,106 @@ def alloc_decode_cp_interleaved(
         flat_offset += seq - pre
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
+
+
+def alloc_verify_cp_interleaved(
+    tree_cache: BasePrefixCache,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    extend_num_tokens: int,
+    backup_state: bool = False,
+):
+    """Interleaved extend allocation for MTP verify batches under LC decode CP.
+
+    The verify batch writes ``draft_token_num`` new tokens per request at
+    positions [prefix_len, seq_len). Unlike ``alloc_decode_cp_interleaved``
+    (which receives a WHOLE new prefix and can use ceil page arithmetic), the
+    verify range usually falls INSIDE the last already-allocated logical page
+    of the prefix, so the new slots must CONTINUE that page:
+
+      * position ``pos`` on a page this rank does not own -> -1 (foreign);
+      * the first position of a request: if ``pos > 0``, ``pos - 1`` lies in
+        the same page and ``last_loc`` (the slot of ``pos - 1``) is valid,
+        continue from ``last_loc + 1``; otherwise allocate a fresh page;
+      * any later page-start position -> allocate a fresh page;
+      * positions inside an already-started local page -> previous slot + 1.
+
+    This mirrors ``alloc_paged_token_slots_decode_cp`` (per-token decode) for
+    the multi-token verify case and keeps every draft K/V on exactly one rank.
+    """
+    cp_size, cp_rank = get_lc_cp_info()
+    allocator = tree_cache.token_to_kv_pool_allocator
+    page_size = allocator.page_size
+    bs = len(prefix_lens_cpu)
+
+    # First pass: count how many fresh pages are needed.
+    need_new_pages = 0
+    for i in range(bs):
+        pre = int(prefix_lens_cpu[i])
+        seq = int(seq_lens_cpu[i])
+        for pos in range(pre, seq):
+            p = pos // page_size
+            if p % cp_size != cp_rank:
+                continue
+            # Mirror the consumption rules of the second pass EXACTLY: a page
+            # is consumed only for a local page-start position, or for the
+            # first position of the request when it cannot continue the
+            # previous page (last_loc invalid). Same-page continuation
+            # positions (prev_slot + 1) and first-position continue-page
+            # consume nothing. Any mismatch here pops pages from the free list
+            # that are never used and never freed (a leak per verify round).
+            if pos == pre and pos > 0 and (pos - 1) // page_size == p and int(last_loc[i]) >= 0:
+                continue  # continue-page: no new page
+            if pos == pre or pos % page_size == 0:
+                need_new_pages += 1
+            # else: same-page continuation, no new page
+
+    evict_from_tree_cache(tree_cache, max(need_new_pages, 1) * page_size)
+    allocator.merge_and_sort_free()
+
+    if need_new_pages > len(allocator.free_pages):
+        return None
+
+    pages = allocator.free_pages[:need_new_pages]
+    allocator.free_pages = allocator.free_pages[need_new_pages:]
+
+    out_cache_loc = torch.full(
+        (extend_num_tokens,), -1, dtype=torch.int64, device=allocator.device
+    )
+    flat = 0
+    k = 0
+    for i in range(bs):
+        pre = int(prefix_lens_cpu[i])
+        seq = int(seq_lens_cpu[i])
+        prev_slot = -1
+        for pos in range(pre, seq):
+            p = pos // page_size
+            if p % cp_size != cp_rank:
+                out_cache_loc[flat] = -1
+                prev_slot = -1
+                flat += 1
+                continue
+            if pos == pre and pos > 0 and (pos - 1) // page_size == p and int(last_loc[i]) >= 0:
+                slot = int(last_loc[i]) + 1
+            elif pos == pre or pos % page_size == 0:
+                slot = pages[k] * page_size + pos % page_size
+                k += 1
+            else:
+                slot = prev_slot + 1
+            out_cache_loc[flat] = slot
+            prev_slot = slot
+            flat += 1
+
+    assert flat == extend_num_tokens, (
+        f"alloc_verify_cp_interleaved: filled {flat} slots, expected "
+        f"{extend_num_tokens}"
+    )
+    assert k == need_new_pages, (
+        f"alloc_verify_cp_interleaved: consumed {k} pages but counted "
+        f"{need_new_pages}; page budget mismatch (leak)"
+    )
+    return out_cache_loc
 
 
 def alloc_req_slots(
