@@ -528,7 +528,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
-            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            free_loc = batch.out_cache_loc[evict_mask]
+            if is_lc_cp_enabled():
+                # Interleaved layout: foreign positions carry -1 and were
+                # never written on this rank; only its own slots can be freed.
+                free_loc = free_loc[free_loc >= 0]
+            token_to_kv_pool_allocator.free(free_loc)
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page

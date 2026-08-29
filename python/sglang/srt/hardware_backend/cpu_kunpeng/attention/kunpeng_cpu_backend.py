@@ -25,6 +25,7 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.distributed import get_socket_tp_group
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.common import is_lc_cp_enabled
 from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import *
 from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
@@ -262,7 +263,7 @@ class KunpengCpuBackend(AttentionBackend):
         # MTP is supported: TARGET_VERIFY / DRAFT_EXTEND run the same sparse
         # path with seqlen_q = speculative_num_draft_tokens rows per sequence.
         # No blockwise KV swap.
-        self._lc_enabled = envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
+        self._lc_enabled = is_lc_cp_enabled()
         self._lc_cp_size: int = 0
         self._lc_cp_rank: int = -1
         # Fixed top-k bound of the sparse-attention metadata (see
@@ -272,10 +273,7 @@ class KunpengCpuBackend(AttentionBackend):
             assert not is_kunpeng_swap_kv_blockwise(), (
                 "long-context decode CP conflicts with blockwise KV swap"
             )
-            logger.info(
-                "Long-context decode CP enabled "
-                "(SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE=1)"
-            )
+            logger.info("Long-context decode CP enabled (mixed LC/regular mode)")
 
         self.forward_metadata = KunpengCpuMetadata()
 

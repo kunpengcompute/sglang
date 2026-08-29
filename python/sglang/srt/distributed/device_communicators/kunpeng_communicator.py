@@ -26,6 +26,7 @@ from sglang.srt.distributed.parallel_state import (
     get_attn_tp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.common import is_lc_cp_enabled
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_cpu_920f
@@ -203,10 +204,7 @@ class KunpengCommunicator:
 
         # SHM MLA long-context alltoall (decode CP; comm8 only, matching the
         # tp=8 single-socket long-context decode constraint).
-        if (
-            envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
-            and self.comm_size == 8
-        ):
+        if is_lc_cp_enabled() and self.comm_size == 8:
             num_heads = 128
             # The exchange stages B' = B * speculative_num_draft_tokens rows
             # per call, where B (concurrent sequences) is bounded by

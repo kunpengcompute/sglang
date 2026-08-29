@@ -23,6 +23,7 @@ from sglang.srt.distributed import get_socket_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.graph import ops as kunpeng
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.mem_cache.common import is_lc_cp_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, get_bool_env_var
@@ -107,7 +108,7 @@ class DeepseekMLAKunpengForwardMixin:
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
-        self._lc_enabled = envs.SGLANG_KUNPENG_USE_LONG_CONTEXT_INFERENCE.get()
+        self._lc_enabled = is_lc_cp_enabled()
 
     def forward_absorb_prepare_kunpeng(
         self: DeepseekV2AttentionMLA,

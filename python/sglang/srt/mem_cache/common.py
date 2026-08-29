@@ -63,6 +63,28 @@ def get_lc_cp_info() -> tuple[int, int]:
     return _lc_cp_size, _lc_cp_rank
 
 
+def get_lc_dp_ranks() -> set[int]:
+    """Parse SGLANG_KUNPENG_LC_DP_RANKS into a set of DP ranks.
+
+    Empty string (or unset) means no DP rank runs long-context mode.
+    Malformed entries raise ValueError so bad config fails fast.
+    """
+    raw = envs.SGLANG_KUNPENG_LC_DP_RANKS.get().strip()
+    if not raw:
+        return set()
+    ranks = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        ranks.add(int(part))  # raises ValueError on malformed input
+    return ranks
+
+
+def is_lc_dp_rank(dp_rank: int) -> bool:
+    return dp_rank in get_lc_dp_ranks()
+
+
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
     # The page is guaranteed to be full except the last page.
     if page_size == 1:
