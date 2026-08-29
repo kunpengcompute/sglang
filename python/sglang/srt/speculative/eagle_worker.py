@@ -1329,7 +1329,7 @@ class EAGLEWorker(TpModelWorker):
                 (logits.shape[0], 1), dtype=torch.int64, device=logits.device
             )
             torch.ops.sgl_kernel.softmax_topk_kunpeng(
-                logits, topk_p, topk_index, envs.SGLANG_KUNPENG_SOFTMAX_TOPK_PRF_VECS
+                logits, topk_p, topk_index, envs.SGLANG_KUNPENG_SOFTMAX_TOPK_PRF_VECS.get()
             )
             return topk_p, topk_index
         probs = torch.softmax(logits, dim=-1)
