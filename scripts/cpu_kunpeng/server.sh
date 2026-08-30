@@ -143,6 +143,24 @@ case "$ROLE" in
         )
         ;;
     router)
+        # ================= Router-node CPU / NUMA binding plan =================
+        # Example layout (adjust *_NUMA_BASE to match the router's real NUMAs;
+        # W = TOKENIZER_WORKER_NUM, each NUMA = 38 cores, last core isolated).
+        # 16 NUMAs total (0-15). With W=4 each role needs 5 (tok W + detok 1),
+        # 3 roles = 15 NUMAs; NUMA 15 is left for the gateway & bootstrap:
+        #   prefill : BASE 0   -> tokenizer 0..(W-1),    detok W
+        #   second  : BASE 5   -> tokenizer 5..(5+W-1),  detok 5+W
+        #   decode  : BASE 10  -> tokenizer 10..(10+W-1), detok 10+W
+        #   NUMA 15 (570-606): gateway cores + bootstrap server cores
+        export PREFILL_NUMA_BASE="${PREFILL_NUMA_BASE:-0}"
+        export DECODE_NUMA_BASE="${DECODE_NUMA_BASE:-10}"
+        export PREFILL_BOOTSTRAP_CPU="${PREFILL_BOOTSTRAP_CPU:-601}"
+        export GATEWAY_CPUS="${GATEWAY_CPUS:-570-600}"
+        # Second prefill only used when enabled.
+        if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
+            export SECOND_PREFILL_NUMA_BASE="${SECOND_PREFILL_NUMA_BASE:-5}"
+            export SECOND_PREFILL_BOOTSTRAP_CPU="${SECOND_PREFILL_BOOTSTRAP_CPU:-602}"
+        fi
         if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
             _router_prefill_url="http://${ROUTER_IP}:30001"
             _router_decode_url="http://${ROUTER_IP}:30002"
@@ -203,6 +221,8 @@ if [[ "$ROLE" == "router" ]]; then
     if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
         # Launch prefill HTTP server (tokenizer side)
         echo "Launching prefill HTTP server..."
+        SGLANG_KUNPENG_TOKENIZER_BASE_NUMA="$PREFILL_NUMA_BASE" \
+        SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU="$PREFILL_BOOTSTRAP_CPU" \
         LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
         python -m sglang.launch_server \
             "${HTTP_COMMON_ARGS[@]}" \
@@ -217,6 +237,8 @@ if [[ "$ROLE" == "router" ]]; then
         # second prefill backend cluster (SECOND_PREFILL_* nodes / master).
         if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
             echo "Launching second prefill HTTP server..."
+            SGLANG_KUNPENG_TOKENIZER_BASE_NUMA="$SECOND_PREFILL_NUMA_BASE" \
+            SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU="$SECOND_PREFILL_BOOTSTRAP_CPU" \
             LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
             python -m sglang.launch_server \
                 "${HTTP_COMMON_ARGS[@]}" \
@@ -230,6 +252,7 @@ if [[ "$ROLE" == "router" ]]; then
 
         # Launch decode HTTP server (tokenizer side)
         echo "Launching decode HTTP server..."
+        SGLANG_KUNPENG_TOKENIZER_BASE_NUMA="$DECODE_NUMA_BASE" \
         LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
         python -m sglang.launch_server \
             "${HTTP_COMMON_ARGS[@]}" \
@@ -245,12 +268,12 @@ if [[ "$ROLE" == "router" ]]; then
         for port in "${HTTP_PORTS[@]}"; do
             echo "Waiting for HTTP server on port $port to be ready..."
             ready=0
-            for i in $(seq 1 900); do  # up to 30 minutes
+            for i in $(seq 1 18000); do  # up to 30 minutes
                 if curl -sf --max-time 2 "http://${ROUTER_IP}:${port}/health" >/dev/null 2>&1; then
                     ready=1
                     break
                 fi
-                sleep 2
+                sleep 0.1
             done
             [[ "$ready" -eq 1 ]] || {
                 echo "ERROR: HTTP server on port $port not ready within 30 minutes" >&2
@@ -269,10 +292,9 @@ if [[ "$ROLE" == "router" ]]; then
         echo "ERROR: sgl-model-gateway not found (MODEL_GATEWAY_BIN=${MODEL_GATEWAY_BIN:-<unset>})" >&2
         exit 1
     fi
-    # Bind gateway to a dedicated core (NUMA 10, first core) so it does not
-    # collide with the tokenizer workers (decode tokenizer now owns NUMA 4-7,
-    # i.e. cores 152-303; detokenizer owns NUMA 8-9, i.e. 304-379).
-    taskset -c 380-416 "$GATEWAY_BIN" "${SPECIFIC_ARGS[@]}" \
+    # Pin the gateway to a dedicated core range so it does not collide with
+    # the tokenizer/detokenizer workers (see the NUMA plan above).
+    taskset -c "$GATEWAY_CPUS" "$GATEWAY_BIN" "${SPECIFIC_ARGS[@]}" \
         > "$LOG_PATH/router_$IP.log" 2>&1 &
 
     exit 0

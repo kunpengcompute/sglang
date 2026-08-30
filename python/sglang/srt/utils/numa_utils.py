@@ -23,6 +23,61 @@ _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
+# Env override for the tokenizer/detokenizer NUMA base of a role. Used to give
+# an extra (e.g. second) prefill its own distinct NUMA block on the router.
+SGLANG_KUNPENG_TOKENIZER_BASE_NUMA = "SGLANG_KUNPENG_TOKENIZER_BASE_NUMA"
+
+
+def resolve_tokenizer_base_numa(server_args: ServerArgs) -> int:
+    """Tokenizer base NUMA for the current role.
+
+    Env override wins (lets the second prefill pick its own block); otherwise
+    decode => 4, prefill => 0.
+    """
+    v = os.getenv(SGLANG_KUNPENG_TOKENIZER_BASE_NUMA)
+    if v is not None:
+        return int(v)
+    return 4 if getattr(server_args, "disaggregation_mode", None) == "decode" else 0
+
+
+def tokenizer_worker_cpusets_from_base(
+    base_numa: int, n: int
+) -> List[List[int]]:
+    """Per-tokenizer-worker NUMA sets starting at base_numa (capped at 4)."""
+    n = min(n, 4)
+    return [
+        list(range((base_numa + i) * 38, (base_numa + i) * 38 + 37))
+        for i in range(n)
+    ]
+
+
+def tokenizer_numa_span(tokenizer_worker_num: int) -> int:
+    """NUMA nodes spanned by the tokenizer block.
+
+    A single worker gets 2 NUMA nodes for headroom; >=2 workers each take 1.
+    The detokenizer sits right after this block, so its offset must match the
+    span returned here.
+    """
+    n = max(1, min(tokenizer_worker_num, 4))
+    return 2 if n == 1 else n
+
+
+def tokenizer_worker_cpuset_for_span(base_numa: int, span: int) -> List[int]:
+    """One worker bound across `span` consecutive NUMA nodes starting at base."""
+    cpus = []
+    for i in range(span):
+        cpus += list(range((base_numa + i) * 38, (base_numa + i) * 38 + 37))
+    return cpus
+
+
+def detokenizer_cpuset_from_base(
+    base_numa: int, tokenizer_numa_count: int
+) -> List[int]:
+    """Detokenizer sits right after the tokenizer block: base + tokenizer count."""
+    d_numa = base_numa + max(1, tokenizer_numa_count)
+    return list(range(d_numa * 38, d_numa * 38 + 37))
+
+
 libnuma = None
 
 for libnuma_so in ["libnuma.so", "libnuma.so.1"]:

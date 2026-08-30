@@ -51,7 +51,13 @@ from sglang.utils import (
     get_exception_traceback,
 )
 from sglang.srt.utils.common import is_cpu_920f, is_http_only
-from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
+from sglang.srt.utils.numa_utils import (
+    detokenizer_cpuset_from_base,
+    resolve_tokenizer_base_numa,
+    tokenizer_numa_span,
+    zmq_context_core_binding,
+    ZmqOffset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -449,12 +455,18 @@ def run_detokenizer_process(
 
             p = psutil.Process(os.getpid())
             if is_http_only():
-                # Router-node detokenizer. NUMA 8 (304-341) for prefill,
-                # NUMA 9 (342-379) for decode; last core of each NUMA isolated.
-                if server_args.disaggregation_mode == "prefill":
-                    p.cpu_affinity(list(range(304, 341)))
-                elif server_args.disaggregation_mode == "decode":
-                    p.cpu_affinity(list(range(342, 379)))
+                # Router-node detokenizer. Derive from the role's tokenizer base
+                # NUMA: tokenizer occupies [base, base+tok_numa), detokenizer
+                # takes the next NUMA (base+tok_numa). Env override lets a second
+                # prefill use a distinct block.
+                if envs.SGLANG_SET_CPU_AFFINITY.get():
+                    base = resolve_tokenizer_base_numa(server_args)
+                    p.cpu_affinity(
+                        detokenizer_cpuset_from_base(
+                            base,
+                            tokenizer_numa_span(server_args.tokenizer_worker_num),
+                        )
+                    )
             else:
                 # TODO (kunpeng): hard code here, should use a more elegant way.
                 p.cpu_affinity({96})  # 20
