@@ -14,7 +14,7 @@
 
 #!/bin/bash
 # Usage: ./stop.sh [prefill|decode|native|router|all] [instance]
-#   instance - optional second prefill instance ("ins"), passed to env.sh
+#   instance - optional second prefill instance ("second"), passed to env.sh
 
 
 if [[ $# -gt 2 ]]; then
@@ -35,9 +35,16 @@ cd "$SCRIPT_DIR"
 # "all" mode: stop every role (router + prefill + decode + native)
 # Handle this before sourcing env.sh, which does not support an "all" role.
 if [[ "$ROLE" == "all" ]]; then
+    # Read SECOND_PREFILL_ENABLED (from env.sh / .user_env.sh)
+    source ./env.sh native
     for _role in router prefill decode; do
         bash ./stop.sh "$_role"
     done
+    # If the second prefill is enabled, stop it too (the loop above
+    # only covers the default prefill nodes).
+    if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
+        bash ./stop.sh prefill second
+    fi
     exit 0
 fi
 

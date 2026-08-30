@@ -1112,7 +1112,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             # DeepSeek V3 PD-disaggregation on Kunpeng: deepen the listen
             # backlog so bursty route/query requests from decode ranks queue
             # up instead of timing out.
-            backlog = 133928 if envs.SGLANG_USE_CPU_920F.get() else 128
+            backlog = 65536 if envs.SGLANG_USE_CPU_920F.get() else 128
             site = web.TCPSite(
                 self._runner, host=self.host, port=self.port, backlog=backlog
             )

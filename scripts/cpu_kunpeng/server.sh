@@ -115,9 +115,9 @@ case "$ROLE" in
             --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
         )
-        if [[ "$INSTANCE" == "ins" ]]; then
+        if [[ "$INSTANCE" == "second" ]]; then
             SPECIFIC_ARGS+=(--disaggregation-bootstrap-port 9002)
-            echo "===================ins 9002 $IP"
+            echo "===================second 9002 $IP"
         else
             SPECIFIC_ARGS+=(--disaggregation-bootstrap-port 9001)
         fi
@@ -154,7 +154,6 @@ case "$ROLE" in
             --model-path "$MODEL_PATH"
             --pd-disaggregation
             --prefill "$_router_prefill_url" 9001
-            --prefill "http://${ROUTER_IP}:30003" 9002
             --decode "$_router_decode_url"
             --policy cache_aware
             --health-check-interval-secs 10000
@@ -163,6 +162,11 @@ case "$ROLE" in
             --health-check-timeout-secs 10000
             --host "$IP"
         )
+        if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
+            SPECIFIC_ARGS+=(
+                --prefill "http://${ROUTER_IP}:30003" 9002
+            )
+        fi
         if [[ "$PREFILL_BUCKET" == "1" ]]; then
             SPECIFIC_ARGS+=(
                 --prefill "${PREFILL_LONG_PROMPT_MASTER_ADDR:+http://$PREFILL_LONG_PROMPT_MASTER_ADDR:30000}" 9001
@@ -209,18 +213,20 @@ if [[ "$ROLE" == "router" ]]; then
             --disaggregation-bootstrap-port 9001 \
         > "$LOG_PATH/router_prefill_http.log" 2>&1 &
 
-        # Launch ins prefill HTTP server (tokenizer side), paired with the
-        # ins prefill backend cluster (PREFILL_INS_* nodes / master).
-        echo "Launching ins prefill HTTP server..."
-        LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
-        python -m sglang.launch_server \
-            "${HTTP_COMMON_ARGS[@]}" \
-            --dp-size "$PREFILL_DP_SIZE" \
-            --port 30003 \
-            --dist-init-addr "$PREFILL_INS_MASTER_ADDR:$PREFILL_INS_MASTER_PORT" \
-            --disaggregation-mode prefill \
-            --disaggregation-bootstrap-port 9002 \
-        > "$LOG_PATH/router_prefill_http_ins.log" 2>&1 &
+        # Launch second prefill HTTP server (tokenizer side), paired with the
+        # second prefill backend cluster (SECOND_PREFILL_* nodes / master).
+        if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
+            echo "Launching second prefill HTTP server..."
+            LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
+            python -m sglang.launch_server \
+                "${HTTP_COMMON_ARGS[@]}" \
+                --dp-size "$PREFILL_DP_SIZE" \
+                --port 30003 \
+                --dist-init-addr "$SECOND_PREFILL_MASTER_ADDR:$SECOND_PREFILL_MASTER_PORT" \
+                --disaggregation-mode prefill \
+                --disaggregation-bootstrap-port 9002 \
+            > "$LOG_PATH/router_prefill_http_second.log" 2>&1 &
+        fi
 
         # Launch decode HTTP server (tokenizer side)
         echo "Launching decode HTTP server..."
@@ -233,8 +239,10 @@ if [[ "$ROLE" == "router" ]]; then
             --disaggregation-mode decode \
         > "$LOG_PATH/router_decode_http.log" 2>&1 &
 
-        # Poll until both HTTP servers are ready (up to 2 minutes each)
-        for port in 30001 30002 30003; do
+        # Poll until the HTTP servers are ready (up to 2 minutes each)
+        HTTP_PORTS=(30001 30002)
+        [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]] && HTTP_PORTS+=(30003)
+        for port in "${HTTP_PORTS[@]}"; do
             echo "Waiting for HTTP server on port $port to be ready..."
             ready=0
             for i in $(seq 1 900); do  # up to 30 minutes

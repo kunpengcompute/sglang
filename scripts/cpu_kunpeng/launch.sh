@@ -37,7 +37,7 @@ for arg in "$@"; do
         prefill|decode|native|router|all)
             ROLE="$arg"
             ;;
-        ins)
+        second)
             INSTANCE="$arg"
             ;;
         long_prompt)
@@ -79,32 +79,37 @@ if [[ "$ROLE" == "all" ]]; then
     echo "[$(date +%T)] ===== Launching all roles (prefill + decode + router) in background ====="
 
     bash ./stop.sh router
+    source ./env.sh native
     bash ./launch.sh prefill --no-log
-    bash ./launch.sh prefill ins --no-log
+    if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
+        bash ./launch.sh prefill second --no-log
+    fi
     SGLANG_SKIP_UPDATE=1 bash ./launch.sh decode --no-log
 
-    source ./env.sh native
-    # Wait for prefill(1), ins prefill, and decode HTTP servers to be ready
-    # (up to 20 minutes total)
+    # Wait for prefill(1), and (optionally) the second prefill, and decode HTTP
+    # servers to be ready (up to 20 minutes total).
     endpoints=(
         "${PREFILL_MASTER_ADDR}:30000"
-        "${PREFILL_INS_MASTER_ADDR}:30000"
         "${DECODE_MASTER_ADDR}:30000"
     )
+    [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]] && endpoints+=("${SECOND_PREFILL_MASTER_ADDR}:30000")
     echo "[$(date +%T)] Waiting for prefill and decode servers to be ready (up to 20 minutes)..."
-    ready=(0 0 0)
+    ready=()
+    for _j in "${endpoints[@]}"; do ready+=(0); done
     for i in $(seq 1 12000); do
-        for j in 0 1 2; do
+        for j in "${!endpoints[@]}"; do
             if [[ "${ready[$j]}" -eq 0 ]] &&
                 curl -sf --max-time 2 "http://${endpoints[$j]}/health" >/dev/null 2>&1; then
                 ready[$j]=1
                 echo "[$(date +%T)] ${endpoints[$j]} ready"
             fi
         done
-        [[ "${ready[0]}" -eq 1 && "${ready[1]}" -eq 1 && "${ready[2]}" -eq 1 ]] && break
+        ready_all=1
+        for v in "${ready[@]}"; do [[ "$v" -eq 1 ]] || { ready_all=0; break; }; done
+        [[ "$ready_all" -eq 1 ]] && break
         sleep 0.1
     done
-    for j in 0 1 2; do
+    for j in "${!endpoints[@]}"; do
         if [[ "${ready[$j]}" -eq 0 ]]; then
             echo "ERROR: HTTP server at ${endpoints[$j]} failed to start within 20 minutes"
             exit 1

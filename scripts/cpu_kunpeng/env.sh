@@ -104,6 +104,14 @@ PREFILL_LONG_PROMPT_IP_FILE=""
 PREFILL_LONG_PROMPT_MASTER_ADDR="xxx.xxx.xxx.17"
 PREFILL_LONG_PROMPT_MASTER_PORT="5020"
 
+# Switch to enable the second prefill instance.
+export SECOND_PREFILL_ENABLED=0
+
+SECOND_PREFILL_IP_SPEC=""
+SECOND_PREFILL_IP_FILE=""
+SECOND_PREFILL_MASTER_ADDR="xxx.xxx.xxx.17"
+SECOND_PREFILL_MASTER_PORT="5020"
+
 DECODE_IP_SPEC=""
 DECODE_IP_FILE=""
 DECODE_MASTER_ADDR="xxx.xxx.xxx.17"
@@ -376,10 +384,10 @@ prefill_config() {
         _export_pd_vars "PREFILL"
         export PP_SIZE=$PREFILL_LONG_PROMPT_PP_SIZE
         _prefix="PREFILL_LONG_PROMPT"
-    elif [[ "$instance" == "ins" ]]; then
-        # Second prefill instance on an independent node group (PREFILL_INS_*)
+    elif [[ "$instance" == "second" ]]; then
+        # Second prefill instance on an independent node group (SECOND_PREFILL_*)
         _export_pd_vars "PREFILL"
-        _prefix="PREFILL_INS"
+        _prefix="SECOND_PREFILL"
     else
         _export_pd_vars "PREFILL"
     fi
