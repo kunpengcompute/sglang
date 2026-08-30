@@ -109,13 +109,18 @@ case "$ROLE" in
     prefill)
         SPECIFIC_ARGS=(
             --disaggregation-mode prefill
-            --disaggregation-bootstrap-port 9001
             --max-prefill-tokens $((SGLANG_KUNPENG_MAX_SEQ_NUM * SGLANG_KUNPENG_MAX_CUR_LEN))
             --max-total-tokens 139328
             --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
             --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
         )
+        if [[ "$INSTANCE" == "ins" ]]; then
+            SPECIFIC_ARGS+=(--disaggregation-bootstrap-port 9002)
+            echo "===================ins 9002 $IP"
+        else
+            SPECIFIC_ARGS+=(--disaggregation-bootstrap-port 9001)
+        fi
         ;;
     decode)
         SPECIFIC_ARGS=(
@@ -149,6 +154,7 @@ case "$ROLE" in
             --model-path "$MODEL_PATH"
             --pd-disaggregation
             --prefill "$_router_prefill_url" 9001
+            --prefill "http://${ROUTER_IP}:30003" 9002
             --decode "$_router_decode_url"
             --policy cache_aware
             --health-check-interval-secs 10000
@@ -200,7 +206,21 @@ if [[ "$ROLE" == "router" ]]; then
             --port 30001 \
             --dist-init-addr "$PREFILL_MASTER_ADDR:$PREFILL_MASTER_PORT" \
             --disaggregation-mode prefill \
+            --disaggregation-bootstrap-port 9001 \
         > "$LOG_PATH/router_prefill_http.log" 2>&1 &
+
+        # Launch ins prefill HTTP server (tokenizer side), paired with the
+        # ins prefill backend cluster (PREFILL_INS_* nodes / master).
+        echo "Launching ins prefill HTTP server..."
+        LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
+        python -m sglang.launch_server \
+            "${HTTP_COMMON_ARGS[@]}" \
+            --dp-size "$PREFILL_DP_SIZE" \
+            --port 30003 \
+            --dist-init-addr "$PREFILL_INS_MASTER_ADDR:$PREFILL_INS_MASTER_PORT" \
+            --disaggregation-mode prefill \
+            --disaggregation-bootstrap-port 9002 \
+        > "$LOG_PATH/router_prefill_http_ins.log" 2>&1 &
 
         # Launch decode HTTP server (tokenizer side)
         echo "Launching decode HTTP server..."
@@ -214,7 +234,7 @@ if [[ "$ROLE" == "router" ]]; then
         > "$LOG_PATH/router_decode_http.log" 2>&1 &
 
         # Poll until both HTTP servers are ready (up to 2 minutes each)
-        for port in 30001 30002; do
+        for port in 30001 30002 30003; do
             echo "Waiting for HTTP server on port $port to be ready..."
             ready=0
             for i in $(seq 1 900); do  # up to 30 minutes

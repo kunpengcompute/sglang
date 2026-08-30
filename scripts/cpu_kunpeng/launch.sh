@@ -37,6 +37,9 @@ for arg in "$@"; do
         prefill|decode|native|router|all)
             ROLE="$arg"
             ;;
+        ins)
+            INSTANCE="$arg"
+            ;;
         long_prompt)
             INSTANCE="$arg"
             ;;
@@ -77,25 +80,31 @@ if [[ "$ROLE" == "all" ]]; then
 
     bash ./stop.sh router
     bash ./launch.sh prefill --no-log
+    bash ./launch.sh prefill ins --no-log
     SGLANG_SKIP_UPDATE=1 bash ./launch.sh decode --no-log
 
     source ./env.sh native
-    # Wait for prefill and decode HTTP servers to be ready (up to 20 minutes total)
-    endpoints=("${PREFILL_MASTER_ADDR}:30000" "${DECODE_MASTER_ADDR}:30000")
+    # Wait for prefill(1), ins prefill, and decode HTTP servers to be ready
+    # (up to 20 minutes total)
+    endpoints=(
+        "${PREFILL_MASTER_ADDR}:30000"
+        "${PREFILL_INS_MASTER_ADDR}:30000"
+        "${DECODE_MASTER_ADDR}:30000"
+    )
     echo "[$(date +%T)] Waiting for prefill and decode servers to be ready (up to 20 minutes)..."
-    ready=(0 0)
+    ready=(0 0 0)
     for i in $(seq 1 12000); do
-        for j in 0 1; do
+        for j in 0 1 2; do
             if [[ "${ready[$j]}" -eq 0 ]] &&
                 curl -sf --max-time 2 "http://${endpoints[$j]}/health" >/dev/null 2>&1; then
                 ready[$j]=1
                 echo "[$(date +%T)] ${endpoints[$j]} ready"
             fi
         done
-        [[ "${ready[0]}" -eq 1 && "${ready[1]}" -eq 1 ]] && break
+        [[ "${ready[0]}" -eq 1 && "${ready[1]}" -eq 1 && "${ready[2]}" -eq 1 ]] && break
         sleep 0.1
     done
-    for j in 0 1; do
+    for j in 0 1 2; do
         if [[ "${ready[$j]}" -eq 0 ]]; then
             echo "ERROR: HTTP server at ${endpoints[$j]} failed to start within 20 minutes"
             exit 1
@@ -114,7 +123,7 @@ source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET"
 
 mkdir -p "$LOG_DIR"
 
-sh stop.sh "$ROLE"
+sh stop.sh "$ROLE" "$INSTANCE"
 
 # Convert space-separated IP list to array
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
@@ -136,7 +145,7 @@ for i in "${!NODES[@]}"; do
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
         "root@$node_ip" \
         "cd \"$PWD\" && sh ./server.sh \"$ROLE\" \"$dp_rank\" \"$LOG_DIR\" \"$INSTANCE\" \"$BUCKET\"" \
-        >"$LOG_DIR/ssh_${ROLE}_rank${dp_rank}.log" 2>&1 &
+        >"$LOG_DIR/ssh_${ROLE}_${INSTANCE}_rank${dp_rank}.log" 2>&1 &
 done
 
 echo "All $ROLE nodes launched."

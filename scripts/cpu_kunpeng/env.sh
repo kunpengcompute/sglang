@@ -370,14 +370,18 @@ _export_pd_vars() {
 # Per-role config functions (called via "${ACTION}_config")
 # ------------------------------------------------------------
 prefill_config() {
-    _export_pd_vars "PREFILL"
     local instance="${PREFILL_INSTANCE:-1}"
-    local _prefix
+    local _prefix="PREFILL"
     if [[ "$instance" == "long_prompt" ]]; then
+        _export_pd_vars "PREFILL"
         export PP_SIZE=$PREFILL_LONG_PROMPT_PP_SIZE
         _prefix="PREFILL_LONG_PROMPT"
+    elif [[ "$instance" == "ins" ]]; then
+        # Second prefill instance on an independent node group (PREFILL_INS_*)
+        _export_pd_vars "PREFILL"
+        _prefix="PREFILL_INS"
     else
-        _prefix="PREFILL"
+        _export_pd_vars "PREFILL"
     fi
     _export_node_config "$_prefix"
     export SGLANG_SKIP_HTTP=1
