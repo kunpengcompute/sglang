@@ -821,53 +821,154 @@ def _setup_flash_attention_with_workspace_kunpeng():
     register_op('flash_attention_with_workspace_kunpeng', shape_infer, eager_fn)
 
 
-def _setup_flash_attention_paged_kunpeng():
-    # Paged MHA for chunked prefill: reads latent via block_table, applies
-    # kv_b_proj internally.
-    def shape_infer(q, latent_cache, kv_b_weight, kv_b_weight_scale,
-                    workspace, block_table,
-                    extend_seq_lens, extend_prefix_lens,
-                    page_size, kv_lora_rank, qk_nope_head_dim,
-                    qk_rope_head_dim, v_head_dim, causal, softmax_scale):
-        return [((q.shape[0], q.shape[1], v_head_dim), q.dtype)]
+def _setup_gather_split_latent_paged_kunpeng():
+    # Gather the paged MLA latent cache via block_table and split rows into
+    # kv_a / k_pe. Decomposed from the old flash_attention_paged_kunpeng.
+    # Takes extend_seq_lens / prefix_lens (registered graph inputs) and
+    # derives per-sequence totals in the kernel. The cache is
+    # [num_tokens, 1, kv_lora_rank + qk_rope_head_dim] (head_num=1 for MLA),
+    # so k_pe width comes from the qk_rope_head_dim scalar, never from
+    # latent_cache.shape[1].
+    def shape_infer(latent_cache, block_table, extend_seq_lens, prefix_lens,
+                    page_size, kv_lora_rank, qk_rope_head_dim, total_kv):
+        return [((total_kv, kv_lora_rank), latent_cache.dtype),
+                ((total_kv, qk_rope_head_dim), latent_cache.dtype)]
 
-    def eager_fn(q, latent_cache, kv_b_weight, kv_b_weight_scale,
-                 workspace, block_table,
-                 extend_seq_lens, extend_prefix_lens,
-                 page_size, kv_lora_rank, qk_nope_head_dim,
-                 qk_rope_head_dim, v_head_dim, causal, softmax_scale):
-        bs = extend_seq_lens.shape[0]
-        qsl = torch.zeros(bs + 1, dtype=torch.int32,
-                           device=extend_seq_lens.device)
-        qsl[1:] = torch.cumsum(extend_seq_lens, dim=0)
-
-        if extend_prefix_lens is None:
-            prefix_lens = torch.zeros(bs, dtype=torch.int32,
-                                       device=extend_seq_lens.device)
-        else:
-            prefix_lens = extend_prefix_lens.to(torch.int32)
-
-        seq_lens = (prefix_lens + extend_seq_lens).to(torch.int32)
-        cur_lens = extend_seq_lens.to(torch.int32)
-
-        out = torch.empty(q.shape[0], q.shape[1], v_head_dim,
-                           dtype=q.dtype)
-        torch.ops.sgl_kernel.flash_attention_paged_kunpeng(
-            q=q, latent_cache=latent_cache, kv_b_weight=kv_b_weight,
-            kv_b_weight_scale=kv_b_weight_scale,
-            out=out, workspace=workspace, block_table=block_table,
-            seq_lens=seq_lens, cur_lens=cur_lens,
-            query_start_loc=qsl,
-            page_size=int(page_size),
-            kv_lora_rank=int(kv_lora_rank),
-            qk_nope_head_dim=int(qk_nope_head_dim),
+    def eager_fn(latent_cache, block_table, extend_seq_lens, prefix_lens,
+                 page_size, kv_lora_rank, qk_rope_head_dim, total_kv):
+        kv_a = torch.empty((total_kv, kv_lora_rank), dtype=latent_cache.dtype)
+        k_pe = torch.empty((total_kv, qk_rope_head_dim), dtype=latent_cache.dtype)
+        torch.ops.sgl_kernel.gather_split_latent_paged_kunpeng(
+            latent_cache=latent_cache, block_table=block_table,
+            extend_seq_lens=extend_seq_lens, prefix_lens=prefix_lens,
+            kv_a=kv_a, k_pe=k_pe,
+            page_size=int(page_size), kv_lora_rank=int(kv_lora_rank),
             qk_rope_head_dim=int(qk_rope_head_dim),
-            v_head_dim=int(v_head_dim),
-            causal=bool(causal),
-            softmax_scale=float(softmax_scale))
+            total_kv=int(total_kv))
+        return kv_a, k_pe
+
+    register_op('gather_split_latent_paged_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_flash_attention_varlen_with_workspace_kunpeng():
+    # Varlen flash attention with prefix support on pre-packed K/V.
+    # Eager path delegates to the existing flash_attention_with_workspace
+    # torch op; graph path hits the C++ graph kernel of the same name.
+    def shape_infer(q, k, v, workspace, extend_seq_lens, prefix_seq_lens,
+                    causal, softmax_scale):
+        return [((q.shape[0], q.shape[1], v.shape[2]), q.dtype)]
+
+    def eager_fn(q, k, v, workspace, extend_seq_lens, prefix_seq_lens,
+                 causal, softmax_scale):
+        bs = extend_seq_lens.shape[0]
+        ext = extend_seq_lens.to(torch.int32)
+        if prefix_seq_lens is None:
+            pfx = torch.zeros(bs, dtype=torch.int32)
+        else:
+            pfx = prefix_seq_lens.to(torch.int32)
+        total = pfx + ext
+        live_total = int(total.sum())
+
+        # k/v may be max-sized buffers (graph-capture sizing); the kernel
+        # must see exactly the live rows, so narrow to a zero-copy view.
+        k = k.narrow(0, 0, live_total)
+        v = v.narrow(0, 0, live_total)
+
+        qsl = torch.zeros(bs + 1, dtype=torch.int32)
+        qsl[1:] = torch.cumsum(ext, dim=0)
+        ksl = torch.zeros(bs + 1, dtype=torch.int32)
+        ksl[1:] = torch.cumsum(total, dim=0)
+
+        out = torch.empty(q.shape[0], q.shape[1], v.shape[2], dtype=q.dtype)
+        torch.ops.sgl_kernel.flash_attention_with_workspace(
+            q=q, k=k, v=v, out=out, workspace=workspace,
+            causal=bool(causal), softmax_scale=float(softmax_scale),
+            query_start_loc=qsl, key_start_loc=ksl,
+            chunked_prefill_size=int(total.max()),
+            seq_lens=total.tolist(), cur_lens=ext.tolist())
         return out
 
-    register_op('flash_attention_paged_kunpeng', shape_infer, eager_fn)
+    register_op('flash_attention_varlen_with_workspace_kunpeng',
+                shape_infer, eager_fn)
+
+
+def _setup_quant_rows_kunpeng():
+    # Live-bounded quantize: only the first live rows (extend+prefix total)
+    # of the max-sized input are processed.
+    def shape_infer(input, extend_seq_lens, prefix_lens):
+        return [((input.shape[0], input.shape[1]), torch.int8),
+                ((input.shape[0],), torch.float32)]
+
+    def eager_fn(input, extend_seq_lens, prefix_lens):
+        out = torch.empty(input.shape, dtype=torch.int8)
+        scale = torch.empty(input.shape[0], dtype=torch.float32)
+        torch.ops.sgl_kernel.quant_rows_kunpeng(
+            input, extend_seq_lens, prefix_lens, out, scale)
+        return out, scale
+
+    register_op('quant_rows_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_s8_gemm_pack_rows_kunpeng():
+    def shape_infer(input, extend_seq_lens, prefix_lens, split_r, split_c):
+        return [((input.shape[0], input.shape[1]), input.dtype)]
+
+    def eager_fn(input, extend_seq_lens, prefix_lens, split_r, split_c):
+        out = torch.empty(input.shape, dtype=input.dtype)
+        torch.ops.sgl_kernel.s8_gemm_pack_rows_kunpeng(
+            input, extend_seq_lens, prefix_lens, out,
+            int(split_r), int(split_c))
+        return out
+
+    register_op('s8_gemm_pack_rows_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_s8_s8_packed_gemm_bf16_dq_rows_kunpeng():
+    def shape_infer(input, weight, weight_scale, scale, workspace,
+                    extend_seq_lens, prefix_lens, tile_m, tile_n, tile_k):
+        return [((input.shape[0], weight.shape[0]), torch.bfloat16)]
+
+    def eager_fn(input, weight, weight_scale, scale, workspace,
+                 extend_seq_lens, prefix_lens, tile_m, tile_n, tile_k):
+        output = torch.empty((input.shape[0], weight.shape[0]),
+                             dtype=torch.bfloat16)
+        torch.ops.sgl_kernel.s8_s8_packed_gemm_bf16_dq_rows_kunpeng(
+            input, weight, weight_scale, scale, workspace,
+            extend_seq_lens, prefix_lens, output,
+            int(tile_m), int(tile_n), int(tile_k))
+        return output
+
+    register_op('s8_s8_packed_gemm_bf16_dq_rows_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_cat_rows_kunpeng():
+    def shape_infer(a, b, dim, extend_seq_lens, prefix_lens):
+        shape = list(a.shape)
+        shape[dim] += b.shape[dim]
+        return [(tuple(shape), a.dtype)]
+
+    def eager_fn(a, b, dim, extend_seq_lens, prefix_lens):
+        shape = list(a.shape)
+        shape[dim] += b.shape[dim]
+        out = torch.empty(tuple(shape), dtype=a.dtype)
+        torch.ops.sgl_kernel.cat_rows_kunpeng(
+            a, b, extend_seq_lens, prefix_lens, out, int(dim))
+        return out
+
+    register_op('cat_rows_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_contiguous_rows_kunpeng():
+    def shape_infer(x, extend_seq_lens, prefix_lens):
+        return [(x.shape, x.dtype)]
+
+    def eager_fn(x, extend_seq_lens, prefix_lens):
+        out = torch.empty(x.shape, dtype=x.dtype)
+        torch.ops.sgl_kernel.contiguous_rows_kunpeng(
+            x, extend_seq_lens, prefix_lens, out)
+        return out
+
+    register_op('contiguous_rows_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_flash_mla_dense_decode_kunpeng():
@@ -1120,7 +1221,13 @@ def setup():
     _setup_shm_mla_o_alltoall_long_context_kunpeng()
     _setup_flash_mla_reduce_kunpeng()
     _setup_flash_attention_with_workspace_kunpeng()
-    _setup_flash_attention_paged_kunpeng()
+    _setup_gather_split_latent_paged_kunpeng()
+    _setup_flash_attention_varlen_with_workspace_kunpeng()
+    _setup_quant_rows_kunpeng()
+    _setup_s8_gemm_pack_rows_kunpeng()
+    _setup_s8_s8_packed_gemm_bf16_dq_rows_kunpeng()
+    _setup_cat_rows_kunpeng()
+    _setup_contiguous_rows_kunpeng()
     _setup_pad_q_left_mtp_kunpeng()
     _setup_unpad_o_right_mtp_kunpeng()
     _setup_topk_convert_kunpeng()
