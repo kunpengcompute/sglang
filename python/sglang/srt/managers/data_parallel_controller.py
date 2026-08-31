@@ -38,6 +38,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
+from sglang.srt.mem_cache.common import get_lc_dp_ranks
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -173,6 +174,59 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
+
+        # Mixed long-context (LC) mode: when SGLANG_KUNPENG_LC_DP_RANKS lists
+        # some DP ranks, round-robin dispatch becomes LC-aware -- requests
+        # long enough to need LC capacity are sent only to LC ranks, the rest
+        # only to regular ranks. Other load-balance methods are untouched.
+        self.lc_dp_ranks: List[int] = []
+        if self.load_balance_method == LoadBalanceMethod.ROUND_ROBIN:
+            lc_dp_ranks = sorted(get_lc_dp_ranks())
+            if lc_dp_ranks:
+                if self.server_args.disaggregation_mode == "prefill":
+                    # LC is decode-only; the prefill instance has no LC ranks
+                    # and the variable only matters on the decode side.
+                    logger.info(
+                        "Prefill instance ignores SGLANG_KUNPENG_LC_DP_RANKS "
+                        "for routing (long-context decode CP is decode-only)"
+                    )
+                else:
+                    out_of_range = [
+                        r for r in lc_dp_ranks if r >= server_args.dp_size
+                    ]
+                    if out_of_range:
+                        raise ValueError(
+                            f"SGLANG_KUNPENG_LC_DP_RANKS contains out-of-range "
+                            f"DP ranks {out_of_range} "
+                            f"(dp_size={server_args.dp_size})"
+                        )
+                    if len(lc_dp_ranks) >= server_args.dp_size:
+                        # All ranks are LC: plain round-robin already sends
+                        # every request to an LC rank.
+                        logger.info(
+                            "All DP ranks are LC ranks; LC-aware routing is a no-op"
+                        )
+                    else:
+                        self.lc_dp_ranks = lc_dp_ranks
+                        self.lc_round_robin_counter = 0
+                        self.lc_min_seq_len = (
+                            envs.SGLANG_KUNPENG_LC_MIN_SEQ_LEN.get()
+                        )
+                        self.regular_dp_ranks = [
+                            r
+                            for r in range(server_args.dp_size)
+                            if r not in self.lc_dp_ranks
+                        ]
+                        dispatch_lookup[LoadBalanceMethod.ROUND_ROBIN] = (
+                            self.lc_aware_round_robin_scheduler
+                        )
+                        logger.info(
+                            f"LC-aware round-robin dispatch enabled: "
+                            f"LC DP ranks {self.lc_dp_ranks}, regular DP ranks "
+                            f"{self.regular_dp_ranks}, "
+                            f"min_seq_len={self.lc_min_seq_len}"
+                        )
+
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
         # Load balance budget
@@ -632,6 +686,41 @@ class DataParallelController:
                 break
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
+            )
+
+    def _estimated_total_len(self, req: Req) -> int:
+        # sampling_params.max_new_tokens always carries a concrete value at
+        # this point (defaults to 128 when the client omits max_tokens), so
+        # short/unspecified requests naturally stay in the regular pool.
+        return len(req.input_ids) + req.sampling_params.max_new_tokens
+
+    def _round_robin_in_pool(self, req: Req, pool: List[int], counter_attr: str):
+        counter = getattr(self, counter_attr)
+        while True:
+            rank = pool[counter % len(pool)]
+            if self.status[rank]:
+                logger.debug(f"Choose worker {rank}")
+                self.workers[rank].send_pyobj(req)
+                setattr(self, counter_attr, counter + 1)
+                break
+            counter += 1
+
+    def lc_aware_round_robin_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        if not isinstance(req, TokenizedGenerateReqInput):
+            # Embedding and other non-generate requests never need LC capacity.
+            self._round_robin_in_pool(
+                req, self.regular_dp_ranks, "round_robin_counter"
+            )
+            return
+
+        if self._estimated_total_len(req) >= self.lc_min_seq_len:
+            self._round_robin_in_pool(req, self.lc_dp_ranks, "lc_round_robin_counter")
+        else:
+            self._round_robin_in_pool(
+                req, self.regular_dp_ranks, "round_robin_counter"
             )
 
     def follow_bootstrap_room_scheduler(self, req: Req):

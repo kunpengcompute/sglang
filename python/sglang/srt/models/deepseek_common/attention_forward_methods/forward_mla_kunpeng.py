@@ -333,7 +333,9 @@ class DeepseekMLAKunpengForwardMixin:
                 q_flat = q_3d.contiguous().view(B_q, -1)
                 if envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get():
                     kunpeng.shm_fence_kunpeng(cp_size)
-                q_all = kunpeng.shm_batched_allgather_kunpeng(q_flat, cp_size)
+                q_all = kunpeng.shm_batched_allgather_kunpeng(
+                    q_flat, cp_size,
+                    profile_name="mla_q_allgather_long_context_kunpeng")
                 q = (
                     q_all.view(B, seqlen_q, cp_size, numhead_local_q, D_qk)
                     .reshape(B, seqlen_q, numhead_local_q * cp_size, D_qk)
