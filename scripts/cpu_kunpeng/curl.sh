@@ -16,12 +16,13 @@
 
 usage() {
   echo "Usage:"
-  echo "  $0 [-d RANK] [-n NUM] [-m TOKENS] [-p] [-s] [-f FILE]                # batch (single request)"
+  echo "  $0 [-n NUM] [-r RATE] [-m TOKENS] [-p] [-s] [-f FILE]                # paced batch (RATE req/s, default 32)"
+  echo "  $0 -n NUM -r 0 [-m TOKENS] [-p] [-s] [-f FILE]                       # legacy batch: all prompts in one request"
   echo "  $0 -d RANGE [-n NUM] [-c CONC] [-m TOKENS] [-p] [-s] [-v] [-f FILE]  # round-robin benchmark"
   echo "  $0 [-i] [-d RANK] [-m TOKENS] [-h]                                   # interactive chat"
   echo ""
   echo "Modes (mutually exclusive):"
-  echo "  (default)   Batch mode — single request with an array of prompts."
+  echo "  (default)   Paced batch — one prompt per request, sent at -r RATE req/s (default 32)."
   echo "  -d RANGE    Round-robin benchmark — triggered by -d with a range (e.g. 0-15, 0,2,5)."
   echo "              Reports: throughput (req/s, tok/s) + per-request latency (P50/P99)."
   echo "  -i          Interactive chat mode — multi-turn streaming conversation."
@@ -30,6 +31,7 @@ usage() {
   echo "  -h          Show this help message"
   echo "  -m TOKENS   Max tokens per request / per turn (default: 10 batch, 128 chat)"
   echo "  -d RANK|RANGE  DP rank (e.g. 5) or range (e.g. 0-15, 0,2,5 → triggers round-robin)"
+  echo "  -r RATE     Paced batch send rate in req/s (default: 32; 0 = legacy single array request)"
   echo ""
   echo "  --- batch & round-robin only ---"
   echo "  -p          Enable profiling (start/stop profile via separate curl calls)"
@@ -37,9 +39,9 @@ usage() {
   echo "  -f FILE     Prompt file, one prompt per line (default: prompts/128.txt)"
   echo "  -n NUM      Number of requests to send (default: all lines from file)"
   echo ""
-  echo "  --- round-robin only ---"
-  echo "  -c CONC     Max concurrent requests (default: 64)"
-  echo "  -v          Print each request's full response body"
+  echo "  --- round-robin & paced batch only ---"
+  echo "  -c CONC     Max concurrent requests (default: 256; paced batch defaults to unbounded)"
+  echo "  -v          Write per-request latency rows + response bodies to <run-id>_detail.txt"
   exit 0
 }
 
@@ -53,10 +55,13 @@ INTERACTIVE=false
 DP_ENABLED=false
 DP_RANK=0
 CONCURRENCY=256
+CONCURRENCY_SET=false
 PROMPT_FILE="prompts/128.txt"
 ROUND_ROBIN=false
+RATE=32
+PACED=false
 
-while getopts "d:hipsvn:m:c:f:" opt; do
+while getopts "d:hipsvn:m:c:r:f:" opt; do
   case $opt in
     h) usage ;;
     i) INTERACTIVE=true ;;
@@ -65,7 +70,8 @@ while getopts "d:hipsvn:m:c:f:" opt; do
     v) VERBOSE=true ;;
     d) DP_ENABLED=true; DP_RANK=$OPTARG ;;
     n) NUM_REQUESTS=$OPTARG ;;
-    c) CONCURRENCY=$OPTARG ;;
+    c) CONCURRENCY=$OPTARG; CONCURRENCY_SET=true ;;
+    r) RATE=$OPTARG ;;
     m) MAX_TOKENS=$OPTARG; MAX_TOKENS_SET=true ;;
     f) PROMPT_FILE=$OPTARG ;;
     *) echo "Invalid option: -$OPTARG" >&2
@@ -157,6 +163,12 @@ if [ "$INTERACTIVE" = false ]; then
     fi
   fi
 
+  # Paced batch mode: without -d, send one prompt per HTTP request at RATE
+  # req/s instead of one request carrying all prompts (RATE=0 restores that).
+  if [ "$RATE" -gt 0 ] && [ "$NUM_REQUESTS" -gt 1 ]; then
+    PACED=true
+  fi
+
   if [ "$PROFILE" = true ]; then
     curl --noproxy "*" http://${IP}:${PORT}/start_profile
   fi
@@ -166,7 +178,7 @@ fi
 # Mode 1: Original batch — single request with array of prompts
 # =============================================================================
 
-if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ]; then
+if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ] && [ "$PACED" = false ]; then
 
   # Build prompt JSON array from PROMPTS, cycling if NUM_REQUESTS exceeds list length
   PROMPT_JSON="["
@@ -271,7 +283,7 @@ fi
 # Mode 2: Round-robin benchmark — concurrent requests across DP ranks
 # =============================================================================
 
-if [ "$ROUND_ROBIN" = true ]; then
+if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
   RESULT_DIR=$(mktemp -d)
   trap 'rm -rf "$RESULT_DIR"' EXIT
 
@@ -280,7 +292,12 @@ if [ "$ROUND_ROBIN" = true ]; then
 
   send_request() {
     local idx=$1
-    local rank=${DP_RANKS[$((idx % NUM_RANKS))]}
+    local rank_line=""
+    if [ "$ROUND_ROBIN" = true ]; then
+      rank_line=",\"routed_dp_rank\": ${DP_RANKS[$((idx % NUM_RANKS))]}"
+    elif [ "$DP_ENABLED" = true ]; then
+      rank_line=",\"routed_dp_rank\": $DP_RANK"
+    fi
     local escaped
     escaped=$(json_escape "${PROMPTS[$((idx % ${#PROMPTS[@]}))]}")
 
@@ -289,8 +306,7 @@ if [ "$ROUND_ROBIN" = true ]; then
         \"prompt\": \"$escaped\",
         \"stream\": $STREAM,
         \"max_tokens\": $MAX_TOKENS,
-        \"temperature\": 0,
-        \"routed_dp_rank\": $rank"
+        \"temperature\": 0$rank_line"
 
     if [ "$STREAM" = true ]; then
       body+=",\"stream_options\":{\"include_usage\":true}"
@@ -304,8 +320,8 @@ if [ "$ROUND_ROBIN" = true ]; then
     printf '%s' "$body" > "$body_file"
 
     local resp_file="$RESULT_DIR/resp_${idx}"
-    local start_ts
-    start_ts=$(date +%s.%N)
+    local start_ns
+    start_ns=$(date +%s%N)
 
     # Client-generated request ID sent via X-Request-Id header;
     # router uses this ID in its logs for easy correlation.
@@ -317,9 +333,9 @@ if [ "$ROUND_ROBIN" = true ]; then
       -H "X-Request-Id: $rid" \
       -d @"$body_file" > "$resp_file" 2>/dev/null
 
-    local end_ts
-    end_ts=$(date +%s.%N)
-    echo "$start_ts $end_ts" > "$RESULT_DIR/time_${idx}"
+    local end_ns
+    end_ns=$(date +%s%N)
+    echo "$start_ns $end_ns" > "$RESULT_DIR/time_${idx}"
 
     if [ "$STREAM" = true ]; then
       local usage_raw comp_tokens chunks done_count
@@ -344,7 +360,16 @@ if [ "$ROUND_ROBIN" = true ]; then
     rm -f "$body_file"
   }
 
-  echo "Round-robin: $NUM_REQUESTS requests, concurrency=$CONCURRENCY, $NUM_RANKS DP ranks ($DP_RANK)"
+  # Paced mode is open-loop: don't throttle on the client unless -c is given.
+  if [ "$PACED" = true ] && [ "$CONCURRENCY_SET" = false ]; then
+    CONCURRENCY=$NUM_REQUESTS
+  fi
+
+  if [ "$ROUND_ROBIN" = true ]; then
+    echo "Round-robin: $NUM_REQUESTS requests, concurrency=$CONCURRENCY, $NUM_RANKS DP ranks ($DP_RANK)"
+  else
+    echo "Paced batch: $NUM_REQUESTS requests, rate=$RATE req/s, concurrency=$CONCURRENCY"
+  fi
   echo "  URL: $URL"
   echo "  Max tokens/req: $MAX_TOKENS, Stream: $STREAM"
   echo "  Run ID: $RUN_ID  (grep this in router logs)"
@@ -359,7 +384,10 @@ if [ "$ROUND_ROBIN" = true ]; then
     echo >&3
   done
 
-  WALL_START=$(date +%s.%N)
+  # One date call provides both the stats epoch (WALL_START) and the
+  # integer-ns pacing base (START_NS).
+  START_NS=$(date +%s%N)
+  printf -v WALL_START '%d.%09d' $((START_NS / 1000000000)) $((START_NS % 1000000000))
 
   for ((i = 0; i < NUM_REQUESTS; i++)); do
     read -u 3
@@ -367,6 +395,18 @@ if [ "$ROUND_ROBIN" = true ]; then
       send_request "$i"
       echo >&3
     } &
+    if [ "$PACED" = true ] && (( (i + 1) % RATE == 0 )); then
+      # Re-anchor to the schedule once per second (every RATE requests).
+      # Per-request clock reads cost a fork each and fall behind under
+      # load (iter cost > 1/RATE), so pace in 1s batches instead: fire
+      # this second's batch, then sleep to the next boundary. If behind
+      # (delta <= 0) the next batch fires immediately to catch up.
+      delta_ns=$(( START_NS + (i + 1) * 1000000000 / RATE - $(date +%s%N) ))
+      if (( delta_ns > 0 )); then
+        printf -v delay '%d.%09d' $((delta_ns / 1000000000)) $((delta_ns % 1000000000))
+        sleep "$delay"
+      fi
+    fi
   done
 
   wait
@@ -400,7 +440,11 @@ if [ "$ROUND_ROBIN" = true ]; then
   echo "==================================="
   echo "  Total requests:      $NUM_REQUESTS"
   echo "  Concurrency:         $CONCURRENCY"
-  echo "  DP ranks:            $DP_RANK ($NUM_RANKS ranks, round-robin)"
+  if [ "$ROUND_ROBIN" = true ]; then
+    echo "  DP ranks:            $DP_RANK ($NUM_RANKS ranks, round-robin)"
+  else
+    echo "  Send rate:           $RATE req/s"
+  fi
   echo "  Max tokens/req:      $MAX_TOKENS"
   echo "  Stream:              $STREAM"
   echo "  Total wall time:     ${WALL_TIME}s"
@@ -414,24 +458,40 @@ if [ "$ROUND_ROBIN" = true ]; then
   LAT_FILE="$RESULT_DIR/all_latencies"
   : > "$LAT_FILE"
 
-  echo ""
-  echo "==================================="
-  echo "Per-Request Latency (relative to test start)"
-  echo "==================================="
-  printf "%-6s %-6s %-12s %-12s %-10s %-8s %s\n" "Req#" "Rank" "Start(s)" "End(s)" "Latency(s)" "Tokens" "ReqID"
+  # With -v, per-request rows and response bodies go to a file instead of
+  # the terminal (row count scales with -n and can be huge).
+  DETAIL_FILE=""
+  if [ "$VERBOSE" = true ]; then
+    DETAIL_FILE="${RUN_ID}_detail.txt"
+    {
+      echo "Per-Request Latency (relative to test start)"
+      printf "%-6s %-6s %-12s %-12s %-10s %-8s %s\n" "Req#" "Rank" "Start(s)" "End(s)" "Latency(s)" "Tokens" "ReqID"
+    } > "$DETAIL_FILE"
+  fi
+
+  # Fork-free per-request stats: builtin reads + integer-ns arithmetic.
+  # The previous awk/cat-per-row version forked ~5 times per request and
+  # silently stalled for minutes on a loaded node after the summary.
   for ((i = 0; i < NUM_REQUESTS; i++)); do
-    rank=${DP_RANKS[$((i % NUM_RANKS))]}
+    if [ "$ROUND_ROBIN" = true ]; then rank=${DP_RANKS[$((i % NUM_RANKS))]} ; else rank="-"; fi
     if [ -f "$RESULT_DIR/time_${i}" ]; then
       read -r s e < "$RESULT_DIR/time_${i}"
-      rel_start=$(awk -v s="$s" -v w="$WALL_START" 'BEGIN { printf "%.3f", s - w }')
-      rel_end=$(awk -v e="$e" -v w="$WALL_START" 'BEGIN { printf "%.3f", e - w }')
-      dur=$(awk -v s="$s" -v e="$e" 'BEGIN { printf "%.3f", e - s }')
+      dur_ns=$((e - s))
+      printf -v dur '%d.%03d' $((dur_ns / 1000000000)) $((dur_ns / 1000000 % 1000))
+      printf -v rel_start '%d.%03d' $(((s - START_NS) / 1000000000)) $(((s - START_NS) / 1000000 % 1000))
+      printf -v rel_end '%d.%03d' $(((e - START_NS) / 1000000000)) $(((e - START_NS) / 1000000 % 1000))
       echo "$dur" >> "$LAT_FILE"
-      toks=$(cat "$RESULT_DIR/tokens_${i}" 2>/dev/null || echo "?")
-      rid=$(cat "$RESULT_DIR/rid_${i}" 2>/dev/null || echo "N/A")
-      printf "%-6d %-6d %-12s %-12s %-10s %-8s %s\n" "$i" "$rank" "$rel_start" "$rel_end" "$dur" "$toks" "$rid"
+      toks="?"
+      rid="N/A"
+      read -r toks < "$RESULT_DIR/tokens_${i}" 2>/dev/null || toks="?"
+      read -r rid < "$RESULT_DIR/rid_${i}" 2>/dev/null || rid="N/A"
+      if [ "$VERBOSE" = true ]; then
+        printf "%-6d %-6s %-12s %-12s %-10s %-8s %s\n" "$i" "$rank" "$rel_start" "$rel_end" "$dur" "$toks" "$rid" >> "$DETAIL_FILE"
+      fi
     else
-      printf "%-6d %-6d %-12s %-12s %-10s %-8s %s\n" "$i" "$rank" "N/A" "N/A" "N/A" "N/A" "N/A"
+      if [ "$VERBOSE" = true ]; then
+        printf "%-6d %-6s %-12s %-12s %-10s %-8s %s\n" "$i" "$rank" "N/A" "N/A" "N/A" "N/A" "N/A" >> "$DETAIL_FILE"
+      fi
     fi
   done
 
@@ -454,21 +514,25 @@ if [ "$ROUND_ROBIN" = true ]; then
   fi
 
   if [ "$VERBOSE" = true ]; then
+    {
+      echo ""
+      echo "==================================="
+      echo "Per-Request Responses"
+      echo "==================================="
+      for ((i = 0; i < NUM_REQUESTS; i++)); do
+        if [ "$ROUND_ROBIN" = true ]; then rank=${DP_RANKS[$((i % NUM_RANKS))]} ; else rank="-"; fi
+        echo "----- Request #$i (rank=$rank) -----"
+        if [ -s "$RESULT_DIR/resp_${i}" ]; then
+          cat "$RESULT_DIR/resp_${i}"
+          echo ""
+        else
+          echo "<no response>"
+        fi
+      done
+      echo "==================================="
+    } >> "$DETAIL_FILE"
     echo ""
-    echo "==================================="
-    echo "Per-Request Responses"
-    echo "==================================="
-    for ((i = 0; i < NUM_REQUESTS; i++)); do
-      rank=${DP_RANKS[$((i % NUM_RANKS))]}
-      echo "----- Request #$i (rank=$rank) -----"
-      if [ -s "$RESULT_DIR/resp_${i}" ]; then
-        cat "$RESULT_DIR/resp_${i}"
-        echo ""
-      else
-        echo "<no response>"
-      fi
-    done
-    echo "==================================="
+    echo "Per-request details written to: $DETAIL_FILE"
   fi
 
   exit 0
