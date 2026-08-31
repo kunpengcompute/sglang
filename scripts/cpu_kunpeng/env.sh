@@ -281,9 +281,6 @@ export DROP_CACHES=0
 export SGLANG_TOKENIZER_TIMELINE_LOG=0
 # Scheduler stream interval (--stream-interval): flush a request's output every N tokens
 export STREAM_INTERVAL=1
-# Dedicated CPU list for the disaggregation bootstrap server thread (only
-# effective in tokenizer-separate mode). 
-export SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU=418-422
 # Tokenizer backend: "huggingface" (default) or "fastokens"
 # (fastokens requires transformers >= 5.12; on 5.6.0 it hits a Metaspace
 #  pre-tokenizer error with DeepSeek-R1)
@@ -420,6 +417,14 @@ build_config() {
 ACTION="${1:-native}"
 shift
 
+# Optional: pass "skip-conda" between/after the action to skip conda activation
+SKIP_CONDA=0
+for _arg in "$@"; do
+    if [[ "$_arg" == "skip-conda" ]]; then
+        SKIP_CONDA=1
+    fi
+done
+
 case "$ACTION" in
     prefill|decode|native|router|build)
         "${ACTION}_config"
@@ -455,4 +460,7 @@ export INCLUDE=${KUPL_PATH}/include:$INCLUDE
 export LIBRARY_PATH=${KUPL_PATH}/lib:$LIBRARY_PATH
 
 export CONDA_ACTIVATE_CMD="eval \"\$($CONDA_BASE_PATH/bin/conda shell.bash hook)\" && conda activate $CONDA_ENV_NAME"
-eval "$CONDA_ACTIVATE_CMD"
+if [[ "$SKIP_CONDA" != "1" ]]; then
+    eval "$CONDA_ACTIVATE_CMD"
+    echo "conda environment activated: $CONDA_ENV_NAME"
+fi

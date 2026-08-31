@@ -154,12 +154,12 @@ case "$ROLE" in
         #   NUMA 15 (570-606): gateway cores + bootstrap server cores
         export PREFILL_NUMA_BASE="${PREFILL_NUMA_BASE:-0}"
         export DECODE_NUMA_BASE="${DECODE_NUMA_BASE:-10}"
-        export PREFILL_BOOTSTRAP_CPU="${PREFILL_BOOTSTRAP_CPU:-601}"
-        export GATEWAY_CPUS="${GATEWAY_CPUS:-570-600}"
+        export PREFILL_BOOTSTRAP_CPU="${PREFILL_BOOTSTRAP_CPU:-591-595}"
+        export GATEWAY_CPUS="${GATEWAY_CPUS:-570-590}"
         # Second prefill only used when enabled.
         if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
             export SECOND_PREFILL_NUMA_BASE="${SECOND_PREFILL_NUMA_BASE:-5}"
-            export SECOND_PREFILL_BOOTSTRAP_CPU="${SECOND_PREFILL_BOOTSTRAP_CPU:-602}"
+            export SECOND_PREFILL_BOOTSTRAP_CPU="${SECOND_PREFILL_BOOTSTRAP_CPU:-596-600}"
         fi
         if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
             _router_prefill_url="http://${ROUTER_IP}:30001"
@@ -294,6 +294,7 @@ if [[ "$ROLE" == "router" ]]; then
     fi
     # Pin the gateway to a dedicated core range so it does not collide with
     # the tokenizer/detokenizer workers (see the NUMA plan above).
+    LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
     taskset -c "$GATEWAY_CPUS" "$GATEWAY_BIN" "${SPECIFIC_ARGS[@]}" \
         > "$LOG_PATH/router_$IP.log" 2>&1 &
 

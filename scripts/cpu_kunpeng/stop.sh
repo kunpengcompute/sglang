@@ -36,7 +36,7 @@ cd "$SCRIPT_DIR"
 # Handle this before sourcing env.sh, which does not support an "all" role.
 if [[ "$ROLE" == "all" ]]; then
     # Read SECOND_PREFILL_ENABLED (from env.sh / .user_env.sh)
-    source ./env.sh native
+    source ./env.sh native skip-conda
     for _role in router prefill decode; do
         bash ./stop.sh "$_role"
     done
@@ -50,7 +50,7 @@ fi
 
 # Source config for the specified role (and optional prefill instance)
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-source ./env.sh "$ROLE" "$INSTANCE"
+source ./env.sh "$ROLE" "$INSTANCE" skip-conda
 
 # Router mode: kill gateway and HTTP server processes on the configured router node
 if [[ "$ROLE" == "router" ]]; then

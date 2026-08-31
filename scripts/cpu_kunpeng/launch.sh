@@ -79,10 +79,10 @@ if [[ "$ROLE" == "all" ]]; then
     echo "[$(date +%T)] ===== Launching all roles (prefill + decode + router) in background ====="
 
     bash ./stop.sh router
-    source ./env.sh native
+    source ./env.sh native skip-conda
     bash ./launch.sh prefill --no-log
     if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
-        bash ./launch.sh prefill second --no-log
+        SGLANG_SKIP_UPDATE=1 bash ./launch.sh prefill second --no-log
     fi
     SGLANG_SKIP_UPDATE=1 bash ./launch.sh decode --no-log
 
@@ -124,7 +124,7 @@ fi
 
 # Source config for the specified role
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET"
+source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET" skip-conda
 
 mkdir -p "$LOG_DIR"
 
