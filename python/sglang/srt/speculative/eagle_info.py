@@ -536,37 +536,38 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             token_to_kv_pool_allocator.free(free_loc)
         else:
             if self.topk == 1:
-                # Only evict full empty page. Do not evict partial empty page
-                if is_cpu_920f():
-                    if is_lc_cp_enabled():
-                        # Interleaved layout: rejected draft slots share their
-                        # physical page with LIVE prefix/accepted tokens (the
-                        # whole logical page belongs to one rank), and free()
-                        # releases WHOLE pages -- freeing here would recycle
-                        # pages whose other slots are still referenced by
-                        # req_to_token and later overwrite live KV when the page
-                        # is re-allocated. The rejected slots are re-assigned to
-                        # the same values next round anyway (last_loc + 1
-                        # continuation in alloc_verify_cp_interleaved), and the
-                        # pages are released when the request finishes. Skip the
-                        # free entirely.
-                        pass
-                    else:
+                if is_lc_cp_enabled():
+                    # Interleaved layout: rejected draft slots share their
+                    # physical page with LIVE prefix/accepted tokens (the
+                    # whole logical page belongs to one rank), and free()
+                    # releases WHOLE pages -- freeing here would recycle
+                    # pages whose other slots are still referenced by
+                    # req_to_token and later overwrite live KV when the page
+                    # is re-allocated. The rejected slots are re-assigned to
+                    # the same values next round anyway (last_loc + 1
+                    # continuation in alloc_verify_cp_interleaved), and the
+                    # pages are released when the request finishes. Skip the
+                    # free entirely.
+                    pass
+                else:
+                    # Only evict full empty page. Do not evict partial empty page
+                    if is_cpu_920f():
                         align_evict_mask_to_page_size_native(
                             batch.seq_lens,
                             evict_mask,
                             page_size,
                             self.draft_token_num,
                         )
-                else:
-                    align_evict_mask_to_page_size[len(batch.seq_lens),](
-                        batch.seq_lens,
-                        evict_mask,
-                        page_size,
-                        self.draft_token_num,
-                        next_power_of_2(self.draft_token_num),
-                    )
-                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+                    else:
+                        align_evict_mask_to_page_size[len(batch.seq_lens),](
+                            batch.seq_lens,
+                            evict_mask,
+                            page_size,
+                            self.draft_token_num,
+                            next_power_of_2(self.draft_token_num),
+                        )
+                    free_loc = batch.out_cache_loc[evict_mask]
+                    token_to_kv_pool_allocator.free(free_loc)
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part

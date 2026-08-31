@@ -109,14 +109,15 @@ for i in "${!NODES[@]}"; do
             done
         fi
 
+        rm -rf /dev/shm/shm_mmap_*
+        for i in $(seq 0 31); do
+            echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
+        done
+
         # Drop caches if configured
         if [ "'"${DROP_CACHES:-0}"'" = "1" ]; then
             echo "Dropping caches on '"$node"'..."
             echo 3 > /proc/sys/vm/drop_caches
-            rm -rf /dev/shm/shm_mmap_*
-            for i in $(seq 0 31); do
-                echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
-            done
         fi
     ' &
 done
