@@ -537,6 +537,10 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    if self._pp_mtp_enabled:
+                        for req in self.mbs[next_mb_id].reqs:
+                            if req.finished():
+                                self._pp_pending_drafts.pop(req.rid, None)
 
                 # ⑩ mb tail: batch completion bookkeeping + transition to the
                 # next micro-batch iteration (spans send_pyobj / send_proxy).
@@ -1354,6 +1358,8 @@ class SchedulerPPMixin:
                 # via _pp_mtp_prepare_verify_batch anyway. The last rank keeps
                 # its EagleDraftInput (the next draft-extend input).
                 batch.spec_info = None
+        elif self._pp_mtp_enabled and self.pp_group.is_last_rank:
+            batch.spec_info = None
 
         output_result = GenerationBatchResult(
             logits_output=logits_output,

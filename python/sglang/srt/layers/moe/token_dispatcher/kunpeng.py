@@ -37,6 +37,7 @@ from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
+from sglang.srt.server_args import get_global_server_args
 
 kernel = torch.ops.sgl_kernel
 
@@ -176,7 +177,7 @@ def _ensure_rdma_initialized(
         state.attn_tp_size = get_attn_tensor_model_parallel_world_size()
         state.attn_tp_rank = get_attn_tensor_model_parallel_rank()
         state.use_static_route = use_static_route
-        state.moe_token_multiple = 2
+        state.moe_token_multiple = max(4, state.router_topk)
         state.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
 
         state.parallel_policy = torch.empty(3, dtype=torch.int16)
@@ -209,6 +210,7 @@ def _ensure_rdma_initialized(
             state.dispatch_send_buf.size(0),
             state.recv_src_info_count,
             state.attn_tp_size,
+            state.moe_token_multiple,
             state.dispatch_recv_buf,
         )
         state.dispatch_initialized = True
@@ -507,6 +509,10 @@ class KunpengDispatcher(BaseDispatcher):
             self.num_max_dispatch_tokens_per_rank = (
                 self.max_tokens // self.attn_tp_size
             ) * min(self.expert_per_rank, self.router_topk)
+            # Per-slot dispatch-drain capacity must cover a whole non-chunked.
+            self.num_max_dispatch_tokens_per_rank = max(
+                self.num_max_dispatch_tokens_per_rank, self.max_tokens
+            )
         else:
             self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
 
@@ -640,6 +646,7 @@ class KunpengDispatcher(BaseDispatcher):
             state.num_local_experts,
             state.num_max_dispatch_tokens_per_rank,
             state.max_tokens,
+            state.moe_token_multiple,
             state.is_prefill,
         )
         t_convert_end = time.perf_counter()

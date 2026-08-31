@@ -49,7 +49,14 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_http_only
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.srt.utils.numa_utils import zmq_context_core_binding, ZmqOffset
+from sglang.srt.utils.numa_utils import (
+    resolve_tokenizer_base_numa,
+    tokenizer_numa_span,
+    tokenizer_worker_cpuset_for_span,
+    tokenizer_worker_cpusets_from_base,
+    zmq_context_core_binding,
+    ZmqOffset,
+)
 from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
@@ -529,28 +536,30 @@ def read_from_shared_memory(name: str) -> Any:
 
 
 def get_tokenizer_worker_cpusets(server_args: ServerArgs) -> "list[list[int]]":
-    """Per-worker CPU sets for the tokenizer HTTP server.
+    """Per-worker CPU sets for the tokenizer HTTP server, derived from the
+    role's tokenizer base NUMA (see numa_utils.resolve_tokenizer_base_numa).
 
     Layout (920F, each NUMA has 38 cores, the last core of each NUMA is
     isolated and must not be used):
-      - prefill tokenizer workers: NUMA 0-3  -> cores 0-36, 38-74, 76-112, 114-150
-      - decode  tokenizer workers: NUMA 4-7  -> cores 152-188, 190-226, 228-264, 266-302
-    Only the first `tokenizer_worker_num` NUMA nodes are used, capped at 4:
-    NUMA 8-9 are reserved for the detokenizers, so more than 4 workers per
-    server would overlap them.
+      - prefill tokenizer workers: base=0  -> NUMA 0..0+n-1
+      - decode  tokenizer workers: base=4  -> NUMA 4..4+n-1
+    The tokenizer occupies [base, base+n); the detokenizer takes the next NUMA
+    (base+n) via numa_utils.detokenizer_cpuset_from_base. An env override
+    (SGLANG_KUNPENG_TOKENIZER_BASE_NUMA) picks a distinct block for a second
+    prefill. `tokenizer_worker_num` workers use that many NUMA nodes (capped 4).
     """
     n = server_args.tokenizer_worker_num
     if n > 4:
         logger.warning(
             f"[MultiTokenizer] tokenizer_worker_num={n} > 4, capping per-server "
-            f"worker cpusets to 4 (NUMA 0-7 are the only tokenizer NUMA nodes)."
+            f"worker cpusets to 4 NUMA nodes."
         )
         n = 4
-    base_numa = 4 if server_args.disaggregation_mode == "decode" else 0
-    return [
-        list(range((base_numa + i) * 38, (base_numa + i) * 38 + 37))
-        for i in range(n)
-    ]
+    base_numa = resolve_tokenizer_base_numa(server_args)
+    if n == 1:
+        # Single worker gets 2 NUMA nodes of headroom.
+        return [tokenizer_worker_cpuset_for_span(base_numa, tokenizer_numa_span(n))]
+    return tokenizer_worker_cpusets_from_base(base_numa, n)
 
 
 def _create_worker_counter_shm(current_pid: int):

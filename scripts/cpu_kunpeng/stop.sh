@@ -13,15 +13,17 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: ./stop.sh [prefill|decode|native|router]  (default: native)
+# Usage: ./stop.sh [prefill|decode|native|router|all] [instance]
+#   instance - optional second prefill instance ("second"), passed to env.sh
 
 
-if [[ $# -gt 1 ]]; then
-    echo "Usage: $0 [prefill|decode|native|router]" >&2
+if [[ $# -gt 2 ]]; then
+    echo "Usage: $0 [prefill|decode|native|router|all] [instance]" >&2
     exit 1
 fi
 
 ROLE="${1:-native}"
+INSTANCE="$2"
 if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" && "$ROLE" != "router" && "$ROLE" != "all" ]]; then
     echo "Error: ROLE must be 'prefill', 'decode', 'native', 'router', or 'all'" >&2
     exit 1
@@ -33,15 +35,22 @@ cd "$SCRIPT_DIR"
 # "all" mode: stop every role (router + prefill + decode + native)
 # Handle this before sourcing env.sh, which does not support an "all" role.
 if [[ "$ROLE" == "all" ]]; then
+    # Read SECOND_PREFILL_ENABLED (from env.sh / .user_env.sh)
+    source ./env.sh native skip-conda
     for _role in router prefill decode; do
         bash ./stop.sh "$_role"
     done
+    # If the second prefill is enabled, stop it too (the loop above
+    # only covers the default prefill nodes).
+    if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
+        bash ./stop.sh prefill second
+    fi
     exit 0
 fi
 
-# Source config for the specified role
+# Source config for the specified role (and optional prefill instance)
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-source ./env.sh "$ROLE"
+source ./env.sh "$ROLE" "$INSTANCE" skip-conda
 
 # Router mode: kill gateway and HTTP server processes on the configured router node
 if [[ "$ROLE" == "router" ]]; then

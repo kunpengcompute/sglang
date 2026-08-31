@@ -104,6 +104,14 @@ PREFILL_LONG_PROMPT_IP_FILE=""
 PREFILL_LONG_PROMPT_MASTER_ADDR="xxx.xxx.xxx.17"
 PREFILL_LONG_PROMPT_MASTER_PORT="5020"
 
+# Switch to enable the second prefill instance.
+export SECOND_PREFILL_ENABLED=0
+
+SECOND_PREFILL_IP_SPEC=""
+SECOND_PREFILL_IP_FILE=""
+SECOND_PREFILL_MASTER_ADDR="xxx.xxx.xxx.17"
+SECOND_PREFILL_MASTER_PORT="5020"
+
 DECODE_IP_SPEC=""
 DECODE_IP_FILE=""
 DECODE_MASTER_ADDR="xxx.xxx.xxx.17"
@@ -274,9 +282,6 @@ export DROP_CACHES=0
 export SGLANG_TOKENIZER_TIMELINE_LOG=0
 # Scheduler stream interval (--stream-interval): flush a request's output every N tokens
 export STREAM_INTERVAL=1
-# Dedicated CPU list for the disaggregation bootstrap server thread (only
-# effective in tokenizer-separate mode). 
-export SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU=418-422
 # Tokenizer backend: "huggingface" (default) or "fastokens"
 # (fastokens requires transformers >= 5.12; on 5.6.0 it hits a Metaspace
 #  pre-tokenizer error with DeepSeek-R1)
@@ -371,14 +376,18 @@ _export_pd_vars() {
 # Per-role config functions (called via "${ACTION}_config")
 # ------------------------------------------------------------
 prefill_config() {
-    _export_pd_vars "PREFILL"
     local instance="${PREFILL_INSTANCE:-1}"
-    local _prefix
+    local _prefix="PREFILL"
     if [[ "$instance" == "long_prompt" ]]; then
+        _export_pd_vars "PREFILL"
         export PP_SIZE=$PREFILL_LONG_PROMPT_PP_SIZE
         _prefix="PREFILL_LONG_PROMPT"
+    elif [[ "$instance" == "second" ]]; then
+        # Second prefill instance on an independent node group (SECOND_PREFILL_*)
+        _export_pd_vars "PREFILL"
+        _prefix="SECOND_PREFILL"
     else
-        _prefix="PREFILL"
+        _export_pd_vars "PREFILL"
     fi
     _export_node_config "$_prefix"
     export SGLANG_SKIP_HTTP=1
@@ -408,6 +417,14 @@ build_config() {
 # ------------------------------------------------------------
 ACTION="${1:-native}"
 shift
+
+# Optional: pass "skip-conda" between/after the action to skip conda activation
+SKIP_CONDA=0
+for _arg in "$@"; do
+    if [[ "$_arg" == "skip-conda" ]]; then
+        SKIP_CONDA=1
+    fi
+done
 
 case "$ACTION" in
     prefill|decode|native|router|build)
@@ -444,4 +461,7 @@ export INCLUDE=${KUPL_PATH}/include:$INCLUDE
 export LIBRARY_PATH=${KUPL_PATH}/lib:$LIBRARY_PATH
 
 export CONDA_ACTIVATE_CMD="eval \"\$($CONDA_BASE_PATH/bin/conda shell.bash hook)\" && conda activate $CONDA_ENV_NAME"
-eval "$CONDA_ACTIVATE_CMD"
+if [[ "$SKIP_CONDA" != "1" ]]; then
+    eval "$CONDA_ACTIVATE_CMD"
+    echo "conda environment activated: $CONDA_ENV_NAME"
+fi
