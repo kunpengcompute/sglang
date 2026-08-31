@@ -77,7 +77,7 @@ std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, 
 
 std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K);
 
-// === Attention ç®—å­å£°æ˜ ===
+// === Attention Ëã×ÓÉùÃ÷ ===
 at::Tensor flash_mla_meta_create_kunpeng();
 at::Tensor flash_mla_meta_destroy_kunpeng(at::Tensor meta_tensor);
 
@@ -154,12 +154,12 @@ void contiguous_rows_kunpeng(
     at::Tensor x, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
     at::Tensor out);
 
-// === Memory ç®—å­å£°æ˜ ===
+// === Memory Ëã×ÓÉùÃ÷ ===
 at::Tensor hbw_allocator_kunpeng(int64_t size);
 
 void hbw_destroy_kunpeng(at::Tensor ptr_tensor);
 
-// === MOE ç®—å­å£°æ˜ ===
+// === MOE Ëã×ÓÉùÃ÷ ===
 at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias);
 
 void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size);
@@ -263,7 +263,7 @@ void multinomial_kunpeng(const at::Tensor &probs, at::Tensor out, int64_t num_sa
 void argmax_kunpeng(const at::Tensor prob_distribution, at::Tensor token_ids, at::Tensor token_probs, int64_t height,
                     int64_t width);
 
-// === SHM ç®—å­å£°æ˜ ===
+// === SHM Ëã×ÓÉùÃ÷ ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
 void shm_pool_destroy_kunpeng();
@@ -325,7 +325,7 @@ void shm_mla_alltoall_long_context_finalize_kunpeng();
 void flash_mla_reduce_kunpeng(at::Tensor o_contrib_tensor, at::Tensor lse_contrib_tensor,
                               at::Tensor topk_length_tensor, at::Tensor out_tensor);
 
-// === Embedding ç®—å­å£°æ˜ ===
+// === Embedding Ëã×ÓÉùÃ÷ ===
 at::Tensor embedding_kunpeng(at::Tensor indices, at::Tensor weight, at::Tensor output, int64_t org_vocab_start,
                              int64_t org_vocab_end, int64_t num_org_vocab_padding, int64_t added_vocab_start,
                              int64_t added_vocab_end);
@@ -336,9 +336,6 @@ void build_tree_kernel_kunpeng(at::Tensor parent_list, at::Tensor top_scores_ind
                                int64_t spec_steps, int64_t num_verify_tokens, int64_t tree_mask_mode,
                                int64_t seq_lens_sum);
 
-void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at::Tensor accept_token_num,
-                                at::Tensor candidates, at::Tensor retrieve_index, at::Tensor retrieve_next_token,
-                                at::Tensor retrieve_next_sibling, at::Tensor target_predict);
 
 void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded);
 
@@ -349,8 +346,6 @@ void repeat_interleave_kunpeng(at::Tensor x, at::Tensor out, int64_t repeats);
 // MTP performance kernels (kutacc::parallel_for, not graph ops)
 void softmax_topk_kunpeng(at::Tensor logits, at::Tensor topk_p, at::Tensor topk_index,
                           int64_t prf_vecs);
-
-void argmax_last_dim_kunpeng(at::Tensor logits, at::Tensor out);
 
 void alloc_extend_kernel_kunpeng(at::Tensor prefix_lens, at::Tensor seq_lens, at::Tensor last_loc,
                                  at::Tensor free_pages, at::Tensor out_indices, int64_t page_size);
@@ -373,19 +368,16 @@ void create_extend_after_decode_kunpeng(at::Tensor verified_id, at::Tensor seq_l
 void compute_position_kunpeng(at::Tensor extend_prefix_lens, at::Tensor extend_seq_lens,
                               at::Tensor positions, at::Tensor extend_start_loc);
 
-// Fused MTP verify helpers (kutacc::parallel_for, not graph ops).
-// verify_finish_kunpeng: per-request finished detection + accept_index
-// truncation + per-req counts/tokens/unfinished lists.
-void verify_finish_kunpeng(
-    at::Tensor predict, at::Tensor accept_index, at::Tensor output_ids_len,
-    at::Tensor max_new_tokens, at::Tensor vocab_size,
+// verify_mtp_kunpeng: single fused 920F topk==1 verify kernel (argmax +
+// greedy accept + finish + evict page-align + compact + scatter + seq_lens).
+std::vector<at::Tensor> verify_mtp_kunpeng(
+    at::Tensor logits, at::Tensor hidden, at::Tensor candidates,
+    at::Tensor retrieve_index, at::Tensor seq_lens, at::Tensor out_cache_loc,
+    at::Tensor output_ids_len, at::Tensor max_new_tokens, at::Tensor vocab_size,
     at::Tensor stop_ids_flat, at::Tensor stop_ids_off,
     at::Tensor eos_ids_flat, at::Tensor eos_ids_off,
-    int64_t tokenizer_eos, int64_t nv, bool use_tokenizer_eos,
-    at::Tensor num_accepted, at::Tensor finished, at::Tensor finish_reason,
-    at::Tensor finish_matched, at::Tensor finish_len,
-    at::Tensor accepted_tokens, at::Tensor accepted_offsets,
-    at::Tensor unfinished_index, at::Tensor unfinished_acc_idx);
+    int64_t tokenizer_eos, bool use_tokenizer_eos, int64_t nv, int64_t page_size,
+    at::Tensor req_pool_indices, at::Tensor req_to_token, at::Tensor seq_lens_cpu);
 
 // gather_index_kunpeng: parallel row gather replacing the two aten::index ops.
 void gather_index_kunpeng(at::Tensor src_logits, at::Tensor src_hidden,
@@ -620,7 +612,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("hbw_destroy_kunpeng(Tensor ptr_tensor) -> ()");
     m.impl("hbw_destroy_kunpeng", hbw_destroy_kunpeng);
 
-    // === MOE ç®—å­å£°æ˜ ===
+    // === MOE Ëã×ÓÉùÃ÷ ===
     m.def("bf16_linear_kunpeng(Tensor input, Tensor weight, Tensor bias) -> Tensor");
     m.impl("bf16_linear_kunpeng", bf16_linear_kunpeng);
 
@@ -896,13 +888,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int seq_lens_sum) -> ()");
     m.impl("build_tree_kernel_kunpeng", build_tree_kernel_kunpeng);
 
-    m.def(
-        "verify_tree_greedy_kunpeng("
-        "Tensor predicts, Tensor! accept_index, Tensor! accept_token_num, "
-        "Tensor candidates, Tensor retrieve_index, Tensor retrieve_next_token, "
-        "Tensor retrieve_next_sibling, Tensor target_predict) -> ()");
-    m.impl("verify_tree_greedy_kunpeng", verify_tree_greedy_kunpeng);
-
     m.def("pad_q_left_mtp_kunpeng(Tensor q_heads, Tensor ext_lens, Tensor q_padded) -> ()");
     m.impl("pad_q_left_mtp_kunpeng", pad_q_left_mtp_kunpeng);
 
@@ -917,9 +902,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "softmax_topk_kunpeng(Tensor logits, Tensor(a!) topk_p, Tensor(b!) topk_index, "
         "int prf_vecs) -> ()");
     m.impl("softmax_topk_kunpeng", softmax_topk_kunpeng);
-
-    m.def("argmax_last_dim_kunpeng(Tensor logits, Tensor(a!) out) -> ()");
-    m.impl("argmax_last_dim_kunpeng", argmax_last_dim_kunpeng);
 
     m.def(
         "alloc_extend_kernel_kunpeng(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, "
@@ -952,19 +934,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor(a!) positions, Tensor(b!) extend_start_loc) -> ()");
     m.impl("compute_position_kunpeng", compute_position_kunpeng);
 
-    // Fused MTP verify helpers (kutacc::parallel_for, not graph ops)
     m.def(
-        "verify_finish_kunpeng("
-        "Tensor predict, Tensor(a!) accept_index, Tensor output_ids_len, "
+        "verify_mtp_kunpeng("
+        "Tensor logits, Tensor hidden, Tensor candidates, Tensor retrieve_index, "
+        "Tensor(a!) seq_lens, Tensor out_cache_loc, Tensor output_ids_len, "
         "Tensor max_new_tokens, Tensor vocab_size, "
         "Tensor stop_ids_flat, Tensor stop_ids_off, "
         "Tensor eos_ids_flat, Tensor eos_ids_off, "
-        "int tokenizer_eos, int nv, bool use_tokenizer_eos, "
-        "Tensor(b!) num_accepted, Tensor(c!) finished, Tensor(d!) finish_reason, "
-        "Tensor(e!) finish_matched, Tensor(f!) finish_len, "
-        "Tensor(g!) accepted_tokens, Tensor(h!) accepted_offsets, "
-        "Tensor(i!) unfinished_index, Tensor(j!) unfinished_acc_idx) -> ()");
-    m.impl("verify_finish_kunpeng", verify_finish_kunpeng);
+        "int tokenizer_eos, bool use_tokenizer_eos, int nv, int page_size, "
+        "Tensor req_pool_indices, Tensor(b!) req_to_token, Tensor(c!) seq_lens_cpu"
+        ") -> ("
+        "Tensor, Tensor, Tensor, Tensor, Tensor, "
+        "Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, "
+        "Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.impl("verify_mtp_kunpeng", verify_mtp_kunpeng);
 
     m.def(
         "gather_index_kunpeng(Tensor src_logits, Tensor src_hidden, "

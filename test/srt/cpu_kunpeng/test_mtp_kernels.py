@@ -16,8 +16,6 @@
 
 Covers the 920F MTP kernels under sgl-kernel/csrc/cpu/cpu_kunpeng/:
   - softmax_topk_kunpeng  (fused softmax + topk=1, SVE + fast_exp + prefetch)
-  - argmax_last_dim_kunpeng
-  - verify_finish_kunpeng (per-request finish detection)
   - gather_index_kunpeng  (row gather of logits/hidden)
   - build_tree_kernel_kunpeng (tree positions / retrieve tables)
 
@@ -25,6 +23,10 @@ Each kernel is first validated against a torch-native reference (correctness
 regression), then timed with time.perf_counter to produce a perf baseline.
 softmax_topk_kunpeng additionally sweeps the software-prefetch distance
 (prf_vecs) so Python can tune / validate it.
+
+Note: argmax_last_dim_kunpeng / verify_finish_kunpeng were removed (their logic
+was fused into the single verify_mtp_kunpeng kernel; see
+doc/MTP_verify_single_c_kernel_plan.md).
 
 Usage:
   source scripts/cpu_kunpeng/env.sh native
@@ -86,140 +88,6 @@ def _bench_softmax_topk(M, vocab, prf_vecs, n_iter, n_warmup):
     for _ in range(n_iter):
         kernel.softmax_topk_kunpeng(logits, topk_p, topk_index, prf_vecs)
     return (time.perf_counter() - t0) * 1e6 / n_iter  # us/op
-
-
-# ---------------------------------------------------------------------------
-# argmax_last_dim_kunpeng
-# ---------------------------------------------------------------------------
-
-def _check_argmax_last_dim(M, vocab):
-    torch.manual_seed(1)
-    logits = torch.randn(M, vocab, dtype=torch.bfloat16)
-    out = torch.empty(M, dtype=torch.int64)
-    kernel.argmax_last_dim_kunpeng(logits.contiguous(), out)
-    ref = torch.argmax(logits, dim=-1)
-    assert torch.equal(out, ref), "argmax_last_dim mismatch"
-
-
-def _bench_argmax_last_dim(M, vocab, n_iter, n_warmup):
-    logits = torch.randn(M, vocab, dtype=torch.bfloat16)
-    out = torch.empty(M, dtype=torch.int64)
-    for _ in range(n_warmup):
-        kernel.argmax_last_dim_kunpeng(logits, out)
-    t0 = time.perf_counter()
-    for _ in range(n_iter):
-        kernel.argmax_last_dim_kunpeng(logits, out)
-    return (time.perf_counter() - t0) * 1e6 / n_iter
-
-
-# ---------------------------------------------------------------------------
-# verify_finish_kunpeng
-# ---------------------------------------------------------------------------
-
-def _pack_id_sets(seqs):
-    flat = []
-    off = [0]
-    for s in seqs:
-        flat.extend(s)
-        off.append(len(flat))
-    return torch.tensor(flat, dtype=torch.int32), torch.tensor(off, dtype=torch.int32)
-
-
-def _ref_verify_finish(accept_index, predict, output_ids_len, max_new_tokens, vocab_size,
-                       stop_off, eos_off, nv, use_tokenizer_eos, tokenizer_eos):
-    """Mirror the C++ kernel semantics (pure-token MTP, topk==1)."""
-    bs = accept_index.shape[0]
-    num_acc = []
-    finished = []
-    reason = []
-    matched = []
-    fin_len = []
-    for b in range(bs):
-        row = accept_index[b]
-        num = 0
-        is_fin = 0
-        r = -1
-        mt = 0
-        fl = 0
-        for j in range(nv):
-            flat = int(row[j])
-            if flat == -1:
-                break
-            tok = int(predict[flat]) if 0 <= flat < predict.shape[0] else -1
-            cur_len = int(output_ids_len[b]) + (j + 1)
-            hit = False
-            if cur_len >= int(max_new_tokens[b]):
-                r, mt, fl, hit = 0, int(max_new_tokens[b]), cur_len, True
-            if not hit:
-                if stop_off[b + 1] > stop_off[b] or eos_off[b + 1] > eos_off[b] or (
-                    use_tokenizer_eos and tokenizer_eos >= 0
-                ):
-                    if use_tokenizer_eos and tokenizer_eos >= 0 and tok == int(tokenizer_eos):
-                        r, mt, fl, hit = 1, tok, cur_len, True
-            if not hit:
-                if tok < 0 or tok > int(vocab_size[b]):
-                    r, mt, fl, hit = 2, 0, cur_len, True
-            num += 1
-            if hit:
-                is_fin = 1
-                break
-        num_acc.append(num)
-        finished.append(is_fin)
-        reason.append(r)
-        matched.append(mt)
-        fin_len.append(fl)
-    return (
-        torch.tensor(num_acc, dtype=torch.int32),
-        torch.tensor(finished, dtype=torch.int32),
-        torch.tensor(reason, dtype=torch.int32),
-        torch.tensor(matched, dtype=torch.int64),
-        torch.tensor(fin_len, dtype=torch.int32),
-    )
-
-
-def _check_verify_finish(bs, nv, total):
-    torch.manual_seed(2)
-    predict = torch.randint(0, 1000, (total,), dtype=torch.int32)
-    accept_index = torch.full((bs, nv), -1, dtype=torch.int32)
-    for b in range(bs):
-        k = random.randint(1, nv)
-        accept_index[b, :k] = torch.arange(k, dtype=torch.int32)
-    output_ids_len = torch.randint(0, 50, (bs,), dtype=torch.int64)
-    max_new_tokens = torch.randint(1, 100, (bs,), dtype=torch.int32)
-    vocab_size = torch.randint(100, 2000, (bs,), dtype=torch.int32)
-    stop_ids = [[random.randint(0, 2000) for _ in range(random.randint(0, 3))] for _ in range(bs)]
-    eos_ids = [[random.randint(0, 2000) for _ in range(random.randint(0, 3))] for _ in range(bs)]
-    stop_flat, stop_off = _pack_id_sets(stop_ids)
-    eos_flat, eos_off = _pack_id_sets(eos_ids)
-    use_tokenizer_eos = True
-    tokenizer_eos = 100
-
-    num_accepted = torch.empty(bs, dtype=torch.int32)
-    finished = torch.empty(bs, dtype=torch.int32)
-    finish_reason = torch.empty(bs, dtype=torch.int32)
-    finish_matched = torch.empty(bs, dtype=torch.int64)
-    finish_len = torch.empty(bs, dtype=torch.int32)
-    accepted_tokens = torch.full((bs * nv,), -1, dtype=torch.int32)
-    accepted_offsets = torch.empty(bs + 1, dtype=torch.int32)
-    unfinished_index_t = torch.empty(bs, dtype=torch.int32)
-    unfinished_acc_idx = torch.full((bs * nv,), -1, dtype=torch.int32)
-
-    kernel.verify_finish_kunpeng(
-        predict, accept_index, output_ids_len, max_new_tokens, vocab_size,
-        stop_flat, stop_off, eos_flat, eos_off, tokenizer_eos, nv, use_tokenizer_eos,
-        num_accepted, finished, finish_reason, finish_matched, finish_len,
-        accepted_tokens, accepted_offsets, unfinished_index_t, unfinished_acc_idx,
-    )
-
-    ref = _ref_verify_finish(
-        accept_index, predict, output_ids_len, max_new_tokens, vocab_size,
-        stop_off, eos_off, nv, use_tokenizer_eos, tokenizer_eos,
-    )
-    assert torch.equal(num_accepted, ref[0]), "num_accepted mismatch"
-    assert torch.equal(finished, ref[1]), "finished mismatch"
-    assert torch.equal(finish_reason, ref[2]), "finish_reason mismatch"
-    assert torch.equal(finish_matched, ref[3]), "finish_matched mismatch"
-    assert torch.equal(finish_len, ref[4]), "finish_len mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -311,10 +179,6 @@ def run(args):
     # Correctness
     _check_softmax_topk_correctness(4, 8192, 8)
     _check_softmax_topk_correctness(8, 4097, 8)
-    _check_argmax_last_dim(16, 4097)
-    _check_argmax_last_dim(8, 8192)
-    _check_verify_finish(8, 4, 32)
-    _check_verify_finish(16, 3, 48)
     _check_gather_index(8, 129, 32, 64)
     _check_gather_index(32, 129, 32, 128)
     _check_build_tree(4, 8)
@@ -342,16 +206,6 @@ def run(args):
             _bench_row(
                 f"softmax_topk M={M} prf_vecs={pv}", _softmax_topk_fn, n_iter,
             )
-
-    print(f"[argmax_last_dim_kunpeng] vocab={vocab}")
-    for M in args.M:
-        logits_buf = torch.randn(M, vocab, dtype=torch.bfloat16)
-        out_buf = torch.empty(M, dtype=torch.int64)
-
-        def _argmax_fn():
-            kernel.argmax_last_dim_kunpeng(logits_buf, out_buf)
-
-        _bench_row(f"argmax_last_dim M={M}", _argmax_fn, n_iter)
 
     print("[gather_index_kunpeng] V=129 H=32")
     for K in args.M:

@@ -279,30 +279,32 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
-    def _finish_check_cpu(
+    def _verify_kunpeng(
         self,
         batch: ScheduleBatch,
-        predict: torch.Tensor,
-        accept_index: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        page_size: int,
     ):
-        """Fused per-request finished detection for the 920F pure-token MTP path.
+        """Fused 920F pure-token MTP verify (single C++ kernel, no tensor index).
 
-        Runs the per-token finished check, accept_index truncation and
-        per-request counting in a multi-core C++ kernel (GIL released), then
-        writes the per-request Req state in a thin Python shell.
+        The whole verify pipeline (argmax, greedy accept, finish detection,
+        evict page alignment, compact gathers, req_to_token scatter, seq_lens
+        update) runs inside one `verify_mtp_kunpeng` call under a single GIL
+        release.  All tensor index / intermediate mask tensors are eliminated;
+        the kernel returns already-compact results that this thin Python shell
+        consumes to write per-request Req state (Python objects) and to
+        assemble the EagleVerifyOutput.
 
-        Returns the same values the Python B-section loop produces:
-          unfinished_index: List[int]
-          unfinished_accept_index: List[torch.Tensor]
-          has_finished: bool
-          num_accepted_drafts_list: List[int]
-          num_accepted_tokens_list: List[int]
-          num_accepted_drafts: torch.Tensor  (per-req accepted draft count)
+        Returns the same EagleVerifyOutput contract as the official `verify`
+        (including the `accepted_indices=None` marker consumed by
+        `gather_index_cpu` to skip the aten::index path).
         """
         device = batch.device
         bs = self.retrieve_index.shape[0]
         nv = self.draft_token_num
-        total = predict.shape[0]
+
+        candidates = self.draft_token.reshape(bs, nv)
 
         # ── Pack per-request pure-token finish parameters ─────────────────
         output_ids_len = torch.tensor(
@@ -319,10 +321,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             [r.vocab_size for r in batch.reqs], dtype=torch.int32, device=device
         )
         stop_flat, stop_off = _pack_id_sets(
-            [
-                list(r.sampling_params.stop_token_ids or [])
-                for r in batch.reqs
-            ],
+            [list(r.sampling_params.stop_token_ids or []) for r in batch.reqs],
             device,
         )
         eos_flat, eos_off = _pack_id_sets(
@@ -333,25 +332,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.reqs[0].tokenizer.eos_token_id if use_tokenizer_eos else -1
         )
 
-        # ── Pre-allocate outputs ─────────────────────────────────────────
-        num_accepted = torch.empty((bs,), dtype=torch.int32, device=device)
-        finished = torch.empty((bs,), dtype=torch.int32, device=device)
-        finish_reason = torch.empty((bs,), dtype=torch.int32, device=device)
-        finish_matched = torch.empty((bs,), dtype=torch.int64, device=device)
-        finish_len = torch.empty((bs,), dtype=torch.int32, device=device)
-        accepted_tokens = torch.full(
-            (bs * nv,), -1, dtype=torch.int32, device=device
-        )
-        accepted_offsets = torch.empty((bs + 1,), dtype=torch.int32, device=device)
-        unfinished_index_t = torch.empty((bs,), dtype=torch.int32, device=device)
-        unfinished_acc_idx = torch.full(
-            (bs * nv,), -1, dtype=torch.int32, device=device
-        )
-
-        # ── Stage 1: fused C++ kernel (GIL released, multi-core) ─────────
-        torch.ops.sgl_kernel.verify_finish_kunpeng(
-            predict,
-            accept_index,
+        # ── Single fused C++ kernel (GIL released, multi-core) ───────────
+        (
+            num_accepted,
+            finished,
+            finish_reason,
+            finish_matched,
+            finish_len,
+            accepted_tokens,
+            accepted_offsets,
+            accepted_cache_loc,
+            accepted_verified_id,
+            accepted_logits,
+            accepted_hidden,
+            _unfinished_index,
+            unfinished_num_accepted,
+            _unfinished_cache_loc,
+            unfinished_verified_id,
+            _unfinished_logits,
+            unfinished_hidden,
+            free_cache_loc,
+        ) = torch.ops.sgl_kernel.verify_mtp_kunpeng(
+            logits_output.next_token_logits.contiguous(),
+            logits_output.hidden_states.contiguous()
+            if logits_output.hidden_states is not None
+            else torch.empty((0,), dtype=torch.bfloat16, device=device),
+            candidates,
+            self.retrieve_index,
+            batch.seq_lens,
+            batch.out_cache_loc,
             output_ids_len,
             max_new_tokens,
             vocab_size,
@@ -360,20 +369,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             eos_flat,
             eos_off,
             tokenizer_eos,
-            nv,
             use_tokenizer_eos,
-            num_accepted,
-            finished,
-            finish_reason,
-            finish_matched,
-            finish_len,
-            accepted_tokens,
-            accepted_offsets,
-            unfinished_index_t,
-            unfinished_acc_idx,
+            nv,
+            page_size,
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens_cpu,
         )
 
-        # ── Stage 2: thin Python shell (per-req Req state only) ──────────
+        # ── Thin Python shell (per-req Req state only) ───────────────────
         num_accepted_cpu = num_accepted.tolist()
         accepted_tokens_cpu = accepted_tokens.tolist()
         accepted_offsets_cpu = accepted_offsets.tolist()
@@ -381,19 +385,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         finish_reason_cpu = finish_reason.tolist()
         finish_matched_cpu = finish_matched.tolist()
         finish_len_cpu = finish_len.tolist()
-        unfinished_index_t_cpu = unfinished_index_t.tolist()
 
         has_finished = False
         unfinished_index = []
-        unfinished_accept_index = []
         num_accepted_drafts_list = []
         num_accepted_tokens_list = []
 
         for i, req in enumerate(batch.reqs):
             num_acc = num_accepted_cpu[i]
             off0 = accepted_offsets_cpu[i]
-            # Only the first `num_acc` entries of the row are valid; the rest
-            # of the fixed-size row is -1 padding.
+            # Compact row segment (fixed-size row, -1 padding after num_acc).
             tok = accepted_tokens_cpu[off0 : off0 + num_acc]
             if tok:
                 req.output_ids.extend(tok)
@@ -414,9 +415,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             req.kv_allocated_len = req.kv_committed_len
             if not req.finished():
                 unfinished_index.append(i)
-                unfinished_accept_index.append(
-                    accept_index[i, :num_acc]
-                )
             req.spec_verify_ct += 1
             accepted_draft_tokens = num_acc - 1
             req.spec_accepted_drafts += accepted_draft_tokens
@@ -424,18 +422,92 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             num_accepted_drafts_list.append(accepted_draft_tokens)
             num_accepted_tokens_list.append(num_acc)
 
-        # Recompute the per-req accepted draft counts after truncation as a
-        # tensor (matches the `has_finished` branch which re-derives it).
+        # Free the KV cache for unaccepted tokens (already page-aligned and
+        # compacted inside the kernel -> no boolean index here).
+        token_to_kv_pool_allocator.free(free_cache_loc)
+
+        # Accepted compact results (no tensor index; `gather_index_cpu`
+        # recognises accepted_indices=None and skips the aten::index path).
+        verified_id = accepted_verified_id
+        batch.out_cache_loc = accepted_cache_loc
+        logits_output.next_token_logits = accepted_logits
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = accepted_hidden
+        # seq_lens / seq_lens_cpu were already incremented by the kernel.
         num_accepted_drafts = num_accepted - 1
 
-        return (
-            unfinished_index,
-            unfinished_accept_index,
-            has_finished,
-            num_accepted_drafts_list,
-            num_accepted_tokens_list,
-            num_accepted_drafts,
-        )
+        if not has_finished:
+            draft_input = EagleDraftInput(
+                hidden_states=accepted_hidden,
+                verified_id=verified_id,
+                num_accepted_drafts=num_accepted_drafts,
+                num_accepted_tokens=num_accepted_drafts + 1,
+                num_accepted_drafts_cpu=num_accepted_drafts_list,
+                num_accepted_tokens_cpu=num_accepted_tokens_list,
+                seq_lens_for_draft_extend=batch.seq_lens,
+                seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu,
+                req_pool_indices_for_draft_extend=batch.req_pool_indices,
+            )
+
+            return EagleVerifyOutput(
+                draft_input=draft_input,
+                logits_output=logits_output,
+                verified_id=verified_id,
+                num_accepted_drafts_per_req_cpu=draft_input.num_accepted_drafts_cpu,
+                accepted_indices=None,
+            )
+        else:
+            if len(unfinished_index) > 0:
+                draft_input_num_accepted_drafts_cpu = [
+                    num_accepted_drafts_list[i] for i in unfinished_index
+                ]
+                draft_input_num_accepted_tokens_cpu = [
+                    num_accepted_tokens_list[i] for i in unfinished_index
+                ]
+                # Select per-unfinished-req values via Python list comprehensions
+                # (no tensor index on the hot path).
+                seq_lens_for_draft_extend = torch.tensor(
+                    [batch.seq_lens[i].item() for i in unfinished_index],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                seq_lens_for_draft_extend_cpu = torch.tensor(
+                    [batch.seq_lens_cpu[i].item() for i in unfinished_index],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                req_pool_indices_for_draft_extend = torch.tensor(
+                    [batch.req_pool_indices[i].item() for i in unfinished_index],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                draft_input = EagleDraftInput(
+                    hidden_states=unfinished_hidden,
+                    verified_id=unfinished_verified_id,
+                    num_accepted_drafts=unfinished_num_accepted - 1,
+                    num_accepted_tokens=unfinished_num_accepted,
+                    num_accepted_drafts_cpu=draft_input_num_accepted_drafts_cpu,
+                    num_accepted_tokens_cpu=draft_input_num_accepted_tokens_cpu,
+                    seq_lens_for_draft_extend=seq_lens_for_draft_extend,
+                    seq_lens_for_draft_extend_cpu=seq_lens_for_draft_extend_cpu,
+                    req_pool_indices_for_draft_extend=req_pool_indices_for_draft_extend,
+                )
+            else:
+                draft_input = EagleDraftInput.create_idle_input(
+                    device=batch.device,
+                    hidden_size=batch.model_config.spec_hidden_size,
+                    dtype=batch.model_config.dtype,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                )
+
+            return EagleVerifyOutput(
+                draft_input=draft_input,
+                logits_output=logits_output,
+                verified_id=verified_id,
+                num_accepted_drafts_per_req_cpu=num_accepted_drafts_list,
+                accepted_indices=None,
+            )
 
     def verify(
         self,
@@ -477,6 +549,29 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         bs = self.retrieve_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
+
+        # ── Kunpeng 920F pure-token MTP: fused single-C-kernel verify. ──
+        # Active only for the same guard as the removed `_finish_check_cpu`:
+        # topk==1 chain, single speculative step, greedy verify, no grammar /
+        # stop-strs / regex / reasoning.  The whole pipeline (argmax, greedy
+        # accept, finish detection, evict page alignment, compact gathers,
+        # req_to_token scatter, seq_lens update) runs inside one C++ kernel;
+        # this branch returns early and keeps the official verify flow intact.
+        if (
+            is_cpu_920f()
+            and self.topk == 1
+            and self.spec_steps == 1
+            and not any(r.grammar is not None for r in batch.reqs)
+            and not any(r.require_reasoning for r in batch.reqs)
+            and not any(
+                r.sampling_params.stop_strs or r.sampling_params.stop_regex_strs
+                for r in batch.reqs
+            )
+        ):
+            return self._verify_kunpeng(
+                batch, logits_output, token_to_kv_pool_allocator, page_size
+            )
+
         sampling_info = batch.sampling_info
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
@@ -534,20 +629,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            if is_cpu_920f():
-                # C++ argmax: batch-parallel SVE scan, avoids the single-threaded
-                # torch.argmax on the (M, vocab) logits.
-                next_token_logits = logits_output.next_token_logits
-                target_predict = torch.empty(
-                    (next_token_logits.shape[0],),
-                    dtype=torch.int64,
-                    device=next_token_logits.device,
-                )
-                torch.ops.sgl_kernel.argmax_last_dim_kunpeng(
-                    next_token_logits.contiguous(), target_predict
-                )
-            else:
-                target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_accepted_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
@@ -646,83 +728,53 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         has_finished = False
         think_end_id = batch.model_config.think_end_id
 
-        # ── Fused CPU finish-check path (replaces the Python double loop) ──
-        # Active only for the 920F pure-token MTP config: topk==1 chain, single
-        # speculative step, greedy verify, no grammar / stop-strs / regex /
-        # reasoning.  The per-token finished detection, accept_index
-        # truncation and per-request counts run in a multi-core C++ kernel with
-        # the GIL released; this Python block only writes per-request Req state.
-        if (
-            is_cpu_920f()
-            and self.topk == 1
-            and self.spec_steps == 1
-            and not any(r.grammar is not None for r in batch.reqs)
-            and not any(r.require_reasoning for r in batch.reqs)
-            and not any(
-                r.sampling_params.stop_strs or r.sampling_params.stop_regex_strs
-                for r in batch.reqs
-            )
+        # Iterate every accepted token and check if req has finished after append the token
+        # should be checked BEFORE free kv cache slots
+        for i, (req, accept_index_row) in enumerate(
+            zip(batch.reqs, accept_index_cpu)
         ):
-            (
-                unfinished_index,
-                unfinished_accept_index,
-                has_finished,
-                num_accepted_drafts_list,
-                num_accepted_tokens_list,
-                num_accepted_drafts,
-            ) = self._finish_check_cpu(
-                batch,
-                predict,
-                accept_index,
-            )
-        else:
-            # Iterate every accepted token and check if req has finished after append the token
-            # should be checked BEFORE free kv cache slots
-            for i, (req, accept_index_row) in enumerate(
-                zip(batch.reqs, accept_index_cpu)
-            ):
-                num_accepted = 0
-                for j, idx in enumerate(accept_index_row):
-                    if idx == -1:
-                        break
-                    num_accepted += 1
-                    id = predict_cpu[idx]
-                    req.output_ids.append(id)
-                    if req.require_reasoning and think_end_id is not None:
-                        req.update_reasoning_tokens(id, think_end_id)
+            num_accepted = 0
+            for j, idx in enumerate(accept_index_row):
+                if idx == -1:
+                    break
+                num_accepted += 1
+                id = predict_cpu[idx]
+                req.output_ids.append(id)
+                if req.require_reasoning and think_end_id is not None:
+                    req.update_reasoning_tokens(id, think_end_id)
+                req.check_finished()
+                if not req.finished() and req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(id)
+                    except ValueError as e:
+                        logger.info(
+                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                        )
+                        raise e
                     req.check_finished()
-                    if not req.finished() and req.grammar is not None:
-                        try:
-                            req.grammar.accept_token(id)
-                        except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                            )
-                            raise e
-                        req.check_finished()
-                    if req.finished():
-                        has_finished = True
-                        # set all tokens after finished token to -1 and break
-                        accept_index[i, j + 1 :] = -1
-                        break
-                # Update KV cache tracking for the accepted tokens
-                req.kv_committed_len += num_accepted
-                req.kv_allocated_len = req.kv_committed_len
-                if not req.finished():
-                    unfinished_index.append(i)
-                    if idx == -1:
-                        unfinished_accept_index.append(accept_index[i, :j])
-                    else:
-                        unfinished_accept_index.append(accept_index[i])
-                req.spec_verify_ct += 1
-                accepted_draft_tokens = (
-                    sum(1 for idx in accept_index_row if idx != -1) - 1
-                )
-                req.spec_accepted_drafts += accepted_draft_tokens
-                req.update_spec_acceptance_histogram(accepted_draft_tokens)
+                if req.finished():
+                    has_finished = True
+                    # set all tokens after finished token to -1 and break
+                    accept_index[i, j + 1 :] = -1
+                    break
+            # Update KV cache tracking for the accepted tokens
+            req.kv_committed_len += num_accepted
+            req.kv_allocated_len = req.kv_committed_len
+            if not req.finished():
+                unfinished_index.append(i)
+                if idx == -1:
+                    unfinished_accept_index.append(accept_index[i, :j])
+                else:
+                    unfinished_accept_index.append(accept_index[i])
+            req.spec_verify_ct += 1
+            accepted_draft_tokens = (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
+            req.spec_accepted_drafts += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
-            if has_finished:
-                num_accepted_drafts = (accept_index != -1).sum(dim=1) - 1
+        if has_finished:
+            num_accepted_drafts = (accept_index != -1).sum(dim=1) - 1
 
         # ── shared compaction + KV eviction ──
         num_accepted_drafts_cpu = num_accepted_drafts.cpu()

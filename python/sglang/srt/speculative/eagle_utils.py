@@ -207,15 +207,4 @@ def verify_tree_greedy_func(
             retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
-    elif _is_cpu:
-        torch.ops.sgl_kernel.verify_tree_greedy_kunpeng(
-            predicts,
-            accept_index,
-            accept_token_num,
-            candidates,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            target_predict,
-        )
     return predicts, accept_index, accept_token_num

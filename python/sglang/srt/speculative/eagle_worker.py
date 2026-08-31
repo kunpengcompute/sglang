@@ -98,9 +98,18 @@ def gather_index_cpu(logits_output, accepted_indices):
         logits_output.hidden_states = logits_output.hidden_states[accepted_indices]
     with a multi-core `gather_index_kunpeng` kernel (GIL released).  Only used
     on the Kunpeng CPU 920F path; other platforms keep the aten::index form.
+
+    When ``accepted_indices is None`` (the fused ``verify_mtp_kunpeng`` path in
+    ``EagleVerifyInput._verify_kunpeng``), the accepted logits/hidden rows are
+    already compacted inside the kernel and assigned to
+    ``logits_output.next_token_logits`` / ``logits_output.hidden_states``; this
+    function then returns True to signal "already done, skip the aten::index".
     """
-    if not _is_cpu_920f or accepted_indices is None:
+    if not _is_cpu_920f:
         return False
+    if accepted_indices is None:
+        return True
+    indices = accepted_indices
     indices = accepted_indices
     if indices.numel() == 0:
         # Empty gather: keep the empty shapes identical to aten::index.
