@@ -320,8 +320,8 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     printf '%s' "$body" > "$body_file"
 
     local resp_file="$RESULT_DIR/resp_${idx}"
-    local start_ts
-    start_ts=$(date +%s.%N)
+    local start_ns
+    start_ns=$(date +%s%N)
 
     # Client-generated request ID sent via X-Request-Id header;
     # router uses this ID in its logs for easy correlation.
@@ -333,9 +333,9 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
       -H "X-Request-Id: $rid" \
       -d @"$body_file" > "$resp_file" 2>/dev/null
 
-    local end_ts
-    end_ts=$(date +%s.%N)
-    echo "$start_ts $end_ts" > "$RESULT_DIR/time_${idx}"
+    local end_ns
+    end_ns=$(date +%s%N)
+    echo "$start_ns $end_ns" > "$RESULT_DIR/time_${idx}"
 
     if [ "$STREAM" = true ]; then
       local usage_raw comp_tokens chunks done_count
@@ -469,16 +469,22 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     } > "$DETAIL_FILE"
   fi
 
+  # Fork-free per-request stats: builtin reads + integer-ns arithmetic.
+  # The previous awk/cat-per-row version forked ~5 times per request and
+  # silently stalled for minutes on a loaded node after the summary.
   for ((i = 0; i < NUM_REQUESTS; i++)); do
     if [ "$ROUND_ROBIN" = true ]; then rank=${DP_RANKS[$((i % NUM_RANKS))]} ; else rank="-"; fi
     if [ -f "$RESULT_DIR/time_${i}" ]; then
       read -r s e < "$RESULT_DIR/time_${i}"
-      rel_start=$(awk -v s="$s" -v w="$WALL_START" 'BEGIN { printf "%.3f", s - w }')
-      rel_end=$(awk -v e="$e" -v w="$WALL_START" 'BEGIN { printf "%.3f", e - w }')
-      dur=$(awk -v s="$s" -v e="$e" 'BEGIN { printf "%.3f", e - s }')
+      dur_ns=$((e - s))
+      printf -v dur '%d.%03d' $((dur_ns / 1000000000)) $((dur_ns / 1000000 % 1000))
+      printf -v rel_start '%d.%03d' $(((s - START_NS) / 1000000000)) $(((s - START_NS) / 1000000 % 1000))
+      printf -v rel_end '%d.%03d' $(((e - START_NS) / 1000000000)) $(((e - START_NS) / 1000000 % 1000))
       echo "$dur" >> "$LAT_FILE"
-      toks=$(cat "$RESULT_DIR/tokens_${i}" 2>/dev/null || echo "?")
-      rid=$(cat "$RESULT_DIR/rid_${i}" 2>/dev/null || echo "N/A")
+      toks="?"
+      rid="N/A"
+      read -r toks < "$RESULT_DIR/tokens_${i}" 2>/dev/null || toks="?"
+      read -r rid < "$RESULT_DIR/rid_${i}" 2>/dev/null || rid="N/A"
       if [ "$VERBOSE" = true ]; then
         printf "%-6d %-6s %-12s %-12s %-10s %-8s %s\n" "$i" "$rank" "$rel_start" "$rel_end" "$dur" "$toks" "$rid" >> "$DETAIL_FILE"
       fi
