@@ -1534,9 +1534,10 @@ class SchedulerDisaggregationDecodeMixin:
         curr_batch_size = self.running_batch.batch_size()
 
         if _is_cpu_920f:
-            num_not_used_batch = (
-                kunpeng_max_seq_num - curr_batch_size
-            )  # kunpeng_max_seq_num: default 128
+            batch_cap = (
+                1 if is_lc_cp_enabled() else kunpeng_max_seq_num
+            )
+            num_not_used_batch = batch_cap - curr_batch_size
         else:
             batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
             num_not_used_batch = batch_size - curr_batch_size
