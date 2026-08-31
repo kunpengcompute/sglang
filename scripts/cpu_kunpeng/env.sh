@@ -138,7 +138,7 @@ export CONDA_ENV_PATH="$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME"
 export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
 # Required when SGLANG_ENABLE_TOKENIZER_SEPERATE=1 (used by tokenizer-side HTTP servers)
 export LIBPTHREAD_HOOK_PATH="/path/to/libpthread_hook.so"
-export GEMM_TILING_PLAN_FILE="$SGLANG_PATH/scripts/cpu_kunpeng/configs"
+export GEMM_TILING_PLAN_FILE="$SGLANG_PATH/scripts/cpu_kunpeng/configs/dsv3_32_tiling.csv"
 # Kunpeng SDMA driver
 export SDMA_KO_PATH="/path-to-sdma-ko"
 # Required when SGLANG_ENABLE_KUCCL=1
