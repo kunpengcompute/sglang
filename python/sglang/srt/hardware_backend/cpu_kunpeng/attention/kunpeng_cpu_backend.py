@@ -537,23 +537,27 @@ class KunpengCpuBackend(AttentionBackend):
 
         Causal scope: the ``seqlen_q`` query rows of a sequence sit at
         positions [seq_len - seqlen_q, seq_len); row ``j`` attends the local
-        slots of positions [0, seq_len - seqlen_q + j) -- a row never attends
-        its own position, matching the dense decode kernel's ``is_causal``
-        masking (the sparse kernel applies no mask itself, so the caller must
-        not hand it the query's own slot). Rows are ordered so row ``j``'s
-        valid prefix is a prefix of row ``j + 1``'s; trailing -1 padding then
-        trims each row to its own length inside the kernel (kv_back_check),
-        while ``topk_length`` stays per-sequence (= the fill of the last
-        FILLED row, i.e. row ``seqlen_q - 1``).
+        slots of positions [0, seq_len - seqlen_q + j] -- INCLUSIVE, so a row
+        DOES attend its own position. This matches the dense decode kernel
+        (``is_causal=True`` over the full ``seq_lens``, where the current
+        token's KV is already written to the pool before attention): a
+        q_len==1 causal row masks nothing, and in TARGET_VERIFY row ``j``
+        attends [0, base + j] with base = seq_len - seqlen_q. The sparse
+        kernel applies no mask itself (kv_back_check only trims trailing -1),
+        so the own-position slot must be handed to it explicitly. Rows are
+        ordered so row ``j``'s valid prefix is a prefix of row ``j + 1``'s;
+        trailing -1 padding then trims each row to its own length inside the
+        kernel (kv_back_check), while ``topk_length`` stays per-sequence (=
+        the fill of the last FILLED row, i.e. row ``seqlen_q - 1``).
 
         For ``seqlen_q == 1`` (plain decode) row 0 is updated incrementally:
-        on a normal continuation step only the slot of position ``seq_len - 2``
-        (the PREVIOUS step's query token, which becomes attendable only now) is
-        appended when it lands on a local page; a row is rebuilt from
-        req_to_token whenever the sequence is new or the batch reshuffled
-        (detected via last_req_idx / last_seq_len). For ``seqlen_q > 1`` every
-        filled row is rebuilt from req_to_token each step (correctness first;
-        the incremental multi-row update is deferred to the MTP driver work).
+        on a normal continuation step the slot of position ``seq_len - 1``
+        (the current query token, which must attend itself) is appended when
+        it lands on a local page; a row is rebuilt from req_to_token whenever
+        the sequence is new or the batch reshuffled (detected via last_req_idx
+        / last_seq_len). For ``seqlen_q > 1`` every filled row is rebuilt from
+        req_to_token each step (correctness first; the incremental multi-row
+        update is deferred to the MTP driver work).
         The persistent buffers live on ``metadata`` and are reused across
         steps (and across graph captures of the same batch size).
         """
@@ -610,9 +614,9 @@ class KunpengCpuBackend(AttentionBackend):
 
         if seqlen_q == 1:
             # Plain decode: a single query row per sequence. Row 0 holds the
-            # local slots of [0, seq_len - 1) (the query's own position is
-            # excluded), maintained incrementally (see the causal-scope note in
-            # the docstring).
+            # local slots of [0, seq_len) (the query's own position is
+            # INCLUDED), maintained incrementally (see the causal-scope note
+            # in the docstring).
             for b in range(B):
                 seq_len = int(seq_lens[b])
                 req_idx = int(req_pool_indices[b])
@@ -623,30 +627,31 @@ class KunpengCpuBackend(AttentionBackend):
                 # the length happened to be contiguous).
                 #
                 # Causal scope: the row holds the local slots of positions
-                # [0, seq_len - 1). The CURRENT query token sits at seq_len - 1
-                # and must NOT attend to itself (the sparse kernel applies no
-                # mask; the dense kernel does this via is_causal). The slot of
-                # position seq_len - 2 (the previous step's query token)
-                # becomes attendable only now, so the continuation path appends
-                # exactly that slot, and the continuity guard checks the slot
-                # of position seq_len - 3 (the last position the previous row
-                # covered).
+                # [0, seq_len) INCLUSIVE of the current query's own position
+                # (seq_len - 1). The current token's KV is already written to
+                # the pool before attention (dense path: is_causal=True over
+                # the full seq_lens masks nothing for q_len==1), and the
+                # sparse kernel applies no mask of its own, so the row must
+                # cover the query's own slot too. The continuation path
+                # appends exactly that slot, and the continuity guard checks
+                # the slot of position seq_len - 2 (the last position the
+                # previous row covered).
                 cont = (
                     last_req_idx[b] == req_idx
                     and last_seq_len[b] == seq_len - 1
                     and (
                         fill_len[b, 0] == 0
-                        or seq_len < 3
+                        or seq_len < 2
                         or int(indices[b, 0, fill_len[b, 0] - 1])
-                        == int(req_to_token[req_idx, seq_len - 3])
+                        == int(req_to_token[req_idx, seq_len - 2])
                     )
                 )
                 if cont:
-                    # Normal continuation: append the slot of position
-                    # seq_len - 2 (the previous step's query token) when it
-                    # lands on a local page (foreign pages carry -1 and are
-                    # skipped by the KV write path as well).
-                    pos = seq_len - 2
+                    # Normal continuation: append the CURRENT token's slot
+                    # (seq_len - 1) when it lands on a local page (foreign
+                    # pages carry -1 and are skipped by the KV write path as
+                    # well).
+                    pos = seq_len - 1
                     if pos >= 0:
                         p = pos // page_size
                         if p % cp_size == cp_rank:
@@ -658,22 +663,33 @@ class KunpengCpuBackend(AttentionBackend):
                 else:
                     # New / reshuffled / non-contiguous sequence: rebuild the
                     # row from req_to_token over this rank's local pages in
-                    # [0, seq_len - 1) (the query's own position is excluded).
+                    # [0, seq_len) (the query's own position is INCLUDED).
                     n_local = 0
-                    n_pages = (seq_len - 1 + page_size - 1) // page_size
+                    n_pages = (seq_len + page_size - 1) // page_size
                     for p in range(n_pages):
                         if p % cp_size != cp_rank:
                             continue
                         s = p * page_size
-                        e = min(s + page_size, seq_len - 1)
+                        e = min(s + page_size, seq_len)
                         n = e - s
                         positions = torch.arange(
                             s, e, dtype=torch.int64, device=req_to_token.device
                         )
-                        indices[b, 0, n_local : n_local + n] = req_to_token[
-                            req_idx, positions
-                        ]
-                        n_local += n
+                        # Keep only REAL slots: a local page may carry -1
+                        # entries (positions never written by this rank, e.g.
+                        # leftover holes), which must not be counted into the
+                        # fill or copied into indices (the sparse kernel would
+                        # otherwise read kvcache + (-1) * head_dim out of
+                        # bounds; its trailing--1 trim only handles -1s at the
+                        # very end of a row).
+                        slots = req_to_token[req_idx, positions]
+                        valid = slots >= 0
+                        n_valid = int(valid.sum())
+                        if n_valid > 0:
+                            indices[b, 0, n_local : n_local + n_valid] = slots[
+                                valid
+                            ]
+                            n_local += n_valid
                     fill_len[b, 0] = n_local
                     last_req_idx[b] = req_idx
                     last_seq_len[b] = seq_len
@@ -681,23 +697,25 @@ class KunpengCpuBackend(AttentionBackend):
             # seqlen_q > 1 (MTP verify/draft-extend style): every query row of
             # a sequence is rebuilt from req_to_token each step (correctness
             # first; an incremental multi-row update is deferred to the MTP
-            # driver work). Row j attends the local slots of [0, base + j)
-            # with base = seq_len - seqlen_q, so it never attends its own
-            # position.
+            # driver work). Row j attends the local slots of [0, base + j]
+            # INCLUSIVE (base = seq_len - seqlen_q), so it DOES attend its own
+            # position -- matching the dense TARGET_VERIFY path, whose
+            # is_causal mask lets row j see positions [0, base + j] (the
+            # current token's KV is already in the pool when attention runs).
             indices.fill_(-1)
             for b in range(B):
                 seq_len = int(seq_lens[b])
                 req_idx = int(req_pool_indices[b])
                 base = seq_len - seqlen_q
-                # Gather this rank's local slots of [0, seq_len - 1) ONCE, in
+                # Gather this rank's local slots of [0, seq_len) ONCE, in
                 # position order (this is exactly the last row's content).
                 spans = []
-                n_pages = (seq_len - 1 + page_size - 1) // page_size
+                n_pages = (seq_len + page_size - 1) // page_size
                 for p in range(n_pages):
                     if p % cp_size != cp_rank:
                         continue
                     s = p * page_size
-                    spans.append((s, min(s + page_size, seq_len - 1)))
+                    spans.append((s, min(s + page_size, seq_len)))
                 if spans:
                     positions = torch.cat(
                         [
@@ -719,11 +737,14 @@ class KunpengCpuBackend(AttentionBackend):
                         valid_positions = positions[valid]
                         valid_slots = slots[valid]
                         for j in range(seqlen_q):
-                            # Row j attends [0, base + j): its fill is the
-                            # number of valid local positions strictly below
-                            # base + j (valid_positions is sorted ascending).
+                            # Row j attends [0, base + j] (inclusive): its
+                            # fill is the number of valid local positions
+                            # strictly below base + j + 1 (valid_positions is
+                            # sorted ascending).
                             f = int(
-                                torch.searchsorted(valid_positions, base + j).item()
+                                torch.searchsorted(
+                                    valid_positions, base + j + 1
+                                ).item()
                             )
                             if f > 0:
                                 indices[b, j, :f] = valid_slots[:f]
