@@ -227,6 +227,189 @@ void varlen_attention_kunpeng(at::Tensor q,    // [total_q_tokens, num_heads, qk
     kutacc::varlen_attention(kt_q, kt_k, kt_v, kt_out, causal, softmax_scale, kt_query_start_loc, kt_key_start_loc);
 }
 
+// Gather the paged MLA latent cache via block_table and split each row into
+// kv_a (kv_lora_rank) and k_pe (qk_rope_head_dim) halves. Equivalent to the
+// gather + slice().clone() previously done inside flash_attention_paged_kunpeng.
+// kv_a [total_kv, kv_lora_rank] and k_pe [total_kv, qk_rope_head_dim] are
+// caller allocated output buffers, sized to the MAX supported total length
+// (graph capture bakes output shapes once); only the live prefix+extend rows
+// are copied and the rest of the buffer is left untouched. extend_seq_lens /
+// prefix_lens are graph inputs (computed totals must not be created as
+// unregistered tensors), so the per-sequence total length is derived here as
+// ext + pfx. NOTE: the cache is stored as [num_tokens, 1, kv_cache_dim]
+// (head_num=1 for MLA), so dims are derived from kv_lora_rank +
+// qk_rope_head_dim, never from latent_cache.size(1).
+void gather_split_latent_paged_kunpeng(
+    at::Tensor latent_cache, at::Tensor block_table, at::Tensor extend_seq_lens,
+    at::Tensor prefix_lens,
+    at::Tensor kv_a, at::Tensor k_pe,
+    int64_t page_size, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
+    int64_t total_kv)
+{
+    TORCH_CHECK(extend_seq_lens.scalar_type() == at::kInt, "extend_seq_lens must be int32");
+    TORCH_CHECK(prefix_lens.scalar_type() == at::kInt, "prefix_lens must be int32");
+    TORCH_CHECK(block_table.scalar_type() == at::kInt, "block_table must be int32");
+
+    auto bs = extend_seq_lens.size(0);
+    TORCH_CHECK(prefix_lens.size(0) == bs, "prefix_lens size mismatch");
+    int64_t kv_cache_dim = kv_lora_rank + qk_rope_head_dim;
+    int64_t rope_dim = qk_rope_head_dim;
+
+    TORCH_CHECK(kv_a.size(0) == total_kv && kv_a.size(1) == kv_lora_rank,
+                "kv_a must be [total_kv, kv_lora_rank], got ", kv_a.sizes());
+    TORCH_CHECK(k_pe.size(0) == total_kv && k_pe.size(1) == rope_dim,
+                "k_pe must be [total_kv, rope_dim], got ", k_pe.sizes());
+    TORCH_CHECK(kv_a.scalar_type() == latent_cache.scalar_type(), "kv_a dtype mismatch");
+    TORCH_CHECK(k_pe.scalar_type() == latent_cache.scalar_type(), "k_pe dtype mismatch");
+
+    auto ext_a = extend_seq_lens.accessor<int32_t, 1>();
+    auto pfx_a = prefix_lens.accessor<int32_t, 1>();
+    auto bt_a = block_table.accessor<int32_t, 2>();
+
+    int64_t row_bytes = kv_cache_dim * latent_cache.element_size();
+    int64_t page_row_bytes = page_size * row_bytes;
+    int64_t kv_a_row_bytes = kv_lora_rank * latent_cache.element_size();
+    int64_t k_pe_row_bytes = rope_dim * latent_cache.element_size();
+
+    const uint8_t *cache_ptr = static_cast<uint8_t *>(latent_cache.data_ptr());
+    uint8_t *kv_a_ptr = static_cast<uint8_t *>(kv_a.data_ptr());
+    uint8_t *k_pe_ptr = static_cast<uint8_t *>(k_pe.data_ptr());
+
+    int64_t kv_offset = 0;
+    for (int64_t i = 0; i < bs; i++) {
+        int64_t seq_len = ext_a[i] + pfx_a[i];
+        if (seq_len == 0)
+            continue;
+        int64_t num_blocks = (seq_len + page_size - 1) / page_size;
+        for (int64_t b = 0; b < num_blocks; b++) {
+            int64_t page_idx = bt_a[i][b];
+            const uint8_t *src = cache_ptr + page_idx * page_row_bytes;
+            int64_t tokens_in_page = (b == num_blocks - 1)
+                ? (seq_len - b * page_size)
+                : page_size;
+            // The cache rows are interleaved [kv_a | k_pe] (kv_cache_dim
+            // wide), so the split must be done per token: a single
+            // contiguous memcpy per output would mix the two halves.
+            for (int64_t t = 0; t < tokens_in_page; t++) {
+                const uint8_t *src_row = src + t * row_bytes;
+                std::memcpy(kv_a_ptr + (kv_offset + t) * kv_a_row_bytes,
+                            src_row, kv_a_row_bytes);
+                std::memcpy(k_pe_ptr + (kv_offset + t) * k_pe_row_bytes,
+                            src_row + kv_a_row_bytes, k_pe_row_bytes);
+            }
+            kv_offset += tokens_in_page;
+        }
+    }
+    TORCH_CHECK(kv_offset <= total_kv, "gathered ", kv_offset,
+                " tokens, exceeds buffer size total_kv=", total_kv);
+}
+
+// ---------------------------------------------------------------------------
+// Live-bounded row ops for the chunked-prefill projection chain.
+//
+// The graph bakes intermediate shapes at the MAX supported total length (see
+// gather_split_latent_paged_kunpeng), so these variants take the live
+// extend/prefix lens and only process the first `live` rows of the max-sized
+// tensors by narrowing to views and delegating to the existing kernels.
+// pack/gemm re-derive their row tile from the live extent (tm = m = live):
+// kutacc keeps blocks_m == m / tm == 1 (one row block per thread partition),
+// and the micro-kernels mask 16-row tail groups, so no tile rounding applies.
+// ---------------------------------------------------------------------------
+
+static inline int64_t rows_live_total(
+    const at::Tensor& extend_seq_lens, const at::Tensor& prefix_lens, int64_t cap)
+{
+    TORCH_CHECK(extend_seq_lens.scalar_type() == at::kInt, "extend_seq_lens must be int32");
+    TORCH_CHECK(prefix_lens.scalar_type() == at::kInt, "prefix_lens must be int32");
+    TORCH_CHECK(prefix_lens.size(0) == extend_seq_lens.size(0), "prefix_lens size mismatch");
+    auto ext_a = extend_seq_lens.accessor<int32_t, 1>();
+    auto pfx_a = prefix_lens.accessor<int32_t, 1>();
+    int64_t live = 0;
+    for (int64_t i = 0; i < extend_seq_lens.size(0); i++)
+        live += ext_a[i] + pfx_a[i];
+    // Buffers are sized to SGLANG_KUNPENG_MAX_SEQ_LEN, which for batches is
+    // the cap on the BATCH-WIDE sum of extend+prefix lens, not a per-seq max.
+    TORCH_CHECK(live <= cap, "live rows (", live,
+                ") exceed the max-sized buffers (", cap, " rows); the "
+                "batch-wide sum of extend+prefix lens must fit "
+                "SGLANG_KUNPENG_MAX_SEQ_LEN (raise it or use a smaller batch)");
+    return live;
+}
+
+void quant_rows_kunpeng(
+    at::Tensor input, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor out, at::Tensor scale)
+{
+    int64_t live = rows_live_total(extend_seq_lens, prefix_lens, input.size(0));
+    if (live == 0)
+        return;
+    // All row-count tensors must be narrowed consistently: the kernels check
+    // out/scale sizes against the (narrowed) input height.
+    quant_kunpeng(input.narrow(0, 0, live), out.narrow(0, 0, live),
+                  scale.narrow(0, 0, live));
+}
+
+void s8_gemm_pack_rows_kunpeng(
+    at::Tensor input, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor out, int64_t split_r, int64_t split_c)
+{
+    int64_t live = rows_live_total(extend_seq_lens, prefix_lens, input.size(0));
+    if (live == 0)
+        return;
+    // kutacc packs exactly one row block per (m, n) tile: blocks_m = m / tm.
+    // The baked split_r is a max-sized placeholder; re-derive it from the
+    // live rows so blocks_m == 1 and the packed layout matches the gemm,
+    // which also uses the live extent as its tile_m.
+    int64_t m = live;
+    s8_gemm_pack_kunpeng(input.narrow(0, 0, m), out.narrow(0, 0, m),
+                         m, split_c, 0, false, std::nullopt);
+}
+
+void s8_s8_packed_gemm_bf16_dq_rows_kunpeng(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor scale, at::Tensor workspace,
+    at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor output, int64_t tile_m, int64_t tile_n, int64_t tile_k)
+{
+    int64_t live = rows_live_total(extend_seq_lens, prefix_lens, input.size(0));
+    if (live == 0)
+        return;
+    // Same contract as pack: one row block per thread partition, so the row
+    // tile must equal the (narrowed) input height. The baked tile_m is a
+    // max-sized placeholder; use the live extent instead. The micro-kernel
+    // masks 16-row tail groups, so no tile rounding is needed.
+    int64_t m = live;
+    s8_s8_packed_gemm_bf16_dq_kunpeng(
+        input.narrow(0, 0, m), weight, weight_scale,
+        scale.narrow(0, 0, m), output.narrow(0, 0, m),
+        workspace, m, tile_n, tile_k);
+}
+
+void cat_rows_kunpeng(
+    at::Tensor a, at::Tensor b, at::Tensor extend_seq_lens,
+    at::Tensor prefix_lens, at::Tensor out, int64_t dim)
+{
+    int64_t live = rows_live_total(extend_seq_lens, prefix_lens, a.size(0));
+    if (live == 0)
+        return;
+    // Manual slice copies: at::cat_out may reject the narrowed (view) output.
+    auto a_l = a.narrow(0, 0, live);
+    auto b_l = b.narrow(0, 0, live);
+    auto o_l = out.narrow(0, 0, live);
+    o_l.narrow(dim, 0, a_l.size(dim)).copy_(a_l);
+    o_l.narrow(dim, a_l.size(dim), b_l.size(dim)).copy_(b_l);
+}
+
+void contiguous_rows_kunpeng(
+    at::Tensor x, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor out)
+{
+    int64_t live = rows_live_total(extend_seq_lens, prefix_lens, x.size(0));
+    if (live == 0)
+        return;
+    out.narrow(0, 0, live).copy_(x.narrow(0, 0, live));
+}
+
 
 void flash_attention_with_workspace(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::Tensor workspace,
                                     bool causal, double softmax_scale, at::Tensor query_start_loc,
@@ -295,176 +478,4 @@ void flash_attention_with_workspace(at::Tensor q, at::Tensor k, at::Tensor v, at
         to_kutacc<float, 2>(attn_max_block_new), to_kutacc<float, 2>(attn_base_block_old),
         to_kutacc<float, 2>(attn_base_block_new), causal, softmax_scale, to_kutacc<int, 1>(query_start_loc),
         to_kutacc<int, 1>(key_start_loc), chunked_prefill_size, seq_lens, cur_lens, /*is_kv_packed=*/false);
-}
-
-// Paged MHA attention for chunked prefill. Reads the MLA latent KV cache via
-// block_table, applies kv_b_proj internally to expand into MHA K/V, then runs
-// kutacc::flash_attention.
-void flash_attention_paged_kunpeng(
-    at::Tensor q, at::Tensor latent_cache, at::Tensor kv_b_weight,
-    at::Tensor kv_b_weight_scale,
-    at::Tensor out, at::Tensor workspace, at::Tensor block_table,
-    at::Tensor seq_lens, at::Tensor cur_lens,
-    at::Tensor query_start_loc, int64_t page_size,
-    int64_t kv_lora_rank, int64_t qk_nope_head_dim,
-    int64_t qk_rope_head_dim, int64_t v_head_dim,
-    bool causal, double softmax_scale)
-{
-    const char* max_len_env = std::getenv("SGLANG_KUNPENG_MAX_SEQ_LEN");
-    const int64_t MAX_SEQ_LEN_SUPPORTED =
-        max_len_env ? std::strtoll(max_len_env, nullptr, 10) : 4096;
-    auto [BR, BC] = kutacc::get_flash_attention_block();
-
-    int64_t num_heads = q.size(1);
-    int64_t qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
-    int64_t vo_head_dim = v_head_dim;
-    int64_t bs = seq_lens.size(0);
-
-    // key_start_loc = cumsum of seq_lens.
-    auto opts = seq_lens.options();
-    at::Tensor key_start_loc = at::empty({bs + 1}, opts);
-    auto ksl_a = key_start_loc.accessor<int32_t, 1>();
-    auto sl_a = seq_lens.accessor<int32_t, 1>();
-    auto cl_a = cur_lens.accessor<int32_t, 1>();
-    int64_t cum = 0;
-    for (int64_t i = 0; i < bs; i++) {
-        ksl_a[i] = static_cast<int32_t>(cum);
-        cum += sl_a[i];
-    }
-    ksl_a[bs] = static_cast<int32_t>(cum);
-
-    // Total KV tokens across all requests.
-    int64_t total_kv = cum;
-
-    // Step 1: Gather latent from paged cache into a contiguous buffer.
-    int64_t kv_cache_dim = kv_lora_rank + qk_rope_head_dim;
-    auto latent_contig = at::empty({total_kv, kv_cache_dim}, q.options());
-
-    // Row bytes for one token (all heads = 1 for MLA latent).
-    int64_t latent_row_bytes = kv_cache_dim * q.element_size();
-    int64_t page_row_bytes = page_size * latent_row_bytes;
-
-    auto bt_a = block_table.accessor<int32_t, 2>();
-    uint8_t *cache_ptr = static_cast<uint8_t *>(latent_cache.data_ptr());
-    uint8_t *dst_ptr = static_cast<uint8_t *>(latent_contig.data_ptr());
-
-    int64_t kv_offset = 0;
-    for (int64_t i = 0; i < bs; i++) {
-        int64_t seq_len = sl_a[i];
-        if (seq_len == 0)
-            continue;
-        int64_t num_blocks = (seq_len + page_size - 1) / page_size;
-        for (int64_t b = 0; b < num_blocks; b++) {
-            int64_t page_idx = bt_a[i][b];
-            int64_t src_offset = page_idx * page_row_bytes;
-            int64_t tokens_in_page = (b == num_blocks - 1)
-                ? (seq_len - b * page_size)
-                : page_size;
-            int64_t copy_bytes = tokens_in_page * latent_row_bytes;
-            std::memcpy(dst_ptr + kv_offset * latent_row_bytes,
-                        cache_ptr + src_offset, copy_bytes);
-            kv_offset += tokens_in_page;
-        }
-    }
-
-    // Step 2: Split latent into kv_a and k_pe.
-    auto kv_a = latent_contig.slice(1, 0, kv_lora_rank).clone();
-    auto k_pe = latent_contig.slice(1, kv_lora_rank).clone();
-
-    // Step 3: Apply int8 kv_b_proj to kv_a.
-    int64_t n_out = num_heads * (qk_nope_head_dim + v_head_dim);
-
-    // 3a. Quantize kv_a to int8 + per-token scale.
-    auto kv_a_int8 = at::empty({total_kv, kv_lora_rank}, at::dtype(at::kChar));
-    auto kv_a_scale = at::empty({total_kv}, at::dtype(at::kFloat));
-    quant_kunpeng(kv_a, kv_a_int8, kv_a_scale);
-
-    // 3b. Pack A for the int8 GEMM.
-    auto [tile_m, tile_n, tile_k] =
-        igemm_find_optimal_tiling_plan(total_kv, n_out, kv_lora_rank);
-    auto pack_a = at::empty({total_kv, kv_lora_rank}, at::dtype(at::kChar));
-    s8_gemm_pack_kunpeng(kv_a_int8, pack_a, tile_m, tile_k, 0, false,
-                         std::nullopt);
-
-    // 3c. int8 GEMM with dequant -> bf16 output.
-    int64_t blocks_in_k = kv_lora_rank / tile_k;
-    int64_t ws_numel = (blocks_in_k > 1) ? blocks_in_k * n_out * total_kv * 2 : 1;
-    auto gemm_ws = at::empty({ws_numel}, at::dtype(at::kBFloat16));
-    auto kv_b_out = at::empty({total_kv, n_out}, at::dtype(at::kBFloat16));
-    s8_s8_packed_gemm_bf16_dq_kunpeng(
-        pack_a, kv_b_weight, kv_b_weight_scale, kv_a_scale,
-        kv_b_out, gemm_ws, tile_m, tile_n, tile_k);
-
-    // Step 4: Reshape kv_b_out into K/V.
-    auto kv_b_3d = kv_b_out.view({total_kv, num_heads, qk_nope_head_dim + v_head_dim});
-    auto k_nope = kv_b_3d.slice(2, 0, qk_nope_head_dim);
-    auto v = kv_b_3d.slice(2, qk_nope_head_dim);
-
-    // Expand k_pe to all heads and concat with k_nope.
-    auto k_pe_expanded = k_pe.unsqueeze(1).expand({-1, num_heads, -1});
-    auto k_contig = at::cat({k_nope, k_pe_expanded}, 2).contiguous();
-    auto v_contig = v.contiguous();
-
-    // Step 5: Run flash_attention on the expanded K/V.
-    std::vector<int64_t> seq_lens_vec(bs);
-    std::vector<int64_t> cur_lens_vec(bs);
-    for (int64_t i = 0; i < bs; i++) {
-        seq_lens_vec[i] = sl_a[i];
-        cur_lens_vec[i] = cl_a[i];
-    }
-
-    // seq_lens = total KV length (prefix + extend). Size the pack buffers to
-    // the max total seq_len (rounded to the BC tile) and guard against
-    // overflow, which would otherwise silently corrupt memory (garbled output).
-    int64_t max_total_len = 0;
-    int64_t pack_len = 0;
-    for (auto x : seq_lens_vec) {
-        max_total_len = std::max(max_total_len, x);
-        TORCH_CHECK(x <= MAX_SEQ_LEN_SUPPORTED, "seq_lens must be <= ", MAX_SEQ_LEN_SUPPORTED,
-                    " (MAX_SEQ_LEN_SUPPORTED), got ", x);
-        pack_len = std::max(pack_len, (x + BC - 1) / BC * BC);
-    }
-
-    auto dtype = q.scalar_type();
-    auto f32 = at::kFloat;
-    auto threads_num = kutacc::get_thread_num();
-
-    int64_t offset = 0;
-    auto alloc = [&](at::ScalarType st, std::vector<int64_t> sizes) {
-        int64_t elem_size = at::elementSize(st);
-        int64_t numel = 1;
-        for (auto s : sizes)
-            numel *= s;
-        int64_t bytes = numel * elem_size;
-        int64_t aligned_bytes = (bytes + 63) / 64 * 64;
-        TORCH_CHECK(offset + aligned_bytes <= workspace.numel(),
-                    "workspace too small: need ", offset + aligned_bytes,
-                    " got ", workspace.numel());
-        auto t = workspace.slice(0, offset, offset + bytes).view(st).reshape(sizes);
-        offset += aligned_bytes;
-        return t;
-    };
-
-    auto pack_attn_k = alloc(dtype, {threads_num, pack_len, qk_head_dim});
-    auto pack_attn_v = alloc(dtype, {threads_num, pack_len, vo_head_dim});
-    auto pack_attn_q = alloc(dtype, {threads_num, BR * qk_head_dim});
-    auto attn_s = alloc(f32, {threads_num, BC * BR});
-    auto attn_out_block_old = alloc(f32, {threads_num, BR, vo_head_dim});
-    auto attn_out_block_new = alloc(f32, {threads_num, BR, vo_head_dim});
-    auto attn_max_block_old = alloc(f32, {threads_num, BR});
-    auto attn_max_block_new = alloc(f32, {threads_num, BR});
-    auto attn_base_block_old = alloc(f32, {threads_num, BR});
-    auto attn_base_block_new = alloc(f32, {threads_num, BR});
-
-    kutacc::flash_attention(
-        to_kutacc<bfloat16_t, 3>(q), to_kutacc<bfloat16_t, 3>(k_contig),
-        to_kutacc<bfloat16_t, 3>(v_contig), to_kutacc<bfloat16_t, 3>(out),
-        to_kutacc<bfloat16_t, 2>(pack_attn_q), to_kutacc<bfloat16_t, 3>(pack_attn_k),
-        to_kutacc<bfloat16_t, 3>(pack_attn_v), to_kutacc<float, 2>(attn_s),
-        to_kutacc<float, 3>(attn_out_block_old), to_kutacc<float, 3>(attn_out_block_new),
-        to_kutacc<float, 2>(attn_max_block_old), to_kutacc<float, 2>(attn_max_block_new),
-        to_kutacc<float, 2>(attn_base_block_old), to_kutacc<float, 2>(attn_base_block_new),
-        causal, softmax_scale, to_kutacc<int, 1>(query_start_loc),
-        to_kutacc<int, 1>(key_start_loc), max_total_len,
-        seq_lens_vec, cur_lens_vec, /*is_kv_packed=*/false);
 }

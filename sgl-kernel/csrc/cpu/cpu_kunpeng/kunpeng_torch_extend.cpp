@@ -125,14 +125,34 @@ void flash_attention_with_workspace(at::Tensor q, at::Tensor k, at::Tensor v, at
                                     at::Tensor key_start_loc, int64_t chunked_prefill_size,
                                     std::vector<int64_t> seq_lens, std::vector<int64_t> cur_lens);
 
-void flash_attention_paged_kunpeng(at::Tensor q, at::Tensor latent_cache, at::Tensor kv_b_weight,
-                                   at::Tensor kv_b_weight_scale,
-                                   at::Tensor out, at::Tensor workspace, at::Tensor block_table,
-                                   at::Tensor seq_lens, at::Tensor cur_lens,
-                                   at::Tensor query_start_loc, int64_t page_size,
-                                   int64_t kv_lora_rank, int64_t qk_nope_head_dim,
-                                   int64_t qk_rope_head_dim, int64_t v_head_dim,
-                                   bool causal, double softmax_scale);
+void gather_split_latent_paged_kunpeng(
+    at::Tensor latent_cache, at::Tensor block_table, at::Tensor extend_seq_lens,
+    at::Tensor prefix_lens,
+    at::Tensor kv_a, at::Tensor k_pe,
+    int64_t page_size, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
+    int64_t total_kv);
+
+void quant_rows_kunpeng(
+    at::Tensor input, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor out, at::Tensor scale);
+
+void s8_gemm_pack_rows_kunpeng(
+    at::Tensor input, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor out, int64_t split_r, int64_t split_c);
+
+void s8_s8_packed_gemm_bf16_dq_rows_kunpeng(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor scale, at::Tensor workspace,
+    at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor output, int64_t tile_m, int64_t tile_n, int64_t tile_k);
+
+void cat_rows_kunpeng(
+    at::Tensor a, at::Tensor b, at::Tensor extend_seq_lens,
+    at::Tensor prefix_lens, at::Tensor out, int64_t dim);
+
+void contiguous_rows_kunpeng(
+    at::Tensor x, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor out);
 
 // === Memory 算子声明 ===
 at::Tensor hbw_allocator_kunpeng(int64_t size);
@@ -533,15 +553,45 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("flash_attention_with_workspace", flash_attention_with_workspace);
 
     m.def(
-        "flash_attention_paged_kunpeng("
-        "Tensor q, Tensor latent_cache, Tensor kv_b_weight, "
-        "Tensor kv_b_weight_scale, "
-        "Tensor out, Tensor workspace, Tensor block_table, "
-        "Tensor seq_lens, Tensor cur_lens, Tensor query_start_loc, "
-        "int page_size, int kv_lora_rank, int qk_nope_head_dim, "
-        "int qk_rope_head_dim, int v_head_dim, "
-        "bool causal, float softmax_scale) -> ()");
-    m.impl("flash_attention_paged_kunpeng", flash_attention_paged_kunpeng);
+        "gather_split_latent_paged_kunpeng("
+        "Tensor latent_cache, Tensor block_table, "
+        "Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor kv_a, Tensor k_pe, "
+        "int page_size, int kv_lora_rank, int qk_rope_head_dim, "
+        "int total_kv) -> ()");
+    m.impl("gather_split_latent_paged_kunpeng", gather_split_latent_paged_kunpeng);
+
+    m.def(
+        "quant_rows_kunpeng("
+        "Tensor input, Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor out, Tensor scale) -> ()");
+    m.impl("quant_rows_kunpeng", quant_rows_kunpeng);
+
+    m.def(
+        "s8_gemm_pack_rows_kunpeng("
+        "Tensor input, Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor out, int split_r, int split_c) -> ()");
+    m.impl("s8_gemm_pack_rows_kunpeng", s8_gemm_pack_rows_kunpeng);
+
+    m.def(
+        "s8_s8_packed_gemm_bf16_dq_rows_kunpeng("
+        "Tensor input, Tensor weight, Tensor weight_scale, Tensor scale, "
+        "Tensor workspace, Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor output, int tile_m, int tile_n, int tile_k) -> ()");
+    m.impl("s8_s8_packed_gemm_bf16_dq_rows_kunpeng",
+           s8_s8_packed_gemm_bf16_dq_rows_kunpeng);
+
+    m.def(
+        "cat_rows_kunpeng("
+        "Tensor a, Tensor b, Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor out, int dim) -> ()");
+    m.impl("cat_rows_kunpeng", cat_rows_kunpeng);
+
+    m.def(
+        "contiguous_rows_kunpeng("
+        "Tensor x, Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor out) -> ()");
+    m.impl("contiguous_rows_kunpeng", contiguous_rows_kunpeng);
 
     // hbw_allocator
     m.def("hbw_allocator_kunpeng(int size) -> Tensor");

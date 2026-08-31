@@ -126,10 +126,11 @@ class DeepseekMHAKunpengForwardMixin:
         q: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        """Run paged MHA attention via the C++ kernel.
+        """Run chunked-prefill MLA attention as a chain of graph ops.
 
-        Reads latent via block_table, applies kv_b_proj internally, runs
-        flash_attention. Requires block_table/seq_lens metadata from
+        Gathers the paged latent via block_table, applies kv_b_proj through
+        the quantized GEMM ops, assembles MHA K/V, then runs varlen flash
+        attention. Requires block_table/seq_lens metadata from
         init_forward_metadata.
         """
         meta = forward_batch.attn_backend.forward_metadata
@@ -162,12 +163,67 @@ class DeepseekMHAKunpengForwardMixin:
         total_lens = forward_batch.extend_seq_lens + prefix_lens
         if total_lens.numel() > 0 and int(total_lens.max()) > MAX_SEQ_LEN_SUPPORTED:
             raise RuntimeError(
-                f"flash_attention_paged_kunpeng: max total seq_len "
+                f"chunked prefill attention: max total seq_len "
                 f"{int(total_lens.max())} exceeds MAX_SEQ_LEN_SUPPORTED "
                 f"({MAX_SEQ_LEN_SUPPORTED}). Increase "
                 f"SGLANG_KUNPENG_MAX_SEQ_LEN."
             )
 
+        # Graph capture bakes intermediate output shapes once, but the live
+        # prefix+extend total grows every chunked-prefill round while
+        # total_tokens/batch stay fixed. So all graph buffers are sized to the
+        # MAX supported total length: the kernels copy/compute over the full
+        # (max-sized) tensors and attention reads only the live rows via
+        # key_start_loc. This keeps a single cached graph valid for all rounds.
+        max_total = MAX_SEQ_LEN_SUPPORTED
+        num_heads = q.shape[1]
+        n_out = num_heads * (self.qk_nope_head_dim + self.v_head_dim)
+
+        # 1. Gather the paged latent and split into kv_a / k_pe. Pass the
+        # registered graph-input tensors (extend/prefix lens); live totals are
+        # derived inside the kernel so no unregistered tensor is created and
+        # the buffer (max-sized) is only partially written.
+        kv_a, k_pe = kunpeng.gather_split_latent_paged_kunpeng(
+            latent_cache, meta.block_table,
+            forward_batch.extend_seq_lens, prefix_lens,
+            meta.page_size, self.kv_lora_rank, self.qk_rope_head_dim,
+            max_total)
+
+        # 2. int8-quantize kv_a for the kv_b_proj GEMM (live rows only).
+        kv_a_int8, kv_a_scale = kunpeng.quant_rows_kunpeng(
+            kv_a, forward_batch.extend_seq_lens, prefix_lens)
+
+        # 3. kv_b_proj int8 GEMM: buffers stay max-sized (baked at capture)
+        # but only the live rows are packed/computed each round. The kernels
+        # re-derive the row tile from the live extent (tile_m = m = live);
+        # tile_n/tile_k from the plan are still used as baked.
+        tile_m, tile_n, tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(
+            max_total, n_out, self.kv_lora_rank)
+        pack_a = kunpeng.s8_gemm_pack_rows_kunpeng(
+            kv_a_int8, forward_batch.extend_seq_lens, prefix_lens,
+            tile_m, tile_k)
+        blocks_in_k = self.kv_lora_rank // tile_k
+        ws_numel = blocks_in_k * n_out * max_total * 2 if blocks_in_k > 1 else 1
+        gemm_ws = kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16)
+        kv_b_out = kunpeng.s8_s8_packed_gemm_bf16_dq_rows_kunpeng(
+            pack_a, kv_b_weight, kv_b_weight_scale, kv_a_scale, gemm_ws,
+            forward_batch.extend_seq_lens, prefix_lens,
+            tile_m, tile_n, tile_k)
+
+        # 4. Assemble MHA K/V (views + registered copy ops, live rows only).
+        kv_b_3d = kv_b_out.view(
+            max_total, num_heads,
+            self.qk_nope_head_dim + self.v_head_dim)
+        k_nope = kv_b_3d[..., : self.qk_nope_head_dim]
+        v_view = kv_b_3d[..., self.qk_nope_head_dim:]
+        k = kunpeng.cat_rows_kunpeng(
+            k_nope,
+            k_pe.unsqueeze(1).expand(max_total, num_heads, self.qk_rope_head_dim),
+            2, forward_batch.extend_seq_lens, prefix_lens)
+        v = kunpeng.contiguous_rows_kunpeng(
+            v_view, forward_batch.extend_seq_lens, prefix_lens)
+
+        # 5. Attention workspace (same sizing as before) + varlen attention.
         def align64(x):
             return (x + 63) // 64 * 64
 
@@ -180,19 +236,9 @@ class DeepseekMHAKunpengForwardMixin:
         ws_bytes += align64(threads_num * BR * f32_size) * 4
         workspace = kunpeng.alloc_buffer(ws_bytes)
 
-        block_table = meta.block_table
-        page_size = meta.page_size
-
-        attn_out = kunpeng.flash_attention_paged_kunpeng(
-            q, latent_cache, kv_b_weight, kv_b_weight_scale, workspace,
-            block_table,
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_prefix_lens,
-            page_size,
-            self.kv_lora_rank,
-            self.qk_nope_head_dim,
-            self.qk_rope_head_dim,
-            self.v_head_dim,
+        attn_out = kunpeng.flash_attention_varlen_with_workspace_kunpeng(
+            q, k, v, workspace,
+            forward_batch.extend_seq_lens, prefix_lens,
             True,  # causal
             softmax_scale,
         )
