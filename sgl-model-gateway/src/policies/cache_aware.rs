@@ -412,10 +412,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load
+                // Low cache match: use worker with minimum load,
+                // break ties by processed count for round-robin distribution
                 healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
+                    .min_by_key(|&&idx| (workers[idx].load(), workers[idx].processed_requests()))
                     .copied()
             };
 
