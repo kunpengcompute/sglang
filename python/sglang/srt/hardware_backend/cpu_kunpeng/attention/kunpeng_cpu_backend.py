@@ -258,8 +258,10 @@ class KunpengCpuBackend(AttentionBackend):
 
         # Long-context decode CP (decode context parallelism). When enabled,
         # every rank keeps the full batch and attends only to its local 1/cp
-        # KV shard; partial attention outputs are merged via the SHM exchange
-        # (Q allgather + O/LSE/topk pure-read exchange + online-softmax reduce).
+        # KV shard; partial attention outputs are merged via the zero-copy
+        # SHM exchange (Q allgather + flash MLA direct-write into the
+        # persistent regions + O/LSE pure-read exchange + online-softmax
+        # reduce).
         # MTP is supported: TARGET_VERIFY / DRAFT_EXTEND run the same sparse
         # path with seqlen_q = speculative_num_draft_tokens rows per sequence.
         # No blockwise KV swap.
@@ -274,6 +276,16 @@ class KunpengCpuBackend(AttentionBackend):
                 "long-context decode CP conflicts with blockwise KV swap"
             )
             logger.info("Long-context decode CP enabled (mixed LC/regular mode)")
+            # Persistent SHM region views for the zero-copy O/LSE exchange.
+            # Safe here: KunpengCommunicator (shm pool + LC alltoall init)
+            # is created during distributed init, before this backend. The
+            # graph runner registers these as fixed storage BEFORE capture,
+            # so they must exist by construction time.
+            self._lc_stage_base: Tuple[torch.Tensor, torch.Tensor] = (
+                torch.ops.sgl_kernel.lc_stage_base_buffers_kunpeng()
+            )
+        else:
+            self._lc_stage_base: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
         self.forward_metadata = KunpengCpuMetadata()
 
@@ -1116,17 +1128,27 @@ class KunpengCpuBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ):
-        """Sparse paged MLA over the local KV shard (long-context decode CP).
+        """Sparse paged MLA over the local KV shard + O/LSE exchange
+        (long-context decode CP, zero-copy).
 
         q is 4D (B, seqlen_q, num_heads_q*cp_size, head_dim) after the Q
-        allgather in the model. Returns (o, softmax_lse) of the PARTIAL
-        attention over this rank's local 1/cp KV shard; the model merges the
-        per-rank partials (O alltoall + LSE reduction).
+        allgather in the model, in lh-major head order (head g = lh*cp + s).
+        The sparse flash MLA writes O/LSE DIRECTLY into this rank's
+        persistent SHM region (its flat output layout then IS the staged
+        (rows, cp, ...) layout the kutacc read kernel expects); empty local
+        shards are marked with LSE = +INFINITY; the exchange pure-reads the
+        peers' regions.
+
+        Returns (o_rows, lse_rows) of the EXCHANGED partials:
+        o_rows (B*seqlen_q*Nh_local, cp_size, v_head_dim) bf16 and
+        lse_rows (B*seqlen_q*Nh_local, cp_size) fp32; the model runs the
+        online-softmax reduce over the cp dimension.
         """
         assert not layer.is_cross_attention, (
             "long-context decode CP does not support cross attention"
         )
         meta = self.forward_metadata
+        b, seqlen_q, nh_all = q.shape[0], q.shape[1], q.shape[2]
         kv_buf = self._get_kv_buffer(
             layer, forward_batch, k, v, forward_batch.out_cache_loc
         )
@@ -1145,22 +1167,56 @@ class KunpengCpuBackend(AttentionBackend):
             else torch.empty(0, dtype=torch.uint8, device=q.device)
         )
 
+        # Persistent region views (stable SHM pointers, fetched once at
+        # backend construction; sliced/viewed per step).
+        o_base, lse_base = self._lc_stage_base
+        o_view = o_base[: b * seqlen_q].view(b, seqlen_q, nh_all, -1)
+        lse_view = lse_base[: b * seqlen_q].view(b, seqlen_q, nh_all)
+
         # The persistent indices buffer has speculative_num_draft_tokens rows
         # (fixed graph-input shape), but the kernel requires indices.shape[1]
         # == this step's seqlen_q; slice the filled leading rows. Decode steps
         # (seqlen_q == 1) read row 0 only.
-        seqlen_q = q.shape[1]
-        o, softmax_lse = kunpeng.flash_mla_sparse_decode_kunpeng(
+        # Direct-write form of the graph op: o_view/lse_view (the persistent
+        # SHM region views) are the kernel's output buffers.
+        kunpeng.flash_mla_sparse_decode_kunpeng(
             q,
             kvcache_paged,
             meta.long_context_indices[:, :seqlen_q, :],
             meta.long_context_topk_length,
+            o_view,
+            lse_view,
             softmax_scale,
             extra_buffer,
             self._decode_meta,
-            layer.v_head_dim,
         )
-        return o, softmax_lse
+
+        # Empty local shards (per-query-row KV count 0) contribute weight 0:
+        # mark their staged LSE with +INFINITY before the exchange.
+        real_topk_length = meta.long_context_real_topk_length
+        if seqlen_q > 1:
+            # One local-KV count per sequence; expand to one per query row.
+            # Use the registered graph op: a plain torch repeat_interleave
+            # allocates a NEW storage mid-capture that the graph engine does
+            # not track.
+            real_topk_length = kunpeng.repeat_interleave_kunpeng(
+                real_topk_length, seqlen_q
+            )
+        kunpeng.lc_mark_empty_lse_kunpeng(lse_view, real_topk_length)
+
+        # Zero-copy exchange: pure-read of the peers' staged regions.
+        socket_group = get_socket_tp_group()
+        cp_size = socket_group.world_size
+        d = layer.v_head_dim
+        rows = b * seqlen_q * (nh_all // cp_size)
+        o_out = kunpeng.alloc_buffer(
+            rows * cp_size * d, dtype=torch.bfloat16
+        ).view(rows, cp_size, d)
+        lse_out = kunpeng.alloc_buffer(
+            rows * cp_size, dtype=torch.float32
+        ).view(rows, cp_size)
+        kunpeng.shm_mla_o_alltoall_long_context_kunpeng(o_out, lse_out)
+        return o_out, lse_out
 
     def _forward_extend_mla_paged(
         self,
@@ -1323,8 +1379,9 @@ class KunpengCpuBackend(AttentionBackend):
         )
         if self._lc_enabled:
             # Long-context decode CP: sparse paged MLA over the local KV
-            # shard. The model already all-gathered Q and merges the partial
-            # (o, softmax_lse) across the cp group after this call.
+            # shard, then the zero-copy O/LSE exchange (flash MLA direct-write
+            # into the persistent SHM regions + pure-read of the peers').
+            # The model runs the online-softmax reduce over the cp dimension.
             return self._forward_mla_paged_cp(q_4d, k, v, layer, forward_batch)
         return self._forward_mla_paged(q_4d, k, v, layer, forward_batch)
 
@@ -1347,8 +1404,8 @@ class KunpengCpuBackend(AttentionBackend):
         self.swap_mgr.get_kv_cache()
 
         if self._lc_enabled:
-            # Long-context decode CP: sparse paged MLA over the local KV
-            # shard; the model merges the partials across the cp group.
+            # Long-context decode CP: sparse paged MLA + zero-copy exchange;
+            # the model runs the online-softmax reduce over the cp dimension.
             return self._forward_mla_paged_cp(q, k, v, layer, forward_batch)
         return self._forward_mla_paged(q, k, v, layer, forward_batch)
 
@@ -1395,13 +1452,13 @@ class KunpengCpuBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, q_head_dim)
 
         if self._lc_enabled:
-            # Long-context decode CP: run the sparse flash MLA over the local
-            # KV shard and return (partial o, softmax_lse); the model merges
-            # the partials across the cp group.
-            o_4d, softmax_lse = self._forward_mla_paged_cp(
+            # Long-context decode CP: sparse flash MLA over the local KV shard
+            # + zero-copy O/LSE exchange; the model runs the online-softmax
+            # reduce over the cp dimension.
+            o_rows, lse_rows = self._forward_mla_paged_cp(
                 q_.unsqueeze(1), k, v, layer, forward_batch
             )
-            return o_4d, softmax_lse
+            return o_rows, lse_rows
 
         o_4d = self._forward_mla_paged(q_.unsqueeze(1), k, v, layer, forward_batch)
 

@@ -681,6 +681,17 @@ class KunpengGraphRunner:
                 fixed.append(metadata.logical_to_all_physical_map_num_valid)
         except Exception:
             pass
+        # Long-context decode CP: the persistent SHM region views the sparse
+        # flash MLA writes O/LSE into directly (lc_stage_base_buffers_kunpeng,
+        # initialized at backend construction -- always exists here). Each
+        # layer derives slice views (o_base[:b*sq], lse_base[:b*sq]) from
+        # them, so the FULL base tensors must be registered as fixed storage
+        # or the slice lookup fails with "non-return-value parameter tensor
+        # not registered".
+        stage_base = self.model_runner.attn_backend._lc_stage_base
+        if stage_base is not None:
+            fixed.append(stage_base[0])
+            fixed.append(stage_base[1])
         return fixed
 
     def _graph_forward(

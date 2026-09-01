@@ -35,71 +35,23 @@ if TYPE_CHECKING:
 _DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
 
 
-def _lc_exchange_partial_o(o, lse, real_topk_length, cp_size, num_local_heads):
-    """Exchange partial attention outputs across the cp group.
-
-    o:             (B, Nh_all, D) bf16, partial attention of EVERY head over
-                   this rank's local KV shard (head block i belongs to cp
-                   rank i).
-    lse:           (B, Nh_all) fp32, log-sum-exp of the partial attention.
-    real_topk_length: (B,) int32, this rank's per-sequence local KV counts.
-
-    Returns:
-        o_contrib:   (cp_size, B, Nh_local, D) bf16, o_contrib[p] is the
-                     partial output contributed by cp rank p for this rank's
-                     local heads.
-        lse_contrib: (cp_size, B, Nh_local) fp32, matching LSEs.
-        topk_out:    (cp_size*B,) int32, topk_out[p*B+b] is cp rank p's local
-                     KV count for sequence b (0 => empty shard, weight 0).
-    """
-    B, Nh_all, D = o.shape
-
-    # kutacc SHM exchange: every rank stages O/LSE/topk into a dedicated SHM
-    # region, barriers (kupl_shm_fence), then reads its own head block from
-    # every peer (pure read; no cross-rank writes). This replaces the gloo
-    # all_to_all x2 + all_gather.
-    o_out = kunpeng.alloc_buffer(
-        cp_size * B * num_local_heads * D, dtype=o.dtype
-    ).view(cp_size * B, num_local_heads, D)
-    lse_out = kunpeng.alloc_buffer(
-        cp_size * B * num_local_heads, dtype=lse.dtype
-    ).view(cp_size * B, num_local_heads)
-    topk_out = kunpeng.alloc_buffer(cp_size * B, dtype=torch.int32)
-    kunpeng.shm_mla_o_alltoall_long_context_kunpeng(
-        o.contiguous(),
-        lse.contiguous(),
-        real_topk_length.contiguous(),
-        o_out,
-        lse_out,
-        topk_out,
-    )
-
-    # o_out (cp*B, Nh_local, D): o_out[p*B+b] = shard p's partial output for
-    # this rank's head block. -> (cp, B, Nh_local, D)
-    o_contrib = o_out.view(cp_size, B, num_local_heads, D)
-    lse_contrib = lse_out.view(cp_size, B, num_local_heads)
-
-    return o_contrib, lse_contrib, topk_out
-
-
-def _lc_reduce_partial_o(o_contrib, lse_contrib, topk_out, cp_size):
+def _lc_reduce_partial_o(o_rows, lse_rows, b, num_local_heads):
     """Merge per-shard partial attention outputs (online-softmax reduction).
 
-    o_contrib:   (cp_size, B, Nh_local, D) bf16
-    lse_contrib: (cp_size, B, Nh_local) fp32
-    topk_out:    (cp_size*B,) int32, per-(shard, seq) local KV counts (0 =>
-                 empty shard contributes weight 0).
+    o_rows:   (B*Nh_local, cp_size, D) bf16 from the zero-copy exchange (the
+              backend's _forward_mla_paged_cp already ran the pure-read SHM
+              exchange over the persistent regions).
+    lse_rows: (B*Nh_local, cp_size) fp32; shards whose LSE is +INFINITY
+              (empty local KV) contribute weight 0.
 
-    Runs entirely inside the graph-compatible ``flash_mla_reduce_kunpeng`` op
-    (max-based online-softmax merge accumulated in fp32, written as bf16).
-    Returns merged (B, Nh_local, D).
+    Runs the unmodified kutacc ``flash_mla_reduce`` (max-based online-softmax
+    merge over the cp dimension, fp32 accumulation, bf16 output) on the
+    flattened (B*Nh_local) rows. Returns (B, Nh_local, D).
     """
-    B, Nh_local, D = o_contrib.shape[1], o_contrib.shape[2], o_contrib.shape[3]
-    out = kunpeng.alloc_buffer(B * Nh_local * D, dtype=torch.bfloat16).view(
-        B, Nh_local, D
-    )
-    kunpeng.flash_mla_reduce_kunpeng(o_contrib, lse_contrib, topk_out, out)
-    return out
+    rows, _, D = o_rows.shape
+    out = kunpeng.alloc_buffer(rows * D, dtype=torch.bfloat16).view(rows, D)
+    kunpeng.flash_mla_reduce_kunpeng(o_rows, lse_rows, out)
+    return out.view(b, num_local_heads, D)
 
 
 class DeepseekMLAKunpengForwardMixin:
@@ -326,62 +278,43 @@ class DeepseekMLAKunpengForwardMixin:
                 )
                 B = B_q // seqlen_q
 
-                # Q allgather over the flattened (B*seqlen_q) rows:
-                # (B', Nh_local, D) -> (B', Nh_local*cp_size, D); head block r
-                # sits at columns [r*Nh_local*D, (r+1)*Nh_local*D) of every
-                # row.
-                q_flat = q_3d.contiguous().view(B_q, -1)
+                # Q allgather, one row per (query row, local head):
+                # (B'*Nh_local, D) -> (B'*Nh_local, cp_size, D). The allgather
+                # output is row-interleaved [row][rank], so viewing it as
+                # (B', seqlen_q, Nh_local, cp, D) yields the LH-MAJOR head
+                # order g = lh*cp_size + rank (reference layout): head g is
+                # the query of cp rank s = g % cp_size for local head
+                # lh = g // cp_size. With this order the flash MLA's flat
+                # output layout IS the staged (rows, cp, ...) layout the
+                # zero-copy exchange expects -- pure views, no permute.
+                q_flat = q_3d.contiguous().view(
+                    B_q * numhead_local_q, D_qk
+                )
                 if envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get():
                     kunpeng.shm_fence_kunpeng(cp_size)
                 q_all = kunpeng.shm_batched_allgather_kunpeng(
                     q_flat, cp_size,
                     profile_name="mla_q_allgather_long_context_kunpeng")
-                q = (
-                    q_all.view(B, seqlen_q, cp_size, numhead_local_q, D_qk)
-                    .reshape(B, seqlen_q, numhead_local_q * cp_size, D_qk)
-                )
+                q = q_all.view(
+                    B, seqlen_q, numhead_local_q, cp_size, D_qk
+                ).reshape(B, seqlen_q, numhead_local_q * cp_size, D_qk)
 
                 saved_tp_q_head_num = self.attn_mqa.tp_q_head_num
                 self.attn_mqa.tp_q_head_num = numhead_local_q * cp_size
                 try:
-                    attn_output, softmax_lse = self._call_attn_mqa(
+                    o_rows, lse_rows = self._call_attn_mqa(
                         q, k, k_nope, forward_batch, topk_indices
                     )
                 finally:
                     self.attn_mqa.tp_q_head_num = saved_tp_q_head_num
 
-                # Partial attention over this rank's local KV shard:
-                # attn_output (B, seqlen_q, Nh_all, D), softmax_lse
-                # (B, seqlen_q, Nh_all). The exchange/reduce operate on
-                # flattened rows, so flatten to (B*seqlen_q, ...) here.
-                attn_output = attn_output.reshape(
-                    B_q, numhead_local_q * cp_size, -1
-                )  # (B', Nh_all, D)
-                softmax_lse = softmax_lse.reshape(
-                    B_q, numhead_local_q * cp_size
-                )  # (B', Nh_all)
-                real_topk_length = (
-                    forward_batch.attn_backend.forward_metadata.long_context_real_topk_length
-                )
-                if seqlen_q > 1:
-                    # The exchange stores one local-KV count per row; broadcast
-                    # the per-sequence count to every query row. Use the
-                    # registered graph op: a plain torch repeat_interleave
-                    # allocates a NEW storage mid-capture that the graph
-                    # engine does not track, failing with "non-return-value
-                    # parameter tensor not registered".
-                    real_topk_length = kunpeng.repeat_interleave_kunpeng(
-                        real_topk_length, seqlen_q
-                    )
-                o_contrib, lse_contrib, topk_out = _lc_exchange_partial_o(
-                    attn_output,
-                    softmax_lse,
-                    real_topk_length,
-                    cp_size,
-                    numhead_local_q,
-                )
+                # The backend already ran the zero-copy exchange (flash MLA
+                # direct-write into the persistent SHM regions + empty-shard
+                # LSE marks + pure-read of the peers' regions): o_rows
+                # (B'*Nh_local, cp, D), lse_rows (B'*Nh_local, cp). Only the
+                # online-softmax merge remains.
                 attn_output = _lc_reduce_partial_o(
-                    o_contrib, lse_contrib, topk_out, cp_size
+                    o_rows, lse_rows, B_q, numhead_local_q
                 )  # (B', Nh_local, D)
 
                 if is_draft_extend:
