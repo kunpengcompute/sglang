@@ -234,7 +234,6 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     TORCH_CHECK(retrieve_index.size(0) == bs && retrieve_index.size(1) == nv, "retrieve_index shape mismatch");
     TORCH_CHECK(seq_lens.size(0) == bs, "seq_lens size mismatch");
     TORCH_CHECK(out_cache_loc.size(0) == bs * nv, "out_cache_loc size mismatch");
-    TORCH_CHECK(req_to_token.size(0) == bs, "req_to_token size mismatch");
     TORCH_CHECK(stop_ids_off.size(0) == bs + 1, "stop_ids_off size mismatch");
     TORCH_CHECK(eos_ids_off.size(0) == bs + 1, "eos_ids_off size mismatch");
 
