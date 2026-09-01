@@ -602,6 +602,9 @@ class Envs:
     # Dedicated CPU list for the disaggregation bootstrap server thread. Only
     # takes effect in http-only mode (tokenizer-separate router process),
     SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU = EnvStr("")
+    # Software prefetch distance (in SVE vectors) for softmax_topk_kunpeng.
+    # Runtime-tunable so Python tests can sweep it. Default 8.
+    SGLANG_KUNPENG_SOFTMAX_TOPK_PRF_VECS = EnvInt(8)
 
 envs = Envs()
 EnvField._allow_set_name = False

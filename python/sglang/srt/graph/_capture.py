@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 from sgl_kernel import graph_cpp as _C
@@ -104,8 +106,9 @@ def finalize(outputs, external_pool=None, external_shm_pool=None):
             views.append(view)
             output_view_ids.append(view.id)
 
+    memory_alignment = int(os.environ.get("SGLANG_KUNPENG_MEMORY_ALIGNMENT", 4096))
     gh = _C.Graph(storages, views, ops, output_view_ids, num_inputs, fixed,
-                  external_pool, external_shm_pool)
+                  external_pool, external_shm_pool, memory_alignment)
     return gh
 
 

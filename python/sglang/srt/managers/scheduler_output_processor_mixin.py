@@ -475,6 +475,19 @@ class SchedulerOutputProcessorMixin:
         for i, req in enumerate(batch.reqs):
             req: Req
 
+            # PP+MTP: drop the pending draft of a request that finished or was
+            # retracted this round, so the stale entry cannot leak or be
+            # popped by a later request with a recycled rid. The draft was
+            # consumed (popped) by `_pp_mtp_prepare_verify_batch` for the
+            # reqs that actually entered a verify round this step; only the
+            # residue (e.g. a draft stashed last round for a req that then
+            # finished before its verify) reaches this point. Must not be
+            # gated on the current microbatch (pp_loop_size microbatch slots
+            # share this scheduler-level dict), only on per-req terminal state.
+            pending_drafts = getattr(self, "_pp_pending_drafts", None)
+            if pending_drafts is not None and (req.finished() or req.is_retracted):
+                pending_drafts.pop(req.rid, None)
+
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted
             ):

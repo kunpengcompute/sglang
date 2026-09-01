@@ -45,7 +45,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.speculative.eagle_worker import EAGLEWorker, gather_index_cpu
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -243,12 +243,13 @@ class PPNextNWorker(EAGLEWorker):
             )
 
         # Post process based on verified outputs.
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
-        ]
-        logits_output.hidden_states = logits_output.hidden_states[
-            res.accepted_indices
-        ]
+        if not gather_index_cpu(logits_output, res.accepted_indices):
+            logits_output.next_token_logits = logits_output.next_token_logits[
+                res.accepted_indices
+            ]
+            logits_output.hidden_states = logits_output.hidden_states[
+                res.accepted_indices
+            ]
         if batch.return_logprob:
             from sglang.srt.speculative.spec_utils import (
                 add_output_logprobs_for_spec_v1,
@@ -304,6 +305,36 @@ class PPNextNWorker(EAGLEWorker):
 
         topk_index has shape (bs, topk) — each row already corresponds to one
         request's prediction, so no splitting by accepted-token count is needed.
+
+        When some requests finish during the verify round, the draft-extend
+        batch only runs over the unfinished subset (`EagleVerifyInput.verify`
+        drops the finished ones from `draft_input`), so `topk_index` has fewer
+        rows than `batch.reqs`. To keep the ring-message `draft_tokens`
+        position-aligned with the full verify batch (the scheduler stashes it
+        with `zip(batch.reqs, draft_tokens)`), we expand it back to the full
+        batch using the per-request pool index, filling `-1` for the finished
+        requests. The stash sites skip the `-1` placeholders.
         """
         topk_index = batch.spec_info.topk_index
-        return [int(topk_index[i, 0]) for i in range(topk_index.shape[0])]
+        drafts = [int(topk_index[i, 0]) for i in range(topk_index.shape[0])]
+        if len(drafts) == len(batch.reqs):
+            # No request finished: the draft-extend batch covers every req, so
+            # the drafts are already aligned with batch.reqs (prefill and the
+            # usual verify rounds).
+            return drafts
+        # Some requests finished: the drafts only cover the unfinished subset.
+        # `batch.req_pool_indices` was restored to the full verify batch by
+        # `forward_draft_extend_after_decode`, while
+        # `spec_info.req_pool_indices_for_draft_extend` holds the unfinished
+        # subset's pool indices — use the pool index as the join key. When
+        # *all* requests finished, `forward_draft_extend_after_decode`
+        # swapped the spec_info for an idle input whose
+        # `req_pool_indices_for_draft_extend` is None; every req is finished
+        # then, so all entries are -1 placeholders.
+        draft_pool = batch.spec_info.req_pool_indices_for_draft_extend
+        if draft_pool is None:
+            return [-1] * len(batch.reqs)
+        draft_pool = draft_pool.tolist()
+        pool_to_draft = {p: d for p, d in zip(draft_pool, drafts)}
+        full_pool = batch.req_pool_indices.tolist()
+        return [pool_to_draft.get(p, -1) for p in full_pool]

@@ -67,7 +67,7 @@ inline svfloat32_t sigmoid(svbool_t pg, svfloat32_t x, int vl)
     return svld1(pg, data);
 }
 
-void softmax_fusion_kernel(int64_t width, float *data, float scale, std::optional<int64_t> causal_width)
+inline void softmax_fusion_kernel(int64_t width, float *data, float scale, std::optional<int64_t> causal_width)
 {
     const int64_t vl = svcntw();
     // mul scale & add mask & reduce max

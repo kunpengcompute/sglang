@@ -67,6 +67,7 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
@@ -87,6 +88,55 @@ if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+def gather_index_cpu(logits_output, accepted_indices):
+    """Parallel row gather for the two aten::index ops on 920F.
+
+    Replaces
+        logits_output.next_token_logits = logits_output.next_token_logits[accepted_indices]
+        logits_output.hidden_states = logits_output.hidden_states[accepted_indices]
+    with a multi-core `gather_index_kunpeng` kernel (GIL released).  Only used
+    on the Kunpeng CPU 920F path; other platforms keep the aten::index form.
+
+    When ``accepted_indices is None`` (the fused ``verify_mtp_kunpeng`` path in
+    ``EagleVerifyInput._verify_kunpeng``), the accepted logits/hidden rows are
+    already compacted inside the kernel and assigned to
+    ``logits_output.next_token_logits`` / ``logits_output.hidden_states``; this
+    function then returns True to signal "already done, skip the aten::index".
+    """
+    if not _is_cpu_920f:
+        return False
+    if accepted_indices is None:
+        return True
+    indices = accepted_indices
+    indices = accepted_indices
+    if indices.numel() == 0:
+        # Empty gather: keep the empty shapes identical to aten::index.
+        logits_output.next_token_logits = logits_output.next_token_logits[indices]
+        logits_output.hidden_states = logits_output.hidden_states[indices]
+        return True
+    k = indices.shape[0]
+    out_logits = torch.empty(
+        (k, logits_output.next_token_logits.shape[-1]),
+        dtype=logits_output.next_token_logits.dtype,
+        device=logits_output.next_token_logits.device,
+    )
+    out_hidden = torch.empty(
+        (k, logits_output.hidden_states.shape[-1]),
+        dtype=logits_output.hidden_states.dtype,
+        device=logits_output.hidden_states.device,
+    )
+    torch.ops.sgl_kernel.gather_index_kunpeng(
+        logits_output.next_token_logits,
+        logits_output.hidden_states,
+        indices,
+        out_logits,
+        out_hidden,
+    )
+    logits_output.next_token_logits = out_logits
+    logits_output.hidden_states = out_hidden
+    return True
 
 
 class EAGLEWorker(TpModelWorker):
@@ -730,7 +780,12 @@ class EAGLEWorker(TpModelWorker):
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
-        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
+        if _is_cpu_920f and self.topk == 1:
+            # topk==1: repeat_interleave(1) is an identity copy of seq_lens
+            # (both int64). Reuse seq_lens directly to skip the aten op.
+            spec_info.positions = batch.seq_lens
+        else:
+            spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
@@ -856,10 +911,37 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
+        topk1 = _is_cpu_920f and self.topk == 1
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
+            if topk1:
+                # Inline topk==1 simplification: repeat_interleave(1),
+                # fast_topk, torch.gather and the hidden-states index are all
+                # identity under a single candidate, so they are elided.
+                input_ids = topk_index.view(-1)
+                if i == 0:
+                    scores = topk_p
+                    parents = torch.full(
+                        (topk_p.shape[0], 2),
+                        -1,
+                        dtype=torch.long,
+                        device=topk_p.device,
+                    )
+                    parents[:, 1] = 0
+                else:
+                    # scores = topk_p * scores (cumulative prob), (b, 1)
+                    scores = topk_p * scores if scores is not None else topk_p
+                    parents = torch.full(
+                        (topk_p.shape[0], 1),
+                        i,
+                        dtype=torch.long,
+                        device=topk_p.device,
+                    )
+                # hidden_states stays unchanged (repeat_interleave(1) identity)
+                tree_info = (scores.unsqueeze(1), topk_index, parents)
+            else:
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -899,9 +981,24 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
-        )
+        if topk1 and self.speculative_num_steps == 1:
+            # 1-step + topk==1: score_list/token_list/parents_list are
+            # single-element. torch.topk of a length-1 row, sort of a single
+            # index and gather of column 0 are all identity, so pass through.
+            parent_list = torch.empty(
+                parents_list[0].shape[0],
+                0,
+                dtype=torch.long,
+                device=parents_list[0].device,
+            )
+            top_scores_index = torch.zeros_like(
+                token_list[0], dtype=torch.long, device=token_list[0].device
+            )
+            draft_tokens = token_list[0]
+        else:
+            parent_list, top_scores_index, draft_tokens = organize_draft_results(
+                score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            )
 
         return parent_list, top_scores_index, draft_tokens
 
@@ -975,10 +1072,13 @@ class EAGLEWorker(TpModelWorker):
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
-        ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        if not gather_index_cpu(logits_output, res.accepted_indices):
+            logits_output.next_token_logits = logits_output.next_token_logits[
+                res.accepted_indices
+            ]
+            logits_output.hidden_states = logits_output.hidden_states[
+                res.accepted_indices
+            ]
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
@@ -1237,7 +1337,9 @@ class EAGLEWorker(TpModelWorker):
             topk_index = torch.empty(
                 (logits.shape[0], 1), dtype=torch.int64, device=logits.device
             )
-            torch.ops.sgl_kernel.softmax_topk_kunpeng(logits, topk_p, topk_index)
+            torch.ops.sgl_kernel.softmax_topk_kunpeng(
+                logits, topk_p, topk_index, envs.SGLANG_KUNPENG_SOFTMAX_TOPK_PRF_VECS.get()
+            )
             return topk_p, topk_index
         probs = torch.softmax(logits, dim=-1)
         return fast_topk(probs, self.topk, dim=-1)

@@ -1323,17 +1323,24 @@ class SchedulerPPMixin:
             # worker produces them (the ring would be one full loop too late).
             draft_tokens = pp_outputs.tensors.get("draft_tokens", None)
             if draft_tokens is not None:
+                # `draft_tokens` is aligned with `batch.reqs` (finished
+                # requests carry a -1 placeholder that is skipped), so the zip
+                # is positionally correct even when some requests finished
+                # early and the last rank only produced drafts for the
+                # unfinished subset.
+                stashed_rids = []
                 for req, tok in zip(batch.reqs, draft_tokens.tolist()):
+                    if tok < 0:
+                        continue
                     self._pp_pending_drafts[req.rid] = int(tok)
+                    stashed_rids.append(req.rid)
                 batch.pp_mtp_accepted_tokens = pp_outputs.tensors.get(
                     "num_accepted_tokens", None
                 )
                 _ppmtp_log(
                     self,
                     f"recv_drafts_via_ring: stashed for "
-                    f"rids={[r.rid for r in batch.reqs]} "
-                    f"drafts={draft_tokens.tolist()} "
-                    f"accepted_tokens={batch.pp_mtp_accepted_tokens}",
+                    f"rids={stashed_rids}",
                 )
             else:
                 _ppmtp_log(
@@ -1527,16 +1534,21 @@ class SchedulerPPMixin:
                     ):
                         # PP + MTP: the last rank produces the next round's
                         # drafts locally; stash them before the ring brings the
-                        # message back (one full loop too late).
+                        # message back (one full loop too late). `draft_tokens`
+                        # is aligned with `cur_batch.reqs` (finished requests
+                        # carry a -1 placeholder that is skipped).
+                        stashed_rids = []
                         for req, tok in zip(
                             self.cur_batch.reqs, result.draft_tokens.tolist()
                         ):
+                            if tok < 0:
+                                continue
                             self._pp_pending_drafts[req.rid] = int(tok)
+                            stashed_rids.append(req.rid)
                         _ppmtp_log(
                             self,
                             f"last_rank_stash: stashed drafts for "
-                            f"rids={[r.rid for r in self.cur_batch.reqs]} "
-                            f"drafts={result.draft_tokens.tolist()}",
+                            f"rids={stashed_rids}",
                         )
         return result, event
 
@@ -1640,7 +1652,7 @@ class SchedulerPPMixin:
         positions = []
         for r in reqs:
             draft = self._pp_pending_drafts.pop(r.rid, None)
-            if draft is None:
+            if draft is None or draft < 0:
                 raise RuntimeError(
                     f"PP+MTP: missing pending draft for req {r.rid} during verify prep"
                 )

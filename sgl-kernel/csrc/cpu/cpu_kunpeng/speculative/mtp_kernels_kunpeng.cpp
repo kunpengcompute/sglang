@@ -66,56 +66,6 @@ void build_tree_kernel_kunpeng(at::Tensor parent_list, at::Tensor top_scores_ind
     }
 }
 
-// predicts: [tot_num_draft_tokens]
-// accept_index: [bs, spec_steps]
-// accept_token_num: [bs]
-// candidates: [bs, num_draft_tokens]
-// retrieve_index: [bs, num_draft_tokens]
-// retrieve_next_token: [bs, num_draft_tokens]
-// retrieve_next_sibling: [bs, num_draft_tokens]
-// target_predict: [bs, num_draft_tokens]
-void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at::Tensor accept_token_num,
-                                at::Tensor candidates, at::Tensor retrieve_index, at::Tensor retrieve_next_token,
-                                at::Tensor retrieve_next_sibling, at::Tensor target_predict)
-{
-    int64_t bs = candidates.size(0);
-    int64_t num_draft_tokens = candidates.size(1);
-    int64_t spec_steps = accept_index.size(1);
-    (void)retrieve_next_sibling;  // topk==1: all entries are -1, no sibling traversal needed
-
-    auto predicts_a = predicts.accessor<int32_t, 1>();
-    auto accept_index_a = accept_index.accessor<int32_t, 2>();
-    auto accept_token_num_a = accept_token_num.accessor<int32_t, 1>();
-    auto candidates_a = candidates.accessor<int64_t, 2>();
-    auto retrieve_index_a = retrieve_index.accessor<int64_t, 2>();
-    auto retrieve_next_token_a = retrieve_next_token.accessor<int64_t, 2>();
-    auto target_predict_a = target_predict.accessor<int64_t, 2>();
-
-    for (int64_t b = 0; b < bs; b++) {
-        int32_t num_accepted_tokens = 0;
-        int64_t last_accepted_retrieve_idx = accept_index_a[b][0] = retrieve_index_a[b][0];
-        int64_t cur_index = 0, pre_index = 0;
-        for (int64_t j = 0; j < spec_steps; j++) {
-            pre_index = cur_index;
-            cur_index = retrieve_next_token_a[b][cur_index];
-            if (cur_index == -1) {
-                break;
-            }
-            int64_t draft_token_id = candidates_a[b][cur_index];
-            int64_t target_token_id = target_predict_a[b][pre_index];
-            if (draft_token_id == target_token_id) {
-                predicts_a[last_accepted_retrieve_idx] = (int32_t)target_token_id;
-                num_accepted_tokens++;
-                last_accepted_retrieve_idx = accept_index_a[b][num_accepted_tokens] = retrieve_index_a[b][cur_index];
-            } else {
-                break;
-            }
-        }
-        accept_token_num_a[b] = num_accepted_tokens;
-        predicts_a[last_accepted_retrieve_idx] = (int32_t)target_predict_a[b][pre_index];
-    }
-}
-
 template <typename scalar_t>
 static void _copy_mtp_strided(scalar_t *src, scalar_t *dst, int64_t *offsets, int32_t *ext_lens, int64_t bs,
                               int64_t max_ext_len, int64_t num_heads, int64_t head_dim, bool is_pad)

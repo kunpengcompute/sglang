@@ -51,6 +51,7 @@ _is_kunpeng_graph_profile = is_kunpeng_graph_profile()
 _is_scheduler_skip_all_gather = (
     os.environ.get("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "0") == "1"
 )
+last_call_timestamp = 0
 
 
 class KunpengGraphRunner:
@@ -798,11 +799,12 @@ class KunpengGraphRunner:
         skip_idle_log = (
             _is_scheduler_skip_all_gather and forward_batch.forward_mode.is_idle()
         )
+        global last_call_timestamp
         if (
             not skip_idle_log
             and os.environ.get("SGLANG_KUNPENG_PP_PROFILE", "0") == "0"
         ):
-            logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms")
+            logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms, others {1000 * (t0 - last_call_timestamp):.3f} ms.")
 
         # Idle replays would grow the profile jsonl unboundedly.
         if _is_kunpeng_graph_profile and not skip_idle_log:
@@ -826,6 +828,7 @@ class KunpengGraphRunner:
                     "batch_size": forward_batch.batch_size,
                 },
             )
+        last_call_timestamp = time.time()
 
         if is_pp_output:
             hidden_states, residual = outputs
