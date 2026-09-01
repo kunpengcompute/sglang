@@ -943,10 +943,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor eos_ids_flat, Tensor eos_ids_off, "
         "int tokenizer_eos, bool use_tokenizer_eos, int nv, int page_size, "
         "Tensor req_pool_indices, Tensor(b!) req_to_token, Tensor(c!) seq_lens_cpu"
-        ") -> ("
-        "Tensor, Tensor, Tensor, Tensor, Tensor, "
-        "Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, "
-        "Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+        ") -> Tensor[]");
     m.impl("verify_mtp_kunpeng", verify_mtp_kunpeng);
 
     m.def(

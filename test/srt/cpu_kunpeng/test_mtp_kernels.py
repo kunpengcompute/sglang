@@ -154,6 +154,179 @@ def _check_build_tree(bs, nv):
 
 
 # ---------------------------------------------------------------------------
+# verify_mtp_kunpeng
+# ---------------------------------------------------------------------------
+
+def _check_finish_token(tok, cur_out_len, mnt, vs, stop_set, eos_set, use_tokenizer_eos, tokenizer_eos):
+    """Mirror of check_finish_token in verify_kunpeng.cpp (reason: 0=len, 1=token, 2=vocab, -1=none)."""
+    if cur_out_len >= mnt:
+        return (0, mnt, mnt)
+    if stop_set or eos_set or (use_tokenizer_eos and tokenizer_eos >= 0):
+        if tok in stop_set or tok in eos_set or (use_tokenizer_eos and tokenizer_eos >= 0 and tok == tokenizer_eos):
+            return (1, tok, cur_out_len)
+    if tok > vs or tok < 0:
+        return (2, 0, cur_out_len)
+    return (-1, 0, 0)
+
+
+def _ref_verify_mtp(logits, candidates, retrieve_index, seq_lens, out_cache_loc,
+                    output_ids_len, max_new_tokens, vocab_size,
+                    stop_sets, eos_sets, tokenizer_eos, page_size):
+    """torch-native reference of verify_mtp_kunpeng (per-node argmax + greedy
+    accept + bonus + finish + evict page alignment)."""
+    bs, nv = candidates.shape
+    target_predict = torch.argmax(logits, dim=-1).reshape(bs, nv).tolist()
+
+    num_accepted = []
+    finished = []
+    finish_reason = []
+    finish_matched = []
+    finish_len = []
+    accepted_tokens = []  # row-offset layout
+    accepted_cache_loc = []
+    accepted_verified_id = []
+    unfinished_index = []
+    unfinished_num_accepted = []
+
+    for b in range(bs):
+        seq = []
+        anchor = 0
+        seq.append(target_predict[b][anchor])  # root always accepted (root row argmax)
+        for j in range(1, nv):
+            if candidates[b][j] == target_predict[b][anchor]:
+                seq.append(target_predict[b][j])  # this draft node's row argmax
+                anchor = j
+            else:
+                break
+        na = len(seq)
+
+        is_fin, reason, matched, fin_len = 0, -1, 0, 0
+        for k in range(na):
+            cur_out_len = output_ids_len[b] + (k + 1)
+            r = _check_finish_token(seq[k], cur_out_len, max_new_tokens[b], vocab_size[b],
+                                    stop_sets[b], eos_sets[b], True, tokenizer_eos)
+            if r[0] >= 0:
+                is_fin, reason, matched, fin_len = 1, r[0], r[1], r[2]
+                na = k + 1  # keep the finishing token, drop the rest
+                break
+        num_accepted.append(na)
+        finished.append(is_fin)
+        finish_reason.append(reason)
+        finish_matched.append(matched)
+        finish_len.append(fin_len)
+
+        # evict mask: first na kept, rest evicted; page alignment never evicts first partial page
+        evict = [1 if j >= na else 0 for j in range(nv)]
+        num_false = na
+        start_raw = ((seq_lens[b] + num_false - 1) // page_size) * page_size - seq_lens[b]
+        start = max(start_raw, 0)
+        end = min(start_raw + page_size, nv)
+        for j in range(start, end):
+            evict[j] = 0
+
+        row_tokens = seq[:na] + [-1] * (nv - na)
+        accepted_tokens.append(row_tokens)
+        for j in range(na):
+            flat = retrieve_index[b][j]
+            accepted_cache_loc.append(int(out_cache_loc[flat]))
+            accepted_verified_id.append(seq[j])
+
+        if not is_fin:
+            unfinished_index.append(b)
+            unfinished_num_accepted.append(na)
+
+    return {
+        "num_accepted": num_accepted,
+        "finished": finished,
+        "finish_reason": finish_reason,
+        "finish_matched": finish_matched,
+        "finish_len": finish_len,
+        "accepted_tokens": accepted_tokens,
+        "accepted_cache_loc": accepted_cache_loc,
+        "accepted_verified_id": accepted_verified_id,
+        "unfinished_index": unfinished_index,
+        "unfinished_num_accepted": unfinished_num_accepted,
+    }
+
+
+def _check_verify_mtp(bs, nv, vocab, page_size, seq_lens_cpu_dtype):
+    torch.manual_seed(7)
+    seq_lens = torch.randint(1, 50, (bs,), dtype=torch.int64)
+    # verify KV slots: out_cache_loc[bs*nv] distinct locations
+    out_cache_loc = torch.arange(bs * nv, dtype=torch.int64)
+    # logits: [bs*nv, vocab] random bf16 (force distinct argmax per row)
+    logits = torch.randn(bs * nv, vocab, dtype=torch.bfloat16)
+    # candidates: per-req [root, draft...], draft often != root argmax so both branches hit
+    root_argmax = torch.argmax(logits[:bs], dim=-1).tolist()
+    draft_val = torch.randint(0, vocab, (bs, nv - 1), dtype=torch.int64)
+    candidates = torch.cat([torch.tensor(root_argmax).reshape(bs, 1), draft_val], dim=1)
+    retrieve_index = torch.arange(bs * nv, dtype=torch.int64).reshape(bs, nv)
+
+    output_ids_len = torch.randint(0, 10, (bs,), dtype=torch.int64)
+    max_new_tokens = torch.randint(1, 20, (bs,), dtype=torch.int32)
+    vocab_size = torch.full((bs,), vocab, dtype=torch.int32)
+    stop_sets = [list(range(0, 0)) for _ in range(bs)]
+    eos_sets = [list(range(0, 0)) for _ in range(bs)]
+    tokenizer_eos = 2
+
+    # finish-triggering case: make one request's draft/root hit EOS
+    if bs >= 2:
+        candidates[1, 1] = torch.tensor(2)  # draft == tokenizer_eos -> finish
+    if bs >= 3:
+        # force max_new_tokens finish: output_ids_len close to max_new_tokens
+        output_ids_len[2] = torch.tensor(max_new_tokens[2].item() - 1)
+
+    stop_flat = torch.tensor(sum(stop_sets, []), dtype=torch.int32)
+    stop_off = torch.tensor([0] + [len(s) for s in stop_sets], dtype=torch.int32).cumsum(0)
+    eos_flat = torch.tensor(sum(eos_sets, []), dtype=torch.int32)
+    eos_off = torch.tensor([0] + [len(s) for s in eos_sets], dtype=torch.int32).cumsum(0)
+
+    req_pool_indices = torch.arange(bs, dtype=torch.int64)
+    max_ctx = 64
+    req_to_token = torch.full((bs, max_ctx), -1, dtype=torch.int32)
+    seq_lens_cpu = seq_lens.clone().to(seq_lens_cpu_dtype)
+
+    got = kernel.verify_mtp_kunpeng(
+        logits.contiguous(),
+        torch.empty((0,), dtype=torch.bfloat16),
+        candidates,
+        retrieve_index,
+        seq_lens.clone(),
+        out_cache_loc,
+        output_ids_len,
+        max_new_tokens,
+        vocab_size,
+        stop_flat, stop_off, eos_flat, eos_off,
+        tokenizer_eos, True, nv, page_size,
+        req_pool_indices, req_to_token, seq_lens_cpu,
+    )
+    ref = _ref_verify_mtp(logits, candidates, retrieve_index, seq_lens,
+                          out_cache_loc, output_ids_len, max_new_tokens,
+                          vocab_size, stop_sets, eos_sets, tokenizer_eos, page_size)
+
+    # (num_accepted, finished, finish_reason, finish_matched, finish_len,
+    #  accepted_tokens, accepted_offsets, accepted_cache_loc, accepted_verified_id,
+    #  accepted_logits, accepted_hidden, unfinished_index, unfinished_num_accepted,
+    #  unfinished_cache_loc, unfinished_verified_id, unfinished_logits,
+    #  unfinished_hidden, free_cache_loc)
+    assert got[0].tolist() == ref["num_accepted"], f"num_accepted mismatch\n{got[0].tolist()}\n{ref['num_accepted']}"
+    assert got[1].tolist() == ref["finished"], "finished mismatch"
+    assert got[2].tolist() == ref["finish_reason"], "finish_reason mismatch"
+    assert got[3].tolist() == ref["finish_matched"], "finish_matched mismatch"
+    assert got[4].tolist() == ref["finish_len"], "finish_len mismatch"
+    # accepted_tokens is returned flattened as [bs*nv] (row-offset layout, -1 pad)
+    ref_tokens_flat = [t for row in ref["accepted_tokens"] for t in row]
+    assert got[5].tolist() == ref_tokens_flat, "accepted_tokens mismatch"
+    assert got[7].tolist() == ref["accepted_cache_loc"], "accepted_cache_loc mismatch"
+    assert got[8].tolist() == ref["accepted_verified_id"], "accepted_verified_id mismatch"
+    assert got[11].tolist() == ref["unfinished_index"], "unfinished_index mismatch"
+    assert got[12].tolist() == ref["unfinished_num_accepted"], "unfinished_num_accepted mismatch"
+    # seq_lens_cpu was incremented in-place by num_accepted
+    expected_seq_cpu = (seq_lens + torch.tensor(ref["num_accepted"], dtype=seq_lens.dtype)).to(seq_lens_cpu_dtype)
+    assert torch.equal(seq_lens_cpu, expected_seq_cpu), f"seq_lens_cpu mismatch\n{seq_lens_cpu}\n{expected_seq_cpu}"
+
+
+# ---------------------------------------------------------------------------
 # perf driver
 # ---------------------------------------------------------------------------
 
@@ -183,6 +356,14 @@ def run(args):
     _check_gather_index(32, 129, 32, 128)
     _check_build_tree(4, 8)
     _check_build_tree(8, 4)
+    try:
+        _check_verify_mtp(4, 2, 32, 1, torch.int32)
+        _check_verify_mtp(8, 2, 65, 1, torch.int64)  # page_size==1 + int64 seq_lens_cpu (PP path)
+        _check_verify_mtp(4, 2, 32, 8, torch.int32)  # page_size>1
+        _check_verify_mtp(0, 2, 32, 1, torch.int32)  # empty batch
+    except (RuntimeError, AttributeError, NotImplementedError):
+        # verify_mtp_kunpeng is only present on the 920F build; skip on stubs.
+        print("  verify_mtp_kunpeng unavailable, skipping verify checks")
     print("  all functional assertions passed")
 
     print()

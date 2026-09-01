@@ -19,9 +19,10 @@
 // verify_mtp_kunpeng: single fused kernel replacing the whole 920F topk==1
 // verify pipeline in `EagleVerifyInput.verify` (eagle_info.py).  In one
 // parallel_for (single GIL release) it performs:
-//   argmax(root) -> greedy accept -> finish detection -> evict-mask
-//   page alignment -> compact gathers (logits/hidden/cache_loc/verified_id)
-//   -> req_to_token scatter -> seq_lens / seq_lens_cpu update.
+//   per-node argmax -> greedy accept (dynamic anchor) -> finish detection ->
+//   evict-mask page alignment -> compact gathers
+//   (logits/hidden/cache_loc/verified_id) -> req_to_token scatter ->
+//   seq_lens / seq_lens_cpu update.
 // The Python side only writes per-request Req state (Python objects) from the
 // compact results; no tensor index / intermediate mask tensors remain.
 //
@@ -158,7 +159,7 @@ FinishState check_finish_token(int32_t tok, int64_t cur_out_len, int64_t mnt, in
 //   page_size       int64
 //   req_pool_indices[bs] int64
 //   req_to_token    [bs, max_ctx] int32 (b!)   : in-place scatter
-//   seq_lens_cpu    [bs] int32 (c!)     : in-place += num_acc
+//   seq_lens_cpu    [bs] int32 or int64 (c!)   : in-place += num_acc
 //
 // Returns (all compact, allocated inside):
 //   num_accepted         [bs] int32
@@ -169,7 +170,7 @@ FinishState check_finish_token(int32_t tok, int64_t cur_out_len, int64_t mnt, in
 //   accepted_tokens      [bs*nv] int32      row-offset layout (-1 padding)
 //   accepted_offsets     [bs+1] int32       row offsets (i*nv)
 //   accepted_cache_loc   [K] int64          out_cache_loc[accept_index]
-//   accepted_verified_id [K] int32          predict[accept_index] (root argmax)
+//   accepted_verified_id [K] int32          predict[accept_index] (accepted-token values)
 //   accepted_logits      [K, V] bf16        logits[accept_index]
 //   accepted_hidden      [K, H] bf16        hidden[accept_index]
 //   unfinished_index     [U] int32
@@ -222,7 +223,8 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     TORCH_CHECK(eos_ids_off.scalar_type() == at::kInt, "eos_ids_off must be int32");
     TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong, "req_pool_indices must be int64");
     TORCH_CHECK(req_to_token.scalar_type() == at::kInt, "req_to_token must be int32");
-    TORCH_CHECK(seq_lens_cpu.scalar_type() == at::kInt, "seq_lens_cpu must be int32");
+    TORCH_CHECK(seq_lens_cpu.scalar_type() == at::kInt || seq_lens_cpu.scalar_type() == at::kLong,
+                "seq_lens_cpu must be int32 or int64");
 
     int64_t bs = candidates.size(0);
     int64_t V = logits.size(1);
@@ -274,10 +276,12 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     const int32_t *eos_off_ptr = eos_ids_off.data_ptr<int32_t>();
     const int64_t *pool_ptr = req_pool_indices.data_ptr<int64_t>();
     int32_t *reqtok_ptr = req_to_token.data_ptr<int32_t>();
-    int32_t *seq_cpu_ptr = seq_lens_cpu.data_ptr<int32_t>();
+    const bool seq_cpu_is_i64 = (seq_lens_cpu.scalar_type() == at::kLong);
+    const void *seq_cpu_raw = seq_lens_cpu.data_ptr();
 
     // ---- per-request scratch buffers (serial-sized, bs small) ----
-    std::vector<int64_t> root_argmax(bs);
+    std::vector<int64_t> node_argmax(bs * nv);  // per-node-row argmax (flat row index)
+    std::vector<int32_t> accepted_seq(bs * nv, -1);  // accepted-token chain values (row offset, -1 pad)
     std::vector<int64_t> free_count(bs, 0);
 
     at::Tensor num_accepted_t = at::empty({bs}, logits.options().dtype(at::kInt));
@@ -294,17 +298,18 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     // evict mask [bs*nv] char (0 = keep, 1 = free)
     std::vector<char> evict(bs * nv, 0);
 
-    // ── Pass 1: per-req argmax + greedy accept + finish + evict (parallel) ──
+    // ── Pass 1: per-req per-node argmax + greedy accept + finish + evict (parallel) ──
     kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
         for (int64_t b = start; b < end; b++) {
             const int64_t base = b * nv;
-            const int64_t flat0 = retr_ptr[base + 0];
-            int64_t ra = row_argmax_bf16_sve(logits_ptr + flat0 * V, V);
-            root_argmax[b] = ra;
 
-            const int64_t draft_id = cand_ptr[base + 1];
-            const bool accept_draft = (draft_id == ra);
-            const int32_t tok_val = (int32_t)ra;
+            // 1) Per-node-row argmax (each tree node / each logits row has its
+            //    own greedy prediction, mirroring the pre-fusion Python path:
+            //    target_predict = torch.argmax(logits, dim=-1).reshape(bs, nv)).
+            for (int64_t j = 0; j < nv; j++) {
+                const int64_t flat = retr_ptr[base + j];
+                node_argmax[base + j] = row_argmax_bf16_sve(logits_ptr + flat * V, V);
+            }
 
             const int64_t mnt = mnt_ptr[b];
             const int64_t vs = vocab_ptr[b];
@@ -314,25 +319,49 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
             const int64_t eos_end = eos_off_ptr[b + 1];
             const int64_t base_out_len = out_len_ptr[b];
 
+            // 2) Greedy accept along the linear chain (topk==1). The anchor is
+            //    dynamic: the root is always accepted, and each draft is
+            //    accepted iff it equals the anchor node's argmax
+            //    (verify_tree_greedy_kunpeng / VerifyTreeGreedy semantics).
+            //    The accepted sequence is [root_argmax, draft1_row_argmax, ...]:
+            //    each accepted node contributes its OWN row's argmax (the
+            //    prediction for the token after that node), so a request with
+            //    a 2-node tree outputs either 1 token (draft rejected) or 2
+            //    tokens (draft accepted).  num_acc = 1 + #accepted drafts.
+            int64_t anchor = 0;
             int32_t num_acc = 0;
+            accepted_seq[base + num_acc] = (int32_t)node_argmax[base + anchor];  // root prediction
+            num_acc++;
+            for (int64_t j = 1; j < nv; j++) {
+                const int64_t draft_id = cand_ptr[base + j];
+                if (draft_id == node_argmax[base + anchor]) {
+                    accepted_seq[base + num_acc] = (int32_t)node_argmax[base + j];  // this node's prediction
+                    num_acc++;
+                    anchor = j;
+                } else {
+                    break;  // rejected: stop the accepted chain here
+                }
+            }
+
+            // 3) Finish detection over the actual accepted-token sequence
+            //    (each token with its own value, checked in order with the
+            //    running output length; mirrors EagleVerifyInput.verify).
             int32_t is_fin = 0;
             int32_t reason = -1;
             int64_t matched = 0;
             int32_t fin_len = 0;
-            for (int64_t j = 0; j < nv; j++) {
-                if (j == 1 && !accept_draft) {
-                    break;
-                }
-                const int64_t cur_out_len = base_out_len + (j + 1);
-                FinishState st = check_finish_token(tok_val, cur_out_len, mnt, vs, stop_flat_ptr,
+            for (int64_t k = 0; k < num_acc; k++) {
+                const int32_t tok = accepted_seq[base + k];
+                const int64_t cur_out_len = base_out_len + (k + 1);
+                FinishState st = check_finish_token(tok, cur_out_len, mnt, vs, stop_flat_ptr,
                                                     stop_begin, stop_end, eos_flat_ptr, eos_begin,
                                                     eos_end, use_tokenizer_eos, tokenizer_eos);
-                num_acc++;
                 if (st.hit) {
                     is_fin = 1;
                     reason = st.reason;
                     matched = st.matched;
                     fin_len = st.fin_len;
+                    num_acc = (int32_t)(k + 1);  // keep the finishing token, drop the rest
                     break;
                 }
             }
@@ -342,9 +371,11 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
             matched_ptr[b] = matched;
             fin_len_ptr[b] = fin_len;
 
-            // evict mask: root always kept; draft evicted only if rejected.
-            evict[base + 0] = 0;
-            evict[base + 1] = accept_draft ? 0 : 1;
+            // evict mask: the first num_acc nodes (root + accepted drafts)
+            // are kept; everything after is evicted.
+            for (int64_t j = 0; j < nv; j++) {
+                evict[base + j] = (j < num_acc) ? 0 : 1;
+            }
 
             // Page alignment (mirrors align_evict_mask_to_page_size_native):
             // never evict the first partial page of a request.
@@ -425,7 +456,6 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
         for (int64_t b = start; b < end; b++) {
             const int64_t base = b * nv;
             const int64_t na = num_acc_ptr[b];
-            const int64_t ra = root_argmax[b];
             const int64_t kbase = k_prefix[b];
 
             // compact accepted segment
@@ -434,7 +464,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
                 const int64_t dst = kbase + j;
                 std::memcpy(acc_logits_ptr + dst * V, logits_ptr + flat * V, V * sizeof(at::BFloat16));
                 acc_cache_ptr[dst] = outloc_ptr[flat];
-                acc_verified_ptr[dst] = (int32_t)ra;
+                acc_verified_ptr[dst] = accepted_seq[base + j];
             }
             if (hidden_ptr != nullptr) {
                 for (int64_t j = 0; j < na; j++) {
@@ -446,7 +476,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
 
             // accepted_tokens: row-offset layout (matches verify_finish_kunpeng)
             for (int64_t j = 0; j < na; j++) {
-                acc_tok_ptr[base + j] = (int32_t)ra;
+                acc_tok_ptr[base + j] = accepted_seq[base + j];
             }
             for (int64_t j = na; j < nv; j++) {
                 acc_tok_ptr[base + j] = -1;
@@ -459,7 +489,11 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
                 reqtok_ptr[pool * max_ctx + seqb + j] = (int32_t)acc_cache_ptr[kbase + j];
             }
             seq_ptr[b] = seqb + na;
-            seq_cpu_ptr[b] += (int32_t)na;
+            if (seq_cpu_is_i64) {
+                static_cast<int64_t *>(const_cast<void *>(seq_cpu_raw))[b] += (int64_t)na;
+            } else {
+                static_cast<int32_t *>(const_cast<void *>(seq_cpu_raw))[b] += (int32_t)na;
+            }
 
             // unfinished compact
             if (!finished_ptr[b]) {
@@ -472,7 +506,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
                     const int64_t dst = ufbase + j;
                     std::memcpy(unfin_logits_ptr + dst * V, logits_ptr + flat * V, V * sizeof(at::BFloat16));
                     unfin_cache_ptr[dst] = outloc_ptr[flat];
-                    unfin_verified_ptr[dst] = (int32_t)ra;
+                    unfin_verified_ptr[dst] = accepted_seq[base + j];
                 }
                 if (hidden_ptr != nullptr) {
                     for (int64_t j = 0; j < na; j++) {
