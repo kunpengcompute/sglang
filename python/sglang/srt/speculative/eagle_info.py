@@ -320,17 +320,27 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         vocab_size = torch.tensor(
             [r.vocab_size for r in batch.reqs], dtype=torch.int32, device=device
         )
-        stop_flat, stop_off = _pack_id_sets(
-            [list(r.sampling_params.stop_token_ids or []) for r in batch.reqs],
-            device,
-        )
-        eos_flat, eos_off = _pack_id_sets(
-            [list(r.eos_token_ids or []) for r in batch.reqs], device
-        )
-        use_tokenizer_eos = batch.reqs[0].tokenizer is not None
-        tokenizer_eos = (
-            batch.reqs[0].tokenizer.eos_token_id if use_tokenizer_eos else -1
-        )
+        # Finish sets mirror Req._check_token_based_finish: ignore_eos reqs
+        # get empty sets (kernel has no ignore_eos flag); tokenizer ids fold
+        # into the per-req eos set, replacing the batch-wide flag.
+        stop_sets = []
+        eos_sets = []
+        for r in batch.reqs:
+            if r.sampling_params.ignore_eos:
+                stop_sets.append([])
+                eos_sets.append([])
+                continue
+            stop_sets.append(list(r.sampling_params.stop_token_ids or []))
+            eos_set = list(r.eos_token_ids or [])
+            if r.tokenizer is not None:
+                if r.tokenizer.eos_token_id is not None:
+                    eos_set.append(r.tokenizer.eos_token_id)
+                eos_set.extend(r.tokenizer.additional_stop_token_ids or [])
+            eos_sets.append(eos_set)
+        stop_flat, stop_off = _pack_id_sets(stop_sets, device)
+        eos_flat, eos_off = _pack_id_sets(eos_sets, device)
+        use_tokenizer_eos = False
+        tokenizer_eos = -1
 
         # ── Single fused C++ kernel (GIL released, multi-core) ───────────
         (
