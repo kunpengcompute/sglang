@@ -228,6 +228,12 @@ class KunpengCpuMetadata:
         self.long_context_fill_len: Optional[torch.Tensor] = None
         self.long_context_last_req_idx: Optional[torch.Tensor] = None
         self.long_context_last_seq_len: Optional[torch.Tensor] = None
+        # Block-wise KV swap only: per-step slot-remapped copy of
+        # ``long_context_indices`` (DDR slot -> compacted HBM swap-buffer
+        # position). PERSISTENT fixed-shape buffer with the same shape as
+        # ``long_context_indices`` (a graph input), refilled every decode
+        # step by _init_lc_blockwise_metadata; None when blockwise is off.
+        self.long_context_hbm_indices: Optional[torch.Tensor] = None
 
 
 class KunpengCpuBackend(AttentionBackend):
@@ -264,7 +270,9 @@ class KunpengCpuBackend(AttentionBackend):
         # reduce).
         # MTP is supported: TARGET_VERIFY / DRAFT_EXTEND run the same sparse
         # path with seqlen_q = speculative_num_draft_tokens rows per sequence.
-        # No blockwise KV swap.
+        # Block-wise KV swap is supported for all LC modes: the DDR-space
+        # indices are remapped to the compacted HBM swap buffer every step
+        # (see _init_lc_blockwise_metadata).
         self._lc_enabled = is_lc_cp_enabled()
         self._lc_cp_size: int = 0
         self._lc_cp_rank: int = -1
@@ -272,10 +280,12 @@ class KunpengCpuBackend(AttentionBackend):
         # _init_long_context_metadata); 0 until the first LC decode step.
         self._lc_max_topk: int = 0
         if self._lc_enabled:
-            assert not is_kunpeng_swap_kv_blockwise(), (
-                "long-context decode CP conflicts with blockwise KV swap"
-            )
-            logger.info("Long-context decode CP enabled (mixed LC/regular mode)")
+            if is_kunpeng_swap_kv_blockwise():
+                logger.info(
+                    "Long-context decode CP enabled with block-wise KV swap"
+                )
+            else:
+                logger.info("Long-context decode CP enabled (mixed LC/regular mode)")
             # Persistent SHM region views for the zero-copy O/LSE exchange.
             # Safe here: KunpengCommunicator (shm pool + LC alltoall init)
             # is created during distributed init, before this backend. The
@@ -431,8 +441,11 @@ class KunpengCpuBackend(AttentionBackend):
             metadata.seq_lens = seq_lens
             if seq_lens.shape[0] == 0:
                 # Idle forward: no attention work, skip sched (kernel rejects
-                # batch_size == 0).
+                # batch_size == 0). Drop any stale block-wise mapping so
+                # neither the swap-in nor the HBM write path acts on it (KV
+                # swap is skipped entirely during idle forwards).
                 metadata.extra_bytes = 0
+                self.swap_mgr._blockwise_ddr_block_ids = None
                 return
             self._init_long_context_metadata(
                 metadata,
@@ -451,6 +464,13 @@ class KunpengCpuBackend(AttentionBackend):
                     meta=self._decode_meta,
                 )
             )
+            if self.swap_mgr.enable_swap_kv_blockwise:
+                # Block-wise KV swap: remap the DDR-space indices to the
+                # compacted HBM swap buffer for this step (all LC modes:
+                # decode seqlen_q=1, MTP seqlen_q=draft_tokens).
+                self._init_lc_blockwise_metadata(
+                    metadata, forward_batch, seqlen_q=seqlen_q
+                )
             return
 
         tp_size = get_attention_tp_size()
@@ -779,6 +799,152 @@ class KunpengCpuBackend(AttentionBackend):
             indices[dummy, :seqlen_q, 0] = 0
         metadata.long_context_topk_length = topk_t
         metadata.long_context_real_topk_length = real_topk_t
+
+    def _init_lc_blockwise_metadata(
+        self,
+        metadata: KunpengCpuMetadata,
+        forward_batch: ForwardBatch,
+        seqlen_q: int = 1,
+    ) -> None:
+        """Block-wise KV swap for long-context decode CP (all LC modes).
+
+        The persistent LC indices live in DDR slot space (stable across
+        steps, incrementally maintained), while the block-wise HBM swap
+        buffer is compacted (max_blocks * page_size). This method derives,
+        once per decode step:
+
+        - the DDR block set: unique blocks of the valid index slots (the
+          fill_len prefix of the first ``seqlen_q`` rows -- later rows are
+          stale after a mode switch, e.g. verify -> decode, and must not
+          contribute) plus this step's real new-token slots. Block 0 is
+          ALWAYS included: empty rows carry the dummy slot 0 (topk_length is
+          clamped to >= 1) and must remap to a real HBM position (its
+          content is garbage but masked out by the +INF LSE in the
+          cross-rank reduce). The set covers only this rank's LOCAL pages,
+          i.e. ~1/cp of the dense-mode working set.
+        - the DDR->HBM block map, registered with the swap manager so
+          ``swap_kv_layer`` swaps exactly these blocks in via
+          ``kupl_sdma_kv_block_swapin`` (mapping identical across layers).
+        - a persistent slot-remapped index buffer
+          (``long_context_hbm_indices``, graph input) consumed by the sparse
+          flash MLA kernel, which reads the HBM swap buffer.
+        - the remapped ``hbw_cache_loc`` for writing this step's new K/V
+          into HBM. LC keeps the FULL batch (token_row_start = 0), so the
+          write slice is all token rows. Rows OUTSIDE the real new-token
+          range (padding rows of a partially-real batch) are routed to the
+          reserved safe block like the dense path (they carry garbage K/V
+          and their dummy locs may alias a swapped-in block, e.g. block 0
+          slot 0 which real sequences attend to). Real rows with loc = -1
+          (foreign pages) keep -1: the write kernel skips loc < 0 rows.
+
+        The DDR write path (``out_cache_loc`` via set_kv_buffer_2_sdma /
+        set_kv_buffer_2 on the DDR buffer) is untouched: DDR stays
+        authoritative, exactly like the dense block-wise decode path.
+        """
+        swap_mgr = self.swap_mgr
+        page_size = metadata.page_size
+        indices = metadata.long_context_indices
+        fill_len = metadata.long_context_fill_len
+        max_blocks_on_package = swap_mgr.max_blocks_on_package
+        device = indices.device
+
+        # Valid slots: the fill_len prefix of the first seqlen_q rows (the
+        # rows this step's kernel actually scans). Stale entries beyond the
+        # fill, and stale rows after a mode switch, are never read.
+        topk = indices.shape[-1]
+        valid_mask = torch.arange(topk, device=device) < fill_len[
+            :, :seqlen_q
+        ].unsqueeze(-1)
+        valid_slots = indices[:, :seqlen_q, :][valid_mask]
+        valid_slots = valid_slots[valid_slots >= 0]
+
+        loc = forward_batch.out_cache_loc
+        # Real new-token rows of this rank. LC keeps the FULL batch
+        # (token_slice_start = 0, batchsize_per_tp = B), so the existing
+        # helper yields the mode-correct range for DECODE (B rows),
+        # TARGET_VERIFY (B * draft_tokens rows, capped by the real token
+        # count) and DRAFT_EXTEND (cumsum of the padded per-sequence
+        # accepted counts).
+        real_start, real_end = self._blockwise_real_new_token_range(
+            forward_batch
+        )
+        real_loc_all = loc[real_start:real_end]
+        real_loc = real_loc_all[real_loc_all >= 0]
+        pool_slots = torch.cat([valid_slots, real_loc])
+
+        blocks = torch.cat(
+            [
+                pool_slots // page_size,
+                torch.zeros(1, dtype=pool_slots.dtype, device=device),
+            ]
+        )
+        unique_blocks = torch.unique(blocks)
+
+        num_unique = int(unique_blocks.shape[0])
+        if num_unique > max_blocks_on_package:
+            raise RuntimeError(
+                f"LC block-wise swap: needed {num_unique} local blocks but "
+                f"HBW buffer only holds {max_blocks_on_package}. "
+                f"Increase SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS."
+            )
+
+        ddr_block_ids = unique_blocks.to(torch.int32)
+        hbw_block_ids = torch.arange(
+            num_unique, dtype=torch.int32, device=device
+        )
+        max_ddr_block = int(unique_blocks.max().item())
+        ddr_to_hbw = torch.full(
+            (max_ddr_block + 1,), -1, dtype=torch.int32, device=device
+        )
+        ddr_to_hbw[ddr_block_ids] = hbw_block_ids
+
+        # Slot-level remap table: DDR flat slot -> HBM flat position
+        # (hbm_block * page_size + offset). Slots whose block is not in this
+        # step's set remap to a negative value (never read: the kernel scans
+        # only the fill_len prefix, whose slots are all in the set).
+        max_slot = (
+            int(pool_slots.max().item()) if pool_slots.numel() > 0 else page_size - 1
+        )
+        slots_range = torch.arange(max_slot + 1, device=device)
+        hbw_of_block = ddr_to_hbw[slots_range // page_size]
+        slot_map = hbw_of_block * page_size + (slots_range % page_size)
+        slot_map[hbw_of_block < 0] = -1
+
+        # Remapped index buffer (persistent fixed-shape, graph input). The
+        # DDR-space ``long_context_indices`` stays the source of truth for
+        # the incremental row maintenance.
+        hbm_indices = metadata.long_context_hbm_indices
+        if hbm_indices is None or hbm_indices.shape != indices.shape:
+            hbm_indices = torch.full_like(indices, -1)
+            metadata.long_context_hbm_indices = hbm_indices
+        remapped = slot_map[indices.clamp(0, max_slot)]
+        remapped[indices < 0] = -1
+        hbm_indices.copy_(remapped)
+
+        # Remapped write positions for this step's new K/V (HBM flat
+        # positions). Default to the reserved safe block (never read by
+        # attention); real rows get their slot-mapped position, foreign rows
+        # (loc = -1) keep -1 so the write kernel skips them.
+        safe_block_pos = (max_blocks_on_package - 1) * page_size
+        hbw_cache_loc = torch.full(
+            (loc.shape[0],), safe_block_pos, dtype=torch.int64, device=device
+        )
+        real_rows = slot_map[loc[real_start:real_end].clamp(0, max_slot)].to(
+            torch.int64
+        )
+        real_rows[loc[real_start:real_end] < 0] = -1
+        hbw_cache_loc[real_start:real_end] = real_rows
+
+        swap_mgr.set_blockwise_block_ids(
+            ddr_block_ids,
+            hbw_block_ids,
+            page_size,
+            ddr_to_hbw,
+            None,  # remapped block_table: the LC sparse kernel is index-driven
+            real_loc // page_size,
+            real_loc % page_size,
+        )
+        swap_mgr.set_blockwise_swap_cache_loc(hbw_cache_loc, 0)
 
     def _blockwise_token_row_slice(
         self, forward_batch: ForwardBatch
@@ -1179,10 +1345,16 @@ class KunpengCpuBackend(AttentionBackend):
         # (seqlen_q == 1) read row 0 only.
         # Direct-write form of the graph op: o_view/lse_view (the persistent
         # SHM region views) are the kernel's output buffers.
+        # With block-wise KV swap the kernel reads the compacted HBM swap
+        # buffer, so the indices must be the per-step remapped copy
+        # (_init_lc_blockwise_metadata); without swap they are the DDR slots.
+        lc_indices = meta.long_context_indices[:, :seqlen_q, :]
+        if meta.long_context_hbm_indices is not None:
+            lc_indices = meta.long_context_hbm_indices[:, :seqlen_q, :]
         kunpeng.flash_mla_sparse_decode_kunpeng(
             q,
             kvcache_paged,
-            meta.long_context_indices[:, :seqlen_q, :],
+            lc_indices,
             meta.long_context_topk_length,
             o_view,
             lse_view,
