@@ -1337,6 +1337,19 @@ class SchedulerPPMixin:
                 batch.pp_mtp_accepted_tokens = pp_outputs.tensors.get(
                     "num_accepted_tokens", None
                 )
+                if (
+                    batch.pp_mtp_accepted_tokens is not None
+                    and batch.pp_mtp_accepted_tokens.numel() != batch.batch_size()
+                ):
+                    # A size mismatch means the last rank's running batch
+                    # diverged from ours (e.g. a finish-check disagreement);
+                    # fail loudly instead of corrupting state downstream.
+                    raise RuntimeError(
+                        "PP+MTP: num_accepted_tokens size "
+                        f"({batch.pp_mtp_accepted_tokens.numel()}) != batch size "
+                        f"({batch.batch_size()}); PP ranks' running batches "
+                        "have desynced"
+                    )
                 _ppmtp_log(
                     self,
                     f"recv_drafts_via_ring: stashed for "
