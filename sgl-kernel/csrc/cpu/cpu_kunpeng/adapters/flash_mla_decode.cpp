@@ -52,6 +52,11 @@ static KernelRegistrar _r_flash_mla_dense_decode(
 // The kernel's c10::optional<at::Tensor> meta is exposed as a plain tensor
 // in the graph dispatch signature (the graph engine does not handle
 // optional-tensor argument types).
+//
+// The dispatch signature MUST match the Python call order exactly (graph
+// dispatch extracts tensors/scalars by type, in positional order): o and
+// softmax_lse are the persistent SHM region views passed IN as outputs, so
+// there is exactly ONE scalar (softmax_scale) and no head_dim_v argument.
 void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache,
                                      at::Tensor indices, at::Tensor topk_length,
                                      at::Tensor o, at::Tensor softmax_lse,
@@ -60,11 +65,10 @@ void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache,
 
 void flash_mla_sparse_decode_graph(at::Tensor q, at::Tensor kcache,
                                    at::Tensor indices, at::Tensor topk_length,
-                                   at::Tensor extra_buffer, at::Tensor meta,
                                    at::Tensor o, at::Tensor softmax_lse,
-                                   double softmax_scale, int64_t head_dim_v)
+                                   double softmax_scale,
+                                   at::Tensor extra_buffer, at::Tensor meta)
 {
-    (void)head_dim_v;
     flash_mla_sparse_decode_kunpeng(
         q, kcache, indices, topk_length, o, softmax_lse,
         softmax_scale, extra_buffer, meta);

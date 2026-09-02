@@ -124,7 +124,7 @@ fi
 
 # Source config for the specified role
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET" skip-conda
+source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET"
 
 mkdir -p "$LOG_DIR"
 

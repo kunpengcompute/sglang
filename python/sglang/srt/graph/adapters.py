@@ -1001,36 +1001,31 @@ def _setup_flash_mla_dense_decode_kunpeng():
 
 
 def _setup_flash_mla_sparse_decode_kunpeng():
-    def shape_infer(q, kcache, indices, topk_length, softmax_scale,
-                    extra_buffer, meta, head_dim_v):
-        bsz = q.shape[0]
-        seq_len = q.shape[1]
-        n_heads = q.shape[2]
-        return [((bsz, seq_len, n_heads, head_dim_v), torch.bfloat16),
-                ((bsz, seq_len, n_heads), torch.float32)]
+    # Sparse paged MLA decode (long-context decode CP only). Writes O/LSE
+    # directly into the caller-provided persistent SHM region views (fixed
+    # storage), so shape_infer returns nothing -- the outputs are inputs.
+    def shape_infer(q, kcache, indices, topk_length, o, softmax_lse,
+                    softmax_scale, extra_buffer, meta):
+        return []
 
-    def eager_fn(q, kcache, indices, topk_length, softmax_scale,
-                 extra_buffer, meta, head_dim_v):
-        bsz = q.shape[0]
-        seq_len = q.shape[1]
-        n_heads = q.shape[2]
-        o = torch.empty((bsz, seq_len, n_heads, head_dim_v), dtype=torch.bfloat16)
-        softmax_lse = torch.empty((bsz, seq_len, n_heads), dtype=torch.float32)
+    def eager_fn(q, kcache, indices, topk_length, o, softmax_lse,
+                 softmax_scale, extra_buffer, meta):
         torch.ops.sgl_kernel.flash_mla_sparse_decode_kunpeng(
             q, kcache, indices, topk_length, o, softmax_lse,
             float(softmax_scale), extra_buffer, meta)
-        return o, softmax_lse
+        return None
 
     register_op('flash_mla_sparse_decode_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_shm_mla_o_alltoall_long_context_kunpeng():
-    def shape_infer(o, lse, real_topk_length, o_out, lse_out, topk_out):
+    # Zero-copy pure-read exchange over the persistent SHM regions (the
+    # flash MLA writes O/LSE into them directly via lc_stage_base_buffers).
+    def shape_infer(o_out, lse_out):
         return []
 
-    def eager_fn(o, lse, real_topk_length, o_out, lse_out, topk_out):
-        torch.ops.sgl_kernel.shm_mla_o_alltoall_long_context_kunpeng(
-            o, lse, real_topk_length, o_out, lse_out, topk_out)
+    def eager_fn(o_out, lse_out):
+        torch.ops.sgl_kernel.shm_mla_o_alltoall_long_context_kunpeng(o_out, lse_out)
         return None
 
     register_op(
@@ -1040,13 +1035,25 @@ def _setup_shm_mla_o_alltoall_long_context_kunpeng():
     )
 
 
-def _setup_flash_mla_reduce_kunpeng():
-    def shape_infer(o_contrib, lse_contrib, topk_length, out):
+def _setup_lc_mark_empty_lse_kunpeng():
+    # Overwrite staged LSE with +INFINITY for rows whose local KV count is 0
+    # (empty shard => weight 0 in flash_mla_reduce).
+    def shape_infer(lse, real_topk_length):
         return []
 
-    def eager_fn(o_contrib, lse_contrib, topk_length, out):
-        torch.ops.sgl_kernel.flash_mla_reduce_kunpeng(
-            o_contrib, lse_contrib, topk_length, out)
+    def eager_fn(lse, real_topk_length):
+        torch.ops.sgl_kernel.lc_mark_empty_lse_kunpeng(lse, real_topk_length)
+        return None
+
+    register_op('lc_mark_empty_lse_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_flash_mla_reduce_kunpeng():
+    def shape_infer(input, softmax_lse, out):
+        return []
+
+    def eager_fn(input, softmax_lse, out):
+        torch.ops.sgl_kernel.flash_mla_reduce_kunpeng(input, softmax_lse, out)
         return None
 
     register_op('flash_mla_reduce_kunpeng', shape_infer, eager_fn)
@@ -1219,6 +1226,7 @@ def setup():
     _setup_flash_mla_dense_decode_kunpeng()
     _setup_flash_mla_sparse_decode_kunpeng()
     _setup_shm_mla_o_alltoall_long_context_kunpeng()
+    _setup_lc_mark_empty_lse_kunpeng()
     _setup_flash_mla_reduce_kunpeng()
     _setup_flash_attention_with_workspace_kunpeng()
     _setup_gather_split_latent_paged_kunpeng()

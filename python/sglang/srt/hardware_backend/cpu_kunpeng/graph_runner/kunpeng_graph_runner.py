@@ -529,13 +529,21 @@ class KunpengGraphRunner:
                         meta.long_context_real_topk_length,
                     ]
                 )
+                if meta.long_context_hbm_indices is not None:
+                    # LC + block-wise KV swap: the per-step slot-remapped
+                    # index buffer consumed by the sparse flash MLA kernel
+                    # (reads the compacted HBM swap buffer).
+                    inputs.append(meta.long_context_hbm_indices)
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 # Block-wise swap: the block_table passed to the attention
                 # kernel is the remapped (HBM slot) version; the per-step
                 # DDR/HBW block ids and the remapped cache_loc (for writing
                 # new K/V into HBM) must be registered as graph inputs too.
-                # meta.block_table is at index 3 here.
-                inputs[3] = self.swap_mgr._blockwise_remapped_block_table
+                # meta.block_table is at index 3 here. LC decode CP is
+                # index-driven (no block_table consumer), so the replacement
+                # only applies when a block_table was actually added.
+                if meta.block_table is not None:
+                    inputs[3] = self.swap_mgr._blockwise_remapped_block_table
                 inputs.append(self.swap_mgr._blockwise_hbw_cache_loc)
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)
@@ -551,7 +559,12 @@ class KunpengGraphRunner:
             if meta is not None:
                 inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
                 if self.swap_mgr._blockwise_ddr_block_ids is not None:
-                    inputs[-3] = self.swap_mgr._blockwise_remapped_block_table
+                    # Only replace when a block_table entry exists (non-LC
+                    # extend); LC decode CP is index-driven and has no
+                    # block_table (meta.block_table is None there, and the
+                    # LC remapped table is None too).
+                    if meta.block_table is not None:
+                        inputs[-3] = self.swap_mgr._blockwise_remapped_block_table
             if getattr(self.model_runner.attn_backend, "_lc_enabled", False) and (
                 forward_mode.is_target_verify() or forward_mode.is_draft_extend()
             ):
@@ -571,6 +584,10 @@ class KunpengGraphRunner:
                         meta.long_context_real_topk_length,
                     ]
                 )
+                if meta.long_context_hbm_indices is not None:
+                    # LC + block-wise KV swap: per-step slot-remapped index
+                    # buffer consumed by the sparse flash MLA kernel.
+                    inputs.append(meta.long_context_hbm_indices)
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)
@@ -681,6 +698,17 @@ class KunpengGraphRunner:
                 fixed.append(metadata.logical_to_all_physical_map_num_valid)
         except Exception:
             pass
+        # Long-context decode CP: the persistent SHM region views the sparse
+        # flash MLA writes O/LSE into directly (lc_stage_base_buffers_kunpeng,
+        # initialized at backend construction -- always exists here). Each
+        # layer derives slice views (o_base[:b*sq], lse_base[:b*sq]) from
+        # them, so the FULL base tensors must be registered as fixed storage
+        # or the slice lookup fails with "non-return-value parameter tensor
+        # not registered".
+        stage_base = self.model_runner.attn_backend._lc_stage_base
+        if stage_base is not None:
+            fixed.append(stage_base[0])
+            fixed.append(stage_base[1])
         return fixed
 
     def _graph_forward(

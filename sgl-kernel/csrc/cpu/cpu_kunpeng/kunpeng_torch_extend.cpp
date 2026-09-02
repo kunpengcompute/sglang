@@ -19,6 +19,8 @@
 #include <torch/library.h>
 #include <torch/extension.h>
 
+#include <tuple>
+
 #include "sgl_kernel_ops.h"
 
 #include "cpu_kunpeng/graph/init_graph_cpp.h"
@@ -315,15 +317,20 @@ void shm_mla_alltoall_finalize_kunpeng();
 void shm_mla_alltoall_long_context_init_kunpeng(int64_t group_size, int64_t max_batch, int64_t kv_lora_rank,
                                                 int64_t num_local_heads, int64_t num_heads);
 
-void shm_mla_o_alltoall_long_context_kunpeng(at::Tensor o_tensor, at::Tensor lse_tensor,
-                                             at::Tensor real_topk_length_tensor, at::Tensor o_out_tensor,
-                                             at::Tensor lse_out_tensor, at::Tensor topk_out_tensor);
+// Persistent SHM region views for the direct-write flash MLA (call once
+// eagerly; returns (o_base, lse_base) from_blob tensors).
+std::tuple<at::Tensor, at::Tensor> lc_stage_base_buffers_kunpeng();
+
+// Mark empty local shards (real_topk_length == 0) with LSE = +INFINITY.
+void lc_mark_empty_lse_kunpeng(at::Tensor lse_tensor, at::Tensor real_topk_length_tensor);
+
+// Zero-copy pure-read exchange over the persistent SHM regions.
+void shm_mla_o_alltoall_long_context_kunpeng(at::Tensor o_out_tensor, at::Tensor lse_out_tensor);
 
 void shm_mla_alltoall_long_context_finalize_kunpeng();
 
 // SHM MLA long-context partial-output reduce (online-softmax merge over cp)
-void flash_mla_reduce_kunpeng(at::Tensor o_contrib_tensor, at::Tensor lse_contrib_tensor,
-                              at::Tensor topk_length_tensor, at::Tensor out_tensor);
+void flash_mla_reduce_kunpeng(at::Tensor input_tensor, at::Tensor softmax_lse_tensor, at::Tensor out_tensor);
 
 // === Embedding Ëã×ÓÉùÃ÷ ===
 at::Tensor embedding_kunpeng(at::Tensor indices, at::Tensor weight, at::Tensor output, int64_t org_vocab_start,
@@ -855,17 +862,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int kv_lora_rank, int num_local_heads, int num_heads) -> ()");
     m.impl("shm_mla_alltoall_long_context_init_kunpeng", shm_mla_alltoall_long_context_init_kunpeng);
 
-    m.def(
-        "shm_mla_o_alltoall_long_context_kunpeng(Tensor o, Tensor lse, Tensor real_topk_length, "
-        "Tensor(a!) o_out, Tensor(a!) lse_out, Tensor(a!) topk_out) -> ()");
+    m.def("lc_stage_base_buffers_kunpeng() -> (Tensor, Tensor)");
+    m.impl("lc_stage_base_buffers_kunpeng", lc_stage_base_buffers_kunpeng);
+
+    m.def("lc_mark_empty_lse_kunpeng(Tensor(a!) lse, Tensor real_topk_length) -> ()");
+    m.impl("lc_mark_empty_lse_kunpeng", lc_mark_empty_lse_kunpeng);
+
+    m.def("shm_mla_o_alltoall_long_context_kunpeng(Tensor(a!) o_out, Tensor(a!) lse_out) -> ()");
     m.impl("shm_mla_o_alltoall_long_context_kunpeng", shm_mla_o_alltoall_long_context_kunpeng);
 
     m.def("shm_mla_alltoall_long_context_finalize_kunpeng() -> ()");
     m.impl("shm_mla_alltoall_long_context_finalize_kunpeng", shm_mla_alltoall_long_context_finalize_kunpeng);
 
-    m.def(
-        "flash_mla_reduce_kunpeng(Tensor o_contrib, Tensor lse_contrib, Tensor topk_length, "
-        "Tensor(a!) out) -> ()");
+    m.def("flash_mla_reduce_kunpeng(Tensor input, Tensor softmax_lse, Tensor(a!) out) -> ()");
     m.impl("flash_mla_reduce_kunpeng", flash_mla_reduce_kunpeng);
 
     // embedding
