@@ -196,7 +196,8 @@ class KunpengCommunicator:
             kernel.shm_mla_alltoall_init_kunpeng(
                 self.comm_size,
                 self.max_tokens,
-                192,   # qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+                576,   # absorb-path q head dim = kv_lora_rank (512, q_nope
+                       # absorbed by w_kc) + qk_rope_head_dim (64)
                 512,   # kv_lora_rank
                 num_heads // self.comm_size,  # num_local_heads
                 num_heads,
