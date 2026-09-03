@@ -285,7 +285,25 @@ fi
 
 if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
   RESULT_DIR=$(mktemp -d)
-  trap 'rm -rf "$RESULT_DIR"' EXIT
+  _cleaned=0
+  cleanup() {
+    # Idempotent cleanup: kill leftover send_request subshells first, wait for
+    # them to finish writing, then remove the temp dir. This avoids two races:
+    #   (a) "Directory not empty" (rm while children still write), and
+    #   (b) "No such file or directory" (dir removed while children still write).
+    if [ "$_cleaned" != "1" ]; then
+      _cleaned=1
+      kill $(jobs -pr) 2>/dev/null
+      wait 2>/dev/null
+      rm -rf -- "$RESULT_DIR" 2>/dev/null || true
+    fi
+  }
+  # EXIT trap only cleans up; INT/TERM must actually exit, otherwise the
+  # interrupted script resumes and touches RESULT_DIR/all_latencies after the
+  # dir was removed ("No such file or directory").
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   # Unique run ID for correlating with router logs (router uses X-Request-Id header)
   RUN_ID="curl-$(date +%s)-$$"
@@ -389,6 +407,63 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
   START_NS=$(date +%s%N)
   printf -v WALL_START '%d.%09d' $((START_NS / 1000000000)) $((START_NS % 1000000000))
 
+  # Live progress bar on stderr: counts completed result files (tokens_* is
+  # written last by send_request), refreshed every 0.5s. Doesn't pollute the
+  # final stdout stats. Killed after wait.
+  # Safety: also bounded by a wall-clock cap so it can NEVER outlive the main
+  # `wait` (which would block script exit forever if some requests fail and
+  # tokens_* never reaches NUM_REQUESTS).
+  _PROG_PID=""
+  if [ "$NUM_REQUESTS" -gt 0 ]; then
+    (
+      _S_W=28
+      _PROG_FIRST=1
+      while :; do
+        # Sent = rid_* (written before each curl fires); Done = time_* (written
+        # after EVERY request ends, success or fail). Both monotone and every
+        # request writes both, so Done always reaches NUM_REQUESTS.
+        _PROG_SENT=$(ls "$RESULT_DIR"/rid_* 2>/dev/null | wc -l)
+        _PROG_DONE=$(ls "$RESULT_DIR"/time_* 2>/dev/null | wc -l)
+        _PROG_PCT=$(( _PROG_DONE * 100 / NUM_REQUESTS ))
+        _S_FILL=$(( _PROG_SENT * _S_W / NUM_REQUESTS ))
+        _D_FILL=$(( _PROG_DONE * _S_W / NUM_REQUESTS ))
+        if [ "$_PROG_FIRST" -eq 1 ]; then
+          # First render: print both lines once.
+          printf "\r  Sent [%s%s] %d/%d%s\n" \
+            "$(printf '%*s' "$_S_FILL" '' | tr ' ' '#')" \
+            "$(printf '%*s' $((_S_W - _S_FILL)) '')" \
+            "$_PROG_SENT" "$NUM_REQUESTS" $'\033[K' >&2
+          printf "  Done [%s%s] %d/%d (%d%%)%s" \
+            "$(printf '%*s' "$_D_FILL" '' | tr ' ' '#')" \
+            "$(printf '%*s' $((_S_W - _D_FILL)) '')" \
+            "$_PROG_DONE" "$NUM_REQUESTS" "$_PROG_PCT" $'\033[K' >&2
+          _PROG_FIRST=0
+        else
+          # Later ticks: cursor is on the Done line (below Sent), so move up
+          # ONE line (\033[1A) back to Sent, then redraw both lines.
+          printf "\033[1A\r  Sent [%s%s] %d/%d%s\n" \
+            "$(printf '%*s' "$_S_FILL" '' | tr ' ' '#')" \
+            "$(printf '%*s' $((_S_W - _S_FILL)) '')" \
+            "$_PROG_SENT" "$NUM_REQUESTS" $'\033[K' >&2
+          printf "  Done [%s%s] %d/%d (%d%%)%s" \
+            "$(printf '%*s' "$_D_FILL" '' | tr ' ' '#')" \
+            "$(printf '%*s' $((_S_W - _D_FILL)) '')" \
+            "$_PROG_DONE" "$NUM_REQUESTS" "$_PROG_PCT" $'\033[K' >&2
+        fi
+        [ "$_PROG_DONE" -ge "$NUM_REQUESTS" ] && break
+        sleep 0.5
+      done
+      _D_FILL=$(( _PROG_DONE * _S_W / NUM_REQUESTS ))
+      printf "\033[1A\r  Sent [%s] %d/%d%s\n" \
+        "$(printf '%*s' "$_S_W" '' | tr ' ' '#')" \
+        "$_PROG_SENT" "$NUM_REQUESTS" $'\033[K' >&2
+      printf "  Done [%s] %d/%d (%d%%)%s\n" \
+        "$(printf '%*s' "$_D_FILL" '' | tr ' ' '#')" \
+        "$_PROG_DONE" "$NUM_REQUESTS" "$_PROG_PCT" $'\033[K' >&2
+    ) &
+    _PROG_PID=$!
+  fi
+
   for ((i = 0; i < NUM_REQUESTS; i++)); do
     read -u 3
     {
@@ -410,6 +485,11 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
   done
 
   wait
+  # Stop the progress monitor (it normally exits at 100%, this is a safety net).
+  if [ -n "$_PROG_PID" ]; then
+    kill "$_PROG_PID" 2>/dev/null
+    wait "$_PROG_PID" 2>/dev/null
+  fi
   WALL_END=$(date +%s.%N)
   exec 3>&-
 
