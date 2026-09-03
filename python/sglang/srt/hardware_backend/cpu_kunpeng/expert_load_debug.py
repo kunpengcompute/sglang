@@ -25,7 +25,7 @@ forward steps and saves the raw snapshot list to a per-rank JSON file under
 ``LOG_DIR`` (no layer attribution here, no digest logging).  Layer
 attribution (from pp/mtp deployment options) and the cross-rank aggregation
 with the virtual -> physical expert mapping are done offline by
-``scripts/cpu_kunpeng/expert_load_stats.py``.
+``scripts/cpu_kunpeng/analysis/expert_load_stats.py``.
 """
 
 import json

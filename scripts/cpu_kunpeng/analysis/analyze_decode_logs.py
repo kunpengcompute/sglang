@@ -547,11 +547,12 @@ def split_logs_by_tp(input_file, output_dir):
 
 def resolve_log_base_dir(script_dir):
     """Resolve LOG_BASE_DIR from the environment, falling back to the value
-    declared in scripts/cpu_kunpeng/.user_env.sh."""
+    declared in scripts/cpu_kunpeng/.user_env.sh (one directory above this
+    script, which lives in cpu_kunpeng/analysis/)."""
     log_base = os.environ.get("LOG_BASE_DIR")
     if log_base:
         return log_base
-    user_env = os.path.join(script_dir, ".user_env.sh")
+    user_env = os.path.join(script_dir, os.pardir, ".user_env.sh")
     try:
         with open(user_env, "r", encoding="utf-8") as f:
             for line in f:
@@ -587,7 +588,7 @@ def find_latest_rank0_log(log_base_dir):
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Default output goes next to this script (scripts/cpu_kunpeng/outputs,
+    # Default output goes next to this script (scripts/cpu_kunpeng/analysis/outputs,
     # already covered by the "outputs/" rule in .gitignore), regardless of
     # the current working directory.
     output_dir = (
