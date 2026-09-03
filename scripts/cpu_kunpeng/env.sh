@@ -254,7 +254,7 @@ export KUPL_SHM_ENABLE_HUGEPAGE=y
 # Kunpeng HBW pool
 export SGLANG_ENABLE_HBW_POOL=1
 export SGLANG_KUNPENG_MEMORY_ALIGNMENT=4096
-export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=3900
+export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB=3400
 export SGLANG_KUNPENG_SWAP_KV_IN=0
 export SGLANG_KUNPENG_SWAP_KV_OUT=0
 export SGLANG_KUNPENG_SWAP_KV_BLOCKWISE=0
@@ -273,9 +273,9 @@ export SGLANG_KUNPENG_SDMA_THRESHOLD=5
 # Kunpeng graph capture
 export SGLANG_ENABLE_GRAPH_CAPTURE=1
 export SGLANG_ENABLE_GRAPH_PROFILE=0
-export SGLANG_KUNPENG_GRAPH_CACHE_SIZE=8
+export SGLANG_KUNPENG_GRAPH_CACHE_SIZE=10
 # Kunpeng prefill graph padding to power 2 size
-export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=0
+export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1
 # Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
 # Other options
@@ -330,6 +330,7 @@ if [[ "$IS_PREFILL" == "1" ]]; then
     export SGLANG_KUNPENG_MAX_CUR_LEN="${SGLANG_KUNPENG_MAX_CUR_LEN:-512}"
     export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-4096}"
 else
+    # Equivalent to MAX_SEQ_NUM / PP_SIZE in DeepSeek-V3-Sample (max_seq_num_per_mb):
     export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-64}"
     # Decode MTP speculates 1 extra token per step: cur len must be 2
     if [[ -z "${SGLANG_KUNPENG_MAX_CUR_LEN:-}" ]]; then
@@ -440,6 +441,15 @@ esac
 
 if [[ "$ACTION" == "router" && "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
     export RAYON_NUM_THREADS=32
+fi
+
+# Static routing (matches DeepSeek-V3-Sample 64p/128p-decode toml
+# enable_static_routing=1): enabled for decode when DP size >= 32
+# (tp8*dp32 pp2 / tp8*dp64 pp2).
+if [[ "$IS_PREFILL" != "1" && "${DP_SIZE:-0}" -ge 32 ]]; then
+    export ENABLE_STATIC_ROUTING="${ENABLE_STATIC_ROUTING:-0}"
+else
+    export ENABLE_STATIC_ROUTING="${ENABLE_STATIC_ROUTING:-0}"
 fi
 
 source "${SCRIPT_DIR}/.time_env.sh"

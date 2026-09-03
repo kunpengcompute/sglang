@@ -38,6 +38,9 @@ usage() {
   echo "  -s          Enable streaming mode"
   echo "  -f FILE     Prompt file, one prompt per line (default: prompts/128.txt)"
   echo "  -n NUM      Number of requests to send (default: all lines from file)"
+  echo "  -F          Fake-transfer mode: inject bootstrap_host=2.2.2.2 + a unique"
+  echo "              bootstrap_room per request; decode skips KV transfer without"
+  echo "              --disaggregation-transfer-backend. Port defaults to 30002."
   echo ""
   echo "  --- round-robin & paced batch only ---"
   echo "  -c CONC     Max concurrent requests (default: 256; paced batch defaults to unbounded)"
@@ -60,14 +63,16 @@ PROMPT_FILE="prompts/128.txt"
 ROUND_ROBIN=false
 RATE=32
 PACED=false
+FAKE=false
 
-while getopts "d:hipsvn:m:c:r:f:" opt; do
+while getopts "d:hiFpsvn:m:c:r:f:" opt; do
   case $opt in
     h) usage ;;
     i) INTERACTIVE=true ;;
     p) PROFILE=true ;;
     s) STREAM=true ;;
     v) VERBOSE=true ;;
+    F) FAKE=true ;;
     d) DP_ENABLED=true; DP_RANK=$OPTARG ;;
     n) NUM_REQUESTS=$OPTARG ;;
     c) CONCURRENCY=$OPTARG; CONCURRENCY_SET=true ;;
@@ -140,9 +145,27 @@ parse_ranks() {
   echo "${ranks[*]}"
 }
 
-IP=$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-PORT=30000
+# Target host/port: defaults to the local NIC (in-cluster router/instance).
+# Override to hit a standalone decode master directly, e.g. fake-transfer
+# decode-throughput tests:
+#   CURL_HOST=<decode master IP> ./curl.sh -d 0-15 -n 512 -m 384
+# With -F (fake transfer), the port defaults to 30002 — the decode tokenizer
+# HTTP server on the route node — so the IP needs no adjustment.
+IP=${CURL_HOST:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}
+if [ "$FAKE" = true ]; then
+  PORT=${CURL_PORT:-30002}
+else
+  PORT=${CURL_PORT:-30000}
+fi
 URL="http://${IP}:${PORT}/v1/completions"
+
+# Fake-transfer injection: per-request unique bootstrap_room (ns timestamp
+# base) + the magic fake host recognized by decode._is_fake_transfer.
+FAKE_LINE=""
+if [ "$FAKE" = true ]; then
+  ROOM_BASE=$(date +%s%N)
+  FAKE_LINE=",\"bootstrap_host\": \"2.2.2.2\""
+fi
 
 # =============================================================================
 # Non-interactive dispatch: round-robin detection + profile start
@@ -198,12 +221,18 @@ if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ] && [ "$PACED" = fals
     DP_LINE=""
   fi
 
+  # Fake transfer: scalar bootstrap_room is auto-incremented per batch item
+  # by GenerateReqInput._normalize_bootstrap_params.
+  if [ "$FAKE" = true ]; then
+    FAKE_LINE="$FAKE_LINE,\"bootstrap_room\": $ROOM_BASE"
+  fi
+
   BODY="{
       \"model\": \"DeepSeek-R1\",
       \"prompt\": $PROMPT_JSON,
       \"stream\": $STREAM,
       \"max_tokens\": $MAX_TOKENS,
-      \"temperature\": 0$DP_LINE"
+      \"temperature\": 0$DP_LINE$FAKE_LINE"
 
   if [ "$STREAM" = true ]; then
     BODY+=",\"stream_options\":{\"include_usage\":true}"
@@ -316,6 +345,13 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     elif [ "$DP_ENABLED" = true ]; then
       rank_line=",\"routed_dp_rank\": $DP_RANK"
     fi
+    # Fake transfer: unique room per request + magic host; the decode side
+    # (_is_fake_transfer) then force-selects the FAKE receiver and decodes
+    # without any KV transfer.
+    local fake_line=""
+    if [ "$FAKE" = true ]; then
+      fake_line=",\"bootstrap_host\": \"2.2.2.2\",\"bootstrap_room\": $((ROOM_BASE + idx))"
+    fi
     local escaped
     escaped=$(json_escape "${PROMPTS[$((idx % ${#PROMPTS[@]}))]}")
 
@@ -324,7 +360,7 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
         \"prompt\": \"$escaped\",
         \"stream\": $STREAM,
         \"max_tokens\": $MAX_TOKENS,
-        \"temperature\": 0$rank_line"
+        \"temperature\": 0$rank_line$fake_line"
 
     if [ "$STREAM" = true ]; then
       body+=",\"stream_options\":{\"include_usage\":true}"
