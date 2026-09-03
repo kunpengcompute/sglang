@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <chrono>
 #include <cstring>
+#include <errno.h>
 #include <iostream>
 #include <numa.h>
 #include <numaif.h>
@@ -50,6 +51,14 @@ at::Tensor hbw_allocator_kunpeng(int64_t size)
         std::cerr << "    FAILED: errno=" << errno << " (" << strerror(errno) << ")" << std::endl;
         munmap(hbm, aligned_size);
         throw std::runtime_error("mbind to HBM NUMA node failed");
+    }
+
+    // Pre-mark the whole pool MADV_DONTFORK (same workaround as the SHM
+    // pool): ibv_reg_mr sub-range DONTFORK calls then no-op instead of
+    // splitting misaligned hugetlb VMAs (EINVAL). Buffers are RDMA-registered.
+    if (madvise(hbm, aligned_size, MADV_DONTFORK) != 0) {
+        std::cerr << "[KuTACC] WARNING: madvise(MADV_DONTFORK) on HBW pool failed: " << errno << " (" << strerror(errno)
+                  << "), RDMA reg_mr on HBW buffers may fail" << std::endl;
     }
 
     // Create a uint8 tensor that wraps the HBM memory directly (no copy)

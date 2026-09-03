@@ -98,7 +98,7 @@ class _KunpengDispatcherState:
 
         self.topk_weights_buf: Optional[torch.Tensor] = None
         self.topk_ids_index_buf: Optional[torch.Tensor] = None
-        # Contiguous [max_tokens, router_topk] int16 SHM buffer holding the
+        # Contiguous [max_tokens_per_mb, router_topk] int16 SHM buffer holding the
         # router's topk ids.  The router computes each rank's token slice
         # into this buffer, then shm_dual_allgather merges all slices into
         # one consistent full table; afterwards the ids are copied into the
@@ -116,7 +116,7 @@ class _KunpengDispatcherState:
         self.num_experts: int = 0
         self.num_local_experts: int = 0
         self.hidden_size: int = 0
-        self.max_tokens: int = 0
+        self.max_tokens_per_mb: int = 0
         self.num_max_dispatch_tokens_per_rank: int = 0
 
         self.dispatch_call_count: torch.Tensor = torch.tensor([0], dtype=torch.int64)
@@ -151,7 +151,7 @@ def _ensure_rdma_initialized(
     num_experts: int,
     num_local_experts: int,
     hidden_size: int,
-    max_tokens: int,
+    max_tokens_per_mb: int,
     num_max_dispatch_tokens_per_rank: int,
     use_static_route: bool,
 ) -> _KunpengDispatcherState:
@@ -171,13 +171,15 @@ def _ensure_rdma_initialized(
         state.num_experts = num_experts
         state.num_local_experts = num_local_experts
         state.hidden_size = hidden_size
-        state.max_tokens = max_tokens
+        state.max_tokens_per_mb = max_tokens_per_mb
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.router_topk = router_topk
         state.attn_tp_size = get_attn_tensor_model_parallel_world_size()
         state.attn_tp_rank = get_attn_tensor_model_parallel_rank()
         state.use_static_route = use_static_route
-        state.moe_token_multiple = max(4, state.router_topk)
+        # Per-expert recv multiplier for prefill; matches DeepSeek-V3-Sample
+        # (context.h: moe_token_multiple = 2). Only used in the prefill path.
+        state.moe_token_multiple = 2
         state.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
 
         state.parallel_policy = torch.empty(3, dtype=torch.int16)
@@ -299,47 +301,101 @@ def _init_rdma_comm(group: dist.ProcessGroup, ep_size: int, ep_rank: int):
         )
 
 
+def _hbw_pool_or_none():
+    """Return the process HBW pool if already initialized, else None.
+
+    The pool is created by KunpengGraphRunner.create() during ModelRunner
+    init, which runs before model loading (and thus before this module's
+    _init_buffers).  get_instance() without a size raises ValueError when
+    the pool does not exist (SGLANG_ENABLE_HBW_POOL=0).
+    """
+    try:
+        from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import (
+            KunpengHBWPool,
+        )
+
+        return KunpengHBWPool.get_instance()
+    except (ImportError, ValueError):
+        return None
+
+
 def _init_buffers(state: _KunpengDispatcherState):
     num_ranks = state.ep_size
     max_dispatch_tokens = state.num_max_dispatch_tokens_per_rank
     multiple = state.moe_token_multiple
 
+    # Communication buffers live on the HBW (on-package) pool when available,
+    # matching DeepSeek-V3-Sample init_low_latency() which allocates
+    # dispatch/combine buffers from on_package_memory.  Falls back to normal
+    # DDR tensors when the pool is disabled or not yet initialized.
+    hbw = _hbw_pool_or_none()
+
+    def _zeros(shape, dtype, name):
+        if hbw is not None:
+            t = hbw.alloc(shape, dtype)
+            t.zero_()
+            logger.info(
+                "[KunpengMoE rank=%s] %s allocated on HBW: ptr=%#x, shape=%s, "
+                "%d bytes (pool used=%d MB / %d MB)",
+                state.ep_rank,
+                name,
+                t.data_ptr(),
+                tuple(t.shape),
+                t.numel() * t.element_size(),
+                hbw.used_bytes // (1024 * 1024),
+                hbw.pool_size // (1024 * 1024),
+            )
+            return t
+        logger.info(
+            "[KunpengMoE rank=%s] %s allocated on DDR (HBW pool unavailable)",
+            state.ep_rank,
+            name,
+        )
+        return torch.zeros(shape, dtype=dtype)
+
     # activation data (hidden_size) + scale (4 bytes float32)
-    state.dispatch_send_buf = torch.zeros(
-        state.max_tokens, state.hidden_size + 4, dtype=torch.uint8
+    state.dispatch_send_buf = _zeros(
+        (state.max_tokens_per_mb, state.hidden_size + 4),
+        torch.uint8,
+        "dispatch_send_buf",
     )
 
     if state.is_prefill:
         state.dispatch_recv_size = (
             state.num_local_experts
             * multiple
-            * state.max_tokens
+            * state.max_tokens_per_mb
             * (state.hidden_size + 4)
             + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
+        )
+        state.dispatch_recv_buf = _zeros(
+            (state.dispatch_recv_size,), torch.uint8, "dispatch_recv_buf"
+        )
+        state.combine_send_buf = _zeros(
+            (
+                state.num_local_experts * multiple * state.max_tokens_per_mb,
+                state.hidden_size,
+            ),
+            torch.bfloat16,
+            "combine_send_buf",
         )
     else:
         state.dispatch_recv_size = (
             state.num_experts * max_dispatch_tokens * (state.hidden_size + 4)
             + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
         )
-
-    # TODO(kunpeng): The size of state.combine_send_buf should be handled separately
-    # in the PD (Prefill-Decode) disaggregated scenario.
-    # This is currently a workaround because there is a bug in the kutacc operator.
-    state.combine_send_buf = torch.zeros(
-        1,
-        state.num_experts * max_dispatch_tokens,
-        state.hidden_size,
-        dtype=torch.bfloat16,
-    )
-    state.dispatch_recv_buf = torch.zeros(state.dispatch_recv_size, dtype=torch.uint8)
+        state.dispatch_recv_buf = _zeros(
+            (state.dispatch_recv_size,), torch.uint8, "dispatch_recv_buf"
+        )
+        state.combine_send_buf = _zeros(
+            (state.num_experts * max_dispatch_tokens, state.hidden_size),
+            torch.bfloat16,
+            "combine_send_buf",
+        )
 
     if state.use_static_route:
-        if state.is_prefill:
-            raise ValueError("Prefill is not supported with static route")
-
         state.combine_recv_size = (
-            state.max_tokens * state.router_topk * state.hidden_size * 2
+            state.max_tokens_per_mb * state.router_topk * state.hidden_size * 2
         )
         state.combine_recv_buf = kernel.create_shm_tensor_kunpeng(
             torch.uint8, [state.combine_recv_size]
@@ -349,18 +405,20 @@ def _init_buffers(state: _KunpengDispatcherState):
         state.combine_recv_size = (
             max_dispatch_tokens * state.router_topk * state.hidden_size * 2
         )
-        state.combine_recv_buf = torch.zeros(state.combine_recv_size, dtype=torch.uint8)
+        state.combine_recv_buf = _zeros(
+            (state.combine_recv_size,), torch.uint8, "combine_recv_buf"
+        )
 
     if state.is_prefill:
         packed_recv_x_bytes = (
             state.num_local_experts
             * multiple
-            * state.max_tokens
+            * state.max_tokens_per_mb
             * (state.hidden_size + 4)
         )
         state.packed_recv_x = state.dispatch_recv_buf[:packed_recv_x_bytes].view(
             state.num_local_experts,
-            multiple * state.max_tokens,
+            multiple * state.max_tokens_per_mb,
             (state.hidden_size + 4),
         )
     else:
@@ -399,7 +457,8 @@ def _init_buffers(state: _KunpengDispatcherState):
 
     if state.is_prefill:
         state.recv_token_ids_buf = torch.zeros(
-            state.num_local_experts * multiple * state.max_tokens, dtype=torch.int32
+            state.num_local_experts * multiple * state.max_tokens_per_mb,
+            dtype=torch.int32,
         )
     else:
         state.recv_token_ids_buf = torch.zeros(
@@ -410,23 +469,23 @@ def _init_buffers(state: _KunpengDispatcherState):
     )
 
     state.combined_x = kernel.create_shm_tensor_kunpeng(
-        torch.bfloat16, [state.max_tokens, state.hidden_size]
+        torch.bfloat16, [state.max_tokens_per_mb, state.hidden_size]
     )
 
     state.topk_weights_buf = kernel.create_shm_tensor_kunpeng(
-        torch.float32, [state.max_tokens, state.router_topk]
+        torch.float32, [state.max_tokens_per_mb, state.router_topk]
     )
     state.topk_ids_flat_buf = kernel.create_shm_tensor_kunpeng(
-        torch.int16, [state.max_tokens, state.router_topk]
+        torch.int16, [state.max_tokens_per_mb, state.router_topk]
     )
     state.topk_ids_index_buf = kernel.create_shm_tensor_kunpeng(
-        torch.int16, [state.max_tokens, state.router_topk * 2]
+        torch.int16, [state.max_tokens_per_mb, state.router_topk * 2]
     )
     state.topk_ids_index_buf.zero_()
 
     logger.info(
         f"[KunpengMoE rank={state.ep_rank}] _init_buffers: "
-        f"max_dispatch_tokens={max_dispatch_tokens}, max_tokens={state.max_tokens}, "
+        f"max_dispatch_tokens={max_dispatch_tokens}, max_tokens_per_mb={state.max_tokens_per_mb}, "
         f"num_experts={state.num_experts}, num_local_experts={state.num_local_experts}, "
         f"use_static_route={state.use_static_route}, "
         f"dispatch_send_buf={state.dispatch_send_buf.shape}({state.dispatch_send_buf.dtype}), "
@@ -496,23 +555,33 @@ class KunpengDispatcher(BaseDispatcher):
         self.ep_size = get_moe_expert_parallel_world_size()
         self.ep_rank = get_moe_expert_parallel_rank()
         self.expert_per_rank = self.num_experts // self.ep_size
-        self.max_tokens = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")) * int(
-            os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024")
-        )
+        self.max_tokens_per_mb = int(
+            os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")
+        ) * int(os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024"))
         self.attn_tp_size = get_attn_tensor_model_parallel_world_size()
         self.attn_tp_rank = get_attn_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.dp_size = self.tp_size // self.attn_tp_size
-        self.use_static_route = use_static_route
+        # Static routing is configured via ENABLE_STATIC_ROUTING (same env as
+        # kutacc's cfg.use_static_route, so both sides always agree).  Matches
+        # DeepSeek-V3-Sample: enabled for decode with dp >= 32 (64p/128p),
+        # unsupported for prefill.
+        env_static = os.environ.get("ENABLE_STATIC_ROUTING", "0") == "1"
+        if env_static and os.environ.get("IS_PREFILL", "1") == "1":
+            raise ValueError(
+                "ENABLE_STATIC_ROUTING=1 is not supported for prefill "
+                "(same limitation as DeepSeek-V3-Sample)"
+            )
+        self.use_static_route = env_static or use_static_route
 
         if num_max_dispatch_tokens_per_rank is None:
+            # Matches DeepSeek-V3-Sample (context.cpp init_context):
+            #   (max_tokens_per_mb / dtp) * min(moe_comm_size / moe_ep, n_activated)
+            # where moe_comm_size / moe_ep == moe_tp == tp_size / ep_size (= 1
+            # in all supported scenarios).
             self.num_max_dispatch_tokens_per_rank = (
-                self.max_tokens // self.attn_tp_size
-            ) * min(self.expert_per_rank, self.router_topk)
-            # Per-slot dispatch-drain capacity must cover a whole non-chunked.
-            self.num_max_dispatch_tokens_per_rank = max(
-                self.num_max_dispatch_tokens_per_rank, self.max_tokens
-            )
+                self.max_tokens_per_mb // self.attn_tp_size
+            ) * min(self.tp_size // self.ep_size, self.router_topk)
         else:
             self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
 
@@ -531,7 +600,7 @@ class KunpengDispatcher(BaseDispatcher):
             num_experts=self.num_experts,
             num_local_experts=self.num_local_experts,
             hidden_size=self.hidden_size,
-            max_tokens=self.max_tokens,
+            max_tokens_per_mb=self.max_tokens_per_mb,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             use_static_route=self.use_static_route,
         )
@@ -563,7 +632,7 @@ class KunpengDispatcher(BaseDispatcher):
         # the actual batch_size = num_tokens * attn_tp_size.
         # TP rank i writes into rows [i * num_tokens : (i+1) * num_tokens].
         t_quant_and_copy_start = time.perf_counter()
-        norm_int8_and_scale = state.dispatch_send_buf[: self.max_tokens]
+        norm_int8_and_scale = state.dispatch_send_buf[: self.max_tokens_per_mb]
         _tp_offset = self.attn_tp_rank * num_tokens
         _tp_count = num_tokens
 
@@ -645,7 +714,7 @@ class KunpengDispatcher(BaseDispatcher):
             state.ep_size,
             state.num_local_experts,
             state.num_max_dispatch_tokens_per_rank,
-            state.max_tokens,
+            state.max_tokens_per_mb,
             state.moe_token_multiple,
             state.is_prefill,
         )
