@@ -1192,11 +1192,11 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def check_finished(self, new_accepted_len: int = 1):
+    def check_finished(self, new_accepted_len: int = 1, skip_to_finish: bool = False):
         if self.finished():
             return
 
-        if self.to_finish:
+        if self.to_finish and not skip_to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None
             return
@@ -1426,6 +1426,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # PP + MTP: set by the scheduler (scheduler_pp_mixin) to carry the per-req
     # accepted token count for the result processing on non-last PP ranks.
     pp_mtp_accepted_tokens: Optional[torch.Tensor] = None
+
+    # PP + MTP: per-req finish verdict of the last rank's verify round,
+    # derived from the `-1` draft placeholders in the ring message
+    # (`draft_tokens[i] < 0` <=> the last rank finished req i this round).
+    # Consumed by `_pp_mtp_apply_verify_result` to reconcile the replicated
+    # finish state on non-last ranks (single-arbiter finish semantics).
+    pp_mtp_ring_finished: Optional[List[bool]] = None
 
     # For processing logprobs
     return_logprob: bool = False

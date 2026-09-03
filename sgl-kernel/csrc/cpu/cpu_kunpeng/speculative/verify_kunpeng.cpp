@@ -96,17 +96,22 @@ struct FinishState
 // Reproduces the exact `req.check_finished()` semantics for one accepted
 // token under the pure-token MTP config (FINISH_LENGTH -> token-based ->
 // vocab boundary), matching verify_finish_kunpeng (now removed).
+//
+// `ignore_eos` mirrors the early-return of `Req._check_token_based_finish`
+// (schedule_batch.py): it gates the whole stop/eos matching block (both
+// stop_token_ids and the per-req eos set), while FINISH_LENGTH (checked
+// before) and the vocab-boundary branch (checked after) stay active.
 FinishState check_finish_token(int32_t tok, int64_t cur_out_len, int64_t mnt, int64_t vs,
                                const int32_t *stop_flat, int64_t stop_begin, int64_t stop_end,
                                const int32_t *eos_flat, int64_t eos_begin, int64_t eos_end,
-                               bool use_tokenizer_eos, int64_t tokenizer_eos)
+                               bool ignore_eos)
 {
     FinishState st{-1, 0, 0, false};
     if (cur_out_len >= mnt) {
         st = {0, mnt, (int32_t)mnt, true};
         return st;
     }
-    if (stop_begin < stop_end || eos_begin < eos_end || (use_tokenizer_eos && tokenizer_eos >= 0)) {
+    if (!ignore_eos && (stop_begin < stop_end || eos_begin < eos_end)) {
         bool matched_eos = false;
         for (int64_t si = stop_begin; si < stop_end; si++) {
             if (tok == stop_flat[si]) {
@@ -122,9 +127,6 @@ FinishState check_finish_token(int32_t tok, int64_t cur_out_len, int64_t mnt, in
                 }
             }
         }
-        if (!matched_eos && use_tokenizer_eos && tokenizer_eos >= 0 && tok == (int32_t)tokenizer_eos) {
-            matched_eos = true;
-        }
         if (matched_eos) {
             st = {1, tok, (int32_t)cur_out_len, true};
             return st;
@@ -135,6 +137,29 @@ FinishState check_finish_token(int32_t tok, int64_t cur_out_len, int64_t mnt, in
         return st;
     }
     return st;
+}
+
+// Vocab-boundary repair, mirroring `Req._check_vocab_boundary_finish`
+// (schedule_batch.py:1179-1193): an out-of-range token is replaced in place,
+// first trying `next(iter(sampling_params.stop_token_ids))` then
+// `next(iter(eos_token_ids))` (two independent ifs, the latter wins).  If both
+// sets are empty the token is kept as-is (same as the Python path).  Note the
+// replacement is NOT gated by ignore_eos (neither is it in Python).
+inline int32_t repair_vocab_boundary_token(int32_t tok, int64_t vs, const int32_t *stop_flat,
+                                           int64_t stop_begin, int64_t stop_end,
+                                           const int32_t *eos_flat, int64_t eos_begin,
+                                           int64_t eos_end)
+{
+    if (tok <= vs && tok >= 0) {
+        return tok;
+    }
+    if (stop_begin < stop_end) {
+        return stop_flat[stop_begin];
+    }
+    if (eos_begin < eos_end) {
+        return eos_flat[eos_begin];
+    }
+    return tok;
 }
 
 }  // namespace
@@ -154,7 +179,7 @@ FinishState check_finish_token(int32_t tok, int64_t cur_out_len, int64_t mnt, in
 //   vocab_size      [bs] int32
 //   stop_ids_flat   [N_stop] int32 / stop_ids_off [bs+1] int32
 //   eos_ids_flat    [N_eos] int32  / eos_ids_off  [bs+1] int32
-//   tokenizer_eos   int64, use_tokenizer_eos bool
+//   ignore_eos      [bs] bool      : per-req gating of the stop/eos match block
 //   nv              int64               : draft_token_num (=2, root+draft)
 //   page_size       int64
 //   req_pool_indices[bs] int64
@@ -188,7 +213,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     at::Tensor seq_lens, at::Tensor out_cache_loc, at::Tensor output_ids_len,
     at::Tensor max_new_tokens, at::Tensor vocab_size, at::Tensor stop_ids_flat,
     at::Tensor stop_ids_off, at::Tensor eos_ids_flat, at::Tensor eos_ids_off,
-    int64_t tokenizer_eos, bool use_tokenizer_eos, int64_t nv, int64_t page_size,
+    at::Tensor ignore_eos, int64_t nv, int64_t page_size,
     at::Tensor req_pool_indices, at::Tensor req_to_token, at::Tensor seq_lens_cpu)
 {
     CHECK_LAST_DIM_CONTIGUOUS_INPUT(logits);
@@ -204,6 +229,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     CHECK_INPUT(stop_ids_off);
     CHECK_INPUT(eos_ids_flat);
     CHECK_INPUT(eos_ids_off);
+    CHECK_INPUT(ignore_eos);
     CHECK_INPUT(req_pool_indices);
     CHECK_INPUT(req_to_token);
     CHECK_INPUT(seq_lens_cpu);
@@ -221,6 +247,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     TORCH_CHECK(stop_ids_off.scalar_type() == at::kInt, "stop_ids_off must be int32");
     TORCH_CHECK(eos_ids_flat.scalar_type() == at::kInt, "eos_ids_flat must be int32");
     TORCH_CHECK(eos_ids_off.scalar_type() == at::kInt, "eos_ids_off must be int32");
+    TORCH_CHECK(ignore_eos.scalar_type() == at::kBool, "ignore_eos must be bool");
     TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong, "req_pool_indices must be int64");
     TORCH_CHECK(req_to_token.scalar_type() == at::kInt, "req_to_token must be int32");
     TORCH_CHECK(seq_lens_cpu.scalar_type() == at::kInt || seq_lens_cpu.scalar_type() == at::kLong,
@@ -236,6 +263,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     TORCH_CHECK(out_cache_loc.size(0) == bs * nv, "out_cache_loc size mismatch");
     TORCH_CHECK(stop_ids_off.size(0) == bs + 1, "stop_ids_off size mismatch");
     TORCH_CHECK(eos_ids_off.size(0) == bs + 1, "eos_ids_off size mismatch");
+    TORCH_CHECK(ignore_eos.size(0) == bs, "ignore_eos size mismatch");
 
     if (bs == 0) {
         return {
@@ -273,6 +301,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     const int32_t *stop_off_ptr = stop_ids_off.data_ptr<int32_t>();
     const int32_t *eos_flat_ptr = eos_ids_flat.data_ptr<int32_t>();
     const int32_t *eos_off_ptr = eos_ids_off.data_ptr<int32_t>();
+    const bool *ignore_eos_ptr = ignore_eos.data_ptr<bool>();
     const int64_t *pool_ptr = req_pool_indices.data_ptr<int64_t>();
     int32_t *reqtok_ptr = req_to_token.data_ptr<int32_t>();
     const bool seq_cpu_is_i64 = (seq_lens_cpu.scalar_type() == at::kLong);
@@ -312,10 +341,6 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
 
             const int64_t mnt = mnt_ptr[b];
             const int64_t vs = vocab_ptr[b];
-            const int64_t stop_begin = stop_off_ptr[b];
-            const int64_t stop_end = stop_off_ptr[b + 1];
-            const int64_t eos_begin = eos_off_ptr[b];
-            const int64_t eos_end = eos_off_ptr[b + 1];
             const int64_t base_out_len = out_len_ptr[b];
 
             // 2) Greedy accept along the linear chain (topk==1). The anchor is
@@ -345,16 +370,31 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
             // 3) Finish detection over the actual accepted-token sequence
             //    (each token with its own value, checked in order with the
             //    running output length; mirrors EagleVerifyInput.verify).
+            //    An out-of-range (NaN) accepted token is repaired in place
+            //    before the finish record is written, mirroring
+            //    Req._check_vocab_boundary_finish: the repaired token flows
+            //    into verified_id / accepted_tokens so every PP rank appends
+            //    the identical token stream.
+            const bool req_ignore_eos = ignore_eos_ptr[b];
             int32_t is_fin = 0;
             int32_t reason = -1;
             int64_t matched = 0;
             int32_t fin_len = 0;
             for (int64_t k = 0; k < num_acc; k++) {
-                const int32_t tok = accepted_seq[base + k];
+                int32_t tok = accepted_seq[base + k];
+                if (tok > (int32_t)vs || tok < 0) {
+                    // repair BEFORE reason computation so accepted_tokens /
+                    // verified_id carry the repaired value
+                    tok = repair_vocab_boundary_token(tok, vs, stop_flat_ptr, stop_off_ptr[b],
+                                                      stop_off_ptr[b + 1], eos_flat_ptr,
+                                                      eos_off_ptr[b], eos_off_ptr[b + 1]);
+                    accepted_seq[base + k] = tok;
+                }
                 const int64_t cur_out_len = base_out_len + (k + 1);
                 FinishState st = check_finish_token(tok, cur_out_len, mnt, vs, stop_flat_ptr,
-                                                    stop_begin, stop_end, eos_flat_ptr, eos_begin,
-                                                    eos_end, use_tokenizer_eos, tokenizer_eos);
+                                                    stop_off_ptr[b], stop_off_ptr[b + 1],
+                                                    eos_flat_ptr, eos_off_ptr[b], eos_off_ptr[b + 1],
+                                                    req_ignore_eos);
                 if (st.hit) {
                     is_fin = 1;
                     reason = st.reason;

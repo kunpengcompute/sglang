@@ -362,6 +362,10 @@ void build_tree_kernel_kunpeng(at::Tensor parent_list, at::Tensor top_scores_ind
                                int64_t spec_steps, int64_t num_verify_tokens, int64_t tree_mask_mode,
                                int64_t seq_lens_sum);
 
+void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at::Tensor accept_token_num,
+                                at::Tensor candidates, at::Tensor retrieve_index, at::Tensor retrieve_next_token,
+                                at::Tensor retrieve_next_sibling, at::Tensor target_predict);
+
 
 void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded);
 
@@ -402,7 +406,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     at::Tensor output_ids_len, at::Tensor max_new_tokens, at::Tensor vocab_size,
     at::Tensor stop_ids_flat, at::Tensor stop_ids_off,
     at::Tensor eos_ids_flat, at::Tensor eos_ids_off,
-    int64_t tokenizer_eos, bool use_tokenizer_eos, int64_t nv, int64_t page_size,
+    at::Tensor ignore_eos, int64_t nv, int64_t page_size,
     at::Tensor req_pool_indices, at::Tensor req_to_token, at::Tensor seq_lens_cpu);
 
 // gather_index_kunpeng: parallel row gather replacing the two aten::index ops.
@@ -946,6 +950,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int seq_lens_sum) -> ()");
     m.impl("build_tree_kernel_kunpeng", build_tree_kernel_kunpeng);
 
+    m.def(
+        "verify_tree_greedy_kunpeng("
+        "Tensor predicts, Tensor! accept_index, Tensor! accept_token_num, "
+        "Tensor candidates, Tensor retrieve_index, Tensor retrieve_next_token, "
+        "Tensor retrieve_next_sibling, Tensor target_predict) -> ()");
+    m.impl("verify_tree_greedy_kunpeng", verify_tree_greedy_kunpeng);
+
     m.def("pad_q_left_mtp_kunpeng(Tensor q_heads, Tensor ext_lens, Tensor q_padded) -> ()");
     m.impl("pad_q_left_mtp_kunpeng", pad_q_left_mtp_kunpeng);
 
@@ -999,7 +1010,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor max_new_tokens, Tensor vocab_size, "
         "Tensor stop_ids_flat, Tensor stop_ids_off, "
         "Tensor eos_ids_flat, Tensor eos_ids_off, "
-        "int tokenizer_eos, bool use_tokenizer_eos, int nv, int page_size, "
+        "Tensor ignore_eos, int nv, int page_size, "
         "Tensor req_pool_indices, Tensor(b!) req_to_token, Tensor(c!) seq_lens_cpu"
         ") -> Tensor[]");
     m.impl("verify_mtp_kunpeng", verify_mtp_kunpeng);

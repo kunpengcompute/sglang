@@ -307,6 +307,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         candidates = self.draft_token.reshape(bs, nv)
 
         # ── Pack per-request pure-token finish parameters ─────────────────
+        # The stop/eos sets always carry the REAL per-req token ids (never
+        # emptied as a proxy for a policy); `ignore_eos` is passed as an
+        # explicit per-req flag that gates the matching block inside the
+        # kernel, mirroring the early-return of
+        # `Req._check_token_based_finish`.  Tokenizer-derived eos ids are
+        # folded per-req into the eos set (same conditions as the Python
+        # `req.tokenizer is not None` checks in `_check_token_based_finish`),
+        # replacing the removed batch-wide `use_tokenizer_eos`/`tokenizer_eos`
+        # kernel arguments.
         output_ids_len = torch.tensor(
             [len(r.output_ids) for r in batch.reqs],
             dtype=torch.int64,
@@ -320,16 +329,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         vocab_size = torch.tensor(
             [r.vocab_size for r in batch.reqs], dtype=torch.int32, device=device
         )
-        # Finish sets mirror Req._check_token_based_finish: ignore_eos reqs
-        # get empty sets (kernel has no ignore_eos flag); tokenizer ids fold
-        # into the per-req eos set, replacing the batch-wide flag.
         stop_sets = []
         eos_sets = []
         for r in batch.reqs:
-            if r.sampling_params.ignore_eos:
-                stop_sets.append([])
-                eos_sets.append([])
-                continue
             stop_sets.append(list(r.sampling_params.stop_token_ids or []))
             eos_set = list(r.eos_token_ids or [])
             if r.tokenizer is not None:
@@ -339,8 +341,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             eos_sets.append(eos_set)
         stop_flat, stop_off = _pack_id_sets(stop_sets, device)
         eos_flat, eos_off = _pack_id_sets(eos_sets, device)
-        use_tokenizer_eos = False
-        tokenizer_eos = -1
+        ignore_eos = torch.tensor(
+            [bool(r.sampling_params.ignore_eos) for r in batch.reqs],
+            dtype=torch.bool,
+            device=device,
+        )
 
         # ── Single fused C++ kernel (GIL released, multi-core) ───────────
         (
@@ -378,8 +383,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             stop_off,
             eos_flat,
             eos_off,
-            tokenizer_eos,
-            use_tokenizer_eos,
+            ignore_eos,
             nv,
             page_size,
             batch.req_pool_indices,
@@ -420,6 +424,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     req.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
                 req.finished_len = finish_len_cpu[i]
+            elif req.to_finish is not None:
+                # The kernel cannot see scheduler-side aborts/timeout
+                # (`req.to_finish`).  Consume it here so the last rank is the
+                # single finish arbiter for conditions outside the kernel's
+                # token sets: the req enters the has_finished branch below
+                # (shrunken draft_input -> -1 draft placeholder), which the
+                # non-last ranks mirror via the `-1` placeholder reconciliation.
+                req.finished_reason = req.to_finish
+                req.to_finish = None
+                has_finished = True
             # KV tracking (num_accepted includes the root, matching Python)
             req.kv_committed_len += num_acc
             req.kv_allocated_len = req.kv_committed_len
