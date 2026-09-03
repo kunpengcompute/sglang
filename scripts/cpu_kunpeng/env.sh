@@ -236,6 +236,7 @@ export SGLANG_KUNPENG_LC_DP_RANKS=""  # comma-separated DP ranks running long-co
 export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=64  # requests with input_len + max_new_tokens >= this go to LC DP ranks; must exceed every regular rank's max_req_input_len
 export SGLANG_KUNPENG_RDMA_ALLGATHER=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_KUNPENG_RDMA_BCAST=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
+export SGLANG_KUNPENG_RDMA_PP_COMM=1  # 1 = enable RDMA communication between PP ranks for rids
 export SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE=0  # 1 = forced MoE load balancing (perf-test only, correctness not preserved)
 # SGLANG_KUNPENG_DEBUG_EXPERT_LOAD=1  # build-time only: set before building sgl-kernel to enable expert load debug recording
 export SGLANG_ENABLE_MTP=0

@@ -409,14 +409,14 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 pp_perf_start(f"mb{mb_id}", tag=f"pp{self.pp_group.rank_in_group}")
-                # ① recv_requests / proc_input (decorated methods)
+                # 1.recv_requests / proc_input (decorated methods)
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                # ② PD consensus (retract / prealloc / transfer)
+                # 2.PD consensus (retract / prealloc / transfer)
                 retract_rids = self._pp_pd_get_retract_ids(mb_id)
                 rmbs[mb_id] = retract_rids
                 self._pp_commit_comm_work(send_retract_work)
@@ -429,7 +429,7 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
 
-                # ③ get batch to run and proxy tensors if needed
+                # 3.get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
                 if self._pp_mtp_enabled:
                     # PP+MTP (disaggregated decode): the decode batch is
@@ -449,7 +449,7 @@ class SchedulerPPMixin:
                         # ④ recv proxy (PP1)
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                # ⑤ early send output if possible (async depth > 0)
+                # 5.early send output if possible (async depth > 0)
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -459,7 +459,7 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
 
-                # ⑥ model execution
+                # 4.model execution
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -468,7 +468,7 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
-                # ⑤ early send output (async depth == 0)
+                # 5.early send output (async depth == 0)
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -477,7 +477,7 @@ class SchedulerPPMixin:
                         )
                     )
 
-                # ⑦ reach consensus on last rank and send to PP=0
+                # 6.reach consensus on last rank and send to PP=0
                 send_consensus_retract_work, consensus_retract_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         rmbs,
@@ -505,7 +505,7 @@ class SchedulerPPMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
-                # ⑧ consensus sync: recv from prev stage + local processing
+                # 7.consensus sync: recv from prev stage + local processing
                 if rmbs[next_mb_id] is not None:
                     next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
                     next_consensus_retract_rids = self.process_retract_queue(
@@ -527,7 +527,7 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(send_release_work)
 
-                # ⑨ post-process the coming microbatch
+                # 8.post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
                         if not _is_cpu_920f:
@@ -542,7 +542,7 @@ class SchedulerPPMixin:
                             if req.finished():
                                 self._pp_pending_drafts.pop(req.rid, None)
 
-                # ⑩ mb tail: batch completion bookkeeping + transition to the
+                # 9.mb tail: batch completion bookkeeping + transition to the
                 # next micro-batch iteration (spans send_pyobj / send_proxy).
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -954,11 +954,10 @@ class SchedulerPPMixin:
     @Kunpeng_PP_Profiler(depth=1, name="commit_comm")
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         if self.pp_group.kunpeng_pp_communicator is not None:
-            # RDMA path: the send is an async single-sided write; "commit"
-            # means waiting for the peer's acks so the ring slots are free.
+            # Tensor sends (send_tensor_dict / send_tensor_message) always use
+            # Kunpeng RDMA regardless of the SGLANG_KUNPENG_RDMA_PP_COMM toggle,
+            # so their acks must always be reclaimed here to free ring slots.
             self._pp_wait_acks()
-            work.clear()
-            return
         for p2p_work in work:
             if p2p_work.work is not None:
                 p2p_work.work.wait()
@@ -1014,7 +1013,7 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-            if self.pp_group.kunpeng_pp_communicator is not None:
+            if self.pp_group.kunpeng_pp_communicator is not None and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1":
                 # Unified RDMA message (async single-sided write); the peer
                 # acks on receive and the commit waits for the ack.
                 self.pp_group.kunpeng_pp_communicator.send_pyobj(
@@ -1035,7 +1034,7 @@ class SchedulerPPMixin:
     @Kunpeng_PP_Profiler(depth=1, name="recv_pyobj")
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-            if self.pp_group.kunpeng_pp_communicator is not None:
+            if self.pp_group.kunpeng_pp_communicator is not None and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1":
                 data = self._pp_recv_message("pyobj")["data"]
             else:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size

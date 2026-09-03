@@ -1828,7 +1828,10 @@ class Scheduler(
                 recv_reqs = None
         else:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-                if self.pp_group.kunpeng_pp_communicator is not None:
+                if (
+                    self.pp_group.kunpeng_pp_communicator is not None
+                    and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
+                ):
                     # Unified RDMA channel: pyobj demux, acks auto-consumed.
                     recv_reqs = self._pp_recv_message("pyobj")["data"]
                 else:
