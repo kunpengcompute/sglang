@@ -176,12 +176,12 @@ SHM 池：`model_runner` 首次捕获后把 SHM bump 分配器剩余全部字节
 
 ## 调试
 
-`SGLANG_ENABLE_GRAPH_PROFILE=1` 会把每次回放的逐算子耗时追加写入 `sglang_graph_rank{RANK}.jsonl`（目录由 `SGLANG_TORCH_PROFILER_DIR` 指定）。`scripts/cpu_kunpeng/` 下提供三个分析脚本：
+`SGLANG_ENABLE_GRAPH_PROFILE=1` 会把每次回放的逐算子耗时追加写入 `sglang_graph_rank{RANK}.jsonl`（目录由 `SGLANG_TORCH_PROFILER_DIR` 指定）。`scripts/cpu_kunpeng/analysis/` 下提供三个分析脚本：
 
 **转 Chrome tracing（时间线视图）**：
 
 ```bash
-python scripts/cpu_kunpeng/stats_to_trace.py sglang_graph_rank0.jsonl sglang_graph_rank1.jsonl ... trace.json
+python scripts/cpu_kunpeng/analysis/stats_to_trace.py sglang_graph_rank0.jsonl sglang_graph_rank1.jsonl ... trace.json
 ```
 
 生成的 `trace.json` 用 chrome://tracing 或 Perfetto 打开，每个 rank 一条线程，查看各算子的起止耗时。建议最多分析 16 个文件避免文件过大。
@@ -189,13 +189,13 @@ python scripts/cpu_kunpeng/stats_to_trace.py sglang_graph_rank0.jsonl sglang_gra
 **生成算子统计 CSV（按 forward_mode 分段，含 count/min/max/avg/total/percent）**：
 
 ```bash
-python scripts/cpu_kunpeng/stats_to_csv.py sglang_graph_rank0.jsonl graph_stats.csv
+python scripts/cpu_kunpeng/analysis/stats_to_csv.py sglang_graph_rank0.jsonl graph_stats.csv
 ```
 
 **对比两份 CSV 的 extend/decode 段差异**：
 
 ```bash
-python scripts/cpu_kunpeng/stats_csv_compare.py run1.csv run2.csv -o compare
+python scripts/cpu_kunpeng/analysis/stats_csv_compare.py run1.csv run2.csv -o compare
 # 生成 compare_extend_summary.csv / compare_decode_summary.csv
 ```
 

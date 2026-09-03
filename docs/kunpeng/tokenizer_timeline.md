@@ -60,7 +60,7 @@ TPOT_n = tok_send(n+1) − tok_send(n)
 ## 分析脚本
 
 ```bash
-cd scripts/cpu_kunpeng
+cd scripts/cpu_kunpeng/analysis
 
 # 全局统计：默认取 /tmp 下最新 timeline 文件
 python analyze_tokenizer_timeline.py [jsonl_file]
@@ -130,6 +130,6 @@ router 侧（detok/tok 打点与 JSONL 写入）通过 mixin 挂载（对齐 `ha
 - scheduler 打点：`python/sglang/srt/managers/scheduler_output_processor_mixin.py`
 - detokenizer 打点实现：`python/sglang/srt/hardware_backend/cpu_kunpeng/managers/detokenizer_mixin.py`（`_timeline_stamp_recv` / `_timeline_stamp_send`；挂载点在 `detokenizer_manager.py` 的 `event_loop`）
 - tok worker 打点与 JSONL 写入实现：`python/sglang/srt/hardware_backend/cpu_kunpeng/managers/tokenizer_mixin.py`（`_timeline_batch_enter` / `_on_chunk` / `_on_finish` / `_batch_exit` 与 `_dump_timeline_record` / `_dump_timeline_request_record`；挂载点在 `tokenizer_manager.py` 的 `_handle_batch_output`）
-- 分析脚本：`scripts/cpu_kunpeng/analyze_tokenizer_timeline.py`
+- 分析脚本：`scripts/cpu_kunpeng/analysis/analyze_tokenizer_timeline.py`
 
 mixin 实现说明：mixin 无法覆写类体内已定义的方法（类体优先于基类查找），因此通用文件中的挂载点调用的是新命名的 hook 方法，由条件 import 决定走鲲鹏实现还是 no-op stub。部署时需确保 pyinstall 打包包含 `hardware_backend/cpu_kunpeng/managers/` 目录（与 attention 等目录同等对待）。
