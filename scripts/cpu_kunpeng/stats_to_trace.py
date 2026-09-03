@@ -15,20 +15,42 @@
 import json
 import sys
 
+_decoder = json.JSONDecoder()
+
+
+def iter_objs(path):
+    # Recover complete JSON objects from a possibly corrupted JSONL file
+    # (truncated fragments or concatenated objects without newlines),
+    # skipping unparseable bytes.
+    for line in open(path):
+        idx, n = 0, len(line)
+        while idx < n:
+            while idx < n and line[idx] in " \t\r\n":
+                idx += 1
+            if idx >= n:
+                break
+            try:
+                obj, end = _decoder.raw_decode(line, idx)
+            except json.JSONDecodeError:
+                nxt = line.find("{", idx + 1)
+                idx = n if nxt == -1 else nxt
+                continue
+            # Skip decoded JSON scalars (e.g. truncated lines holding only a
+            # number) — only dict records are profile events.
+            if isinstance(obj, dict):
+                yield obj
+            idx = end
+
 
 def convert(files, output_path):
-    base_ts_ns = min(
-        json.loads(open(path).readline())["ts_ns"]
-        for path in files
-    )
+    base_ts_ns = min(next(iter_objs(path))["ts_ns"] for path in files)
 
     events = []
     ev_id = 0
 
     for tid, path in enumerate(files):
         parent_id = 0
-        for line in open(path):
-            obj = json.loads(line)
+        for obj in iter_objs(path):
             if obj["_type"] == "meta":
                 parent_id = ev_id
                 events.append(

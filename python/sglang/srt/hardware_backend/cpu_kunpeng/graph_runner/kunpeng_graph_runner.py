@@ -839,9 +839,22 @@ class KunpengGraphRunner:
             from sglang.srt.graph.profile import write_profile
 
             profile_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+            # With PP>1, stages sharing a tp_rank would concurrently append
+            # to the same file; split per pp_rank. The MTP draft runner is
+            # constructed with pp_size=1/pp_rank=0 but only ever runs on the
+            # last PP rank, so merge its records into that stage's file.
+            if self.model_runner.is_draft_worker:
+                pp_size = self.model_runner.server_args.pp_size
+                pp_rank = pp_size - 1
+            else:
+                pp_size = self.model_runner.pp_size
+                pp_rank = self.model_runner.pp_rank
+            rank_part = f"rank{self.model_runner.tp_rank}"
+            if pp_size > 1:
+                rank_part += f"_pp{pp_rank}"
             path = os.path.join(
                 profile_dir,
-                f"sglang_graph_rank{self.model_runner.tp_rank}.jsonl",
+                f"sglang_graph_{rank_part}.jsonl",
             )
             row = graph.get_profile_row()
             op_names = graph.profile_op_names()
