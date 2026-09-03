@@ -7,7 +7,7 @@ from sglang.srt.graph._capture import (
     record_op,
     upgrade_storage_memory_type,
 )
-from sglang.srt.graph.ops import ops, register_op
+from sglang.srt.graph.ops import idle_forward_mode, ops, register_op
 from sglang.srt.graph import adapters  # noqa: F401 — registers all graph ops
 from sglang.srt.graph.profile import write_profile
 

@@ -9,6 +9,18 @@ from sglang.srt.graph._capture import (
 )
 
 _DEBUG = False
+_IDLE = False
+
+class idle_forward_mode:
+    """Mark the current forward as IDLE to suppress op debug prints."""
+
+    def __enter__(self):
+        global _IDLE
+        _IDLE = True
+
+    def __exit__(self, *exc):
+        global _IDLE
+        _IDLE = False
 
 
 class GraphOp:
@@ -21,11 +33,11 @@ class GraphOp:
     def __call__(self, *args, **kwargs):
         profile_name = kwargs.pop('profile_name', '')
         if is_capturing():
-            if _DEBUG:
+            if _DEBUG and not _IDLE:
                 print(f"[capture] {self.name}", flush=True)
             return self._capture(args, kwargs, profile_name)
         if self.eager_fn:
-            if _DEBUG:
+            if _DEBUG and not _IDLE:
                 print(f"[eager] {self.name}", flush=True)
             return self.eager_fn(*args, **kwargs)
         raise RuntimeError("Op not available outside capture graph")
