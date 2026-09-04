@@ -265,6 +265,13 @@ void multinomial_kunpeng(const at::Tensor &probs, at::Tensor out, int64_t num_sa
 void argmax_kunpeng(const at::Tensor prob_distribution, at::Tensor token_ids, at::Tensor token_probs, int64_t height,
                     int64_t width);
 
+void softmax_kunpeng(const at::Tensor logits, const at::Tensor temperatures, at::Tensor probs);
+ 
+void top_k_top_p_sampling_from_probs_kunpeng(
+    const at::Tensor probs, const at::Tensor top_ks, const at::Tensor top_ps,
+    const at::Tensor min_ps, bool need_min_p_sampling,
+    at::Tensor token_ids, at::Tensor token_probs);
+
 // === SHM Ëã×ÓÉùÃ÷ ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
@@ -778,6 +785,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "argmax_kunpeng(Tensor prob_distribution, Tensor(a!) token_ids, Tensor(b!) token_probs, "
         "int height, int width) -> ()");
     m.impl("argmax_kunpeng", argmax_kunpeng);
+
+    // softmax with temperature
+    m.def(
+        "softmax_kunpeng(Tensor logits, Tensor temperatures, Tensor(a!) probs) -> ()");
+    m.impl("softmax_kunpeng", softmax_kunpeng);
+
+    // top-k + top-p + min-p sampling from probs (fused kernel)
+    m.def(
+        "top_k_top_p_sampling_from_probs_kunpeng("
+        "Tensor probs, Tensor top_ks, Tensor top_ps, Tensor min_ps, "
+        "bool need_min_p_sampling, "
+        "Tensor(a!) token_ids, Tensor(b!) token_probs) -> ()");
+    m.impl("top_k_top_p_sampling_from_probs_kunpeng", top_k_top_p_sampling_from_probs_kunpeng);
 
     // SHM operators
     m.def("shm_pool_create_kunpeng(int intra_node_pg, int intra_socket_pg, int intra_die_pg, int shm_size_mb) -> ()");

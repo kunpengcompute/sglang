@@ -178,10 +178,14 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-
-                # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
+                if _is_cpu_920f:
+                    torch.ops.sgl_kernel.softmax_kunpeng(
+                        logits, sampling_info.temperatures, logits
+                    )
+                else:
+                    logits.div_(sampling_info.temperatures)
+                    # In-place op to save memory
+                    logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
 
                 batch_next_token_ids = self._sample_from_probs(
@@ -251,16 +255,28 @@ class Sampler(nn.Module):
                         check_nan=self.use_nan_detection,
                     )
             elif backend == "pytorch":
-                # A slower fallback implementation with torch native operations.
-                batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
-                    probs,
-                    sampling_info.top_ks,
-                    sampling_info.top_ps,
-                    sampling_info.min_ps,
-                    sampling_info.need_min_p_sampling,
-                    sampling_info.sampling_seed,
-                    positions,
-                )
+                if _is_cpu_920f and sampling_info.sampling_seed is None:
+                    batch_next_token_ids = (
+                        top_k_top_p_min_p_sampling_from_probs_kunpeng(
+                            probs,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                        )
+                    )
+                else:
+                    batch_next_token_ids = (
+                        top_k_top_p_min_p_sampling_from_probs_torch(
+                            probs,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                            sampling_info.sampling_seed,
+                            positions,
+                        )
+                    )
             else:
                 raise ValueError(f"Invalid sampling backend: {backend}")
         return batch_next_token_ids
@@ -517,6 +533,27 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+def top_k_top_p_min_p_sampling_from_probs_kunpeng(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+):
+    """
+    Kunpeng 920F fused top-k + top-p + min-p + multinomial sampling.
+    Sorts only O(k) elements by using nth_element to find top-k threshold,
+    then sorting only the candidates. Avoids full vocabulary sort (O(V log V)).
+    """
+    batch_size = probs.shape[0]
+    token_ids = torch.empty(batch_size, dtype=torch.int64, device=probs.device)
+    token_probs = torch.empty(batch_size, dtype=torch.float32, device=probs.device)
+    torch.ops.sgl_kernel.top_k_top_p_sampling_from_probs_kunpeng(
+        probs, top_ks, top_ps, min_ps, need_min_p_sampling, token_ids, token_probs
+    )
+    return token_ids.to(torch.int32)
 
 
 def top_k_top_p_min_p_sampling_from_logits_ascend(
