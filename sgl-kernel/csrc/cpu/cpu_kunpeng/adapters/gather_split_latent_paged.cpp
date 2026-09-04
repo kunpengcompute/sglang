@@ -25,9 +25,21 @@ void gather_split_latent_paged_kunpeng(
     int64_t page_size, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
     int64_t total_kv);
 
+void gather_split_latent_paged_quant_kunpeng(
+    at::Tensor latent_cache, at::Tensor block_table, at::Tensor extend_seq_lens,
+    at::Tensor prefix_lens,
+    at::Tensor kv_a_int8, at::Tensor kv_a_scale, at::Tensor k_pe,
+    int64_t page_size, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
+    int64_t total_kv);
+
 // Graph kernel signature follows the (inputs..., outputs..., scalars...)
 // convention, which matches the kernel itself, so register it directly.
 static KernelRegistrar _r_gather_split_latent_paged(
     "gather_split_latent_paged_kunpeng",
     make_dispatch_v<decltype(&gather_split_latent_paged_kunpeng),
                     &gather_split_latent_paged_kunpeng>);
+
+static KernelRegistrar _r_gather_split_latent_paged_quant(
+    "gather_split_latent_paged_quant_kunpeng",
+    make_dispatch_v<decltype(&gather_split_latent_paged_quant_kunpeng),
+                    &gather_split_latent_paged_quant_kunpeng>);

@@ -21,6 +21,13 @@
 void rmsnorm_kunpeng(at::Tensor acts, at::Tensor weights, double eps,
                      at::Tensor outs);
 
+void rmsnorm_quant_kunpeng(at::Tensor acts, at::Tensor weights, double eps,
+                           at::Tensor outs, at::Tensor scales);
+
 static KernelRegistrar _r_rmsnorm(
     "rmsnorm_kunpeng",
     make_dispatch_v<decltype(&rmsnorm_kunpeng), &rmsnorm_kunpeng>);
+
+static KernelRegistrar _r_rmsnorm_quant(
+    "rmsnorm_quant_kunpeng",
+    make_dispatch_v<decltype(&rmsnorm_quant_kunpeng), &rmsnorm_quant_kunpeng>);

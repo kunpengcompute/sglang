@@ -64,6 +64,13 @@ void s8_s8_packed_gemm_bf16_dq_kunpeng(at::Tensor input, at::Tensor weight, at::
                                        at::Tensor output, at::Tensor workspace, int64_t tile_m, int64_t tile_n,
                                        int64_t tile_k);
 
+void s8_s8_gemm_bf16_dq_kunpeng(at::Tensor act, at::Tensor input_ptr, at::Tensor weight, at::Tensor act_scale,
+                                at::Tensor weight_scale, at::Tensor output, at::Tensor workspace, int64_t tile_m,
+                                int64_t tile_n, int64_t tile_k);
+
+int64_t s8_s8_gemm_bf16_dq_tmpc_size_kunpeng(int64_t m, int64_t n, int64_t k, int64_t tile_m, int64_t tile_n,
+                                             int64_t tile_k);
+
 void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c);
 
 void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
@@ -131,6 +138,13 @@ void gather_split_latent_paged_kunpeng(
     at::Tensor latent_cache, at::Tensor block_table, at::Tensor extend_seq_lens,
     at::Tensor prefix_lens,
     at::Tensor kv_a, at::Tensor k_pe,
+    int64_t page_size, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
+    int64_t total_kv);
+
+void gather_split_latent_paged_quant_kunpeng(
+    at::Tensor latent_cache, at::Tensor block_table, at::Tensor extend_seq_lens,
+    at::Tensor prefix_lens,
+    at::Tensor kv_a_int8, at::Tensor kv_a_scale, at::Tensor k_pe,
     int64_t page_size, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
     int64_t total_kv);
 
@@ -472,6 +486,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor(a!) output, Tensor workspace, int tile_m, int tile_n, int tile_k) -> ()");
     m.impl("s8_s8_packed_gemm_bf16_dq_kunpeng", s8_s8_packed_gemm_bf16_dq_kunpeng);
 
+    // s8_s8_gemm_bf16_dq (left matrix packed on-the-fly)
+    m.def(
+        "s8_s8_gemm_bf16_dq_kunpeng(Tensor act, Tensor(a!) input_ptr, Tensor weight, Tensor act_scale, "
+        "Tensor weight_scale, Tensor(a!) output, Tensor workspace, int tile_m, int tile_n, int tile_k) -> ()");
+    m.impl("s8_s8_gemm_bf16_dq_kunpeng", s8_s8_gemm_bf16_dq_kunpeng);
+
+    m.def("s8_s8_gemm_bf16_dq_tmpc_size_kunpeng(int M, int N, int K, int tile_m, int tile_n, int tile_k) -> int");
+    m.impl("s8_s8_gemm_bf16_dq_tmpc_size_kunpeng", s8_s8_gemm_bf16_dq_tmpc_size_kunpeng);
+
     // bf16 gemm pack
     m.def("bf16_gemm_pack_kunpeng(Tensor input, Tensor(a!) out, int split_r, int split_c) -> ()");
     m.impl("bf16_gemm_pack_kunpeng", bf16_gemm_pack_kunpeng);
@@ -602,6 +625,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int page_size, int kv_lora_rank, int qk_rope_head_dim, "
         "int total_kv) -> ()");
     m.impl("gather_split_latent_paged_kunpeng", gather_split_latent_paged_kunpeng);
+
+    m.def(
+        "gather_split_latent_paged_quant_kunpeng("
+        "Tensor latent_cache, Tensor block_table, "
+        "Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor kv_a_int8, Tensor kv_a_scale, Tensor k_pe, "
+        "int page_size, int kv_lora_rank, int qk_rope_head_dim, "
+        "int total_kv) -> ()");
+    m.impl("gather_split_latent_paged_quant_kunpeng",
+           gather_split_latent_paged_quant_kunpeng);
 
     m.def(
         "quant_rows_kunpeng("

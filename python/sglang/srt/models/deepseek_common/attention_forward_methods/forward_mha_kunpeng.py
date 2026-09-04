@@ -183,15 +183,25 @@ class DeepseekMHAKunpengForwardMixin:
         # registered graph-input tensors (extend/prefix lens); live totals are
         # derived inside the kernel so no unregistered tensor is created and
         # the buffer (max-sized) is only partially written.
-        kv_a, k_pe = kunpeng.gather_split_latent_paged_kunpeng(
-            latent_cache, meta.block_table,
-            forward_batch.extend_seq_lens, prefix_lens,
-            meta.page_size, self.kv_lora_rank, self.qk_rope_head_dim,
-            max_total)
+        # When SGLANG_KUNPENG_FUSED_GATHER_QUANT is enabled, kv_a is
+        # per-row-quantized to int8 during the gather itself, replacing the
+        # separate quant_rows_kunpeng pass below.
+        if envs.SGLANG_KUNPENG_FUSED_GATHER_QUANT.get():
+            kv_a_int8, kv_a_scale, k_pe = kunpeng.gather_split_latent_paged_quant_kunpeng(
+                latent_cache, meta.block_table,
+                forward_batch.extend_seq_lens, prefix_lens,
+                meta.page_size, self.kv_lora_rank, self.qk_rope_head_dim,
+                max_total)
+        else:
+            kv_a, k_pe = kunpeng.gather_split_latent_paged_kunpeng(
+                latent_cache, meta.block_table,
+                forward_batch.extend_seq_lens, prefix_lens,
+                meta.page_size, self.kv_lora_rank, self.qk_rope_head_dim,
+                max_total)
 
-        # 2. int8-quantize kv_a for the kv_b_proj GEMM (live rows only).
-        kv_a_int8, kv_a_scale = kunpeng.quant_rows_kunpeng(
-            kv_a, forward_batch.extend_seq_lens, prefix_lens)
+            # 2. int8-quantize kv_a for the kv_b_proj GEMM (live rows only).
+            kv_a_int8, kv_a_scale = kunpeng.quant_rows_kunpeng(
+                kv_a, forward_batch.extend_seq_lens, prefix_lens)
 
         # 3. kv_b_proj int8 GEMM: buffers stay max-sized (baked at capture)
         # but only the live rows are packed/computed each round. The kernels
