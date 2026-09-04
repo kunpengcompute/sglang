@@ -21,6 +21,7 @@ show_usage() {
     echo "  native   - Launch without PD disaggregation" >&2
     echo "  router   - Launch router server (route requests to prefill/decode)" >&2
     echo "  all      - Launch prefill, decode, and router sequentially" >&2
+    echo "  update   - Only regenerate .time_env.sh" >&2
     echo "  --no-log - Do not tail logs (exit after launching)" >&2
 }
 
@@ -34,7 +35,7 @@ for arg in "$@"; do
         --no-log)
             SHOW_LOG=0
             ;;
-        prefill|decode|native|router|all)
+        prefill|decode|native|router|all|update)
             ROLE="$arg"
             ;;
         second)
@@ -58,7 +59,7 @@ done
 ROLE="${ROLE:-native}"
 
 # Re-validate role
-VALID_ROLES=("prefill" "decode" "native" "router" "all")
+VALID_ROLES=("prefill" "decode" "native" "router" "all" "update")
 if [[ ! " ${VALID_ROLES[*]} " =~ " ${ROLE} " ]]; then
     echo "Error: Invalid role '$ROLE'. Must be one of: ${VALID_ROLES[*]}" >&2
     show_usage
@@ -68,11 +69,14 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# update mode: regenerate .time_env.sh only, then exit
+if [[ "$ROLE" == "update" ]]; then
+    bash ./runtime/update_time.sh
+    exit 0
+fi
+
 # Persist time-sensitive env vars so all nodes source the same values
-cat > "$SCRIPT_DIR/.time_env.sh" << EOF
-export LOG_DATE="$(date +%y%m%d)"
-export LOG_TIME="$(date +%H%M%S)"
-EOF
+bash ./runtime/update_time.sh
 
 # all mode: launch prefill, decode, and router via background launch.sh calls
 if [[ "$ROLE" == "all" ]]; then

@@ -1380,6 +1380,16 @@ class SchedulerPPMixin:
         elif self._pp_mtp_enabled and self.pp_group.is_last_rank:
             batch.spec_info = None
 
+        # PP+MTP: populate the accepted-draft counts so report_decode_stats /
+        # update_spec_metrics see real acceptance on non-last ranks too. The
+        # per-req accepted counts (accepted + bonus) arrive via the ring in
+        # pp_outputs; convert to drafts-only (accepted + bonus - 1 per req).
+        num_accepted_drafts = 0
+        if self._pp_mtp_enabled and batch.pp_mtp_accepted_tokens is not None:
+            num_accepted_drafts = (
+                int(batch.pp_mtp_accepted_tokens.sum().item()) - batch.batch_size()
+            )
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1387,6 +1397,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            num_accepted_drafts=num_accepted_drafts,
         )
         return output_result
 

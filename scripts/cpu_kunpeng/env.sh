@@ -452,6 +452,9 @@ else
     export ENABLE_STATIC_ROUTING="${ENABLE_STATIC_ROUTING:-0}"
 fi
 
+if [[ ! -f "${SCRIPT_DIR}/.time_env.sh" ]]; then
+    bash "${SCRIPT_DIR}/runtime/update_time.sh"
+fi
 source "${SCRIPT_DIR}/.time_env.sh"
 export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/$ACTION/${LOG_TIME}"
 export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
