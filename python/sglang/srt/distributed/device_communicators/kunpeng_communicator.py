@@ -326,8 +326,6 @@ class KunpengPPCommunicator:
         self._pp_initialized = False
         # pp_ranks[pp_rank] = world_rank, for the C++ per-peer message region.
         self.pp_ranks = pp_ranks or list(range(self.comm_size))
-        # Unacked messages per peer (flow control).
-        self._inflight = {r: 0 for r in range(self.comm_size)}
 
         # pp_init is deferred to init_pp_domain() after the MoE domains exist.
 
@@ -398,15 +396,49 @@ class KunpengPPCommunicator:
         """Single pp_recv for the tensor data expected in the buffer."""
         kernel.pp_recv_batch_kunpeng(src_rank, total_size)
 
+    def send_tensor_batch(self, dst_rank: int, tensors):
+        """Fused: copy all tensors into the batch region + one pp_put in C++."""
+        kernel.pp_send_tensor_batch_kunpeng(dst_rank, tensors)
+
+    def recv_tensor_batch(self, src_rank: int, offsets: torch.Tensor, out_tensors):
+        """Fused: one pp_recv then copy all out tensors from the batch region."""
+        kernel.pp_recv_batch_copy_kunpeng(src_rank, offsets, out_tensors)
+
+    def send_pyobjs_bundle(self, payloads, dst_rank: int):
+        """Coalesce several pyobjs into ONE slot/message (single pp_put + 1 ack).
+
+        Used to merge the per-microbatch consensus rids (retract / prealloc /
+        transfer) into a single ring message in the PP loop.
+        """
+        self.pp_comm_init()
+        assert kernel.pp_inflight_kunpeng(dst_rank) < PP_MSG_SLOTS, (
+            f"PP send_pyobjs_bundle: {kernel.pp_inflight_kunpeng(dst_rank)} inflight "
+            f"msgs to rank {dst_rank} exceed {PP_MSG_SLOTS} ring slots"
+        )
+        payload_tensors = [
+            torch.frombuffer(bytearray(pickle.dumps(p)), dtype=torch.uint8)
+            for p in payloads
+        ]
+        kernel.pp_send_pyobjs_bundle_kunpeng(dst_rank, payload_tensors)
+
+    def recv_pyobjs_bundle(self, src_rank: int):
+        """Receive one bundle and unpack its sub-pyobjects in order."""
+        self.pp_comm_init()
+        payload_tensors = kernel.pp_recv_pyobjs_bundle_kunpeng(src_rank)
+        return [
+            pickle.loads(p.numpy().tobytes()) for p in payload_tensors
+        ]
+
     # === unified message send ===
 
     def send_pyobj(self, payload, dst_rank: int):
         """Asynchronously send a python object to dst_rank (PP local rank)."""
         self.pp_comm_init()
         data = pickle.dumps(payload)
-        assert self._inflight[dst_rank] < PP_MSG_SLOTS, (
-            f"PP send_pyobj: {self._inflight[dst_rank]} inflight msgs to rank "
-            f"{dst_rank} exceed {PP_MSG_SLOTS} ring slots; acks not consumed in time"
+        assert kernel.pp_inflight_kunpeng(dst_rank) < PP_MSG_SLOTS, (
+            f"PP send_pyobj: {kernel.pp_inflight_kunpeng(dst_rank)} inflight msgs "
+            f"to rank {dst_rank} exceed {PP_MSG_SLOTS} ring slots; acks not consumed "
+            f"in time"
         )
         # bytearray avoids frombuffer's non-writable-buffer warning.
         kernel.pp_send_msg_kunpeng(
@@ -414,18 +446,17 @@ class KunpengPPCommunicator:
             PP_KIND_PYOBJ,
             dst_rank,
         )
-        self._inflight[dst_rank] += 1
 
     def send_tensor_message(self, metadata_list, tensor_list, dst_rank: int,
                             all_gather_group=None, all_gather_size=1,
                             all_gather_rank=0):
         """Asynchronously send a tensor dict: metadata via message slot (TENSOR),
-        payloads staged in the batch region (second pp_put)."""
+        payloads staged in the batch region (single fused pp_put)."""
         self.pp_comm_init()
         meta = pickle.dumps(metadata_list)
-        assert self._inflight[dst_rank] < PP_MSG_SLOTS, (
-            f"PP send_tensor_message: {self._inflight[dst_rank]} inflight msgs "
-            f"to rank {dst_rank} exceed {PP_MSG_SLOTS} ring slots; acks not "
+        assert kernel.pp_inflight_kunpeng(dst_rank) < PP_MSG_SLOTS, (
+            f"PP send_tensor_message: {kernel.pp_inflight_kunpeng(dst_rank)} inflight "
+            f"msgs to rank {dst_rank} exceed {PP_MSG_SLOTS} ring slots; acks not "
             f"consumed in time"
         )
         kernel.pp_send_msg_kunpeng(
@@ -433,9 +464,10 @@ class KunpengPPCommunicator:
             PP_KIND_TENSOR,
             dst_rank,
         )
-        self._inflight[dst_rank] += 1
 
-        pp_offset = 0
+        # all_gather slicing + contiguity stay here (needs group info); the copy
+        # into the batch region + single pp_put are fused in C++.
+        shards = []
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
@@ -452,10 +484,9 @@ class KunpengPPCommunicator:
                 raise RuntimeError("Kunpeng PP RDMA channel requires CPU tensors")
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
-            self.copy_to_buffer(tensor, pp_offset)
-            pp_offset += tensor.nbytes
+            shards.append(tensor)
         # Always post the data imm (zero-length payloads are legal in IB).
-        self.send_batch(dst_rank, pp_offset)
+        self.send_tensor_batch(dst_rank, shards)
 
     # === unified message recv ===
 
@@ -470,11 +501,8 @@ class KunpengPPCommunicator:
     # === ack / flow control ===
 
     def inflight(self, dst_rank: int) -> int:
-        return self._inflight.get(dst_rank, 0)
-
-    def ack_received(self, dst_rank: int):
-        """Account one ack for `dst_rank` (an ACK message was consumed)."""
-        self._inflight[dst_rank] = max(self._inflight.get(dst_rank, 0) - 1, 0)
+        # Tracked inside the C++ kernel (see pp_inflight_kunpeng).
+        return kernel.pp_inflight_kunpeng(dst_rank)
 
     def __del__(self):
         if hasattr(self, "buffer"):

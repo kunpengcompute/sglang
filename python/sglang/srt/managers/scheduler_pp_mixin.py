@@ -384,9 +384,7 @@ class SchedulerPPMixin:
         consensus_retract_rids: Optional[List[str]] = None
         consensus_prealloc_rids: Optional[List[str]] = None
         release_rids: Optional[List[str]] = None  # consensus transferred rids
-        send_retract_work = []
-        send_prealloc_work = []
-        send_transfer_work = []
+        send_consensus_work = []
         send_consensus_retract_work = []
         send_consensus_prealloc_work = []
         send_release_work = []
@@ -416,18 +414,16 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                # 2.PD consensus (retract / prealloc / transfer)
-                retract_rids = self._pp_pd_get_retract_ids(mb_id)
+                # 2.PD consensus (retract / prealloc / transfer): all local polls first, then
+                # ONE bundle recv from the previous stage, then the 3 consensus
+                # (deadlock-safe order; gloo keeps the old per-pyobj recvs).
+                retract_rids, prealloc_rids, transferred_rids = (
+                    self._pp_pd_get_decode_consensus_rids(mb_id)
+                )
                 rmbs[mb_id] = retract_rids
-                self._pp_commit_comm_work(send_retract_work)
-
-                prealloc_rids = self._pp_pd_get_prealloc_ids()
                 pmbs[mb_id] = prealloc_rids
-                self._pp_commit_comm_work(send_prealloc_work)
-
-                transferred_rids = self._pp_pd_get_decode_transferred_ids()
                 tmbs[mb_id] = transferred_rids
-                self._pp_commit_comm_work(send_transfer_work)
+                self._pp_commit_comm_work(send_consensus_work)
 
                 # 3.get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
@@ -548,14 +544,10 @@ class SchedulerPPMixin:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    send_retract_work = self._pp_send_pyobj_to_next_stage(
-                        retract_rids, async_send=True
-                    )
-                    send_prealloc_work = self._pp_send_pyobj_to_next_stage(
-                        prealloc_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
+                    send_consensus_work = (
+                        self._pp_send_consensus_bundle_to_next_stage(
+                            [retract_rids, prealloc_rids, transferred_rids]
+                        )
                     )
                     if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
                         if not _is_cpu_920f:
@@ -1010,6 +1002,7 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
+    @Kunpeng_PP_Profiler(depth=1, name="_pp_send_pyobj_to_next_stage")
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
@@ -1187,7 +1180,7 @@ class SchedulerPPMixin:
         comm = self.pp_group.kunpeng_pp_communicator
         kind, payload = comm.recv_message(src)
         if kind == PP_KIND_ACK:
-            comm.ack_received(src)
+            # inflight accounting is handled inside the C++ kernel; nothing to do.
             return None
         if kind == PP_KIND_PYOBJ:
             return {"kind": "pyobj", "data": pickle.loads(payload)}
@@ -1204,8 +1197,11 @@ class SchedulerPPMixin:
         all_gather_rank = (
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
-        comm.recv_batch(src, 0)
+
         tensor_dict: Dict[str, Any] = {}
+        shards = []
+        offsets = []
+        pending = []  # (key, shard, use_all_gather, orig_shape)
         pp_offset = 0
         for key, value in recv_metadata_list:
             if not isinstance(value, TensorMetadata):
@@ -1223,17 +1219,27 @@ class SchedulerPPMixin:
                     or (tensor.numel() // all_gather_size) % SHM_ALIGN_SIZE == 0
                 )
             )
+            orig_shape = None
             if use_all_gather:
                 orig_shape = tensor.shape
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
-            else:
-                orig_shape = None
             if not tensor.is_cpu:
                 raise RuntimeError("Kunpeng PP RDMA channel requires CPU tensors")
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
-            comm.copy_from_buffer(tensor, pp_offset)
+            # Record the shard; the C++ fused op does one pp_recv + all copies.
+            shards.append(tensor)
+            offsets.append(pp_offset)
             pp_offset += tensor.nbytes
+            pending.append((key, tensor, use_all_gather, orig_shape))
+
+        # Fused recv of the data imm + scatter into all shards in a single call
+        # (the TENSOR metadata imm above was consumed by recv_message).
+        offsets_t = torch.tensor(offsets, dtype=torch.int64)
+        comm.recv_tensor_batch(src, offsets_t, shards)
+
+        for key, shard, use_all_gather, orig_shape in pending:
+            tensor = shard
             if use_all_gather:
                 tensor = self._pp_all_gather_shard(tensor, all_gather_group)
                 tensor = tensor.reshape(orig_shape)
@@ -1748,6 +1754,135 @@ class SchedulerPPMixin:
                 ]
             )
         return tuple(rids) if len(rids) > 1 else rids[0]
+
+    # === consensus bundle (RDMA) / per-pyobj (Gloo fallback) ===
+    # The decode PD consensus (retract / prealloc / transfer) is coalesced into
+    # a SINGLE ring message when the RDMA PP comm is enabled: all local polls
+    # run first, then one bundle recv from the previous stage, then the three
+    # consensus are built.  Gloo keeps the original per-pyobj behavior.
+
+    @Kunpeng_PP_Profiler(depth=2, name="send_consensus_bundle")
+    def _pp_send_consensus_bundle_to_next_stage(
+        self: Scheduler, data_list: List[Any]
+    ) -> List[P2PWork]:
+        work = []
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            if (
+                self.pp_group.kunpeng_pp_communicator is not None
+                and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
+            ):
+                self.pp_group.kunpeng_pp_communicator.send_pyobjs_bundle(
+                    data_list, (self.pp_rank + 1) % self.pp_size
+                )
+            else:
+                for data in data_list:
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    work += point_to_point_pyobj(
+                        data,
+                        self.pp_rank * self.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        self.pp_rank * self.tp_size + dp_offset,
+                        ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                        async_send=True,
+                    )
+        return work
+
+    @Kunpeng_PP_Profiler(depth=2, name="recv_consensus_bundle")
+    def _pp_recv_consensus_bundle_from_prev_stage(
+        self: Scheduler, count: int
+    ) -> Optional[List[Any]]:
+        if (
+            self.pp_group.kunpeng_pp_communicator is not None
+            and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
+        ):
+            # RDMA bundle: only (tp0, cp0) recvs the single bundle, then the list
+            # is broadcast to the rest of the tp/cp ranks.
+            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+                data = self.pp_group.kunpeng_pp_communicator.recv_pyobjs_bundle(
+                    (self.pp_rank - 1) % self.pp_size
+                )
+                assert len(data) == count, (
+                    f"consensus bundle: expected {count} sub-payloads, "
+                    f"got {len(data)}"
+                )
+            else:
+                data = None
+            if self.attn_tp_size > 1:
+                data = broadcast_pyobj(
+                    data,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
+            if self.attn_cp_size > 1:
+                data = broadcast_pyobj(
+                    data,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+            return data
+        else:
+            # Gloo fallback: per-pyobj recv (+ broadcast) on every rank.
+            return [self._pp_recv_pyobj_from_prev_stage() for _ in range(count)]
+
+    @Kunpeng_PP_Profiler(depth=1, name="pd_consensus")
+    def _pp_pd_get_decode_consensus_rids(self: Scheduler, mb_id: int):
+        """Compute retract / prealloc / transfer consensus for the microbatch.
+
+        Runs ALL local polls first, then a SINGLE blocking bundle-recv from the
+        previous stage (deadlock-safe order), then builds the three consensus.
+        """
+        # pre-consensus retracted reqs for the current microbatch
+        for req in self.disagg_decode_prealloc_queue.retracted_queue:
+            if req.retraction_mb_id is None:
+                req.retraction_mb_id = mb_id
+        curr_retract_rids = [
+            req.rid
+            for req in self.disagg_decode_prealloc_queue.retracted_queue
+            if req.retraction_mb_id == mb_id
+        ]
+        # prealloc poll BEFORE any blocking recv (fence/pp_recv deadlock).
+        curr_good_prealloc_rids, curr_bad_prealloc_rids = self.get_rids(
+            self.disagg_decode_prealloc_queue.queue,
+            False,
+            [KVPoll.WaitingForInput],
+            [KVPoll.Failed],
+        )
+        # transfer poll BEFORE any blocking recv.
+        curr_transferred_rids = self.get_rids(
+            self.disagg_decode_transfer_queue.queue,
+            False,
+            [KVPoll.Success, KVPoll.Failed],
+        )
+
+        if self.pp_group.is_first_rank:
+            return (
+                curr_retract_rids,
+                [curr_good_prealloc_rids, curr_bad_prealloc_rids],
+                curr_transferred_rids,
+            )
+
+        # other ranks: one bundle-recv of [retract, prealloc, transfer], then
+        # build the three consensus exactly like the per-getter originals.
+        prev = self._pp_recv_consensus_bundle_from_prev_stage(3)
+        prev_retract_rids, prev_prealloc_rids, prev_transferred_rids = prev
+        prev_good_prealloc_rids, prev_bad_prealloc_rids = prev_prealloc_rids
+        retract_rids = list(set(prev_retract_rids) & set(curr_retract_rids))
+        good_prealloc_rids = list(
+            set(prev_good_prealloc_rids) & set(curr_good_prealloc_rids)
+        )
+        bad_prealloc_rids = list(
+            set(prev_bad_prealloc_rids) | set(curr_bad_prealloc_rids)
+        )
+        transferred_rids = list(
+            set(prev_transferred_rids) & set(curr_transferred_rids)
+        )
+        return (
+            retract_rids,
+            [good_prealloc_rids, bad_prealloc_rids],
+            transferred_rids,
+        )
 
     @Kunpeng_PP_Profiler(depth=1, name="pd_retract")
     def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int):
