@@ -26,6 +26,8 @@ Two kinds of API are provided:
   ``depth`` limits how many descendant levels below this function are recorded
   (``depth=2`` = this function plus up to two levels of nested instrumented
   callees).  ``name`` overrides the printed span name.
+* ``pp_span(name)`` -- inline context-manager span for fine-grained
+  attribution inside a stage (always recorded, budget-independent).
 * ``pp_perf_start(root, tag)`` / ``pp_perf_report(print_report)`` frame one
   micro-batch iteration.  ``pp_perf_start`` is called at the top of every
   ``event_loop_pp_disagg_decode`` mb iteration, ``pp_perf_report`` at the end;
@@ -159,6 +161,89 @@ class Kunpeng_PP_Profiler:
                 )
 
         return wrapper
+
+
+class _NullSpan:
+    """Shared no-op context returned by pp_span when profiling is off."""
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
+_NULL_SPAN = _NullSpan()
+
+
+class _SpanCtx:
+    """Context-manager span: ``with pp_span("name"):``.
+
+    Unlike the decorator, an inline span is ALWAYS recorded -- it does not
+    honour the ancestors' depth budgets, so debug spans stay visible even
+    under an exhausted decorator chain.  Its nested spans receive a fresh
+    ``depth`` budget (default 0 = leaf, decorated callees not recorded).
+    """
+
+    __slots__ = ("_name", "_depth", "_frame")
+
+    def __init__(self, name, depth=0):
+        self._name = name
+        self._depth = depth
+        self._frame = None
+
+    def __enter__(self):
+        win = _win()
+        if win is None:
+            return self
+        frame = {
+            "name": self._name,
+            "start": time.perf_counter(),
+            "cpu": time.thread_time(),
+            "abs": time.time(),
+            "id": win.next_id,
+            "budget": self._depth,
+        }
+        win.next_id += 1
+        self._frame = frame
+        _stack().append(frame)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        frame = self._frame
+        if frame is None:
+            return False
+        self._frame = None
+        stack = _stack()
+        while stack:
+            if stack.pop() is frame:
+                break
+        win = _win()
+        if win is None:
+            return False
+        ms = (time.perf_counter() - frame["start"]) * 1000.0
+        cpu_ms = (time.thread_time() - frame["cpu"]) * 1000.0
+        parent_id = stack[-1]["id"] if stack else 0
+        win.children.setdefault(parent_id, []).append(
+            (frame["id"], frame["name"], ms, cpu_ms, frame["abs"])
+        )
+        return False
+
+
+def pp_span(name, depth=0):
+    """Inline span for fine-grained attribution inside a stage, e.g.::
+
+        with pp_span("build_graph_inputs"):
+            inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
+
+    Always recorded into the active window (budget-independent); a no-op
+    shared singleton when profiling is off.
+    """
+    if not _enabled():
+        return _NULL_SPAN
+    return _SpanCtx(name, depth)
 
 
 def pp_perf_start(root="pp_mb", tag=""):

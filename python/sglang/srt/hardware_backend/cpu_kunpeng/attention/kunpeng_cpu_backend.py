@@ -27,6 +27,7 @@ from sglang.srt.distributed import get_socket_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.common import is_lc_cp_enabled
 from sglang.srt.graph import ops as kunpeng
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import pp_span
 from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import *
 from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -447,30 +448,33 @@ class KunpengCpuBackend(AttentionBackend):
                 metadata.extra_bytes = 0
                 self.swap_mgr._blockwise_ddr_block_ids = None
                 return
-            self._init_long_context_metadata(
-                metadata,
-                forward_batch,
-                seq_lens,
-                req_pool_indices,
-                seqlen_q=seqlen_q,
-            )
-            metadata.extra_bytes = (
-                torch.ops.sgl_kernel.flash_mla_sparse_decode_sched_kunpeng(
-                    metadata.long_context_topk_length,
+            with pp_span("lc_metadata_build"):
+                self._init_long_context_metadata(
+                    metadata,
+                    forward_batch,
+                    seq_lens,
+                    req_pool_indices,
                     seqlen_q=seqlen_q,
-                    num_heads_q=self.num_q_heads * cp_size,
-                    head_dim=self.decode_head_dim,
-                    head_dim_v=self.decode_head_dim_v,
-                    meta=self._decode_meta,
                 )
-            )
+            with pp_span("lc_sparse_sched"):
+                metadata.extra_bytes = (
+                    torch.ops.sgl_kernel.flash_mla_sparse_decode_sched_kunpeng(
+                        metadata.long_context_topk_length,
+                        seqlen_q=seqlen_q,
+                        num_heads_q=self.num_q_heads * cp_size,
+                        head_dim=self.decode_head_dim,
+                        head_dim_v=self.decode_head_dim_v,
+                        meta=self._decode_meta,
+                    )
+                )
             if self.swap_mgr.enable_swap_kv_blockwise:
                 # Block-wise KV swap: remap the DDR-space indices to the
                 # compacted HBM swap buffer for this step (all LC modes:
                 # decode seqlen_q=1, MTP seqlen_q=draft_tokens).
-                self._init_lc_blockwise_metadata(
-                    metadata, forward_batch, seqlen_q=seqlen_q
-                )
+                with pp_span("lc_blockwise_swap"):
+                    self._init_lc_blockwise_metadata(
+                        metadata, forward_batch, seqlen_q=seqlen_q
+                    )
             return
 
         tp_size = get_attention_tp_size()
@@ -510,29 +514,32 @@ class KunpengCpuBackend(AttentionBackend):
 
         metadata.seq_lens = seq_lens
 
-        self._init_block_table(
-            metadata,
-            forward_batch,
-            req_pool_indices,
-            seq_lens,
-            enable_blockwise=enable_blockwise,
-        )
-
-        metadata.extra_bytes = (
-            torch.ops.sgl_kernel.flash_mla_dense_decode_sched_kunpeng(
-                metadata.seq_lens,
-                seqlen_q=seqlen_q,
-                num_heads_q=num_heads_q,
-                head_dim=self.decode_head_dim,
-                head_dim_v=self.decode_head_dim_v,
-                page_block_size=metadata.page_size,
-                is_kv_packed=False,
-                meta=self._decode_meta,
+        with pp_span("block_table_build"):
+            self._init_block_table(
+                metadata,
+                forward_batch,
+                req_pool_indices,
+                seq_lens,
+                enable_blockwise=enable_blockwise,
             )
-        )
+
+        with pp_span("dense_sched"):
+            metadata.extra_bytes = (
+                torch.ops.sgl_kernel.flash_mla_dense_decode_sched_kunpeng(
+                    metadata.seq_lens,
+                    seqlen_q=seqlen_q,
+                    num_heads_q=num_heads_q,
+                    head_dim=self.decode_head_dim,
+                    head_dim_v=self.decode_head_dim_v,
+                    page_block_size=metadata.page_size,
+                    is_kv_packed=False,
+                    meta=self._decode_meta,
+                )
+            )
 
         if enable_blockwise:
-            self._init_blockwise_swap_metadata(metadata, forward_batch)
+            with pp_span("blockwise_swap"):
+                self._init_blockwise_swap_metadata(metadata, forward_batch)
 
     def _init_long_context_metadata(
         self,
@@ -696,33 +703,34 @@ class KunpengCpuBackend(AttentionBackend):
                     # New / reshuffled / non-contiguous sequence: rebuild the
                     # row from req_to_token over this rank's local pages in
                     # [0, seq_len) (the query's own position is INCLUDED).
-                    n_local = 0
-                    n_pages = (seq_len + page_size - 1) // page_size
-                    for p in range(n_pages):
-                        if p % cp_size != cp_rank:
-                            continue
-                        s = p * page_size
-                        e = min(s + page_size, seq_len)
-                        n = e - s
-                        positions = torch.arange(
-                            s, e, dtype=torch.int64, device=req_to_token.device
-                        )
-                        # Keep only REAL slots: a local page may carry -1
-                        # entries (positions never written by this rank, e.g.
-                        # leftover holes), which must not be counted into the
-                        # fill or copied into indices (the sparse kernel would
-                        # otherwise read kvcache + (-1) * head_dim out of
-                        # bounds; its trailing--1 trim only handles -1s at the
-                        # very end of a row).
-                        slots = req_to_token[req_idx, positions]
-                        valid = slots >= 0
-                        n_valid = int(valid.sum())
-                        if n_valid > 0:
-                            indices[b, 0, n_local : n_local + n_valid] = slots[
-                                valid
-                            ]
-                            n_local += n_valid
-                    fill_len[b, 0] = n_local
+                    with pp_span("lc_row_rebuild"):
+                        n_local = 0
+                        n_pages = (seq_len + page_size - 1) // page_size
+                        for p in range(n_pages):
+                            if p % cp_size != cp_rank:
+                                continue
+                            s = p * page_size
+                            e = min(s + page_size, seq_len)
+                            n = e - s
+                            positions = torch.arange(
+                                s, e, dtype=torch.int64, device=req_to_token.device
+                            )
+                            # Keep only REAL slots: a local page may carry -1
+                            # entries (positions never written by this rank, e.g.
+                            # leftover holes), which must not be counted into the
+                            # fill or copied into indices (the sparse kernel would
+                            # otherwise read kvcache + (-1) * head_dim out of
+                            # bounds; its trailing--1 trim only handles -1s at the
+                            # very end of a row).
+                            slots = req_to_token[req_idx, positions]
+                            valid = slots >= 0
+                            n_valid = int(valid.sum())
+                            if n_valid > 0:
+                                indices[b, 0, n_local : n_local + n_valid] = slots[
+                                    valid
+                                ]
+                                n_local += n_valid
+                        fill_len[b, 0] = n_local
                     last_req_idx[b] = req_idx
                     last_seq_len[b] = seq_len
         else:
@@ -790,15 +798,16 @@ class KunpengCpuBackend(AttentionBackend):
         # (row seqlen_q - 1; rows are ordered so the fills are non-decreasing;
         # the kernel scans the same topk_length for every row of a sequence,
         # and trailing -1 padding trims each row to its own length).
-        real_topk_t = fill_len[:, seqlen_q - 1].clone()
-        # Sparse sched/kernel require topk_length >= 1 with valid slot ids;
-        # the dummy entry is masked out in the cross-rank LSE reduction.
-        topk_t = torch.clamp(real_topk_t, min=1)
-        dummy = real_topk_t == 0
-        if bool(dummy.any()):
-            indices[dummy, :seqlen_q, 0] = 0
-        metadata.long_context_topk_length = topk_t
-        metadata.long_context_real_topk_length = real_topk_t
+        with pp_span("lc_topk_tail"):
+            real_topk_t = fill_len[:, seqlen_q - 1].clone()
+            # Sparse sched/kernel require topk_length >= 1 with valid slot ids;
+            # the dummy entry is masked out in the cross-rank LSE reduction.
+            topk_t = torch.clamp(real_topk_t, min=1)
+            dummy = real_topk_t == 0
+            if bool(dummy.any()):
+                indices[dummy, :seqlen_q, 0] = 0
+            metadata.long_context_topk_length = topk_t
+            metadata.long_context_real_topk_length = real_topk_t
 
     def _init_lc_blockwise_metadata(
         self,
@@ -851,100 +860,107 @@ class KunpengCpuBackend(AttentionBackend):
         # Valid slots: the fill_len prefix of the first seqlen_q rows (the
         # rows this step's kernel actually scans). Stale entries beyond the
         # fill, and stale rows after a mode switch, are never read.
-        topk = indices.shape[-1]
-        valid_mask = torch.arange(topk, device=device) < fill_len[
-            :, :seqlen_q
-        ].unsqueeze(-1)
-        valid_slots = indices[:, :seqlen_q, :][valid_mask]
-        valid_slots = valid_slots[valid_slots >= 0]
+        with pp_span("lc_block_set"):
+            topk = indices.shape[-1]
+            valid_mask = torch.arange(topk, device=device) < fill_len[
+                :, :seqlen_q
+            ].unsqueeze(-1)
+            valid_slots = indices[:, :seqlen_q, :][valid_mask]
+            valid_slots = valid_slots[valid_slots >= 0]
 
-        loc = forward_batch.out_cache_loc
-        # Real new-token rows of this rank. LC keeps the FULL batch
-        # (token_slice_start = 0, batchsize_per_tp = B), so the existing
-        # helper yields the mode-correct range for DECODE (B rows),
-        # TARGET_VERIFY (B * draft_tokens rows, capped by the real token
-        # count) and DRAFT_EXTEND (cumsum of the padded per-sequence
-        # accepted counts).
-        real_start, real_end = self._blockwise_real_new_token_range(
-            forward_batch
-        )
-        real_loc_all = loc[real_start:real_end]
-        real_loc = real_loc_all[real_loc_all >= 0]
-        pool_slots = torch.cat([valid_slots, real_loc])
-
-        blocks = torch.cat(
-            [
-                pool_slots // page_size,
-                torch.zeros(1, dtype=pool_slots.dtype, device=device),
-            ]
-        )
-        unique_blocks = torch.unique(blocks)
-
-        num_unique = int(unique_blocks.shape[0])
-        if num_unique > max_blocks_on_package:
-            raise RuntimeError(
-                f"LC block-wise swap: needed {num_unique} local blocks but "
-                f"HBW buffer only holds {max_blocks_on_package}. "
-                f"Increase SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS."
+            loc = forward_batch.out_cache_loc
+            # Real new-token rows of this rank. LC keeps the FULL batch
+            # (token_slice_start = 0, batchsize_per_tp = B), so the existing
+            # helper yields the mode-correct range for DECODE (B rows),
+            # TARGET_VERIFY (B * draft_tokens rows, capped by the real token
+            # count) and DRAFT_EXTEND (cumsum of the padded per-sequence
+            # accepted counts).
+            real_start, real_end = self._blockwise_real_new_token_range(
+                forward_batch
             )
+            real_loc_all = loc[real_start:real_end]
+            real_loc = real_loc_all[real_loc_all >= 0]
+            pool_slots = torch.cat([valid_slots, real_loc])
 
-        ddr_block_ids = unique_blocks.to(torch.int32)
-        hbw_block_ids = torch.arange(
-            num_unique, dtype=torch.int32, device=device
-        )
-        max_ddr_block = int(unique_blocks.max().item())
-        ddr_to_hbw = torch.full(
-            (max_ddr_block + 1,), -1, dtype=torch.int32, device=device
-        )
-        ddr_to_hbw[ddr_block_ids] = hbw_block_ids
+            blocks = torch.cat(
+                [
+                    pool_slots // page_size,
+                    torch.zeros(1, dtype=pool_slots.dtype, device=device),
+                ]
+            )
+            unique_blocks = torch.unique(blocks)
+
+            num_unique = int(unique_blocks.shape[0])
+            if num_unique > max_blocks_on_package:
+                raise RuntimeError(
+                    f"LC block-wise swap: needed {num_unique} local blocks but "
+                    f"HBW buffer only holds {max_blocks_on_package}. "
+                    f"Increase SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS."
+                )
+
+            ddr_block_ids = unique_blocks.to(torch.int32)
+            hbw_block_ids = torch.arange(
+                num_unique, dtype=torch.int32, device=device
+            )
+            max_ddr_block = int(unique_blocks.max().item())
+            ddr_to_hbw = torch.full(
+                (max_ddr_block + 1,), -1, dtype=torch.int32, device=device
+            )
+            ddr_to_hbw[ddr_block_ids] = hbw_block_ids
 
         # Slot-level remap table: DDR flat slot -> HBM flat position
         # (hbm_block * page_size + offset). Slots whose block is not in this
         # step's set remap to a negative value (never read: the kernel scans
         # only the fill_len prefix, whose slots are all in the set).
-        max_slot = (
-            int(pool_slots.max().item()) if pool_slots.numel() > 0 else page_size - 1
-        )
-        slots_range = torch.arange(max_slot + 1, device=device)
-        hbw_of_block = ddr_to_hbw[slots_range // page_size]
-        slot_map = hbw_of_block * page_size + (slots_range % page_size)
-        slot_map[hbw_of_block < 0] = -1
+        with pp_span("lc_slot_map_build"):
+            max_slot = (
+                int(pool_slots.max().item())
+                if pool_slots.numel() > 0
+                else page_size - 1
+            )
+            slots_range = torch.arange(max_slot + 1, device=device)
+            hbw_of_block = ddr_to_hbw[slots_range // page_size]
+            slot_map = hbw_of_block * page_size + (slots_range % page_size)
+            slot_map[hbw_of_block < 0] = -1
 
         # Remapped index buffer (persistent fixed-shape, graph input). The
         # DDR-space ``long_context_indices`` stays the source of truth for
         # the incremental row maintenance.
-        hbm_indices = metadata.long_context_hbm_indices
-        if hbm_indices is None or hbm_indices.shape != indices.shape:
-            hbm_indices = torch.full_like(indices, -1)
-            metadata.long_context_hbm_indices = hbm_indices
-        remapped = slot_map[indices.clamp(0, max_slot)]
-        remapped[indices < 0] = -1
-        hbm_indices.copy_(remapped)
+        with pp_span("lc_hbm_remap"):
+            hbm_indices = metadata.long_context_hbm_indices
+            if hbm_indices is None or hbm_indices.shape != indices.shape:
+                hbm_indices = torch.full_like(indices, -1)
+                metadata.long_context_hbm_indices = hbm_indices
+            remapped = slot_map[indices.clamp(0, max_slot)]
+            remapped[indices < 0] = -1
+            hbm_indices.copy_(remapped)
 
         # Remapped write positions for this step's new K/V (HBM flat
         # positions). Default to the reserved safe block (never read by
         # attention); real rows get their slot-mapped position, foreign rows
         # (loc = -1) keep -1 so the write kernel skips them.
-        safe_block_pos = (max_blocks_on_package - 1) * page_size
-        hbw_cache_loc = torch.full(
-            (loc.shape[0],), safe_block_pos, dtype=torch.int64, device=device
-        )
-        real_rows = slot_map[loc[real_start:real_end].clamp(0, max_slot)].to(
-            torch.int64
-        )
-        real_rows[loc[real_start:real_end] < 0] = -1
-        hbw_cache_loc[real_start:real_end] = real_rows
+        with pp_span("lc_write_loc"):
+            safe_block_pos = (max_blocks_on_package - 1) * page_size
+            hbw_cache_loc = torch.full(
+                (loc.shape[0],), safe_block_pos, dtype=torch.int64, device=device
+            )
+            real_rows = slot_map[loc[real_start:real_end].clamp(0, max_slot)].to(
+                torch.int64
+            )
+            real_rows[loc[real_start:real_end] < 0] = -1
+            hbw_cache_loc[real_start:real_end] = real_rows
 
-        swap_mgr.set_blockwise_block_ids(
-            ddr_block_ids,
-            hbw_block_ids,
-            page_size,
-            ddr_to_hbw,
-            None,  # remapped block_table: the LC sparse kernel is index-driven
-            real_loc // page_size,
-            real_loc % page_size,
-        )
-        swap_mgr.set_blockwise_swap_cache_loc(hbw_cache_loc, 0)
+        with pp_span("lc_swap_register"):
+            swap_mgr.set_blockwise_block_ids(
+                ddr_block_ids,
+                hbw_block_ids,
+                page_size,
+                ddr_to_hbw,
+                None,  # remapped block_table: the LC sparse kernel is index-driven
+                real_loc // page_size,
+                real_loc % page_size,
+            )
+            swap_mgr.set_blockwise_swap_cache_loc(hbw_cache_loc, 0)
 
     def _blockwise_token_row_slice(
         self, forward_batch: ForwardBatch

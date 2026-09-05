@@ -43,7 +43,10 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
-from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import (
+    Kunpeng_PP_Profiler,
+    pp_span,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -503,9 +506,10 @@ class TpModelWorker(BaseTpWorker):
 
             if not model_worker_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
-                batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
-                )
+                with pp_span("sample"):
+                    batch_result.next_token_ids = self.model_runner.sample(
+                        logits_output, forward_batch
+                    )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens

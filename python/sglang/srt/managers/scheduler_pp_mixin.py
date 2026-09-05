@@ -1509,7 +1509,10 @@ class SchedulerPPMixin:
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
-    @Kunpeng_PP_Profiler(depth=2, name="launch_batch")
+    # depth=4 so the run_batch -> model_runner.forward -> forward_batch chain
+    # stays visible (each decorated level consumes one budget unit; inline
+    # pp_span spans are budget-independent and always recorded).
+    @Kunpeng_PP_Profiler(depth=4, name="launch_batch")
     def _pp_launch_batch(
         self: Scheduler,
         mb_id: int,

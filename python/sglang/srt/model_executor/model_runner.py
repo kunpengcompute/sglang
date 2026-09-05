@@ -211,7 +211,10 @@ from sglang.srt.utils.patch_torch import (
     register_sgl_tp_rank,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import (
+    Kunpeng_PP_Profiler,
+    pp_span,
+)
 from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -3197,12 +3200,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
-        output.routed_experts_output = get_global_experts_capturer().on_forward_end(
-            forward_batch=forward_batch,
-            can_run_graph=output.can_run_graph,
-            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
-            no_copy_to_cpu=no_copy_to_cpu,
-        )
+        with pp_span("experts_capture"):
+            output.routed_experts_output = get_global_experts_capturer().on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+                no_copy_to_cpu=no_copy_to_cpu,
+            )
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
@@ -3232,7 +3236,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # of inflating in-graph comm ops. Each forward passes once per rank,
         # keeping barrier counts consistent; no-ops before MoE comm init.
         if _is_cpu_920f and is_kunpeng_graph_profile():
-            torch.ops.sgl_kernel.moe_comm_barrier_kunpeng()
+            with pp_span("moe_comm_barrier"):
+                torch.ops.sgl_kernel.moe_comm_barrier_kunpeng()
 
         # Check whether can run cuda graph
         mode_check = (
