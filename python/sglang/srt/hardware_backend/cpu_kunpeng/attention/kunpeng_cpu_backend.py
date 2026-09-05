@@ -223,11 +223,17 @@ class KunpengCpuMetadata:
         # of each row is valid per step. ``last_req_idx`` / ``last_seq_len``
         # track per-row continuation so a row is incrementally appended on a
         # normal step and fully rebuilt after a batch reshuffle.
+        # ``long_context_last_pos`` (per row 0, seqlen_q == 1 path) records
+        # the position of the LAST slot stored in the row, so the content
+        # guard can verify that slot in O(1) against req_to_token without
+        # assuming the last covered position was local (under CP it usually
+        # is not -- the old guard misfired and forced a full rebuild).
         self.long_context_topk_length: Optional[torch.Tensor] = None
         self.long_context_real_topk_length: Optional[torch.Tensor] = None
         self.long_context_indices: Optional[torch.Tensor] = None
         self.long_context_fill_len: Optional[torch.Tensor] = None
         self.long_context_last_req_idx: Optional[torch.Tensor] = None
+        self.long_context_last_pos: Optional[torch.Tensor] = None
         self.long_context_last_seq_len: Optional[torch.Tensor] = None
         # Block-wise KV swap only: per-step slot-remapped copy of
         # ``long_context_indices`` (DDR slot -> compacted HBM swap-buffer
@@ -593,10 +599,14 @@ class KunpengCpuBackend(AttentionBackend):
         on a normal continuation step the slot of position ``seq_len - 1``
         (the current query token, which must attend itself) is appended when
         it lands on a local page; a row is rebuilt from req_to_token whenever
-        the sequence is new or the batch reshuffled (detected via last_req_idx
-        / last_seq_len). For ``seqlen_q > 1`` every filled row is rebuilt from
-        req_to_token each step (correctness first; the incremental multi-row
-        update is deferred to the MTP driver work).
+        the sequence is new or the batch reshuffled / retracted (detected via
+        last_req_idx / last_seq_len plus an O(1) content guard comparing the
+        row's last stored slot against req_to_token at its recorded position
+        ``long_context_last_pos[b]`` -- the guard is locality-independent, so
+        a normal CP step appends and continues without a rebuild). For
+        ``seqlen_q > 1`` every filled row is rebuilt from req_to_token each
+        step (correctness first; the incremental multi-row update is deferred
+        to the MTP driver work).
         The persistent buffers live on ``metadata`` and are reused across
         steps (and across graph captures of the same batch size).
         """
@@ -622,6 +632,7 @@ class KunpengCpuBackend(AttentionBackend):
         fill_len = metadata.long_context_fill_len
         last_req_idx = metadata.long_context_last_req_idx
         last_seq_len = metadata.long_context_last_seq_len
+        last_pos = metadata.long_context_last_pos
         # The buffer row count is the RUN-WIDE maximum seqlen_q (MTP); a step
         # fills the first ``seqlen_q`` rows only, so the shape stays constant
         # across decode (seqlen_q == 1) and verify/draft-extend (seqlen_q ==
@@ -646,10 +657,12 @@ class KunpengCpuBackend(AttentionBackend):
                 (B,), -1, dtype=torch.int64, device=device
             )
             last_seq_len = torch.zeros(B, dtype=torch.int64, device=device)
+            last_pos = torch.full((B,), -1, dtype=torch.int64, device=device)
             metadata.long_context_indices = indices
             metadata.long_context_fill_len = fill_len
             metadata.long_context_last_req_idx = last_req_idx
             metadata.long_context_last_seq_len = last_seq_len
+            metadata.long_context_last_pos = last_pos
 
         if seqlen_q == 1:
             # Plain decode: a single query row per sequence. Row 0 holds the
@@ -660,10 +673,16 @@ class KunpengCpuBackend(AttentionBackend):
                 seq_len = int(seq_lens[b])
                 req_idx = int(req_pool_indices[b])
                 # A row continues iff the same sequence occupies this row, the
-                # length advanced by exactly one, AND the last stored local
-                # slot still matches req_to_token (guards against retraction /
+                # length advanced by exactly one, AND the last stored slot
+                # still matches req_to_token at the position it was taken
+                # from (``last_pos``, O(1)). This guards against retraction /
                 # req_pool_idx reuse where the underlying slots changed but
-                # the length happened to be contiguous).
+                # the length happened to be contiguous. The check must NOT
+                # reference req_to_token[seq_len - 1 - k] for the last covered
+                # position: under CP that position usually sits on a FOREIGN
+                # page whose slot is never stored in the row, so the old
+                # seq_len - 2 comparison misfired ~7/8 of steps and forced a
+                # full O(n_pages) rebuild every decode step.
                 #
                 # Causal scope: the row holds the local slots of positions
                 # [0, seq_len) INCLUSIVE of the current query's own position
@@ -672,24 +691,23 @@ class KunpengCpuBackend(AttentionBackend):
                 # the full seq_lens masks nothing for q_len==1), and the
                 # sparse kernel applies no mask of its own, so the row must
                 # cover the query's own slot too. The continuation path
-                # appends exactly that slot, and the continuity guard checks
-                # the slot of position seq_len - 2 (the last position the
-                # previous row covered).
+                # appends exactly that slot (when local).
                 cont = (
                     last_req_idx[b] == req_idx
                     and last_seq_len[b] == seq_len - 1
                     and (
                         fill_len[b, 0] == 0
-                        or seq_len < 2
                         or int(indices[b, 0, fill_len[b, 0] - 1])
-                        == int(req_to_token[req_idx, seq_len - 2])
+                        == int(req_to_token[req_idx, last_pos[b]])
                     )
                 )
                 if cont:
                     # Normal continuation: append the CURRENT token's slot
                     # (seq_len - 1) when it lands on a local page (foreign
                     # pages carry -1 and are skipped by the KV write path as
-                    # well).
+                    # well). last_pos tracks the position of the last stored
+                    # slot for the next step's guard; it is left untouched
+                    # when the current token is foreign.
                     pos = seq_len - 1
                     if pos >= 0:
                         p = pos // page_size
@@ -698,6 +716,7 @@ class KunpengCpuBackend(AttentionBackend):
                             if slot >= 0 and fill_len[b, 0] < max_topk:
                                 indices[b, 0, fill_len[b, 0]] = slot
                                 fill_len[b, 0] += 1
+                                last_pos[b] = pos
                     last_seq_len[b] = seq_len
                 else:
                     # New / reshuffled / non-contiguous sequence: rebuild the
@@ -705,6 +724,7 @@ class KunpengCpuBackend(AttentionBackend):
                     # [0, seq_len) (the query's own position is INCLUDED).
                     with pp_span("lc_row_rebuild"):
                         n_local = 0
+                        row_last_pos = -1
                         n_pages = (seq_len + page_size - 1) // page_size
                         for p in range(n_pages):
                             if p % cp_size != cp_rank:
@@ -730,7 +750,13 @@ class KunpengCpuBackend(AttentionBackend):
                                     valid
                                 ]
                                 n_local += n_valid
+                                row_last_pos = int(positions[valid][-1])
                         fill_len[b, 0] = n_local
+                        # Track the position of the last stored slot for the
+                        # next step's continuation guard (row may be empty:
+                        # row_last_pos stays -1 and the guard's fill_len == 0
+                        # branch keeps continuation valid).
+                        last_pos[b] = row_last_pos
                     last_req_idx[b] = req_idx
                     last_seq_len[b] = seq_len
         else:
