@@ -171,20 +171,24 @@ void pp_send_msg_kunpeng(at::Tensor payload, int64_t kind, int64_t dest_rank)
     int64_t size = payload.nbytes();
     TORCH_CHECK(size <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER,
                 "PP send msg payload exceeds one message slot");
-    int64_t slot_off = pp_send_slot_off(dest_rank);
-    uint32_t header[3] = {PP_MSG_MAGIC, static_cast<uint32_t>(kind), static_cast<uint32_t>(size)};
-    memcpy(g_pp_base_ptr + slot_off, header, PP_MSG_HEADER);
-    if (size > 0) {
-        memcpy(g_pp_base_ptr + slot_off + PP_MSG_HEADER, payload.data_ptr(), size);
-    }
-    kutacc::pp_put(g_pp_to_world[dest_rank], slot_off, PP_MSG_HEADER + size,
-                   g_moe_comm_h->global_ds_conn_info);
-    g_pp_send_cnt[dest_rank]++;
-    if (kind != PP_KIND_ACK) {
-        // A posted non-ack message occupies a peer ring slot until its ack
-        // comes back; track it here so the Python side no longer manages it.
-        g_pp_inflight[dest_rank]++;
-    }
+    // Single-iteration parallel_for: stage the frame and issue the RDMA put
+    // from a kutacc worker core.
+    kutacc::parallel_for(0, 1, 1, [&](int64_t s, int64_t e) {
+        int64_t slot_off = pp_send_slot_off(dest_rank);
+        uint32_t header[3] = {PP_MSG_MAGIC, static_cast<uint32_t>(kind), static_cast<uint32_t>(size)};
+        memcpy(g_pp_base_ptr + slot_off, header, PP_MSG_HEADER);
+        if (size > 0) {
+            memcpy(g_pp_base_ptr + slot_off + PP_MSG_HEADER, payload.data_ptr(), size);
+        }
+        kutacc::pp_put(g_pp_to_world[dest_rank], slot_off, PP_MSG_HEADER + size,
+                       g_moe_comm_h->global_ds_conn_info);
+        g_pp_send_cnt[dest_rank]++;
+        if (kind != PP_KIND_ACK) {
+            // A posted non-ack message occupies a peer ring slot until its ack
+            // comes back; track it here so the Python side no longer manages it.
+            g_pp_inflight[dest_rank]++;
+        }
+    });
 }
 
 // Query how many outbound non-ack messages to `dst_rank` are not yet acked.
@@ -211,28 +215,34 @@ std::vector<at::Tensor> pp_recv_msg_kunpeng(int64_t src_rank)
 {
     TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
     TORCH_CHECK(src_rank >= 0 && src_rank < g_pp_world_size, "PP recv msg: bad src_rank");
-    // Wait for the next imm from src; the payload already landed in the
-    // current slot of the per-sender-src region (single-sided write).
-    kutacc::pp_recv(g_pp_to_world[src_rank], g_moe_comm_h->global_ds_conn_info);
-    int64_t slot_off = pp_recv_slot_off(src_rank);
-    uint32_t *header = reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off);
-    TORCH_CHECK(header[0] == PP_MSG_MAGIC, "PP recv msg: bad message magic");
-    int64_t kind = header[1];
-    int64_t size = header[2];
-    TORCH_CHECK(size <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER, "PP recv msg: oversized frame");
-    auto payload = torch::empty({size}, torch::TensorOptions().dtype(torch::kUInt8));
-    if (size > 0) {
-        memcpy(payload.data_ptr(), g_pp_base_ptr + slot_off + PP_MSG_HEADER, size);
-    }
-    g_pp_recv_cnt[src_rank]++;
-    auto kind_t = torch::tensor({kind}, torch::TensorOptions().dtype(torch::kInt64));
-    // Consuming an ACK frees one outbound ring slot to that peer (flow control).
-    if (kind == PP_KIND_ACK) {
-        g_pp_inflight[src_rank] = std::max<int64_t>(0, g_pp_inflight[src_rank] - 1);
-    } else {
-        // Auto ack every non-ack message so the sender can reuse the slot.
-        pp_send_ack_locked(src_rank);
-    }
+    at::Tensor kind_t;
+    at::Tensor payload;
+    // Single-iteration parallel_for: the whole recv (RDMA wait + parse + alloc
+    // + copy + counter + ack) runs on a kutacc worker core.
+    kutacc::parallel_for(0, 1, 1, [&](int64_t s, int64_t e) {
+        // Wait for the next imm from src; the payload has already landed in
+        // the current slot of the per-sender-src region (single-sided write).
+        kutacc::pp_recv(g_pp_to_world[src_rank], g_moe_comm_h->global_ds_conn_info);
+        int64_t slot_off = pp_recv_slot_off(src_rank);
+        uint32_t *header = reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off);
+        TORCH_CHECK(header[0] == PP_MSG_MAGIC, "PP recv msg: bad message magic");
+        int64_t kind = header[1];
+        int64_t size = header[2];
+        TORCH_CHECK(size <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER, "PP recv msg: oversized frame");
+        payload = torch::empty({size}, torch::TensorOptions().dtype(torch::kUInt8));
+        if (size > 0) {
+            memcpy(payload.data_ptr(), g_pp_base_ptr + slot_off + PP_MSG_HEADER, size);
+        }
+        g_pp_recv_cnt[src_rank]++;
+        kind_t = torch::tensor({kind}, torch::TensorOptions().dtype(torch::kInt64));
+        // Consuming an ACK frees one outbound ring slot to that peer (flow control).
+        if (kind == PP_KIND_ACK) {
+            g_pp_inflight[src_rank] = std::max<int64_t>(0, g_pp_inflight[src_rank] - 1);
+        } else {
+            // Auto ack every non-ack message so the sender can reuse the slot.
+            pp_send_ack_locked(src_rank);
+        }
+    });
     return {kind_t, payload};
 }
 
@@ -246,19 +256,24 @@ void pp_send_tensor_batch_kunpeng(int64_t dest_rank, at::TensorList tensors)
 {
     TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
     TORCH_CHECK(dest_rank >= 0 && dest_rank < g_pp_world_size, "PP send tensor batch: bad dest_rank");
-    int64_t off = 0;
-    for (const auto &t : tensors) {
-        if (t.numel() == 0) {
-            continue;  // keep offsets aligned with the metadata skip-empty logic
+    // Run the entire packing (per-tensor offsets + copies + RDMA put) once on a
+    // kutacc worker core via a single-iteration parallel_for.
+    kutacc::parallel_for(0, 1, 1, [&](int64_t s, int64_t e) {
+        int64_t off = 0;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const auto &t = tensors[i];
+            int64_t n = t.nbytes();
+            if (n == 0) {
+                continue;  // keep offsets aligned with the metadata skip-empty logic
+            }
+            TORCH_CHECK(t.is_cpu() && t.is_contiguous(),
+                        "PP send tensor batch requires contiguous CPU tensors");
+            TORCH_CHECK(off + n <= g_pp_msg_offset, "PP send tensor batch exceeds the batch region");
+            memcpy(g_pp_base_ptr + off, t.data_ptr(), n);
+            off += n;
         }
-        TORCH_CHECK(t.is_cpu() && t.is_contiguous(),
-                    "PP send tensor batch requires contiguous CPU tensors");
-        int64_t n = t.nbytes();
-        TORCH_CHECK(off + n <= g_pp_msg_offset, "PP send tensor batch exceeds the batch region");
-        memcpy(g_pp_base_ptr + off, t.data_ptr(), n);
-        off += n;
-    }
-    kutacc::pp_put(g_pp_to_world[dest_rank], 0, off, g_moe_comm_h->global_ds_conn_info);
+        kutacc::pp_put(g_pp_to_world[dest_rank], 0, off, g_moe_comm_h->global_ds_conn_info);
+    });
 }
 
 // Consume the data imm for a TENSOR message (one pp_recv) and copy each output
@@ -270,21 +285,24 @@ void pp_recv_batch_copy_kunpeng(int64_t src_rank, at::Tensor offsets, at::Tensor
     TORCH_CHECK(offsets.dtype() == at::kLong && (int64_t)offsets.numel() == (int64_t)out_tensors.size(),
                 "PP recv batch copy: offsets must be int64 and match out_tensors count");
     // The TENSOR metadata imm was consumed by a prior pp_recv_msg_kunpeng; this
-    // call consumes its data imm, then fills the out tensors.
-    kutacc::pp_recv(g_pp_to_world[src_rank], g_moe_comm_h->global_ds_conn_info);
-    const int64_t *off_ptr = offsets.data_ptr<int64_t>();
-    for (size_t i = 0; i < out_tensors.size(); ++i) {
-        const auto &t = out_tensors[i];
-        int64_t n = t.nbytes();
-        if (n == 0) {
-            continue;
+    // call consumes its data imm, then fills the out tensors. Run the whole
+    // recv + copies on a kutacc worker core via a single-iteration parallel_for.
+    kutacc::parallel_for(0, 1, 1, [&](int64_t s, int64_t e) {
+        kutacc::pp_recv(g_pp_to_world[src_rank], g_moe_comm_h->global_ds_conn_info);
+        const int64_t *off_ptr = offsets.data_ptr<int64_t>();
+        for (size_t i = 0; i < out_tensors.size(); ++i) {
+            const auto &t = out_tensors[i];
+            int64_t n = t.nbytes();
+            if (n == 0) {
+                continue;
+            }
+            TORCH_CHECK(t.is_cpu() && t.is_contiguous(),
+                        "PP recv batch copy requires contiguous CPU tensors");
+            TORCH_CHECK(off_ptr[i] >= 0 && off_ptr[i] + n <= g_pp_msg_offset,
+                        "PP recv batch copy: offset exceeds the batch region");
+            memcpy(t.data_ptr(), g_pp_base_ptr + off_ptr[i], n);
         }
-        TORCH_CHECK(t.is_cpu() && t.is_contiguous(),
-                    "PP recv batch copy requires contiguous CPU tensors");
-        TORCH_CHECK(off_ptr[i] >= 0 && off_ptr[i] + n <= g_pp_msg_offset,
-                    "PP recv batch copy: offset exceeds the batch region");
-        memcpy(t.data_ptr(), g_pp_base_ptr + off_ptr[i], n);
-    }
+    });
 }
 
 // === Pyobj bundle (coalesce multiple rid/consensus lists into ONE slot) ===
@@ -297,33 +315,37 @@ void pp_send_pyobjs_bundle_kunpeng(int64_t dest_rank, at::TensorList payloads)
 {
     TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
     TORCH_CHECK(dest_rank >= 0 && dest_rank < g_pp_world_size, "PP send bundle: bad dest_rank");
-    int64_t total = 0;
-    for (const auto &p : payloads) {
-        TORCH_CHECK(p.dtype() == torch::kUInt8 && p.is_contiguous(),
-                    "PP bundle payload must be a contiguous uint8 tensor");
-        total += 4 + p.nbytes();  // [len] header per sub-part
-    }
-    TORCH_CHECK(total <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER,
-                "PP send bundle: combined payloads exceed one message slot");
-
-    int64_t slot_off = pp_send_slot_off(dest_rank);
-    uint32_t header[3] = {PP_MSG_MAGIC, PP_KIND_BUNDLE, static_cast<uint32_t>(total)};
-    memcpy(g_pp_base_ptr + slot_off, header, PP_MSG_HEADER);
-    int64_t off = PP_MSG_HEADER;
-    for (const auto &p : payloads) {
-        uint32_t len = static_cast<uint32_t>(p.nbytes());
-        memcpy(g_pp_base_ptr + slot_off + off, &len, sizeof(uint32_t));
-        off += sizeof(uint32_t);
-        if (len > 0) {
-            memcpy(g_pp_base_ptr + slot_off + off, p.data_ptr(), len);
-            off += len;
+    // Single-iteration parallel_for: frame the whole bundle and issue the RDMA
+    // put on a kutacc worker core.
+    kutacc::parallel_for(0, 1, 1, [&](int64_t s, int64_t e) {
+        int64_t total = 0;
+        for (const auto &p : payloads) {
+            TORCH_CHECK(p.dtype() == torch::kUInt8 && p.is_contiguous(),
+                        "PP bundle payload must be a contiguous uint8 tensor");
+            total += 4 + p.nbytes();  // [len] header per sub-part
         }
-    }
-    TORCH_CHECK(off == PP_MSG_HEADER + total, "PP send bundle: framing mismatch");
-    kutacc::pp_put(g_pp_to_world[dest_rank], slot_off, PP_MSG_HEADER + total,
-                   g_moe_comm_h->global_ds_conn_info);
-    g_pp_send_cnt[dest_rank]++;
-    g_pp_inflight[dest_rank]++;  // occupies one ring slot -> one ack back
+        TORCH_CHECK(total <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER,
+                    "PP send bundle: combined payloads exceed one message slot");
+
+        int64_t slot_off = pp_send_slot_off(dest_rank);
+        uint32_t header[3] = {PP_MSG_MAGIC, PP_KIND_BUNDLE, static_cast<uint32_t>(total)};
+        memcpy(g_pp_base_ptr + slot_off, header, PP_MSG_HEADER);
+        int64_t off = PP_MSG_HEADER;
+        for (const auto &p : payloads) {
+            uint32_t len = static_cast<uint32_t>(p.nbytes());
+            memcpy(g_pp_base_ptr + slot_off + off, &len, sizeof(uint32_t));
+            off += sizeof(uint32_t);
+            if (len > 0) {
+                memcpy(g_pp_base_ptr + slot_off + off, p.data_ptr(), len);
+                off += len;
+            }
+        }
+        TORCH_CHECK(off == PP_MSG_HEADER + total, "PP send bundle: framing mismatch");
+        kutacc::pp_put(g_pp_to_world[dest_rank], slot_off, PP_MSG_HEADER + total,
+                       g_moe_comm_h->global_ds_conn_info);
+        g_pp_send_cnt[dest_rank]++;
+        g_pp_inflight[dest_rank]++;  // occupies one ring slot -> one ack back
+    });
 }
 
 // Receive one bundle and unpack its sub-payloads.  One pp_recv, then auto-ack
@@ -332,33 +354,37 @@ std::vector<at::Tensor> pp_recv_pyobjs_bundle_kunpeng(int64_t src_rank)
 {
     TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
     TORCH_CHECK(src_rank >= 0 && src_rank < g_pp_world_size, "PP recv bundle: bad src_rank");
-    kutacc::pp_recv(g_pp_to_world[src_rank], g_moe_comm_h->global_ds_conn_info);
-    int64_t slot_off = pp_recv_slot_off(src_rank);
-    uint32_t *header = reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off);
-    TORCH_CHECK(header[0] == PP_MSG_MAGIC, "PP recv bundle: bad message magic");
-    TORCH_CHECK(header[1] == PP_KIND_BUNDLE, "PP recv bundle: expected a BUNDLE frame");
-    int64_t total = header[2];
-    TORCH_CHECK(total <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER, "PP recv bundle: oversized frame");
-
     std::vector<at::Tensor> payloads;
-    int64_t off = PP_MSG_HEADER;
-    int64_t end = PP_MSG_HEADER + total;
-    while (off < end) {
-        TORCH_CHECK(off + static_cast<int64_t>(sizeof(uint32_t)) <= end, "PP recv bundle: short len");
-        uint32_t len = *reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off + off);
-        off += sizeof(uint32_t);
-        TORCH_CHECK(off + len <= end, "PP recv bundle: sub-payload exceeds frame");
-        auto payload = torch::empty({static_cast<int64_t>(len)},
-                                    torch::TensorOptions().dtype(torch::kUInt8));
-        if (len > 0) {
-            memcpy(payload.data_ptr(), g_pp_base_ptr + slot_off + off, len);
-            off += len;
+    // Single-iteration parallel_for: the whole recv (RDMA wait + unpack + ack)
+    // runs on a kutacc worker core.
+    kutacc::parallel_for(0, 1, 1, [&](int64_t s, int64_t e) {
+        kutacc::pp_recv(g_pp_to_world[src_rank], g_moe_comm_h->global_ds_conn_info);
+        int64_t slot_off = pp_recv_slot_off(src_rank);
+        uint32_t *header = reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off);
+        TORCH_CHECK(header[0] == PP_MSG_MAGIC, "PP recv bundle: bad message magic");
+        TORCH_CHECK(header[1] == PP_KIND_BUNDLE, "PP recv bundle: expected a BUNDLE frame");
+        int64_t total = header[2];
+        TORCH_CHECK(total <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER, "PP recv bundle: oversized frame");
+
+        int64_t off = PP_MSG_HEADER;
+        int64_t end = PP_MSG_HEADER + total;
+        while (off < end) {
+            TORCH_CHECK(off + static_cast<int64_t>(sizeof(uint32_t)) <= end, "PP recv bundle: short len");
+            uint32_t len = *reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off + off);
+            off += sizeof(uint32_t);
+            TORCH_CHECK(off + len <= end, "PP recv bundle: sub-payload exceeds frame");
+            auto payload = torch::empty({static_cast<int64_t>(len)},
+                                        torch::TensorOptions().dtype(torch::kUInt8));
+            if (len > 0) {
+                memcpy(payload.data_ptr(), g_pp_base_ptr + slot_off + off, len);
+                off += len;
+            }
+            payloads.push_back(payload);
         }
-        payloads.push_back(payload);
-    }
-    TORCH_CHECK(off == end, "PP recv bundle: framing mismatch");
-    g_pp_recv_cnt[src_rank]++;
-    pp_send_ack_locked(src_rank);  // one ack for the whole bundle
+        TORCH_CHECK(off == end, "PP recv bundle: framing mismatch");
+        g_pp_recv_cnt[src_rank]++;
+        pp_send_ack_locked(src_rank);  // one ack for the whole bundle
+    });
     return payloads;
 }
 
