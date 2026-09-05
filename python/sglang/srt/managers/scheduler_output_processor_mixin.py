@@ -472,6 +472,16 @@ class SchedulerOutputProcessorMixin:
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
+        # Replicate the last rank's one-step MTP verify updates for all requests
+        # in a single batched pass (removes the per-request O(n^2) prefix sum
+        # and per-request evict-mask allocations).
+        if (
+            is_spec_v1
+            and batch.pp_mtp_accepted_tokens is not None
+            and not self.pp_group.is_last_rank
+        ):
+            self._pp_mtp_apply_verify_batch(batch, result)
+
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -496,15 +506,6 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if is_spec_v1:
-                if (
-                    batch.pp_mtp_accepted_tokens is not None
-                    and not self.pp_group.is_last_rank
-                ):
-                    # PP+MTP: the verify phase (output_ids append, finish checks,
-                    # KV bookkeeping, rejected-slot eviction) ran on the last
-                    # rank; replicate it locally so every rank keeps the same
-                    # request state.
-                    self._pp_mtp_apply_verify_result(batch, result, i)
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finished_req(req, i, logits_output)
@@ -685,6 +686,124 @@ class SchedulerOutputProcessorMixin:
                     f"rejected draft KV slots for req {req.rid}"
                 )
 
+            self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+
+    @Kunpeng_PP_Profiler(depth=2, name="pp_mtp_apply_verify_batch")
+    def _pp_mtp_apply_verify_batch(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Batch version of `_pp_mtp_apply_verify_result` over all requests.
+
+        Semantics are identical to calling the per-request method once per req,
+        but two expensive per-request patterns are removed:
+
+        * The accepted-token prefix offsets are computed once with a single O(n)
+          prefix pass (the per-request version re-sums `accepted_tokens[:i]`,
+          which is O(n^2) across the batch).
+        * The rejected-draft KV eviction mask is built vectorized for the whole
+          batch (one boolean allocation instead of one `torch.zeros` per req).
+        """
+        from sglang.srt.utils import is_cpu_920f
+
+        n = len(batch.reqs)
+        if n == 0:
+            return
+
+        counts_int = [int(c) for c in batch.pp_mtp_accepted_tokens]
+        # offsets[i] = sum(counts_int[:i]); single O(n) prefix pass.
+        offsets = [0] * (n + 1)
+        for i in range(n):
+            offsets[i + 1] = offsets[i] + counts_int[i]
+
+        think_end_id = batch.model_config.think_end_id
+        # One tensor -> python list conversion for the whole accepted region,
+        # instead of one `.tolist()` per request; per-request offsets then slice
+        # the python list directly.
+        total_accepted = offsets[n]
+        flat_toks = result.next_token_ids[:total_accepted].tolist()
+        for i, req in enumerate(batch.reqs):
+            req: Req
+            num_accepted = counts_int[i]
+            if num_accepted < 1:
+                continue
+            offset = offsets[i]
+            toks = flat_toks[offset : offset + num_accepted]
+
+            sp = req.sampling_params
+            need_reasoning = req.require_reasoning and think_end_id is not None
+            # Fast path: no grammar, no per-token reasoning update, and no way
+            # to finish mid-slice. MTP accepted tokens are by construction
+            # non-terminal (the verifier only accepts valid continuations), so
+            # token/stop finishes cannot trigger mid-slice; the budget and
+            # stop-str guards rule out the remaining intermediate finishes.
+            # One extend + one check_finished over the whole slice is then
+            # exactly equivalent to the per-token loop.
+            if (
+                req.grammar is None
+                and not need_reasoning
+                and (
+                    sp.max_new_tokens is None
+                    or len(req.output_ids) + num_accepted <= sp.max_new_tokens
+                )
+                and not sp.stop_strs
+                and not sp.stop_regex_strs
+            ):
+                req.output_ids.extend(toks)
+                req.check_finished(num_accepted)
+            else:
+                for tok in toks:
+                    req.output_ids.append(tok)
+                    if need_reasoning:
+                        req.update_reasoning_tokens(tok, think_end_id)
+                    req.check_finished()
+                    if not req.finished() and req.grammar is not None:
+                        try:
+                            req.grammar.accept_token(tok)
+                        except ValueError as e:
+                            logger.info(f"{req=}\n{e}")
+                            raise e
+                        req.check_finished()
+                    if req.finished():
+                        break
+
+            req.kv_committed_len += num_accepted
+            req.kv_allocated_len = req.kv_committed_len
+            req.spec_verify_ct += 1
+
+
+        # Build the rejected-draft KV eviction mask for the whole batch at once.
+        # Note: reqs with 0 accepted tokens are skipped above (no eviction), the
+        # same as the per-request path returning early on `num_accepted < 1`.
+        draft_token_num = 2
+        if (
+            batch.out_cache_loc is not None
+            and batch.out_cache_loc.numel() >= n * draft_token_num
+        ):
+            counts_t = torch.tensor(
+                counts_int, dtype=torch.int64, device=batch.out_cache_loc.device
+            )
+            cols = torch.arange(
+                draft_token_num, device=batch.out_cache_loc.device
+            ).unsqueeze(0)
+            valid = (counts_t >= 1) & (counts_t < draft_token_num)
+            evict_mask = (
+                (cols >= counts_t.unsqueeze(1)) & valid.unsqueeze(1)
+            ).reshape(-1)
+            if is_cpu_920f():
+                from sglang.srt.speculative.spec_utils import (
+                    align_evict_mask_to_page_size_native,
+                )
+
+                align_evict_mask_to_page_size_native(
+                    batch.seq_lens, evict_mask, self.page_size, draft_token_num
+                )
+            if _DEBUG_PP_MTP:
+                pp_rank = getattr(self, "pp_rank", None)
+                n_evict = evict_mask.sum().item()
+                logger.info(
+                    f"[PP{pp_rank}] apply_verify_batch: evicting {n_evict} "
+                    f"rejected draft KV slots (batch)"
+                )
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
 
     def _handle_finished_req(

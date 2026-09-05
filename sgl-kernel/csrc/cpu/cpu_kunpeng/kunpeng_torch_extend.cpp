@@ -79,7 +79,7 @@ std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, 
 
 std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K);
 
-// === Attention Ëã×ÓÉùÃ÷ ===
+// === Attention ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ===
 at::Tensor flash_mla_meta_create_kunpeng();
 at::Tensor flash_mla_meta_destroy_kunpeng(at::Tensor meta_tensor);
 
@@ -156,12 +156,12 @@ void contiguous_rows_kunpeng(
     at::Tensor x, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
     at::Tensor out);
 
-// === Memory Ëã×ÓÉùÃ÷ ===
+// === Memory ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ===
 at::Tensor hbw_allocator_kunpeng(int64_t size);
 
 void hbw_destroy_kunpeng(at::Tensor ptr_tensor);
 
-// === MOE Ëã×ÓÉùÃ÷ ===
+// === MOE ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ===
 at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias);
 
 void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size);
@@ -199,6 +199,18 @@ void pp_recv_batch_kunpeng(int64_t src_rank, int64_t total_size);
 void pp_send_msg_kunpeng(at::Tensor payload, int64_t kind, int64_t dest_rank);
 
 std::vector<at::Tensor> pp_recv_msg_kunpeng(int64_t src_rank);
+
+// Fused PP batch + flow-control ops, see comm/pp_comm.cpp
+int64_t pp_inflight_kunpeng(int64_t dst_rank);
+
+void pp_send_tensor_batch_kunpeng(int64_t dest_rank, at::TensorList tensors);
+
+void pp_recv_batch_copy_kunpeng(int64_t src_rank, at::Tensor offsets, at::TensorList out_tensors);
+
+// Fused pyobj bundle ops (coalesce multiple consensus lists into one slot)
+void pp_send_pyobjs_bundle_kunpeng(int64_t dest_rank, at::TensorList payloads);
+
+std::vector<at::Tensor> pp_recv_pyobjs_bundle_kunpeng(int64_t src_rank);
 
 void broadcast_kunpeng_create(int64_t pg_ptr, int64_t max_buf_bytes);
 
@@ -265,7 +277,7 @@ void multinomial_kunpeng(const at::Tensor &probs, at::Tensor out, int64_t num_sa
 void argmax_kunpeng(const at::Tensor prob_distribution, at::Tensor token_ids, at::Tensor token_probs, int64_t height,
                     int64_t width);
 
-// === SHM Ëã×ÓÉùÃ÷ ===
+// === SHM ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
 void shm_pool_destroy_kunpeng();
@@ -332,7 +344,7 @@ void shm_mla_alltoall_long_context_finalize_kunpeng();
 // SHM MLA long-context partial-output reduce (online-softmax merge over cp)
 void flash_mla_reduce_kunpeng(at::Tensor input_tensor, at::Tensor softmax_lse_tensor, at::Tensor out_tensor);
 
-// === Embedding Ëã×ÓÉùÃ÷ ===
+// === Embedding ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ===
 at::Tensor embedding_kunpeng(at::Tensor indices, at::Tensor weight, at::Tensor output, int64_t org_vocab_start,
                              int64_t org_vocab_end, int64_t num_org_vocab_padding, int64_t added_vocab_start,
                              int64_t added_vocab_end);
@@ -619,7 +631,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("hbw_destroy_kunpeng(Tensor ptr_tensor) -> ()");
     m.impl("hbw_destroy_kunpeng", hbw_destroy_kunpeng);
 
-    // === MOE Ëã×ÓÉùÃ÷ ===
+    // === MOE ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ===
     m.def("bf16_linear_kunpeng(Tensor input, Tensor weight, Tensor bias) -> Tensor");
     m.impl("bf16_linear_kunpeng", bf16_linear_kunpeng);
 
@@ -685,6 +697,23 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("pp_recv_msg_kunpeng(int src_rank) -> Tensor[]");
     m.impl("pp_recv_msg_kunpeng", pp_recv_msg_kunpeng);
+
+    // Fused PP batch send/recv + flow control
+    m.def("pp_inflight_kunpeng(int dest_rank) -> int");
+    m.impl("pp_inflight_kunpeng", pp_inflight_kunpeng);
+
+    m.def("pp_send_tensor_batch_kunpeng(int dest_rank, Tensor[] tensors) -> ()");
+    m.impl("pp_send_tensor_batch_kunpeng", pp_send_tensor_batch_kunpeng);
+
+    m.def("pp_recv_batch_copy_kunpeng(int src_rank, Tensor offsets, Tensor[] out_tensors) -> ()");
+    m.impl("pp_recv_batch_copy_kunpeng", pp_recv_batch_copy_kunpeng);
+
+    // Fused pyobj bundle ops
+    m.def("pp_send_pyobjs_bundle_kunpeng(int dest_rank, Tensor[] payloads) -> ()");
+    m.impl("pp_send_pyobjs_bundle_kunpeng", pp_send_pyobjs_bundle_kunpeng);
+
+    m.def("pp_recv_pyobjs_bundle_kunpeng(int src_rank) -> Tensor[]");
+    m.impl("pp_recv_pyobjs_bundle_kunpeng", pp_recv_pyobjs_bundle_kunpeng);
 
     // kunpeng broadcast (fixed-cap persistent buffer owned by the comm layer)
     m.def("broadcast_kunpeng_create(int pg_ptr, int max_buf_bytes) -> ()");

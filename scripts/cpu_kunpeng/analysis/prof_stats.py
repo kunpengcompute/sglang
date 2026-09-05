@@ -51,6 +51,7 @@ TARGET_MAP = {
     "logits_processor.py(285): forward": "logits_processor",
     "model_runner.py(3341): sample": "sampler",
     "process_batch_result": "process_batch_result",
+    "pd_consensus": "pd_consensus",
 }
 # ===================================================================
 
