@@ -735,6 +735,8 @@ class DeepseekV2WeightLoaderMixin:
                     "kv_b_proj",
                 ]:
                     if hasattr(self_attn, proj):
+                        # Note: kv_b_proj is prepacked as well, but during decode
+                        # with weight absorption it is not actually used.
                         _kunpeng_prepack_igemm_weight(getattr(self_attn, proj).weight)
 
                 # mlp gate_up_proj and down_proj prepack

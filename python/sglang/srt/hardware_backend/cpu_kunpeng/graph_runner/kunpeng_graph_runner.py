@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import pp_span
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.utils import (
@@ -384,19 +385,21 @@ class KunpengGraphRunner:
             else:
                 # ── Decode ──
                 if not skip_attn_backend_init:
-                    if hasattr(self.model_runner.model, "prepare_forward_batch"):
-                        self.model_runner.model.prepare_forward_batch(forward_batch)
-                    if self.model_runner.server_args.enable_pdmux:
-                        self.model_runner.decode_attn_backend.init_forward_metadata(
-                            forward_batch
-                        )
-                        forward_batch.attn_backend = (
-                            self.model_runner.decode_attn_backend
-                        )
-                    else:
-                        self.model_runner.attn_backend.init_forward_metadata(
-                            forward_batch
-                        )
+                    with pp_span("prepare_forward_batch"):
+                        if hasattr(self.model_runner.model, "prepare_forward_batch"):
+                            self.model_runner.model.prepare_forward_batch(forward_batch)
+                    with pp_span("init_forward_metadata"):
+                        if self.model_runner.server_args.enable_pdmux:
+                            self.model_runner.decode_attn_backend.init_forward_metadata(
+                                forward_batch
+                            )
+                            forward_batch.attn_backend = (
+                                self.model_runner.decode_attn_backend
+                            )
+                        else:
+                            self.model_runner.attn_backend.init_forward_metadata(
+                                forward_batch
+                            )
 
                 output = self._forward_decode(forward_batch, **kwargs)
 
@@ -441,7 +444,8 @@ class KunpengGraphRunner:
                 **kwargs,
             )
 
-        inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
+        with pp_span("build_graph_inputs"):
+            inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
         return self._graph_forward(
             forward_batch, inputs, "decode", use_hbw=True, **kwargs
         )
@@ -819,7 +823,8 @@ class KunpengGraphRunner:
             ]
 
         t0 = time.time()
-        outputs = graph.run(inputs)
+        with pp_span("graph_run"):
+            outputs = graph.run(inputs)
         t1 = time.time()
         # With SGLANG_SCHEDULER_SKIP_ALL_GATHER the scheduler issues an idle
         # forward every iteration even when no requests arrive; skip logging

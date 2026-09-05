@@ -1386,6 +1386,16 @@ class SchedulerPPMixin:
         elif self._pp_mtp_enabled and self.pp_group.is_last_rank:
             batch.spec_info = None
 
+        # PP+MTP: populate the accepted-draft counts so report_decode_stats /
+        # update_spec_metrics see real acceptance on non-last ranks too. The
+        # per-req accepted counts (accepted + bonus) arrive via the ring in
+        # pp_outputs; convert to drafts-only (accepted + bonus - 1 per req).
+        num_accepted_drafts = 0
+        if self._pp_mtp_enabled and batch.pp_mtp_accepted_tokens is not None:
+            num_accepted_drafts = (
+                int(batch.pp_mtp_accepted_tokens.sum().item()) - batch.batch_size()
+            )
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1393,6 +1403,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            num_accepted_drafts=num_accepted_drafts,
         )
         return output_result
 
@@ -1504,7 +1515,10 @@ class SchedulerPPMixin:
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
-    @Kunpeng_PP_Profiler(depth=2, name="launch_batch")
+    # depth=4 so the run_batch -> model_runner.forward -> forward_batch chain
+    # stays visible (each decorated level consumes one budget unit; inline
+    # pp_span spans are budget-independent and always recorded).
+    @Kunpeng_PP_Profiler(depth=4, name="launch_batch")
     def _pp_launch_batch(
         self: Scheduler,
         mb_id: int,
