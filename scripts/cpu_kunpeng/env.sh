@@ -233,7 +233,7 @@ export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
 export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=0
 export SGLANG_KUNPENG_LC_DP_RANKS=""  # comma-separated DP ranks running long-context decode CP (e.g. "14,15"); empty = all regular; must be identical between prefill and decode instances
-export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=64  # requests with input_len + max_new_tokens >= this go to LC DP ranks; must exceed every regular rank's max_req_input_len
+export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096  # requests with input_len + max_new_tokens >= this go to LC DP ranks; must exceed every regular rank's max_req_input_len
 export SGLANG_KUNPENG_RDMA_ALLGATHER=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_KUNPENG_RDMA_BCAST=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
 export SGLANG_KUNPENG_RDMA_PP_COMM=1  # 1 = enable RDMA communication between PP ranks for rids
@@ -328,7 +328,7 @@ if [[ "$IS_PREFILL" == "1" ]]; then
     export SGLANG_KUNPENG_SWAP_EXPERT="${SGLANG_KUNPENG_SWAP_EXPERT:-1}"
     export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-8}"
     export SGLANG_KUNPENG_MAX_CUR_LEN="${SGLANG_KUNPENG_MAX_CUR_LEN:-512}"
-    export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-4096}"
+    export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-65536}"
 else
     # Equivalent to MAX_SEQ_NUM / PP_SIZE in DeepSeek-V3-Sample (max_seq_num_per_mb):
     export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-64}"
