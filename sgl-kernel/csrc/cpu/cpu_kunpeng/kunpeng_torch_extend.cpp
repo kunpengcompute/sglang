@@ -79,7 +79,7 @@ std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(int64_t M, 
 
 std::tuple<int64_t, int64_t, int64_t> bgemm_find_optimal_tiling_plan(int64_t M, int64_t N, int64_t K);
 
-// === Attention �������� ===
+// === Attention operator definition ===
 at::Tensor flash_mla_meta_create_kunpeng();
 at::Tensor flash_mla_meta_destroy_kunpeng(at::Tensor meta_tensor);
 
@@ -156,12 +156,12 @@ void contiguous_rows_kunpeng(
     at::Tensor x, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
     at::Tensor out);
 
-// === Memory �������� ===
+// === Memory operator definition ===
 at::Tensor hbw_allocator_kunpeng(int64_t size);
 
 void hbw_destroy_kunpeng(at::Tensor ptr_tensor);
 
-// === MOE �������� ===
+// === MOE operator definition ===
 at::Tensor bf16_linear_kunpeng(const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias);
 
 void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size);
@@ -284,7 +284,7 @@ void top_k_top_p_sampling_from_probs_kunpeng(
     const at::Tensor min_ps, bool need_min_p_sampling,
     at::Tensor token_ids, at::Tensor token_probs);
 
-// === SHM �������� ===
+// === SHM operator definition ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
 void shm_pool_destroy_kunpeng();
@@ -351,7 +351,7 @@ void shm_mla_alltoall_long_context_finalize_kunpeng();
 // SHM MLA long-context partial-output reduce (online-softmax merge over cp)
 void flash_mla_reduce_kunpeng(at::Tensor input_tensor, at::Tensor softmax_lse_tensor, at::Tensor out_tensor);
 
-// === Embedding �������� ===
+// === Embedding operator definition ===
 at::Tensor embedding_kunpeng(at::Tensor indices, at::Tensor weight, at::Tensor output, int64_t org_vocab_start,
                              int64_t org_vocab_end, int64_t num_org_vocab_padding, int64_t added_vocab_start,
                              int64_t added_vocab_end);
@@ -638,7 +638,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("hbw_destroy_kunpeng(Tensor ptr_tensor) -> ()");
     m.impl("hbw_destroy_kunpeng", hbw_destroy_kunpeng);
 
-    // === MOE �������� ===
+    // === MOE operator definition ===
     m.def("bf16_linear_kunpeng(Tensor input, Tensor weight, Tensor bias) -> Tensor");
     m.impl("bf16_linear_kunpeng", bf16_linear_kunpeng);
 
