@@ -220,12 +220,11 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_WARMUP_TIMEOUT=1600
 export PYTHONWARNINGS="ignore::FutureWarning"
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
 export SGLANG_SCHEDULER_SKIP_ALL_GATHER=0
 
 # Kunpeng CPU
 export SGLANG_USE_CPU_920F=1
-export SGLANG_ENABLE_TOKENIZER_SEPERATE=0  # Only supports PD disaggregation mode
 export TOKENIZER_WORKER_NUM=1
 export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_KUNPENG_PP_PROFILE=0  # 1 = enable decode pipeline profiling
@@ -247,9 +246,8 @@ export SGLANG_ENABLE_KUCCL=0  # set to 1 to use kuccl backend instead of gloo
 export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476
 export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=50
 export SGLANG_KUNPENG_ENABLE_SHM_FENCE=0
-# SHM_ON_PACKAGE: requires kupl built from https://gitcode.com/kunpengcompute/kupl/tree/sglang_830
 export KUPL_SHM_TYPE=sls
-export KUPL_SHM_ON_PACKAGE=y
+export KUPL_SHM_ON_PACKAGE=y  # requires kupl built from https://gitcode.com/kunpengcompute/kupl/tree/sglang_830
 export KUPL_SHM_ENABLE_HUGEPAGE=y
 # Kunpeng HBW pool
 export SGLANG_ENABLE_HBW_POOL=1
@@ -274,20 +272,24 @@ export SGLANG_KUNPENG_SDMA_THRESHOLD=5
 export SGLANG_ENABLE_GRAPH_CAPTURE=1
 export SGLANG_ENABLE_GRAPH_PROFILE=0
 export SGLANG_KUNPENG_GRAPH_CACHE_SIZE=10
-# Kunpeng prefill graph padding to power 2 size
-export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1
+export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1 # Kunpeng prefill graph padding to power 2 size
 # Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
-# Other options
+# Drop OS page cache (echo 3 > /proc/sys/vm/drop_caches) during stop.sh node
 export DROP_CACHES=0
 # Tokenizer-side cross-process batch timeline logging
 export SGLANG_TOKENIZER_TIMELINE_LOG=0
 # Scheduler stream interval (--stream-interval): flush a request's output every N tokens
 export STREAM_INTERVAL=1
-# Tokenizer backend: "huggingface" (default) or "fastokens"
-# (fastokens requires transformers >= 5.12; on 5.6.0 it hits a Metaspace
-#  pre-tokenizer error with DeepSeek-R1)
+# Tokenizer backend: "huggingface" (default) or "fastokens" (fastokens requires transformers >= 5.12)
 export SGLANG_TOKENIZER_BACKEND="huggingface"
+# Tokenizer-separate mode: on by default for PD roles (prefill/decode/router), off for native.
+# .user_env.sh can still override.
+if [[ "${1:-native}" == "native" ]]; then
+    export SGLANG_ENABLE_TOKENIZER_SEPERATE=0
+else
+    export SGLANG_ENABLE_TOKENIZER_SEPERATE=1
+fi
 
 # ------------------------------------------------------------
 # Load local config
@@ -440,7 +442,8 @@ case "$ACTION" in
 esac
 
 if [[ "$ACTION" == "router" && "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
-    export RAYON_NUM_THREADS=32
+    export RAYON_NUM_THREADS=16
+    export SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET=17
 fi
 
 # Static routing (matches DeepSeek-V3-Sample 64p/128p-decode toml
