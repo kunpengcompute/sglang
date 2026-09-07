@@ -1274,6 +1274,33 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
     full_buf = state.topk_ids_index_buf[: topk_ids.shape[0]]
     ep_size = get_moe_expert_parallel_world_size()
 
+    # All ranks in the attn-TP group hold the SAME tokens and remap into the
+    # SAME shared SHM buffer (topk_ids_index_buf is carved from the intra-node
+    # shared pool, so every rank's tensor is the same physical memory), but
+    # each rank's remap table is rank-local: static uses the per-ep-rank
+    # nearest-copy dispatch map, dynamic additionally advances a process-
+    # private round-robin counter.  If every rank remapped all rows they
+    # would concurrently write DIFFERENT (rank, slot) values into the same
+    # rows -> torn entries.  In dynamic mode this happens every step and
+    # hangs the dispatch nbb; in static mode it is rarer but can still route
+    # a token to a copy of a DIFFERENT logical expert (silent corruption).
+    # So BOTH paths remap only this rank's own token slice; the trailing
+    # allgather acts as the fence that publishes every slice to the group --
+    # each row is decided by exactly one owner rank.
+    num_tokens, _ = topk_ids.shape
+    if state.attn_tp_size > 1 and num_tokens % state.attn_tp_size == 0:
+        chunk = num_tokens // state.attn_tp_size
+        remap_start = state.attn_tp_rank * chunk
+        remap_end = remap_start + chunk
+    else:
+        # No allgather fence in this case either (_kunpeng_allgather_interleaved_slots
+        # skips), so there is no owner to publish foreign slices: every rank
+        # must fall back to the full remap (single-writer only when
+        # attn_tp_size == 1).
+        remap_start, remap_end = 0, num_tokens
+    my_topk_ids = topk_ids[remap_start:remap_end]
+    my_full_buf = full_buf[remap_start:remap_end]
+
     if algorithm == "static":
         dispatch_map = (
             expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
@@ -1281,12 +1308,9 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
         assert dispatch_map is not None, (
             "static EPLB requires partial_logical_to_rank_dispatch_physical_map"
         )
-        # --- [KunpengDBG] remap consistency: are topk_ids / dispatch_map the
-        # same across ranks?  ep_rank, attn_tp_rank and dp_rank are printed so
-        # that the per-rank logs can be cross-referenced.
         kunpeng.remap_topk_ids_to_rank_slot_kunpeng(
-            topk_ids,
-            full_buf,
+            my_topk_ids,
+            my_full_buf,
             dispatch_map,
             expert_location_dispatch_info.num_physical_experts,
             ep_size,
@@ -1305,9 +1329,14 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
         )
         # 0 = round-robin, 1 = random (reference mt19937, seed 123).
         shuffle_mode = int(os.environ.get("SGLANG_KUNPENG_MOE_SHUFFLE_MODE", "0"))
+        # All ranks in the attn-TP group remap into the SAME shared SHM
+        # buffer, but the dynamic round-robin counter is PROCESS-PRIVATE,
+        # so this rank remaps ONLY its own token slice (see the comment
+        # above the slice computation); the trailing allgather (fence)
+        # publishes it to the rest of the group.
         kunpeng.remap_topk_ids_to_rank_slot_dynamic_kunpeng(
-            topk_ids,
-            full_buf,
+            my_topk_ids,
+            my_full_buf,
             all_physical_map,
             num_valid,
             state.dynamic_remap_counter,
