@@ -19,7 +19,8 @@ charts and an analysis report (no split log files are produced).
 
 Usage: python analyze_decode_logs.py [log_file] [output_dir]
        When log_file is omitted, the newest rank0 decode log is auto-detected
-       under LOG_BASE_DIR (<LOG_BASE_DIR>/<date>/decode/<time>/0_0_*.log).
+       under LOG_BASE_DIR (<LOG_BASE_DIR>/<date>/decode/<time>/pp0_dp0_tp0_*.log,
+       legacy binary: 0_0_*.log).
 """
 
 import re
@@ -568,9 +569,9 @@ def find_latest_rank0_log(log_base_dir):
     """Locate the newest rank0 decode log under LOG_BASE_DIR.
 
     Expected layout (created by launch.sh/env.sh):
-        <LOG_BASE_DIR>/<yymmdd>/decode/<HHMMSS>/0_0_<node_ip>.log
-    Falls back to 0_*.log for non-binary launches. Returns None when no
-    matching log exists.
+        <LOG_BASE_DIR>/<yymmdd>/decode/<HHMMSS>/pp0_dp0_tp0_<node_ip>.log
+    Falls back to the legacy binary name 0_0_*.log / non-binary 0_*.log.
+    Returns None when no matching log exists.
     """
     for date_dir in sorted(glob.glob(os.path.join(log_base_dir, "*")), reverse=True):
         decode_dir = os.path.join(date_dir, "decode")
@@ -579,7 +580,7 @@ def find_latest_rank0_log(log_base_dir):
         for time_dir in sorted(glob.glob(os.path.join(decode_dir, "*")), reverse=True):
             if not os.path.isdir(time_dir):
                 continue
-            for pattern in ("0_0_*.log", "0_*.log"):
+            for pattern in ("pp0_dp0_tp0_*.log", "0_0_*.log", "0_*.log"):
                 hits = sorted(glob.glob(os.path.join(time_dir, pattern)))
                 if hits:
                     return hits[0]
@@ -610,7 +611,7 @@ if __name__ == "__main__":
             sys.exit(1)
         input_file = find_latest_rank0_log(log_base)
         if not input_file:
-            print(f"Error: no rank0 decode log (0_0_*.log / 0_*.log) found under {log_base}")
+            print(f"Error: no rank0 decode log (pp0_dp0_tp0_*.log / 0_*.log) found under {log_base}")
             sys.exit(1)
         print(f"Auto-detected log: {input_file}")
     split_logs_by_tp(input_file, output_dir)

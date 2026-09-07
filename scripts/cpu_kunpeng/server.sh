@@ -22,7 +22,10 @@ if [[ $# -lt 3 ]]; then
 fi
 
 ROLE="$1"
-DP_RANK="$2"
+# NOTE: $2 is the NODE index inside the role's NODE_IPS_LIST (0..WORLD_SIZE-1),
+# NOT the data-parallel rank. The true dp/pp/tp identity of each launched
+# process is derived below from (node index, rank-in-node).
+NODE_RANK="$2"
 LOG_PATH="$3"
 INSTANCE="$4"
 BUCKET="$5"
@@ -44,7 +47,7 @@ BASE_ARGS=(
     --host "$IP"
     --dist-init-addr "$MASTER_ADDR:$MASTER_PORT"
     --nnodes "$WORLD_SIZE"
-    --node-rank "$DP_RANK"
+    --node-rank "$NODE_RANK"
     --dist-timeout 600
     --dp-size "$DP_SIZE"
     --tp-size "$TP_SIZE"
@@ -308,6 +311,16 @@ fi
 IB_DEVICE_ALL="roceroh0,roceroh1,roceroh2,roceroh3,roceroh4,roceroh5,roceroh6,roceroh7"
 
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
+    # ── Log naming: translate (node index, rank-in-node) into the true
+    # (dp, pp, attn-tp) identity so every log file is named after its real rank.
+    # Global ranks are node-major: g = NODE_RANK * LOCAL_WORLD_SIZE + tp_rank_in_node.
+    # PP stages are contiguous chunks of TP_SIZE ranks (pp = g / TP_SIZE); inside
+    # one pp stage each DP group owns ATTENTION_TP_SIZE consecutive ranks
+    # (dp = (g % TP_SIZE) / ATTENTION_TP_SIZE, tp = (g % TP_SIZE) % ATTENTION_TP_SIZE).
+    # E.g. TP=256 DP=32 PP=2 on 32 nodes: LOCAL_WORLD_SIZE=16, ATTENTION_TP_SIZE=8,
+    # node 0..15 = pp0, node 16..31 = pp1, per node rin 0..7 = dpA tp0..7 / rin 8..15 = dpB.
+    LOCAL_WORLD_SIZE=$((TP_SIZE * PP_SIZE / WORLD_SIZE))
+    ATTENTION_TP_SIZE=$((TP_SIZE / DP_SIZE))
     for ((RANK_IN_NODE=0; RANK_IN_NODE < (TP_SIZE * PP_SIZE / WORLD_SIZE); RANK_IN_NODE++)); do
         if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" ]]; then
             SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/sglang_server"
@@ -355,11 +368,18 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
             IB_ARGS=()
         fi
 
+        # True rank identity of this process (see the mapping above).
+        GLOBAL_RANK=$((NODE_RANK * LOCAL_WORLD_SIZE + RANK_IN_NODE))
+        PP_RANK=$((GLOBAL_RANK / TP_SIZE))
+        _IN_PP=$((GLOBAL_RANK % TP_SIZE))
+        DP_RANK_ACTUAL=$((_IN_PP / ATTENTION_TP_SIZE))
+        TP_RANK_ACTUAL=$((_IN_PP % ATTENTION_TP_SIZE))
+
         taskset -c $((RANK_IN_NODE * 38 + 20)) \
         $SERVER_BIN "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
           --tp-rank-in-node ${RANK_IN_NODE} \
           --port $((30000 + RANK_IN_NODE)) \
-          > "${LOG_PATH}/${DP_RANK}_${RANK_IN_NODE}_$IP.log" 2>&1 &
+          > "${LOG_PATH}/pp${PP_RANK}_dp${DP_RANK_ACTUAL}_tp${TP_RANK_ACTUAL}_$IP.log" 2>&1 &
     done
 else
     # Non-binary launch: sglang forks workers internally, so pass all devices
@@ -375,5 +395,5 @@ else
     fi
     python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
       --port 30000 \
-      > "$LOG_PATH/${DP_RANK}_$IP.log" 2>&1 &
+      > "$LOG_PATH/${NODE_RANK}_$IP.log" 2>&1 &
 fi

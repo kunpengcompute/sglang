@@ -149,12 +149,12 @@ echo "Launching $ROLE on $WORLD_SIZE node(s)"
 
 for i in "${!NODES[@]}"; do
     node_ip="${NODES[i]}"
-    dp_rank="$i"
-    echo "[$(date +%T)] Starting dp_rank $dp_rank on $node_ip"
+    node_rank="$i"
+    echo "[$(date +%T)] Starting node_rank $node_rank ($node_ip)"
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
         "root@$node_ip" \
-        "cd \"$PWD\" && sh ./server.sh \"$ROLE\" \"$dp_rank\" \"$LOG_DIR\" \"$INSTANCE\" \"$BUCKET\"" \
-        >"$LOG_DIR/ssh_${ROLE}_${INSTANCE}_rank${dp_rank}.log" 2>&1 &
+        "cd \"$PWD\" && sh ./server.sh \"$ROLE\" \"$node_rank\" \"$LOG_DIR\" \"$INSTANCE\" \"$BUCKET\"" \
+        >"$LOG_DIR/ssh_${ROLE}_${INSTANCE}_rank${node_rank}.log" 2>&1 &
 done
 
 echo "All $ROLE nodes launched."
@@ -162,7 +162,9 @@ echo "All $ROLE nodes launched."
 if [[ "$ROLE" == "router" ]]; then
     rank0_log_file="$LOG_DIR/router_${NODES[0]}.log"
 elif [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
-    rank0_log_file="$LOG_DIR/0_0_${NODES[0]}.log"
+    # Binary launch names each log by its true rank (see server.sh):
+    # pp{pp}_dp{dp}_tp{tp}_{ip}.log. Rank 0 = node 0, rank-in-node 0 = pp0/dp0/tp0.
+    rank0_log_file="$LOG_DIR/pp0_dp0_tp0_${NODES[0]}.log"
 else
     rank0_log_file="$LOG_DIR/0_${NODES[0]}.log"
 fi
