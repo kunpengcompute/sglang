@@ -14,6 +14,7 @@
 
 import sys
 
+import sgl_kernel
 import torch
 
 

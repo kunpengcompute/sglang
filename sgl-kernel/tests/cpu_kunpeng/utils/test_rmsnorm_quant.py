@@ -14,6 +14,7 @@
 
 import sys
 
+import sgl_kernel
 import torch
 
 
@@ -98,11 +99,14 @@ def test_fused_add_rmsnorm_quant(height, width, eps):
         print(f"FAIL fused_add_rmsnorm_quant.scale: max_diff={scale_diff:.6f}")
         sys.exit(1)
 
-    # residual is updated in-place to the normalized x (before weight/quant),
-    # matching fused_add_rmsnorm semantics where residual carries the new
-    # pre-norm activation for the next layer. Verify it equals the added sum.
-    res_diff = (residual_in.to(torch.float32) - added).abs().max().item()
-    if res_diff > 0.01:
+    # residual is updated in-place to the pre-norm sum (x + residual), stored
+    # as bf16 (norm/rmsnorm.cpp passes residual as bfloat16_t*), matching
+    # fused_add_rmsnorm semantics where residual carries the new pre-norm
+    # activation for the next layer. Compare against the bf16-rounded sum,
+    # not the fp32 sum (bf16 half-ulp in [4,8) is 0.015625).
+    added_bf16 = x + residual
+    res_diff = (residual_in.to(torch.float32) - added_bf16.to(torch.float32)).abs().max().item()
+    if res_diff > 0:
         print(f"FAIL fused_add_rmsnorm_quant.residual: max_diff={res_diff:.6f}")
         sys.exit(1)
 
