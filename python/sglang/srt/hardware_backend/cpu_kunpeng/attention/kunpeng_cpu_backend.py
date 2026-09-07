@@ -603,10 +603,11 @@ class KunpengCpuBackend(AttentionBackend):
         last_req_idx / last_seq_len plus an O(1) content guard comparing the
         row's last stored slot against req_to_token at its recorded position
         ``long_context_last_pos[b]`` -- the guard is locality-independent, so
-        a normal CP step appends and continues without a rebuild). For
-        ``seqlen_q > 1`` every filled row is rebuilt from req_to_token each
-        step (correctness first; the incremental multi-row update is deferred
-        to the MTP driver work).
+        a normal CP step appends and continues without a rebuild). Rows whose
+        seq_len is UNCHANGED from the previous step (graph-padded padding
+        rows) also continue, appending nothing. For ``seqlen_q > 1`` every
+        filled row is rebuilt from req_to_token each step (correctness first;
+        the incremental multi-row update is deferred to the MTP driver work).
         The persistent buffers live on ``metadata`` and are reused across
         steps (and across graph captures of the same batch size).
         """
@@ -673,7 +674,10 @@ class KunpengCpuBackend(AttentionBackend):
                 seq_len = int(seq_lens[b])
                 req_idx = int(req_pool_indices[b])
                 # A row continues iff the same sequence occupies this row, the
-                # length advanced by exactly one, AND the last stored slot
+                # length advanced by exactly one (append the new token) or
+                # stayed unchanged (nothing to append -- graph-padded rows
+                # replicate row 0 with a constant seq_len and would otherwise
+                # misfire the guard every step), AND the last stored slot
                 # still matches req_to_token at the position it was taken
                 # from (``last_pos``, O(1)). This guards against retraction /
                 # req_pool_idx reuse where the underlying slots changed but
@@ -692,9 +696,11 @@ class KunpengCpuBackend(AttentionBackend):
                 # sparse kernel applies no mask of its own, so the row must
                 # cover the query's own slot too. The continuation path
                 # appends exactly that slot (when local).
+                advanced = last_seq_len[b] == seq_len - 1
+                unchanged = last_seq_len[b] == seq_len
                 cont = (
                     last_req_idx[b] == req_idx
-                    and last_seq_len[b] == seq_len - 1
+                    and (advanced or unchanged)
                     and (
                         fill_len[b, 0] == 0
                         or int(indices[b, 0, fill_len[b, 0] - 1])
@@ -703,13 +709,14 @@ class KunpengCpuBackend(AttentionBackend):
                 )
                 if cont:
                     # Normal continuation: append the CURRENT token's slot
-                    # (seq_len - 1) when it lands on a local page (foreign
-                    # pages carry -1 and are skipped by the KV write path as
-                    # well). last_pos tracks the position of the last stored
-                    # slot for the next step's guard; it is left untouched
-                    # when the current token is foreign.
+                    # (seq_len - 1) when the sequence advanced AND it lands
+                    # on a local page (foreign pages carry -1 and are skipped
+                    # by the KV write path as well). last_pos tracks the
+                    # position of the last stored slot for the next step's
+                    # guard; it is left untouched when the current token is
+                    # foreign. An unchanged row (padding) appends nothing.
                     pos = seq_len - 1
-                    if pos >= 0:
+                    if advanced and pos >= 0:
                         p = pos // page_size
                         if p % cp_size == cp_rank:
                             slot = int(req_to_token[req_idx, pos])
