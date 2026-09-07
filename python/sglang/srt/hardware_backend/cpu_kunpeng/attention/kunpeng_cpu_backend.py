@@ -670,9 +670,23 @@ class KunpengCpuBackend(AttentionBackend):
             # local slots of [0, seq_len) (the query's own position is
             # INCLUDED), maintained incrementally (see the causal-scope note
             # in the docstring).
+            #
+            # The guard loop runs on ZERO-COPY numpy views of the persistent
+            # CPU buffers: per-scalar torch indexing costs ~30us of dispatch
+            # each (~1.6ms for B=8 rows), while numpy views share storage
+            # with the torch tensors so every write below is visible to the
+            # graph-input tensors without any copy-back.
+            indices_np = indices.numpy()
+            fill_len_np = fill_len.numpy()
+            last_req_idx_np = last_req_idx.numpy()
+            last_seq_len_np = last_seq_len.numpy()
+            last_pos_np = last_pos.numpy()
+            req_to_token_np = req_to_token.numpy()
+            seq_lens_np = seq_lens.numpy()
+            req_pool_indices_np = req_pool_indices.numpy()
             for b in range(B):
-                seq_len = int(seq_lens[b])
-                req_idx = int(req_pool_indices[b])
+                seq_len = int(seq_lens_np[b])
+                req_idx = int(req_pool_indices_np[b])
                 # A row continues iff the same sequence occupies this row, the
                 # length advanced by exactly one (append the new token) or
                 # stayed unchanged (nothing to append -- graph-padded rows
@@ -696,15 +710,17 @@ class KunpengCpuBackend(AttentionBackend):
                 # sparse kernel applies no mask of its own, so the row must
                 # cover the query's own slot too. The continuation path
                 # appends exactly that slot (when local).
-                advanced = last_seq_len[b] == seq_len - 1
-                unchanged = last_seq_len[b] == seq_len
+                last_sl = int(last_seq_len_np[b])
+                advanced = last_sl == seq_len - 1
+                unchanged = last_sl == seq_len
+                fill = int(fill_len_np[b, 0])
                 cont = (
-                    last_req_idx[b] == req_idx
+                    int(last_req_idx_np[b]) == req_idx
                     and (advanced or unchanged)
                     and (
-                        fill_len[b, 0] == 0
-                        or int(indices[b, 0, fill_len[b, 0] - 1])
-                        == int(req_to_token[req_idx, last_pos[b]])
+                        fill == 0
+                        or int(indices_np[b, 0, fill - 1])
+                        == int(req_to_token_np[req_idx, int(last_pos_np[b])])
                     )
                 )
                 if cont:
@@ -719,12 +735,12 @@ class KunpengCpuBackend(AttentionBackend):
                     if advanced and pos >= 0:
                         p = pos // page_size
                         if p % cp_size == cp_rank:
-                            slot = int(req_to_token[req_idx, pos])
-                            if slot >= 0 and fill_len[b, 0] < max_topk:
-                                indices[b, 0, fill_len[b, 0]] = slot
-                                fill_len[b, 0] += 1
-                                last_pos[b] = pos
-                    last_seq_len[b] = seq_len
+                            slot = int(req_to_token_np[req_idx, pos])
+                            if slot >= 0 and fill < max_topk:
+                                indices_np[b, 0, fill] = slot
+                                fill_len_np[b, 0] = fill + 1
+                                last_pos_np[b] = pos
+                    last_seq_len_np[b] = seq_len
                 else:
                     # New / reshuffled / non-contiguous sequence: rebuild the
                     # row from req_to_token over this rank's local pages in
@@ -738,10 +754,6 @@ class KunpengCpuBackend(AttentionBackend):
                                 continue
                             s = p * page_size
                             e = min(s + page_size, seq_len)
-                            n = e - s
-                            positions = torch.arange(
-                                s, e, dtype=torch.int64, device=req_to_token.device
-                            )
                             # Keep only REAL slots: a local page may carry -1
                             # entries (positions never written by this rank, e.g.
                             # leftover holes), which must not be counted into the
@@ -749,23 +761,20 @@ class KunpengCpuBackend(AttentionBackend):
                             # otherwise read kvcache + (-1) * head_dim out of
                             # bounds; its trailing--1 trim only handles -1s at the
                             # very end of a row).
-                            slots = req_to_token[req_idx, positions]
-                            valid = slots >= 0
-                            n_valid = int(valid.sum())
-                            if n_valid > 0:
-                                indices[b, 0, n_local : n_local + n_valid] = slots[
-                                    valid
-                                ]
-                                n_local += n_valid
-                                row_last_pos = int(positions[valid][-1])
-                        fill_len[b, 0] = n_local
+                            for pos_i in range(s, e):
+                                slot = int(req_to_token_np[req_idx, pos_i])
+                                if slot >= 0:
+                                    indices_np[b, 0, n_local] = slot
+                                    n_local += 1
+                                    row_last_pos = pos_i
+                        fill_len_np[b, 0] = n_local
                         # Track the position of the last stored slot for the
                         # next step's continuation guard (row may be empty:
                         # row_last_pos stays -1 and the guard's fill_len == 0
                         # branch keeps continuation valid).
-                        last_pos[b] = row_last_pos
-                    last_req_idx[b] = req_idx
-                    last_seq_len[b] = seq_len
+                        last_pos_np[b] = row_last_pos
+                    last_req_idx_np[b] = req_idx
+                    last_seq_len_np[b] = seq_len
         else:
             # seqlen_q > 1 (MTP verify/draft-extend style): every query row of
             # a sequence is rebuilt from req_to_token each step (correctness
