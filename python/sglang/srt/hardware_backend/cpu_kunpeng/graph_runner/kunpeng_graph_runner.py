@@ -374,6 +374,17 @@ class KunpengGraphRunner:
                 if self.model_runner.support_pp and pp_proxy_tensors is not None:
                     hidden_states = pp_proxy_tensors.tensors["hidden_states"]
                     residual = pp_proxy_tensors.tensors["residual"]
+                    if hidden_states.numel() != 0 or residual.numel() != 0:
+                        # Aborted batch (e.g. PD transfer failure) arrives as
+                        # idle with non-empty proxy tensors, which the idle
+                        # graph cannot replay -- run eagerly to avoid a
+                        # shape-mismatch crash.
+                        return self.model_runner.model.forward(
+                            forward_batch.input_ids,
+                            forward_batch.positions,
+                            forward_batch,
+                            **kwargs,
+                        )
                     kwargs["pp_proxy_tensors"].tensors["hidden_states"] = torch.empty(
                         1, dtype=hidden_states.dtype
                     )[:0].view(hidden_states.shape)
@@ -789,9 +800,13 @@ class KunpengGraphRunner:
             if use_hbw and _is_kunpeng_hbw_pool:
                 if KunpengGraphRunner._graph_hbw_tensor is None:
                     remaining = self.weight_hbw_pool.largest_free_bytes
-                    KunpengGraphRunner._graph_hbw_tensor = self.weight_hbw_pool.alloc(
-                        (remaining,), torch.uint8
-                    )
+                    raw = self.weight_hbw_pool.alloc((remaining,), torch.uint8)
+                    # Round the pool base up to 2M so that per-storage offset
+                    # alignment in pack_intervals (2M/512K/1K workspace bufs)
+                    # equals absolute-address alignment.
+                    _align = 2 * 1024 * 1024
+                    off = (_align - (raw.data_ptr() % _align)) % _align
+                    KunpengGraphRunner._graph_hbw_tensor = raw[off:]
                 graph = finalize(
                     graph_outputs,
                     external_pool=KunpengGraphRunner._graph_hbw_tensor,
