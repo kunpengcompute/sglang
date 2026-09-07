@@ -2081,6 +2081,18 @@ class MooncakeKVReceiver(CommonKVReceiver):
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
 
+            # Sessions per prefill rank: required_dst_info_num covers the
+            # attn-tp dimension; with prefill pp=1 / decode pp>1 all decode
+            # PP stages bootstrap to the same prefill rank, adding
+            # decode_pp/prefill_pp. Under-counting makes prefill release
+            # after the first session, so late decode PP stages hang until
+            # timeout.
+            dst_session_num = self.required_dst_info_num * (
+                self.kv_mgr.pp_size // (self.prefill_info.pp_size or 1)
+                if self.kv_mgr.pp_size > (self.prefill_info.pp_size or 1)
+                else 1
+            )
+
             with lock:
                 sock.send_multipart(
                     [
@@ -2098,7 +2110,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             if not is_dummy and state_indices is not None
                             else b""
                         ),
-                        str(self.required_dst_info_num).encode("ascii"),
+                        str(dst_session_num).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()
