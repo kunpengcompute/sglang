@@ -642,7 +642,7 @@ class LayerCommunicator:
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
                         )
-                    elif _is_cpu_920f and envs.SGLANG_KUNPENG_QUANT_RMSNORM.get():
+                    elif _is_cpu_920f:
                         # Fused add + rmsnorm + int8 quantize. Returns
                         # (outs_int8, scales, residual) so the downstream
                         # int8 GEMM (fused_qkv_a_proj) consumes the quantized
