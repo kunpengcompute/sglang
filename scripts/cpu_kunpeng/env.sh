@@ -325,7 +325,8 @@ if [[ "$SGLANG_ENABLE_KUCCL" == "1" ]]; then
     fi
 fi
 
-# Defaults below use ":-" so explicit .user_env.sh overrides still win.
+export SGLANG_KUNPENG_MOE_TOKEN_MULTIPLE=2
+
 if [[ "$IS_PREFILL" == "1" ]]; then
     export SGLANG_KUNPENG_SWAP_EXPERT="${SGLANG_KUNPENG_SWAP_EXPERT:-1}"
     export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-8}"
