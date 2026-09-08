@@ -50,7 +50,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 from sglang.srt.graph import ops as kunpeng
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
@@ -260,24 +259,17 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 dtype=torch.bfloat16,
             )
 
-            if envs.SGLANG_KUNPENG_UNPACKED_GEMM.get():
-                # On-the-fly activation packing: skips the separate int8 pack
-                # pass. act stays row-major int8; input_ptr is a [m, k] int8
-                # scratch the kernel packs into internally. Weight is still
-                # pre-packed, scale order is (act_scale, weight_scale).
-                input_ptr = kunpeng.alloc_buffer(
-                    batch_size * k, dtype=torch.int8
-                )
-                output = kunpeng.s8_s8_gemm_bf16_dq_kunpeng(
-                    norm_int8, input_ptr.view(batch_size, k), layer.weight,
-                    norm_scale.view(-1), layer.weight_scale.view(-1),
-                    workspace, tile_m, tile_n, tile_k)
-            else:
-                pack_a = kunpeng.s8_gemm_pack_kunpeng(norm_int8, tile_m, tile_k)
-                output = kunpeng.s8_s8_packed_gemm_bf16_dq_kunpeng(
-                    pack_a, layer.weight, layer.weight_scale.view(-1),
-                    norm_scale.view(-1), workspace,
-                    tile_m, tile_n, tile_k)
+            # On-the-fly activation packing: skips the separate int8 pack
+            # pass. act stays row-major int8; input_ptr is a [m, k] int8
+            # scratch the kernel packs into internally. Weight is still
+            # pre-packed, scale order is (act_scale, weight_scale).
+            input_ptr = kunpeng.alloc_buffer(
+                batch_size * k, dtype=torch.int8
+            )
+            output = kunpeng.s8_s8_gemm_bf16_dq_kunpeng(
+                norm_int8, input_ptr.view(batch_size, k), layer.weight,
+                norm_scale.view(-1), layer.weight_scale.view(-1),
+                workspace, tile_m, tile_n, tile_k)
 
             return output
 

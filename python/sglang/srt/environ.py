@@ -577,10 +577,6 @@ class Envs:
     # Fused paged-latent gather + int8 quantize for the chunked-prefill kv_b
     # projection on Kunpeng 920F (skips a separate quant_rows_kunpeng pass).
     SGLANG_KUNPENG_FUSED_GATHER_QUANT = EnvBool(False)
-    # s8 GEMM with on-the-fly activation packing (s8_s8_gemm_bf16_dq) for the
-    # 920F int8 linear path, replacing pack + packed-gemm (skips one int8 pack
-    # pass). Default off: keeps the original pack+packed path for debugging.
-    SGLANG_KUNPENG_UNPACKED_GEMM = EnvBool(False)
     SGLANG_ENABLE_BINARY_LAUNCH = EnvBool(True)
     SGLANG_KUNPENG_RDMA_ALLGATHER = EnvBool(True)
     SGLANG_KUNPENG_MAX_SEQ_NUM = EnvInt(128)

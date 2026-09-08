@@ -55,8 +55,9 @@ class DeepseekMHAKunpengForwardMixin:
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            # q_norm + q_b_proj
-            q_normed = self.q_a_layernorm(q)
+            # q_norm + quantize fusion: emit (int8, scale) so q_b_proj skips
+            # the separate quant pass inside W8A8Int8LinearMethod.apply.
+            q_normed = self.q_a_layernorm(q, quantize=True)
             out, _ = self.q_b_proj(q_normed)
             q = out.view(-1, self.num_local_heads, self.qk_head_dim)
         else:
