@@ -254,7 +254,7 @@ class KunpengCommunicator:
     @KunpengProfiler(depth=3)
     def shm_all_gather_into_tensor(self, input: torch.Tensor, output: torch.Tensor):
         if input.dim() == 1:
-            dim = self.max_elements / self.max_tokens
+            dim = self.max_elements // self.max_tokens
             assert input.size(0) % dim == 0 and output.size(0) % dim == 0, {
                 f"shm_all_gather_into_tensor: input.size(0)({input.size(0)}) % {dim} != 0 "
                 f"shm_all_gather_into_tensor: output.size(0)({output.size(0)}) % {dim} != 0 "

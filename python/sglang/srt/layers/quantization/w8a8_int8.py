@@ -269,7 +269,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                     batch_size * k, dtype=torch.int8
                 )
                 output = kunpeng.s8_s8_gemm_bf16_dq_kunpeng(
-                    norm_int8, input_ptr, layer.weight,
+                    norm_int8, input_ptr.view(batch_size, k), layer.weight,
                     norm_scale.view(-1), layer.weight_scale.view(-1),
                     workspace, tile_m, tile_n, tile_k)
             else:

@@ -36,8 +36,8 @@ def _setup_fused_add_rmsnorm_quant_kunpeng():
     # Returns (out_int8, scale, residual_out); out_int8/scale feed the
     # subsequent int8 GEMM directly, skipping a separate quant_kunpeng pass.
     def shape_infer(act, residual, weight, eps):
-        return [list(residual.shape),
-                (residual.shape[0], torch.float32)]
+        return [(list(residual.shape), torch.int8),
+                ((residual.shape[0],), torch.float32)]
 
     def eager_fn(act, residual, weight, eps):
         outs = torch.empty(residual.shape, dtype=torch.int8)

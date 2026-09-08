@@ -1062,7 +1062,7 @@ class GroupCoordinator:
             elif (
                 self.use_kunpeng_communicator
                 and input_.shape[0] > 0
-                and output_tensor.shape[0] <= self.kunpeng_communicator.max_tokens
+                and output_tensor.shape[0] <= self.kunpeng_communicator.max_elements
             ):
                 self.kunpeng_communicator.shm_all_gather_into_tensor(
                     input_, output_tensor
