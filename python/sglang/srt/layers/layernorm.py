@@ -419,6 +419,7 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quantize: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if _is_cpu_amx_available:
             if residual is not None:
@@ -436,9 +437,16 @@ class RMSNorm(MultiPlatformOp):
                 if post_residual_addition is not None:
                     assert False, "no impl"
                     residual = residual + post_residual_addition
+                if quantize:
+                    outs, scales = kunpeng.fused_add_rmsnorm_quant_kunpeng(
+                        x, residual, self.weight.data, self.variance_epsilon)
+                    return outs, scales, residual
                 outs = kunpeng.fused_add_rmsnorm_kunpeng(
                     x, residual, self.weight.data, self.variance_epsilon)
                 return outs, residual
+            if quantize:
+                return kunpeng.rmsnorm_quant_kunpeng(
+                    x, self.weight.data, self.variance_epsilon)
             return kunpeng.rmsnorm_kunpeng(
                 x, self.weight.data, self.variance_epsilon)
         else:

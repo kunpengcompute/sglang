@@ -30,6 +30,25 @@ def _setup_fused_add_rmsnorm_kunpeng():
     register_op('fused_add_rmsnorm_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_fused_add_rmsnorm_quant_kunpeng():
+    # fused add + rmsnorm + per-token int8 quantize in a single kernel.
+    # act is the all-reduced hidden states, residual is the layer residual.
+    # Returns (out_int8, scale, residual_out); out_int8/scale feed the
+    # subsequent int8 GEMM directly, skipping a separate quant_kunpeng pass.
+    def shape_infer(act, residual, weight, eps):
+        return [(list(residual.shape), torch.int8),
+                ((residual.shape[0],), torch.float32)]
+
+    def eager_fn(act, residual, weight, eps):
+        outs = torch.empty(residual.shape, dtype=torch.int8)
+        scales = torch.empty(residual.shape[0], dtype=torch.float32)
+        torch.ops.sgl_kernel.fused_add_rmsnorm_quant_kunpeng(
+            act, residual, weight, eps, outs, scales)
+        return outs, scales
+
+    register_op('fused_add_rmsnorm_quant_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_rmsnorm_kunpeng():
     def shape_infer(acts, weights, eps):
         return [(acts.shape, acts.dtype)]
@@ -40,6 +59,21 @@ def _setup_rmsnorm_kunpeng():
         return out
 
     register_op('rmsnorm_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_rmsnorm_quant_kunpeng():
+    def shape_infer(acts, weights, eps):
+        return [(list(acts.shape), torch.int8),
+                ((acts.shape[0],), torch.float32)]
+
+    def eager_fn(acts, weights, eps):
+        outs = torch.empty(acts.shape, dtype=torch.int8)
+        scales = torch.empty(acts.shape[0], dtype=torch.float32)
+        torch.ops.sgl_kernel.rmsnorm_quant_kunpeng(
+            acts, weights, eps, outs, scales)
+        return outs, scales
+
+    register_op('rmsnorm_quant_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_quant_kunpeng():
@@ -200,6 +234,29 @@ def _setup_s8_s8_packed_gemm_bf16_dq_kunpeng():
         return output
 
     register_op('s8_s8_packed_gemm_bf16_dq_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_s8_s8_gemm_bf16_dq_kunpeng():
+    # s8 GEMM with on-the-fly packing of the left (activation) matrix.
+    # act is row-major int8; input_ptr is a [m, k] int8 scratch the kernel
+    # packs into internally; weight is still pre-packed. Returns [m, n] bf16.
+    def shape_infer(act, input_ptr, weight, act_scale, weight_scale, workspace,
+                    tile_m, tile_n, tile_k):
+        M = act.shape[0]
+        N = weight.shape[0]
+        return [((M, N), torch.bfloat16)]
+
+    def eager_fn(act, input_ptr, weight, act_scale, weight_scale, workspace,
+                 tile_m, tile_n, tile_k):
+        M = act.shape[0]
+        N = weight.shape[0]
+        output = torch.empty((M, N), dtype=torch.bfloat16)
+        torch.ops.sgl_kernel.s8_s8_gemm_bf16_dq_kunpeng(
+            act, input_ptr, weight, act_scale, weight_scale,
+            output, workspace, int(tile_m), int(tile_n), int(tile_k))
+        return output
+
+    register_op('s8_s8_gemm_bf16_dq_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_bf16_gemm_pack_kunpeng():
@@ -850,6 +907,35 @@ def _setup_gather_split_latent_paged_kunpeng():
     register_op('gather_split_latent_paged_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_gather_split_latent_paged_quant_kunpeng():
+    # gather_split_latent_paged + per-row int8 quantize of kv_a in one kernel.
+    # Returns (kv_a_int8 [total_kv, kv_lora_rank] int8, kv_a_scale [total_kv]
+    # float32, k_pe [total_kv, qk_rope_head_dim] bf16). Replaces the
+    # separate gather + quant_rows_kunpeng chain in the chunked-prefill kv_b
+    # projection.
+    def shape_infer(latent_cache, block_table, extend_seq_lens, prefix_lens,
+                    page_size, kv_lora_rank, qk_rope_head_dim, total_kv):
+        return [((total_kv, kv_lora_rank), torch.int8),
+                ((total_kv,), torch.float32),
+                ((total_kv, qk_rope_head_dim), latent_cache.dtype)]
+
+    def eager_fn(latent_cache, block_table, extend_seq_lens, prefix_lens,
+                 page_size, kv_lora_rank, qk_rope_head_dim, total_kv):
+        kv_a_int8 = torch.empty((total_kv, kv_lora_rank), dtype=torch.int8)
+        kv_a_scale = torch.empty((total_kv,), dtype=torch.float32)
+        k_pe = torch.empty((total_kv, qk_rope_head_dim), dtype=latent_cache.dtype)
+        torch.ops.sgl_kernel.gather_split_latent_paged_quant_kunpeng(
+            latent_cache=latent_cache, block_table=block_table,
+            extend_seq_lens=extend_seq_lens, prefix_lens=prefix_lens,
+            kv_a_int8=kv_a_int8, kv_a_scale=kv_a_scale, k_pe=k_pe,
+            page_size=int(page_size), kv_lora_rank=int(kv_lora_rank),
+            qk_rope_head_dim=int(qk_rope_head_dim),
+            total_kv=int(total_kv))
+        return kv_a_int8, kv_a_scale, k_pe
+
+    register_op('gather_split_latent_paged_quant_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_flash_attention_varlen_with_workspace_kunpeng():
     # Varlen flash attention with prefix support on pre-packed K/V.
     # Eager path delegates to the existing flash_attention_with_workspace
@@ -1172,7 +1258,9 @@ def _setup_mul_scalar_add_kunpeng():
 
 def setup():
     _setup_fused_add_rmsnorm_kunpeng()
+    _setup_fused_add_rmsnorm_quant_kunpeng()
     _setup_rmsnorm_kunpeng()
+    _setup_rmsnorm_quant_kunpeng()
     _setup_quant_kunpeng()
     _setup_quant_inplace_kunpeng()
     _setup_batched_gemm_pack_allthreads_kunpeng()
@@ -1185,6 +1273,7 @@ def setup():
     _setup_zero_()
     _setup_last_tokens()
     _setup_s8_s8_packed_gemm_bf16_dq_kunpeng()
+    _setup_s8_s8_gemm_bf16_dq_kunpeng()
     _setup_bf16_gemm_pack_kunpeng()
     _setup_bf16_packed_gemm_kunpeng()
     _setup_grouped_topk_kunpeng()
@@ -1230,6 +1319,7 @@ def setup():
     _setup_flash_mla_reduce_kunpeng()
     _setup_flash_attention_with_workspace_kunpeng()
     _setup_gather_split_latent_paged_kunpeng()
+    _setup_gather_split_latent_paged_quant_kunpeng()
     _setup_flash_attention_varlen_with_workspace_kunpeng()
     _setup_quant_rows_kunpeng()
     _setup_s8_gemm_pack_rows_kunpeng()

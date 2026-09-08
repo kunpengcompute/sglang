@@ -574,6 +574,9 @@ class Envs:
     # KUNPENG_CPU
     SGLANG_USE_CPU_920F = EnvBool(False)
     SGLANG_KUNPENG_PROFILE = EnvBool(False)
+    # Fused paged-latent gather + int8 quantize for the chunked-prefill kv_b
+    # projection on Kunpeng 920F (skips a separate quant_rows_kunpeng pass).
+    SGLANG_KUNPENG_FUSED_GATHER_QUANT = EnvBool(False)
     SGLANG_ENABLE_BINARY_LAUNCH = EnvBool(True)
     SGLANG_KUNPENG_RDMA_ALLGATHER = EnvBool(True)
     SGLANG_KUNPENG_MAX_SEQ_NUM = EnvInt(128)

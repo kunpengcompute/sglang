@@ -18,6 +18,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
+    FINISH_ABORT,
     Req,
     ScheduleBatch,
 )
@@ -102,7 +103,17 @@ class SchedulerOutputProcessorMixin:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
-            req.check_finished()
+            if (
+                getattr(self, "_pp_mtp_enabled", False)
+                and not self.pp_group.is_last_rank
+            ):
+                # PP+MTP: aborts/timeout (`to_finish`) are arbitrated by the
+                # last rank's verify and reconciled via the ring `-1`
+                # placeholder (see `_pp_mtp_apply_verify_result`); keep the
+                # pending abort alive here.
+                req.check_finished(skip_to_finish=True)
+            else:
+                req.check_finished()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
                 if self.enable_hisparse:
@@ -624,14 +635,25 @@ class SchedulerOutputProcessorMixin:
             )
 
         if num_accepted < 1:
-            if _DEBUG_PP_MTP:
-                pp_rank = getattr(self, "pp_rank", None)
-                logger.info(f"[PP{pp_rank}] apply_verify: num_accepted < 1, skip")
-            return
+            # The kernel contract guarantees num_accepted >= 1 (the root is
+            # always accepted).  Skipping here would diverge the allocator
+            # state from the last rank (which already freed the rejected
+            # slots) and eventually desync the running batches -- fail loudly
+            # instead.
+            raise RuntimeError(
+                f"PP+MTP: num_accepted={num_accepted} < 1 for req {req.rid}; "
+                "ring message corrupt or kernel contract violated"
+            )
 
         # The flattened accepted tokens (result.next_token_ids) split by the
         # per-req accepted counts.
         offset = sum(int(t) for t in batch.pp_mtp_accepted_tokens[:i])
+        if offset + num_accepted > result.next_token_ids.numel():
+            raise RuntimeError(
+                f"PP+MTP: next_token_ids slice [{offset}:{offset + num_accepted}] "
+                f"out of range ({result.next_token_ids.numel()}) for req "
+                f"{req.rid}; ring message misaligned"
+            )
         accepted_tokens = result.next_token_ids[offset : offset + num_accepted]
 
         think_end_id = batch.model_config.think_end_id
@@ -639,16 +661,60 @@ class SchedulerOutputProcessorMixin:
             req.output_ids.append(tok)
             if req.require_reasoning and think_end_id is not None:
                 req.update_reasoning_tokens(tok, think_end_id)
-            req.check_finished()
+            # skip_to_finish: aborts/timeout (`to_finish`) are arbitrated
+            # exclusively by the last rank (which consumes them in the verify
+            # shell) and propagate here via the `-1` draft placeholder in the
+            # ring message.  Consuming them locally as well would race with
+            # the ring's per-hop AbortReq forwarding and desync the batches.
+            req.check_finished(skip_to_finish=True)
             if not req.finished() and req.grammar is not None:
                 try:
                     req.grammar.accept_token(tok)
                 except ValueError as e:
                     logger.info(f"{req=}\n{e}")
                     raise e
-                req.check_finished()
+                req.check_finished(skip_to_finish=True)
             if req.finished():
                 break
+
+        # ── Finish reconciliation (single-arbiter semantics) ──────────────
+        # `pp_mtp_ring_finished[i]` <=> `draft_tokens[i] < 0` <=> the last
+        # rank's verify finished this req this round.
+        ring_finished = batch.pp_mtp_ring_finished
+        if ring_finished is not None:
+            if ring_finished[i] and not req.finished():
+                # The last rank finished this req this round (the `-1` draft
+                # placeholder IS the verdict).  Consume the local `to_finish`
+                # if one is pending (typical: the abort arrived while this
+                # rank was awaiting the ring); otherwise synthesize a generic
+                # abort (timeout boundary race).  Either way the req ends up
+                # finished with a FINISH_ABORT reason, matching the last
+                # rank's verdict.
+                if req.to_finish is not None:
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
+                else:
+                    req.finished_reason = FINISH_ABORT(
+                        "Finished by last rank's verify verdict "
+                        "(abort/timeout race resolved by ring placeholder)."
+                    )
+                    logger.warning(
+                        "PP+MTP: req %s finished by ring verdict without a "
+                        "local pending abort (timeout boundary race); "
+                        "generic FINISH_ABORT synthesized.",
+                        req.rid,
+                    )
+            elif not ring_finished[i] and req.finished():
+                # The kernel/official-verify on the last rank and the
+                # replicated token-level checks here must agree (a125f622d
+                # aligned the finish sets).  Disagreement means the
+                # replication semantics have drifted -- raise instead of
+                # silently desyncing the running batches.
+                raise RuntimeError(
+                    f"PP+MTP: req {req.rid} finished locally but the last "
+                    "rank's verify verdict is alive; finish-check semantics "
+                    "have diverged between PP ranks"
+                )
 
         req.kv_committed_len += num_accepted
         req.kv_allocated_len = req.kv_committed_len

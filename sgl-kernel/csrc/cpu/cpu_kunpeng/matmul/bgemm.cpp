@@ -248,7 +248,8 @@ void bmm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output)
 
     kutacc::MatrixTilingBlock t = bgemm_find_optimal_tiling_plan(M, N, K);
 
-    auto [tile_m, tile_n, tile_k] = t;
+    int64_t tile_m, tile_n, tile_k;
+    std::tie(tile_m, tile_n, tile_k) = t;
     TORCH_CHECK(tile_k % 2 == 0, "bmm_kunpeng: tile_k % 2 != 0");
 
     int64_t blocks_in_k = K / tile_k;

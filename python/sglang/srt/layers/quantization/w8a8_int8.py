@@ -253,18 +253,23 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(batch_size, n, k)
             )
 
-            pack_a = kunpeng.s8_gemm_pack_kunpeng(norm_int8, tile_m, tile_k)
-
             blocks_in_k = k // tile_k
             workspace = kunpeng.alloc_buffer(
                 blocks_in_k * n * batch_size + 1024 if blocks_in_k > 1 else 0,
                 dtype=torch.bfloat16,
             )
 
-            output = kunpeng.s8_s8_packed_gemm_bf16_dq_kunpeng(
-                pack_a, layer.weight, layer.weight_scale.view(-1),
-                norm_scale.view(-1), workspace,
-                tile_m, tile_n, tile_k)
+            # On-the-fly activation packing: skips the separate int8 pack
+            # pass. act stays row-major int8; input_ptr is a [m, k] int8
+            # scratch the kernel packs into internally. Weight is still
+            # pre-packed, scale order is (act_scale, weight_scale).
+            input_ptr = kunpeng.alloc_buffer(
+                batch_size * k, dtype=torch.int8
+            )
+            output = kunpeng.s8_s8_gemm_bf16_dq_kunpeng(
+                norm_int8, input_ptr.view(batch_size, k), layer.weight,
+                norm_scale.view(-1), layer.weight_scale.view(-1),
+                workspace, tile_m, tile_n, tile_k)
 
             return output
 

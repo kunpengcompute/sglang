@@ -18,7 +18,10 @@
 #include <kutacc.h>
 #include <torch/extension.h>
 
+#include <arm_sve.h>
+
 #include <cstdint>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -302,6 +305,175 @@ void gather_split_latent_paged_kunpeng(
     }
     TORCH_CHECK(kv_offset <= total_kv, "gathered ", kv_offset,
                 " tokens, exceeds buffer size total_kv=", total_kv);
+}
+
+// ---------------------------------------------------------------------------
+// gather_split_latent_paged + quantize fusion (chunked-prefill kv_b chain)
+//
+// Same page gather + kv_a/k_pe split as gather_split_latent_paged_kunpeng, but
+// additionally per-row quantizes kv_a to int8 with an absmax scale while it is
+// being gathered. kv_a_int8 [total_kv, kv_lora_rank] int8 and
+// kv_a_scale [total_kv] float32 replace the bf16 kv_a + separate
+// quant_rows_kunpeng pass, eliminating one full bf16 write + one int8 read of
+// the kv_a buffer. k_pe is still emitted as bf16 (unchanged path).
+//
+// Parallelization: output rows are the natural parallel unit (total_kv rows).
+// Cumulative per-seq row starts are precomputed once, then kutacc::parallel_for
+// walks output rows; each row locates its (seq, block, token) via a binary
+// search over the sorted row_start array (robust to any thread range layout).
+// The per-row absmax + quantize inner loop mirrors kutacc::quant exactly:
+// first pass SVE-vectorizes the absmax reduction (bf16 -> f32 lane expansion,
+// svmaxv_f32), second pass vectorizes the store (scale via svmul, f32->f16,
+// svrintn round-to-nearest-even, f16->s16, saturating narrow s16->s8 via
+// svqxtnb_s16, svuzp1 interleave, svst1), with a scalar tail that clamps to
+// [-127, 127] and rounds RNE identically to kutacc::quant.
+//
+// Quant formula matches kutacc::quant: scale = absmax/127,
+// out = clamp(round(x/scale), -127, 127); zero rows use scale=1.
+// ---------------------------------------------------------------------------
+void gather_split_latent_paged_quant_kunpeng(
+    at::Tensor latent_cache, at::Tensor block_table, at::Tensor extend_seq_lens,
+    at::Tensor prefix_lens,
+    at::Tensor kv_a_int8, at::Tensor kv_a_scale, at::Tensor k_pe,
+    int64_t page_size, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
+    int64_t total_kv)
+{
+    TORCH_CHECK(extend_seq_lens.scalar_type() == at::kInt, "extend_seq_lens must be int32");
+    TORCH_CHECK(prefix_lens.scalar_type() == at::kInt, "prefix_lens must be int32");
+    TORCH_CHECK(block_table.scalar_type() == at::kInt, "block_table must be int32");
+
+    auto bs = extend_seq_lens.size(0);
+    TORCH_CHECK(prefix_lens.size(0) == bs, "prefix_lens size mismatch");
+    int64_t kv_cache_dim = kv_lora_rank + qk_rope_head_dim;
+    int64_t rope_dim = qk_rope_head_dim;
+
+    TORCH_CHECK(latent_cache.scalar_type() == at::kBFloat16, "latent_cache must be bfloat16");
+    TORCH_CHECK(kv_a_int8.scalar_type() == at::kChar, "kv_a_int8 must be int8");
+    TORCH_CHECK(kv_a_scale.scalar_type() == at::kFloat, "kv_a_scale must be float32");
+    TORCH_CHECK(k_pe.scalar_type() == at::kBFloat16, "k_pe must be bfloat16");
+
+    TORCH_CHECK(kv_a_int8.size(0) == total_kv && kv_a_int8.size(1) == kv_lora_rank,
+                "kv_a_int8 must be [total_kv, kv_lora_rank], got ", kv_a_int8.sizes());
+    TORCH_CHECK(kv_a_scale.size(0) == total_kv, "kv_a_scale must be [total_kv]");
+    TORCH_CHECK(k_pe.size(0) == total_kv && k_pe.size(1) == rope_dim,
+                "k_pe must be [total_kv, rope_dim], got ", k_pe.sizes());
+
+    auto ext_a = extend_seq_lens.accessor<int32_t, 1>();
+    auto pfx_a = prefix_lens.accessor<int32_t, 1>();
+    auto bt_a = block_table.accessor<int32_t, 2>();
+
+    // Cumulative per-seq output-row starts: row_start[i] = rows before seq i.
+    // Also the total live rows (must fit total_kv).
+    std::vector<int64_t> row_start(bs + 1, 0);
+    for (int64_t i = 0; i < bs; i++) {
+        row_start[i + 1] = row_start[i] + ext_a[i] + pfx_a[i];
+    }
+    TORCH_CHECK(row_start[bs] <= total_kv, "gathered ", row_start[bs],
+                " tokens, exceeds buffer size total_kv=", total_kv);
+
+    int64_t row_bytes = kv_cache_dim * latent_cache.element_size();
+    int64_t page_row_bytes = page_size * row_bytes;
+    int64_t kv_a_row_bytes = kv_lora_rank * latent_cache.element_size();
+    int64_t k_pe_row_bytes = rope_dim * latent_cache.element_size();
+
+    const uint8_t *cache_ptr = static_cast<uint8_t *>(latent_cache.data_ptr());
+    int8_t *kv_a_int8_ptr = static_cast<int8_t *>(kv_a_int8.data_ptr());
+    float *kv_a_scale_ptr = static_cast<float *>(kv_a_scale.data_ptr());
+    uint8_t *k_pe_ptr = static_cast<uint8_t *>(k_pe.data_ptr());
+
+    const int64_t vl = svcnth();          // bf16 elements per SVE vector
+    const int64_t step_half = vl;         // bf16 per SVE vector (kutacc STEP_HALF)
+    const int64_t step_32 = vl * 2;       // bf16 per two vectors (kutacc STEP_32)
+    const svbfloat16_t zero_b = svdup_bf16(0);
+
+    if (row_start[bs] == 0)
+        return;
+
+    kutacc::parallel_for(0, row_start[bs], 1, [&](int64_t r_begin, int64_t r_end) {
+        for (int64_t r = r_begin; r < r_end; r++) {
+            // Binary search the seq owning output row r (row_start is sorted
+            // ascending; robust to any thread range layout).
+            int64_t lo = 0, hi = bs - 1;
+            while (lo < hi) {
+                int64_t mid = (lo + hi) >> 1;
+                if (row_start[mid + 1] <= r)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            int64_t i = lo;
+            int64_t local = r - row_start[i];  // token index within seq i
+            int64_t b = local / page_size;
+            int64_t t = local % page_size;
+            int64_t page_idx = bt_a[i][b];
+            const uint8_t *src_row = cache_ptr + page_idx * page_row_bytes + t * row_bytes;
+
+            // k_pe (bf16) unchanged: contiguous byte copy.
+            std::memcpy(k_pe_ptr + r * k_pe_row_bytes,
+                        src_row + kv_a_row_bytes, k_pe_row_bytes);
+
+            // Per-row absmax quantize of kv_a (SVE, kutacc::quant pattern).
+            const bfloat16_t *kv_a_row =
+                reinterpret_cast<const bfloat16_t *>(src_row);
+            svfloat32_t mx_v = svdup_f32(0);
+            int64_t j = 0;
+            for (; j + step_32 <= kv_lora_rank; j += step_32) {
+                svbfloat16_t i0 = svld1(svptrue_b16(), kv_a_row + j);
+                svbfloat16_t i1 = svld1(svptrue_b16(), kv_a_row + j + step_half);
+                svfloat32_t i00 = svreinterpret_f32(svzip1(zero_b, i0));
+                svfloat32_t i01 = svreinterpret_f32(svzip2(zero_b, i0));
+                svfloat32_t i10 = svreinterpret_f32(svzip1(zero_b, i1));
+                svfloat32_t i11 = svreinterpret_f32(svzip2(zero_b, i1));
+                i00 = svabs_f32_x(svptrue_b32(), i00);
+                i01 = svabs_f32_x(svptrue_b32(), i01);
+                i10 = svabs_f32_x(svptrue_b32(), i10);
+                i11 = svabs_f32_x(svptrue_b32(), i11);
+                mx_v = svmax_x(svptrue_b32(), i00, mx_v);
+                mx_v = svmax_x(svptrue_b32(), i01, mx_v);
+                mx_v = svmax_x(svptrue_b32(), i10, mx_v);
+                mx_v = svmax_x(svptrue_b32(), i11, mx_v);
+            }
+            float max_value = svmaxv_f32(svptrue_b32(), mx_v);
+            for (; j < kv_lora_rank; j++) {
+                max_value = std::max(max_value, std::abs(static_cast<float>(kv_a_row[j])));
+            }
+            float scale_val = max_value / 127.0f;
+            if (scale_val == 0.0f)
+                scale_val = 1.0f;
+            kv_a_scale_ptr[r] = scale_val;
+            float scale_val_inv = 1.0f / scale_val;
+
+            // Quantize store (SVE vectorized like kutacc::quant):
+            // scale -> svmul, f32->f16, round-to-nearest-even (svrintn),
+            // f16->s16, saturating narrow s16->s8 (svqxtnb), interleave back
+            // via svuzp1, store. Scalar tail matches the vector path: RNE
+            // rounding and clamps to [-127, 127] exactly like kutacc::quant.
+            int8_t *out_row = kv_a_int8_ptr + r * kv_lora_rank;
+            j = 0;
+            for (; j + step_32 <= kv_lora_rank; j += step_32) {
+                svbfloat16_t i0 = svld1(svptrue_b16(), kv_a_row + j);
+                svbfloat16_t i1 = svld1(svptrue_b16(), kv_a_row + j + step_half);
+                svfloat32_t i00 = svreinterpret_f32(svzip1(zero_b, i0));
+                svfloat32_t i01 = svreinterpret_f32(svzip2(zero_b, i0));
+                svfloat32_t i10 = svreinterpret_f32(svzip1(zero_b, i1));
+                svfloat32_t i11 = svreinterpret_f32(svzip2(zero_b, i1));
+                i00 = svmul_x(svptrue_b32(), i00, scale_val_inv);
+                i01 = svmul_x(svptrue_b32(), i01, scale_val_inv);
+                i10 = svmul_x(svptrue_b32(), i10, scale_val_inv);
+                i11 = svmul_x(svptrue_b32(), i11, scale_val_inv);
+
+                svfloat16_t o0 = svuzp1(svcvt_f16_x(svptrue_b32(), i00), svcvt_f16_x(svptrue_b32(), i01));
+                svfloat16_t o1 = svuzp1(svcvt_f16_x(svptrue_b32(), i10), svcvt_f16_x(svptrue_b32(), i11));
+                svint8_t t0 = svqxtnb_s16(svcvt_s16_x(svptrue_b16(), svrintn_x(svptrue_b16(), o0)));
+                svint8_t t1 = svqxtnb_s16(svcvt_s16_x(svptrue_b16(), svrintn_x(svptrue_b16(), o1)));
+                svst1(svptrue_b8(), out_row + j, svuzp1(t0, t1));
+            }
+            for (; j < kv_lora_rank; j++) {
+                out_row[j] = static_cast<int8_t>(std::nearbyint(std::clamp(
+                    static_cast<float>(kv_a_row[j]) / scale_val, -127.0f, 127.0f)));
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

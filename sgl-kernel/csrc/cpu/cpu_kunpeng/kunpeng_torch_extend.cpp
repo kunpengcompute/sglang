@@ -64,6 +64,13 @@ void s8_s8_packed_gemm_bf16_dq_kunpeng(at::Tensor input, at::Tensor weight, at::
                                        at::Tensor output, at::Tensor workspace, int64_t tile_m, int64_t tile_n,
                                        int64_t tile_k);
 
+void s8_s8_gemm_bf16_dq_kunpeng(at::Tensor act, at::Tensor input_ptr, at::Tensor weight, at::Tensor act_scale,
+                                at::Tensor weight_scale, at::Tensor output, at::Tensor workspace, int64_t tile_m,
+                                int64_t tile_n, int64_t tile_k);
+
+int64_t s8_s8_gemm_bf16_dq_tmpc_size_kunpeng(int64_t m, int64_t n, int64_t k, int64_t tile_m, int64_t tile_n,
+                                             int64_t tile_k);
+
 void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, int64_t split_c);
 
 void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
@@ -131,6 +138,13 @@ void gather_split_latent_paged_kunpeng(
     at::Tensor latent_cache, at::Tensor block_table, at::Tensor extend_seq_lens,
     at::Tensor prefix_lens,
     at::Tensor kv_a, at::Tensor k_pe,
+    int64_t page_size, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
+    int64_t total_kv);
+
+void gather_split_latent_paged_quant_kunpeng(
+    at::Tensor latent_cache, at::Tensor block_table, at::Tensor extend_seq_lens,
+    at::Tensor prefix_lens,
+    at::Tensor kv_a_int8, at::Tensor kv_a_scale, at::Tensor k_pe,
     int64_t page_size, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
     int64_t total_kv);
 
@@ -362,6 +376,10 @@ void build_tree_kernel_kunpeng(at::Tensor parent_list, at::Tensor top_scores_ind
                                int64_t spec_steps, int64_t num_verify_tokens, int64_t tree_mask_mode,
                                int64_t seq_lens_sum);
 
+void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at::Tensor accept_token_num,
+                                at::Tensor candidates, at::Tensor retrieve_index, at::Tensor retrieve_next_token,
+                                at::Tensor retrieve_next_sibling, at::Tensor target_predict);
+
 
 void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded);
 
@@ -402,7 +420,7 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     at::Tensor output_ids_len, at::Tensor max_new_tokens, at::Tensor vocab_size,
     at::Tensor stop_ids_flat, at::Tensor stop_ids_off,
     at::Tensor eos_ids_flat, at::Tensor eos_ids_off,
-    int64_t tokenizer_eos, bool use_tokenizer_eos, int64_t nv, int64_t page_size,
+    at::Tensor ignore_eos, int64_t nv, int64_t page_size,
     at::Tensor req_pool_indices, at::Tensor req_to_token, at::Tensor seq_lens_cpu);
 
 // gather_index_kunpeng: parallel row gather replacing the two aten::index ops.
@@ -467,6 +485,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "s8_s8_packed_gemm_bf16_dq_kunpeng(Tensor input, Tensor weight, Tensor weight_scale, Tensor scale, "
         "Tensor(a!) output, Tensor workspace, int tile_m, int tile_n, int tile_k) -> ()");
     m.impl("s8_s8_packed_gemm_bf16_dq_kunpeng", s8_s8_packed_gemm_bf16_dq_kunpeng);
+
+    // s8_s8_gemm_bf16_dq (left matrix packed on-the-fly)
+    m.def(
+        "s8_s8_gemm_bf16_dq_kunpeng(Tensor act, Tensor(a!) input_ptr, Tensor weight, Tensor act_scale, "
+        "Tensor weight_scale, Tensor(a!) output, Tensor workspace, int tile_m, int tile_n, int tile_k) -> ()");
+    m.impl("s8_s8_gemm_bf16_dq_kunpeng", s8_s8_gemm_bf16_dq_kunpeng);
+
+    m.def("s8_s8_gemm_bf16_dq_tmpc_size_kunpeng(int M, int N, int K, int tile_m, int tile_n, int tile_k) -> int");
+    m.impl("s8_s8_gemm_bf16_dq_tmpc_size_kunpeng", s8_s8_gemm_bf16_dq_tmpc_size_kunpeng);
 
     // bf16 gemm pack
     m.def("bf16_gemm_pack_kunpeng(Tensor input, Tensor(a!) out, int split_r, int split_c) -> ()");
@@ -598,6 +625,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int page_size, int kv_lora_rank, int qk_rope_head_dim, "
         "int total_kv) -> ()");
     m.impl("gather_split_latent_paged_kunpeng", gather_split_latent_paged_kunpeng);
+
+    m.def(
+        "gather_split_latent_paged_quant_kunpeng("
+        "Tensor latent_cache, Tensor block_table, "
+        "Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor kv_a_int8, Tensor kv_a_scale, Tensor k_pe, "
+        "int page_size, int kv_lora_rank, int qk_rope_head_dim, "
+        "int total_kv) -> ()");
+    m.impl("gather_split_latent_paged_quant_kunpeng",
+           gather_split_latent_paged_quant_kunpeng);
 
     m.def(
         "quant_rows_kunpeng("
@@ -946,6 +983,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int seq_lens_sum) -> ()");
     m.impl("build_tree_kernel_kunpeng", build_tree_kernel_kunpeng);
 
+    m.def(
+        "verify_tree_greedy_kunpeng("
+        "Tensor predicts, Tensor! accept_index, Tensor! accept_token_num, "
+        "Tensor candidates, Tensor retrieve_index, Tensor retrieve_next_token, "
+        "Tensor retrieve_next_sibling, Tensor target_predict) -> ()");
+    m.impl("verify_tree_greedy_kunpeng", verify_tree_greedy_kunpeng);
+
     m.def("pad_q_left_mtp_kunpeng(Tensor q_heads, Tensor ext_lens, Tensor q_padded) -> ()");
     m.impl("pad_q_left_mtp_kunpeng", pad_q_left_mtp_kunpeng);
 
@@ -999,7 +1043,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor max_new_tokens, Tensor vocab_size, "
         "Tensor stop_ids_flat, Tensor stop_ids_off, "
         "Tensor eos_ids_flat, Tensor eos_ids_off, "
-        "int tokenizer_eos, bool use_tokenizer_eos, int nv, int page_size, "
+        "Tensor ignore_eos, int nv, int page_size, "
         "Tensor req_pool_indices, Tensor(b!) req_to_token, Tensor(c!) seq_lens_cpu"
         ") -> Tensor[]");
     m.impl("verify_mtp_kunpeng", verify_mtp_kunpeng);

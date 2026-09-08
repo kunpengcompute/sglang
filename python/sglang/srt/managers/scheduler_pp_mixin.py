@@ -533,10 +533,6 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                    if self._pp_mtp_enabled:
-                        for req in self.mbs[next_mb_id].reqs:
-                            if req.finished():
-                                self._pp_pending_drafts.pop(req.rid, None)
 
                 # 9.mb tail: batch completion bookkeeping + transition to the
                 # next micro-batch iteration (spans send_pyobj / send_proxy).
@@ -625,6 +621,13 @@ class SchedulerPPMixin:
             and self.spec_algorithm is not None
             and not self.spec_algorithm.is_none()
         )
+        # Cleanup ownership (single authority -- do not add more pop sites):
+        #   - `_pp_mtp_prepare_verify_batch` pops on consume;
+        #   - `process_batch_result_decode` pops the residue of reqs that
+        #     finished or were retracted this round;
+        #   - PD prefill pops on transfer hand-over.
+        # Known bounded leak: a req retracted and then aborted leaves one int
+        # entry behind (rids are never recycled; harmless).
         self._pp_pending_drafts: Dict[str, int] = {}
         _ppmtp_log(
             self,
@@ -1327,40 +1330,56 @@ class SchedulerPPMixin:
             # the last rank stashes them in `_pp_launch_batch` right after its
             # worker produces them (the ring would be one full loop too late).
             draft_tokens = pp_outputs.tensors.get("draft_tokens", None)
+            num_accepted_tokens = pp_outputs.tensors.get("num_accepted_tokens", None)
             if draft_tokens is not None:
+                # Validate BEFORE stashing: a size mismatch means the last
+                # rank's running batch diverged from ours (e.g. a finish-check
+                # disagreement); fail loudly without corrupting
+                # `_pp_pending_drafts` with misaligned entries.
+                expected_bs = batch.batch_size()
+                if draft_tokens.numel() != expected_bs:
+                    raise RuntimeError(
+                        "PP+MTP: draft_tokens size "
+                        f"({draft_tokens.numel()}) != batch size "
+                        f"({expected_bs}); PP ranks' running batches "
+                        "have desynced"
+                    )
+                if (
+                    num_accepted_tokens is not None
+                    and num_accepted_tokens.numel() != expected_bs
+                ):
+                    raise RuntimeError(
+                        "PP+MTP: num_accepted_tokens size "
+                        f"({num_accepted_tokens.numel()}) != batch size "
+                        f"({expected_bs}); PP ranks' running batches "
+                        "have desynced"
+                    )
                 # `draft_tokens` is aligned with `batch.reqs` (finished
-                # requests carry a -1 placeholder that is skipped), so the zip
-                # is positionally correct even when some requests finished
-                # early and the last rank only produced drafts for the
-                # unfinished subset.
+                # requests carry a -1 placeholder that is skipped).  The `-1`
+                # placeholder is also the finish-verdict channel: it marks
+                # exactly the requests the last rank's verify finished this
+                # round (single-arbiter semantics reconciled by
+                # `_pp_mtp_apply_verify_result`).
+                draft_tokens_list = draft_tokens.tolist()
+                batch.pp_mtp_ring_finished = [tok < 0 for tok in draft_tokens_list]
+                batch.pp_mtp_accepted_tokens = num_accepted_tokens
                 stashed_rids = []
-                for req, tok in zip(batch.reqs, draft_tokens.tolist()):
+                for req, tok in zip(batch.reqs, draft_tokens_list):
                     if tok < 0:
                         continue
                     self._pp_pending_drafts[req.rid] = int(tok)
                     stashed_rids.append(req.rid)
-                batch.pp_mtp_accepted_tokens = pp_outputs.tensors.get(
-                    "num_accepted_tokens", None
-                )
-                if (
-                    batch.pp_mtp_accepted_tokens is not None
-                    and batch.pp_mtp_accepted_tokens.numel() != batch.batch_size()
-                ):
-                    # A size mismatch means the last rank's running batch
-                    # diverged from ours (e.g. a finish-check disagreement);
-                    # fail loudly instead of corrupting state downstream.
-                    raise RuntimeError(
-                        "PP+MTP: num_accepted_tokens size "
-                        f"({batch.pp_mtp_accepted_tokens.numel()}) != batch size "
-                        f"({batch.batch_size()}); PP ranks' running batches "
-                        "have desynced"
-                    )
                 _ppmtp_log(
                     self,
                     f"recv_drafts_via_ring: stashed for "
                     f"rids={stashed_rids}",
                 )
             else:
+                # No verify round this step (no drafts in the ring message):
+                # clear any stale verdict from a previous round so the
+                # replication path cannot consume outdated finish state.
+                batch.pp_mtp_ring_finished = None
+                batch.pp_mtp_accepted_tokens = None
                 _ppmtp_log(
                     self,
                     f"recv_drafts_via_ring: no draft_tokens in pp_outputs "
@@ -1568,12 +1587,28 @@ class SchedulerPPMixin:
                         # drafts locally; stash them before the ring brings the
                         # message back (one full loop too late). `draft_tokens`
                         # is aligned with `cur_batch.reqs` (finished requests
-                        # carry a -1 placeholder that is skipped).
+                        # carry a -1 placeholder that is skipped).  The `-1`
+                        # placeholder doubles as the finish-verdict channel
+                        # for the non-last ranks, so its exactness is
+                        # load-bearing: check it here at the single
+                        # construction point.
+                        draft_tokens_list = result.draft_tokens.tolist()
+                        if len(draft_tokens_list) != len(self.cur_batch.reqs):
+                            raise RuntimeError(
+                                "PP+MTP: draft_tokens size "
+                                f"({len(draft_tokens_list)}) != batch size "
+                                f"({len(self.cur_batch.reqs)}); "
+                                "_next_draft_from_spec_info misaligned"
+                            )
                         stashed_rids = []
-                        for req, tok in zip(
-                            self.cur_batch.reqs, result.draft_tokens.tolist()
-                        ):
+                        for req, tok in zip(self.cur_batch.reqs, draft_tokens_list):
                             if tok < 0:
+                                if not req.finished():
+                                    raise RuntimeError(
+                                        "PP+MTP: draft placeholder -1 for "
+                                        f"unfinished req {req.rid}; "
+                                        "_next_draft_from_spec_info join broken"
+                                    )
                                 continue
                             self._pp_pending_drafts[req.rid] = int(tok)
                             stashed_rids.append(req.rid)

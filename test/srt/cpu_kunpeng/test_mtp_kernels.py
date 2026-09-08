@@ -154,26 +154,148 @@ def _check_build_tree(bs, nv):
 
 
 # ---------------------------------------------------------------------------
+# verify_tree_greedy_kunpeng (fallback path used by the official verify loop)
+# ---------------------------------------------------------------------------
+
+def _ref_verify_tree_greedy(candidates, retrieve_index, retrieve_next_token,
+                            target_predict, accept_steps):
+    """torch-native reference of verify_tree_greedy_kunpeng (topk==1 chain).
+
+    Mirrors the C++ kernel.  ``accept_steps`` is accept_index.size(1); the
+    official verify loop allocates accept_index as (bs, spec_steps + 1) --
+    one slot more than the number of chain steps -- so a full accept writes
+    the bonus slot at index spec_steps.
+    """
+    bs, nv = candidates.shape
+    predicts = torch.full((bs * nv,), -1, dtype=torch.int32)
+    accept_index = torch.full((bs, accept_steps), -1, dtype=torch.int32)
+    accept_token_num = torch.empty(bs, dtype=torch.int32)
+    cand = candidates.tolist()
+    ri = retrieve_index.tolist()
+    rnt = retrieve_next_token.tolist()
+    tp = target_predict.tolist()
+    for b in range(bs):
+        num_acc = 0
+        last_idx = ri[b][0]
+        accept_index[b][0] = last_idx
+        cur, pre = 0, 0
+        for j in range(accept_steps):
+            pre = cur
+            cur = rnt[b][cur]
+            if cur == -1:
+                break
+            draft_id = cand[b][cur]
+            target_id = tp[b][pre]
+            if draft_id == target_id:
+                predicts[last_idx] = int(target_id)
+                num_acc += 1
+                last_idx = ri[b][cur]
+                accept_index[b][num_acc] = last_idx
+            else:
+                break
+        accept_token_num[b] = num_acc
+        predicts[last_idx] = int(tp[b][pre])
+    return predicts, accept_index, accept_token_num
+
+
+def _check_verify_tree_greedy(bs, nv):
+    """Three acceptance chains per batch: reject at first draft, mid-chain
+    reject, full accept.  accept_index uses the official caller shape
+    (bs, spec_steps + 1)."""
+    torch.manual_seed(9)
+    spec_steps = nv - 1
+    candidates = torch.randint(0, 32, (bs, nv), dtype=torch.int64)
+    retrieve_index = torch.arange(bs * nv, dtype=torch.int64).reshape(bs, nv)
+    # topk==1 linear chain: node j+1 is the child of node j
+    retrieve_next_token = torch.cat(
+        [torch.arange(1, nv, dtype=torch.int64), torch.tensor([-1], dtype=torch.int64)]
+    ).repeat(bs, 1)
+    retrieve_next_sibling = torch.full((bs, nv), -1, dtype=torch.int64)
+
+    # target_predict[b][j]: the target's prediction at node j.  Walk node 0's
+    # prediction so the chain accepts until we decide to break.
+    #   req 0: target_predict[0] != candidates[0][1] -> reject at first draft
+    #   req 1..bs-2: accept spec_steps-1 drafts, then reject
+    #   req bs-1: full accept (all drafts match the chain)
+    target_predict = torch.zeros(bs, nv, dtype=torch.int64)
+    for b in range(bs):
+        node = 0
+        for j in range(spec_steps):
+            child = node + 1
+            if b == 0:
+                target_predict[b][node] = candidates[b][child] + 7  # mismatch
+            elif b == bs - 1:
+                target_predict[b][node] = candidates[b][child]  # full accept
+            else:
+                if j < spec_steps - 1:
+                    target_predict[b][node] = candidates[b][child]  # accept
+                else:
+                    target_predict[b][node] = candidates[b][child] + 7  # reject
+            node = child
+        target_predict[b][nv - 1] = 5  # bonus token at the last node
+
+    predicts = torch.full((bs * nv,), -1, dtype=torch.int32)
+    accept_index = torch.full((bs, spec_steps + 1), -1, dtype=torch.int32)
+    accept_token_num = torch.empty(bs, dtype=torch.int32)
+    kernel.verify_tree_greedy_kunpeng(
+        predicts, accept_index, accept_token_num,
+        candidates, retrieve_index, retrieve_next_token,
+        retrieve_next_sibling, target_predict,
+    )
+    ref_p, ref_ai, ref_n = _ref_verify_tree_greedy(
+        candidates, retrieve_index, retrieve_next_token, target_predict,
+        spec_steps + 1,
+    )
+    assert torch.equal(accept_index, ref_ai), (
+        f"accept_index mismatch\nkernel={accept_index.tolist()}\nref={ref_ai.tolist()}"
+    )
+    assert torch.equal(accept_token_num, ref_n), (
+        f"accept_token_num mismatch\nkernel={accept_token_num.tolist()}\nref={ref_n.tolist()}"
+    )
+    assert torch.equal(predicts, ref_p), (
+        f"predicts mismatch\nkernel={predicts.tolist()}\nref={ref_p.tolist()}"
+    )
+    # sanity: the three chains produce the intended acceptance counts
+    assert int(accept_token_num[0]) == 0, "req 0 should reject at first draft"
+    if bs >= 3:
+        assert int(accept_token_num[-1]) == spec_steps, "last req should fully accept"
+        assert 0 < int(accept_token_num[1]) < spec_steps, "mid req should partially accept"
+        # full accept must fill the bonus slot (accept_index width == spec_steps + 1)
+        assert int(accept_index[-1][spec_steps]) != -1, "bonus slot not written on full accept"
+
+
+# ---------------------------------------------------------------------------
 # verify_mtp_kunpeng
 # ---------------------------------------------------------------------------
 
-def _check_finish_token(tok, cur_out_len, mnt, vs, stop_set, eos_set, use_tokenizer_eos, tokenizer_eos):
+def _check_finish_token(tok, cur_out_len, mnt, vs, stop_set, eos_set, ignore_eos):
     """Mirror of check_finish_token in verify_kunpeng.cpp (reason: 0=len, 1=token, 2=vocab, -1=none)."""
     if cur_out_len >= mnt:
         return (0, mnt, mnt)
-    if stop_set or eos_set or (use_tokenizer_eos and tokenizer_eos >= 0):
-        if tok in stop_set or tok in eos_set or (use_tokenizer_eos and tokenizer_eos >= 0 and tok == tokenizer_eos):
+    if not ignore_eos and (stop_set or eos_set):
+        if tok in stop_set or tok in eos_set:
             return (1, tok, cur_out_len)
     if tok > vs or tok < 0:
         return (2, 0, cur_out_len)
     return (-1, 0, 0)
 
 
+def _repair_vocab_boundary_token(tok, vs, stop_set, eos_set):
+    """Mirror of repair_vocab_boundary_token in verify_kunpeng.cpp."""
+    if tok <= vs and tok >= 0:
+        return tok
+    if stop_set:
+        return next(iter(stop_set))
+    if eos_set:
+        return next(iter(eos_set))
+    return tok
+
+
 def _ref_verify_mtp(logits, candidates, retrieve_index, seq_lens, out_cache_loc,
                     output_ids_len, max_new_tokens, vocab_size,
-                    stop_sets, eos_sets, tokenizer_eos, page_size):
+                    stop_sets, eos_sets, ignore_eos_flags, page_size):
     """torch-native reference of verify_mtp_kunpeng (per-node argmax + greedy
-    accept + bonus + finish + evict page alignment)."""
+    accept + bonus + finish + vocab repair + evict page alignment)."""
     bs, nv = candidates.shape
     target_predict = torch.argmax(logits, dim=-1).reshape(bs, nv).tolist()
 
@@ -203,8 +325,13 @@ def _ref_verify_mtp(logits, candidates, retrieve_index, seq_lens, out_cache_loc,
         is_fin, reason, matched, fin_len = 0, -1, 0, 0
         for k in range(na):
             cur_out_len = output_ids_len[b] + (k + 1)
+            if seq[k] > vocab_size[b] or seq[k] < 0:
+                # repair mirrors the kernel: repair BEFORE reason computation
+                seq[k] = _repair_vocab_boundary_token(
+                    seq[k], vocab_size[b], stop_sets[b], eos_sets[b]
+                )
             r = _check_finish_token(seq[k], cur_out_len, max_new_tokens[b], vocab_size[b],
-                                    stop_sets[b], eos_sets[b], True, tokenizer_eos)
+                                    stop_sets[b], eos_sets[b], ignore_eos_flags[b])
             if r[0] >= 0:
                 is_fin, reason, matched, fin_len = 1, r[0], r[1], r[2]
                 na = k + 1  # keep the finishing token, drop the rest
@@ -267,19 +394,26 @@ def _check_verify_mtp(bs, nv, vocab, page_size, seq_lens_cpu_dtype):
     vocab_size = torch.full((bs,), vocab, dtype=torch.int32)
     stop_sets = [list(range(0, 0)) for _ in range(bs)]
     eos_sets = [list(range(0, 0)) for _ in range(bs)]
-    tokenizer_eos = 2
+    ignore_eos_flags = [False] * bs
 
     # finish-triggering case: make one request's draft/root hit EOS
     if bs >= 2:
-        candidates[1, 1] = torch.tensor(2)  # draft == tokenizer_eos -> finish
+        eos_sets[1] = [2]
+        candidates[1, 1] = torch.tensor(2)  # draft == eos_sets[1][0] -> finish
     if bs >= 3:
         # force max_new_tokens finish: output_ids_len close to max_new_tokens
         output_ids_len[2] = torch.tensor(max_new_tokens[2].item() - 1)
+    if bs >= 4:
+        # ignore_eos: same eos hit, but the flag gates the match -> no finish
+        eos_sets[3] = [2]
+        ignore_eos_flags[3] = True
+        candidates[3, 1] = torch.tensor(2)
 
     stop_flat = torch.tensor(sum(stop_sets, []), dtype=torch.int32)
     stop_off = torch.tensor([0] + [len(s) for s in stop_sets], dtype=torch.int32).cumsum(0)
     eos_flat = torch.tensor(sum(eos_sets, []), dtype=torch.int32)
     eos_off = torch.tensor([0] + [len(s) for s in eos_sets], dtype=torch.int32).cumsum(0)
+    ignore_eos_t = torch.tensor(ignore_eos_flags, dtype=torch.bool)
 
     req_pool_indices = torch.arange(bs, dtype=torch.int64)
     max_ctx = 64
@@ -297,12 +431,12 @@ def _check_verify_mtp(bs, nv, vocab, page_size, seq_lens_cpu_dtype):
         max_new_tokens,
         vocab_size,
         stop_flat, stop_off, eos_flat, eos_off,
-        tokenizer_eos, True, nv, page_size,
+        ignore_eos_t, nv, page_size,
         req_pool_indices, req_to_token, seq_lens_cpu,
     )
     ref = _ref_verify_mtp(logits, candidates, retrieve_index, seq_lens,
                           out_cache_loc, output_ids_len, max_new_tokens,
-                          vocab_size, stop_sets, eos_sets, tokenizer_eos, page_size)
+                          vocab_size, stop_sets, eos_sets, ignore_eos_flags, page_size)
 
     # (num_accepted, finished, finish_reason, finish_matched, finish_len,
     #  accepted_tokens, accepted_offsets, accepted_cache_loc, accepted_verified_id,
@@ -357,7 +491,13 @@ def run(args):
     _check_build_tree(4, 8)
     _check_build_tree(8, 4)
     try:
-        _check_verify_mtp(4, 2, 32, 1, torch.int32)
+        _check_verify_tree_greedy(3, 4)   # reject-first / mid-chain / full-accept
+        _check_verify_tree_greedy(8, 2)   # nv=2: single-step chains
+    except (RuntimeError, AttributeError, NotImplementedError):
+        # verify_tree_greedy_kunpeng is only present on the kunpeng build; skip on stubs.
+        print("  verify_tree_greedy_kunpeng unavailable, skipping tree-greedy checks")
+    try:
+        _check_verify_mtp(4, 2, 32, 1, torch.int32)  # incl. ignore_eos case (bs>=4)
         _check_verify_mtp(8, 2, 65, 1, torch.int64)  # page_size==1 + int64 seq_lens_cpu (PP path)
         _check_verify_mtp(4, 2, 32, 8, torch.int32)  # page_size>1
         _check_verify_mtp(0, 2, 32, 1, torch.int32)  # empty batch
