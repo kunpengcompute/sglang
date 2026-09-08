@@ -63,8 +63,8 @@ def _setup_rmsnorm_kunpeng():
 
 def _setup_rmsnorm_quant_kunpeng():
     def shape_infer(acts, weights, eps):
-        return [(acts.shape, torch.int8),
-                (acts.shape[0], torch.float32)]
+        return [(list(acts.shape), torch.int8),
+                ((acts.shape[0],), torch.float32)]
 
     def eager_fn(acts, weights, eps):
         outs = torch.empty(acts.shape, dtype=torch.int8)
