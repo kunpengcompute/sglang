@@ -864,14 +864,14 @@ class KunpengGraphRunner:
             # constructed with pp_size=1/pp_rank=0 but only ever runs on the
             # last PP rank, so merge its records into that stage's file.
             if self.model_runner.is_draft_worker:
-                pp_size = self.model_runner.server_args.pp_size
-                pp_rank = pp_size - 1
+                pp_rank = self.model_runner.server_args.pp_size - 1
             else:
-                pp_size = self.model_runner.pp_size
                 pp_rank = self.model_runner.pp_rank
-            rank_part = f"rank{self.model_runner.tp_rank}"
-            if pp_size > 1:
-                rank_part += f"_pp{pp_rank}"
+            rank_part = (
+                f"pp{pp_rank}"
+                f"_dp{self.model_runner.dp_rank}"
+                f"_tp{self.model_runner.tp_rank}"
+            )
             path = os.path.join(
                 profile_dir,
                 f"sglang_graph_{rank_part}.jsonl",

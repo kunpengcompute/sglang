@@ -181,7 +181,7 @@ SHM 池：`model_runner` 首次捕获后把 SHM bump 分配器剩余全部字节
 **转 Chrome tracing（时间线视图）**：
 
 ```bash
-python scripts/cpu_kunpeng/analysis/stats_to_trace.py sglang_graph_rank0.jsonl sglang_graph_rank1.jsonl ... trace.json
+python scripts/cpu_kunpeng/analysis/stats_to_trace.py sglang_graph_pp0_dp0_tp0.jsonl sglang_graph_pp1_dp0_tp0.jsonl ... trace.json
 ```
 
 生成的 `trace.json` 用 chrome://tracing 或 Perfetto 打开，每个 rank 一条线程，查看各算子的起止耗时。建议最多分析 16 个文件避免文件过大。
