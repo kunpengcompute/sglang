@@ -58,7 +58,6 @@ BASE_ARGS=(
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --skip-server-warmup
     --disable-custom-all-reduce
-    --disable-radix-cache
     --enable-dp-attention
     --enable-dp-lm-head
     --enable-dp-mlp

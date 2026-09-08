@@ -349,6 +349,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        self.dp_rank = dp_rank if dp_rank is not None else 0
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.attn_cp_rank = attn_cp_rank

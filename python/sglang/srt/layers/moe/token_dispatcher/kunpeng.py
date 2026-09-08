@@ -179,7 +179,17 @@ def _ensure_rdma_initialized(
         state.use_static_route = use_static_route
         # Per-expert recv multiplier for prefill; matches DeepSeek-V3-Sample
         # (context.h: moe_token_multiple = 2). Only used in the prefill path.
-        state.moe_token_multiple = 2
+        # Capacity per local expert = multiple * max_tokens_per_mb rows.  The
+        # uniform per-expert fan-in per step is
+        #   max_tokens_per_mb * num_ranks * topk / (attn_tp * num_experts)
+        # so multiple=2 only tolerates ~4x routing skew at EP=256/topk=8.
+        # A hot DeepSeek expert reached ~4.0x and its RDMA token puts
+        # overran the expert region, trashing the src_info metadata area
+        # (observed as "token_bias overflow" in topk_convert).  Default 8
+        # gives ~16x headroom at ~+450MB/rank prefill working set.
+        state.moe_token_multiple = int(
+            os.environ.get("SGLANG_KUNPENG_MOE_TOKEN_MULTIPLE", "2")
+        )
         state.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
 
         state.parallel_policy = torch.empty(3, dtype=torch.int16)

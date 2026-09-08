@@ -13,9 +13,9 @@
 # ==============================================================================
 
 # Usage:
-#   Mode 1 (merge): stats_to_csv.py <profiler_dir_or_jsonl> <rank>
-#     Merges sglang_graph_rank<rank>_pp*.jsonl into
-#     sglang_graph_rank<rank>_<YYYYMMDDHHMM>.csv (written to the current
+#   Mode 1 (merge): stats_to_csv.py <profiler_dir_or_jsonl> <tp_rank>
+#     Merges sglang_graph_pp*_dp*_tp<tp_rank>.jsonl into
+#     sglang_graph_tp<tp_rank>_<YYYYMMDDHHMM>.csv (written to the current
 #     working directory), with per-stage reference sections appended.
 #   Mode 2 (legacy): stats_to_csv.py <in.jsonl> <out.csv> [batch_size]
 #     Converts a single profile jsonl into stats csv.
@@ -222,7 +222,7 @@ def merge_stats(stages):
 
 
 def _pp_sort_key(path):
-    m = re.search(r"_pp(\d+)\.jsonl$", path)
+    m = re.search(r"_pp(\d+)_dp", path)
     return int(m.group(1)) if m else -1
 
 
@@ -280,7 +280,9 @@ def merge_to_csv(path, rank):
         path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
     )
     files = sorted(
-        glob.glob(os.path.join(profiler_dir, f"sglang_graph_rank{rank}_pp*.jsonl")),
+        glob.glob(
+            os.path.join(profiler_dir, f"sglang_graph_pp*_dp*_tp{rank}.jsonl")
+        ),
         key=_pp_sort_key,
     )
     if not files:
@@ -288,7 +290,7 @@ def merge_to_csv(path, rank):
         if os.path.exists(legacy):
             files = [legacy]
             print(
-                f"[warn] no sglang_graph_rank{rank}_pp*.jsonl found; falling back "
+                f"[warn] no sglang_graph_pp*_dp*_tp{rank}.jsonl found; falling back "
                 f"to legacy {legacy} (may contain draft-only or mixed data)"
             )
         else:
@@ -303,7 +305,7 @@ def merge_to_csv(path, rank):
 
     # Write the summary CSV to the current working directory instead of the
     # (possibly remote/shared) profiler dir holding the jsonl files.
-    output_path = f"sglang_graph_rank{rank}_{datetime.now():%Y%m%d%H%M}.csv"
+    output_path = f"sglang_graph_tp{rank}_{datetime.now():%Y%m%d%H%M}.csv"
     with open(output_path, "w") as f:
         # Merged stats: runs of the same (mode, bs) group paired across
         # stages (pp0 + pp1) so per-layer op counts cover all layers.
