@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 PP_KIND_PYOBJ = 0
 PP_KIND_TENSOR = 1
 PP_KIND_ACK = 2
+PP_KIND_BUNDLE = 3  # must match PP_KIND_BUNDLE in pp_comm.cpp
 PP_MSG_SLOTS = 8  # must match PP_MSG_SLOTS in pp_comm.cpp
 
 SHM_ALIGN_SIZE = 7168
@@ -186,6 +187,11 @@ class KunpengCommunicator:
         kernel.shm_reduce_scatter_init_kunpeng()
         kernel.shm_allgather_init_kunpeng()
         kernel.shm_allreduce_init_kunpeng(self.max_elements)
+
+        _max_seq_num = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "32"))
+        _max_cur_len = int(os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "2"))
+        dim_size = _max_seq_num * _max_cur_len * SHM_ALIGN_SIZE //  self.comm_size
+        kernel.shm_batched_allgather_init_kunpeng(dim_size)
 
         # Pre-allocate min-int8 allreduce SHM before graph capture claims the pool.
         kernel.shm_allreduce_min_int8_init_kunpeng(1024)

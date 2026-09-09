@@ -1790,7 +1790,7 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
-    @Kunpeng_PP_Profiler(depth=1, name="recv_requests")
+    @Kunpeng_PP_Profiler(depth=1)
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1984,7 +1984,7 @@ class Scheduler(
         ]
         return work_reqs, control_reqs
 
-    @Kunpeng_PP_Profiler(depth=1, name="proc_input")
+    @Kunpeng_PP_Profiler(depth=1)
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
@@ -2975,7 +2975,7 @@ class Scheduler(
 
         return new_batch
 
-    @Kunpeng_PP_Profiler(depth=2, name="update_running")
+    @Kunpeng_PP_Profiler(depth=2)
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -3075,7 +3075,7 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
-    @Kunpeng_PP_Profiler(depth=2, name="run_batch")
+    @Kunpeng_PP_Profiler(depth=2)
     def run_batch(
         self,
         batch: ScheduleBatch,

@@ -37,6 +37,7 @@
 #   mla_alltoall     -- SHM MLA alltoall correctness + benchmark vs torch.distributed
 #   rdma_allgather   -- RDMA full-mesh allgather correctness + benchmark vs torch.distributed
 #   pp_comm          -- PP unified RDMA message (pyobj/tensor/ack) correctness
+#   pp_bundle        -- PP consensus bundle (forward/ring-back) demux correctness
 #   broadcast        -- kunpeng broadcast (functional + perf vs gloo)
 #
 # Options (environment variables):
@@ -110,6 +111,13 @@ case "${TEST_NAME}" in
         export PP_TEST_WORLD_SIZE=2
         export PP_TEST_MASTER_PORT=5012
         ;;
+    pp_bundle)
+        TEST_FILE="${SCRIPT_DIR}/test_pp_bundle.py"
+        MASTER_PORT=5013
+        TEST_LABEL="PP consensus bundle (forward/ring-back) demux correctness"
+        export PP_TEST_WORLD_SIZE=2
+        export PP_TEST_MASTER_PORT=5013
+        ;;
     broadcast)
         TEST_FILE="${SCRIPT_DIR}/test_broadcast_kunpeng.py"
         MASTER_PORT=5014
@@ -119,7 +127,7 @@ case "${TEST_NAME}" in
         ;;
     *)
         echo "ERROR: unknown test '${TEST_NAME}'" >&2
-        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8, mla_alltoall, rdma_allgather, pp_comm, broadcast" >&2
+        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8, mla_alltoall, rdma_allgather, pp_comm, pp_bundle, broadcast" >&2
         exit 1
         ;;
 esac
@@ -134,6 +142,7 @@ fi
 source ../../../scripts/cpu_kunpeng/env.sh native
 source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 
+export SGLANG_ENABLE_KUCCL=0
 export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
 export LD_LIBRARY_PATH=/usr/lib64/libibverbs:${LD_LIBRARY_PATH}
 export LD_LIBRARY_PATH=${KUPL_PATH}/lib:${LD_LIBRARY_PATH}

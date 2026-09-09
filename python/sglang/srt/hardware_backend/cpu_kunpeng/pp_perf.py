@@ -61,6 +61,16 @@ logger.setLevel(logging.INFO)
 # stripped to the bare function, so there is no measurable overhead.
 _PP_PROFILE = os.environ.get("SGLANG_KUNPENG_PP_PROFILE", "0") == "1"
 
+# Thresholds for the synthetic "[self]" row.  A [self] row is only meaningful
+# when this span owns recorded sub-spans that don't add up to its total; a bare
+# leaf's time is already shown in its own |-- line.  Even then it is only
+# printed when the residual is significant: above an absolute floor AND above a
+# fraction of the span total.  This hides per-level bookkeeping noise while
+# keeping genuinely costly phase overhead visible.  Override via
+# PP_SELF_ABS_MS / PP_SELF_RATIO.
+_PP_SELF_ABS_MS = float(os.environ.get("PP_SELF_ABS_MS", "0.5"))
+_PP_SELF_RATIO = float(os.environ.get("PP_SELF_RATIO", "0.10"))
+
 _tls = threading.local()
 _tls.stack = []
 _tls.win = None
@@ -355,26 +365,35 @@ def _print_node(win, lines, indent, pfx, records):
         lines.append(_ms_line(pfx, abs_start, f"{indent}|-- {name}", total_ms, total_cpu))
         child_ms_sum = 0.0
         child_cpu_sum = 0.0
+        has_child = False
         for sid in span_ids:
             sub_records = win.children.get(sid, [])
             if not sub_records:
                 continue
+            has_child = True
             sub_agg = _agg_children(sub_records)
             child_ms_sum += sum(v[0] for v in sub_agg.values())
             child_cpu_sum += sum(v[1] for v in sub_agg.values())
             _print_node(win, lines, indent + "|   ", pfx, sub_records)
-        residual_ms = total_ms - child_ms_sum
-        residual_cpu = total_cpu - child_cpu_sum
-        if residual_ms > 0.05:
-            lines.append(
-                _ms_line(
-                    pfx,
-                    abs_start,
-                    f"{indent}|   |-- [self]",
-                    residual_ms,
-                    residual_cpu,
+        # Only emit a synthetic [self] row when this node genuinely owns
+        # recorded sub-spans that don't add up to its total, AND the residual is
+        # significant.  A bare leaf's time is already printed in its own |-- line,
+        # so no [self] row is needed there.
+        if has_child:
+            residual_ms = total_ms - child_ms_sum
+            residual_cpu = total_cpu - child_cpu_sum
+            if (residual_ms > _PP_SELF_ABS_MS
+                    and total_ms > 0
+                    and residual_ms / total_ms > _PP_SELF_RATIO):
+                lines.append(
+                    _ms_line(
+                        pfx,
+                        abs_start,
+                        f"{indent}|   |-- [self]",
+                        residual_ms,
+                        residual_cpu,
+                    )
                 )
-            )
 
 
 def pp_perf_report(print_report=True):

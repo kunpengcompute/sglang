@@ -2986,7 +2986,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
-    @Kunpeng_PP_Profiler(depth=1, name="forward_decode")
+    @Kunpeng_PP_Profiler(depth=1)
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -3023,7 +3023,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 **kwargs,
             )
 
-    @Kunpeng_PP_Profiler(depth=1, name="forward_extend")
+    @Kunpeng_PP_Profiler(depth=1)
     def forward_extend(
         self,
         forward_batch: ForwardBatch,
@@ -3151,7 +3151,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.split_index = next_split_index
         return ret
 
-    @Kunpeng_PP_Profiler(depth=3, name="model_runner.forward")
+    @Kunpeng_PP_Profiler(depth=3)
     def forward(
         self,
         forward_batch: ForwardBatch,

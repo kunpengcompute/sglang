@@ -87,6 +87,18 @@ void shm_allgather_init_kunpeng();
 void shm_allgather_finalize_kunpeng();
 
 /**
+ * Pre-allocate the SHM buffer caches used by shm_batched_allgather_kunpeng.
+ * Must be called before the static graph captures the pool, otherwise the
+ * eager fallback's lazy get_or_create_shm_tensor fails with "Not enough shared
+ * memory".  Populates the dim-keyed caches for sendbuf (dim) and the comm-8/16
+ * recvbuf (dim*8 / dim*16).
+ *
+ * @param dim  Inner element count of the allgather input (model hidden size,
+ *             e.g. 7168 for DeepSeek V3).
+ */
+void shm_batched_allgather_init_kunpeng(int64_t dim);
+
+/**
  * Initialize the SHM allreduce request.
  * Called automatically at the end of shm_pool_create_kunpeng().
  *

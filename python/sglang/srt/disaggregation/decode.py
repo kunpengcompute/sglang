@@ -1487,7 +1487,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
-    @Kunpeng_PP_Profiler(depth=2, name="get_batch")
+    @Kunpeng_PP_Profiler(depth=2)
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
@@ -1520,7 +1520,7 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return ret
 
-    @Kunpeng_PP_Profiler(depth=1, name="get_new_prebuilt")
+    @Kunpeng_PP_Profiler(depth=1)
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():

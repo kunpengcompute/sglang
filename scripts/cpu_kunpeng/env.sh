@@ -244,7 +244,7 @@ export SGLANG_ENABLE_OVERLAP_TRACE=0
 export SGLANG_ENABLE_KUCCL=0  # set to 1 to use kuccl backend instead of gloo
 # Kunpeng SHM pool
 export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=476
-export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=50
+export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=100
 export SGLANG_KUNPENG_ENABLE_SHM_FENCE=0
 export KUPL_SHM_TYPE=sls
 export KUPL_SHM_ON_PACKAGE=y  # requires kupl built from https://gitcode.com/kunpengcompute/kupl/tree/sglang_830

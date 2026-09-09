@@ -317,6 +317,8 @@ void shm_reduce_scatter_finalize_kunpeng();
 
 void shm_allgather_init_kunpeng();
 
+void shm_batched_allgather_init_kunpeng(int64_t dim);
+
 void shm_dual_allgather_kunpeng(at::Tensor src0_tensor, at::Tensor dst0_tensor, at::Tensor src1_tensor,
                                 at::Tensor dst1_tensor);
 
@@ -894,6 +896,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     // SHM Allgather operators
     m.def("shm_allgather_init_kunpeng() -> ()");
     m.impl("shm_allgather_init_kunpeng", shm_allgather_init_kunpeng);
+
+    m.def("shm_batched_allgather_init_kunpeng(int dim) -> ()");
+    m.impl("shm_batched_allgather_init_kunpeng", shm_batched_allgather_init_kunpeng);
 
     m.def(
         "shm_dual_allgather_kunpeng(Tensor src0_tensor, Tensor dst0_tensor, Tensor src1_tensor, Tensor dst1_tensor) -> "

@@ -4,10 +4,11 @@ import logging
 import math
 import os
 import pickle
+import struct
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -75,6 +76,30 @@ def _ppmtp_log(self, msg: str, *args) -> None:
         return
     pp_rank = getattr(self, "pp_rank", None)
     logger.info(f"[PP{pp_rank}] {msg}", *args)
+
+
+# First sub-payload of a "ring-back" consensus bundle; lets the demux tell the
+# ring-back bundle (consumed at step7) apart from the forward bundle (step2).
+_PP_RINGBACK_TAG = "__pp_ringback__"
+
+
+def _pp_unpack_bundle(payload: bytes) -> List[Any]:
+    """Unpack a PP bundle frame body ``[len][payload]...`` into its pickled
+    objects (mirrors pp_recv_pyobjs_bundle_kunpeng on the Python side)."""
+    subs: List[Any] = []
+    i = 0
+    n = len(payload)
+    while i < n:
+        if i + 4 > n:
+            raise RuntimeError("PP bundle: short sub-payload length")
+        ln = struct.unpack_from("<I", payload, i)[0]
+        i += 4
+        if i + ln > n:
+            raise RuntimeError("PP bundle: sub-payload exceeds frame")
+        subs.append(pickle.loads(payload[i : i + ln]))
+        i += ln
+    return subs
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -474,54 +499,39 @@ class SchedulerPPMixin:
                     )
 
                 # 6.reach consensus on last rank and send to PP=0
-                send_consensus_retract_work, consensus_retract_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        rmbs,
-                        next_first_rank_mb_id,
-                        consensus_retract_rids,
-                        retract_rids,
-                    )
-                )
-
-                send_consensus_prealloc_work, consensus_prealloc_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        pmbs,
-                        next_first_rank_mb_id,
-                        consensus_prealloc_rids,
-                        prealloc_rids,
-                    )
-                )
-
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
+                (
+                    send_consensus_ringback_work,
+                    consensus_retract_rids,
+                    consensus_prealloc_rids,
+                    release_rids,
+                ) = self._pp_pd_send_process_consensus_rids(
+                    rmbs,
+                    pmbs,
+                    tmbs,
+                    next_first_rank_mb_id,
+                    consensus_retract_rids,
+                    consensus_prealloc_rids,
+                    release_rids,
+                    retract_rids,
+                    prealloc_rids,
+                    transferred_rids,
                 )
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
                 # 7.consensus sync: recv from prev stage + local processing
-                if rmbs[next_mb_id] is not None:
-                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_retract_rids = self.process_retract_queue(
-                        next_consensus_retract_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_retract_work)
-
-                if pmbs[next_mb_id] is not None:
-                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_prealloc_rids = self.process_prealloc_queue(
-                        next_consensus_prealloc_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_prealloc_work)
-
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_release_rids = self.process_decode_transfer_queue(
-                        next_release_rids
-                    )
-                self._pp_commit_comm_work(send_release_work)
+                (
+                    next_consensus_retract_rids,
+                    next_consensus_prealloc_rids,
+                    next_release_rids,
+                ) = self._pp_pd_recv_process_consensus_rids(
+                    rmbs,
+                    pmbs,
+                    tmbs,
+                    next_mb_id,
+                    send_consensus_ringback_work,
+                )
 
                 # 8.post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -900,7 +910,7 @@ class SchedulerPPMixin:
             )
         return transferred_rids
 
-    @Kunpeng_PP_Profiler(depth=1, name="send_consensus")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
         bmbs: List[List[str]],
@@ -946,7 +956,186 @@ class SchedulerPPMixin:
                 )
         return send_release_work, release_rids
 
-    @Kunpeng_PP_Profiler(depth=1, name="commit_comm")
+    @Kunpeng_PP_Profiler(depth=2)
+    def _pp_pd_send_process_consensus_rids(
+        self: Scheduler,
+        rmbs: List[Optional[List[str]]],
+        pmbs: List[Optional[List[List[str]]]],
+        tmbs: List[Optional[List[str]]],
+        next_first_rank_mb_id: int,
+        consensus_retract_rids: Optional[List[str]],
+        consensus_prealloc_rids: Optional[List[List[str]]],
+        release_rids: Optional[List[str]],
+        retract_rids: List[str],
+        prealloc_rids: List[List[str]],
+        transferred_rids: List[str],
+    ):
+        """Send the decode consensus rids (retract / prealloc / release) to the
+        next stage (step6 of the PP loop).
+
+        Kunpeng RDMA path: ONE coalesced 3-slot bundle (mirrors step2's
+        consensus bundle); the non-empty slots carry the rids, empty slots use
+        None and are skipped on the receiving side.  Otherwise it falls back to
+        the original per-pyobj sends, returning the three P2PWork lists as a
+        single tuple so the caller keeps a uniform 4-tuple shape.
+        """
+        if (
+            self.pp_group.kunpeng_pp_communicator is not None
+            and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
+        ):
+            # Last rank: seed the ring-back consensus from the locally-computed
+            # values; other ranks: forward what the previous stage sent last round.
+            vals: List[Any] = [None, None, None]
+            if self.pp_group.is_last_rank:
+                if rmbs[next_first_rank_mb_id] is not None:
+                    consensus_retract_rids = retract_rids
+                    vals[0] = retract_rids
+                if pmbs[next_first_rank_mb_id] is not None:
+                    consensus_prealloc_rids = prealloc_rids
+                    vals[1] = prealloc_rids
+                if tmbs[next_first_rank_mb_id] is not None:
+                    release_rids = transferred_rids
+                    vals[2] = transferred_rids
+            else:
+                vals[0] = consensus_retract_rids
+                vals[1] = consensus_prealloc_rids
+                vals[2] = release_rids
+
+            # Post the ring-back bundle only when a consensus actually exists; the
+            # receiving side uses the matching conditional recv, so both stay
+            # symmetric and idle iterations do not stall on an early bundle recv.
+            if any(v is not None for v in vals):
+                send_ringback_work = self._pp_send_consensus_bundle_to_next_stage(
+                    [_PP_RINGBACK_TAG] + vals
+                )
+            else:
+                send_ringback_work = []
+            return (
+                send_ringback_work,
+                consensus_retract_rids,
+                consensus_prealloc_rids,
+                release_rids,
+            )
+
+        else:
+            # Per-pyobj consensus sends, one message per channel.
+            send_consensus_retract_work, consensus_retract_rids = (
+                self._pp_pd_send_consensus_bootstrapped_ids(
+                    rmbs,
+                    next_first_rank_mb_id,
+                    consensus_retract_rids,
+                    retract_rids,
+                )
+            )
+            send_consensus_prealloc_work, consensus_prealloc_rids = (
+                self._pp_pd_send_consensus_bootstrapped_ids(
+                    pmbs,
+                    next_first_rank_mb_id,
+                    consensus_prealloc_rids,
+                    prealloc_rids,
+                )
+            )
+            send_release_work, release_rids = (
+                self._pp_pd_send_consensus_release_ids(
+                    tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                )
+            )
+            return (
+                (send_consensus_retract_work, send_consensus_prealloc_work, send_release_work),
+                consensus_retract_rids,
+                consensus_prealloc_rids,
+                release_rids,
+            )
+
+    @Kunpeng_PP_Profiler(depth=2)
+    def _pp_pd_recv_process_consensus_rids(
+        self: Scheduler,
+        rmbs: List[Optional[List[str]]],
+        pmbs: List[Optional[List[List[str]]]],
+        tmbs: List[Optional[List[str]]],
+        next_mb_id: int,
+        send_ringback_work: Any,
+    ):
+        """Recv the decode consensus rids from the previous stage and run the
+        local queue processing, then commit the pending sends (step7 of the PP
+        loop).
+
+        Kunpeng RDMA path: one fixed 3-slot bundle, committed once.  Otherwise
+        it falls back to the original per-pyobj receives (three independent
+        recv + commit), unpacking the three P2PWork lists bundled by the send
+        side.
+        """
+        next_consensus_retract_rids = None
+        next_consensus_prealloc_rids = None
+        next_release_rids = None
+        if (
+            self.pp_group.kunpeng_pp_communicator is not None
+            and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
+        ):
+            # Receive the ring-back bundle only when this microbatch actually owns a
+            # consensus (matching the sending side's conditional send); idle
+            # iterations skip the recv instead of blocking on an early bundle.
+            if (
+                rmbs[next_mb_id] is not None
+                or pmbs[next_mb_id] is not None
+                or tmbs[next_mb_id] is not None
+            ):
+                payloads = self._pp_recv_consensus_bundle_from_prev_stage(
+                    3, direction="ringback"
+                )
+                if rmbs[next_mb_id] is not None:
+                    next_consensus_retract_rids = self.process_retract_queue(
+                        payloads[0]
+                    )
+                if pmbs[next_mb_id] is not None:
+                    next_consensus_prealloc_rids = self.process_prealloc_queue(
+                        payloads[1]
+                    )
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self.process_decode_transfer_queue(
+                        payloads[2]
+                    )
+            self._pp_commit_comm_work(send_ringback_work)
+            return (
+                next_consensus_retract_rids,
+                next_consensus_prealloc_rids,
+                next_release_rids,
+            )
+
+        else:
+            # Fallback: original per-pyobj consensus recv + per-channel commit.
+            (
+                send_consensus_retract_work,
+                send_consensus_prealloc_work,
+                send_release_work,
+            ) = send_ringback_work
+            if rmbs[next_mb_id] is not None:
+                next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
+                next_consensus_retract_rids = self.process_retract_queue(
+                    next_consensus_retract_rids
+                )
+            self._pp_commit_comm_work(send_consensus_retract_work)
+
+            if pmbs[next_mb_id] is not None:
+                next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+                next_consensus_prealloc_rids = self.process_prealloc_queue(
+                    next_consensus_prealloc_rids
+                )
+            self._pp_commit_comm_work(send_consensus_prealloc_work)
+
+            if tmbs[next_mb_id] is not None:
+                next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                next_release_rids = self.process_decode_transfer_queue(
+                    next_release_rids
+                )
+            self._pp_commit_comm_work(send_release_work)
+            return (
+                next_consensus_retract_rids,
+                next_consensus_prealloc_rids,
+                next_release_rids,
+            )
+
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         if self.pp_group.kunpeng_pp_communicator is not None:
             # Tensor sends (send_tensor_dict / send_tensor_message) always use
@@ -1005,7 +1194,7 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
-    @Kunpeng_PP_Profiler(depth=1, name="_pp_send_pyobj_to_next_stage")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
@@ -1027,7 +1216,7 @@ class SchedulerPPMixin:
                 )
         return p2p_work
 
-    @Kunpeng_PP_Profiler(depth=1, name="recv_pyobj")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             if self.pp_group.kunpeng_pp_communicator is not None and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1":
@@ -1158,7 +1347,7 @@ class SchedulerPPMixin:
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
-    @Kunpeng_PP_Profiler(depth=1, name="allgather")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_all_gather_shard(self, tensor: torch.Tensor, all_gather_group):
         """Rebuild the full tensor from this rank's shard; the fence wait for
         all attn_tp ranks to arrive lands inside this span."""
@@ -1177,6 +1366,7 @@ class SchedulerPPMixin:
             PP_KIND_PYOBJ,
             PP_KIND_TENSOR,
             PP_KIND_ACK,
+            PP_KIND_BUNDLE,
             SHM_ALIGN_SIZE,
         )
 
@@ -1187,6 +1377,14 @@ class SchedulerPPMixin:
             return None
         if kind == PP_KIND_PYOBJ:
             return {"kind": "pyobj", "data": pickle.loads(payload)}
+        if kind == PP_KIND_BUNDLE:
+            # A bundle can carry either the forward consensus (step2) or the
+            # ring-back consensus (step7); stamp the demux kind accordingly so
+            # they are stashed/consumed independently and never collide.
+            data = _pp_unpack_bundle(payload)
+            if data and isinstance(data[0], str) and data[0] == _PP_RINGBACK_TAG:
+                return {"kind": "ringback", "data": data[1:]}
+            return {"kind": "bundle", "data": data}
 
         # TENSOR: the metadata pickle already landed in the ring slot; wait for
         # the data imm (sent right after the metadata imm in FIFO order) and
@@ -1279,7 +1477,7 @@ class SchedulerPPMixin:
             )
             self._pp_tensor_dict_inbox.setdefault(msg["kind"], deque()).append(msg)
 
-    @Kunpeng_PP_Profiler(depth=1, name="recv_proxy")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
@@ -1463,7 +1661,7 @@ class SchedulerPPMixin:
                     )
         return send_output_work
 
-    @Kunpeng_PP_Profiler(depth=2, name="send_res")
+    @Kunpeng_PP_Profiler(depth=2)
     def _pp_send_recv_and_preprocess_output_tensors(
         self: Scheduler,
         next_first_rank_mb_id: int,
@@ -1537,7 +1735,7 @@ class SchedulerPPMixin:
     # depth=4 so the run_batch -> model_runner.forward -> forward_batch chain
     # stays visible (each decorated level consumes one budget unit; inline
     # pp_span spans are budget-independent and always recorded).
-    @Kunpeng_PP_Profiler(depth=4, name="launch_batch")
+    @Kunpeng_PP_Profiler(depth=4)
     def _pp_launch_batch(
         self: Scheduler,
         mb_id: int,
@@ -1810,7 +2008,7 @@ class SchedulerPPMixin:
     # run first, then one bundle recv from the previous stage, then the three
     # consensus are built.  Gloo keeps the original per-pyobj behavior.
 
-    @Kunpeng_PP_Profiler(depth=2, name="send_consensus_bundle")
+    @Kunpeng_PP_Profiler(depth=2)
     def _pp_send_consensus_bundle_to_next_stage(
         self: Scheduler, data_list: List[Any]
     ) -> List[P2PWork]:
@@ -1836,20 +2034,19 @@ class SchedulerPPMixin:
                     )
         return work
 
-    @Kunpeng_PP_Profiler(depth=2, name="recv_consensus_bundle")
+    @Kunpeng_PP_Profiler(depth=2)
     def _pp_recv_consensus_bundle_from_prev_stage(
-        self: Scheduler, count: int
+        self: Scheduler, count: int, direction: str = "bundle"
     ) -> Optional[List[Any]]:
         if (
             self.pp_group.kunpeng_pp_communicator is not None
             and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
         ):
-            # RDMA bundle: only (tp0, cp0) recvs the single bundle, then the list
-            # is broadcast to the rest of the tp/cp ranks.
+            # RDMA bundle: only (tp0, cp0) demuxes the single bundle through the
+            # unified channel (stashing any non-target kind that arrives first),
+            # then the list is broadcast to the rest of the tp/cp ranks.
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-                data = self.pp_group.kunpeng_pp_communicator.recv_pyobjs_bundle(
-                    (self.pp_rank - 1) % self.pp_size
-                )
+                data = self._pp_recv_message(direction)["data"]
                 assert len(data) == count, (
                     f"consensus bundle: expected {count} sub-payloads, "
                     f"got {len(data)}"
@@ -1875,7 +2072,7 @@ class SchedulerPPMixin:
             # Gloo fallback: per-pyobj recv (+ broadcast) on every rank.
             return [self._pp_recv_pyobj_from_prev_stage() for _ in range(count)]
 
-    @Kunpeng_PP_Profiler(depth=1, name="pd_consensus")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_pd_get_decode_consensus_rids(self: Scheduler, mb_id: int):
         """Compute retract / prealloc / transfer consensus for the microbatch.
 
@@ -1933,7 +2130,7 @@ class SchedulerPPMixin:
             transferred_rids,
         )
 
-    @Kunpeng_PP_Profiler(depth=1, name="pd_retract")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int):
         # communicate pre-consensus retracted reqs
         for req in self.disagg_decode_prealloc_queue.retracted_queue:
@@ -1953,7 +2150,7 @@ class SchedulerPPMixin:
             prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
             return list(set(prev_retract_rids) & set(curr_retract_rids))
 
-    @Kunpeng_PP_Profiler(depth=1, name="pd_prealloc")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_pd_get_prealloc_ids(self: Scheduler):
         # communicate pre-consensus prealloc reqs
         if self.pp_group.is_first_rank:
@@ -1982,7 +2179,7 @@ class SchedulerPPMixin:
             )
         return [good_prealloc_rids, bad_prealloc_rids]
 
-    @Kunpeng_PP_Profiler(depth=1, name="pd_transfer")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:

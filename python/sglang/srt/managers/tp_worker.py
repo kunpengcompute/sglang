@@ -446,7 +446,7 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
-    @Kunpeng_PP_Profiler(depth=2, name="forward_batch")
+    @Kunpeng_PP_Profiler(depth=2)
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

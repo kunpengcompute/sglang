@@ -95,7 +95,7 @@ class SchedulerOutputProcessorMixin:
 
         return None
 
-    @Kunpeng_PP_Profiler(depth=1, name="proc_prebuilt")
+    @Kunpeng_PP_Profiler(depth=1)
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
@@ -425,7 +425,7 @@ class SchedulerOutputProcessorMixin:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
-    @Kunpeng_PP_Profiler(depth=2, name="process_batch_result")
+    @Kunpeng_PP_Profiler(depth=1)
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -754,7 +754,7 @@ class SchedulerOutputProcessorMixin:
 
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
 
-    @Kunpeng_PP_Profiler(depth=2, name="pp_mtp_apply_verify_batch")
+    @Kunpeng_PP_Profiler(depth=1)
     def _pp_mtp_apply_verify_batch(
         self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> None:
@@ -1233,7 +1233,7 @@ class SchedulerOutputProcessorMixin:
         if req.input_token_ids_logprobs_idx is None:
             req.input_token_ids_logprobs_idx = []
 
-    @Kunpeng_PP_Profiler(depth=1, name="stream_output")
+    @Kunpeng_PP_Profiler(depth=1)
     def stream_output(
         self: Scheduler,
         reqs: List[Req],
