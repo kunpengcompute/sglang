@@ -37,6 +37,17 @@ static bool g_ag_initialized = false;
 static int intra_node_rank;
 static int intra_node_size;
 
+// Fixed pre-allocated SHM buffers for shm_batched_allgather_kunpeng's eager
+// fallback.  Key insight: they are NOT keyed by dim (unlike a cache), so a
+// dynamically varying (batch, dim) reuses the same pre-sized region instead of
+// lazily carving pool memory at run time (which OOMs once the static graph has
+// claimed the pool).
+static at::Tensor g_batch_ag_send;
+static at::Tensor g_batch_ag_recv;
+static int64_t g_batch_ag_send_cap = 0;  // in elements
+static int64_t g_batch_ag_recv_cap = 0;  // in elements
+static bool g_batch_ag_initialized = false;
+
 void shm_allgather_init_kunpeng()
 {
     TORCH_CHECK(is_shm_initialized(), "shm_allgather_init_kunpeng called before shm_pool_create_kunpeng");
@@ -58,6 +69,44 @@ void shm_allgather_init_kunpeng()
     g_ag_initialized = true;
     std::cout << "[KuTACC] AllGather initialized, rank=" << intra_node_rank << ", size=" << intra_node_size
               << std::endl;
+}
+
+/**
+ * Pre-allocate FIXED SHM buffers for shm_batched_allgather_kunpeng's eager
+ * fallback.
+ *
+ * Must be called BEFORE the static graph captures the rest of the SHM pool,
+ * otherwise the eager fallback's lazy allocation hits "Not enough shared
+ * memory" once the pool is fully claimed.  Unlike a dim-keyed cache, these two
+ * buffers (send + receive) are reused by ANY (batch, dim) within capacity,
+ * because the varying runtime dim is NOT part of a lookup key -- the eager path
+ * just memcpys into the pre-sized region.  This is what makes a dynamically
+ * varying batch dimension safe.
+ *
+ * @param send_cap  Send buffer capacity in elements (single-row dim width).
+ *                  Should cover the largest per-step hidden shard
+ *                  (>= batch-token cap / comm_size * hidden).
+ */
+void shm_batched_allgather_init_kunpeng(int64_t send_cap)
+{
+    TORCH_CHECK(is_shm_initialized(),
+                "shm_batched_allgather_init_kunpeng called before shm_pool_create_kunpeng");
+    if (g_batch_ag_initialized) return;
+    TORCH_CHECK(send_cap > 0,
+                "shm_batched_allgather_init_kunpeng: send_cap must be positive, got ", send_cap);
+
+    int64_t ws = get_intra_node_size();
+    g_batch_ag_send_cap = send_cap;
+    g_batch_ag_recv_cap = send_cap * ws;
+
+    // Both tensors are 1D; the run-time (batch, dim) view slices the leading
+    // batch*dim / batch*dim*ws contiguous elements out of them.
+    g_batch_ag_send = create_shm_tensor_kunpeng(at::kBFloat16, {g_batch_ag_send_cap});
+    g_batch_ag_recv = create_shm_tensor_kunpeng(at::kBFloat16, {g_batch_ag_recv_cap});
+    g_batch_ag_initialized = true;
+
+    std::cout << "[KuTACC] Batched AllGather fixed SHM preallocated: send_cap="
+              << g_batch_ag_send_cap << " recv_cap=" << g_batch_ag_recv_cap << std::endl;
 }
 
 /**
@@ -94,13 +143,35 @@ void shm_batched_allgather_kunpeng(at::Tensor input, at::Tensor output, int64_t 
         sendbuf = input.data_ptr();
         recvbuf = output.data_ptr();
     } else {
-        sendbuf_tensor = get_or_create_shm_tensor(dim, batch);
-        recvbuf_tensor = get_or_create_shm_tensor(dim * comm_size, batch);
-        sendbuf = sendbuf_tensor.data_ptr();
-        recvbuf = recvbuf_tensor.data_ptr();
-
-        // copy in: user input -> SHM sendbuf
-        std::memcpy(sendbuf, input.data_ptr(), send_total_bytes);
+        // Prefer the fixed pre-allocated SHM buffers whenever this (batch, dim)
+        // fits: avoids lazily carving more pool memory at run time (which OOMs
+        // once the static graph has claimed the pool), and works for any
+        // varying batch dimension.  Fall back to the legacy dim-keyed cache for
+        // an oversized request.
+        if (g_batch_ag_initialized &&
+            input.numel() <= static_cast<size_t>(g_batch_ag_send_cap) &&
+            output.numel() <= static_cast<size_t>(g_batch_ag_recv_cap)) {
+            sendbuf = g_batch_ag_send.data_ptr();
+            recvbuf = g_batch_ag_recv.data_ptr();
+            std::memcpy(sendbuf, input.data_ptr(), send_total_bytes);
+        } else if (!g_batch_ag_initialized) {
+            // Not pre-allocated (e.g. unit tests): keep the legacy dim-keyed cache.
+            sendbuf_tensor = get_or_create_shm_tensor(dim, batch);
+            recvbuf_tensor = get_or_create_shm_tensor(dim * comm_size, batch);
+            sendbuf = sendbuf_tensor.data_ptr();
+            recvbuf = recvbuf_tensor.data_ptr();
+            std::memcpy(sendbuf, input.data_ptr(), send_total_bytes);
+        } else {
+            // Fixed buffers exist but this (batch, dim) exceeds them.  Fail
+            // loudly with the actual sizes so the cap can be raised, instead of
+            // lazily carving pool memory at run time (which crashes with a
+            // cryptic OOM once the static graph has claimed the pool).
+            TORCH_CHECK(false,
+                        "shm_batched_allgather_kunpeng exceeds pre-allocated SHM cap: send ",
+                        input.numel(), " > ", g_batch_ag_send_cap, " or recv ",
+                        output.numel(), " > ", g_batch_ag_recv_cap,
+                        ". Raise SGLANG_KUNPENG_PP_ALLGATHER_MAX_DIM and repackage.");
+        }
     }
 
     // build remote peer pointers for sendbuf and recvbuf
@@ -165,6 +236,9 @@ void shm_allgather_finalize_kunpeng()
         g_ag_request_comm8 = nullptr;
     }
     g_ag_initialized = false;
+    g_batch_ag_initialized = false;
+    g_batch_ag_send_cap = 0;
+    g_batch_ag_recv_cap = 0;
     std::cout << "[KuTACC] AllGather finalized" << std::endl;
 }
 

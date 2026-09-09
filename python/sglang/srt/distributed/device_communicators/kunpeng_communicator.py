@@ -188,6 +188,11 @@ class KunpengCommunicator:
         kernel.shm_allgather_init_kunpeng()
         kernel.shm_allreduce_init_kunpeng(self.max_elements)
 
+        _max_seq_num = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "32"))
+        _max_cur_len = int(os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "2"))
+        dim_size = _max_seq_num * _max_cur_len * SHM_ALIGN_SIZE //  self.comm_size
+        kernel.shm_batched_allgather_init_kunpeng(dim_size)
+
         # Pre-allocate min-int8 allreduce SHM before graph capture claims the pool.
         kernel.shm_allreduce_min_int8_init_kunpeng(1024)
 

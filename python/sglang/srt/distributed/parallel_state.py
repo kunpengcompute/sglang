@@ -1059,15 +1059,28 @@ class GroupCoordinator:
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
-            # elif (
-            #     self.use_kunpeng_communicator
-            #     and input_.shape[0] > 0
-            #     and output_tensor.shape[0] <= self.kunpeng_communicator.max_elements
-            # ):
-            #     self.kunpeng_communicator.shm_all_gather_into_tensor(
-            #         input_, output_tensor
-            #     )
+            elif (
+                self.use_kunpeng_communicator
+                and input_.dim() == 1
+                and input_.dtype == torch.bfloat16
+                and self.world_size in (8, 16)
+            ):
+                out = torch.empty(
+                    (1, input_.numel() * self.world_size),
+                    dtype=input_.dtype,
+                    device=input_.device,
+                )
+                torch.ops.sgl_kernel.shm_batched_allgather_kunpeng(
+                    input_.unsqueeze(0), out, self.world_size
+                )
+                return out.reshape(
+                    input_size[:dim]
+                    + (world_size * input_size[dim],)
+                    + input_size[dim + 1 :]
+                )
             else:
+                if _is_cpu_920f:
+                    logger.warning(f"[gloo] fall back to Gloo/kuccl all-gather for {input_.size()}")
                 torch.distributed.all_gather_into_tensor(
                     output_tensor,
                     input_,
