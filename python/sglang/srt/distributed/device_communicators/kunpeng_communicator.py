@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 PP_KIND_PYOBJ = 0
 PP_KIND_TENSOR = 1
 PP_KIND_ACK = 2
+PP_KIND_BUNDLE = 3  # must match PP_KIND_BUNDLE in pp_comm.cpp
 PP_MSG_SLOTS = 8  # must match PP_MSG_SLOTS in pp_comm.cpp
 
 SHM_ALIGN_SIZE = 7168

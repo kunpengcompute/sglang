@@ -1059,14 +1059,14 @@ class GroupCoordinator:
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
-            elif (
-                self.use_kunpeng_communicator
-                and input_.shape[0] > 0
-                and output_tensor.shape[0] <= self.kunpeng_communicator.max_elements
-            ):
-                self.kunpeng_communicator.shm_all_gather_into_tensor(
-                    input_, output_tensor
-                )
+            # elif (
+            #     self.use_kunpeng_communicator
+            #     and input_.shape[0] > 0
+            #     and output_tensor.shape[0] <= self.kunpeng_communicator.max_elements
+            # ):
+            #     self.kunpeng_communicator.shm_all_gather_into_tensor(
+            #         input_, output_tensor
+            #     )
             else:
                 torch.distributed.all_gather_into_tensor(
                     output_tensor,
@@ -1408,7 +1408,7 @@ class GroupCoordinator:
                 async_handle.wait()
         return tensor_dict
 
-    @Kunpeng_PP_Profiler(depth=1, name="send_tensor_dict")
+    @Kunpeng_PP_Profiler(depth=1)
     def send_tensor_dict(
         self,
         tensor_dict: Dict[str, Union[torch.Tensor, Any]],
@@ -1484,7 +1484,7 @@ class GroupCoordinator:
                     p2p_works.append(P2PWork(work, tensor))
         return p2p_works
 
-    @Kunpeng_PP_Profiler(depth=2, name="recv_tensor_dict")
+    @Kunpeng_PP_Profiler(depth=1)
     def recv_tensor_dict(
         self,
         src: Optional[int] = None,

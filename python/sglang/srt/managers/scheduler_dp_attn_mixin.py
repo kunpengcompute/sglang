@@ -210,7 +210,7 @@ def _update_gather_batch(
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
 
 
-@Kunpeng_PP_Profiler(depth=1, name="prepare_mlp_sync")
+@Kunpeng_PP_Profiler(depth=1)
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     dp_size: int,
@@ -330,7 +330,7 @@ class SchedulerDPAttnMixin:
             offload_tags=self.offload_tags,
         )
 
-    @Kunpeng_PP_Profiler(depth=1, name="mlp_sync")
+    @Kunpeng_PP_Profiler(depth=1)
     def maybe_prepare_mlp_sync_batch(
         self: Scheduler,
         batch: Optional[ScheduleBatch],

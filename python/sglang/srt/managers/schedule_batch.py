@@ -2268,7 +2268,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
-    @Kunpeng_PP_Profiler(depth=1, name="pd_prepare")
+    @Kunpeng_PP_Profiler(depth=1)
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
