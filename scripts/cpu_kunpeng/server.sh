@@ -119,6 +119,7 @@ case "$ROLE" in
             --max-prefill-tokens $((SGLANG_KUNPENG_MAX_SEQ_NUM * SGLANG_KUNPENG_MAX_CUR_LEN))
             --max-total-tokens 180000
             --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
+            --max-running-requests $((2 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
             --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
         )
