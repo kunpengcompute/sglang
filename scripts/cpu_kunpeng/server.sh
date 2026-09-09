@@ -86,6 +86,11 @@ if [[ -n "${INIT_EXPERT_LOCATION:-}" ]]; then
     BASE_ARGS+=(--init-expert-location "$INIT_EXPERT_LOCATION")
 fi
 
+# Disable radix cache
+if [[ "$SGLANG_DISABLE_RADIX_CACHE" == "1" ]]; then
+    BASE_ARGS+=(--disable-radix-cache)
+fi
+
 # Disable overlap schedule
 if [[ "$SGLANG_ENABLE_OVERLAP" == "0" ]]; then
     BASE_ARGS+=(
