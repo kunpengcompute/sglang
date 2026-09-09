@@ -232,12 +232,15 @@ class KunpengGraphRunner:
         if metadata is None:
             return self.weight_hbw_pool.move_to_hbw(param)
 
-        m = re.match(r"^model\.layers\.(\d+)\.mlp\.experts\.\S+$", name)
+        # Target model: model.layers.<N>.mlp.experts.*
+        # MTP draft model: decoder.mlp.experts.* (no layer id; use the last
+        # layer's mapping row since the metadata has no MTP layer row).
+        m = re.match(r"^(?:model\.layers\.(\d+)|decoder)\.mlp\.experts\.\S+$", name)
         if m is None:
             logger.info("non-moe weight %s", name)
             return self.weight_hbw_pool.move_to_hbw(param)
 
-        layer_id = int(m.group(1))
+        layer_id = int(m.group(1)) if m.group(1) is not None else metadata.num_layers - 1
         ep_rank = get_moe_expert_parallel_rank()
         # Use the MOE EP world size (not metadata.ep_size, which is the global
         # world size and differs under PP), consistent with the routing remap.

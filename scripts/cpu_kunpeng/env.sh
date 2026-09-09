@@ -239,6 +239,7 @@ export SGLANG_KUNPENG_RDMA_PP_COMM=1  # 1 = enable RDMA communication between PP
 export SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE=0  # 1 = forced MoE load balancing (perf-test only, correctness not preserved)
 # SGLANG_KUNPENG_DEBUG_EXPERT_LOAD=1  # build-time only: set before building sgl-kernel to enable expert load debug recording
 export SGLANG_ENABLE_MTP=0
+export SGLANG_DISABLE_RADIX_CACHE=0  # 1 = append --disable-radix-cache to server args
 export SGLANG_ENABLE_OVERLAP=0
 export SGLANG_ENABLE_OVERLAP_TRACE=0
 export SGLANG_ENABLE_KUCCL=0  # set to 1 to use kuccl backend instead of gloo
@@ -290,6 +291,8 @@ if [[ "${1:-native}" == "native" ]]; then
 else
     export SGLANG_ENABLE_TOKENIZER_SEPERATE=1
 fi
+
+export SGLANG_KUNPENG_MOE_TOKEN_MULTIPLE=2
 
 # ------------------------------------------------------------
 # Load local config

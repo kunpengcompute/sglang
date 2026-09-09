@@ -86,6 +86,11 @@ if [[ -n "${INIT_EXPERT_LOCATION:-}" ]]; then
     BASE_ARGS+=(--init-expert-location "$INIT_EXPERT_LOCATION")
 fi
 
+# Disable radix cache
+if [[ "$SGLANG_DISABLE_RADIX_CACHE" == "1" ]]; then
+    BASE_ARGS+=(--disable-radix-cache)
+fi
+
 # Disable overlap schedule
 if [[ "$SGLANG_ENABLE_OVERLAP" == "0" ]]; then
     BASE_ARGS+=(
@@ -114,6 +119,7 @@ case "$ROLE" in
             --max-prefill-tokens $((SGLANG_KUNPENG_MAX_SEQ_NUM * SGLANG_KUNPENG_MAX_CUR_LEN))
             --max-total-tokens 180000
             --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
+            --max-running-requests $((2 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
             --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
         )
