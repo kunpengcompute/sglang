@@ -288,13 +288,24 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     ):
         """Fused 920F pure-token MTP verify (single C++ kernel, no tensor index).
 
-        The whole verify pipeline (argmax, greedy accept, finish detection,
+        The whole verify pipeline (argmax/probability accept, finish detection,
         evict page alignment, compact gathers, req_to_token scatter, seq_lens
         update) runs inside one `verify_mtp_kunpeng` call under a single GIL
         release.  All tensor index / intermediate mask tensors are eliminated;
         the kernel returns already-compact results that this thin Python shell
         consumes to write per-request Req state (Python objects) and to
         assemble the EagleVerifyOutput.
+
+        Greedy batches run the original argmax chain; non-greedy batches run
+        the target-only rejection sampler (draft probability treated as 1
+        since sglang does not store draft probs): draft token j is accepted
+        iff coin <= p_target(j) under the per-req temperature / top-k / top-p
+        renorm, and on rejection the recovered token is drawn from the anchor
+        row distribution excluding the draft token; full acceptance samples a
+        bonus token from the last anchor row.  The coins are drawn here with
+        torch.rand in the same order as the official probability path
+        (rand_like(candidates) then rand(bs)) so the RNG stream matches and
+        stays reproducible under a global seed.
 
         Returns the same EagleVerifyOutput contract as the official `verify`
         (including the `accepted_indices=None` marker consumed by
@@ -347,6 +358,45 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             device=device,
         )
 
+        # ── Standard-sampling parameters (empty for greedy batches) ──────
+        # Per-req values come straight from sampling_params (same packing
+        # pattern as the finish parameters), which also sidesteps the official
+        # path's sampling_info deepcopy/filter_batch dance.  The coin tensors
+        # mirror the official probability path's RNG consumption order:
+        # torch.rand_like(candidates) first, then torch.rand((bs,)).
+        is_all_greedy = batch.sampling_info.is_all_greedy
+        if not is_all_greedy:
+            temperatures = torch.tensor(
+                [r.sampling_params.temperature for r in batch.reqs],
+                dtype=torch.float32,
+                device=device,
+            )
+            top_ks = torch.tensor(
+                [r.sampling_params.top_k for r in batch.reqs],
+                dtype=torch.int32,
+                device=device,
+            )
+            top_ps = torch.tensor(
+                [r.sampling_params.top_p for r in batch.reqs],
+                dtype=torch.float32,
+                device=device,
+            )
+            global_server_args = get_global_server_args()
+            threshold_single = (
+                global_server_args.speculative_accept_threshold_single
+            )
+            threshold_acc = global_server_args.speculative_accept_threshold_acc
+            coins = torch.rand((bs, nv), dtype=torch.float32, device=device)
+            coins_final = torch.rand((bs,), dtype=torch.float32, device=device)
+        else:
+            temperatures = torch.empty((0,), dtype=torch.float32, device=device)
+            top_ks = temperatures
+            top_ps = temperatures
+            coins = temperatures
+            coins_final = temperatures
+            threshold_single = 1.0
+            threshold_acc = 1.0
+
         # ── Single fused C++ kernel (GIL released, multi-core) ───────────
         (
             num_accepted,
@@ -389,6 +439,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens_cpu,
+            temperatures,
+            top_ks,
+            top_ps,
+            threshold_single,
+            threshold_acc,
+            coins,
+            coins_final,
         )
 
         # ── Thin Python shell (per-req Req state only) ───────────────────
@@ -576,14 +633,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # ── Kunpeng 920F pure-token MTP: fused single-C-kernel verify. ──
         # Active only for the same guard as the removed `_finish_check_cpu`:
-        # topk==1 chain, greedy verify, no grammar / stop-strs / regex /
-        # reasoning. The kernel is generic over the chain depth (`nv` =
-        # draft_token_num): the greedy walk iterates `for j in 1..nv-1`, so it
-        # serves any speculative_num_steps (mtp=1 is nv=2, mtp=2 is nv=3).
-        # The whole pipeline (argmax, greedy accept, finish detection, evict
-        # page alignment, compact gathers, req_to_token scatter, seq_lens
-        # update) runs inside one C++ kernel; this branch returns early and
-        # keeps the official verify flow intact.
+        # topk==1 chain, single speculative step, no grammar / stop-strs /
+        # regex / reasoning.  Greedy batches run the argmax chain inside the
+        # kernel; non-greedy batches run the target-only rejection sampler
+        # (draft probability treated as 1, rejection resamples from the anchor
+        # row excluding the draft token).  The whole pipeline (finish
+        # detection, evict page alignment, compact gathers, req_to_token
+        # scatter, seq_lens update) runs inside one C++ kernel; this branch
+        # returns early and keeps the official verify flow intact.
+        # Note: non-greedy batches with penalties / logit_bias keep the
+        # pre-existing behavior (verified by argmax); penalties are not
+        # modeled inside the fused kernel.
         if (
             is_cpu_920f()
             and self.topk == 1

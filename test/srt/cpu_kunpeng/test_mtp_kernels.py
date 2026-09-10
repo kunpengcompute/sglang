@@ -433,6 +433,10 @@ def _check_verify_mtp(bs, nv, vocab, page_size, seq_lens_cpu_dtype):
         stop_flat, stop_off, eos_flat, eos_off,
         ignore_eos_t, nv, page_size,
         req_pool_indices, req_to_token, seq_lens_cpu,
+        # greedy mode: all-empty sampling aux tensors
+        torch.empty((0,), dtype=torch.float32), torch.empty((0,), dtype=torch.int32),
+        torch.empty((0,), dtype=torch.float32), 1.0, 1.0,
+        torch.empty((0,), dtype=torch.float32), torch.empty((0,), dtype=torch.float32),
     )
     ref = _ref_verify_mtp(logits, candidates, retrieve_index, seq_lens,
                           out_cache_loc, output_ids_len, max_new_tokens,
@@ -458,6 +462,307 @@ def _check_verify_mtp(bs, nv, vocab, page_size, seq_lens_cpu_dtype):
     # seq_lens_cpu was incremented in-place by num_accepted
     expected_seq_cpu = (seq_lens + torch.tensor(ref["num_accepted"], dtype=seq_lens.dtype)).to(seq_lens_cpu_dtype)
     assert torch.equal(seq_lens_cpu, expected_seq_cpu), f"seq_lens_cpu mismatch\n{seq_lens_cpu}\n{expected_seq_cpu}"
+
+
+# ---------------------------------------------------------------------------
+# verify_mtp_kunpeng: target-only standard sampling path
+# ---------------------------------------------------------------------------
+
+def _ref_row_dist(logits_row, temperature, top_k, top_p):
+    """Mirror of compute_row_dist in verify_kunpeng.cpp: retain set
+    S = top-p(top-k(softmax(row/T))) plus normalizer Z (raw exp mass).
+
+    Sampling order mirrors the kernel: descending keep order for the top-k
+    path, index order when top-k is disabled (full rows and the histogram
+    top-p path)."""
+    V = logits_row.shape[0]
+    if torch.isnan(logits_row.float()).any():
+        return {"nan": True, "full": False, "sum": 1.0, "Z": 1.0,
+                "keep": [(1.0, 0)], "exp": None}
+    inv_T = 1.0 / max(float(temperature), 1e-6)
+    x = logits_row.float() * inv_T
+    e = torch.exp(x - x.max())
+    s = float(e.sum())
+    k = min(max(int(top_k), 1), V)
+    tp = float(top_p) if float(top_p) > 0 else 1.0
+    if k >= V and tp >= 1.0:
+        return {"nan": False, "full": True, "sum": s, "Z": s, "keep": [], "exp": e}
+    vals, idxs = torch.topk(e, k, largest=True)
+    cand = sorted(zip(vals.tolist(), idxs.tolist()), key=lambda t: (-t[0], t[1]))
+    Zk = sum(v for v, _ in cand)
+    if tp < 1.0:
+        out, cum = [], 0.0
+        for v, i in cand:
+            if cum > tp * Zk:
+                break
+            out.append((v, i))
+            cum += v
+        cand = out
+    if k >= V:
+        cand = sorted(cand, key=lambda t: t[1])
+    Z = sum(v for v, _ in cand)
+    return {"nan": False, "full": False, "sum": s, "Z": Z, "keep": cand, "exp": e}
+
+
+def _ref_row_sample(dist, exclude, coin):
+    """Mirror of row_sample: draw from the retain set (excluding `exclude` when
+    >= 0) with one uniform coin; empty residual falls back to token 0."""
+    if dist["nan"]:
+        return 0
+    if dist["full"]:
+        e = dist["exp"]
+        V = e.shape[0]
+        zres = dist["Z"] - (float(e[exclude]) if 0 <= exclude < V else 0.0)
+        if not zres > 0:
+            return 0
+        cum, last = 0.0, 0
+        for i in range(V):
+            if i == exclude:
+                continue
+            last = i
+            cum += float(e[i]) / zres
+            if coin <= cum:
+                return i
+        return last
+    zres = dist["Z"]
+    has_ex = any(i == exclude for _, i in dist["keep"])
+    if has_ex:
+        zres -= next(v for v, i in dist["keep"] if i == exclude)
+    if not dist["keep"] or not zres > 0:
+        return 0
+    cum, last, first = 0.0, 0, True
+    for v, i in dist["keep"]:
+        if has_ex and i == exclude:
+            continue
+        if first:
+            last, first = i, False
+        cum += v / zres
+        if coin <= cum:
+            return i
+    return last
+
+
+def _ref_verify_mtp_sampling(logits, candidates, retrieve_index, seq_lens, out_cache_loc,
+                             output_ids_len, max_new_tokens, vocab_size,
+                             stop_sets, eos_sets, ignore_eos_flags, page_size,
+                             temperatures, top_ks, top_ps, thr_single, thr_acc,
+                             coins, coins_final):
+    """torch-native reference of the verify_mtp_kunpeng target-only sampling
+    path (draft probability treated as 1)."""
+    bs, nv = candidates.shape
+    V = logits.shape[1]
+    thr_acc = max(thr_acc, 1e-9)
+
+    num_accepted, finished, finish_reason, finish_matched, finish_len = [], [], [], [], []
+    accepted_tokens, accepted_cache_loc, accepted_verified_id = [], [], []
+    unfinished_index, unfinished_num_accepted = [], []
+
+    for b in range(bs):
+        cache = {}
+
+        def row_dist(flat, b=b):
+            if flat not in cache:
+                cache[flat] = _ref_row_dist(
+                    logits[flat], temperatures[b], top_ks[b], top_ps[b]
+                )
+            return cache[flat]
+
+        seq, anchor, rejected = [], 0, False
+        for j in range(1, nv):
+            d = row_dist(int(retrieve_index[b][anchor]))
+            draft = int(candidates[b][j])
+            if d["nan"]:
+                p_acc = 1.0 if draft == 0 else 0.0
+            elif d["full"]:
+                p_acc = float(d["exp"][draft]) / d["Z"] if 0 <= draft < V else 0.0
+            else:
+                p_acc = next((v / d["Z"] for v, i in d["keep"] if i == draft), 0.0)
+            if float(coins[b][j - 1]) <= p_acc / thr_acc or p_acc >= thr_single:
+                seq.append(draft)  # accepted drafts contribute the draft token itself
+                anchor = j
+            else:
+                seq.append(_ref_row_sample(d, draft, float(coins_final[b])))
+                rejected = True
+                break
+        if not rejected:
+            d = row_dist(int(retrieve_index[b][anchor]))
+            seq.append(_ref_row_sample(d, -1, float(coins_final[b])))  # bonus
+        na = len(seq)
+
+        is_fin, reason, matched, fin_len = 0, -1, 0, 0
+        for kk in range(na):
+            cur_out_len = output_ids_len[b] + (kk + 1)
+            if seq[kk] > vocab_size[b] or seq[kk] < 0:
+                seq[kk] = _repair_vocab_boundary_token(
+                    seq[kk], vocab_size[b], stop_sets[b], eos_sets[b]
+                )
+            r = _check_finish_token(seq[kk], cur_out_len, max_new_tokens[b], vocab_size[b],
+                                    stop_sets[b], eos_sets[b], ignore_eos_flags[b])
+            if r[0] >= 0:
+                is_fin, reason, matched, fin_len = 1, r[0], r[1], r[2]
+                na = kk + 1
+                break
+        num_accepted.append(na)
+        finished.append(is_fin)
+        finish_reason.append(reason)
+        finish_matched.append(matched)
+        finish_len.append(fin_len)
+
+        evict = [1 if j >= na else 0 for j in range(nv)]
+        start_raw = ((seq_lens[b] + na - 1) // page_size) * page_size - seq_lens[b]
+        for j in range(max(start_raw, 0), min(start_raw + page_size, nv)):
+            evict[j] = 0
+
+        accepted_tokens.append(seq[:na] + [-1] * (nv - na))
+        for j in range(na):
+            flat = int(retrieve_index[b][j])
+            accepted_cache_loc.append(int(out_cache_loc[flat]))
+            accepted_verified_id.append(seq[j])
+        if not is_fin:
+            unfinished_index.append(b)
+            unfinished_num_accepted.append(na)
+
+    return {
+        "num_accepted": num_accepted,
+        "finished": finished,
+        "finish_reason": finish_reason,
+        "finish_matched": finish_matched,
+        "finish_len": finish_len,
+        "accepted_tokens": accepted_tokens,
+        "accepted_cache_loc": accepted_cache_loc,
+        "accepted_verified_id": accepted_verified_id,
+        "unfinished_index": unfinished_index,
+        "unfinished_num_accepted": unfinished_num_accepted,
+    }
+
+
+def _check_verify_mtp_sampling(bs, nv, vocab, page_size, seq_lens_cpu_dtype,
+                               temperature=1.0, top_k=1 << 30, top_p=1.0,
+                               nan_row=False):
+    """Kernel vs reference for the target-only sampling path.
+
+    Rows are built with 4 well-separated dominant tokens (logits 6/5/3/2) so
+    every accept/reject decision and every sampled token is far from the
+    coin boundaries: the fixed coin 0.5 accepts p~0.63 drafts and rejects
+    p~0.23 drafts, and the recovered/bonus token is always the row's top-1.
+    Requests alternate accept-chain (all drafts accepted -> bonus) and
+    reject-first (recovered from the anchor row minus the draft)."""
+    torch.manual_seed(13)
+    seq_lens = torch.randint(1, 50, (bs,), dtype=torch.int64)
+    out_cache_loc = torch.arange(bs * nv, dtype=torch.int64)
+    logits = torch.randn(bs * nv, vocab, dtype=torch.bfloat16) * 0.01
+    for r in range(bs * nv):
+        base = (r * 7) % vocab
+        logits[r, base] = 6.0
+        logits[r, (base + 1) % vocab] = 5.0
+        logits[r, (base + 2) % vocab] = 3.0
+        logits[r, (base + 3) % vocab] = 2.0
+    if nan_row and bs >= 2 and nv >= 2:
+        # Poison the odd req's root row: it reject-firsts, so the NaN row
+        # degrades to one-hot(0) -> rejected draft + recovered token 0.
+        logits[1 * nv + 0, 5] = float("nan")
+    order = torch.argsort(logits.to(torch.float32), dim=-1, descending=True)
+    top1 = order[:, 0].tolist()
+    top2 = order[:, 1].tolist()
+
+    candidates = torch.zeros(bs, nv, dtype=torch.int64)
+    for b in range(bs):
+        candidates[b, 0] = top1[b * nv]  # root slot (unused by the sampler)
+        for j in range(1, nv):
+            anchor_row = b * nv + j - 1
+            # Even reqs run the full accept chain (draft == anchor row top-1,
+            # p ~ 0.63 > coin 0.5); odd reqs reject at the first layer
+            # (draft == anchor row top-2, p ~ 0.23 < coin 0.5).
+            src = top1 if b % 2 == 0 else top2
+            candidates[b, j] = src[anchor_row]
+
+    retrieve_index = torch.arange(bs * nv, dtype=torch.int64).reshape(bs, nv)
+    output_ids_len = torch.randint(0, 10, (bs,), dtype=torch.int64)
+    max_new_tokens = torch.full((bs,), 20, dtype=torch.int32)
+    vocab_size = torch.full((bs,), vocab, dtype=torch.int32)
+    stop_sets = [[] for _ in range(bs)]
+    eos_sets = [[] for _ in range(bs)]
+    ignore_eos_flags = [False] * bs
+    if bs >= 2:
+        # Finish via an accepted-token EOS hit: req 0 accepts its first draft
+        # (== root row top-1), which is put into the eos set, so the chain is
+        # cut right after the first token.
+        eos_sets[0] = [top1[0]]
+
+    stop_flat = torch.tensor(sum(stop_sets, []), dtype=torch.int32)
+    stop_off = torch.tensor([0] + [len(s) for s in stop_sets], dtype=torch.int32).cumsum(0)
+    eos_flat = torch.tensor(sum(eos_sets, []), dtype=torch.int32)
+    eos_off = torch.tensor([0] + [len(s) for s in eos_sets], dtype=torch.int32).cumsum(0)
+    ignore_eos_t = torch.tensor(ignore_eos_flags, dtype=torch.bool)
+
+    temperatures = torch.full((bs,), float(temperature), dtype=torch.float32)
+    top_ks = torch.full((bs,), int(top_k), dtype=torch.int32)
+    top_ps = torch.full((bs,), float(top_p), dtype=torch.float32)
+    coins = torch.full((bs, nv), 0.5, dtype=torch.float32)
+    coins_final = torch.full((bs,), 0.5, dtype=torch.float32)
+
+    req_pool_indices = torch.arange(bs, dtype=torch.int64)
+    max_ctx = 64
+    req_to_token = torch.full((bs, max_ctx), -1, dtype=torch.int32)
+    seq_lens_cpu = seq_lens.clone().to(seq_lens_cpu_dtype)
+
+    got = kernel.verify_mtp_kunpeng(
+        logits.contiguous(),
+        torch.empty((0,), dtype=torch.bfloat16),
+        candidates,
+        retrieve_index,
+        seq_lens.clone(),
+        out_cache_loc,
+        output_ids_len,
+        max_new_tokens,
+        vocab_size,
+        stop_flat, stop_off, eos_flat, eos_off,
+        ignore_eos_t, nv, page_size,
+        req_pool_indices, req_to_token, seq_lens_cpu,
+        temperatures, top_ks, top_ps, 1.0, 1.0,
+        coins, coins_final,
+    )
+    ref = _ref_verify_mtp_sampling(
+        logits, candidates, retrieve_index, seq_lens, out_cache_loc,
+        output_ids_len, max_new_tokens, vocab_size,
+        stop_sets, eos_sets, ignore_eos_flags, page_size,
+        temperatures, top_ks, top_ps, 1.0, 1.0,
+        coins, coins_final,
+    )
+
+    assert got[0].tolist() == ref["num_accepted"], \
+        f"num_accepted mismatch\n{got[0].tolist()}\n{ref['num_accepted']}"
+    assert got[1].tolist() == ref["finished"], "finished mismatch"
+    assert got[2].tolist() == ref["finish_reason"], "finish_reason mismatch"
+    assert got[3].tolist() == ref["finish_matched"], "finish_matched mismatch"
+    assert got[4].tolist() == ref["finish_len"], "finish_len mismatch"
+    ref_tokens_flat = [t for row in ref["accepted_tokens"] for t in row]
+    assert got[5].tolist() == ref_tokens_flat, "accepted_tokens mismatch"
+    assert got[7].tolist() == ref["accepted_cache_loc"], "accepted_cache_loc mismatch"
+    assert got[8].tolist() == ref["accepted_verified_id"], "accepted_verified_id mismatch"
+    assert got[11].tolist() == ref["unfinished_index"], "unfinished_index mismatch"
+    assert got[12].tolist() == ref["unfinished_num_accepted"], "unfinished_num_accepted mismatch"
+    expected_seq_cpu = (seq_lens + torch.tensor(ref["num_accepted"], dtype=seq_lens.dtype)).to(seq_lens_cpu_dtype)
+    assert torch.equal(seq_lens_cpu, expected_seq_cpu), "seq_lens_cpu mismatch"
+
+    # Semantic spot checks: even reqs accept the full chain and end with a
+    # bonus equal to the last anchor row's top-1; odd reqs reject at layer 1
+    # and their recovered token must exclude the rejected draft; req 0 (when
+    # the eos case is armed) finishes on its first accepted draft.
+    for b in range(bs):
+        na = ref["num_accepted"][b]
+        toks = ref["accepted_tokens"][b][:na]
+        if b % 2 == 0 and ref["finished"][b]:
+            assert na == 1, f"req {b}: eos finish expected after 1 token, got na={na}"
+        elif b % 2 == 0:
+            assert na == nv, f"req {b}: full chain expected, got na={na}"
+            assert toks[:-1] == [top1[b * nv + j - 1] for j in range(1, nv)], \
+                f"req {b}: accepted chain mismatch {toks}"
+            assert toks[-1] == top1[b * nv + nv - 1], f"req {b}: bonus mismatch {toks}"
+        else:
+            assert na == 1, f"req {b}: reject-first expected, got na={na}"
+            assert toks[0] != candidates[b, 1], \
+                f"req {b}: recovered token equals rejected draft {toks}"
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +809,17 @@ def run(args):
     except (RuntimeError, AttributeError, NotImplementedError):
         # verify_mtp_kunpeng is only present on the 920F build; skip on stubs.
         print("  verify_mtp_kunpeng unavailable, skipping verify checks")
+    try:
+        # target-only standard sampling path (draft probability treated as 1)
+        _check_verify_mtp_sampling(4, 2, 64, 1, torch.int32)  # full rows: accept chain / reject-first
+        _check_verify_mtp_sampling(4, 3, 64, 1, torch.int64)  # nv=3: chain + bonus, int64 seq_lens_cpu
+        _check_verify_mtp_sampling(4, 2, 64, 8, torch.int32, top_k=4)  # top-k keep path + page_size>1
+        _check_verify_mtp_sampling(4, 2, 64, 1, torch.int32, top_p=0.9)  # top-p histogram path
+        _check_verify_mtp_sampling(4, 2, 64, 1, torch.int32, temperature=0.0)  # T=0 clamp (greedy-like)
+        _check_verify_mtp_sampling(2, 2, 64, 1, torch.int32, nan_row=True)  # NaN row degradation
+        _check_verify_mtp_sampling(0, 2, 64, 1, torch.int32)  # empty batch
+    except (RuntimeError, AttributeError, NotImplementedError):
+        print("  verify_mtp_kunpeng sampling path unavailable, skipping sampling checks")
     print("  all functional assertions passed")
 
     print()
