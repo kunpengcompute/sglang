@@ -26,6 +26,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.distributed import rank_layout
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -559,26 +560,44 @@ class DataParallelController:
 
         pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
         nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
-        )
 
-        nnodes_per_tp_group = nnodes_per_pp_rank
-        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        if _is_kunpeng_binary_launch:
-            tp_rank_range = range(
-                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group)
-                + server_args.tp_rank_in_node,
-                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group)
-                + server_args.tp_rank_in_node
-                + 1,
+        if _is_kunpeng_binary_launch and rank_layout.pp_interleave_in_node():
+            inter = rank_layout.per_node_pp_tp_ranges(
+                server_args.node_rank,
+                server_args.tp_rank_in_node,
+                server_args.pp_size,
+                server_args.tp_size,
             )
         else:
-            tp_rank_range = range(
-                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+            inter = None
+
+        if inter is not None:
+            pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = inter
+        else:
+            pp_rank_range = range(
+                pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+                pp_size_per_node
+                * (server_args.node_rank // nnodes_per_pp_rank + 1),
             )
+
+            nnodes_per_tp_group = nnodes_per_pp_rank
+            tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+            if _is_kunpeng_binary_launch:
+                tp_rank_range = range(
+                    tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group)
+                    + server_args.tp_rank_in_node,
+                    tp_size_per_node
+                    * (server_args.node_rank % nnodes_per_tp_group)
+                    + server_args.tp_rank_in_node
+                    + 1,
+                )
+            else:
+                tp_rank_range = range(
+                    tp_size_per_node
+                    * (server_args.node_rank % nnodes_per_tp_group),
+                    tp_size_per_node
+                    * (server_args.node_rank % nnodes_per_tp_group + 1),
+                )
 
         attn_cp_rank = 0
         moe_dp_rank = 0

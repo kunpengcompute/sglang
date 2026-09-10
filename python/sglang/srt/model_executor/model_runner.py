@@ -76,6 +76,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed import rank_layout
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
@@ -1177,7 +1178,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             init_distributed_environment(
                 backend=backend,
                 world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                rank=rank_layout.compute_grank(
+                    self.pp_rank,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.pp_size,
+                ),
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,

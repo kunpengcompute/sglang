@@ -62,7 +62,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import get_pp_group, get_world_group, rank_layout
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -4074,10 +4074,9 @@ def configure_scheduler_process(
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         if _is_cpu_920f:
             p = psutil.Process(os.getpid())
-            tp_ranks_in_node = (
-                server_args.tp_size * server_args.pp_size
-            ) // server_args.nnodes
-            tp_rank_in_node = tp_rank % tp_ranks_in_node
+            tp_rank_in_node = rank_layout.compute_rin_in_node(
+                pp_rank, tp_rank, server_args.pp_size
+            )
             # TODO (kunpeng): hard code here, should use a more elegant way.
             if envs.KUTACC_ASYNC_LAUNCH.get():
                 p.cpu_affinity(
@@ -4165,10 +4164,9 @@ def run_scheduler_process(
         if envs.SGLANG_SET_CPU_AFFINITY.get():
             if _is_cpu_920f:
                 p = psutil.Process(os.getpid())
-                tp_ranks_in_node = (
-                    server_args.tp_size * server_args.pp_size
-                ) // server_args.nnodes
-                tp_rank_in_node = tp_rank % tp_ranks_in_node
+                tp_rank_in_node = rank_layout.compute_rin_in_node(
+                    pp_rank, tp_rank, server_args.pp_size
+                )
                 base_cpu = tp_rank_in_node * 38
 
                 # Pin non-compute threads to base CPU to keep kupl cores exclusive.
