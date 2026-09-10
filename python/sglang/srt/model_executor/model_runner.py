@@ -1175,15 +1175,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
 
             # Only initialize the distributed environment on the target model worker.
+            if rank_layout.pp_interleave_in_node():
+                dist_rank = rank_layout.compute_grank(
+                    self.pp_rank, self.tp_rank, self.pp_size
+                )
+            else:
+                dist_rank = self.tp_size * self.pp_rank + self.tp_rank
             init_distributed_environment(
                 backend=backend,
                 world_size=self.tp_size * self.pp_size,
-                rank=rank_layout.compute_grank(
-                    self.pp_rank,
-                    self.tp_rank,
-                    self.tp_size,
-                    self.pp_size,
-                ),
+                rank=dist_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,

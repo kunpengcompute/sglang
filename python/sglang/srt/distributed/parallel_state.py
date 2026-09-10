@@ -2082,10 +2082,11 @@ def initialize_model_parallel(
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = []
     for tp_group_idx in range(num_tensor_model_parallel_groups):
-        ranks = rank_layout.build_tp_group_ranks(
-            tp_group_idx, tensor_model_parallel_size, pipeline_model_parallel_size
-        )
-        if ranks is None:
+        if rank_layout.pp_interleave_in_node():
+            ranks = rank_layout.build_tp_group_ranks(
+                tp_group_idx, tensor_model_parallel_size, pipeline_model_parallel_size
+            )
+        else:
             ranks = list(
                 range(
                     tp_group_idx * tensor_model_parallel_size,
@@ -2151,16 +2152,19 @@ def initialize_model_parallel(
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for dp_idx in range(attn_dp_size):
                 for attn_tp_idx in range(attn_tp_size):
-                    ranks = rank_layout.map_stage_local_ranks(
-                        tp_group_idx,
-                        range(
-                            dp_idx * attn_tp_size * attn_cp_size + attn_tp_idx,
-                            (dp_idx + 1) * attn_tp_size * attn_cp_size + attn_tp_idx,
-                            attn_tp_size,
-                        ),
-                        tensor_model_parallel_size,
-                        pipeline_model_parallel_size,
+                    local_tp_ranks = range(
+                        dp_idx * attn_tp_size * attn_cp_size + attn_tp_idx,
+                        (dp_idx + 1) * attn_tp_size * attn_cp_size + attn_tp_idx,
+                        attn_tp_size,
                     )
+                    if rank_layout.pp_interleave_in_node():
+                        ranks = rank_layout.map_stage_local_ranks(
+                            tp_group_idx,
+                            local_tp_ranks,
+                            pipeline_model_parallel_size,
+                        )
+                    else:
+                        ranks = list(local_tp_ranks)
                     group_ranks.append(ranks)
         logger.debug(
             "[DEBUG] [ATTN_CP Group] world_size=%s, attn_cp_size=%s, "
@@ -2198,15 +2202,18 @@ def initialize_model_parallel(
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
-                ranks = rank_layout.map_stage_local_ranks(
-                    tp_group_idx,
-                    range(
-                        cp_dp_combined_idx * attn_tp_size,
-                        (cp_dp_combined_idx + 1) * attn_tp_size,
-                    ),
-                    tensor_model_parallel_size,
-                    pipeline_model_parallel_size,
+                local_tp_ranks = range(
+                    cp_dp_combined_idx * attn_tp_size,
+                    (cp_dp_combined_idx + 1) * attn_tp_size,
                 )
+                if rank_layout.pp_interleave_in_node():
+                    ranks = rank_layout.map_stage_local_ranks(
+                        tp_group_idx,
+                        local_tp_ranks,
+                        pipeline_model_parallel_size,
+                    )
+                else:
+                    ranks = list(local_tp_ranks)
                 group_ranks.append(ranks)
 
         logger.debug(
@@ -2242,12 +2249,15 @@ def initialize_model_parallel(
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for socket_offset in range(0, tensor_model_parallel_size, socket_tp_size):
-                ranks = rank_layout.map_stage_local_ranks(
-                    tp_group_idx,
-                    range(socket_offset, socket_offset + socket_tp_size),
-                    tensor_model_parallel_size,
-                    pipeline_model_parallel_size,
-                )
+                local_tp_ranks = range(socket_offset, socket_offset + socket_tp_size)
+                if rank_layout.pp_interleave_in_node():
+                    ranks = rank_layout.map_stage_local_ranks(
+                        tp_group_idx,
+                        local_tp_ranks,
+                        pipeline_model_parallel_size,
+                    )
+                else:
+                    ranks = list(local_tp_ranks)
                 group_ranks.append(ranks)
         _SOCKET_TP = init_model_parallel_group(
             group_ranks,
@@ -2287,16 +2297,19 @@ def initialize_model_parallel(
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for tp_ep_combined_idx in range(moe_tp_size * moe_ep_size):
-                ranks = rank_layout.map_stage_local_ranks(
-                    tp_group_idx,
-                    range(
-                        tp_ep_combined_idx,
-                        tensor_model_parallel_size + tp_ep_combined_idx,
-                        moe_tp_size * moe_ep_size,
-                    ),
-                    tensor_model_parallel_size,
-                    pipeline_model_parallel_size,
+                local_tp_ranks = range(
+                    tp_ep_combined_idx,
+                    tensor_model_parallel_size + tp_ep_combined_idx,
+                    moe_tp_size * moe_ep_size,
                 )
+                if rank_layout.pp_interleave_in_node():
+                    ranks = rank_layout.map_stage_local_ranks(
+                        tp_group_idx,
+                        local_tp_ranks,
+                        pipeline_model_parallel_size,
+                    )
+                else:
+                    ranks = list(local_tp_ranks)
                 group_ranks.append(ranks)
         logger.debug(
             "[DEBUG] [MOE_DP Group] world_size=%s, moe_dp_size=%s, "
@@ -2330,16 +2343,19 @@ def initialize_model_parallel(
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for moe_dp_idx in range(moe_dp_size):
                 for moe_tp_idx in range(moe_tp_size):
-                    ranks = rank_layout.map_stage_local_ranks(
-                        tp_group_idx,
-                        range(
-                            moe_dp_idx * moe_ep_size * moe_tp_size + moe_tp_idx,
-                            (moe_dp_idx + 1) * moe_ep_size * moe_tp_size + moe_tp_idx,
-                            moe_tp_size,
-                        ),
-                        tensor_model_parallel_size,
-                        pipeline_model_parallel_size,
+                    local_tp_ranks = range(
+                        moe_dp_idx * moe_ep_size * moe_tp_size + moe_tp_idx,
+                        (moe_dp_idx + 1) * moe_ep_size * moe_tp_size + moe_tp_idx,
+                        moe_tp_size,
                     )
+                    if rank_layout.pp_interleave_in_node():
+                        ranks = rank_layout.map_stage_local_ranks(
+                            tp_group_idx,
+                            local_tp_ranks,
+                            pipeline_model_parallel_size,
+                        )
+                    else:
+                        ranks = list(local_tp_ranks)
                     group_ranks.append(ranks)
         logger.debug(
             "[DEBUG] [MOE_EP Group] world_size=%s, moe_ep_size=%s, "
@@ -2374,15 +2390,18 @@ def initialize_model_parallel(
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for ep_dp_combined_idx in range(moe_ep_size * moe_dp_size):
-                ranks = rank_layout.map_stage_local_ranks(
-                    tp_group_idx,
-                    range(
-                        ep_dp_combined_idx * moe_tp_size,
-                        (ep_dp_combined_idx + 1) * moe_tp_size,
-                    ),
-                    tensor_model_parallel_size,
-                    pipeline_model_parallel_size,
+                local_tp_ranks = range(
+                    ep_dp_combined_idx * moe_tp_size,
+                    (ep_dp_combined_idx + 1) * moe_tp_size,
                 )
+                if rank_layout.pp_interleave_in_node():
+                    ranks = rank_layout.map_stage_local_ranks(
+                        tp_group_idx,
+                        local_tp_ranks,
+                        pipeline_model_parallel_size,
+                    )
+                else:
+                    ranks = list(local_tp_ranks)
                 group_ranks.append(ranks)
         logger.debug(
             "[DEBUG] [MOE_TP Group] world_size=%s, moe_tp_size=%s, "
@@ -2410,15 +2429,15 @@ def initialize_model_parallel(
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = []
     for pp_group_idx in range(num_pipeline_model_parallel_groups):
-        # In node-interleaved PP mode a stage's TP ranks span every node, so a
-        # PP chain's members are no longer tp_size apart in grank; build them
-        # explicitly, otherwise keep the legacy stride-based layout.
-        ranks = rank_layout.build_pp_group_ranks(
-            pp_group_idx,
-            tensor_model_parallel_size,
-            pipeline_model_parallel_size,
-        )
-        if ranks is None:
+        if rank_layout.pp_interleave_in_node():
+            # In node-interleaved PP mode a stage's TP ranks span every node, so
+            # a PP chain's members are no longer tp_size apart in grank; build
+            # them explicitly.
+            ranks = rank_layout.build_pp_group_ranks(
+                pp_group_idx,
+                pipeline_model_parallel_size,
+            )
+        else:
             ranks = list(
                 range(pp_group_idx, world_size, num_pipeline_model_parallel_groups)
             )

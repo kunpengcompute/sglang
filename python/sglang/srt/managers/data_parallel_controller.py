@@ -561,18 +561,23 @@ class DataParallelController:
         pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
         nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
 
-        if _is_kunpeng_binary_launch and rank_layout.pp_interleave_in_node():
-            inter = rank_layout.per_node_pp_tp_ranges(
+        if (
+            _is_kunpeng_binary_launch
+            and server_args.nnodes > 1
+            and rank_layout.pp_interleave_in_node()
+        ):
+            # In-node interleaved PP: a single node hosts every PP stage, so each
+            # node-local process slot gets a single (pp, tp) pair.
+            (
+                pp_rank_range,
+                tp_rank_range,
+                pp_size_per_node,
+                tp_size_per_node,
+            ) = rank_layout.per_node_pp_tp_ranges(
                 server_args.node_rank,
                 server_args.tp_rank_in_node,
                 server_args.pp_size,
-                server_args.tp_size,
             )
-        else:
-            inter = None
-
-        if inter is not None:
-            pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = inter
         else:
             pp_rank_range = range(
                 pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),

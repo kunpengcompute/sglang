@@ -334,11 +334,9 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     #   LOCAL_WORLD_SIZE=16, LRPS=8, ATTENTION_TP_SIZE=8 -> dp = NODE_RANK.
     LOCAL_WORLD_SIZE=$((TP_SIZE * PP_SIZE / WORLD_SIZE))
     ATTENTION_TP_SIZE=$((TP_SIZE / DP_SIZE))
-    # In-node interleave flag: canonical SGLANG_KUNPENG_PP_LAYOUT=1 (or "interleave"), or
-    # deprecated boolean alias SGLANG_KUNPENG_PP_INTERLEAVE_IN_NODE=1.
+    # In-node interleave flag: SGLANG_KUNPENG_PP_LAYOUT=1 (or "interleave").
     _PP_INTERLEAVE=0
     if [[ "${SGLANG_KUNPENG_PP_LAYOUT:-0}" == "1" || "${SGLANG_KUNPENG_PP_LAYOUT:-0}" == "interleave" ]]; then _PP_INTERLEAVE=1; fi
-    if [[ -z "${SGLANG_KUNPENG_PP_LAYOUT:-}" && "${SGLANG_KUNPENG_PP_INTERLEAVE_IN_NODE:-0}" == "1" ]]; then _PP_INTERLEAVE=1; fi
     for ((RANK_IN_NODE=0; RANK_IN_NODE < (TP_SIZE * PP_SIZE / WORLD_SIZE); RANK_IN_NODE++)); do
         if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" ]]; then
             SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/sglang_server"

@@ -1321,17 +1321,18 @@ def _calculate_rank_ranges(
     pp_size_per_node = max(pp_size // nnodes, 1)
     nnodes_per_pp_rank = max(nnodes // pp_size, 1)
 
-    if _is_kunpeng_binary_launch and rank_layout.pp_interleave_in_node() and nnodes > 1:
-        # In-node interleaved PP: a single node hosts every PP stage, so the
-        # ranges are a single (pp, tp) pair per node-local process slot.
-        inter = rank_layout.per_node_pp_tp_ranges(
-            server_args.node_rank,
+    if (
+        _is_kunpeng_binary_launch
+        and nnodes > 1
+        and rank_layout.pp_interleave_in_node()
+    ):
+        # In-node interleaved PP: a single node hosts every PP stage, so each
+        # node-local process slot gets a single (pp, tp) pair.
+        return rank_layout.per_node_pp_tp_ranges(
+            node_rank,
             server_args.tp_rank_in_node,
             pp_size,
-            tp_size,
         )
-        if inter is not None:
-            return inter
 
     pp_rank_range = range(
         pp_size_per_node * (node_rank // nnodes_per_pp_rank),
