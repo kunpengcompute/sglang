@@ -2164,7 +2164,8 @@ def initialize_model_parallel(
                             pipeline_model_parallel_size,
                         )
                     else:
-                        ranks = list(local_tp_ranks)
+                        base = tp_group_idx * tensor_model_parallel_size
+                        ranks = [base + r for r in local_tp_ranks]
                     group_ranks.append(ranks)
         logger.debug(
             "[DEBUG] [ATTN_CP Group] world_size=%s, attn_cp_size=%s, "
@@ -2213,7 +2214,8 @@ def initialize_model_parallel(
                         pipeline_model_parallel_size,
                     )
                 else:
-                    ranks = list(local_tp_ranks)
+                    base = tp_group_idx * tensor_model_parallel_size
+                    ranks = [base + r for r in local_tp_ranks]
                 group_ranks.append(ranks)
 
         logger.debug(
@@ -2257,7 +2259,8 @@ def initialize_model_parallel(
                         pipeline_model_parallel_size,
                     )
                 else:
-                    ranks = list(local_tp_ranks)
+                    base = tp_group_idx * tensor_model_parallel_size
+                    ranks = [base + r for r in local_tp_ranks]
                 group_ranks.append(ranks)
         _SOCKET_TP = init_model_parallel_group(
             group_ranks,
@@ -2309,7 +2312,8 @@ def initialize_model_parallel(
                         pipeline_model_parallel_size,
                     )
                 else:
-                    ranks = list(local_tp_ranks)
+                    base = tp_group_idx * tensor_model_parallel_size
+                    ranks = [base + r for r in local_tp_ranks]
                 group_ranks.append(ranks)
         logger.debug(
             "[DEBUG] [MOE_DP Group] world_size=%s, moe_dp_size=%s, "
@@ -2355,7 +2359,8 @@ def initialize_model_parallel(
                             pipeline_model_parallel_size,
                         )
                     else:
-                        ranks = list(local_tp_ranks)
+                        base = tp_group_idx * tensor_model_parallel_size
+                        ranks = [base + r for r in local_tp_ranks]
                     group_ranks.append(ranks)
         logger.debug(
             "[DEBUG] [MOE_EP Group] world_size=%s, moe_ep_size=%s, "
@@ -2401,7 +2406,8 @@ def initialize_model_parallel(
                         pipeline_model_parallel_size,
                     )
                 else:
-                    ranks = list(local_tp_ranks)
+                    base = tp_group_idx * tensor_model_parallel_size
+                    ranks = [base + r for r in local_tp_ranks]
                 group_ranks.append(ranks)
         logger.debug(
             "[DEBUG] [MOE_TP Group] world_size=%s, moe_tp_size=%s, "
