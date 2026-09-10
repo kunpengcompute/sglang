@@ -85,6 +85,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.data_parallel_controller import DataParallelController
+from sglang.srt.distributed import rank_layout
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -1319,6 +1320,20 @@ def _calculate_rank_ranges(
     """
     pp_size_per_node = max(pp_size // nnodes, 1)
     nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+
+    if (
+        _is_kunpeng_binary_launch
+        and nnodes > 1
+        and rank_layout.pp_interleave_in_node()
+    ):
+        # In-node interleaved PP: a single node hosts every PP stage, so each
+        # node-local process slot gets a single (pp, tp) pair.
+        return rank_layout.per_node_pp_tp_ranges(
+            node_rank,
+            server_args.tp_rank_in_node,
+            pp_size,
+        )
+
     pp_rank_range = range(
         pp_size_per_node * (node_rank // nnodes_per_pp_rank),
         pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),

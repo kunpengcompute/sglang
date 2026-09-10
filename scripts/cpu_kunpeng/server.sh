@@ -319,13 +319,24 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     # ── Log naming: translate (node index, rank-in-node) into the true
     # (dp, pp, attn-tp) identity so every log file is named after its real rank.
     # Global ranks are node-major: g = NODE_RANK * LOCAL_WORLD_SIZE + tp_rank_in_node.
-    # PP stages are contiguous chunks of TP_SIZE ranks (pp = g / TP_SIZE); inside
-    # one pp stage each DP group owns ATTENTION_TP_SIZE consecutive ranks
-    # (dp = (g % TP_SIZE) / ATTENTION_TP_SIZE, tp = (g % TP_SIZE) % ATTENTION_TP_SIZE).
-    # E.g. TP=256 DP=32 PP=2 on 32 nodes: LOCAL_WORLD_SIZE=16, ATTENTION_TP_SIZE=8,
-    # node 0..15 = pp0, node 16..31 = pp1, per node rin 0..7 = dpA tp0..7 / rin 8..15 = dpB.
+    #
+    # Two PP layouts:
+    # - Legacy node-block (SGLANG_KUNPENG_PP_LAYOUT=0): PP stages are
+    #   contiguous chunks of TP_SIZE ranks (pp = g / TP_SIZE); inside one pp stage
+    #   each DP group owns ATTENTION_TP_SIZE consecutive ranks
+    #   (dp = (g % TP_SIZE) / ATTENTION_TP_SIZE, tp = (g % TP_SIZE) % ATTENTION_TP_SIZE).
+    #   E.g. TP=256 DP=32 PP=2 on 32 nodes: node 0..15 = pp0, node 16..31 = pp1.
+    # - In-node interleave (SGLANG_KUNPENG_PP_LAYOUT=1): every node hosts
+    #   all PP stages; rin 0..(LRPS-1) -> PP0, next LRPS ranks -> PP1
+    #   (LRPS = LOCAL_WORLD_SIZE / PP_SIZE).  Stage-local tp =
+    #   NODE_RANK*LRPS + (rin % LRPS); dp = stage_tp / ATTENTION_TP_SIZE,
+    #   tp = stage_tp % ATTENTION_TP_SIZE.  E.g. TP=256 DP=32 PP=2 on 32 nodes:
+    #   LOCAL_WORLD_SIZE=16, LRPS=8, ATTENTION_TP_SIZE=8 -> dp = NODE_RANK.
     LOCAL_WORLD_SIZE=$((TP_SIZE * PP_SIZE / WORLD_SIZE))
     ATTENTION_TP_SIZE=$((TP_SIZE / DP_SIZE))
+    # In-node interleave flag: SGLANG_KUNPENG_PP_LAYOUT=1 (or "interleave").
+    _PP_INTERLEAVE=0
+    if [[ "${SGLANG_KUNPENG_PP_LAYOUT:-0}" == "1" || "${SGLANG_KUNPENG_PP_LAYOUT:-0}" == "interleave" ]]; then _PP_INTERLEAVE=1; fi
     for ((RANK_IN_NODE=0; RANK_IN_NODE < (TP_SIZE * PP_SIZE / WORLD_SIZE); RANK_IN_NODE++)); do
         if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" ]]; then
             SERVER_BIN="$PYINSTALL_PATH/dist/sglang_server_tp${RANK_IN_NODE}/sglang_server"
@@ -374,11 +385,20 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
         fi
 
         # True rank identity of this process (see the mapping above).
-        GLOBAL_RANK=$((NODE_RANK * LOCAL_WORLD_SIZE + RANK_IN_NODE))
-        PP_RANK=$((GLOBAL_RANK / TP_SIZE))
-        _IN_PP=$((GLOBAL_RANK % TP_SIZE))
-        DP_RANK_ACTUAL=$((_IN_PP / ATTENTION_TP_SIZE))
-        TP_RANK_ACTUAL=$((_IN_PP % ATTENTION_TP_SIZE))
+        if [[ ${_PP_INTERLEAVE} == 1 && ${PP_SIZE} -gt 1 ]]; then
+            _RIN_PER_STAGE=$((LOCAL_WORLD_SIZE / PP_SIZE))
+            PP_RANK=$((RANK_IN_NODE / _RIN_PER_STAGE))
+            _RIN_IN_STAGE=$((RANK_IN_NODE % _RIN_PER_STAGE))
+            _STAGE_TP=$((NODE_RANK * _RIN_PER_STAGE + _RIN_IN_STAGE))
+            DP_RANK_ACTUAL=$((_STAGE_TP / ATTENTION_TP_SIZE))
+            TP_RANK_ACTUAL=$((_STAGE_TP % ATTENTION_TP_SIZE))
+        else
+            GLOBAL_RANK=$((NODE_RANK * LOCAL_WORLD_SIZE + RANK_IN_NODE))
+            PP_RANK=$((GLOBAL_RANK / TP_SIZE))
+            _IN_PP=$((GLOBAL_RANK % TP_SIZE))
+            DP_RANK_ACTUAL=$((_IN_PP / ATTENTION_TP_SIZE))
+            TP_RANK_ACTUAL=$((_IN_PP % ATTENTION_TP_SIZE))
+        fi
 
         taskset -c $((RANK_IN_NODE * 38 + 20)) \
         $SERVER_BIN "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \

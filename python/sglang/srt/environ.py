@@ -585,6 +585,14 @@ class Envs:
     SGLANG_KUNPENG_ENABLE_SHM_FENCE = EnvBool(False)
     SGLANG_KUNPENG_RDMA_BCAST = EnvBool(False)
     SGLANG_ENABLE_KUCCL = EnvBool(False)
+    # PP layout for the Kunpeng CPU path (consumed by
+    # sglang.srt.distributed.rank_layout):
+    #   ""/"0"/"node_block" (default): a node maps to a single PP stage (legacy
+    #       node-block PP); dist rank = tp_size * pp_rank + tp_rank.
+    #   "1"/"interleave": every node hosts all PP stages (with LOCAL_WORLD_SIZE=16
+    #       and pp_size=2, rin 0..7 -> PP0 and rin 8..15 -> PP1); dist rank stays
+    #       node-major: node * 16 + rin.
+    SGLANG_KUNPENG_PP_LAYOUT = EnvStr("")
     # Mixed long-context (LC) mode: comma-separated DP ranks that run LC
     # decode-CP (e.g. "14,15"). Empty string = no LC rank (all regular).
     # Must be identical between prefill and decode instances (declared in
