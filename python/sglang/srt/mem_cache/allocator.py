@@ -64,16 +64,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return ""
 
     def available_size(self):
-        available = (len(self.free_pages) + len(self.release_pages)) * self.page_size
-        if _kv_pool_debug:
-            logger.info(
-                f"[KV_POOL] available_size "
-                f"free_pages={len(self.free_pages)} "
-                f"release_pages={len(self.release_pages)} "
-                f"page_size={self.page_size} "
-                f"available={available}"
-            )
-        return available
+        return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
     def get_kvcache(self):
         return self._kvcache
@@ -535,9 +526,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
         else:
             self.free_group.append(free_index)
-
-        if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.

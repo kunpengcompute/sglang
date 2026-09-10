@@ -263,6 +263,10 @@ class DeepseekMHAKunpengForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if self.swap_mgr.enable_swap_kv_in:
+            # Drain the async layer swap-in before writing new K/V into the
+            # same HBM buffer (a late copy of the stale DDR contents at the
+            # new-token slots would clobber the freshly written rows).
+            self.swap_mgr.wait_kv_swap_in()
             self.swap_mgr.set_kv_buffer_2(
                 self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, kv_a, k_pe
             )

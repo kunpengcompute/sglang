@@ -4,9 +4,17 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import (
+    is_cpu,
+    is_cpu_920f,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+)
 
 _is_cpu = is_cpu()
+_is_cpu_920f = is_cpu_920f()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -167,6 +175,90 @@ def build_tree_kernel_efficient(
     )
 
 
+def verify_tree_greedy_kunpeng(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+):
+    """Kunpeng-920F port of the CUDA `VerifyTreeGreedy` kernel.
+
+    Faithfully mirrors sgl-kernel `verify_tree_greedy`
+    (`sgl-kernel/csrc/speculative/eagle_utils.cu`) for the linear topk==1
+    chain trees that the kunpeng CPU builder produces
+    (`sgl-kernel/csrc/cpu/cpu_kunpeng/speculative/mtp_kernels_kunpeng.cpp`:
+    retrieve_next_token[t] = t+1, retrieve_next_sibling = -1, and
+    retrieve_index stores the flat candidate index b*nv+t).
+
+    For each request the walk starts at the root candidate (retrieve_index
+    column 0, always recorded into accept_index[0]) and follows the chain:
+    candidate t+1 is accepted iff its draft token equals the target argmax at
+    the last accepted candidate's position. `accept_token_num` counts the
+    accepted *drafts* (root excluded); after the walk the model's own argmax
+    at the last accepted position is written back as the bonus token. Only
+    reachable on kunpeng 920F with speculative_num_steps > 1 (mtp=1 on
+    kunpeng uses the fused `verify_mtp_kunpeng` kernel instead).
+    """
+    bs, nv = candidates.shape
+    nss = accept_index.shape[1]
+    # Single C->Python conversion per tensor: per-element tensor indexing /
+    # `.item()` inside the walk is the dominant cost of this pure-Python
+    # fallback (reachable on kunpeng 920F whenever the fused
+    # `verify_mtp_kunpeng` guard degrades, e.g. grammar / stop-strs /
+    # reasoning in the batch). Snapshot the rows once into plain lists and
+    # walk the lists; the mutated results are written back with one tensor
+    # copy per output, keeping the algorithm byte-for-byte identical.
+    cand_f = candidates.reshape(-1).tolist()
+    ridx = retrieve_index.reshape(-1).tolist()
+    rnt = retrieve_next_token.reshape(-1).tolist()
+    rns = retrieve_next_sibling.reshape(-1).tolist()
+    tp_f = target_predict.reshape(-1).tolist()
+    predicts_list = predicts.reshape(-1).tolist()
+    accept_rows: List[List[int]] = []
+    num_accs: List[int] = []
+
+    for b in range(bs):
+        base = b * nv
+        last = ridx[base]
+        row = [-1] * nss
+        row[0] = last
+        num_acc = 0
+        cur = 0
+        for _ in range(1, nss):
+            cur = rnt[base + cur]
+            while cur != -1:
+                di = ridx[base + cur]
+                if cand_f[base + cur] == tp_f[last]:
+                    predicts_list[last] = tp_f[last]
+                    num_acc += 1
+                    row[num_acc] = di
+                    last = di
+                    break
+                cur = rns[base + cur]
+            if cur == -1:
+                break
+        accept_rows.append(row)
+        num_accs.append(num_acc)
+        predicts_list[last] = tp_f[last]
+
+    if bs > 0:
+        predicts.reshape(-1).copy_(
+            torch.tensor(
+                predicts_list, dtype=predicts.dtype, device=predicts.device
+            )
+        )
+        accept_index.copy_(
+            torch.tensor(accept_rows, dtype=accept_index.dtype, device=accept_index.device)
+        )
+        accept_token_num.copy_(
+            torch.tensor(num_accs, dtype=accept_token_num.dtype, device=accept_token_num.device)
+        )
+
+
 def verify_tree_greedy_func(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -178,7 +270,21 @@ def verify_tree_greedy_func(
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
-    if _is_cuda or _is_hip or _is_musa:
+    if _is_cpu_920f:
+        # sgl_kernel.verify_tree_greedy is CUDA-only; the kunpeng CPU backend
+        # needs its own chain walk (mtp=1 uses the fused verify_mtp_kunpeng
+        # kernel, spec_steps>1 falls through to this generic path).
+        verify_tree_greedy_kunpeng(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
+        )
+    elif _is_cuda or _is_hip or _is_musa:
         from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(

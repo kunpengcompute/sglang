@@ -3016,12 +3016,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         with ctx:
-            return self.model.forward(
+            output = self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
             )
+        return output
 
     @Kunpeng_PP_Profiler(depth=1)
     def forward_extend(

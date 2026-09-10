@@ -229,8 +229,13 @@ def is_kunpeng_graph_profile() -> bool:
 
 
 def is_kunpeng_extend_pad() -> bool:
+    # Power-of-2 EXTEND padding must apply in BOTH graph and eager paths so
+    # that a graph run and a graph-disabled run pad tokens identically
+    # (kernels must be row-count invariant; equalizing pad rows keeps the
+    # graph-vs-eager comparison free of the pad-count variable). It must NOT
+    # be gated on is_kunpeng_graph_capture().
     return (
-        is_kunpeng_graph_capture()
+        is_cpu_920f()
         and os.environ.get("SGLANG_KUNPENG_EXTEND_POWER_2_PADDING", "0") == "1"
     )
 

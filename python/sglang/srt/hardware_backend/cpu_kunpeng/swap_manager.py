@@ -529,6 +529,20 @@ class KunpengSwapManager:
         if self.enable_swap_kv_blockwise:
             return
 
+        # Full-layer mirror: the single shared HBM buffer is sized by the
+        # FIRST runner that called init_kv_buffer (target or draft). A layer
+        # buffer larger than it would make the SDMA copy write past the
+        # buffer into adjacent HBW pool allocations, so fail loudly instead.
+        if (
+            kv_buffer.shape[0] > self._cur_kv_hbm.shape[0]
+            or kv_buffer.shape[1:] != self._cur_kv_hbm.shape[1:]
+        ):
+            raise RuntimeError(
+                f"KV swap-in size mismatch: layer kv_buffer "
+                f"{tuple(kv_buffer.shape)} does not fit the shared HBM KV "
+                f"buffer {tuple(self._cur_kv_hbm.shape)} (sized by the first "
+                f"runner's pool; target and draft pools must both fit)"
+            )
         total_bytes = kv_buffer.numel() * kv_buffer.element_size()
         kunpeng.kupl_sdma_kv_swapin(
             self._cur_kv_hbm,
@@ -616,6 +630,21 @@ class KunpengSwapManager:
         kunpeng.kupl_sdma_wait_all(
             self._kv_ddr_event_tensor, self._kv_ddr_event_num_tensor
         )
+
+    def wait_kv_swap_in(self) -> None:
+        """Drain pending DDR->HBM swap-in events for the current layer.
+
+        Must run BEFORE writing this step's new K/V into ``_cur_kv_hbm``:
+        the swap-in is an async DMA over the whole pool, so a copy of the
+        stale DDR contents landing at the new-token slots after the write
+        would clobber the freshly written K/V (the later read via
+        :meth:`get_kv_cache` waits for the same events but only after the
+        write already happened).
+        """
+        if self.enable_swap_kv_in:
+            kunpeng.kupl_sdma_wait_all(
+                self._kv_swap_in_event_tensor, self._kv_swap_in_event_num_tensor
+            )
 
     def get_kv_cache(self) -> torch.Tensor:
         """Return KV cache for the current layer from HBM buffer.

@@ -78,9 +78,13 @@ at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t
 /**
  * Get or create a cached SHM tensor in bfloat16, sized by bs.
  *
- * If bs < g_max_seq_num, the tensor shape is [g_max_seq_num, dim] and is
- * cached for reuse. Otherwise the tensor shape is [g_max_tokens, dim]
- * where g_max_tokens = g_max_seq_num * g_max_cur_len.
+ * If bs <= max(g_max_seq_num, intra_node_size), the tensor shape is
+ * [max(g_max_seq_num, intra_node_size), dim] and is cached for reuse.
+ * Otherwise the tensor is sized to bs rounded up to a multiple of that
+ * small-cache batch size (bounded by g_max_tokens = g_max_seq_num *
+ * g_max_cur_len), so decode/verify-sized comm buffers do not over-allocate
+ * the shared-memory pool. A larger bs later reallocates and replaces the
+ * cache entry.
  *
  * @param dim  Second dimension of the tensor.
  * @param bs   Batch size (mandatory). Determines which cached buffer to use.
