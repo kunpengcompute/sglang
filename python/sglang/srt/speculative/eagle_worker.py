@@ -72,8 +72,11 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
+    get_int_env_var,
     is_cpu_920f,
     is_cuda,
+    is_kunpeng_graph_capture,
     is_musa,
     is_npu,
     next_power_of_2,
@@ -81,8 +84,17 @@ from sglang.srt.utils import (
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_cpu_920f = is_cpu_920f()
+_is_kunpeng_graph_capture = is_kunpeng_graph_capture()
 _is_npu = is_npu()
 _is_musa = is_musa()
+
+# Debug: aggregate per-step MTP draft acceptance and dump d1 / d2 acceptance
+# rates every N verify rounds. Shared by both the PP>1 path (PPNextNWorker,
+# which records in its own _pp_mtp_verify) and the PP=1 path (recorded in
+# EAGLEWorker.verify). No cross-process communication: the counters live only
+# on the worker that runs the verify phase.
+_ENABLE_MTP_ACCEPTANCE_STATS = get_bool_env_var("SGLANG_MTP_ACCEPTANCE_STATS")
+_MTP_ACCEPTANCE_LOG_INTERVAL = get_int_env_var("SGLANG_MTP_ACCEPTANCE_LOG_INTERVAL", 32)
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -301,6 +313,54 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+        # Per-verify acceptance counters (SGLANG_MTP_ACCEPTANCE_STATS=1).
+        self._mtp_accept_stats = {
+            "total_verify": 0,
+            "accepted_ge1": 0,  # steps where d1 (the 1st draft) was accepted
+            "accepted_ge2": 0,  # steps where d1 and d2 (both drafts) accepted
+        }
+        self._mtp_accept_histogram = [0, 0, 0]  # [steps accepting exactly k drafts]
+
+    def _mtp_acceptance_record(self, num_accepted_drafts_per_req_cpu: List[int]) -> None:
+        """Accumulate per-req accepted draft counts into the aggregate stats."""
+        if not _ENABLE_MTP_ACCEPTANCE_STATS:
+            return
+        for n in num_accepted_drafts_per_req_cpu:
+            if n >= len(self._mtp_accept_histogram):
+                self._mtp_accept_histogram.extend([0] * (n - len(self._mtp_accept_histogram) + 1))
+            self._mtp_accept_histogram[n] += 1
+            self._mtp_accept_stats["total_verify"] += 1
+            if n >= 1:
+                self._mtp_accept_stats["accepted_ge1"] += 1
+            if n >= 2:
+                self._mtp_accept_stats["accepted_ge2"] += 1
+        if self._mtp_accept_stats["total_verify"] >= _MTP_ACCEPTANCE_LOG_INTERVAL:
+            self._mtp_acceptance_dump()
+
+    def _mtp_acceptance_dump(self) -> None:
+        """Log the aggregated d1 / d2 acceptance rates and reset counters."""
+        s = self._mtp_accept_stats
+        total = max(s["total_verify"], 1)
+        d1 = s["accepted_ge1"]
+        d2 = s["accepted_ge2"]
+        d2_cond = d2 / max(d1, 1)
+        hist_str = ", ".join(
+            f"accept_{k}={c}" for k, c in enumerate(self._mtp_accept_histogram)
+        )
+        logger.info(
+            f"[PP_LAST][MTP_ACCEPT] verify_steps={total} "
+            f"d1_accept_rate={d1 / total:.4f} "
+            f"d2_accept_rate={d2 / total:.4f} "
+            f"d2_cond_accept_rate={d2_cond:.4f} "
+            f"({hist_str})"
+        )
+        self._mtp_accept_stats = {
+            "total_verify": 0,
+            "accepted_ge1": 0,
+            "accepted_ge2": 0,
+        }
+        self._mtp_accept_histogram = [0, 0, 0]
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -782,8 +842,15 @@ class EAGLEWorker(TpModelWorker):
         batch.return_hidden_states = False
         if _is_cpu_920f and self.topk == 1:
             # topk==1: repeat_interleave(1) is an identity copy of seq_lens
-            # (both int64). Reuse seq_lens directly to skip the aten op.
-            spec_info.positions = batch.seq_lens
+            # (both int64). Use a cheap clone to skip the aten op.
+            # MUST be a copy, never an alias: draft_forward mutates
+            # forward_batch.positions in place (positions.add_(1) per chain
+            # step), and ForwardBatch.init_new assigns spec_info.positions by
+            # reference — aliasing seq_lens here lets speculative_num_steps>1
+            # shift ScheduleBatch.seq_lens by +1 between the draft-side and
+            # verify-side allocations, which silently bypasses page pops at
+            # page boundaries and leaks KV pool pages.
+            spec_info.positions = batch.seq_lens.clone()
         else:
             spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
@@ -980,6 +1047,11 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            if _is_kunpeng_graph_capture:
+                # Per-step draft graphs replay into a shared graph pool;
+                # clone so the next step's replay cannot overwrite this
+                # step's h-condition in place.
+                hidden_states = hidden_states.clone()
 
         if topk1 and self.speculative_num_steps == 1:
             # 1-step + topk==1: score_list/token_list/parents_list are
@@ -1069,6 +1141,8 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
+
+        self._mtp_acceptance_record(res.num_accepted_drafts_per_req_cpu)
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
@@ -1351,6 +1425,12 @@ class EAGLEWorker(TpModelWorker):
             logits_output.next_token_logits
         )
         draft_input.hidden_states = logits_output.hidden_states
+        if _is_kunpeng_graph_capture:
+            # Graph replay returns from_blob views into the graph pool
+            # (shared across graphs when the HBW pool is enabled). The
+            # h-condition survives multiple replays (verify + draft chain)
+            # before the next round consumes it, so it must be owned memory.
+            draft_input.hidden_states = draft_input.hidden_states.clone()
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

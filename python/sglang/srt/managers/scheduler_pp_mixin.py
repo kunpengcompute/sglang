@@ -622,10 +622,12 @@ class SchedulerPPMixin:
             defaultdict(deque)
         )
 
-        # PP + MTP (1-step): the draft token of every req that is about to be
-        # verified in the next decode round, keyed by req.rid. Filled on the
-        # last rank right after its worker produces the drafts, and on the
-        # other ranks when the output message circulates back.
+        # PP + MTP: the per-req drafts (`speculative_num_steps` per req) that
+        # are about to be verified in the next decode round, keyed by req.rid.
+        # Filled on the last rank right after its worker produces the drafts,
+        # and on the other ranks when the output message circulates back.
+        # Finished requests carry [-1] * num_steps placeholders that are
+        # skipped at the stash sites.
         self._pp_mtp_enabled = (
             self.pp_size > 1
             and self.spec_algorithm is not None
@@ -636,12 +638,14 @@ class SchedulerPPMixin:
         #   - `process_batch_result_decode` pops the residue of reqs that
         #     finished or were retracted this round;
         #   - PD prefill pops on transfer hand-over.
-        # Known bounded leak: a req retracted and then aborted leaves one int
+        # Known bounded leak: a req retracted and then aborted leaves one
         # entry behind (rids are never recycled; harmless).
-        self._pp_pending_drafts: Dict[str, int] = {}
+        self._pp_mtp_num_steps = int(self.server_args.speculative_num_steps or 0)
+        self._pp_pending_drafts: Dict[str, List[int]] = {}
         _ppmtp_log(
             self,
             f"init: pp_mtp_enabled={self._pp_mtp_enabled} "
+            f"num_steps={self._pp_mtp_num_steps} "
             f"pp_size={self.pp_size} spec={self.spec_algorithm}",
         )
 
@@ -1535,12 +1539,13 @@ class SchedulerPPMixin:
                 # disagreement); fail loudly without corrupting
                 # `_pp_pending_drafts` with misaligned entries.
                 expected_bs = batch.batch_size()
-                if draft_tokens.numel() != expected_bs:
+                num_steps = self._pp_mtp_num_steps
+                if draft_tokens.numel() != expected_bs * num_steps:
                     raise RuntimeError(
                         "PP+MTP: draft_tokens size "
-                        f"({draft_tokens.numel()}) != batch size "
-                        f"({expected_bs}); PP ranks' running batches "
-                        "have desynced"
+                        f"({draft_tokens.numel()}) != batch size * num_steps "
+                        f"({expected_bs} * {num_steps}); PP ranks' "
+                        "running batches have desynced"
                     )
                 if (
                     num_accepted_tokens is not None
@@ -1552,20 +1557,30 @@ class SchedulerPPMixin:
                         f"({expected_bs}); PP ranks' running batches "
                         "have desynced"
                     )
-                # `draft_tokens` is aligned with `batch.reqs` (finished
-                # requests carry a -1 placeholder that is skipped).  The `-1`
-                # placeholder is also the finish-verdict channel: it marks
+                # `draft_tokens` is a flat list aligned with `batch.reqs`
+                # (num_steps entries per req); finished requests carry -1
+                # placeholders that are skipped, so the slicing is positionally
+                # correct even when some requests finished early and the last
+                # rank only produced drafts for the unfinished subset.  The
+                # `-1` placeholder is also the finish-verdict channel: it marks
                 # exactly the requests the last rank's verify finished this
                 # round (single-arbiter semantics reconciled by
                 # `_pp_mtp_apply_verify_result`).
-                draft_tokens_list = draft_tokens.tolist()
-                batch.pp_mtp_ring_finished = [tok < 0 for tok in draft_tokens_list]
+                flat = draft_tokens.tolist()
+                batch.pp_mtp_ring_finished = [
+                    any(
+                        tok < 0
+                        for tok in flat[i * num_steps : (i + 1) * num_steps]
+                    )
+                    for i in range(len(batch.reqs))
+                ]
                 batch.pp_mtp_accepted_tokens = num_accepted_tokens
                 stashed_rids = []
-                for req, tok in zip(batch.reqs, draft_tokens_list):
-                    if tok < 0:
+                for idx, req in enumerate(batch.reqs):
+                    slice_ = flat[idx * num_steps : (idx + 1) * num_steps]
+                    if len(slice_) != num_steps or any(tok < 0 for tok in slice_):
                         continue
-                    self._pp_pending_drafts[req.rid] = int(tok)
+                    self._pp_pending_drafts[req.rid] = slice_
                     stashed_rids.append(req.rid)
                 _ppmtp_log(
                     self,
@@ -1784,23 +1799,27 @@ class SchedulerPPMixin:
                         # PP + MTP: the last rank produces the next round's
                         # drafts locally; stash them before the ring brings the
                         # message back (one full loop too late). `draft_tokens`
-                        # is aligned with `cur_batch.reqs` (finished requests
-                        # carry a -1 placeholder that is skipped).  The `-1`
-                        # placeholder doubles as the finish-verdict channel
-                        # for the non-last ranks, so its exactness is
-                        # load-bearing: check it here at the single
-                        # construction point.
-                        draft_tokens_list = result.draft_tokens.tolist()
-                        if len(draft_tokens_list) != len(self.cur_batch.reqs):
+                        # is aligned with `cur_batch.reqs` (num_steps entries
+                        # per req; finished requests carry a -1 placeholder
+                        # slice that is skipped).  The `-1` placeholder doubles
+                        # as the finish-verdict channel for the non-last ranks,
+                        # so its exactness is load-bearing: check it here at
+                        # the single construction point.
+                        num_steps = self._pp_mtp_num_steps
+                        flat = result.draft_tokens.tolist()
+                        if len(flat) != len(self.cur_batch.reqs) * num_steps:
                             raise RuntimeError(
                                 "PP+MTP: draft_tokens size "
-                                f"({len(draft_tokens_list)}) != batch size "
-                                f"({len(self.cur_batch.reqs)}); "
+                                f"({len(flat)}) != batch size * num_steps "
+                                f"({len(self.cur_batch.reqs)} * {num_steps}); "
                                 "_next_draft_from_spec_info misaligned"
                             )
                         stashed_rids = []
-                        for req, tok in zip(self.cur_batch.reqs, draft_tokens_list):
-                            if tok < 0:
+                        for idx, req in enumerate(self.cur_batch.reqs):
+                            slice_ = flat[idx * num_steps : (idx + 1) * num_steps]
+                            if len(slice_) != num_steps or any(
+                                tok < 0 for tok in slice_
+                            ):
                                 if not req.finished():
                                     raise RuntimeError(
                                         "PP+MTP: draft placeholder -1 for "
@@ -1808,7 +1827,7 @@ class SchedulerPPMixin:
                                         "_next_draft_from_spec_info join broken"
                                     )
                                 continue
-                            self._pp_pending_drafts[req.rid] = int(tok)
+                            self._pp_pending_drafts[req.rid] = slice_
                             stashed_rids.append(req.rid)
                         _ppmtp_log(
                             self,
@@ -1858,12 +1877,14 @@ class SchedulerPPMixin:
             # by the KV-transfer metadata instead of the output ring message.
             for req in batch.reqs:
                 if req.rid not in self._pp_pending_drafts:
-                    tok = self._pp_pd_extract_transferred_draft(req)
-                    if tok is not None:
-                        self._pp_pending_drafts[req.rid] = tok
+                    drafts = self._pp_pd_extract_transferred_draft(
+                        req, self._pp_mtp_num_steps
+                    )
+                    if drafts is not None:
+                        self._pp_pending_drafts[req.rid] = drafts
                         _ppmtp_log(
                             self,
-                            f"maybe_prepare: rid={req.rid} fallback draft={tok} "
+                            f"maybe_prepare: rid={req.rid} fallback drafts={drafts} "
                             f"from req.output_topk_index",
                         )
             missing = [
@@ -1878,11 +1899,11 @@ class SchedulerPPMixin:
         self._pp_mtp_prepare_verify_batch(batch)
 
     @staticmethod
-    def _pp_pd_extract_transferred_draft(req) -> Optional[int]:
-        """Extract the first transferred draft token from a request.
+    def _pp_pd_extract_transferred_draft(req, num_steps) -> Optional[List[int]]:
+        """Extract the transferred draft tokens of a request.
 
-        In disaggregated deployment the first draft of a request is produced
-        on the prefill server and travels inside the KV-transfer metadata
+        In disaggregated deployment the first drafts of a request are produced
+        on the prefill server and travel inside the KV-transfer metadata
         (`req.output_topk_index`, restored by `_commit_transfer_to_req` on
         every PP rank). Returns None when no metadata is attached.
         """
@@ -1890,45 +1911,83 @@ class SchedulerPPMixin:
         if idx is None:
             return None
         try:
-            tok = int(idx[0])
+            toks = [int(t) for t in idx[:num_steps]]
         except (TypeError, IndexError):
             return None
-        return tok
+        if len(toks) != num_steps or any(t < 0 for t in toks):
+            return None
+        return toks
+
+    @staticmethod
+    def _pp_mtp_build_linear_tree(
+        bs: int,
+        draft_token_num: int,
+        seq_lens: List[int],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a linear chain tree [root, d1, ..., d_{N-1}] per request.
+
+        Mirrors build_tree_kernel_kunpeng for topk=1, spec_steps=N.
+        """
+        positions = torch.tensor(
+            [
+                pos
+                for seq_len in seq_lens
+                for pos in range(seq_len, seq_len + draft_token_num)
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        retrieve_index = torch.arange(
+            bs * draft_token_num, dtype=torch.long, device=device
+        ).reshape(bs, draft_token_num)
+        retrieve_next_token = torch.tensor(
+            [list(range(1, draft_token_num)) + [-1]] * bs,
+            dtype=torch.long,
+            device=device,
+        )
+        retrieve_next_sibling = torch.full(
+            (bs, draft_token_num), -1, dtype=torch.long, device=device
+        )
+        return positions, retrieve_index, retrieve_next_token, retrieve_next_sibling
 
     def _pp_mtp_prepare_verify_batch(self: Scheduler, batch: ScheduleBatch):
-        """Turn a decode batch into a 1-step TARGET_VERIFY batch.
+        """Turn a decode batch into a N-step TARGET_VERIFY batch.
 
-        input_ids = [root, draft] per req, where the root is the last confirmed
-        token (req.output_ids[-1]) and the draft comes from the scheduler's
-        pending per-req state. KV locations are allocated extend-style via the
-        same prepare_for_verify logic used in non-PP EAGLE, and the batch's
-        spec_info carries the linear 1-step tree so that the forward path and
-        the last-rank acceptance machinery see the same structures.
+        input_ids = [root, d1, ..., dN] per req, where the root is the last
+        confirmed token (req.output_ids[-1]) and the drafts come from the
+        scheduler's pending per-req state (N = speculative_num_steps). KV
+        locations are allocated extend-style via the same prepare_for_verify
+        logic used in non-PP EAGLE, and the batch's spec_info carries the
+        linear N-step tree so that the forward path and the last-rank
+        acceptance machinery see the same structures.
         """
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         reqs = batch.reqs
         bs = len(reqs)
         device = self.device
-        draft_token_num = 2  # [root, draft]
+        num_steps = self._pp_mtp_num_steps
+        draft_token_num = num_steps + 1  # [root, d1, ..., dN]
 
         seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
         input_ids = []
-        positions = []
         for r in reqs:
-            draft = self._pp_pending_drafts.pop(r.rid, None)
-            if draft is None or draft < 0:
+            drafts = self._pp_pending_drafts.pop(r.rid, None)
+            if drafts is None or len(drafts) != num_steps or any(
+                d < 0 for d in drafts
+            ):
                 raise RuntimeError(
                     f"PP+MTP: missing pending draft for req {r.rid} during verify prep"
                 )
             input_ids.append(r.output_ids[-1])
-            input_ids.append(draft)
+            input_ids.extend(drafts)
 
         _ppmtp_log(
             self,
-            f"prepare_verify: bs={bs} seq_lens={seq_lens} "
-            f"roots={[i for i in input_ids[::2]]} "
-            f"drafts={[i for i in input_ids[1::2]]}",
+            f"prepare_verify: bs={bs} num_steps={num_steps} seq_lens={seq_lens} "
+            f"roots={[input_ids[i * draft_token_num] for i in range(bs)]} "
+            f"drafts={[input_ids[i * draft_token_num + 1 : (i + 1) * draft_token_num] for i in range(bs)]}",
         )
 
         batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
@@ -1939,31 +1998,22 @@ class SchedulerPPMixin:
         batch.input_embeds = None
         batch.forward_mode = ForwardMode.TARGET_VERIFY
 
-        # Linear 1-step tree: positions [seq_len, seq_len+1] per req and the
-        # corresponding retrieve structures (mirrors build_tree_kernel_kunpeng
-        # for topk=1, spec_steps=1).
-        positions = [
-            pos for seq_len in seq_lens for pos in (seq_len, seq_len + 1)
-        ]
-        retrieve_index = torch.arange(
-            bs * draft_token_num, dtype=torch.long, device=device
-        ).reshape(bs, draft_token_num)
-        retrieve_next_token = torch.tensor(
-            [[1, -1]] * bs, dtype=torch.long, device=device
-        )
-        retrieve_next_sibling = torch.full(
-            (bs, draft_token_num), -1, dtype=torch.long, device=device
-        )
+        (
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+        ) = self._pp_mtp_build_linear_tree(bs, draft_token_num, seq_lens, device)
 
         verify_input = EagleVerifyInput(
             draft_token=batch.input_ids,
             custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
-            positions=torch.tensor(positions, dtype=torch.int64, device=device),
+            positions=positions,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_cum_len=None,
-            spec_steps=1,
+            spec_steps=num_steps,
             topk=1,
             draft_token_num=draft_token_num,
             capture_hidden_mode=CaptureHiddenMode.FULL,

@@ -56,7 +56,7 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_decode_backend,
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
-            "kunpeng_cpu": lambda: None,
+            "kunpeng_cpu": self._create_kunpeng_cpu_decode_backend,
         }
 
         return self._create_backend(
@@ -284,3 +284,12 @@ class DraftBackendFactory:
         )
 
         return KunpengCpuBackend(self.draft_model_runner)
+
+    def _create_kunpeng_cpu_decode_backend(self):
+        from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_multi_step_draft_backend import (
+            KunpengCpuMultiStepDraftBackend,
+        )
+
+        return KunpengCpuMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )

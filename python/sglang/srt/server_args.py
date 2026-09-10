@@ -3565,6 +3565,16 @@ class ServerArgs:
                     )
 
             if (
+                is_cpu_920f()
+                and self.speculative_num_steps > 1
+                and self.speculative_eagle_topk != 1
+            ):
+                raise ValueError(
+                    "NEXTN/EAGLE on the kunpeng CPU backend supports only "
+                    "speculative_eagle_topk == 1 for multi-step chain drafting."
+                )
+
+            if (
                 self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
             ):

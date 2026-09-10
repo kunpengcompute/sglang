@@ -551,13 +551,18 @@ class SchedulerDisaggregationPrefillMixin:
                 # the next draft-extend is re-captured by the decode-side
                 # verify forward, so hidden states are not transferred).
                 if getattr(self, "_pp_mtp_enabled", False):
-                    draft = self._pp_pending_drafts.get(req.rid)
-                    if draft is not None:
-                        req.output_topk_p = torch.tensor(
-                            [1.0], dtype=torch.float32
+                    drafts = self._pp_pending_drafts.get(req.rid)
+                    num_steps = getattr(self, "_pp_mtp_num_steps", 1) or 1
+                    if drafts is not None and len(drafts) == num_steps:
+                        assert num_steps <= 16, (
+                            "PD transfer metadata buffer holds at most 16 draft "
+                            f"tokens; got num_steps={num_steps}"
+                        )
+                        req.output_topk_p = torch.ones(
+                            (num_steps,), dtype=torch.float32
                         )
                         req.output_topk_index = torch.tensor(
-                            [draft], dtype=torch.int64
+                            drafts, dtype=torch.int64
                         )
                     else:
                         logger.debug(

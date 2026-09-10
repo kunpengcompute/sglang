@@ -146,6 +146,13 @@ class DeepseekMLAKunpengForwardMixin:
             return loc, kk, pp
 
         if self.swap_mgr.enable_swap_kv_in:
+            # The layer's swap-in is an async DMA over the whole pool and may
+            # still be in flight; drain it before writing this step's new K/V
+            # into the same HBM buffer. Otherwise a late-landing copy of the
+            # stale DDR contents at the new-token slots clobbers the freshly
+            # written K/V (the read-side wait in get_kv_cache only orders the
+            # copy against the read, not against this write).
+            self.swap_mgr.wait_kv_swap_in()
             # Block-wise (decode): out_cache_loc is remapped to HBM flat
             # positions; k_nope/k_pe must be sliced to this rank's Btp tokens
             # to match (Btp == B when all2all is disabled). token_slice_start

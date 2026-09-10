@@ -1972,7 +1972,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator,
         )
 
-        if _is_cpu_920f:
+        if _is_cpu_920f and not self.is_nextn:
+            # The NextN draft layer reuses this code path; its layer_id (0)
+            # collides with the target's layer 0 in the swap order, so an
+            # unguarded prefetch would copy TARGET layer-1 expert weights
+            # into the shared HBM buffer from inside every draft replay.
             self._swap_mgr.swap_next_expert_layer(self.layer_id)
         if _is_cpu_920f and self._swap_mgr.enable_swap_kv_out:
             self._swap_mgr.wait_kv_ddr()

@@ -1285,7 +1285,15 @@ class DecodeTransferQueue:
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
-            decode_req.req.hidden_states_tensor = output_hidden_states
+            if getattr(self.scheduler, "_pp_mtp_enabled", False):
+                # PP+MTP: the prefill side never transfers the MTP h-condition
+                # (the decode-side verify forward re-captures it); the metadata
+                # hidden_states row stays all zeros. Do not attach a stale
+                # zeros tensor to the req (it would be consumed as if real by
+                # any non-PP path).
+                decode_req.req.hidden_states_tensor = None
+            else:
+                decode_req.req.hidden_states_tensor = output_hidden_states
 
         if decode_req.req.return_logprob:
             decode_req.req.output_token_logprobs_val.append(

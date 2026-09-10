@@ -336,10 +336,12 @@ if [[ "$IS_PREFILL" == "1" ]]; then
 else
     # Equivalent to MAX_SEQ_NUM / PP_SIZE in DeepSeek-V3-Sample (max_seq_num_per_mb):
     export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-64}"
-    # Decode MTP speculates 1 extra token per step: cur len must be 2
+    # Decode MTP: a verify micro-batch holds (root + speculative_num_steps
+    # draft) tokens per sequence, so the per-sequence in-flight width is
+    # speculative_num_steps + 1.
     if [[ -z "${SGLANG_KUNPENG_MAX_CUR_LEN:-}" ]]; then
         if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
-            export SGLANG_KUNPENG_MAX_CUR_LEN=2
+            export SGLANG_KUNPENG_MAX_CUR_LEN=$(( ${SGLANG_SPECULATIVE_NUM_STEPS:-2} + 1 ))
         else
             export SGLANG_KUNPENG_MAX_CUR_LEN=1
         fi

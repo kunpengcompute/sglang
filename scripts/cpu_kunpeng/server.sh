@@ -101,7 +101,7 @@ fi
 if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
     BASE_ARGS+=(
         --speculative-algorithm NEXTN
-        --speculative-num-steps 1
+        --speculative-num-steps "${SGLANG_SPECULATIVE_NUM_STEPS:-2}"
         --speculative-eagle-topk 1
     )
     # Use explicit draft model path if set; otherwise omit the argument

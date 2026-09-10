@@ -1698,5 +1698,6 @@ class KunpengCpuBackend(AttentionBackend):
         return False
 
     def get_cuda_graph_seq_len_fill_value(self):
-        # 多节点prepare_mlp_sync会调用到
-        return 1
+        # 多节点prepare_mlp_sync会调用到；verify/draft-extend batch 每 seq 有
+        # speculative_num_draft_tokens 行，seq_len 填充值需与其一致
+        return self.speculative_num_draft_tokens

@@ -483,9 +483,8 @@ class SchedulerOutputProcessorMixin:
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
-        # Replicate the last rank's one-step MTP verify updates for all requests
-        # in a single batched pass (removes the per-request O(n^2) prefix sum
-        # and per-request evict-mask allocations).
+        # Replicate the last rank's MTP verify updates for all requests in a
+        # single batched pass (removes the per-request O(n^2) prefix sum).
         if (
             is_spec_v1
             and batch.pp_mtp_accepted_tokens is not None
@@ -602,6 +601,15 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
+        if (
+            is_spec_v1
+            and batch.pp_mtp_accepted_tokens is not None
+            and not self.pp_group.is_last_rank
+        ):
+            # PP+MTP: free the rejected draft KV slots in one batch-wide pass
+            # (the last rank already did it inside EagleVerifyInput.verify()).
+            self._pp_mtp_evict_rejected_drafts(batch)
+
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -615,15 +623,15 @@ class SchedulerOutputProcessorMixin:
     def _pp_mtp_apply_verify_result(
         self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult, i: int
     ) -> None:
-        """Replicate the last rank's 1-step MTP verify updates for request i.
+        """Replicate the last rank's MTP verify updates for request i.
 
         Mirrors the per-request updates of `EagleVerifyInput.verify()` so that
         every PP rank keeps identical request state: the accepted tokens are
-        appended to output_ids, finish conditions are checked, KV bookkeeping
-        advances, and the rejected draft's KV slots are freed.
+        appended to output_ids, finish conditions are checked, and KV
+        bookkeeping advances. The rejected draft's KV slots are freed
+        batch-wide by `_pp_mtp_evict_rejected_drafts` after the per-request
+        loop (mirroring the last rank's single-pass eviction).
         """
-        from sglang.srt.utils import is_cpu_920f
-
         req = batch.reqs[i]
         num_accepted = int(batch.pp_mtp_accepted_tokens[i])
 
@@ -720,39 +728,88 @@ class SchedulerOutputProcessorMixin:
         req.kv_allocated_len = req.kv_committed_len
         req.spec_verify_ct += 1
 
-        # Evict the rejected draft KV slots (the trailing slots of this req).
-        draft_token_num = 2
-        if (
-            num_accepted < draft_token_num
-            and batch.out_cache_loc is not None
-            and batch.out_cache_loc.numel() >= (i + 1) * draft_token_num
-        ):
-            evict_mask = torch.zeros(
-                batch.out_cache_loc.numel(),
-                dtype=torch.bool,
-                device=batch.out_cache_loc.device,
-            )
-            evict_mask[i * draft_token_num + num_accepted : (i + 1) * draft_token_num] = (
-                True
-            )
-            if is_cpu_920f():
-                from sglang.srt.speculative.spec_utils import (
-                    align_evict_mask_to_page_size_native,
-                )
+        # NOTE: the rejected draft KV slots are freed batch-wide (after the
+        # per-request loop) by `_pp_mtp_evict_rejected_drafts`, mirroring the
+        # last rank's single-pass eviction inside EagleVerifyInput.verify().
 
+    def _pp_mtp_evict_rejected_drafts(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> None:
+        """Evict the rejected draft KV slots of a PP+MTP verify batch.
+
+        Mirrors the last rank's eviction inside `EagleVerifyInput.verify()`:
+        build one batch-wide evict mask (True = rejected draft slots to free;
+        per req the trailing slots [num_accepted, draft_token_num)), align it
+        to page boundaries ("only evict full empty pages"), and free the slots
+        in a single pass. Runs only on non-last ranks, which never execute the
+        verify phase.
+
+        The mask is allocated over the FULL `out_cache_loc` length so that any
+        slots beyond the `bs * draft_token_num` real request rows (padding /
+        dummy tokens) are masked out (False) and never freed here. Boolean
+        indexing requires the mask length to equal `out_cache_loc.numel()`
+        exactly; building the mask only over the real rows crashes as soon as
+        the verify batch carries any padding. This matches the pre-batch
+        per-request eviction, which tolerated such trailing padding.
+        """
+        from sglang.srt.speculative.spec_utils import (
+            align_evict_mask_to_page_size,
+            align_evict_mask_to_page_size_native,
+        )
+        from sglang.srt.utils import is_cpu_920f
+
+        num_accepted = batch.pp_mtp_accepted_tokens
+        out_cache_loc = batch.out_cache_loc
+        if num_accepted is None or out_cache_loc is None:
+            return
+        num_steps = getattr(self, "_pp_mtp_num_steps", 0) or 0
+        draft_token_num = num_steps + 1
+        bs = batch.batch_size()
+        if (
+            num_accepted.numel() != bs
+            or out_cache_loc.numel() < bs * draft_token_num
+        ):
+            # Shape guard failure: do not free a misaligned slice (it would
+            # corrupt the pool). Log it so a real desync is visible.
+            if _DEBUG_PP_MTP:
+                pp_rank = getattr(self, "pp_rank", None)
+                logger.warning(
+                    f"[PP{pp_rank}] evict_rejected_drafts: shape guard failed "
+                    f"(num_accepted={num_accepted.numel()}, bs={bs}, "
+                    f"out_cache_loc={out_cache_loc.numel()}, "
+                    f"need >= {bs * draft_token_num})"
+                )
+            return
+        device = out_cache_loc.device
+        # Per-req rule: keep columns [0, num_accepted), evict the trailing
+        # columns [num_accepted, draft_token_num) of each real request row.
+        cols_keep = (
+            torch.arange(draft_token_num, device=device)[None, :]
+            < num_accepted.to(device=device)[:, None]
+        )
+        evict_mask = torch.zeros(
+            out_cache_loc.numel(), dtype=torch.bool, device=device
+        )
+        evict_mask[: bs * draft_token_num] = ~cols_keep.reshape(-1)
+        if self.page_size == 1:
+            self.token_to_kv_pool_allocator.free(out_cache_loc[evict_mask])
+        else:
+            # Only evict full empty pages; do not evict partial empty pages.
+            if is_cpu_920f():
                 align_evict_mask_to_page_size_native(
                     batch.seq_lens, evict_mask, self.page_size, draft_token_num
                 )
+            else:
+                from sglang.srt.utils import next_power_of_2
 
-            if _DEBUG_PP_MTP:
-                pp_rank = getattr(self, "pp_rank", None)
-                n_evict = evict_mask.sum().item()
-                logger.info(
-                    f"[PP{pp_rank}] apply_verify: evicting {n_evict} "
-                    f"rejected draft KV slots for req {req.rid}"
+                align_evict_mask_to_page_size[len(batch.seq_lens),](
+                    batch.seq_lens,
+                    evict_mask,
+                    self.page_size,
+                    draft_token_num,
+                    next_power_of_2(draft_token_num),
                 )
-
-            self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            self.token_to_kv_pool_allocator.free(out_cache_loc[evict_mask])
 
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_mtp_apply_verify_batch(
@@ -766,11 +823,14 @@ class SchedulerOutputProcessorMixin:
         * The accepted-token prefix offsets are computed once with a single O(n)
           prefix pass (the per-request version re-sums `accepted_tokens[:i]`,
           which is O(n^2) across the batch).
-        * The rejected-draft KV eviction mask is built vectorized for the whole
-          batch (one boolean allocation instead of one `torch.zeros` per req).
-        """
-        from sglang.srt.utils import is_cpu_920f
+        * Per-request output_ids / KV bookkeeping / spec-stats updates run off a
+          single `.tolist()` slice.
 
+        Rejected-draft KV eviction is intentionally NOT part of this method; it
+        runs once, batch-wide, in `_pp_mtp_evict_rejected_drafts` (same guard),
+        mirroring the last rank's single-pass eviction for any
+        speculative_num_steps.
+        """
         n = len(batch.reqs)
         if n == 0:
             return
@@ -835,42 +895,14 @@ class SchedulerOutputProcessorMixin:
             req.kv_committed_len += num_accepted
             req.kv_allocated_len = req.kv_committed_len
             req.spec_verify_ct += 1
+            accepted_draft_tokens = num_accepted - 1
+            req.spec_accepted_drafts += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
-
-        # Build the rejected-draft KV eviction mask for the whole batch at once.
-        # Note: reqs with 0 accepted tokens are skipped above (no eviction), the
-        # same as the per-request path returning early on `num_accepted < 1`.
-        draft_token_num = 2
-        if (
-            batch.out_cache_loc is not None
-            and batch.out_cache_loc.numel() >= n * draft_token_num
-        ):
-            counts_t = torch.tensor(
-                counts_int, dtype=torch.int64, device=batch.out_cache_loc.device
-            )
-            cols = torch.arange(
-                draft_token_num, device=batch.out_cache_loc.device
-            ).unsqueeze(0)
-            valid = (counts_t >= 1) & (counts_t < draft_token_num)
-            evict_mask = (
-                (cols >= counts_t.unsqueeze(1)) & valid.unsqueeze(1)
-            ).reshape(-1)
-            if is_cpu_920f():
-                from sglang.srt.speculative.spec_utils import (
-                    align_evict_mask_to_page_size_native,
-                )
-
-                align_evict_mask_to_page_size_native(
-                    batch.seq_lens, evict_mask, self.page_size, draft_token_num
-                )
-            if _DEBUG_PP_MTP:
-                pp_rank = getattr(self, "pp_rank", None)
-                n_evict = evict_mask.sum().item()
-                logger.info(
-                    f"[PP{pp_rank}] apply_verify_batch: evicting {n_evict} "
-                    f"rejected draft KV slots (batch)"
-                )
-            self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+        # NOTE: rejected-draft KV eviction is NOT done here. It runs once,
+        # batch-wide, in `_pp_mtp_evict_rejected_drafts` (same guard as this
+        # method), which mirrors the last rank's single-pass eviction inside
+        # EagleVerifyInput.verify() for any speculative_num_steps.
 
     def _handle_finished_req(
         self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput

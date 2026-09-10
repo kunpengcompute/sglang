@@ -411,9 +411,12 @@ class KunpengGraphRunner:
                                 self.model_runner.decode_attn_backend
                             )
                         else:
-                            self.model_runner.attn_backend.init_forward_metadata(
-                                forward_batch
-                            )
+                            # Honor a per-step backend switch (multi-step MTP
+                            # chain drafts pre-init draft_attn_backend.attn_backends[i]
+                            # and skip re-init here); otherwise init the default.
+                            self._resolve_attn_backend(
+                                self.model_runner, forward_batch
+                            ).init_forward_metadata(forward_batch)
 
                 output = self._forward_decode(forward_batch, **kwargs)
 
@@ -510,6 +513,21 @@ class KunpengGraphRunner:
 
     # ── Graph internals ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _resolve_attn_backend(
+        model_runner, forward_batch: ForwardBatch
+    ):
+        """Return the attention backend the current forward actually uses.
+
+        EAGLEWorker.draft_forward switches `forward_batch.attn_backend` to a
+        per-step backend (`draft_attn_backend.attn_backends[i]`) for multi-step
+        MTP chain drafts. The graph capture/replay inputs must be built from
+        THAT backend's metadata, otherwise the per-step switch is silently
+        ignored and the captured attention runs with stale metadata.
+        """
+        backend = getattr(forward_batch, "attn_backend", None)
+        return backend if backend is not None else model_runner.attn_backend
+
     def _build_kunpeng_graph_inputs(
         self, forward_batch: ForwardBatch, kwargs: dict
     ) -> List[torch.Tensor]:
@@ -519,7 +537,10 @@ class KunpengGraphRunner:
         when pipeline parallelism is active, and None entries are filtered out.
         """
         forward_mode = forward_batch.forward_mode
-        meta = self.model_runner.attn_backend.forward_metadata
+        attn_backend = self._resolve_attn_backend(
+            self.model_runner, forward_batch
+        )
+        meta = attn_backend.forward_metadata
 
         if forward_mode.is_idle():
             forward_batch.input_ids = torch.tensor([], dtype=torch.int64)
@@ -534,9 +555,9 @@ class KunpengGraphRunner:
             if meta is not None:
                 inputs.extend([meta.block_table, meta.seq_lens])
             inputs.extend(
-                [forward_batch.out_cache_loc, self.model_runner.attn_backend._decode_meta]
+                [forward_batch.out_cache_loc, attn_backend._decode_meta]
             )
-            if getattr(self.model_runner.attn_backend, "_lc_enabled", False):
+            if getattr(attn_backend, "_lc_enabled", False):
                 # Long-context decode CP: per-step sparse-attention metadata
                 # (local KV indices + per-sequence counts) consumed by the
                 # graph ops. Shapes vary per step, so they must be graph inputs.
@@ -572,7 +593,7 @@ class KunpengGraphRunner:
                 forward_batch.extend_seq_lens,
                 forward_batch.out_cache_loc,
                 forward_batch.num_token_non_padded,
-                self.model_runner.attn_backend._decode_meta,
+                attn_backend._decode_meta,
             ]
             if meta is not None:
                 inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
@@ -583,7 +604,7 @@ class KunpengGraphRunner:
                     # LC remapped table is None too).
                     if meta.block_table is not None:
                         inputs[-3] = self.swap_mgr._blockwise_remapped_block_table
-            if getattr(self.model_runner.attn_backend, "_lc_enabled", False) and (
+            if getattr(attn_backend, "_lc_enabled", False) and (
                 forward_mode.is_target_verify() or forward_mode.is_draft_extend()
             ):
                 # Long-context decode CP + MTP: the sparse LC metadata
@@ -723,7 +744,9 @@ class KunpengGraphRunner:
         # them, so the FULL base tensors must be registered as fixed storage
         # or the slice lookup fails with "non-return-value parameter tensor
         # not registered".
-        stage_base = self.model_runner.attn_backend._lc_stage_base
+        stage_base = self._resolve_attn_backend(
+            self.model_runner, forward_batch
+        )._lc_stage_base
         if stage_base is not None:
             fixed.append(stage_base[0])
             fixed.append(stage_base[1])
@@ -753,11 +776,22 @@ class KunpengGraphRunner:
         # last_tokens, MTP pad/unpad) fix their output shape at capture, so two
         # batches with equal total_tokens but different sequence counts must
         # not share a graph.
+        # The backend identity joins the key when forward_batch.attn_backend is
+        # switched away from the runner's default (multi-step MTP chain draft
+        # steps assign draft_attn_backend.attn_backends[i] per step). Each such
+        # backend owns distinct metadata tensors, so they must not share a
+        # captured graph.
+        attn_backend = self._resolve_attn_backend(
+            self.model_runner, forward_batch
+        )
         graph_cache_key = (
             forward_batch.forward_mode,
             total_tokens,
             forward_batch.batch_size,
             is_pp_graph,
+            id(attn_backend)
+            if attn_backend is not self.model_runner.attn_backend
+            else None,
         )
 
         if graph_cache_key not in self._sglang_graph_cache:

@@ -274,10 +274,34 @@ at::Tensor get_or_create_shm_tensor(int64_t dim, int64_t bs)
     }
 
     auto it = g_shm_tensor_cache_large.find(dim);
-    if (it != g_shm_tensor_cache_large.end()) {
+    if (it != g_shm_tensor_cache_large.end() && it->second.size(0) >= bs) {
         return it->second;
     }
-    int64_t shape[2] = {g_max_tokens, dim};
+    // Size the cached comm buffer by the requested batch, not by the
+    // worst-case prefill token count (g_max_tokens rows). The comm kernels
+    // only ever touch `bs` rows per call, while g_max_tokens rows can
+    // request far more shm than the pool has left after the communicator
+    // buffers. In particular the attn-TP logits gather dims (vocab/attn_tp
+    // and the full vocab for the recv buffer) only carry decode/verify-sized
+    // batches, and MTP=2 verify padding (lcm(attn_tp, draft_token_num *
+    // socket_tp) tokens per req) is what pushes bs past the small-cache
+    // threshold into this branch. Round the capacity up to a multiple of the
+    // small-cache batch size so nearby batch sizes reuse the same tensor; a
+    // larger bs later reallocates and replaces the entry (the old slab stays
+    // carved out of the pool, bounded by the geometric bucket sequence).
+    int64_t bucket = batch_size;
+    int64_t rows = ((bs + bucket - 1) / bucket) * bucket;
+    if (rows > g_max_tokens) {
+        rows = g_max_tokens;
+    }
+    // Never hand back a buffer smaller than the requested `bs`: the comm
+    // kernels always touch `bs` rows and would write out of bounds. A request
+    // above the pool bound is a caller bug -- fail loudly instead.
+    TORCH_CHECK(
+        rows >= bs,
+        "get_or_create_shm_tensor: requested bs ", bs,
+        " exceeds the shared-memory pool bound g_max_tokens=", g_max_tokens);
+    int64_t shape[2] = {rows, dim};
     at::Tensor tensor = create_shm_tensor_kunpeng(at::kBFloat16, c10::ArrayRef<int64_t>(shape, 2));
     g_shm_tensor_cache_large[dim] = tensor;
     return tensor;

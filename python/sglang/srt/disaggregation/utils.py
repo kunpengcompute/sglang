@@ -316,9 +316,9 @@ class MetadataBuffers:
                 req.hidden_states_tensor
             )
         elif req.output_topk_index is not None and req.output_topk_p is not None:
-            # PP+MTP: only the first draft (topk) is transferred; hidden
-            # states are re-captured by the decode-side verify forward, so
-            # they are not attached to the request.
+            # PP+MTP: only the drafts (speculative_num_steps per req) are
+            # transferred; hidden states are re-captured by the decode-side
+            # verify forward, so they are not attached to the request.
             topk = req.output_topk_p.size(0)
             self.output_topk_p[req.metadata_buffer_index, :topk].copy_(
                 req.output_topk_p

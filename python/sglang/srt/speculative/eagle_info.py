@@ -576,15 +576,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # ── Kunpeng 920F pure-token MTP: fused single-C-kernel verify. ──
         # Active only for the same guard as the removed `_finish_check_cpu`:
-        # topk==1 chain, single speculative step, greedy verify, no grammar /
-        # stop-strs / regex / reasoning.  The whole pipeline (argmax, greedy
-        # accept, finish detection, evict page alignment, compact gathers,
-        # req_to_token scatter, seq_lens update) runs inside one C++ kernel;
-        # this branch returns early and keeps the official verify flow intact.
+        # topk==1 chain, greedy verify, no grammar / stop-strs / regex /
+        # reasoning. The kernel is generic over the chain depth (`nv` =
+        # draft_token_num): the greedy walk iterates `for j in 1..nv-1`, so it
+        # serves any speculative_num_steps (mtp=1 is nv=2, mtp=2 is nv=3).
+        # The whole pipeline (argmax, greedy accept, finish detection, evict
+        # page alignment, compact gathers, req_to_token scatter, seq_lens
+        # update) runs inside one C++ kernel; this branch returns early and
+        # keeps the official verify flow intact.
         if (
             is_cpu_920f()
             and self.topk == 1
-            and self.spec_steps == 1
             and not any(r.grammar is not None for r in batch.reqs)
             and not any(r.require_reasoning for r in batch.reqs)
             and not any(
