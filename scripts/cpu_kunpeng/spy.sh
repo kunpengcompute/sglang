@@ -16,7 +16,7 @@
 
 # Usage: spy.sh [decode|prefill|all]   (default: decode)
 #
-# Sources env.sh with <role> + skip-conda to obtain the correct
+# Sources env.sh with <role> and SKIP_CONDA=1 to obtain the correct
 # SGLANG_PATH / CONDA_ENV_PATH / NODE_IPS from the cluster config.
 # Requires bash (env.sh uses bash syntax); re-exec under bash if it
 # was invoked as "sh spy.sh".
@@ -43,7 +43,7 @@ if [[ ! -f "$ENV_SH" ]]; then
 fi
 
 # ------------------------------------------------------------------
-# Source env.sh for the required role(s) with skip-conda. For "all" we
+# Source env.sh for the required role(s) with SKIP_CONDA=1. For "all" we
 # need both decode and prefill node sets, so source twice (save the
 # NODE_IPS array each time before it gets overwritten).
 # ------------------------------------------------------------------
@@ -51,13 +51,13 @@ DECODE_IPS=()
 PREFILL_IPS=()
 case "$ROLE" in
     decode|all)
-        source "$ENV_SH" decode skip-conda
+        SKIP_CONDA=1 source "$ENV_SH" decode
         DECODE_IPS=("${NODE_IPS[@]}")
         ;;
 esac
 case "$ROLE" in
     prefill|all)
-        source "$ENV_SH" prefill skip-conda
+        SKIP_CONDA=1 source "$ENV_SH" prefill
         PREFILL_IPS=("${NODE_IPS[@]}")
         ;;
 esac
