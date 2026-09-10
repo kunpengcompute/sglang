@@ -426,15 +426,9 @@ build_config() {
 # Main: dispatch based on command-line argument
 # ------------------------------------------------------------
 ACTION="${1:-native}"
-shift
 
-# Optional: pass "skip-conda" between/after the action to skip conda activation
-SKIP_CONDA=0
-for _arg in "$@"; do
-    if [[ "$_arg" == "skip-conda" ]]; then
-        SKIP_CONDA=1
-    fi
-done
+# Optional: set SKIP_CONDA=1 before sourcing (SKIP_CONDA=1 source env.sh) to skip conda activation
+SKIP_CONDA="${SKIP_CONDA:-0}"
 
 case "$ACTION" in
     prefill|decode|native|router|build)

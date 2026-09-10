@@ -83,7 +83,7 @@ if [[ "$ROLE" == "all" ]]; then
     echo "[$(date +%T)] ===== Launching all roles (prefill + decode + router) in background ====="
 
     bash ./stop.sh router
-    source ./env.sh native skip-conda
+    SKIP_CONDA=1 source ./env.sh native
     bash ./launch.sh prefill --no-log
     if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
         SGLANG_SKIP_UPDATE=1 bash ./launch.sh prefill second --no-log
