@@ -103,7 +103,16 @@ void softmax_kunpeng(const at::Tensor logits, const at::Tensor temperatures, at:
             }
             float sum_inv = 1.0f / std::max(svaddv(svptrue_b32(), reduce_sum), 1e-30f);
 
-            // Pass 3: normalize, convert f32 -> bf16, store both halves
+            // Pass 3: normalize, convert f32 -> bf16, store.
+            // svcvt_bf16_x lands each converted f32 element in an EVEN bf16
+            // lane of the destination register (odd lanes are undefined per
+            // the BFCVT instruction), so the two converted halves must be
+            // compacted with svuzp1 (even lanes of a, then even lanes of b)
+            // before a single predicated store -- the same svcvt+uzp1
+            // packing pair proven in shm_allreduce_naive
+            // (comm/allreduce.cpp).  Storing the raw cvt results directly
+            // leaves half of every row as garbage and loses half of the
+            // probability mass.
             for (int64_t i = 0; i < vocab_size; i += vl_b) {
                 svbool_t pg_lo = svwhilelt_b32(i, vocab_size);
                 svbool_t pg_hi = svwhilelt_b32(i + half, vocab_size);
@@ -111,12 +120,11 @@ void softmax_kunpeng(const at::Tensor logits, const at::Tensor temperatures, at:
                 svfloat32_t hi = svld1_f32(pg_hi, &buf[i + half]);
                 lo = svmul_x(pg_lo, lo, sum_inv);
                 hi = svmul_x(pg_hi, hi, sum_inv);
-                svbfloat16_t b_lo = svcvt_bf16_x(pg_lo, lo);
-                svbfloat16_t b_hi = svcvt_bf16_x(pg_hi, hi);
-                svbool_t pgb_lo = svwhilelt_b16(i, std::min(i + half, vocab_size));
-                svbool_t pgb_hi = svwhilelt_b16(i + half, std::min(i + vl_b, vocab_size));
-                svst1_bf16(pgb_lo, row_probs + i, b_lo);
-                svst1_bf16(pgb_hi, row_probs + i + half, b_hi);
+                svbfloat16_t packed = svuzp1(
+                    svcvt_bf16_x(pg_lo, lo),
+                    svcvt_bf16_x(pg_hi, hi));
+                svbool_t pgb = svwhilelt_b16(i, vocab_size);
+                svst1_bf16(pgb, row_probs + i, packed);
             }
         }
     });
