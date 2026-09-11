@@ -231,6 +231,8 @@ export SGLANG_KUNPENG_PP_PROFILE=0  # 1 = enable decode pipeline profiling
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
 export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=0
+export SGLANG_KUNPENG_ALLTOALL_FENCE=0  # 1 = explicit kupl_shm_fence after MLA shm alltoall
+export SGLANG_KUNPENG_ALLREDUCE_NAIVE=0  # 1 = non-kutacc naive shm allreduce
 export SGLANG_KUNPENG_LC_DP_RANKS=""  # comma-separated DP ranks running long-context decode CP (e.g. "14,15"); empty = all regular; must be identical between prefill and decode instances
 export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096  # requests with input_len + max_new_tokens >= this go to LC DP ranks; must exceed every regular rank's max_req_input_len
 export SGLANG_KUNPENG_RDMA_ALLGATHER=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
