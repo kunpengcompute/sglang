@@ -561,9 +561,15 @@ class KunpengGraphRunner:
                 # Long-context decode CP: per-step sparse-attention metadata
                 # (local KV indices + per-sequence counts) consumed by the
                 # graph ops. Shapes vary per step, so they must be graph inputs.
+                # The indices buffers must be registered as the SAME view the
+                # kernel consumes: _forward_mla_paged_cp slices them to
+                # [:, :seqlen_q, :] and seqlen_q == 1 in decode. With MTP the
+                # persistent buffer has speculative_num_draft_tokens > 1 rows,
+                # so registering the full buffer instead of the slice fails
+                # capture with "input tensor has no matching view".
                 inputs.extend(
                     [
-                        meta.long_context_indices,
+                        meta.long_context_indices[:, :1, :],
                         meta.long_context_topk_length,
                         meta.long_context_real_topk_length,
                     ]
@@ -572,7 +578,7 @@ class KunpengGraphRunner:
                     # LC + block-wise KV swap: the per-step slot-remapped
                     # index buffer consumed by the sparse flash MLA kernel
                     # (reads the compacted HBM swap buffer).
-                    inputs.append(meta.long_context_hbm_indices)
+                    inputs.append(meta.long_context_hbm_indices[:, :1, :])
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 # Block-wise swap: the block_table passed to the attention
                 # kernel is the remapped (HBM slot) version; the per-step
