@@ -85,7 +85,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.data_parallel_controller import DataParallelController
-from sglang.srt.distributed import rank_layout
+from sglang.srt.hardware_backend.cpu_kunpeng.distributed import rank_layout
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs

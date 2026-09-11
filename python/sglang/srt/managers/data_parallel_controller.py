@@ -26,7 +26,7 @@ import psutil
 import setproctitle
 import zmq
 
-from sglang.srt.distributed import rank_layout
+from sglang.srt.hardware_backend.cpu_kunpeng.distributed import rank_layout
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (

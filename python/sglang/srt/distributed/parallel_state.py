@@ -57,7 +57,7 @@ from torch.distributed import Backend, ProcessGroup
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
-from sglang.srt.distributed import rank_layout
+from sglang.srt.hardware_backend.cpu_kunpeng.distributed import rank_layout
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_current_device_stream_fast,
