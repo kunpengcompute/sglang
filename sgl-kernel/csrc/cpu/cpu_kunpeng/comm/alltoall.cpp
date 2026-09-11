@@ -86,6 +86,13 @@ static std::vector<bfloat16_t *> &get_ata_o_buffers(int64_t group_size)
     return (group_size == 8) ? g_ata_o_send_buffers_comm8 : g_ata_o_send_buffers;
 }
 
+// TEMP: SGLANG_KUNPENG_ALLTOALL_FENCE=1 adds an explicit kupl_shm_fence after
+// shm_alltoall2D (which runs with need_comm_fence=false).
+static const bool g_alltoall_extra_fence = [] {
+    const char *env = std::getenv("SGLANG_KUNPENG_ALLTOALL_FENCE");
+    return env != nullptr && std::strcmp(env, "1") == 0;
+}();
+
 // ---------------------------------------------------------------------------
 // Initialisation / finalisation
 // ---------------------------------------------------------------------------
@@ -301,6 +308,8 @@ static void q_alltoall_exec(at::Tensor shape_ref, at::Tensor out_tensor, void **
     kutacc::shm_alltoall2D(reinterpret_cast<void **>(send_buffers), out_tensor.data_ptr(), b,
                            sub_h * d, /*dim=*/1,
                            /*need_comm_fence=*/false, get_ata_request(group_size));
+    if (g_alltoall_extra_fence)
+        kupl_shm_fence(group_size == 8 ? kupl_win_intra_socket : kupl_win_intra_node);
 }
 
 void shm_mla_q_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor)
@@ -337,6 +346,8 @@ static void o_alltoall_exec(at::Tensor shape_ref, at::Tensor out_tensor, void **
     kutacc::shm_alltoall2D(reinterpret_cast<void **>(send_buffers), out_tensor.data_ptr(),
                            sub_b, h * d, /*dim=*/0,
                            /*need_comm_fence=*/false, get_ata_request(group_size));
+    if (g_alltoall_extra_fence)
+        kupl_shm_fence(group_size == 8 ? kupl_win_intra_socket : kupl_win_intra_node);
 }
 
 void shm_mla_o_alltoall_exec_kunpeng(at::Tensor shape_ref, at::Tensor out_tensor)
