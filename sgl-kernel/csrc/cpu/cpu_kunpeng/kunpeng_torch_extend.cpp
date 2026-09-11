@@ -416,6 +416,8 @@ void compute_position_kunpeng(at::Tensor extend_prefix_lens, at::Tensor extend_s
 
 // verify_mtp_kunpeng: single fused 920F topk==1 verify kernel (argmax +
 // greedy accept + finish + evict page-align + compact + scatter + seq_lens).
+// Standard (target-only) sampling support: greedy callers pass empty
+// temperatures/top_ks/top_ps/coins/coins_final tensors.
 std::vector<at::Tensor> verify_mtp_kunpeng(
     at::Tensor logits, at::Tensor hidden, at::Tensor candidates,
     at::Tensor retrieve_index, at::Tensor seq_lens, at::Tensor out_cache_loc,
@@ -423,7 +425,10 @@ std::vector<at::Tensor> verify_mtp_kunpeng(
     at::Tensor stop_ids_flat, at::Tensor stop_ids_off,
     at::Tensor eos_ids_flat, at::Tensor eos_ids_off,
     at::Tensor ignore_eos, int64_t nv, int64_t page_size,
-    at::Tensor req_pool_indices, at::Tensor req_to_token, at::Tensor seq_lens_cpu);
+    at::Tensor req_pool_indices, at::Tensor req_to_token, at::Tensor seq_lens_cpu,
+    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps,
+    double threshold_single, double threshold_acc,
+    at::Tensor coins, at::Tensor coins_final);
 
 // gather_index_kunpeng: parallel row gather replacing the two aten::index ops.
 void gather_index_kunpeng(at::Tensor src_logits, at::Tensor src_hidden,
@@ -1049,7 +1054,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor stop_ids_flat, Tensor stop_ids_off, "
         "Tensor eos_ids_flat, Tensor eos_ids_off, "
         "Tensor ignore_eos, int nv, int page_size, "
-        "Tensor req_pool_indices, Tensor(b!) req_to_token, Tensor(c!) seq_lens_cpu"
+        "Tensor req_pool_indices, Tensor(b!) req_to_token, Tensor(c!) seq_lens_cpu, "
+        "Tensor temperatures, Tensor top_ks, Tensor top_ps, "
+        "float threshold_single, float threshold_acc, "
+        "Tensor coins, Tensor coins_final"
         ") -> Tensor[]");
     m.impl("verify_mtp_kunpeng", verify_mtp_kunpeng);
 
