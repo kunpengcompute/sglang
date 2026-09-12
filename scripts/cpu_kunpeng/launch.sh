@@ -103,7 +103,7 @@ if [[ "$ROLE" == "all" ]]; then
     for i in $(seq 1 12000); do
         for j in "${!endpoints[@]}"; do
             if [[ "${ready[$j]}" -eq 0 ]] &&
-                curl -sf --max-time 2 "http://${endpoints[$j]}/health" >/dev/null 2>&1; then
+                curl -sf --noproxy "*" --max-time 2 "http://${endpoints[$j]}/health" >/dev/null 2>&1; then
                 ready[$j]=1
                 echo "[$(date +%T)] ${endpoints[$j]} ready"
             fi

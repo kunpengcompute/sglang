@@ -280,7 +280,7 @@ if [[ "$ROLE" == "router" ]]; then
             echo "Waiting for HTTP server on port $port to be ready..."
             ready=0
             for i in $(seq 1 18000); do  # up to 30 minutes
-                if curl -sf --max-time 2 "http://${ROUTER_IP}:${port}/health" >/dev/null 2>&1; then
+                if curl -sf --noproxy "*" --max-time 2 "http://${ROUTER_IP}:${port}/health" >/dev/null 2>&1; then
                     ready=1
                     break
                 fi
