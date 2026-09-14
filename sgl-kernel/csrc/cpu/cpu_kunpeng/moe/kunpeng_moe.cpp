@@ -22,6 +22,8 @@
 #include <fstream>
 #include <functional>
 #include <vector>
+#include <optional>
+#include <unordered_map>
 
 #include <sgl_kernel_ops.h>
 #include <arm_bf16.h>
@@ -46,7 +48,13 @@ bool g_global_comm_initialized = false;                      // Global domain in
 int g_comm_size = 0;
 int g_comm_rank = 0;
 c10d::ProcessGroup *g_process_group = nullptr;
-static bool g_is_prefill = true;
+
+static bool _read_is_prefill_default_true()
+{
+    const char *env = std::getenv("IS_PREFILL");
+    return env == nullptr ? true : (std::atol(env) != 0);
+}
+static bool g_is_prefill = _read_is_prefill_default_true();
 
 #ifdef SGLANG_KUNPENG_DEBUG_EXPERT_LOAD
 namespace {
@@ -168,11 +176,6 @@ void moe_comm_create_kunpeng(int64_t process_group_ptr)
               << std::endl;
 
     g_comm_initialized = true;
-
-    auto str = std::getenv("IS_PREFILL");
-    if (str != nullptr) {
-        g_is_prefill = std::atol(str);
-    }
 }
 
 void moe_comm_barrier_kunpeng()
@@ -546,6 +549,53 @@ void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_wei
 }
 
 // ---------------------------------------------------------------------------
+// n_slice lookup for the 2-local-expert fusedmoe dualexst path. Ported from
+// DeepSeek-V3-Sample csrc/adapter/kernel/fusedmoe_tiling.cpp: SME igemm
+// efficiency of (M,N,K) is ~equal to M rounded up to a multiple of 16, so
+// keys are 16-aligned (bigger, smaller) per-local-expert token counts.
+// kutacc only consumes n_slice when bs <= tilebuf && ne == 2 (routing to
+// fusedmoe_*_dualexpt_parallel); on every other path it is ignored.
+// ---------------------------------------------------------------------------
+static uint64_t fusedmoe_encode_pair(int x, int y)
+{
+    return (static_cast<uint64_t>(x) << 32) | static_cast<uint32_t>(y);
+}
+
+// n_slice splits N so the two experts' tile_n work is balanced across the
+// 16+16 thread halves; *_default = full N (no split).
+static const std::unordered_map<uint64_t, int> g_fusedmoe_nslice_gateup = {
+    {fusedmoe_encode_pair(64, 64), 4096}, {fusedmoe_encode_pair(64, 48), 4096},
+    {fusedmoe_encode_pair(64, 32), 2816}, {fusedmoe_encode_pair(48, 48), 4096},
+    {fusedmoe_encode_pair(48, 32), 2944}, {fusedmoe_encode_pair(48, 16), 2560},
+    {fusedmoe_encode_pair(32, 32), 4096}, {fusedmoe_encode_pair(16, 16), 4096},
+};
+static const std::unordered_map<uint64_t, int> g_fusedmoe_nslice_down = {
+    {fusedmoe_encode_pair(64, 64), 7168}, {fusedmoe_encode_pair(64, 48), 7168},
+    {fusedmoe_encode_pair(64, 32), 5120}, {fusedmoe_encode_pair(64, 16), 5120},
+    {fusedmoe_encode_pair(48, 48), 7168}, {fusedmoe_encode_pair(48, 32), 6144},
+    {fusedmoe_encode_pair(48, 16), 5120}, {fusedmoe_encode_pair(32, 32), 7168},
+    {fusedmoe_encode_pair(32, 16), 7168}, {fusedmoe_encode_pair(16, 16), 7168},
+};
+
+// ne == 2 only: look up n_slice by the 16-aligned (bigger, smaller) local
+// expert token counts. nullopt when the pair is not in the table (kutacc
+// then takes the regular expansion path).
+static std::optional<int64_t> fusedmoe_lookup_nslice(
+    const int *experts_offset_data, const std::unordered_map<uint64_t, int> &table)
+{
+    int64_t m0 = experts_offset_data[1] - experts_offset_data[0];
+    int64_t m1 = experts_offset_data[2] - experts_offset_data[1];
+    int m0_aligned = static_cast<int>((m0 + 15) / 16 * 16);
+    int m1_aligned = static_cast<int>((m1 + 15) / 16 * 16);
+    uint64_t key = m0_aligned >= m1_aligned
+                       ? fusedmoe_encode_pair(m0_aligned, m1_aligned)
+                       : fusedmoe_encode_pair(m1_aligned, m0_aligned);
+    auto it = table.find(key);
+    if (it == table.end()) return std::nullopt;
+    return static_cast<int64_t>(it->second);
+}
+
+// ---------------------------------------------------------------------------
 // igemm_fusedmoe_gateup_kunpeng
 //
 // Calls kutacc::fusedmoe_gateup to compute the gate/up projection for all
@@ -571,17 +621,28 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     TORCH_CHECK(moe_gateup.scalar_type() == at::kBFloat16, "moe_gateup must be bfloat16");
     TORCH_CHECK(token_ids.size(0) <= moe_gateup.size(0), "fusedmoe_gateup token_ids size larger than output size");
 
-    int64_t bs = token_ids.size(0);
+    int64_t ne = experts_w13.size(0);  // num_local_experts
+    int *experts_offset_data = experts_offset.data_ptr<int>();
+
+    // bs = actual received tokens (ti), like DeepSeek-V3-Sample which slices
+    // token_ids to ti in topk_convert before calling the kernel. The whole
+    // recv_token_ids_buf (num_experts * max_dispatch_tokens rows) cannot be
+    // used as bs: it always exceeds the tilebuf, permanently routing decode
+    // to buffer_limited and making the dualexst path unreachable. Graph
+    // replay is safe: experts_offset is a fixed tensor refreshed by
+    // topk_convert before every call.
+    int64_t bs = experts_offset_data[ne] - experts_offset_data[0];
+    TORCH_CHECK(bs >= 0 && bs <= token_ids.size(0),
+                "fusedmoe_gateup: experts_offset token count (", bs,
+                ") is outside [0, token_ids.size(0)=", token_ids.size(0), "]");
     int64_t K = act.size(1);           // hidden
     int64_t N = experts_w13.size(1);   // 2 * inter_dim
-    int64_t ne = experts_w13.size(0);  // num_local_experts
 
     int8_t *acts_data = act.data_ptr<int8_t>();
-    int8_t *weights_data = experts_w13.data_ptr<int8_t>();
-    float *acts_scale_data = scale.data_ptr<float>();
-    float *weights_scale_data = experts_w13_scale.data_ptr<float>();
     int *token_ids_data = token_ids.data_ptr<int>();
-    int *experts_offset_data = experts_offset.data_ptr<int>();
+    float *weights_scale_data = experts_w13_scale.data_ptr<float>();
+    float *acts_scale_data = scale.data_ptr<float>();
+    int8_t *weights_data = experts_w13.data_ptr<int8_t>();
     bfloat16_t *output_data = reinterpret_cast<bfloat16_t *>(moe_gateup.data_ptr());
     int8_t *pbx_data = tmpx.data_ptr<int8_t>();
     float *pby_data = tmpy.data_ptr<float>();
@@ -608,8 +669,12 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     auto t = igemm_find_optimal_tiling_plan(bs, N, K);
     int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
 
-    // TODO: n_slice for 2-expert case
-    std::optional<int64_t> n_slice = std::nullopt;
+    // 2-local-expert case: n_slice from the (m0, m1) table, same as
+    // DeepSeek-V3-Sample; consumed by kutacc only on the bs <= tilebuf
+    // dualexst path, ignored otherwise.
+    std::optional<int64_t> n_slice =
+        (ne == 2) ? fusedmoe_lookup_nslice(experts_offset_data, g_fusedmoe_nslice_gateup)
+                  : std::nullopt;
 
     kutacc::fusedmoe_gateup(bs, K, N, ne, acts_stride, acts_scale_stride, acts_data, weights_data, acts_scale_data,
                             weights_scale_data, token_ids_data, experts_offset_data, output_data, pbx_data, pby_data,
@@ -640,10 +705,17 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
     TORCH_CHECK(experts_w2_scale.scalar_type() == at::kFloat, "experts_w2_scale must be float32");
     TORCH_CHECK(moe_down.scalar_type() == at::kBFloat16, "moe_down must be bfloat16");
 
-    int64_t bs = token_ids.size(0);
     int64_t K = moe_silu_int8.size(1);  // inter_dim
     int64_t N = experts_w2.size(1);     // hidden
     int64_t ne = experts_w2.size(0);    // num_local_experts
+    int *experts_offset_data = experts_offset.data_ptr<int>();
+
+    // bs = actual received tokens (ti), same as gateup (see the comment
+    // there for why the whole recv_token_ids_buf cannot be used as bs).
+    int64_t bs = experts_offset_data[ne] - experts_offset_data[0];
+    TORCH_CHECK(bs >= 0 && bs <= token_ids.size(0),
+                "fusedmoe_down: experts_offset token count (", bs,
+                ") is outside [0, token_ids.size(0)=", token_ids.size(0), "]");
 
     if (bs == 0) return;
 
@@ -651,7 +723,6 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
     int8_t *weights_data = experts_w2.data_ptr<int8_t>();
     float *acts_scale_data = moe_silu_scale.data_ptr<float>();
     float *weights_scale_data = experts_w2_scale.data_ptr<float>();
-    int *experts_offset_data = experts_offset.data_ptr<int>();
     bfloat16_t *output_data = reinterpret_cast<bfloat16_t *>(moe_down.data_ptr());
     int8_t *pbx_data = tmpx.data_ptr<int8_t>();
     float *pby_data = tmpy.data_ptr<float>();
@@ -659,8 +730,12 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
     auto t = igemm_find_optimal_tiling_plan(bs, N, K);
     int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
 
-    // TODO: n_slice for 2-expert case
-    std::optional<int64_t> n_slice = std::nullopt;
+    // 2-local-expert case: n_slice from the (m0, m1) table, same as
+    // DeepSeek-V3-Sample; consumed by kutacc only on the bs <= tilebuf
+    // dualexst path, ignored otherwise.
+    std::optional<int64_t> n_slice =
+        (ne == 2) ? fusedmoe_lookup_nslice(experts_offset_data, g_fusedmoe_nslice_down)
+                  : std::nullopt;
 
     kutacc::fusedmoe_down(bs, K, N, ne, acts_data, weights_data, acts_scale_data, weights_scale_data,
                           experts_offset_data, output_data, pbx_data, pby_data, t, fusedmoe_tilebuf_size, n_slice);
