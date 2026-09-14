@@ -160,9 +160,17 @@ for ip in "${NODE_IPS[@]}"; do
             }
         }
         END {
+            # Emphasize the scheduler header line (Process <pid>: sglang::scheduler_DPx_TPy...)
+            # with separator bars, so it is easy to spot in a plain-text summary.
             for (dp in data) {
                 for (tp in data[dp]) {
-                    printf "%s\n", data[dp][tp];
+                    block = data[dp][tp];
+                    printf "==================================================================\n";
+                    hdr_end = index(block, "\n");
+                    if (hdr_end == 0) hdr_end = length(block) + 1;
+                    printf ">>> %s\n", substr(block, 1, hdr_end - 1);
+                    if (hdr_end <= length(block)) printf "%s\n", substr(block, hdr_end + 1);
+                    printf "==================================================================\n";
                 }
             }
         }
