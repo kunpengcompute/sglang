@@ -28,7 +28,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.common import is_lc_cp_enabled
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_kunpeng_graph_capture
 from sglang.srt.utils.common import is_cpu_920f
 from sgl_kernel import pg_helper
 from sglang.srt.graph import ops as kunpeng
@@ -191,7 +191,13 @@ class KunpengCommunicator:
         _max_seq_num = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "32"))
         _max_cur_len = int(os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "2"))
         dim_size = _max_seq_num * _max_cur_len * SHM_ALIGN_SIZE //  self.comm_size
-        kernel.shm_batched_allgather_init_kunpeng(dim_size)
+        if is_kunpeng_graph_capture():
+            kernel.shm_batched_allgather_init_kunpeng(dim_size)
+            logger.info(
+                f"[KunpengCommunicator rank {dist.get_rank()}] "
+                f"shm_batched_allgather pre-allocated dim_size={dim_size} "
+                f"(graph capture ON)"
+            )
 
         # Pre-allocate min-int8 allreduce SHM before graph capture claims the pool.
         kernel.shm_allreduce_min_int8_init_kunpeng(1024)

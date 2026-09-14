@@ -116,20 +116,62 @@ for ip in "${NODE_IPS[@]}"; do
     echo "=== Node $ip ===" >> "$SUMMARY"
     if [ -s "$file" ]; then
         awk '
-        BEGIN { RS = "Process "; ORS = ""; }
+        BEGIN {
+            RS = "Process "; ORS = "";
+            # sort DP groups and TP ranks numerically (not lexicographic)
+            PROCINFO["sorted_in"] = "@ind_num_asc";
+        }
+        # Keep only the main-thread stack: in py-spy output the main thread is
+        # the one whose thread id equals the process pid, i.e. "Thread <pid>".
+        function filter_main_thread(rec, pid,   i, start, n, lines, out, m) {
+            n = split(rec, lines, "\n");
+            out = lines[1];                       # process header "Process <pid>: <cmd>"
+            start = 0;
+            for (i = 1; i <= n; i++) {
+                if (lines[i] ~ /^Thread [0-9]+/ &&
+                    match(lines[i], /^Thread ([0-9]+)/, m) && m[1] == pid) {
+                    start = i;                    # the main-thread header
+                    break;
+                }
+            }
+            if (start == 0) {
+                return out;                       # no main thread found -> header only
+            }
+            for (i = start; i <= n; i++) {
+                if (i > start && lines[i] ~ /^Thread [0-9]+/) break;
+                out = out "\n" lines[i];
+            }
+            return out;
+        }
         NR > 1 {
             rec = "Process " $0;
-            if (match($0, /sglang::scheduler_DP([0-9]+)/, arr)) {
-                dp = arr[1];
+            # DP / TP ranks parsed from the process title, e.g. "sglang::scheduler_DP0_TP1".
+            # Within each node we want stacks ordered by DP then TP.
+            if (match($0, /sglang::scheduler_DP([0-9]+)/, a)) dp = a[1] + 0; else dp = 999;
+            if (match($0, /_TP([0-9]+)/, t)) tp = t[1] + 0; else tp = 0;
+
+            match(rec, /^Process ([0-9]+):/, hdr);
+            pid = hdr[1];
+            block = filter_main_thread(rec, pid);
+            if ((dp in data) && (tp in data[dp])) {
+                data[dp][tp] = data[dp][tp] "\n" block;
             } else {
-                dp = 999;
+                data[dp][tp] = block;
             }
-            if (dp in data) data[dp] = data[dp] "\n" rec; else data[dp] = rec;
         }
         END {
-            n = asorti(data, sorted);
-            for (i = 1; i <= n; i++) {
-                print data[sorted[i]];
+            # Emphasize the scheduler header line (Process <pid>: sglang::scheduler_DPx_TPy...)
+            # with separator bars, so it is easy to spot in a plain-text summary.
+            for (dp in data) {
+                for (tp in data[dp]) {
+                    block = data[dp][tp];
+                    printf "==================================================================\n";
+                    hdr_end = index(block, "\n");
+                    if (hdr_end == 0) hdr_end = length(block) + 1;
+                    printf ">>> %s\n", substr(block, 1, hdr_end - 1);
+                    if (hdr_end <= length(block)) printf "%s\n", substr(block, hdr_end + 1);
+                    printf "==================================================================\n";
+                }
             }
         }
         ' "$file" >> "$SUMMARY"
