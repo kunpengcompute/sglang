@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
@@ -13,7 +14,12 @@ from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
-from sglang.srt.utils.common import is_cpu_920f, require_mlp_tp_gather
+from sglang.srt.utils.common import (
+    is_cpu_920f,
+    is_kunpeng_graph_profile,
+    kunpeng_forward_count,
+    require_mlp_tp_gather,
+)
 from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler
 
 if TYPE_CHECKING:
@@ -45,6 +51,16 @@ def _rdma_allgather_available() -> bool:
         return False
     state = _KunpengDispatcherState._instance
     return state is not None and state.rdma_comm_created
+
+
+# Forward-count parity check (kunpeng 920F): auto-on when graph profile is
+# on (per-forward RDMA barriers then make count divergence a deadlock), or
+# force-on with SGLANG_KUNPENG_CHECK_FWD_COUNT=1.
+_is_kunpeng_fwd_count_check = _is_cpu_920f and (
+    is_kunpeng_graph_profile()
+    or os.environ.get("SGLANG_KUNPENG_CHECK_FWD_COUNT", "0") == "1"
+)
+_fwd_count_check_last = 0
 
 # ---------------------------------------------------------------------------
 # Persistent RDMA allgather buffers for the DP-attention sync info tensor.
@@ -224,6 +240,33 @@ def _update_gather_batch(
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
 
 
+def _check_forward_count_consistency(tp_group: "GroupCoordinator") -> None:
+    """Assert every rank in the TP group (the kutacc RDMA domain) ran the
+    same number of forwards since the last call: per-forward collectives
+    (graph-profile moe_comm_barrier, NextN MoE dispatch) mispair and
+    deadlock the domain otherwise.
+    """
+    global _fwd_count_check_last
+    local = kunpeng_forward_count()
+    delta = local - _fwd_count_check_last
+    _fwd_count_check_last = local
+
+    group = tp_group.cpu_group
+    gathered = torch.empty(group.size(), dtype=torch.int64)
+    torch.distributed.all_gather_into_tensor(
+        gathered, torch.tensor([delta], dtype=torch.int64), group=group
+    )
+    deltas = gathered.tolist()
+    if len(set(deltas)) != 1:
+        raise RuntimeError(
+            f"[fwd-count-check] per-rank forward counts diverged since the "
+            f"last scheduler sync: deltas={deltas} (local delta={delta}). "
+            f"Per-forward RDMA-domain collectives (moe_comm_barrier under "
+            f"SGLANG_ENABLE_GRAPH_PROFILE, NextN MoE dispatch) mispair across "
+            f"ranks and will deadlock the cluster."
+        )
+
+
 @Kunpeng_PP_Profiler(depth=1)
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
@@ -247,6 +290,11 @@ def prepare_mlp_sync_batch_raw(
     # gathered buffer / idle batch is required.
     if local_batch is None and dp_size == 1:
         return None
+
+    # Forward-count parity check; requires overlap schedule disabled (with
+    # overlap the previous iteration's forwards may still be running).
+    if _is_kunpeng_fwd_count_check and disable_overlap_schedule:
+        _check_forward_count_consistency(tp_group)
 
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
