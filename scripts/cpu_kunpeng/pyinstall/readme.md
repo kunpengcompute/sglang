@@ -76,7 +76,7 @@ bash pyinstall.sh
 
 ## 二、后续源码更新
 
-代码更新已集成到 `scripts/cpu_kunpeng/launch.sh` 启动流程中。当环境变量 `SGLANG_ENABLE_BINARY_LAUNCH=1` 时，每次调用 `launch.sh` 都会自动执行增量更新：
+代码更新已集成到 `scripts/cpu_kunpeng/runtime/launch_cluster.sh` 启动流程中（经顶层 `launch.sh` 分发调用）。当环境变量 `SGLANG_ENABLE_BINARY_LAUNCH=1` 时，每次调用 `launch.sh <role>` 都会自动执行增量更新：
 
 ```bash
 # 启动 prefill/decode 节点时，自动先更新打包产物中的源码
@@ -84,7 +84,7 @@ export SGLANG_ENABLE_BINARY_LAUNCH=1
 bash launch.sh native
 ```
 
-`launch.sh` 中的自动更新逻辑（`sh ./pyinstall/update.sh`）会直接拷贝最新源码覆盖各 NUMA 副本的 `_internal` 目录，**无需重新执行 PyInstaller**，速度远快于全量打包。
+`runtime/launch_cluster.sh` 中的自动更新逻辑（`bash ./pyinstall/update.sh`）会直接拷贝最新源码覆盖各 NUMA 副本的 `_internal` 目录，**无需重新执行 PyInstaller**，速度远快于全量打包。
 
 也可以手动执行增量更新：
 

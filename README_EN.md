@@ -106,6 +106,14 @@ Four deployment modes are available via `source env.sh [mode]`:
 - **decode**: PD disaggregation decode role. Nodes read from `DECODE_IP_SPEC`.
 - **router**: PD disaggregation router node, single-node running `sglang_router.launch_router`.
 
+Script call hierarchy (`launch.sh` is a pure task dispatcher; the real logic lives in sub-scripts):
+
+```
+launch.sh (dispatcher: ./launch.sh <role>)
+  └─→ runtime/launch_cluster.sh (cluster launch orchestration: env loading, stop-first, SSH fan-out to nodes)
+        └─→ server.sh (single-node process launch)
+```
+
 When `IS_PREFILL=1` (prefill mode), `SGLANG_KUNPENG_MAX_SEQ_NUM=4` and `SGLANG_KUNPENG_MAX_CUR_LEN=1024` are set automatically; when `IS_PREFILL=0` (decode/native), `SGLANG_KUNPENG_MAX_SEQ_NUM=128` and `SGLANG_KUNPENG_MAX_CUR_LEN=1` are set.
 
 ### 3.4 Environment Variables

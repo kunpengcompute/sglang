@@ -27,12 +27,10 @@ ROLE="$1"
 # process is derived below from (node index, rank-in-node).
 NODE_RANK="$2"
 LOG_PATH="$3"
-INSTANCE="$4"
-BUCKET="$5"
 IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 
 # Source environment config (exports CONDA_ACTIVATE_CMD, PYTHON_SCRIPT, etc.)
-source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET"
+source ./env.sh "$ROLE"
 
 rmmod sdma_dae 2>/dev/null || true
 insmod "$SDMA_KO_PATH" safe_mode=0 share_chns=160
@@ -55,7 +53,7 @@ BASE_ARGS=(
     --pp-size "$PP_SIZE"
     --page-size 64
     --mem-fraction-static 0.88
-    --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
+    --chunked-prefill-size $((CHUNKED_PREFILL_SIZE_PER_DP * DP_SIZE))
     --skip-server-warmup
     --disable-custom-all-reduce
     --enable-dp-attention
@@ -122,13 +120,8 @@ case "$ROLE" in
             --max-running-requests $((2 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
             --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
+            --disaggregation-bootstrap-port 9001
         )
-        if [[ "$INSTANCE" == "second" ]]; then
-            SPECIFIC_ARGS+=(--disaggregation-bootstrap-port 9002)
-            echo "===================second 9002 $IP"
-        else
-            SPECIFIC_ARGS+=(--disaggregation-bootstrap-port 9001)
-        fi
         ;;
     decode)
         SPECIFIC_ARGS=(
@@ -153,25 +146,35 @@ case "$ROLE" in
             --load-balance-method round_robin
         )
         ;;
-    router)
+    tokenizer)
         # ================= Router-node CPU / NUMA binding plan =================
         # Example layout (adjust *_NUMA_BASE to match the router's real NUMAs;
         # W = TOKENIZER_WORKER_NUM, each NUMA = 38 cores, last core isolated).
         # 16 NUMAs total (0-15). With W=4 each role needs 5 (tok W + detok 1),
-        # 3 roles = 15 NUMAs; NUMA 15 is left for the gateway & bootstrap:
+        # 2 roles = 10 NUMAs; remaining NUMAs are left for the gateway & bootstrap:
         #   prefill : BASE 0   -> tokenizer 0..(W-1),    detok W
-        #   second  : BASE 5   -> tokenizer 5..(5+W-1),  detok 5+W
         #   decode  : BASE 10  -> tokenizer 10..(10+W-1), detok 10+W
-        #   NUMA 15 (570-606): gateway cores + bootstrap server cores
         export PREFILL_NUMA_BASE="${PREFILL_NUMA_BASE:-0}"
         export DECODE_NUMA_BASE="${DECODE_NUMA_BASE:-10}"
         export PREFILL_BOOTSTRAP_CPU="${PREFILL_BOOTSTRAP_CPU:-591-595}"
+        # Common args for tokenizer-side HTTP server
+        HTTP_COMMON_ARGS=(
+            --model "$MODEL_PATH"
+            --device cpu --trust-remote-code
+            --host "$ROUTER_IP"
+            --disaggregation-bootstrap-port 9001
+            --nnodes 1 --node-rank 0 --dist-timeout 600
+            --tp-size 1
+            --max-total-tokens 64
+            --tokenizer-worker-num "$TOKENIZER_WORKER_NUM"
+            --skip-server-warmup
+            --enable-dynamic-batch-tokenizer
+            --batch-notify-size "$SGLANG_KUNPENG_MAX_SEQ_NUM"
+            --tokenizer-backend "${SGLANG_TOKENIZER_BACKEND:-huggingface}"
+        )
+        ;;
+    router)
         export GATEWAY_CPUS="${GATEWAY_CPUS:-570-590}"
-        # Second prefill only used when enabled.
-        if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
-            export SECOND_PREFILL_NUMA_BASE="${SECOND_PREFILL_NUMA_BASE:-5}"
-            export SECOND_PREFILL_BOOTSTRAP_CPU="${SECOND_PREFILL_BOOTSTRAP_CPU:-596-600}"
-        fi
         if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
             _router_prefill_url="http://${ROUTER_IP}:30001"
             _router_decode_url="http://${ROUTER_IP}:30002"
@@ -191,35 +194,6 @@ case "$ROLE" in
             --health-check-timeout-secs 10000
             --host "$IP"
         )
-        if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
-            SPECIFIC_ARGS+=(
-                --prefill "http://${ROUTER_IP}:30003" 9002
-            )
-        fi
-        if [[ "$PREFILL_BUCKET" == "1" ]]; then
-            SPECIFIC_ARGS+=(
-                --prefill "${PREFILL_LONG_PROMPT_MASTER_ADDR:+http://$PREFILL_LONG_PROMPT_MASTER_ADDR:30000}" 9001
-                --prefill-policy bucket
-                --balance-abs-threshold 64
-                --balance-rel-threshold 1.5
-                --bucket-adjust-interval-secs 5
-            )
-        fi
-        # Common args for tokenizer-side HTTP server
-        HTTP_COMMON_ARGS=(
-            --model "$MODEL_PATH"
-            --device cpu --trust-remote-code
-            --host "$ROUTER_IP"
-            --disaggregation-bootstrap-port 9001
-            --nnodes 1 --node-rank 0 --dist-timeout 600
-            --tp-size 1
-            --max-total-tokens 64
-            --tokenizer-worker-num "$TOKENIZER_WORKER_NUM"
-            --skip-server-warmup
-            --enable-dynamic-batch-tokenizer
-            --batch-notify-size "$SGLANG_KUNPENG_MAX_SEQ_NUM"
-            --tokenizer-backend "${SGLANG_TOKENIZER_BACKEND:-huggingface}"
-        )
         ;;
     *)
         echo "Error: unknown role '$ROLE'" >&2
@@ -228,10 +202,9 @@ case "$ROLE" in
 esac
 
 # Combine and execute
-if [[ "$ROLE" == "router" ]]; then
-    if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
-        # Launch prefill HTTP server (tokenizer side)
-        echo "Launching prefill HTTP server..."
+if [[ "$ROLE" == "tokenizer" ]]; then
+    # Launch prefill HTTP server (tokenizer side)
+    echo "Launching prefill HTTP server..."
         SGLANG_KUNPENG_TOKENIZER_BASE_NUMA="$PREFILL_NUMA_BASE" \
         SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU="$PREFILL_BOOTSTRAP_CPU" \
         LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
@@ -242,24 +215,7 @@ if [[ "$ROLE" == "router" ]]; then
             --dist-init-addr "$PREFILL_MASTER_ADDR:$PREFILL_MASTER_PORT" \
             --disaggregation-mode prefill \
             --disaggregation-bootstrap-port 9001 \
-        > "$LOG_PATH/router_prefill_http.log" 2>&1 &
-
-        # Launch second prefill HTTP server (tokenizer side), paired with the
-        # second prefill backend cluster (SECOND_PREFILL_* nodes / master).
-        if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
-            echo "Launching second prefill HTTP server..."
-            SGLANG_KUNPENG_TOKENIZER_BASE_NUMA="$SECOND_PREFILL_NUMA_BASE" \
-            SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU="$SECOND_PREFILL_BOOTSTRAP_CPU" \
-            LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
-            python -m sglang.launch_server \
-                "${HTTP_COMMON_ARGS[@]}" \
-                --dp-size "$PREFILL_DP_SIZE" \
-                --port 30003 \
-                --dist-init-addr "$SECOND_PREFILL_MASTER_ADDR:$SECOND_PREFILL_MASTER_PORT" \
-                --disaggregation-mode prefill \
-                --disaggregation-bootstrap-port 9002 \
-            > "$LOG_PATH/router_prefill_http_second.log" 2>&1 &
-        fi
+        > "$LOG_PATH/tokenizer_prefill_http.log" 2>&1 &
 
         # Launch decode HTTP server (tokenizer side)
         echo "Launching decode HTTP server..."
@@ -271,11 +227,10 @@ if [[ "$ROLE" == "router" ]]; then
             --port 30002 \
             --dist-init-addr "$DECODE_MASTER_ADDR:$DECODE_MASTER_PORT" \
             --disaggregation-mode decode \
-        > "$LOG_PATH/router_decode_http.log" 2>&1 &
+        > "$LOG_PATH/tokenizer_decode_http.log" 2>&1 &
 
-        # Poll until the HTTP servers are ready (up to 2 minutes each)
+        # Poll until the HTTP servers are ready (up to 30 minutes each)
         HTTP_PORTS=(30001 30002)
-        [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]] && HTTP_PORTS+=(30003)
         for port in "${HTTP_PORTS[@]}"; do
             echo "Waiting for HTTP server on port $port to be ready..."
             ready=0
@@ -292,7 +247,10 @@ if [[ "$ROLE" == "router" ]]; then
             }
             echo "HTTP server on port $port ready"
         done
-    fi
+    exit 0
+fi
+
+if [[ "$ROLE" == "router" ]]; then
     
     # Launch sgl-model-gateway (Rust router) ----
     echo "Launching PD disaggregation router..."
