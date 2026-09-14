@@ -51,6 +51,7 @@ from sglang.srt.utils.common import get_bool_env_var, get_device_module, is_xpu,
 logger = logging.getLogger(__name__)
 
 _is_cpu_920f = is_cpu_920f()
+
 _DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
 _is_scheduler_skip_all_gather = (
     os.environ.get("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "0") == "1"
@@ -264,8 +265,7 @@ class SchedulerPPMixin:
         consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
-        send_bootstrapped_work = []
-        send_transfer_work = []
+        send_prefill_consensus_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
 
@@ -289,13 +289,15 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                # 2.PD consensus (bootstrap / transfer): all local polls first,
+                # then ONE bundle recv from the previous stage, then both
+                # consensus (deadlock-safe order; gloo keeps the per-pyobj recvs).
+                bootstrapped_rids, transferred_rids = (
+                    self._pp_pd_get_prefill_consensus_rids()
+                )
                 bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
-
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                self._pp_commit_comm_work(send_prefill_consensus_work)
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
@@ -371,11 +373,10 @@ class SchedulerPPMixin:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
+                    send_prefill_consensus_work = (
+                        self._pp_send_consensus_bundle_to_next_stage(
+                            [bootstrapped_rids, transferred_rids]
+                        )
                     )
                     if self.cur_batch:
                         if not _is_cpu_920f:
@@ -621,6 +622,9 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        # Bundles drained out-of-order during _pp_wait_acks (non-blocking ack
+        # reclaim) are stashed here until the consensus getter consumes them.
+        self._pp_bundle_inbox: deque[List[Any]] = deque()
 
         # PP + MTP: the per-req drafts (`speculative_num_steps` per req) that
         # are about to be verified in the next decode round, keyed by req.rid.
@@ -914,7 +918,50 @@ class SchedulerPPMixin:
             )
         return transferred_rids
 
-    @Kunpeng_PP_Profiler(depth=1)
+    @Kunpeng_PP_Profiler(depth=1, name="pd_prefill_consensus")
+    def _pp_pd_get_prefill_consensus_rids(self: Scheduler):
+        """Compute prefill bootstrap / transfer consensus for the microbatch.
+
+        Runs ALL local polls first, then a SINGLE blocking bundle-recv from the
+        previous stage (deadlock-safe order), then builds the two consensus.
+        Gloo keeps the original per-pyobj behavior.
+        """
+        # bootstrap poll BEFORE any blocking recv (fence/pp_recv deadlock).
+        curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
+            self.disagg_prefill_bootstrap_queue.queue,
+            True,
+            [KVPoll.WaitingForInput],
+            [KVPoll.Failed],
+        )
+        # transfer poll BEFORE any blocking recv.
+        curr_transferred_rids = self.get_rids(
+            self.disagg_prefill_inflight_queue,
+            True,
+            [KVPoll.Success, KVPoll.Failed],
+        )
+
+        if self.pp_group.is_first_rank:
+            return [curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids], (
+                curr_transferred_rids
+            )
+
+        # other ranks: one bundle-recv of [bootstrapped, transferred], then
+        # build the two consensus exactly like the per-getter originals.
+        prev = self._pp_recv_consensus_bundle_from_prev_stage(2)
+        prev_bootstrapped_rids, prev_transferred_rids = prev
+        prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = prev_bootstrapped_rids
+        good_bootstrapped_rids = list(
+            set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+        )
+        bad_bootstrapped_rids = list(
+            set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+        )
+        transferred_rids = list(
+            set(prev_transferred_rids) & set(curr_transferred_rids)
+        )
+        return [good_bootstrapped_rids, bad_bootstrapped_rids], transferred_rids
+
+    @Kunpeng_PP_Profiler(depth=1, name="send_consensus")
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
         bmbs: List[List[str]],
@@ -1154,21 +1201,69 @@ class SchedulerPPMixin:
     def _pp_wait_acks(self: Scheduler) -> None:
         """Wait until every posted message has been acked by its peer.
 
-        ACK messages come back from the downstream peer(s) on the same FIFO
-        as their data messages; while waiting we consume those messages and
-        stash them in the inbox for later demux.
+        A blocking wait on the downstream peer forms a circular ACK wait across
+        the PP ring: every rank blocks on its downstream's ACK while never
+        consuming its upstream's data that would /release/ it.  To avoid this:
+          * first drain any pending upstream frame (non-blocking); consuming it
+            auto-acks the sender and frees the sender's ring slot, which unwinds
+            a circular wait;
+          * then check the downstream ACK non-blockingly (sleep + retry when it
+            is not ready yet).
+
+        Drained data frames are stashed — pyobj/tensor into
+        `_pp_tensor_dict_inbox`, bundle into `_pp_bundle_inbox` — so the later
+        demux consumers pick them up in order.
         """
+        from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
+            PP_KIND_BUNDLE,
+        )
+
         comm = self.pp_group.kunpeng_pp_communicator
         if comm is None:
             return
         all_gather_group = (
             self.attn_tp_group if self.require_attn_tp_allgather else None
         )
+        upstream = (self.pp_rank - 1) % self.pp_size
         while True:
+            # 1) Drain upstream data first (breaks the circular ACK wait).
+            #    This must run even when this rank has NO inflight messages:
+            #    an idle rank that returns early never frees its upstream
+            #    sender's ring slots (the PP15->PP0 ringback channel sends
+            #    unconditionally every microbatch), the sender then stalls
+            #    here waiting for this rank's ack, and the whole ring
+            #    deadlocks with every rank blocked on its ringback recv.
+            kind = comm.try_peek_msg(upstream)
+            if kind == PP_KIND_BUNDLE:
+                data = comm.recv_pyobjs_bundle(upstream)
+                self._pp_bundle_inbox.append(data)
+                continue
+            if kind >= 0:  # pyobj / tensor / (defensive: ack)
+                msg = self._pp_consume_message(
+                    upstream, all_gather_group, defer_all_gather=True
+                )
+                if msg is not None:
+                    self._pp_tensor_dict_inbox.setdefault(
+                        msg["kind"], deque()
+                    ).append(msg)
+                continue
+
+            # 2) No upstream frame: check the downstream ack (non-blocking).
             dsts = [d for d in range(comm.comm_size) if comm.inflight(d) > 0]
             if not dsts:
                 return
-            msg = self._pp_consume_message(dsts[0], all_gather_group)
+            kind = comm.try_peek_msg(dsts[0])
+            if kind < 0:
+                # Not acked yet; avoid a busy spin while the peer catches up.
+                time.sleep(0.0001)
+                continue
+            if kind == PP_KIND_BUNDLE:
+                data = comm.recv_pyobjs_bundle(dsts[0])
+                self._pp_bundle_inbox.append(data)
+                continue
+            msg = self._pp_consume_message(
+                dsts[0], all_gather_group, defer_all_gather=True
+            )
             if msg is None:
                 continue  # ACK: inflight already decremented
             self._pp_tensor_dict_inbox.setdefault(msg["kind"], deque()).append(msg)
@@ -1357,8 +1452,32 @@ class SchedulerPPMixin:
         all attn_tp ranks to arrive lands inside this span."""
         return all_gather_group.all_gather(tensor, dim=0)
 
+    def _pp_resolve_deferred_all_gather(
+        self: Scheduler, msg: Dict[str, Any], all_gather_group: Optional
+    ) -> None:
+        """Rebuild tensor shards that were deferred during the release-slot
+        drain, now that a real demux consumer is taking ownership of the msg."""
+        deferred = msg.pop("_deferred_all_gather", None)
+        if not deferred:
+            return
+        if all_gather_group is None:
+            all_gather_group = (
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            )
+        if all_gather_group is None:
+            return
+        tensor_dict = msg["tensor_dict"]
+        for key, orig_shape in deferred.items():
+            shard = tensor_dict[key]
+            tensor_dict[key] = self._pp_all_gather_shard(
+                shard, all_gather_group
+            ).reshape(orig_shape)
+
     def _pp_consume_message(
-        self: Scheduler, src: int, all_gather_group: Optional = None
+        self: Scheduler,
+        src: int,
+        all_gather_group: Optional = None,
+        defer_all_gather: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Consume one FIFO message from `src` (kunpeng RDMA path).
 
@@ -1372,6 +1491,7 @@ class SchedulerPPMixin:
             PP_KIND_ACK,
             PP_KIND_BUNDLE,
             SHM_ALIGN_SIZE,
+            _msg_type_from_metadata,
         )
 
         comm = self.pp_group.kunpeng_pp_communicator
@@ -1402,10 +1522,14 @@ class SchedulerPPMixin:
         all_gather_rank = (
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
-
+# The recv side must read the offset the sender wrote to. kutacc::pp_put
+        # writes local[off] -> remote[off] with one offset, so both sides agree
+        # on the slot: output frames use the per-sender ring slot that the
+        # sender picked, proxy frames reuse segment 0.
+        is_output = _msg_type_from_metadata(recv_metadata_list) == "output"
+        offset_base = comm.output_recv_offset(src) if is_output else 0
+        comm.recv_batch(src, offset_base)
         tensor_dict: Dict[str, Any] = {}
-        shards = []
-        offsets = []
         pending = []  # (key, shard, use_all_gather, orig_shape)
         pp_offset = 0
         for key, value in recv_metadata_list:
@@ -1432,25 +1556,31 @@ class SchedulerPPMixin:
                 raise RuntimeError("Kunpeng PP RDMA channel requires CPU tensors")
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
-            # Record the shard; the C++ fused op does one pp_recv + all copies.
-            shards.append(tensor)
-            offsets.append(pp_offset)
+            comm.copy_from_buffer(tensor, offset_base + pp_offset)
             pp_offset += tensor.nbytes
             pending.append((key, tensor, use_all_gather, orig_shape))
 
-        # Fused recv of the data imm + scatter into all shards in a single call
-        # (the TENSOR metadata imm above was consumed by recv_message).
-        offsets_t = torch.tensor(offsets, dtype=torch.int64)
-        comm.recv_tensor_batch(src, offsets_t, shards)
-
+        deferred = {}
         for key, shard, use_all_gather, orig_shape in pending:
             tensor = shard
             if use_all_gather:
-                tensor = self._pp_all_gather_shard(tensor, all_gather_group)
-                tensor = tensor.reshape(orig_shape)
+                if defer_all_gather:
+                    # Release-slot drain path: materialize only the shard now,
+                    # defer the node-local TP all_gather (a strong fence) to the
+                    # real demux consumer. Perform the all_gather here would
+                    # force the 16 independent PP chains into a node-local
+                    # barrier while this rank is still spinning on a downstream
+                    # ACK, which deadlocks the ring.
+                    deferred[key] = orig_shape
+                else:
+                    tensor = self._pp_all_gather_shard(tensor, all_gather_group)
+                    tensor = tensor.reshape(orig_shape)
             tensor_dict[key] = tensor
         msg_type = tensor_dict.get("__msg_type__", "default")
-        return {"kind": msg_type, "tensor_dict": tensor_dict}
+        msg = {"kind": msg_type, "tensor_dict": tensor_dict}
+        if deferred:
+            msg["_deferred_all_gather"] = deferred
+        return msg
 
     def _pp_recv_message(
         self: Scheduler,
@@ -1463,7 +1593,9 @@ class SchedulerPPMixin:
         if expected_kind in self._pp_tensor_dict_inbox:
             inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
             if inbox_queue:
-                return inbox_queue.popleft()
+                msg = inbox_queue.popleft()
+                self._pp_resolve_deferred_all_gather(msg, all_gather_group)
+                return msg
 
         if all_gather_group is None:
             all_gather_group = (
@@ -2096,7 +2228,12 @@ class SchedulerPPMixin:
             # unified channel (stashing any non-target kind that arrives first),
             # then the list is broadcast to the rest of the tp/cp ranks.
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-                data = self._pp_recv_message(direction)["data"]
+                if self._pp_bundle_inbox:
+                    data = self._pp_bundle_inbox.popleft()
+                else:
+                    data = self.pp_group.kunpeng_pp_communicator.recv_pyobjs_bundle(
+                        (self.pp_rank - 1) % self.pp_size
+                    )
                 assert len(data) == count, (
                     f"consensus bundle: expected {count} sub-payloads, "
                     f"got {len(data)}"

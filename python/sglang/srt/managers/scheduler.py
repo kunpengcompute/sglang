@@ -237,7 +237,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu, is_cpu_920f
+from sglang.srt.utils.common import is_npu, is_cpu_920f, is_skip_http
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -274,6 +274,7 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
 _is_cpu_920f = is_cpu_920f()
+_is_skip_http = is_skip_http()
 _enable_kunpeng_profile = envs.SGLANG_KUNPENG_PROFILE.get()
 
 
@@ -466,7 +467,7 @@ class Scheduler(
             # finished. Synchronize all PP ranks here so no rank proceeds to the
             # event loop before every rank is ready — otherwise the ring
             # communication in the event loop deadlocks.
-            barrier()
+            barrier(group=get_pp_group().cpu_group)
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
@@ -544,8 +545,18 @@ class Scheduler(
         self.idle_sleeper = None
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            # When dp_size > 1, the scheduler receives requests from the
+            # DataParallelController, which already binds the worker port as a
+            # PUSH socket; the scheduler's PULL must connect instead of bind.
+            # Only when dp_size == 1 in tokenizer-separate mode does the
+            # scheduler receive directly from the tokenizer (router connects),
+            # so it must bind.
+            _bind_recv_from_tokenizer = _is_skip_http and self.dp_size == 1
             self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                context,
+                zmq.PULL,
+                port_args.scheduler_input_ipc_name,
+                _bind_recv_from_tokenizer,
             )
             self.recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False

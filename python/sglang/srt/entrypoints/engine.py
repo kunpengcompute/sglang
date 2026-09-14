@@ -575,6 +575,24 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
             )
 
+            if _is_kunpeng_binary_launch:
+                # In kunpeng binary launch, each node runs one binary per rank
+                # (identified by --tp-rank-in-node). This binary must run exactly
+                # ONE scheduler rank instead of forking all local TP ranks.
+                # Mirror launch_tensor_parallel_group's binary rank computation.
+                nnodes_per_tp_group = max(
+                    server_args.nnodes // server_args.pp_size, 1
+                )
+                tp_rank_range = range(
+                    tp_size_per_node
+                    * (server_args.node_rank % nnodes_per_tp_group)
+                    + server_args.tp_rank_in_node,
+                    tp_size_per_node
+                    * (server_args.node_rank % nnodes_per_tp_group)
+                    + server_args.tp_rank_in_node
+                    + 1,
+                )
+
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=False)
@@ -1341,16 +1359,10 @@ def _calculate_rank_ranges(
 
     nnodes_per_tp_group = nnodes_per_pp_rank
     tp_size_per_node = tp_size // nnodes_per_tp_group
-    if _is_kunpeng_binary_launch and nnodes > 1:
-        tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node,
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group) + server_args.tp_rank_in_node + 1,
-        )
-    else:
-        tp_rank_range = range(
-            tp_size_per_node * (node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
-        )
+    tp_rank_range = range(
+        tp_size_per_node * (node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
+    )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
 

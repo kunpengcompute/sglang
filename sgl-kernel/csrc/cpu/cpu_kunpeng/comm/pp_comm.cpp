@@ -49,19 +49,33 @@ extern bool g_global_comm_initialized;
 #define PP_KIND_BUNDLE 3  // one frame carrying N pyobj sub-payloads (consensus merge)
 #define PP_MSG_HEADER 12
 #define PP_MSG_SLOTS 8
-// 1MB per slot: enough for pyobj (req/consensus) and tensor metadata pickles.
-// At world_size=16 the message region is 16*8*1MB=128MB, leaving 128MB for
-// the tensor batch region of a 256MB buffer.
 #define PP_MSG_SLOT_SIZE (1 * 1024 * 1024)
 #define PP_MSG_PER_PEER (PP_MSG_SLOTS * PP_MSG_SLOT_SIZE)
+// 1MB per slot: enough for pyobj (req/consensus) and tensor metadata pickles.
+// At world_size=16 the message region is 16*8*1MB=128MB. The tensor batch
+// region occupies everything below the message region:
+//   proxy  : [0, PP_PROXY_REGION_SIZE)                          -- single segment
+//   output : [PP_PROXY_REGION_SIZE, + pp_size * PP_OUTPUT_PER_SENDER) -- per-sender ring
+// kutacc::pp_put writes local[off] -> remote[off] with the *same* offset, so a
+// message must live at an offset every rank agrees on. Proxy traffic on the
+// 1-D PP ring is alternating (recv -> forward -> send) and needs only one
+// segment; output traffic streams back-to-back and would alias itself, so it
+// is split per-sender with an 8-slot ring mirroring the message slots.
+#define PP_PROXY_REGION_SIZE (64 * 1024 * 1024)
+#define PP_OUTPUT_SLOTS 8
+#define PP_OUTPUT_SLOT_SIZE (1 * 1024 * 1024)
+#define PP_OUTPUT_PER_SENDER (PP_OUTPUT_SLOTS * PP_OUTPUT_SLOT_SIZE)
 
 static uint8_t *g_pp_base_ptr = nullptr;
 static int64_t g_pp_buf_size = 0;
 static int64_t g_pp_msg_offset = 0;      // start of the per-sender message region
 static int64_t g_pp_msg_per_peer = 0;
+static int64_t g_pp_output_base = 0;     // start of the per-sender output region
 static int64_t *g_pp_send_cnt = nullptr;  // [pp_size] msgs I posted to each pp peer
 static int64_t *g_pp_recv_cnt = nullptr;  // [pp_size] msgs I received from each pp peer
 static int64_t *g_pp_inflight = nullptr;  // [pp_size] outbound non-ack msgs not yet acked by each peer
+static int64_t *g_pp_output_send_cnt = nullptr;  // [pp_size] output data frames I sent to each peer
+static int64_t *g_pp_output_recv_cnt = nullptr;  // [pp_size] output data frames I received from each peer
 static int64_t *g_pp_to_world = nullptr;  // [pp_size] pp_rank -> world_rank
 static int g_pp_world_size = 0;           // PP group size (not the world size)
 static int g_pp_my_rank = 0;              // rank inside the PP group
@@ -89,13 +103,20 @@ void pp_comm_init_kunpeng(at::Tensor buffer, int64_t process_group_ptr, at::Tens
     TORCH_CHECK(g_pp_buf_size > (int64_t)g_pp_world_size * g_pp_msg_per_peer,
                 "PP buffer too small for the message region");
     g_pp_msg_offset = g_pp_buf_size - (int64_t)g_pp_world_size * g_pp_msg_per_peer;
+    // Proxy occupies the single segment below the output region; the output
+    // region is split per-sender with a ring (see the layout comment above).
+    g_pp_output_base = PP_PROXY_REGION_SIZE;
+    TORCH_CHECK(g_pp_msg_offset >= g_pp_output_base + (int64_t)g_pp_world_size * PP_OUTPUT_PER_SENDER,
+                "PP buffer too small for the tensor batch region");
 
     g_pp_send_cnt = (int64_t *)calloc(g_pp_world_size, sizeof(int64_t));
     g_pp_recv_cnt = (int64_t *)calloc(g_pp_world_size, sizeof(int64_t));
     g_pp_inflight = (int64_t *)calloc(g_pp_world_size, sizeof(int64_t));
+    g_pp_output_send_cnt = (int64_t *)calloc(g_pp_world_size, sizeof(int64_t));
+    g_pp_output_recv_cnt = (int64_t *)calloc(g_pp_world_size, sizeof(int64_t));
     g_pp_to_world = (int64_t *)calloc(g_pp_world_size, sizeof(int64_t));
-    TORCH_CHECK(g_pp_send_cnt != nullptr && g_pp_recv_cnt != nullptr && g_pp_inflight != nullptr
-                    && g_pp_to_world != nullptr,
+    TORCH_CHECK(g_pp_send_cnt != nullptr && g_pp_recv_cnt != nullptr && g_pp_inflight != nullptr &&
+                g_pp_output_send_cnt != nullptr && g_pp_output_recv_cnt != nullptr && g_pp_to_world != nullptr,
                 "pp_init: calloc failed");
     for (int i = 0; i < g_pp_world_size; ++i) {
         g_pp_to_world[i] = pp_ranks.data_ptr<int64_t>()[i];
@@ -129,20 +150,61 @@ void pp_copy_from_buffer_kunpeng(at::Tensor tensor, int64_t offset)
     memcpy(tensor.data_ptr(), g_pp_base_ptr + offset, size);
 }
 
-void pp_send_batch_kunpeng(int64_t dest_rank, int64_t total_size)
+// Output slot offsets on the per-sender ring. kutacc::pp_put uses the same
+// offset for the local source and the remote target, so a sender's source slot
+// is, by construction, the receiver's target slot. Each sender owns its own
+// ring region, and the 8 slots advance with the output stream so consecutive
+// frames never alias each other.
+static int64_t pp_output_send_slot_off(int64_t dest_rank)
+{
+    return g_pp_output_base + g_pp_my_rank * PP_OUTPUT_PER_SENDER
+         + (g_pp_output_send_cnt[dest_rank] % PP_OUTPUT_SLOTS) * PP_OUTPUT_SLOT_SIZE;
+}
+
+static int64_t pp_output_recv_slot_off(int64_t src_rank)
+{
+    return g_pp_output_base + src_rank * PP_OUTPUT_PER_SENDER
+         + (g_pp_output_recv_cnt[src_rank] % PP_OUTPUT_SLOTS) * PP_OUTPUT_SLOT_SIZE;
+}
+
+void pp_send_batch_kunpeng(int64_t dest_rank, int64_t send_offset, int64_t total_size)
 {
     TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
     TORCH_CHECK(dest_rank >= 0 && dest_rank < g_pp_world_size, "PP send batch: bad dest_rank");
-    TORCH_CHECK(total_size <= g_pp_msg_offset, "PP send total_size exceeds the tensor batch region");
-    kutacc::pp_put(g_pp_to_world[dest_rank], 0, total_size, g_moe_comm_h->global_ds_conn_info);
+    TORCH_CHECK(send_offset >= 0 && send_offset + total_size <= g_pp_msg_offset,
+                "PP send offset+size exceeds the tensor batch region");
+    if (send_offset >= g_pp_output_base) {
+        TORCH_CHECK(total_size <= PP_OUTPUT_SLOT_SIZE, "PP output send exceeds one ring slot");
+    }
+    kutacc::pp_put(g_pp_to_world[dest_rank], send_offset, total_size,
+                   g_moe_comm_h->global_ds_conn_info);
+    if (send_offset >= g_pp_output_base) {
+        g_pp_output_send_cnt[dest_rank]++;
+    }
 }
 
-void pp_recv_batch_kunpeng(int64_t src_rank, int64_t total_size)
+void pp_recv_batch_kunpeng(int64_t src_rank, int64_t recv_offset)
 {
     TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
     TORCH_CHECK(src_rank >= 0 && src_rank < g_pp_world_size, "PP recv batch: bad src_rank");
-    TORCH_CHECK(total_size <= g_pp_msg_offset, "PP recv total_size exceeds the tensor batch region");
     kutacc::pp_recv(g_pp_to_world[src_rank], g_moe_comm_h->global_ds_conn_info);
+    if (recv_offset >= g_pp_output_base) {
+        g_pp_output_recv_cnt[src_rank]++;
+    }
+}
+
+int64_t pp_get_output_send_offset_kunpeng(int64_t dest_rank)
+{
+    TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
+    TORCH_CHECK(dest_rank >= 0 && dest_rank < g_pp_world_size, "PP output send: bad dest_rank");
+    return pp_output_send_slot_off(dest_rank);
+}
+
+int64_t pp_get_output_recv_offset_kunpeng(int64_t src_rank)
+{
+    TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
+    TORCH_CHECK(src_rank >= 0 && src_rank < g_pp_world_size, "PP output recv: bad src_rank");
+    return pp_output_recv_slot_off(src_rank);
 }
 
 // === Unified message channel (pyobj / tensor metadata / ack) ===
@@ -226,6 +288,7 @@ std::vector<at::Tensor> pp_recv_msg_kunpeng(int64_t src_rank)
         int64_t slot_off = pp_recv_slot_off(src_rank);
         uint32_t *header = reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off);
         TORCH_CHECK(header[0] == PP_MSG_MAGIC, "PP recv msg: bad message magic");
+        header[0] = 0;  // consume: clear magic so a reused ring slot won't look new
         int64_t kind = header[1];
         int64_t size = header[2];
         TORCH_CHECK(size <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER, "PP recv msg: oversized frame");
@@ -244,6 +307,25 @@ std::vector<at::Tensor> pp_recv_msg_kunpeng(int64_t src_rank)
         }
     });
     return {kind_t, payload};
+}
+
+// Non-blocking probe of the next message from `src_rank` WITHOUT consuming it.
+// Returns the message kind (`header[1]`), or -1 when no message is available
+// (the sender has not written the current ring slot's magic yet).  The caller
+// must still consume the message with pp_recv_msg_kunpeng /
+// pp_recv_pyobjs_bundle_kunpeng (or leave it for a later consumer; the probe is
+// side-effect free).  A stale "-1" is safe: it just makes the caller retry.
+int64_t pp_try_peek_msg_kunpeng(int64_t src_rank)
+{
+    TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
+    TORCH_CHECK(src_rank >= 0 && src_rank < g_pp_world_size, "PP peek msg: bad src_rank");
+    int64_t slot_off = pp_recv_slot_off(src_rank);
+    const volatile uint32_t *header =
+        reinterpret_cast<const volatile uint32_t *>(g_pp_base_ptr + slot_off);
+    if (header[0] != PP_MSG_MAGIC) {
+        return -1;
+    }
+    return static_cast<int64_t>(header[1]);
 }
 
 // === Fused batch send/recv (single pp_put/pp_recv + all tensor copies in C++) ===
@@ -363,6 +445,7 @@ std::vector<at::Tensor> pp_recv_pyobjs_bundle_kunpeng(int64_t src_rank)
         uint32_t *header = reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off);
         TORCH_CHECK(header[0] == PP_MSG_MAGIC, "PP recv bundle: bad message magic");
         TORCH_CHECK(header[1] == PP_KIND_BUNDLE, "PP recv bundle: expected a BUNDLE frame");
+        header[0] = 0;  // consume: clear magic so a reused ring slot won't look new
         int64_t total = header[2];
         TORCH_CHECK(total <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER, "PP recv bundle: oversized frame");
 
@@ -402,6 +485,14 @@ void pp_comm_finalize_kunpeng()
         free(g_pp_inflight);
         g_pp_inflight = nullptr;
     }
+    if (g_pp_output_send_cnt) {
+        free(g_pp_output_send_cnt);
+        g_pp_output_send_cnt = nullptr;
+    }
+    if (g_pp_output_recv_cnt) {
+        free(g_pp_output_recv_cnt);
+        g_pp_output_recv_cnt = nullptr;
+    }
     if (g_pp_to_world) {
         free(g_pp_to_world);
         g_pp_to_world = nullptr;
@@ -410,4 +501,5 @@ void pp_comm_finalize_kunpeng()
     g_pp_base_ptr = nullptr;
     g_pp_buf_size = 0;
     g_pp_msg_offset = 0;
+    g_pp_output_base = 0;
 }

@@ -77,6 +77,12 @@ class _KunpengDispatcherState:
     def __init__(self):
         # Communication
         self.rdma_initialized = False
+        # True only when the RDMA communication domain (g_ds_conn_info) was
+        # actually created via moe_comm_create_kunpeng.  Local SHM dispatch
+        # (single-node pp) does not create it, and ranks without any MoE layer
+        # never create it either; the DP-attention allgather must fall back to
+        # torch.all_gather_into_tensor in those cases.
+        self.rdma_comm_created = False
         self.dispatch_initialized = False
         self.combine_initialized = False
 
@@ -191,6 +197,15 @@ def _ensure_rdma_initialized(
             os.environ.get("SGLANG_KUNPENG_MOE_TOKEN_MULTIPLE", "2")
         )
         state.is_prefill = os.environ.get("IS_PREFILL", "1") == "1"
+        # Use local (intra-node SHM) dispatch/combine only when all dispatcher
+        # ranks are on a single node (e.g. single-node pp=16).  In this mode
+        # the RDMA communication domain is NOT created: both the MoE dispatch
+        # and the DP-attention sync run over local SHM / torch collective.
+        state.use_local_dis_com = (
+            state.is_prefill
+            and state.ep_size == get_tensor_model_parallel_world_size()
+            and get_tensor_model_parallel_world_size() == state.attn_tp_size
+        )
 
         state.parallel_policy = torch.empty(3, dtype=torch.int16)
         state.parallel_policy[0] = state.ep_size  # moe_ep
@@ -201,8 +216,14 @@ def _ensure_rdma_initialized(
             get_tensor_model_parallel_world_size() // state.ep_size
         )  # moe_tp
 
-        # Step 1: RDMA communication domain
-        _init_rdma_comm(group, state.ep_size, state.ep_rank)
+        # Step 1: RDMA communication domain.  Only needed when MoE dispatch/
+        # combine actually runs over RDMA (i.e. not local SHM dispatch).  When
+        # it is created we set rdma_comm_created so the DP-attention sync can
+        # select the RDMA allgather; otherwise the DP-attention sync falls back
+        # to torch.all_gather_into_tensor.
+        if not state.use_local_dis_com:
+            _init_rdma_comm(group, state.ep_size, state.ep_rank)
+            state.rdma_comm_created = True
 
         # Step 2: Buffers
         _init_buffers(state)
@@ -212,35 +233,46 @@ def _ensure_rdma_initialized(
         state.dynamic_remap_counter = torch.zeros(state.num_experts, dtype=torch.int64)
 
         # Step 3: Dispatch & combine init
-        torch.ops.sgl_kernel.moe_dispatch_init_kunpeng(
-            state.dispatch_send_buf,
-            state.recv_src_info,
-            state.recv_src_info_bak,
-            state.num_experts,
-            state.num_max_dispatch_tokens_per_rank,
-            state.dispatch_send_buf.size(1),
-            state.dispatch_send_buf.size(0),
-            state.recv_src_info_count,
-            state.attn_tp_size,
-            state.moe_token_multiple,
-            state.dispatch_recv_buf,
-        )
-        state.dispatch_initialized = True
+        if state.use_local_dis_com:
+            # Local (intra-node SHM) dispatch/combine init
+            torch.ops.sgl_kernel.moe_local_dispatch_init_kunpeng(
+                state.dispatch_send_buf,
+                state.combined_x,
+                state.attn_tp_rank,
+                state.attn_tp_size,
+            )
+            state.dispatch_initialized = True
+            state.combine_initialized = True
+        else:
+            torch.ops.sgl_kernel.moe_dispatch_init_kunpeng(
+                state.dispatch_send_buf,
+                state.recv_src_info,
+                state.recv_src_info_bak,
+                state.num_experts,
+                state.num_max_dispatch_tokens_per_rank,
+                state.dispatch_send_buf.size(1),
+                state.dispatch_send_buf.size(0),
+                state.recv_src_info_count,
+                state.attn_tp_size,
+                state.moe_token_multiple,
+                state.dispatch_recv_buf,
+            )
+            state.dispatch_initialized = True
 
-        torch.ops.sgl_kernel.moe_combine_init_kunpeng(
-            state.combine_send_buf,
-            state.combined_x,
-            state.dispatch_send_buf.size(0),
-            state.num_experts,
-            state.num_max_dispatch_tokens_per_rank,
-            state.router_topk,
-            state.hidden_size,
-            state.attn_tp_rank,
-            state.attn_tp_size,
-            state.combine_recv_buf,
-            state.use_static_route,
-        )
-        state.combine_initialized = True
+            torch.ops.sgl_kernel.moe_combine_init_kunpeng(
+                state.combine_send_buf,
+                state.combined_x,
+                state.dispatch_send_buf.size(0),
+                state.num_experts,
+                state.num_max_dispatch_tokens_per_rank,
+                state.router_topk,
+                state.hidden_size,
+                state.attn_tp_rank,
+                state.attn_tp_size,
+                state.combine_recv_buf,
+                state.use_static_route,
+            )
+            state.combine_initialized = True
 
         state.rdma_initialized = True
         logger.info(
@@ -296,9 +328,13 @@ def _init_rdma_comm(group: dist.ProcessGroup, ep_size: int, ep_rank: int):
         use_kunpeng_pp = False
 
     if use_kunpeng_pp:
-        world_group = get_world_group()
-        global_pg_ptr = pg_helper.get_process_group_ptr(world_group.cpu_group)
-        torch.ops.sgl_kernel.moe_comm_create_all_kunpeng(global_pg_ptr, pg_ptr)
+        # Skip moe_comm_create_all_kunpeng if pp_comm_init already created it
+        if not pp_group.kunpeng_pp_communicator._pp_initialized:
+            from sglang.srt.distributed.parallel_state import get_world_group
+            global_pg_ptr = pg_helper.get_process_group_ptr(
+                get_world_group().cpu_group
+            )
+            torch.ops.sgl_kernel.moe_comm_create_all_kunpeng(global_pg_ptr, pg_ptr)
         logger.info(
             "[KunpengMoE] MoE global + sub-domain created (ep_rank=%s)",
             ep_rank,
@@ -364,10 +400,9 @@ def _init_buffers(state: _KunpengDispatcherState):
         return torch.zeros(shape, dtype=dtype)
 
     # activation data (hidden_size) + scale (4 bytes float32)
-    state.dispatch_send_buf = _zeros(
-        (state.max_tokens_per_mb, state.hidden_size + 4),
-        torch.uint8,
-        "dispatch_send_buf",
+    # Use SHM tensor so peer ranks can access it for local (intra-node) dispatch
+    state.dispatch_send_buf = kernel.create_shm_tensor_kunpeng(
+        torch.uint8, [state.max_tokens_per_mb, state.hidden_size + 4]
     )
 
     if state.is_prefill:
@@ -664,15 +699,31 @@ class KunpengDispatcher(BaseDispatcher):
         # Dispatch send
         t_send_start = time.perf_counter()
         batch_id = 0
-        kunpeng.moe_dispatch_send_kunpeng(
-            norm_int8_and_scale,
-            state.topk_ids_index_buf,
-            state.num_experts,
-            state.num_max_dispatch_tokens_per_rank,
-            state.parallel_policy,
-            batch_size,
-            batch_id,
-        )
+        if state.use_local_dis_com:
+            # Local dispatch: no RDMA, just build token_ids/experts_offset
+            # and copy quantized data from peers' SHM dispatch_send_buf
+            kunpeng.moe_local_dispatch_kunpeng(
+                state.topk_ids_index_buf,
+                state.recv_token_ids_buf,
+                state.recv_experts_offset,
+                state.packed_recv_x,
+                state.dispatch_send_buf,
+                state.num_experts,
+                state.num_local_experts,
+                num_tokens,
+                batch_size,
+                state.hidden_size,
+            )
+        else:
+            kunpeng.moe_dispatch_send_kunpeng(
+                norm_int8_and_scale,
+                state.topk_ids_index_buf,
+                state.num_experts,
+                state.num_max_dispatch_tokens_per_rank,
+                state.parallel_policy,
+                batch_size,
+                batch_id,
+            )
         t_send_end = time.perf_counter()
 
         # Stash state needed by dispatch_recv().
@@ -708,26 +759,28 @@ class KunpengDispatcher(BaseDispatcher):
 
         # Dispatch recv
         t_recv_start = time.perf_counter()
-        kunpeng.moe_dispatch_recv_kunpeng(
-            batch_id,
-        )
+        if not state.use_local_dis_com:
+            kunpeng.moe_dispatch_recv_kunpeng(
+                batch_id,
+            )
         t_recv_end = time.perf_counter()
 
         # Build token_ids and experts_offset from recv_src_info.
         t_convert_start = time.perf_counter()
-        kunpeng.topk_convert_kunpeng(
-            state.dispatch_call_count,
-            state.recv_src_info,
-            state.recv_src_info_bak,
-            state.recv_token_ids_buf,
-            state.recv_experts_offset,
-            state.ep_size,
-            state.num_local_experts,
-            state.num_max_dispatch_tokens_per_rank,
-            state.max_tokens_per_mb,
-            state.moe_token_multiple,
-            state.is_prefill,
-        )
+        if not state.use_local_dis_com:
+            kunpeng.topk_convert_kunpeng(
+                state.dispatch_call_count,
+                state.recv_src_info,
+                state.recv_src_info_bak,
+                state.recv_token_ids_buf,
+                state.recv_experts_offset,
+                state.ep_size,
+                state.num_local_experts,
+                state.num_max_dispatch_tokens_per_rank,
+                state.max_tokens_per_mb,
+                state.moe_token_multiple,
+                state.is_prefill,
+            )
         t_convert_end = time.perf_counter()
 
         t_total_end = time.perf_counter()
@@ -777,23 +830,36 @@ class KunpengDispatcher(BaseDispatcher):
 
         t_send_start = time.perf_counter()
         batch_id = 0
-        kunpeng.moe_combine_send_kunpeng(
-            state.combine_send_buf,
-            state.dispatch_call_count,
-            state.recv_src_info,
-            state.recv_src_info_bak,
-            state.num_max_dispatch_tokens_per_rank,
-            state.num_experts,
-            state.hidden_size,
-            state.parallel_policy,
-            batch_id,
-            state.combined_x,
-            topk_ids_index,
-            topk_weights,
-            batch_size,
-            topk_ids_index.shape[1] // 2,
-            True,
-        )
+        if state.use_local_dis_com:
+            # Local combine send: write expert outputs to peers' combined_x via SHM
+            kunpeng.moe_local_combine_send_kunpeng(
+                state.combine_send_buf,
+                state.recv_token_ids_buf,
+                state.recv_experts_offset,
+                state.combined_x,
+                state.topk_ids_index_buf,
+                state.num_local_experts,
+                state.hidden_size,
+                batch_size,
+            )
+        else:
+            kunpeng.moe_combine_send_kunpeng(
+                state.combine_send_buf,
+                state.dispatch_call_count,
+                state.recv_src_info,
+                state.recv_src_info_bak,
+                state.num_max_dispatch_tokens_per_rank,
+                state.num_experts,
+                state.hidden_size,
+                state.parallel_policy,
+                batch_id,
+                state.combined_x,
+                topk_ids_index,
+                topk_weights,
+                batch_size,
+                topk_ids_index.shape[1] // 2,
+                True,
+            )
         t_send_end = time.perf_counter()
 
         # Stash state needed by combine_recv().
@@ -821,16 +887,26 @@ class KunpengDispatcher(BaseDispatcher):
         t_send_end = pending["t_send_end"]
 
         t_recv_start = time.perf_counter()
-        kunpeng.moe_combine_recv_kunpeng(
-            state.combined_x,
-            state.topk_ids_index_buf,
-            state.topk_weights_buf,
-            batch_size,
-            state.num_max_dispatch_tokens_per_rank,
-            state.topk_ids_index_buf.shape[1] // 2,
-            state.hidden_size,
-            batch_id,
-        )
+        if state.use_local_dis_com:
+            kunpeng.moe_local_combine_recv_kunpeng(
+                state.combined_x,
+                state.topk_ids_index_buf,
+                state.topk_weights_buf,
+                state.num_local_experts,
+                state.hidden_size,
+                batch_size,
+            )
+        else:
+            kunpeng.moe_combine_recv_kunpeng(
+                state.combined_x,
+                state.topk_ids_index_buf,
+                state.topk_weights_buf,
+                batch_size,
+                state.num_max_dispatch_tokens_per_rank,
+                state.topk_ids_index_buf.shape[1] // 2,
+                state.hidden_size,
+                batch_id,
+            )
         t_recv_end = time.perf_counter()
 
         result = state.combined_x[:batch_size]

@@ -623,6 +623,54 @@ def _setup_moe_combine_recv_kunpeng():
     register_op('moe_combine_recv_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_moe_local_dispatch_kunpeng():
+    def shape_infer(topk_idx, token_ids, experts_offset, packed_recv_x,
+                    dispatch_send_buf, num_experts, num_local_experts,
+                    num_tokens, batch_size, hidden):
+        return []
+
+    def eager_fn(topk_idx, token_ids, experts_offset, packed_recv_x,
+                 dispatch_send_buf, num_experts, num_local_experts,
+                 num_tokens, batch_size, hidden):
+        torch.ops.sgl_kernel.moe_local_dispatch_kunpeng(
+            topk_idx, token_ids, experts_offset, packed_recv_x,
+            dispatch_send_buf, num_experts, num_local_experts,
+            num_tokens, batch_size, hidden)
+        return None
+
+    register_op('moe_local_dispatch_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_moe_local_combine_send_kunpeng():
+    def shape_infer(moe_down, token_ids, experts_offset, combined_x,
+                    topk_idx, num_local_experts, hidden, batch_size):
+        return []
+
+    def eager_fn(moe_down, token_ids, experts_offset, combined_x,
+                 topk_idx, num_local_experts, hidden, batch_size):
+        torch.ops.sgl_kernel.moe_local_combine_send_kunpeng(
+            moe_down, token_ids, experts_offset, combined_x,
+            topk_idx, num_local_experts, hidden, batch_size)
+        return None
+
+    register_op('moe_local_combine_send_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_moe_local_combine_recv_kunpeng():
+    def shape_infer(combined_x, topk_idx, topk_weights, num_local_experts,
+                    hidden, batch_size):
+        return []
+
+    def eager_fn(combined_x, topk_idx, topk_weights, num_local_experts,
+                 hidden, batch_size):
+        torch.ops.sgl_kernel.moe_local_combine_recv_kunpeng(
+            combined_x, topk_idx, topk_weights, num_local_experts,
+            hidden, batch_size)
+        return None
+
+    register_op('moe_local_combine_recv_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_kupl_sdma_memcpy_chunked():
     def shape_infer(
         dst,
@@ -1299,6 +1347,9 @@ def setup():
     _setup_moe_dispatch_recv_kunpeng()
     _setup_moe_combine_send_kunpeng()
     _setup_moe_combine_recv_kunpeng()
+    _setup_moe_local_dispatch_kunpeng()
+    _setup_moe_local_combine_send_kunpeng()
+    _setup_moe_local_combine_recv_kunpeng()
     _setup_kupl_sdma_memcpy_chunked()
     _setup_kupl_sdma_kv_swapin()
     _setup_kupl_sdma_kv_block_swapin()
