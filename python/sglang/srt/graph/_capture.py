@@ -160,10 +160,11 @@ _MEMORY_TYPE_TO_ENUM = {
 }
 
 
-def register_output(tensor, memory_type='regular'):
+def register_output(tensor, memory_type='regular', alignment=0):
     mgr = _C.CaptureManager.instance()
     so = _C.storage_offset(tensor)
     buf, view = _C.tensor_to_buf_and_view(tensor)
+    buf.alignment = int(alignment)
     sid = mgr.register_output_storage(buf, _MEMORY_TYPE_TO_ENUM[memory_type])
     view.storage_id = sid
     view.is_return = True

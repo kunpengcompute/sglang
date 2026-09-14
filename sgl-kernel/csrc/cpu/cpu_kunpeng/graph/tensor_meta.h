@@ -33,6 +33,7 @@ struct StorageBuf {
     int born_op = -1;       // -1 = external input
     int death_op = -1;
     size_t size = 0;        // bytes needed (max extent over all views)
+    size_t alignment = 0;   // 0 = use graph-level memory_alignment
     bool in_pool = true;    // allocated in memory pool; false = external/fixed
     MemoryType memory_type = MemoryType::REGULAR;
     void* data_ptr = nullptr; // runtime data address (pool or external)

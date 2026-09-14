@@ -184,10 +184,13 @@ def _setup_s8_gemm_pack_kunpeng():
 
 
 def _setup_alloc_buffer():
-    def shape_infer(numel, dtype=torch.uint8):
-        return [((numel,), dtype)]
+    def shape_infer(numel, dtype=torch.uint8, alignment=0):
+        return [((numel,), dtype, alignment)]
 
-    def eager_fn(numel, dtype=torch.uint8):
+    def eager_fn(numel, dtype=torch.uint8, alignment=0):
+        if alignment > 0:
+            from sglang.srt.graph.ops import _alloc_aligned
+            return _alloc_aligned((numel,), dtype, alignment)
         return torch.empty(numel, dtype=dtype)
 
     register_op('alloc_buffer', shape_infer, eager_fn)

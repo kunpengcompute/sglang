@@ -742,23 +742,32 @@ class KunpengMoE(FusedMoE):
         moe_down = dispatch_output.combine_send_buf
         moe_down_flat = moe_down.view(-1)
         gateup_numel = recv_dense_size * inter_dim * 2
-        if gateup_numel <= moe_down_flat.numel():
-            moe_gateup = moe_down_flat[:gateup_numel].view(
-                recv_dense_size, inter_dim * 2
+        if gateup_numel > moe_down_flat.numel():
+            raise ValueError(
+                f"combine_send_buf too small for gateup reuse: need "
+                f"{gateup_numel} elems, have {moe_down_flat.numel()} "
+                f"(recv_dense_size={recv_dense_size}, inter_dim={inter_dim})"
             )
-        else:
-            moe_gateup = kunpeng.alloc_buffer(
-                recv_dense_size * inter_dim * 2, dtype=torch.bfloat16
-            ).view(recv_dense_size, inter_dim * 2)
+        moe_gateup = moe_down_flat[:gateup_numel].view(recv_dense_size, inter_dim * 2)
 
         # Workspace buffers (sizes follow C++ reference heuristic).
-        # TODO(kunpeng): get fusedmoe_fixed_size from env
         if self.is_prefill:
-            fusedmoe_fixed_size = max(2048, max_tokens)
+            # Matches DeepSeek-V3-Sample PREFILL_FUSEDMOE_TILEBUF (=2048,
+            # inner-loop tile size).  TODO(kunpeng): if flash_comm is enabled
+            # later, bump to max(2048, max_tokens_per_mb) as sample moe.cpp
+            # L175-176 does for the flash_comm + shared-expert full-token path.
+            fusedmoe_fixed_size = 2048
         else:
             fusedmoe_fixed_size = 256
 
-        tmpx_gateup = kunpeng.alloc_buffer(fusedmoe_fixed_size * hidden, dtype=torch.int8)
+        # Workspace alignments mirror DeepSeek-V3-Sample moe.cpp
+        # (utils::ALIGNMENT_2M / ALIGNMENT_512K / ALIGNMENT_1K); buffers the
+        # sample leaves unaligned (tmpy_gateup, tmp_scales_gateup) keep the
+        # graph default.
+        align_2m, align_512k, align_1k = 2 * 1024 * 1024, 512 * 1024, 1024
+        tmpx_gateup = kunpeng.alloc_buffer(
+            fusedmoe_fixed_size * hidden, dtype=torch.int8, alignment=align_2m
+        )
         tmpy_gateup = kunpeng.alloc_buffer(
             fusedmoe_fixed_size * inter_dim * 4, dtype=torch.float32
         )
@@ -787,10 +796,10 @@ class KunpengMoE(FusedMoE):
 
         # 2) SiLU + mul + quantize
         moe_silu_int8 = kunpeng.alloc_buffer(
-            recv_dense_size * inter_dim, dtype=torch.int8
+            recv_dense_size * inter_dim, dtype=torch.int8, alignment=align_1k
         ).view(recv_dense_size, inter_dim)
         moe_silu_scale = kunpeng.alloc_buffer(
-            recv_dense_size, dtype=torch.float32
+            recv_dense_size, dtype=torch.float32, alignment=align_1k
         ).view(recv_dense_size, 1)
 
         t_silu_start = time.perf_counter()
@@ -803,9 +812,15 @@ class KunpengMoE(FusedMoE):
         t_silu_end = time.perf_counter()
 
         # 3) down GEMM
-        tmpx_down = kunpeng.alloc_buffer(fusedmoe_fixed_size * inter_dim, dtype=torch.int8)
-        tmpy_down = kunpeng.alloc_buffer(fusedmoe_fixed_size * hidden, dtype=torch.float32)
-        tmp_scales_down = kunpeng.alloc_buffer(fusedmoe_fixed_size * 4, dtype=torch.float32)
+        tmpx_down = kunpeng.alloc_buffer(
+            fusedmoe_fixed_size * inter_dim, dtype=torch.int8, alignment=align_512k
+        )
+        tmpy_down = kunpeng.alloc_buffer(
+            fusedmoe_fixed_size * hidden, dtype=torch.float32, alignment=align_512k
+        )
+        tmp_scales_down = kunpeng.alloc_buffer(
+            fusedmoe_fixed_size * 4, dtype=torch.float32, alignment=align_1k
+        )
 
         t_down_start = time.perf_counter()
         kunpeng.igemm_fusedmoe_down_kunpeng(
