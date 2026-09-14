@@ -11,8 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- * ==============================================================================
- */
+ * ======================================================================= */
 
 #include <ATen/ATen.h>
 #include <torch/all.h>
@@ -205,14 +204,20 @@ void pp_copy_to_buffer_kunpeng(at::Tensor tensor, int64_t offset);
 
 void pp_copy_from_buffer_kunpeng(at::Tensor tensor, int64_t offset);
 
-void pp_send_batch_kunpeng(int64_t dest_rank, int64_t total_size);
+void pp_send_batch_kunpeng(int64_t dest_rank, int64_t send_offset, int64_t total_size);
 
-void pp_recv_batch_kunpeng(int64_t src_rank, int64_t total_size);
+void pp_recv_batch_kunpeng(int64_t src_rank, int64_t recv_offset);
+
+int64_t pp_get_output_send_offset_kunpeng(int64_t dest_rank);
+
+int64_t pp_get_output_recv_offset_kunpeng(int64_t src_rank);
 
 // Unified PP message channel (pyobj / tensor metadata / ack), see comm/pp_comm.cpp
 void pp_send_msg_kunpeng(at::Tensor payload, int64_t kind, int64_t dest_rank);
 
 std::vector<at::Tensor> pp_recv_msg_kunpeng(int64_t src_rank);
+
+int64_t pp_try_peek_msg_kunpeng(int64_t src_rank);
 
 // Fused PP batch + flow-control ops, see comm/pp_comm.cpp
 int64_t pp_inflight_kunpeng(int64_t dst_rank);
@@ -298,7 +303,21 @@ void top_k_top_p_sampling_from_probs_kunpeng(
     const at::Tensor min_ps, bool need_min_p_sampling,
     at::Tensor token_ids, at::Tensor token_probs);
 
-// === SHM operator definition ===
+// === Local dispatch/combine (intra-node SHM, no RDMA) ===
+void moe_local_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor combined_x,
+                                     int64_t local_rank, int64_t local_size);
+void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::Tensor experts_offset,
+                                at::Tensor packed_recv_x, at::Tensor dispatch_send_buf,
+                                int64_t num_experts, int64_t num_local_experts, int64_t num_tokens,
+                                int64_t batch_size, int64_t hidden);
+void moe_local_combine_send_kunpeng(at::Tensor moe_down, at::Tensor token_ids, at::Tensor experts_offset,
+                                    at::Tensor combined_x, at::Tensor topk_idx,
+                                    int64_t num_local_experts, int64_t hidden,
+                                    int64_t batch_size);
+void moe_local_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights,
+                                   int64_t num_local_experts, int64_t hidden, int64_t batch_size);
+
+// === SHM operator declarations ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
 void shm_pool_destroy_kunpeng();
@@ -736,11 +755,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("pp_copy_from_buffer_kunpeng(Tensor tensor, int offset) -> ()");
     m.impl("pp_copy_from_buffer_kunpeng", pp_copy_from_buffer_kunpeng);
 
-    m.def("pp_send_batch_kunpeng(int dest_rank, int total_size) -> ()");
+    m.def("pp_send_batch_kunpeng(int dest_rank, int send_offset, int total_size) -> ()");
     m.impl("pp_send_batch_kunpeng", pp_send_batch_kunpeng);
 
-    m.def("pp_recv_batch_kunpeng(int src_rank, int total_size) -> ()");
+    m.def("pp_recv_batch_kunpeng(int src_rank, int recv_offset) -> ()");
     m.impl("pp_recv_batch_kunpeng", pp_recv_batch_kunpeng);
+
+    m.def("pp_get_output_send_offset_kunpeng(int dest_rank) -> int");
+    m.impl("pp_get_output_send_offset_kunpeng", pp_get_output_send_offset_kunpeng);
+
+    m.def("pp_get_output_recv_offset_kunpeng(int src_rank) -> int");
+    m.impl("pp_get_output_recv_offset_kunpeng", pp_get_output_recv_offset_kunpeng);
 
     // Unified PP message channel (pyobj / tensor metadata / ack)
     m.def("pp_send_msg_kunpeng(Tensor payload, int kind, int dest_rank) -> ()");
@@ -748,6 +773,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("pp_recv_msg_kunpeng(int src_rank) -> Tensor[]");
     m.impl("pp_recv_msg_kunpeng", pp_recv_msg_kunpeng);
+
+    m.def("pp_try_peek_msg_kunpeng(int src_rank) -> int");
+    m.impl("pp_try_peek_msg_kunpeng", pp_try_peek_msg_kunpeng);
 
     // Fused PP batch send/recv + flow control
     m.def("pp_inflight_kunpeng(int dest_rank) -> int");
@@ -871,6 +899,28 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "bool need_min_p_sampling, "
         "Tensor(a!) token_ids, Tensor(b!) token_probs) -> ()");
     m.impl("top_k_top_p_sampling_from_probs_kunpeng", top_k_top_p_sampling_from_probs_kunpeng);
+
+    // Local dispatch/combine (intra-node SHM, no RDMA)
+    m.def(
+        "moe_local_dispatch_init_kunpeng(Tensor dispatch_send_buf, Tensor combined_x, "
+        "int local_rank, int local_size) -> ()");
+    m.impl("moe_local_dispatch_init_kunpeng", moe_local_dispatch_init_kunpeng);
+
+    m.def(
+        "moe_local_dispatch_kunpeng(Tensor topk_idx, Tensor(a!) token_ids, Tensor(b!) experts_offset, "
+        "Tensor packed_recv_x, Tensor dispatch_send_buf, "
+        "int num_experts, int num_local_experts, int num_tokens, int batch_size, int hidden) -> ()");
+    m.impl("moe_local_dispatch_kunpeng", moe_local_dispatch_kunpeng);
+
+    m.def(
+        "moe_local_combine_send_kunpeng(Tensor moe_down, Tensor token_ids, Tensor experts_offset, "
+        "Tensor combined_x, Tensor topk_idx, int num_local_experts, int hidden, int batch_size) -> ()");
+    m.impl("moe_local_combine_send_kunpeng", moe_local_combine_send_kunpeng);
+
+    m.def(
+        "moe_local_combine_recv_kunpeng(Tensor combined_x, Tensor topk_idx, Tensor topk_weights, "
+        "int num_local_experts, int hidden, int batch_size) -> ()");
+    m.impl("moe_local_combine_recv_kunpeng", moe_local_combine_recv_kunpeng);
 
     // SHM operators
     m.def("shm_pool_create_kunpeng(int intra_node_pg, int intra_socket_pg, int intra_die_pg, int shm_size_mb) -> ()");

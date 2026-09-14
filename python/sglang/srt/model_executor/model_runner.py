@@ -636,6 +636,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.elastic_ep_backend
             else None
         )
+        # Initialize Kunpeng PP communicator before load_model so that all PP
+        # ranks synchronize on moe_comm_create_all_kunpeng, even PP ranks that
+        # have no MoE layers (e.g. PP0 with only dense layers).
+        if self.pp_size > 1:
+            _pp_group = get_pp_group()
+            if (
+                _pp_group.kunpeng_pp_communicator is not None
+                and _pp_group.use_kunpeng_pp_communicator
+            ):
+                _pp_group.kunpeng_pp_communicator.pp_comm_init()
+
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -1231,8 +1242,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=get_tp_group().world_size > 1,
+            cpu_group=get_tp_group().cpu_group,
         )
         self.tp_group = get_tp_group()
         self.pp_group = get_pp_group()

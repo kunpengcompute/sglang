@@ -22,6 +22,7 @@ import logging
 from typing import Any, Dict, Optional
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.distributed.parallel_state import (
+    TensorMetadata,
     create_custom_parallel_group,
     get_attn_tp_group,
 )
@@ -32,6 +33,10 @@ from sglang.srt.utils import get_bool_env_var, is_kunpeng_graph_capture
 from sglang.srt.utils.common import is_cpu_920f
 from sgl_kernel import pg_helper
 from sglang.srt.graph import ops as kunpeng
+from sglang.srt.graph._capture import (
+    is_capturing,
+    register_output_storage_only,
+)
 
 kernel = torch.ops.sgl_kernel
 
@@ -48,6 +53,14 @@ PP_KIND_BUNDLE = 3  # must match PP_KIND_BUNDLE in pp_comm.cpp
 PP_MSG_SLOTS = 8  # must match PP_MSG_SLOTS in pp_comm.cpp
 
 SHM_ALIGN_SIZE = 7168
+
+
+def _msg_type_from_metadata(metadata_list):
+    """Extract the ``__msg_type__`` tag from a split tensor dict's metadata list."""
+    for key, value in metadata_list:
+        if key == "__msg_type__":
+            return value
+    return "default"
 
 _INTRA_SOCKET: Optional[dist.ProcessGroup] = None
 _INTRA_DIE: Optional[dist.ProcessGroup] = None
@@ -303,6 +316,12 @@ class KunpengCommunicator:
         output_2d.copy_(dst0)
         t_copy_out_end = time.perf_counter()
 
+        # ``output`` is allocated by the caller (all_gather's torch.empty), not
+        # by any captured op, so during graph capture its storage must be
+        # registered explicitly or finalize() will fail to resolve the output.
+        if is_capturing():
+            register_output_storage_only(output)
+
         if envs.SGLANG_KUNPENG_PROFILE.get():
             logger.info(
                 f"[KunpengCommunicator rank {dist.get_rank()}] shm_all_gather_into_tensor timing (ms): "
@@ -328,7 +347,7 @@ class KunpengPPCommunicator:
     """
 
     def __init__(self, pp_group: dist.ProcessGroup, global_group: dist.ProcessGroup,
-                 pp_ranks: list = None, max_buf_bytes: int = 256 * 1024 * 1024):
+                 pp_ranks: list = None, max_buf_bytes: int = 384 * 1024 * 1024):
         self.pp_group = pp_group
         self.global_group = global_group
         self.comm_size = pp_group.size()
@@ -354,8 +373,7 @@ class KunpengPPCommunicator:
         )
         self._pp_initialized = True
         logger.debug(
-            "[KunpengPPCommunicator] pp_init OK "
-            "(rank=%s, buf_size=%s)",
+            "[KunpengPPCommunicator] pp_init OK (rank=%s, buf_size=%s)",
             dist.get_rank(), self.max_buf_bytes,
         )
 
@@ -376,7 +394,7 @@ class KunpengPPCommunicator:
 
         # Same groups as the MoE dispatcher, so the domain topology is identical.
         kernel.moe_comm_create_all_kunpeng(
-            _pg_helper.get_process_group_ptr(get_world_group().cpu_group),
+            _pg_helper.get_process_group_ptr(self.global_group),
             _pg_helper.get_process_group_ptr(get_tp_group().cpu_group),
         )
         logger.info(
@@ -400,13 +418,25 @@ class KunpengPPCommunicator:
         """Copy data from the PP buffer at the given offset into tensor."""
         kernel.pp_copy_from_buffer_kunpeng(tensor, offset)
 
-    def send_batch(self, dst_rank: int, total_size: int):
+    def send_batch(self, dst_rank: int, send_offset: int, total_size: int):
         """Single pp_put for the tensor data already copied to the buffer."""
-        kernel.pp_send_batch_kunpeng(dst_rank, total_size)
+        kernel.pp_send_batch_kunpeng(dst_rank, send_offset, total_size)
 
-    def recv_batch(self, src_rank: int, total_size: int):
-        """Single pp_recv for the tensor data expected in the buffer."""
-        kernel.pp_recv_batch_kunpeng(src_rank, total_size)
+    def recv_batch(self, src_rank: int, recv_offset: int):
+        """Single pp_recv for the tensor data expected in the buffer.
+
+        recv_offset tells the C++ layer whether this is an output frame (which
+        advances the per-sender output ring) or a proxy frame (segment 0).
+        """
+        kernel.pp_recv_batch_kunpeng(src_rank, recv_offset)
+
+    def output_send_offset(self, dst_rank: int) -> int:
+        """Next output ring slot to copy data into before pp_put to dst_rank."""
+        return int(kernel.pp_get_output_send_offset_kunpeng(dst_rank))
+
+    def output_recv_offset(self, src_rank: int) -> int:
+        """Output ring slot where the data from src_rank will land."""
+        return int(kernel.pp_get_output_recv_offset_kunpeng(src_rank))
 
     def send_tensor_batch(self, dst_rank: int, tensors):
         """Fused: copy all tensors into the batch region + one pp_put in C++."""
@@ -477,9 +507,14 @@ class KunpengPPCommunicator:
             dst_rank,
         )
 
-        # all_gather slicing + contiguity stay here (needs group info); the copy
-        # into the batch region + single pp_put are fused in C++.
-        shards = []
+        pp_offset = 0
+        # kutacc::pp_put writes local[off] -> remote[off] with the same offset,
+        # so a frame must live at an offset every rank agrees on. Output frames
+        # stream back-to-back and use a per-sender ring (the slot advances on
+        # every send); proxy frames reuse segment 0, which is safe because proxy
+        # traffic on the 1-D ring is alternating (recv -> forward -> send).
+        is_output = _msg_type_from_metadata(metadata_list) == "output"
+        send_base = self.output_send_offset(dst_rank) if is_output else 0
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
@@ -496,9 +531,10 @@ class KunpengPPCommunicator:
                 raise RuntimeError("Kunpeng PP RDMA channel requires CPU tensors")
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
-            shards.append(tensor)
+            self.copy_to_buffer(tensor, send_base + pp_offset)
+            pp_offset += tensor.nbytes
         # Always post the data imm (zero-length payloads are legal in IB).
-        self.send_tensor_batch(dst_rank, shards)
+        self.send_batch(dst_rank, send_base, pp_offset)
 
     # === unified message recv ===
 
@@ -509,6 +545,17 @@ class KunpengPPCommunicator:
         self.pp_comm_init()
         kind_t, payload_t = kernel.pp_recv_msg_kunpeng(src_rank)
         return int(kind_t.item()), payload_t.numpy().tobytes()
+
+    def try_peek_msg(self, src_rank: int) -> int:
+        """Non-blocking probe of the next message kind from src_rank.
+
+        Returns -1 when no message is available yet (the sender has not written
+        the current ring slot's magic); otherwise returns the message kind
+        WITHOUT consuming it.  The caller must later consume it with
+        recv_message / recv_pyobjs_bundle (or leave it for a later consumer).
+        """
+        self.pp_comm_init()
+        return int(kernel.pp_try_peek_msg_kunpeng(src_rank))
 
     # === ack / flow control ===
 
@@ -593,6 +640,18 @@ def get_kunpeng_broadcast(
     if not (is_cpu_920f() and envs.SGLANG_KUNPENG_RDMA_BCAST.get()):
         return None
     if group is None or group.size() <= 1:
+        return None
+    # The Kunpeng RDMA broadcast is only used by the PP pipeline (PP_SIZE=16).
+    # For single-PP configs (e.g. PP_SIZE=1 / TP_SIZE=256 / DP_SIZE=16) keep
+    # the legacy gloo broadcast: the early random-seed broadcast would spin up
+    # the kurmcl RDMA fabric before the MoE domain exists, which fails on large
+    # groups with "Connection closed by peer".
+    try:
+        from sglang.srt.distributed.parallel_state import get_pp_group
+
+        if get_pp_group().size() <= 1:
+            return None
+    except Exception:
         return None
     pg_ptr = pg_helper.get_process_group_ptr(group)
     bcast = _kunpeng_broadcast_registry.get(pg_ptr)

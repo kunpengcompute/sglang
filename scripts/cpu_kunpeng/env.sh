@@ -157,6 +157,13 @@ export TP_SIZE=256
 export DP_SIZE=16
 export EP_SIZE=${TP_SIZE}
 export PP_SIZE=1  # >1 enable pp  eg: 2
+export LONG_PROMPT_PREFILL_INSTANCE=0
+if [[ $LONG_PROMPT_PREFILL_INSTANCE == "1" ]]; then
+    export TP_SIZE=16
+    export DP_SIZE=1
+    export EP_SIZE=${TP_SIZE}
+    export PP_SIZE=16
+fi
 export REDUNDANT_EXPERTS=0
 export INIT_EXPERT_LOCATION=""
 export EP_DISPATCH_ALGORITHM=""  # e.g. static, dynamic

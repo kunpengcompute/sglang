@@ -23,7 +23,28 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 _is_cpu_920f = is_cpu_920f()
-_use_rdma_allgather = envs.SGLANG_KUNPENG_RDMA_ALLGATHER.get()
+
+
+def _rdma_allgather_available() -> bool:
+    """Whether the DP-attention sync may use the RDMA allgather.
+
+    The RDMA allgather requires the MoE RDMA communication domain
+    (``g_ds_conn_info``) to have been created via ``moe_comm_create_kunpeng``.
+    That only happens when MoE dispatch runs over RDMA (not local SHM
+    dispatch) AND the current rank actually has MoE layers.  For local
+    dispatch (e.g. single-node pp=16) or MoE-less ranks (e.g. PP0 in a
+    MoE-on-PP1-only split), fall back to ``torch.all_gather_into_tensor``.
+    """
+    if not (_is_cpu_920f and envs.SGLANG_KUNPENG_RDMA_ALLGATHER.get()):
+        return False
+    try:
+        from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+            _KunpengDispatcherState,
+        )
+    except ImportError:
+        return False
+    state = _KunpengDispatcherState._instance
+    return state is not None and state.rdma_comm_created
 
 # ---------------------------------------------------------------------------
 # Persistent RDMA allgather buffers for the DP-attention sync info tensor.
@@ -150,17 +171,10 @@ class MLPSyncBatchInfo:
             device=device,
         )
 
-        if _is_cpu_920f and _use_rdma_allgather:
-            comm_size = self.dp_size * self.tp_size * self.cp_size
-            _rdma_allgather_info_kunpeng(
-                local_info_tensor, global_info_tensor, comm_size
-            )
-        else:
-            torch.distributed.all_gather_into_tensor(
-                global_info_tensor.flatten(),
-                local_info_tensor,
-                group=group,
-            )
+        comm_size = self.dp_size * self.tp_size * self.cp_size
+        _rdma_allgather_info_kunpeng(
+            local_info_tensor, global_info_tensor, comm_size
+        )
         if device == "cpu":
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
@@ -223,6 +237,17 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
 ):
+    # Deadlock avoidance (PP-disagg single DP). When there is no local batch and
+    # dp_size == 1, no cross-DP probing is needed (there is no other DP rank),
+    # so the all_gather below only forces a node-local TP barrier that aligns
+    # the 16 independent PP chains.  In the node-block layout TP=16 is
+    # node-local while PP=16 is the cross-node ring; after the health-check
+    # drains the PP ring goes idle and the ring-back lets the 16 chains drift,
+    # so this barrier stalls the ring.  Skip it: idle with no DP means no
+    # gathered buffer / idle batch is required.
+    if local_batch is None and dp_size == 1:
+        return None
+
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
         num_tokens = 0

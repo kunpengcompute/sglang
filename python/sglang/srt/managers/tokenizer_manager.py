@@ -380,11 +380,17 @@ class TokenizerManager(
         if self.server_args.tokenizer_worker_num == 1:
             if is_http_only():
                 self.send_to_scheduler = get_zmq_socket(
-                    context, zmq.PUSH, port_args.scheduler_input_ipc_name, False
+                    context,
+                    zmq.PUSH,
+                    port_args.scheduler_input_ipc_name,
+                    False,
                 )
             else:
                 self.send_to_scheduler = get_zmq_socket(
-                    context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+                    context,
+                    zmq.PUSH,
+                    port_args.scheduler_input_ipc_name,
+                    True,
                 )
         else:
             from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper

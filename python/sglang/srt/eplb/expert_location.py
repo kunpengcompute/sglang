@@ -41,6 +41,7 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+    ep_size: int
 
     # -------------------------------- properties ------------------------------------
 
@@ -61,11 +62,6 @@ class ExpertLocationMetadata:
     @property
     def num_logical_experts(self) -> int:
         return self.logical_to_all_physical_map.shape[1]
-
-    @property
-    def ep_size(self):
-        # TODO change when EP size != world size
-        return torch.distributed.get_world_size()
 
     def __post_init__(self):
         num_layers_0, num_physical_experts_0 = self.physical_to_logical_map.shape
@@ -247,6 +243,7 @@ class ExpertLocationMetadata:
                 if server_args.ep_dispatch_algorithm == "static"
                 else None
             ),
+            ep_size=ep_size,
         )
 
     # -------------------------------- mutation ------------------------------------

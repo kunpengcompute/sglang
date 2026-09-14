@@ -756,6 +756,31 @@ class KunpengGraphRunner:
         if stage_base is not None:
             fixed.append(stage_base[0])
             fixed.append(stage_base[1])
+
+        # Kunpeng SHM communicator tensors consumed by shm_dual_allgather_kunpeng
+        # in the logits all-gather path (last PP rank, or every rank when PP is
+        # disabled). They are allocated lazily by KunpengCommunicator outside the
+        # graph, so their storages must be registered as fixed inputs; otherwise
+        # the capture-time lookup fails with "non-return-value parameter tensor
+        # not registered".
+        if self.model_runner.pp_group.is_last_rank:
+            try:
+                from sglang.srt.distributed.parallel_state import get_tp_group
+
+                comm = get_tp_group().kunpeng_communicator
+                if comm is not None:
+                    fixed.append(comm.dummy_tensor)
+                    # shm_all_gather_into_tensor uses dim = input.size(1) as the key,
+                    # i.e. the local vocab of logits (vocab_size // tp_size),
+                    # not the global vocab_size, otherwise it would be registered as a different SHM tensor.
+                    local_vocab_size = -(
+                        -self.model_runner.model_config.vocab_size
+                        // self.model_runner.tp_size
+                    )
+                    fixed.append(comm.get_shm_tensor(local_vocab_size))
+            except Exception:
+                pass
+
         return fixed
 
     def _graph_forward(

@@ -21,6 +21,7 @@
 #include <iostream>
 #include <fstream>
 #include <functional>
+#include <vector>
 
 #include <sgl_kernel_ops.h>
 #include <arm_bf16.h>
@@ -741,3 +742,267 @@ void mul_scalar_add_kunpeng(at::Tensor input, at::Tensor out, double alpha)
 
     kutacc::mul_scalar_add(i_ptr, o_ptr, num, static_cast<float>(alpha), /*load_output=*/true);
 }
+
+// ---------------------------------------------------------------------------
+// Local (intra-node SHM) dispatch/combine — no RDMA, used when ep_size==tp_size.
+// Mirrors DeepSeek-V3-Sample's mpi::local_dispatch / mpi::local_combine.
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t *> g_local_disp_send_ptrs;   // peer dispatch_send_buf base ptrs
+static std::vector<bfloat16_t *> g_local_combined_ptrs;  // peer combined_x base ptrs
+static bool g_local_dispatch_initialized = false;
+
+void moe_local_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor combined_x,
+                                     int64_t local_rank, int64_t local_size)
+{
+    TORCH_CHECK(is_shm(dispatch_send_buf.data_ptr()), "dispatch_send_buf must be SHM tensor");
+    TORCH_CHECK(is_shm(combined_x.data_ptr()), "combined_x must be SHM tensor");
+
+    g_local_disp_send_ptrs.resize(local_size, nullptr);
+    g_local_combined_ptrs.resize(local_size, nullptr);
+
+    uint8_t *send_base = reinterpret_cast<uint8_t *>(dispatch_send_buf.data_ptr());
+    bfloat16_t *comb_base = reinterpret_cast<bfloat16_t *>(combined_x.data_ptr());
+
+    for (int64_t i = 0; i < local_size; ++i) {
+        if (i != local_rank) {
+            get_peer_shm_baseptr(i, send_base, reinterpret_cast<void **>(&g_local_disp_send_ptrs[i]));
+            get_peer_shm_baseptr(i, comb_base, reinterpret_cast<void **>(&g_local_combined_ptrs[i]));
+        } else {
+            g_local_disp_send_ptrs[i] = send_base;
+            g_local_combined_ptrs[i] = comb_base;
+        }
+    }
+    g_local_dispatch_initialized = true;
+}
+
+void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::Tensor experts_offset,
+                                at::Tensor packed_recv_x, at::Tensor dispatch_send_buf,
+                                int64_t num_experts, int64_t num_local_experts, int64_t num_tokens,
+                                int64_t batch_size, int64_t hidden)
+{
+    TORCH_CHECK(g_local_dispatch_initialized, "local dispatch not initialized");
+
+    int16_t *topk_idx_data = topk_idx.data_ptr<int16_t>();
+    int32_t *token_ids_data = token_ids.data_ptr<int32_t>();
+    int32_t *experts_offset_data = experts_offset.data_ptr<int32_t>();
+
+    int64_t num_topk = topk_idx.size(1) / 2;
+    int local_rank = get_intra_node_rank();
+    int local_size = get_intra_node_size();
+    int64_t n_local_tokens = batch_size / local_size;
+
+    // dispatch_send_buf row size = hidden + 4 (scale)
+    int64_t row_size = hidden + 4;
+
+    // Build token_ids and experts_offset from topk_idx.
+    // token_ids stores the ROW INDEX into packed_recv_x (2D view), NOT the
+    // global token ID. This matches topk_convert_kunpeng's convention where
+    // token_ids[ti] = ei * 2 * max_tokens + offset (position in packed_recv_x).
+    //
+    // For local dispatch: token_ids[ti] = expert_id_off * packed_stride + ti
+    // where packed_stride = packed_recv_x.size(1) (multiple * max_tokens)
+    //
+    // We also store the global token ID separately for data copy.
+    int64_t packed_stride = packed_recv_x.size(1);  // multiple * max_tokens
+    int64_t ti = 0;
+    for (int64_t expert_id_off = 0; expert_id_off < num_local_experts; expert_id_off++) {
+        experts_offset_data[expert_id_off] = ti;
+        for (int64_t token = 0; token < batch_size; token++) {
+            for (int64_t j = 0; j < num_topk; ++j) {
+                int16_t global_expert = topk_idx_data[token * num_topk * 2 + j * 2];
+                int64_t peer_rank = global_expert / num_local_experts;
+                int64_t local_exp = global_expert % num_local_experts;
+                if (peer_rank == local_rank && local_exp == expert_id_off) {
+                    // Store the position in packed_recv_x (2D row index)
+                    token_ids_data[ti] = static_cast<int32_t>(expert_id_off * packed_stride + ti);
+                    ti++;
+                    break;
+                }
+            }
+        }
+    }
+    experts_offset_data[num_local_experts] = ti;
+    TORCH_CHECK(ti <= token_ids.size(0), "token_ids overflow: ti=", ti, " capacity=", token_ids.size(0));
+
+    // Fill packed_recv_x: copy quantized data from peers' dispatch_send_buf.
+    // packed_recv_x layout (prefill): [num_local_experts, multiple * max_tokens, hidden+4]
+    // For each local expert, for each token assigned to it:
+    //   Copy dispatch_send_buf[global_token] from peer_rank's SHM to packed_recv_x[expert_id_off][ti2]
+    uint8_t *packed_data = reinterpret_cast<uint8_t *>(packed_recv_x.data_ptr());
+    int64_t packed_row_size = hidden + 4;
+    int64_t packed_stride_expert = packed_stride * packed_row_size; // multiple * max_tokens * (hidden+4)
+
+    // Barrier before reading peers' dispatch_send_buf: each rank quantizes its
+    // own slice of the SHM buffer in `quant_inplace_kunpeng`, so a fast rank
+    // must not start reading a slow rank's slice before the slow rank finished
+    // writing it (otherwise it reads stale/zero data).
+    kupl_shm_fence(kupl_win_intra_node);
+
+    // Re-iterate to copy data (need both global token and position)
+    int64_t ti2 = 0;
+    for (int64_t expert_id_off = 0; expert_id_off < num_local_experts; expert_id_off++) {
+        for (int64_t token = 0; token < batch_size; token++) {
+            bool found = false;
+            for (int64_t j = 0; j < num_topk; ++j) {
+                int16_t global_expert = topk_idx_data[token * num_topk * 2 + j * 2];
+                int64_t peer_rank = global_expert / num_local_experts;
+                int64_t local_exp = global_expert % num_local_experts;
+                if (peer_rank == local_rank && local_exp == expert_id_off) {
+                    // Source: peer's dispatch_send_buf[token]
+                    uint8_t *src = g_local_disp_send_ptrs[token / n_local_tokens] + token * row_size;
+                    // Dest: packed_recv_x[expert_id_off][ti2]
+                    uint8_t *dst = packed_data + expert_id_off * packed_stride_expert + ti2 * packed_row_size;
+                    memcpy(dst, src, row_size);
+                    ti2++;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) continue;
+        }
+    }
+    TORCH_CHECK(ti2 == ti, "data copy count mismatch: ti2=", ti2, " ti=", ti);
+}
+
+void moe_local_combine_send_kunpeng(at::Tensor moe_down, at::Tensor token_ids, at::Tensor experts_offset,
+                                    at::Tensor combined_x, at::Tensor topk_idx,
+                                    int64_t num_local_experts, int64_t hidden,
+                                    int64_t batch_size)
+{
+    TORCH_CHECK(g_local_dispatch_initialized, "local dispatch not initialized");
+
+    bfloat16_t *moe_down_data = reinterpret_cast<bfloat16_t *>(moe_down.data_ptr());
+    int32_t *token_ids_data = token_ids.data_ptr<int32_t>();
+    int32_t *experts_offset_data = experts_offset.data_ptr<int32_t>();
+    int16_t *topk_idx_data = topk_idx.data_ptr<int16_t>();
+    int local_rank = get_intra_node_rank();
+    int local_size = get_intra_node_size();
+    int64_t n_local_tokens = batch_size / local_size;
+    int64_t num_topk = topk_idx.size(1) / 2;
+
+    int64_t per_rank_buf = num_topk * n_local_tokens * hidden;
+
+    // Zero our combined_x region. Each token owns `num_topk` slots, and slot j
+    // holds the contribution of that token's j-th routed expert. Using the
+    // (local_token, j) pair as the index makes every (token, expert) write go
+    // to a unique slot, unlike the previous [num_local_experts, ...] layout
+    // where experts with the same `global_expert % num_local_experts` from
+    // different EP ranks collided with each other.
+    bfloat16_t *my_combined = g_local_combined_ptrs[local_rank];
+    memset(my_combined, 0, per_rank_buf * sizeof(bfloat16_t));
+
+    // Barrier: every rank must finish zeroing its own region before any rank
+    // starts writing expert outputs into its peers.  Without this barrier a
+    // slow rank's memset could run after a fast rank's memcpy into the same
+    // region and clobber the already-written expert output.
+    kupl_shm_fence(kupl_win_intra_node);
+
+    // Write expert outputs to peers' combined_x buffers via SHM.
+    // For each local expert, for each token assigned to it:
+    //   Find the global token by iterating topk_idx (same logic as dispatch)
+    //   owner_rank = token / n_local_tokens
+    //   local_token = token % n_local_tokens
+    //   Write moe_down[ti] to combined_x[owner_rank][local_token * num_topk + j]
+    int64_t ti = 0;
+    for (int64_t expert_id_off = 0; expert_id_off < num_local_experts; expert_id_off++) {
+        for (int64_t token = 0; token < batch_size; token++) {
+            for (int64_t j = 0; j < num_topk; ++j) {
+                int16_t global_expert = topk_idx_data[token * num_topk * 2 + j * 2];
+                int64_t peer_rank = global_expert / num_local_experts;
+                int64_t local_exp = global_expert % num_local_experts;
+                if (peer_rank == local_rank && local_exp == expert_id_off) {
+                    int64_t owner_rank = token / n_local_tokens;
+                    int64_t local_token = token % n_local_tokens;
+                    bfloat16_t *dst = g_local_combined_ptrs[owner_rank]
+                        + (local_token * num_topk + j) * hidden;
+                    bfloat16_t *src = moe_down_data + ti * hidden;
+                    memcpy(dst, src, hidden * sizeof(bfloat16_t));
+                    ti++;
+                    break;
+                }
+            }
+        }
+    }
+
+    // SHM barrier — ensure all ranks have written
+    kupl_shm_fence(kupl_win_intra_node);
+}
+
+void moe_local_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights,
+                                   int64_t num_local_experts, int64_t hidden, int64_t batch_size)
+{
+    TORCH_CHECK(g_local_dispatch_initialized, "local dispatch not initialized");
+
+    bfloat16_t *combined_x_data = reinterpret_cast<bfloat16_t *>(combined_x.data_ptr());
+    int16_t *topk_idx_data = topk_idx.data_ptr<int16_t>();
+    float *topk_weights_data = topk_weights.data_ptr<float>();
+
+    int64_t num_topk = topk_idx.size(1) / 2;
+    int local_rank = get_intra_node_rank();
+    int local_size = get_intra_node_size();
+    int64_t n_local_tokens = batch_size / local_size;
+
+    // Wait for all ranks to finish writing expert outputs
+    kupl_shm_fence(kupl_win_intra_node);
+
+    // Local reduce: for each token owned by this rank,
+    //   combined_x[token] = sum_j(w[token,j] * peer_buf[local_token][j])
+    //
+    // Our combined_x region holds [n_local_tokens, num_topk, hidden]: slot j of
+    // local token lt stores the output of that token's j-th routed expert.
+    // (See moe_local_combine_send_kunpeng for the matching write side.)
+    //
+    // IMPORTANT: We must read ALL intermediate data BEFORE writing ANY reduced
+    // results, because the result overwrites the intermediate data (same buffer).
+    // If rank A writes its result before rank B reads A's intermediate data, B
+    // gets corrupt data.
+    //
+    // Solution: Phase 1 — read & reduce all tokens into a temp buffer.
+    //            Phase 2 — barrier, then write temp buffer to combined_x.
+
+    int64_t my_start = local_rank * n_local_tokens;
+    // Temp buffer for reduced results: [n_local_tokens, hidden]
+    std::vector<bfloat16_t> reduced(n_local_tokens * hidden);
+
+    for (int64_t lt = 0; lt < n_local_tokens; lt++) {
+        int64_t token = my_start + lt;
+        std::vector<float> accum(hidden, 0.0f);
+
+        for (int64_t j = 0; j < num_topk; ++j) {
+            float weight = topk_weights_data[token * num_topk + j];
+            bfloat16_t *src = g_local_combined_ptrs[local_rank]
+                + (lt * num_topk + j) * hidden;
+
+            for (int64_t d = 0; d < hidden; ++d) {
+                accum[d] += weight * (float)src[d];
+            }
+        }
+
+        for (int64_t d = 0; d < hidden; ++d) {
+            reduced[lt * hidden + d] = (bfloat16_t)accum[d];
+        }
+    }
+
+    // SHM barrier — ensure all ranks have finished reading intermediate data
+    kupl_shm_fence(kupl_win_intra_node);
+
+    // Phase 2: write reduced results to combined_x
+    memcpy(combined_x_data + my_start * hidden, reduced.data(),
+           n_local_tokens * hidden * sizeof(bfloat16_t));
+
+    // SHM barrier — ensure all ranks have finished writing results
+    kupl_shm_fence(kupl_win_intra_node);
+
+    // Allgather: copy results from peers' combined_x regions into our combined_x.
+    for (int64_t r = 0; r < local_size; ++r) {
+        if (r == local_rank) continue;
+        bfloat16_t *src = g_local_combined_ptrs[r] + r * n_local_tokens * hidden;
+        bfloat16_t *dst = combined_x_data + r * n_local_tokens * hidden;
+        memcpy(dst, src, n_local_tokens * hidden * sizeof(bfloat16_t));
+    }
+
+    // SHM barrier — ensure allgather is complete
+    kupl_shm_fence(kupl_win_intra_node);
+}
+

@@ -389,13 +389,16 @@ std::vector<torch::Tensor> Graph::run(const std::vector<torch::Tensor> &inputs)
             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(ts.time_since_epoch()).count());
     }
 
+    // Build outputs from cached tensors BEFORE restoring placeholders, so that
+    // outputs aliasing runtime input views (e.g. PP proxy residual) keep their
+    // real data instead of the 0-dim placeholder.
+    std::vector<torch::Tensor> outputs;
+    for (int vid : output_view_ids_)
+        outputs.push_back(cached_tensors_[vid]);
+
     // Restore 0-dim placeholder tensors
     for (int i = 0; i < n; ++i)
         cached_tensors_[input_view_ids_[i]] = saved_[i];
 
-    // Build outputs from cached tensors
-    std::vector<torch::Tensor> outputs;
-    for (int vid : output_view_ids_)
-        outputs.push_back(cached_tensors_[vid]);
     return outputs;
 }

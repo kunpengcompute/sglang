@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.parallel_state import get_pp_group, get_tp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
@@ -55,16 +55,34 @@ _is_hip = is_hip()
 class ModelRunnerKVCacheMixin:
 
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
-        post_model_load_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
+        if self.pp_size > 1:
+            pp_group = get_pp_group()
+            post_model_load_memory = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=True,
+                cpu_group=pp_group.cpu_group,
+            )
 
-        rest_memory = post_model_load_memory - pre_model_load_memory * (
-            1 - self.mem_fraction_static
-        )
+            # In PP mode each stage only holds a slice of the layers, but the
+            # MoE stages still load tens of GB of expert weights plus the PP/EP
+            # comm buffers, so post_model_load_memory is already close to zero.
+            # The original reservation pre * (1 - mem_fraction_static) is
+            # anchored on the total free memory and can exceed post, producing a
+            # negative rest_memory. Anchor the activation headroom on post
+            # instead so the KV cache stays non-negative.
+            rest_memory = post_model_load_memory * self.mem_fraction_static
+        else:
+            post_model_load_memory = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=get_tp_group().world_size > 1,
+                cpu_group=get_tp_group().cpu_group,
+            )
+
+            rest_memory = post_model_load_memory - pre_model_load_memory * (
+                1 - self.mem_fraction_static
+            )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
@@ -705,7 +723,7 @@ class ModelRunnerKVCacheMixin:
             torch.distributed.all_reduce(
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=get_world_group().cpu_group,
+                group=get_pp_group().cpu_group,
             )
             token_capacity = tensor.item()
 

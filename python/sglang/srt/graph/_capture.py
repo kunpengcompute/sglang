@@ -171,6 +171,16 @@ def register_output(tensor, memory_type='regular'):
     return vid, so
 
 
+def register_output_storage_only(tensor, memory_type='regular'):
+    """Register only the storage backing ``tensor`` as a graph output, without
+    creating a return view. Used for tensors allocated outside any captured op
+    (e.g. ``torch.empty`` in ``all_gather``) whose return view is later created
+    by ``finalize``."""
+    mgr = _C.CaptureManager.instance()
+    buf, _ = _C.tensor_to_buf_and_view(tensor)
+    return mgr.register_output_storage(buf, _MEMORY_TYPE_TO_ENUM[memory_type])
+
+
 def upgrade_storage_memory_type(tensor):
     """Upgrade the storage backing ``tensor`` to SHM memory type."""
     mgr = _C.CaptureManager.instance()

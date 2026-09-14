@@ -873,6 +873,15 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
+            elif _is_cpu_920f:
+                # Each rank holds local logits of shape [batch, vocab/tp_size],
+                # aggregated via batched SHM allgather along dim=-1 into [batch, vocab_size],
+                # consistent with the use_attn_tp_group path (_gather_attn_tp_logits),
+                # avoiding the tensor_model_parallel_all_gather -> dual allgather path that leads to misordering.
+                comm_size = get_tensor_model_parallel_world_size()
+                if _enable_shm_fence:
+                    kunpeng.shm_fence_kunpeng(comm_size)
+                logits = kunpeng.shm_batched_allgather_kunpeng(logits, comm_size)
             else:
                 logits = tensor_model_parallel_all_gather(logits)
 

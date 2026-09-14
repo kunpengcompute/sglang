@@ -567,8 +567,13 @@ async def health_generate(request: Request) -> Response:
         )
 
     async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
-            break
+        try:
+            async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
+                break
+        except Exception as e:
+            logger.error(
+                f"Health check generate_request raised exception: {e}", exc_info=True
+            )
 
     task = asyncio.create_task(gen())
 
@@ -583,17 +588,39 @@ async def health_generate(request: Request) -> Response:
             return Response(status_code=200)
 
     task.cancel()
+    tm = _global_state.tokenizer_manager
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
-        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
+        "%H:%M:%S", time.localtime(tm.last_receive_tstamp)
     )
+
+    # Dump the health-check request's per-stage progress and the global queue
+    # state to tell whether the stall is at tokenize, scheduler, or detokenizer.
+    health_state = tm.rid_to_state.get(rid)
+    if health_state is None:
+        health_desc = "state missing (request never entered the state machine)"
+    else:
+        ts = health_state.time_stats
+        health_desc = (
+            f"finished={health_state.finished}, "
+            f"output_tokens={len(health_state.output_ids)}, "
+            f"ttft_observed={health_state.ttft_observed}, "
+            f"tokenize_finish={ts.tokenize_finish_time > 0}, "
+            f"first_token={ts.first_token_time > 0}"
+        )
+    n_total = len(tm.rid_to_state)
+    n_running = sum(1 for s in tm.rid_to_state.values() if not s.finished)
+
     logger.error(
         f"Health check failed. Server couldn't get a response from detokenizer for last "
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
-        f"last_heartbeat time: {last_receive_time}"
+        f"last_heartbeat time: {last_receive_time}. "
+        f"[diag] health_req={rid} -> {health_desc}; "
+        f"queue total={n_total} running={n_running}; "
+        f"heartbeat_age={time.time() - tm.last_receive_tstamp:.1f}s"
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+    tm.rid_to_state.pop(rid, None)
+    tm.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 
 
