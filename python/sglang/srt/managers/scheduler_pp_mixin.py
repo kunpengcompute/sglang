@@ -79,15 +79,23 @@ def _ppmtp_log(self, msg: str, *args) -> None:
     logger.info(f"[PP{pp_rank}] {msg}", *args)
 
 
-# First sub-payload of a "ring-back" consensus bundle; lets the demux tell the
-# ring-back bundle (consumed at step7) apart from the forward bundle (step2).
-_PP_RINGBACK_TAG = "__pp_ringback__"
+# Consensus-bundle sub-kinds: the frame header's kind field carries the base
+# kind (PP_KIND_BUNDLE) in its low byte and the sub-kind in bits 8..15, so the
+# receiver demuxes the ring-back bundle (consumed at step7) from the forward
+# bundle (step2) WITHOUT unpickling a tag string.  Values must match
+# PP_BUNDLE_SUB_* in kunpeng_communicator.py / pp_comm.cpp; mirrored here to
+# keep the communicator import lazy (function-level) as elsewhere in this file.
+_PP_BUNDLE_SUB_FORWARD = 0
+_PP_BUNDLE_SUB_RINGBACK = 1
 
 
-def _pp_unpack_bundle(payload: bytes) -> List[Any]:
-    """Unpack a PP bundle frame body ``[len][payload]...`` into its pickled
-    objects (mirrors pp_recv_pyobjs_bundle_kunpeng on the Python side)."""
-    subs: List[Any] = []
+def _pp_split_bundle_frame(payload: bytes) -> List[bytes]:
+    """Split a PP bundle frame body ``[len][payload]...`` into RAW sub-payload
+    byte strings (framing only, NO unpickling; mirrors the sender-side framing
+    in pp_send_pyobjs_bundle_kunpeng).  Deferring pickle.loads to the real
+    consumer keeps the stash/drain path (_pp_wait_acks) free of per-sub-payload
+    deserialization work."""
+    subs: List[bytes] = []
     i = 0
     n = len(payload)
     while i < n:
@@ -97,7 +105,7 @@ def _pp_unpack_bundle(payload: bytes) -> List[Any]:
         i += 4
         if i + ln > n:
             raise RuntimeError("PP bundle: sub-payload exceeds frame")
-        subs.append(pickle.loads(payload[i : i + ln]))
+        subs.append(payload[i : i + ln])
         i += ln
     return subs
 
@@ -622,9 +630,6 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
-        # Bundles drained out-of-order during _pp_wait_acks (non-blocking ack
-        # reclaim) are stashed here until the consensus getter consumes them.
-        self._pp_bundle_inbox: deque[List[Any]] = deque()
 
         # PP + MTP: the per-req drafts (`speculative_num_steps` per req) that
         # are about to be verified in the next decode round, keyed by req.rid.
@@ -1057,7 +1062,7 @@ class SchedulerPPMixin:
             # symmetric and idle iterations do not stall on an early bundle recv.
             if any(v is not None for v in vals):
                 send_ringback_work = self._pp_send_consensus_bundle_to_next_stage(
-                    [_PP_RINGBACK_TAG] + vals
+                    vals, sub_kind=_PP_BUNDLE_SUB_RINGBACK
                 )
             else:
                 send_ringback_work = []
@@ -1210,14 +1215,12 @@ class SchedulerPPMixin:
           * then check the downstream ACK non-blockingly (sleep + retry when it
             is not ready yet).
 
-        Drained data frames are stashed — pyobj/tensor into
-        `_pp_tensor_dict_inbox`, bundle into `_pp_bundle_inbox` — so the later
-        demux consumers pick them up in order.
+        Drained frames of every kind — pyobj/tensor into
+        `_pp_tensor_dict_inbox`, consensus bundles into the same inbox under
+        their header-derived demux kind ("bundle" / "ringback") — so the later
+        consumers pick them up in order.  Bundle sub-payloads are stashed RAW
+        (framing split only); the consensus consumer unpickles on pop.
         """
-        from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
-            PP_KIND_BUNDLE,
-        )
-
         comm = self.pp_group.kunpeng_pp_communicator
         if comm is None:
             return
@@ -1233,12 +1236,9 @@ class SchedulerPPMixin:
             #    unconditionally every microbatch), the sender then stalls
             #    here waiting for this rank's ack, and the whole ring
             #    deadlocks with every rank blocked on its ringback recv.
-            kind = comm.try_peek_msg(upstream)
-            if kind == PP_KIND_BUNDLE:
-                data = comm.recv_pyobjs_bundle(upstream)
-                self._pp_bundle_inbox.append(data)
-                continue
-            if kind >= 0:  # pyobj / tensor / (defensive: ack)
+            if comm.try_peek_msg(upstream) >= 0:
+                # Any frame (bundle / pyobj / tensor / defensive: ack);
+                # _pp_consume_message classifies it by the frame header.
                 msg = self._pp_consume_message(
                     upstream, all_gather_group, defer_all_gather=True
                 )
@@ -1252,14 +1252,9 @@ class SchedulerPPMixin:
             dsts = [d for d in range(comm.comm_size) if comm.inflight(d) > 0]
             if not dsts:
                 return
-            kind = comm.try_peek_msg(dsts[0])
-            if kind < 0:
+            if comm.try_peek_msg(dsts[0]) < 0:
                 # Not acked yet; avoid a busy spin while the peer catches up.
                 time.sleep(0.0001)
-                continue
-            if kind == PP_KIND_BUNDLE:
-                data = comm.recv_pyobjs_bundle(dsts[0])
-                self._pp_bundle_inbox.append(data)
                 continue
             msg = self._pp_consume_message(
                 dsts[0], all_gather_group, defer_all_gather=True
@@ -1490,6 +1485,7 @@ class SchedulerPPMixin:
             PP_KIND_TENSOR,
             PP_KIND_ACK,
             PP_KIND_BUNDLE,
+            PP_KIND_MASK,
             SHM_ALIGN_SIZE,
             _msg_type_from_metadata,
         )
@@ -1501,14 +1497,18 @@ class SchedulerPPMixin:
             return None
         if kind == PP_KIND_PYOBJ:
             return {"kind": "pyobj", "data": pickle.loads(payload)}
-        if kind == PP_KIND_BUNDLE:
+        if (kind & PP_KIND_MASK) == PP_KIND_BUNDLE:
             # A bundle can carry either the forward consensus (step2) or the
-            # ring-back consensus (step7); stamp the demux kind accordingly so
+            # ring-back consensus (step7); the sub-kind rides in the frame
+            # header's high bits (no pickled tag), stamping the demux kind so
             # they are stashed/consumed independently and never collide.
-            data = _pp_unpack_bundle(payload)
-            if data and isinstance(data[0], str) and data[0] == _PP_RINGBACK_TAG:
-                return {"kind": "ringback", "data": data[1:]}
-            return {"kind": "bundle", "data": data}
+            # Sub-payloads stay RAW (framing split only): the stash/drain path
+            # pays no pickle.loads; the consensus consumer unpickles on pop.
+            sub = (kind >> 8) & PP_KIND_MASK
+            demux_kind = (
+                "ringback" if sub == _PP_BUNDLE_SUB_RINGBACK else "bundle"
+            )
+            return {"kind": demux_kind, "raw": _pp_split_bundle_frame(payload)}
 
         # TENSOR: the metadata pickle already landed in the ring slot; wait for
         # the data imm (sent right after the metadata imm in FIFO order) and
@@ -2192,7 +2192,7 @@ class SchedulerPPMixin:
 
     @Kunpeng_PP_Profiler(depth=2)
     def _pp_send_consensus_bundle_to_next_stage(
-        self: Scheduler, data_list: List[Any]
+        self: Scheduler, data_list: List[Any], sub_kind: int = _PP_BUNDLE_SUB_FORWARD
     ) -> List[P2PWork]:
         work = []
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
@@ -2201,7 +2201,7 @@ class SchedulerPPMixin:
                 and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
             ):
                 self.pp_group.kunpeng_pp_communicator.send_pyobjs_bundle(
-                    data_list, (self.pp_rank + 1) % self.pp_size
+                    data_list, (self.pp_rank + 1) % self.pp_size, sub_kind
                 )
             else:
                 for data in data_list:
@@ -2228,12 +2228,15 @@ class SchedulerPPMixin:
             # unified channel (stashing any non-target kind that arrives first),
             # then the list is broadcast to the rest of the tp/cp ranks.
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-                if self._pp_bundle_inbox:
-                    data = self._pp_bundle_inbox.popleft()
-                else:
-                    data = self.pp_group.kunpeng_pp_communicator.recv_pyobjs_bundle(
-                        (self.pp_rank - 1) % self.pp_size
-                    )
+                # Demux by the frame-header sub-kind: "bundle" = forward
+                # consensus (step2), "ringback" = ring-back consensus (step7).
+                # _pp_recv_message consumes any interleaved frames first and
+                # stashes them, so the two bundle kinds (which share the FIFO
+                # with req pyobjs / proxy / output frames) never collide; the
+                # RAW sub-payload bytes are unpickled only here, at the real
+                # consumer.
+                msg = self._pp_recv_message(direction)
+                data = [pickle.loads(p) for p in msg["raw"]]
                 assert len(data) == count, (
                     f"consensus bundle: expected {count} sub-payloads, "
                     f"got {len(data)}"

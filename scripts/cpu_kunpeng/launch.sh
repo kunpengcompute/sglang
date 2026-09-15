@@ -13,170 +13,84 @@
 # ==============================================================================
 
 #!/bin/bash
+# launch.sh - Task dispatcher for cpu_kunpeng scripts.
+# Usage: ./launch.sh <role> [args...]
+#   prefill/decode/native -> runtime/launch_cluster.sh
+#   router                -> runtime/launch_router.sh
+#   all                   -> inline: prefill + decode + health-check + router
+#   update                -> inline: update_time + update_numa_dup
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 show_usage() {
-    echo "Usage: $0 [prefill|decode|native|router|all] [--no-log]" >&2
-    echo "  prefill  - Launch prefill server (PD disaggregation, prefill side)" >&2
-    echo "  decode   - Launch decode server (PD disaggregation, decode side)" >&2
-    echo "  native   - Launch without PD disaggregation" >&2
-    echo "  router   - Launch router server (route requests to prefill/decode)" >&2
-    echo "  all      - Launch prefill, decode, and router sequentially" >&2
-    echo "  update   - Only regenerate .time_env.sh" >&2
-    echo "  --no-log - Do not tail logs (exit after launching)" >&2
+    cat <<EOF
+Usage: $0 <role> [args...]
+
+Roles:
+  prefill    Launch prefill server (PD disaggregation, prefill side)
+  decode     Launch decode server (PD disaggregation, decode side)
+  native     Launch without PD disaggregation
+  router     Launch gateway (route requests to prefill/decode)
+  tokenizer  Launch tokenizer HTTP servers (prefill:30001 + decode:30002)
+  all        Launch prefill, decode, tokenizer, and router sequentially
+  update     Regenerate .time_env.sh + update NUMA binary replicas
+
+Options:
+  -h, --help    show this help and exit
+
+Examples:
+  $0 prefill
+  $0 all
+  $0 update
+EOF
 }
 
-# Parse args: ROLE (positional) + optional --no-log flag
-ROLE=""
-INSTANCE=""
-BUCKET=""
-SHOW_LOG=1
-for arg in "$@"; do
-    case "$arg" in
-        --no-log)
-            SHOW_LOG=0
-            ;;
-        prefill|decode|native|router|all|update)
-            ROLE="$arg"
-            ;;
-        second)
-            INSTANCE="$arg"
-            ;;
-        long_prompt)
-            INSTANCE="$arg"
-            ;;
-        prefill_bucket)
-            BUCKET="$arg"
-            ;;
-        *)
-            echo "Error: Unknown argument '$arg'" >&2
-            show_usage
-            exit 1
-            ;;
-    esac
-done
-
-# Default role if none given
-ROLE="${ROLE:-native}"
-
-# Re-validate role
-VALID_ROLES=("prefill" "decode" "native" "router" "all" "update")
-if [[ ! " ${VALID_ROLES[*]} " =~ " ${ROLE} " ]]; then
-    echo "Error: Invalid role '$ROLE'. Must be one of: ${VALID_ROLES[*]}" >&2
-    show_usage
+if [[ $# -eq 0 ]]; then
+    echo "Error: missing command" >&2
+    show_usage >&2
     exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+CMD="$1"
+shift
 
-# update mode: regenerate .time_env.sh only, then exit
+case "$CMD" in
+    -h|--help|help)
+        show_usage
+        exit 0
+        ;;
+    prefill|decode|native|router|tokenizer|all|update)
+        ROLE="$CMD"
+        ;;
+    *)
+        echo "Error: unknown command '$CMD'" >&2
+        show_usage >&2
+        exit 1
+        ;;
+esac
+
+
+bash "$SCRIPT_DIR/runtime/update_time.sh"
+bash "$SCRIPT_DIR/runtime/update_numa_dup.sh"
+
 if [[ "$ROLE" == "update" ]]; then
-    bash ./runtime/update_time.sh
     exit 0
-fi
 
-# Persist time-sensitive env vars so all nodes source the same values
-bash ./runtime/update_time.sh
+elif [[ "$ROLE" == "all" ]]; then
+    echo "[$(date +%T)] ===== Launching all roles (prefill + decode + tokenizer + router) ====="
 
-# all mode: launch prefill, decode, and router via background launch.sh calls
-if [[ "$ROLE" == "all" ]]; then
-    echo "[$(date +%T)] ===== Launching all roles (prefill + decode + router) in background ====="
+    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_cluster.sh" prefill
+    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_cluster.sh" decode
+    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_tokenizer.sh"
+    bash "$SCRIPT_DIR/runtime/launch_router.sh"
 
-    bash ./stop.sh router
-    SKIP_CONDA=1 source ./env.sh native
-    bash ./launch.sh prefill --no-log
-    if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
-        SGLANG_SKIP_UPDATE=1 bash ./launch.sh prefill second --no-log
-    fi
-    SGLANG_SKIP_UPDATE=1 bash ./launch.sh decode --no-log
+elif [[ "$ROLE" == "router" ]]; then
+    bash "$SCRIPT_DIR/runtime/launch_router.sh" "$@"
 
-    # Wait for prefill(1), and (optionally) the second prefill, and decode HTTP
-    # servers to be ready (up to 20 minutes total).
-    endpoints=(
-        "${PREFILL_MASTER_ADDR}:30000"
-        "${DECODE_MASTER_ADDR}:30000"
-    )
-    [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]] && endpoints+=("${SECOND_PREFILL_MASTER_ADDR}:30000")
-    echo "[$(date +%T)] Waiting for prefill and decode servers to be ready (up to 20 minutes)..."
-    ready=()
-    for _j in "${endpoints[@]}"; do ready+=(0); done
-    for i in $(seq 1 12000); do
-        for j in "${!endpoints[@]}"; do
-            if [[ "${ready[$j]}" -eq 0 ]] &&
-                curl -sf --noproxy "*" --max-time 2 "http://${endpoints[$j]}/health" >/dev/null 2>&1; then
-                ready[$j]=1
-                echo "[$(date +%T)] ${endpoints[$j]} ready"
-            fi
-        done
-        ready_all=1
-        for v in "${ready[@]}"; do [[ "$v" -eq 1 ]] || { ready_all=0; break; }; done
-        [[ "$ready_all" -eq 1 ]] && break
-        sleep 0.1
-    done
-    for j in "${!endpoints[@]}"; do
-        if [[ "${ready[$j]}" -eq 0 ]]; then
-            echo "ERROR: HTTP server at ${endpoints[$j]} failed to start within 20 minutes"
-            exit 1
-        fi
-    done
-    echo "[$(date +%T)] ===== Prefill and decode servers launched (running in background) ====="
+elif [[ "$ROLE" == "tokenizer" ]]; then
+    bash "$SCRIPT_DIR/runtime/launch_tokenizer.sh" "$@"
 
-    bash ./launch.sh router
-
-    exit 0
-fi
-
-# Source config for the specified role
-# Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-source ./env.sh "$ROLE" "$INSTANCE" "$BUCKET"
-
-mkdir -p "$LOG_DIR"
-
-sh stop.sh "$ROLE" "$INSTANCE"
-
-# Convert space-separated IP list to array
-IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
-WORLD_SIZE=${#NODES[@]}
-
-# SGLANG_SKIP_UPDATE=1 skips the binary update (set for the decode phase of
-# `launch.sh all` so it never re-swaps .so files under running prefill processes).
-if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" == "1" && "$ROLE" != "router" && "${SGLANG_SKIP_UPDATE:-0}" != "1" ]]; then
-    echo "Update binary sglang..."
-    bash ./pyinstall/update.sh
-fi
-
-echo "Launching $ROLE on $WORLD_SIZE node(s)"
-
-for i in "${!NODES[@]}"; do
-    node_ip="${NODES[i]}"
-    node_rank="$i"
-    echo "[$(date +%T)] Starting node_rank $node_rank ($node_ip)"
-    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-        "root@$node_ip" \
-        "cd \"$PWD\" && sh ./server.sh \"$ROLE\" \"$node_rank\" \"$LOG_DIR\" \"$INSTANCE\" \"$BUCKET\"" \
-        >"$LOG_DIR/ssh_${ROLE}_${INSTANCE}_rank${node_rank}.log" 2>&1 &
-done
-
-echo "All $ROLE nodes launched."
-
-if [[ "$ROLE" == "router" ]]; then
-    rank0_log_file="$LOG_DIR/router_${NODES[0]}.log"
-elif [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
-    # Binary launch names each log by its true rank (see server.sh):
-    # pp{pp}_dp{dp}_tp{tp}_{ip}.log. Rank 0 = node 0, rank-in-node 0 = pp0/dp0/tp0.
-    rank0_log_file="$LOG_DIR/pp0_dp0_tp0_${NODES[0]}.log"
 else
-    rank0_log_file="$LOG_DIR/0_${NODES[0]}.log"
+    # prefill/decode/native
+    bash "$SCRIPT_DIR/runtime/launch_cluster.sh" "$ROLE" "$@"
 fi
-
-echo "Log file of rank_0: $rank0_log_file"
-
-# Skip tail -f if --no-log was given
-if [[ "$SHOW_LOG" -eq 0 ]]; then
-    exit 0
-fi
-
-while [ ! -f "$rank0_log_file" ]; do
-    sleep 1
-done
-tail -f "$rank0_log_file"

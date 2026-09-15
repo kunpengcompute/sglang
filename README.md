@@ -106,6 +106,14 @@ sh launch.sh router
 - **decode**：PD分离的decode角色。节点从 `DECODE_IP_SPEC` 读取。
 - **router**：PD分离的router节点，单节点运行 `sglang_router.launch_router`。
 
+脚本调用关系（`launch.sh` 为纯任务分发器，实际逻辑位于子脚本）：
+
+```
+launch.sh（任务分发器：./launch.sh <role>）
+  └─→ runtime/launch_cluster.sh（集群启动编排：env 加载、stop 前置、SSH 分发到各节点）
+        └─→ server.sh（单节点进程启动）
+```
+
 ### 3.4 环境变量说明
 
 #### 3.4.1 功能类

@@ -13,61 +13,73 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: ./stop.sh [prefill|decode|native|router|all] [instance]
-#   instance - optional second prefill instance ("second"), passed to env.sh
+# Usage: ./stop.sh [prefill|decode|native|router|tokenizer|all]
 
 
-if [[ $# -gt 2 ]]; then
-    echo "Usage: $0 [prefill|decode|native|router|all] [instance]" >&2
+if [[ $# -gt 1 ]]; then
+    echo "Usage: $0 [prefill|decode|native|router|tokenizer|all]" >&2
     exit 1
 fi
 
 ROLE="${1:-native}"
-INSTANCE="$2"
-if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" && "$ROLE" != "router" && "$ROLE" != "all" ]]; then
-    echo "Error: ROLE must be 'prefill', 'decode', 'native', 'router', or 'all'" >&2
+if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" && "$ROLE" != "router" && "$ROLE" != "tokenizer" && "$ROLE" != "all" ]]; then
+    echo "Error: ROLE must be 'prefill', 'decode', 'native', 'router', 'tokenizer', or 'all'" >&2
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# "all" mode: stop every role (router + prefill + decode + native)
+# "all" mode: stop every role (router + tokenizer + prefill + decode + native)
 # Handle this before sourcing env.sh, which does not support an "all" role.
 if [[ "$ROLE" == "all" ]]; then
-    # Read SECOND_PREFILL_ENABLED (from env.sh / .user_env.sh)
-    SKIP_CONDA=1 source ./env.sh native
-    for _role in router prefill decode; do
+    for _role in router tokenizer prefill decode; do
         bash ./stop.sh "$_role"
     done
-    # If the second prefill is enabled, stop it too (the loop above
-    # only covers the default prefill nodes).
-    if [[ "${SECOND_PREFILL_ENABLED:-0}" == "1" ]]; then
-        bash ./stop.sh prefill second
-    fi
     exit 0
 fi
 
-# Source config for the specified role (and optional prefill instance)
+# Source config for the specified role
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-SKIP_CONDA=1 source ./env.sh "$ROLE" "$INSTANCE"
+SKIP_CONDA=1 source ./env.sh "$ROLE"
 
-# Router mode: kill gateway and HTTP server processes on the configured router node
+# Router mode: kill gateway on the configured router node
 if [[ "$ROLE" == "router" ]]; then
-    echo "Killing router/gateway on $ROUTER_IP"
+    echo "Killing gateway on $ROUTER_IP"
     ssh "root@$ROUTER_IP" '
-        MAIN_PIDS=$(ps aux | grep -E "sgl-model-gateway|sglang" | grep -v grep | awk "{print \$2}")
+        MAIN_PIDS=$(ps aux | grep "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
         if [ -n "$MAIN_PIDS" ]; then
             echo "Killing process(es): $MAIN_PIDS"
             kill -15 $MAIN_PIDS 2>/dev/null
             sleep 5
-            REMAINING=$(ps aux | grep -E "sgl-model-gateway|sglang" | grep -v grep | awk "{print \$2}")
+            REMAINING=$(ps aux | grep "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
             if [ -n "$REMAINING" ]; then
                 kill -9 $REMAINING 2>/dev/null
             fi
             echo "Router stopped."
         else
             echo "No router process found."
+        fi
+    '
+    exit 0
+fi
+
+# Tokenizer mode: kill tokenizer HTTP servers on the configured router node
+if [[ "$ROLE" == "tokenizer" ]]; then
+    echo "Killing tokenizer HTTP servers on $ROUTER_IP"
+    ssh "root@$ROUTER_IP" '
+        MAIN_PIDS=$(ps aux | grep "sglang" | grep -v "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
+        if [ -n "$MAIN_PIDS" ]; then
+            echo "Killing process(es): $MAIN_PIDS"
+            kill -15 $MAIN_PIDS 2>/dev/null
+            sleep 5
+            REMAINING=$(ps aux | grep "sglang" | grep -v "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
+            if [ -n "$REMAINING" ]; then
+                kill -9 $REMAINING 2>/dev/null
+            fi
+            echo "Tokenizer stopped."
+        else
+            echo "No tokenizer process found."
         fi
     '
     exit 0
