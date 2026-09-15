@@ -111,6 +111,7 @@ void init_graph_cpp(py::module& m)
         .def_readwrite("born_op", &StorageBuf::born_op)
         .def_readwrite("death_op", &StorageBuf::death_op)
         .def_readwrite("size", &StorageBuf::size)
+        .def_readwrite("alignment", &StorageBuf::alignment)
         .def_readwrite("in_pool", &StorageBuf::in_pool)
         .def_readwrite("memory_type", &StorageBuf::memory_type)
         .def_property("data_ptr",

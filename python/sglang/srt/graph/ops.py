@@ -55,7 +55,10 @@ class GraphOp:
         output_tensors = []
         for info in out_infos:
             if isinstance(info, tuple):
-                shape, dtype = info
+                if len(info) == 3:
+                    shape, dtype, _ = info
+                else:
+                    shape, dtype = info
             else:
                 shape, dtype = info, tensor_args[0].dtype
             if any(s == 0 for s in shape):
@@ -73,9 +76,10 @@ class GraphOp:
             shm_ids = {id(t) for t in shm_tensors if t is not None}
 
         outputs = []
-        for out in output_tensors:
+        for out, info in zip(output_tensors, out_infos):
             memory_type = 'shm' if id(out) in shm_ids else 'regular'
-            vid, so = register_output(out, memory_type=memory_type)
+            alignment = info[2] if isinstance(info, tuple) and len(info) == 3 else 0
+            vid, so = register_output(out, memory_type=memory_type, alignment=alignment)
             outputs.append((vid, so))
 
         for t in tensor_args:
@@ -87,6 +91,25 @@ class GraphOp:
         if len(output_tensors) == 1:
             return output_tensors[0]
         return tuple(output_tensors)
+
+
+def _alloc_aligned(shape, dtype, alignment):
+    """Allocate a tensor whose data_ptr is ``alignment``-byte aligned.
+
+    Eager path only (adapters.py eager_fn): in eager mode the tensor is the
+    real execution buffer, so alignment must be done at allocation time.
+    Never use during capture — see the note in GraphOp._capture.
+    Over-allocates by ``alignment`` bytes and slices to the aligned offset,
+    so it works on any allocator (plain torch.empty, caching allocator).
+    The extra bytes are bounded by ``alignment`` per allocation.
+    """
+    numel = 1
+    for s in shape:
+        numel *= s
+    nbytes = numel * torch.empty((), dtype=dtype).element_size()
+    base = torch.empty(nbytes + alignment, dtype=torch.uint8)
+    off = (alignment - (base.data_ptr() % alignment)) % alignment
+    return base[off : off + nbytes].view(dtype).view(shape)
 
 
 class _Ops:

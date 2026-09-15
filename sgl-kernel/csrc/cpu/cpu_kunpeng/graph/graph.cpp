@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
@@ -98,6 +100,7 @@ struct Interval {
     int born;
     int death;
     size_t size;
+    size_t alignment = 0;  // 0 = use graph-level memory_alignment
 };
 
 struct PlaceEntry {
@@ -119,8 +122,12 @@ std::vector<PlaceEntry> pack_intervals(std::vector<Interval> intervals, int memo
               [](const auto &a, const auto &b) { return a.size != b.size ? a.size > b.size : a.idx < b.idx; });
 
     std::vector<PlaceEntry> placed;
-    for (const auto &[idx, born, death, size] : intervals) {
+    for (const auto &[idx, born, death, size, alignment] : intervals) {
         if (size == 0) continue;
+
+        // Per-storage alignment override: this interval's start offset must
+        // be aligned to `align` (>= graph-level memory_alignment).
+        size_t align = std::max<size_t>(memory_alignment, alignment);
 
         std::vector<size_t> candidates = {0};
         for (const auto &pe : placed) {
@@ -134,17 +141,18 @@ std::vector<PlaceEntry> pack_intervals(std::vector<Interval> intervals, int memo
 
         size_t best_offset = 0;
         for (size_t cand : candidates) {
+            size_t start = (cand + align - 1) / align * align;
             bool valid = true;
             for (const auto &pe : placed) {
                 if (intervals_overlap(born, death, pe.born, pe.death)) {
-                    if (cand < pe.offset + pe.size && cand + size > pe.offset) {
+                    if (start < pe.offset + pe.size && start + size > pe.offset) {
                         valid = false;
                         break;
                     }
                 }
             }
             if (valid) {
-                best_offset = cand;
+                best_offset = start;
                 break;
             }
         }
@@ -164,7 +172,7 @@ void Graph::plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_
         const auto &s = storages_[i];
         if (!s.in_pool) continue;
         int born = std::max(0, s.born_op);
-        Interval iv{static_cast<int>(i), born, s.death_op, s.size};
+        Interval iv{static_cast<int>(i), born, s.death_op, s.size, s.alignment};
         if (s.memory_type == MemoryType::SHM)
             shm_intervals.push_back(iv);
         else
@@ -174,6 +182,11 @@ void Graph::plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_
     auto assign_pool = [this](std::vector<Interval> intervals, MemoryPool &pool, torch::Tensor external, bool is_shm,
                               const char *tag, int memory_alignment) {
         if (intervals.empty()) return;
+
+        // Base alignment required by per-storage overrides in this pool.
+        size_t base_align = static_cast<size_t>(memory_alignment);
+        for (const auto &iv : intervals)
+            base_align = std::max(base_align, iv.alignment);
 
         auto placed = pack_intervals(std::move(intervals), memory_alignment);
 
@@ -185,10 +198,16 @@ void Graph::plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_
         if (external.defined()) {
             TORCH_CHECK(external.nbytes() >= static_cast<int64_t>(pool_size), "plan_memory: external ", tag,
                         " pool too small (", external.nbytes(), " bytes vs needed ", pool_size, " bytes)");
+            if (base_align > static_cast<size_t>(memory_alignment)) {
+                uintptr_t base = reinterpret_cast<uintptr_t>(external.data_ptr());
+                TORCH_CHECK(base % base_align == 0, "plan_memory: external ", tag, " pool base 0x",
+                            std::hex, base, " not aligned to ", std::dec, base_align,
+                            " (required by per-storage alignment overrides)");
+            }
             pool.adopt(std::move(external));
         } else {
             TORCH_CHECK(!is_shm, "plan_memory: ", tag, " pool requires external pool");
-            pool.allocate(pool_size);
+            pool.allocate(pool_size, base_align);
         }
 
         if constexpr (kGraphDebugPrint) {
@@ -240,6 +259,12 @@ void Graph::precompute_replay()
         }
     }
 
+    // Alignment verification (SGLANG_KUNPENG_VERIFY_ALIGNMENT=1): assert the
+    // replay data_ptr of every view with an alignment override is aligned.
+    const char *verify_env = std::getenv("SGLANG_KUNPENG_VERIFY_ALIGNMENT");
+    const bool verify_alignment = verify_env != nullptr && verify_env[0] == '1';
+    size_t misaligned_views = 0;
+
     // All views: from_blob into pool or fixed memory.
     // Fixed storage views use data_ptr set during begin_capture.
     for (size_t vid = 0; vid < views_.size(); ++vid) {
@@ -264,6 +289,23 @@ void Graph::precompute_replay()
         auto dtype = static_cast<c10::ScalarType>(view.scalar_type);
         cached_tensors_[vid] =
             torch::from_blob(ptr, view.shape, view.strides, torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+
+        if (verify_alignment && storage.alignment > 0) {
+            uintptr_t data_addr = reinterpret_cast<uintptr_t>(ptr);
+            uintptr_t start_addr = reinterpret_cast<uintptr_t>(storage.data_ptr);
+            bool ok = data_addr % storage.alignment == 0;
+            // storage_start misaligned => pool base/packing issue; storage_start
+            // aligned but data_ptr misaligned => leading offset from slicing.
+            std::cout << "[align-check] storage=" << view.storage_id
+                      << " view=" << vid
+                      << " storage_start=0x" << std::hex << start_addr
+                      << " view_off_bytes=" << std::dec
+                      << (view.storage_offset * view.element_size)
+                      << " data_ptr=0x" << std::hex << data_addr << std::dec
+                      << " req_align=" << storage.alignment
+                      << (ok ? "  OK" : "  MISALIGNED") << std::endl;
+            if (!ok) misaligned_views++;
+        }
     }
 
     // Pre-compute per-op dispatch data (one-time lookups, amortized over replays)
@@ -299,6 +341,12 @@ void Graph::precompute_replay()
     // Pre-allocate saved_ and op_tensors_
     saved_.resize(input_view_ids_.size());
     op_tensors_.reserve(max_tensor_count_);
+
+    if (verify_alignment && misaligned_views > 0) {
+        TORCH_CHECK(false, "precompute_replay: alignment verification failed for ",
+                    misaligned_views, " view(s) with alignment override "
+                    "(SGLANG_KUNPENG_VERIFY_ALIGNMENT=1)");
+    }
 }
 
 void Graph::hold_fixed(const std::unordered_map<int, torch::Tensor> &fixed)

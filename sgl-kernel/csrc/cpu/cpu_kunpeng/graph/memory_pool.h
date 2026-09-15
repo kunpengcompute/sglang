@@ -31,13 +31,14 @@ public:
     MemoryPool(MemoryPool&& other) noexcept = default;
     MemoryPool& operator=(MemoryPool&& other) noexcept = default;
 
-    void allocate(size_t size);
+    void allocate(size_t size, size_t base_alignment = 0);
     void adopt(torch::Tensor tensor);
-    void* data() { return tensor_.defined() ? tensor_.data_ptr() : nullptr; }
-    size_t size() const { return tensor_.defined() ? tensor_.nbytes() : 0; }
+    void* data() { return tensor_.defined() ? static_cast<char*>(tensor_.data_ptr()) + base_off_ : nullptr; }
+    size_t size() const { return tensor_.defined() ? static_cast<size_t>(tensor_.nbytes()) - base_off_ : 0; }
 
     void* ptr(size_t offset) { return static_cast<char*>(data()) + offset; }
 
 private:
     torch::Tensor tensor_;
+    size_t base_off_ = 0;  // leading pad so the usable base is base_alignment-aligned
 };
