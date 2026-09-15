@@ -30,18 +30,9 @@ IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 SKIP_CONDA=1 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/env.sh" router
 
 export GATEWAY_CPUS="${GATEWAY_CPUS:-570-590}"
-if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
-    _router_prefill_url="http://${ROUTER_IP}:30001"
-    _router_decode_url="http://${ROUTER_IP}:30002"
-else
-    _router_prefill_url="http://${PREFILL_MASTER_ADDR}:30000"
-    _router_decode_url="http://${DECODE_MASTER_ADDR}:30000"
-fi
 SPECIFIC_ARGS=(
     --model-path "$MODEL_PATH"
     --pd-disaggregation
-    --prefill "$_router_prefill_url" 9001
-    --decode "$_router_decode_url"
     --policy cache_aware
     --health-check-interval-secs 10000
     --queue-timeout-secs 10000
@@ -49,6 +40,52 @@ SPECIFIC_ARGS=(
     --health-check-timeout-secs 10000
     --host "$IP"
 )
+# Backend URLs per INSTANCES entry. In tokenizer-separate mode each side
+# has a single fixed tokenizer HTTP port (30001/30002) that fronts the
+# side's schedulers. Otherwise every instance's master :30000 is a
+# backend directly (one --prefill/--decode pair per entry; the gateway
+# accepts repeated flags to build its worker set).
+for _entry in ${INSTANCES//,/ }; do
+    _entry="${_entry//[[:space:]]/}"
+    [[ -z "$_entry" ]] && continue
+    _role="${_entry%%_*}"
+    _inst=""
+    [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
+    case "$_role" in
+        prefill)
+            if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
+                SPECIFIC_ARGS+=(--prefill "http://${ROUTER_IP}:30001" 9001)
+            else
+                _addr="$(SKIP_CONDA=1 bash -c "
+                    source '$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/env.sh' prefill '$_inst' >/dev/null 2>&1
+                    echo \"\$PREFILL_MASTER_ADDR\"")"
+                SPECIFIC_ARGS+=(--prefill "http://${_addr}:30000" 9001)
+            fi
+            ;;
+        decode)
+            if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
+                SPECIFIC_ARGS+=(--decode "http://${ROUTER_IP}:30002")
+            else
+                _addr="$(SKIP_CONDA=1 bash -c "
+                    source '$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/env.sh' decode '$_inst' >/dev/null 2>&1
+                    echo \"\$DECODE_MASTER_ADDR\"")"
+                SPECIFIC_ARGS+=(--decode "http://${_addr}:30000")
+            fi
+            ;;
+    esac
+done
+# Fallback: INSTANCES empty/unparsed -> single backend per side from the
+# current role env (the 15 fixed args above were not extended).
+if [[ ${#SPECIFIC_ARGS[@]} -eq 15 ]]; then
+    if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
+        _router_prefill_url="http://${ROUTER_IP}:30001"
+        _router_decode_url="http://${ROUTER_IP}:30002"
+    else
+        _router_prefill_url="http://${PREFILL_MASTER_ADDR}:30000"
+        _router_decode_url="http://${DECODE_MASTER_ADDR}:30000"
+    fi
+    SPECIFIC_ARGS+=(--prefill "$_router_prefill_url" 9001 --decode "$_router_decode_url")
+fi
 
 # Launch sgl-model-gateway (Rust router) ----
 echo "Launching PD disaggregation router..."

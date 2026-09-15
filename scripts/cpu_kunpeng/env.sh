@@ -13,29 +13,58 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: source env.sh [prefill|decode|native|router|tokenizer|build]
+# Usage: source env.sh [prefill|decode|native|router|tokenizer|build|none] [instance]
+#   instance (e.g. "128p") selects per-instance user env overrides
+#   (runtime/.user_env_<role>_<instance>.sh); empty = default instance.
+#   For tokenizer, the instance arg is "<side>[_<instance>]" (e.g.
+#   "prefill", "decode_128p"): only that side's role env is loaded.
+#   "none" loads only the base env (incl. .user_env.sh) and returns
+#   immediately — no role config, no toolchain/conda setup.
 
 ACTION="${1:-native}"
+INSTANCE="${2:-}"
+export INSTANCE
 
 # Source base environment: configuration variables, .user_env.sh loading,
 # helper functions, etc. (sets SCRIPT_DIR and IS_PREFILL too)
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime/env_base.sh"
 
+# "none" mode: base config only (for reading INSTANCES etc. from
+# .user_env.sh); skip role config, conda activation, and all path setup.
+if [[ "$ACTION" == "none" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # Role-dependent config + defaults.
 # prefill/native/build -> prefill config; decode -> decode config.
-# router/tokenizer need BOTH sides' topology (master addrs, DP sizes);
-# decode is sourced first so shared role defaults keep the decode values
-# (matches the previous IS_PREFILL=0 behavior for these roles).
+# router needs BOTH sides' topology (master addrs, DP sizes); decode is
+# sourced first so shared role defaults keep the decode values.
+# tokenizer fronts ONE side: its INSTANCE arg is "<side>[_<instance>]"
+# (e.g. "prefill", "decode_128p") — only that side's role env is loaded,
+# with the side's instance file if an instance suffix is given.
 case "$ACTION" in
     prefill|native|build)
-        source "$SCRIPT_DIR/runtime/env_prefill.sh"
+        source "$SCRIPT_DIR/runtime/env_prefill.sh" || return 1
         ;;
-    router|tokenizer)
-        source "$SCRIPT_DIR/runtime/env_decode.sh"
-        source "$SCRIPT_DIR/runtime/env_prefill.sh"
+    router)
+        source "$SCRIPT_DIR/runtime/env_decode.sh" || return 1
+        source "$SCRIPT_DIR/runtime/env_prefill.sh" || return 1
+        ;;
+    tokenizer)
+        _tok_side="${INSTANCE%%_*}"
+        if [[ "$INSTANCE" == *_* ]]; then
+            INSTANCE="${INSTANCE#*_}"
+        else
+            INSTANCE=""
+        fi
+        if [[ "$_tok_side" == "prefill" ]]; then
+            source "$SCRIPT_DIR/runtime/env_prefill.sh" || return 1
+        else
+            source "$SCRIPT_DIR/runtime/env_decode.sh" || return 1
+        fi
         ;;
     *)
-        source "$SCRIPT_DIR/runtime/env_decode.sh"
+        source "$SCRIPT_DIR/runtime/env_decode.sh" || return 1
         ;;
 esac
 

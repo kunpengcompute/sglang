@@ -27,14 +27,41 @@ SKIP_CONDA=1 source "$SCRIPT_DIR/env.sh" router
 
 sh "$SCRIPT_DIR/stop.sh" router
 
-# Wait for ALL gateway backends to be ready (up to 20 minutes):
-# always the prefill/decode masters, plus the tokenizer HTTP servers
+# Wait for ALL gateway backends to be ready (up to 20 minutes): one master
+# per INSTANCES entry (e.g. "prefill,decode_128p" -> prefill master +
+# decode 128p master; each entry's role env is sourced in a subshell to
+# read its real master address), plus the tokenizer HTTP servers
 # (30001/30002) in tokenizer-separate mode (tokenizer starts in parallel
 # with the compute servers, so its ports may not be up yet either).
-endpoints=(
-    "prefill|${PREFILL_MASTER_ADDR}:30000"
-    "decode|${DECODE_MASTER_ADDR}:30000"
-)
+endpoints=()
+for _entry in ${INSTANCES//,/ }; do
+    _entry="${_entry//[[:space:]]/}"
+    [[ -z "$_entry" ]] && continue
+    _role="${_entry%%_*}"
+    _inst=""
+    [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
+    case "$_role" in
+        prefill)
+            _addr="$(SKIP_CONDA=1 bash -c "
+                source '$SCRIPT_DIR/env.sh' prefill '$_inst' >/dev/null 2>&1
+                echo \"\$PREFILL_MASTER_ADDR\"")"
+            endpoints+=("prefill${_inst:+-$_inst}|${_addr}:30000")
+            ;;
+        decode)
+            _addr="$(SKIP_CONDA=1 bash -c "
+                source '$SCRIPT_DIR/env.sh' decode '$_inst' >/dev/null 2>&1
+                echo \"\$DECODE_MASTER_ADDR\"")"
+            endpoints+=("decode${_inst:+-$_inst}|${_addr}:30000")
+            ;;
+    esac
+done
+# Fallback: INSTANCES empty/unparsed -> use this shell's role env.
+if [[ ${#endpoints[@]} -eq 0 ]]; then
+    endpoints=(
+        "prefill|${PREFILL_MASTER_ADDR}:30000"
+        "decode|${DECODE_MASTER_ADDR}:30000"
+    )
+fi
 if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
     endpoints+=(
         "tokenizer-prefill|${ROUTER_IP}:30001"

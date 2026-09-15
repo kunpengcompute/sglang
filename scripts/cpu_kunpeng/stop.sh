@@ -13,139 +13,81 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: ./stop.sh [prefill|decode|native|router|tokenizer|all]
-
-
-if [[ $# -gt 1 ]]; then
-    echo "Usage: $0 [prefill|decode|native|router|tokenizer|all]" >&2
-    exit 1
-fi
-
-ROLE="${1:-native}"
-if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" && "$ROLE" != "native" && "$ROLE" != "router" && "$ROLE" != "tokenizer" && "$ROLE" != "all" ]]; then
-    echo "Error: ROLE must be 'prefill', 'decode', 'native', 'router', 'tokenizer', or 'all'" >&2
-    exit 1
-fi
+# stop.sh - Task dispatcher for cpu_kunpeng stop scripts.
+# Pure dispatcher: delegates to the matching sub-script under runtime/.
+# Usage: ./stop.sh <target> [args]
+#   server    [prefill|decode|native] [instance] -> runtime/stop_server.sh
+#   router                                       -> runtime/stop_router.sh
+#   tokenizer [prefill|decode|all]               -> runtime/stop_tokenizer.sh
+#   all    -> router + tokenizer(both) + server(per INSTANCES in env_base.sh)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
-# "all" mode: stop every role (router + tokenizer + prefill + decode + native)
-# Handle this before sourcing env.sh, which does not support an "all" role.
-if [[ "$ROLE" == "all" ]]; then
-    for _role in router tokenizer prefill decode; do
-        bash ./stop.sh "$_role"
-    done
-    exit 0
+show_usage() {
+    cat <<EOF
+Usage: $0 <target> [side]
+
+Targets:
+  server    Kill sglang on the role's cluster nodes (side: prefill|decode|native, optional instance)
+  router    Kill the gateway on the router node
+  tokenizer Kill tokenizer HTTP server(s) (side: prefill|decode|all, default all)
+  all       Stop router + both tokenizer sides + servers per INSTANCES
+
+Options:
+  -h, --help    show this help and exit
+
+Examples:
+  $0 server decode
+  $0 server decode 128p
+  $0 tokenizer prefill
+  $0 all
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+    # Default: stop everything
+    set -- all
 fi
 
-# Source config for the specified role
-# Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-SKIP_CONDA=1 source ./env.sh "$ROLE"
+TARGET="$1"
+shift
 
-# Router mode: kill gateway on the configured router node
-if [[ "$ROLE" == "router" ]]; then
-    echo "Killing gateway on $ROUTER_IP"
-    ssh "root@$ROUTER_IP" '
-        MAIN_PIDS=$(ps aux | grep "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
-        if [ -n "$MAIN_PIDS" ]; then
-            echo "Killing process(es): $MAIN_PIDS"
-            kill -15 $MAIN_PIDS 2>/dev/null
-            sleep 5
-            REMAINING=$(ps aux | grep "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
-            if [ -n "$REMAINING" ]; then
-                kill -9 $REMAINING 2>/dev/null
-            fi
-            echo "Router stopped."
-        else
-            echo "No router process found."
+case "$TARGET" in
+    -h|--help|help)
+        show_usage
+        exit 0
+        ;;
+    server|router)
+        bash "$SCRIPT_DIR/runtime/stop_${TARGET}.sh" "$@"
+        exit $?
+        ;;
+    tokenizer)
+        bash "$SCRIPT_DIR/runtime/stop_tokenizer.sh" "${1:-all}"
+        exit $?
+        ;;
+    all)
+        bash "$SCRIPT_DIR/runtime/stop_router.sh"
+        bash "$SCRIPT_DIR/runtime/stop_tokenizer.sh" all
+        # Stop servers per the deployment's instance list (same parsing
+        # as launch.sh all): entries "<role>" or "<role>_<instance>".
+        INSTANCES="$(grep -E '^\s*INSTANCES=' "$SCRIPT_DIR/runtime/env_base.sh" | head -n1 | cut -d'"' -f2)"
+        if [[ -z "$INSTANCES" ]]; then
+            INSTANCES="prefill,decode"
         fi
-    '
-    exit 0
-fi
-
-# Tokenizer mode: kill only the two tokenizer HTTP server parents
-# (python -m sglang.launch_server ... --port 30001/30002). Their child
-# workers (sglang::detokenizer / sglang::tokenizer_worker) are cleaned up
-# by the parents on SIGTERM.
-if [[ "$ROLE" == "tokenizer" ]]; then
-    echo "Killing tokenizer HTTP servers on $ROUTER_IP"
-    ssh "root@$ROUTER_IP" '
-        TOK_PAT="sglang[.]launch_server.*--port 3000[12]"
-        MAIN_PIDS=$(ps aux | grep -E "$TOK_PAT" | grep -v grep | awk "{print \$2}")
-        if [ -n "$MAIN_PIDS" ]; then
-            echo "Killing process(es): $MAIN_PIDS"
-            kill -15 $MAIN_PIDS 2>/dev/null
-            sleep 5
-            REMAINING=$(ps aux | grep -E "$TOK_PAT" | grep -v grep | awk "{print \$2}")
-            if [ -n "$REMAINING" ]; then
-                kill -9 $REMAINING 2>/dev/null
-            fi
-            echo "Tokenizer stopped."
-        else
-            echo "No tokenizer process found."
-        fi
-    '
-    exit 0
-fi
-
-# Convert space-separated IP list to array
-IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
-WORLD_SIZE=${#NODES[@]}
-
-echo "Killing $ROLE on $WORLD_SIZE node(s)"
-
-for i in "${!NODES[@]}"; do
-    node="${NODES[i]}"
-
-    ssh "$node" '
-        MAIN_PIDS=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
-
-        if [ -n "$MAIN_PIDS" ]; then
-            echo "Found SGLang processes on '"$node"'"
-
-            for pid in $MAIN_PIDS; do
-                kill -15 $pid 2>/dev/null
-            done
-
-            sleep 15
-
-            REMAINING=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
-            if [ -n "$REMAINING" ]; then
-                echo "Processes still running on '"$node"'. Sending SIGKILL..."
-                for pid in $REMAINING; do
-                    kill -9 $pid 2>/dev/null
-                done
-            else
-                echo "All processes on '"$node"' terminated gracefully."
-            fi
-        else
-            echo "No SGLang processes found on '"$node"'"
-        fi
-
-        ZOMBIES=$(ps aux | awk '\''$8 ~ /^Z/ && $11 ~ /sglang/ {print $2}'\'')
-        if [ -n "$ZOMBIES" ]; then
-            echo "Found zombie processes on '$node'"
-            for zpid in $ZOMBIES; do
-                parent_pid=$(ps -o ppid= -p $zpid 2>/dev/null | xargs)
-                if [ -n "$parent_pid" ] && [ "$parent_pid" != "1" ]; then
-                    kill -9 $parent_pid 2>/dev/null
-                fi
-            done
-        fi
-
-        rm -rf /dev/shm/shm_mmap_*
-        for i in $(seq 0 31); do
-            echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
+        IFS=',' read -ra _INST_LIST <<< "$INSTANCES"
+        for _entry in "${_INST_LIST[@]}"; do
+            _entry="${_entry//[[:space:]]/}"
+            [[ -z "$_entry" ]] && continue
+            _role="${_entry%%_*}"
+            _inst=""
+            [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
+            bash "$SCRIPT_DIR/runtime/stop_server.sh" "$_role" "$_inst"
         done
-
-        # Drop caches if configured
-        if [ "'"${DROP_CACHES:-0}"'" = "1" ]; then
-            echo "Dropping caches on '"$node"'..."
-            echo 3 > /proc/sys/vm/drop_caches
-        fi
-    ' &
-done
-
-wait
-echo "All $ROLE nodes processed."
+        exit $?
+        ;;
+    *)
+        echo "Error: unknown target '$TARGET'" >&2
+        show_usage >&2
+        exit 1
+        ;;
+esac

@@ -69,7 +69,19 @@ if [[ -z "${SGLANG_KUNPENG_MAX_CUR_LEN:-}" ]]; then
     fi
 fi
 
-# Per-server overrides (sourced after role defaults so they take priority)
-if [[ -f "$SCRIPT_DIR/runtime/.user_env_decode.sh" ]]; then
+# Per-server overrides (sourced after role defaults so they take priority).
+# With an instance (env.sh decode 128p -> INSTANCE=128p), ONLY the instance
+# file .user_env_decode_<instance>.sh is loaded; the default file
+# .user_env_decode.sh is loaded only when no instance is given.
+if [[ -n "${INSTANCE:-}" ]]; then
+    if [[ -f "$SCRIPT_DIR/runtime/.user_env_decode_${INSTANCE}.sh" ]]; then
+        source "$SCRIPT_DIR/runtime/.user_env_decode_${INSTANCE}.sh"
+    else
+        echo "ERROR: instance file runtime/.user_env_decode_${INSTANCE}.sh not found (required when an instance is specified)" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+elif [[ -f "$SCRIPT_DIR/runtime/.user_env_decode.sh" ]]; then
     source "$SCRIPT_DIR/runtime/.user_env_decode.sh"
+else
+    echo "WARNING: runtime/.user_env_decode.sh not found, using role defaults only" >&2
 fi

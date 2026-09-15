@@ -85,12 +85,18 @@ git apply pytorch-v2.9.0-kupl.patch
 ```shell
 # native模式（非PD分离）
 sh launch.sh native
-sh stop.sh native
+sh stop.sh server native
 
 # PD分离模式（分别在prefill、decode、router节点执行）
 sh launch.sh prefill
 sh launch.sh decode
 sh launch.sh router
+
+# 停止（server支持 prefill|decode|native，tokenizer支持 prefill|decode|all）
+sh stop.sh server prefill
+sh stop.sh server decode
+sh stop.sh router
+sh stop.sh all
 ```
 
 ### 3.2 非DeepSeek模型使用

@@ -22,6 +22,12 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Load base user overrides (INSTANCES etc.) early so the dispatch logic
+# below can read them. "none" mode = base config only: no role config,
+# no conda activation, no toolchain paths — children set those up via
+# their own env.sh sourcing.
+source "$SCRIPT_DIR/env.sh" none
+
 show_usage() {
     cat <<EOF
 Usage: $0 <role> [args...]
@@ -31,7 +37,9 @@ Roles:
   decode     Launch decode server (PD disaggregation, decode side)
   native     Launch without PD disaggregation
   router     Launch gateway (route requests to prefill/decode)
-  tokenizer  Launch tokenizer HTTP servers (prefill:30001 + decode:30002)
+  tokenizer  Launch one tokenizer HTTP server: $0 tokenizer <prefill|decode> [instance]
+             (prefill -> port 30001, decode -> port 30002; instance selects
+             runtime/.user_env_<side>_<instance>.sh)
   all        Launch prefill, decode, tokenizer, and router sequentially
   update     Regenerate .time_env.sh + update NUMA binary replicas
 
@@ -81,11 +89,32 @@ if [[ "$ROLE" == "update" ]]; then
     exit 0
 
 elif [[ "$ROLE" == "all" ]]; then
-    echo "[$(date +%T)] ===== Launching all roles (prefill + decode + tokenizer + router) ====="
+    # Deployment instance list: comma-separated entries, each "<role>" or
+    # "<role>_<instance>" (e.g. "prefill,decode_128p" -> prefill + decode
+    # instance 128p). Default lives in runtime/env_base.sh; .user_env.sh
+    # (sourced via "env.sh none" at the top) may override it.
+    echo "[$(date +%T)] ===== Launching all roles ($INSTANCES + tokenizer + router) ====="
 
-    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_cluster.sh" prefill
-    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_cluster.sh" decode
-    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_tokenizer.sh"
+    IFS=',' read -ra _INST_LIST <<< "$INSTANCES"
+    for _entry in "${_INST_LIST[@]}"; do
+        _entry="${_entry//[[:space:]]/}"
+        [[ -z "$_entry" ]] && continue
+        _role="${_entry%%_*}"   # "decode_128p" -> "decode"; "native" -> "native"
+        _inst=""
+        [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
+        SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_cluster.sh" "$_role" "$_inst"
+    done
+    # Tokenizers follow the same instance list: one per prefill/decode
+    # entry, loading that entry's instance env (master addr, DP size).
+    for _entry in "${_INST_LIST[@]}"; do
+        _entry="${_entry//[[:space:]]/}"
+        [[ -z "$_entry" ]] && continue
+        _role="${_entry%%_*}"
+        _inst=""
+        [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
+        [[ "$_role" == "prefill" || "$_role" == "decode" ]] || continue
+        SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_tokenizer.sh" "$_role" "$_inst"
+    done
     bash "$SCRIPT_DIR/runtime/launch_router.sh"
 
 elif [[ "$ROLE" == "router" ]]; then
