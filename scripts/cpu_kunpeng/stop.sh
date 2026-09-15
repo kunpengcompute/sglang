@@ -64,16 +64,20 @@ if [[ "$ROLE" == "router" ]]; then
     exit 0
 fi
 
-# Tokenizer mode: kill tokenizer HTTP servers on the configured router node
+# Tokenizer mode: kill only the two tokenizer HTTP server parents
+# (python -m sglang.launch_server ... --port 30001/30002). Their child
+# workers (sglang::detokenizer / sglang::tokenizer_worker) are cleaned up
+# by the parents on SIGTERM.
 if [[ "$ROLE" == "tokenizer" ]]; then
     echo "Killing tokenizer HTTP servers on $ROUTER_IP"
     ssh "root@$ROUTER_IP" '
-        MAIN_PIDS=$(ps aux | grep "sglang" | grep -v "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
+        TOK_PAT="sglang[.]launch_server.*--port 3000[12]"
+        MAIN_PIDS=$(ps aux | grep -E "$TOK_PAT" | grep -v grep | awk "{print \$2}")
         if [ -n "$MAIN_PIDS" ]; then
             echo "Killing process(es): $MAIN_PIDS"
             kill -15 $MAIN_PIDS 2>/dev/null
             sleep 5
-            REMAINING=$(ps aux | grep "sglang" | grep -v "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
+            REMAINING=$(ps aux | grep -E "$TOK_PAT" | grep -v grep | awk "{print \$2}")
             if [ -n "$REMAINING" ]; then
                 kill -9 $REMAINING 2>/dev/null
             fi
