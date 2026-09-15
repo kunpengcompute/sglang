@@ -20,13 +20,16 @@ frame, and the ability of the unified demux (``_pp_consume_message`` /
 ``_pp_recv_message``) to tell it apart from the forward bundle and from plain
 pyobj messages even when they arrive interleaved on the same FIFO.
 
+The bundle direction (forward vs ring-back) is carried in the frame header's
+kind bits 8..15 (PP_BUNDLE_SUB_*), so the demux classifies a bundle without
+unpickling any tag string.
+
 Regression covered: previously a bundle frame consumed through
 ``recv_message`` returned kind=3, which ``_pp_consume_message`` mis-routed to
 the TENSOR branch and ``pickle.loads`` crashed with
-``UnpicklingError: invalid load key`` (and ``recv_pyobjs_bundle`` crashed with
-``PP recv bundle: expected a BUNDLE frame`` when the FIFO top was not a
-bundle).  With this fix a bundle may arrive anywhere and is stashed by kind
-(forward / ring-back / pyobj) instead of breaking the stream.
+``UnpicklingError: invalid load key``.  With this fix a bundle may arrive
+anywhere and is stashed by kind (forward / ring-back / pyobj) instead of
+breaking the stream.
 
 The PP group is created through the real deployment path
 (init_distributed_environment + initialize_model_parallel) so the test
@@ -54,11 +57,10 @@ from sglang.srt.distributed.device_communicators.kunpeng_communicator import (
     PP_KIND_PYOBJ,
     PP_KIND_TENSOR,
     PP_KIND_BUNDLE,
+    PP_KIND_MASK,
+    PP_BUNDLE_SUB_RINGBACK,
 )
-from sglang.srt.managers.scheduler_pp_mixin import (
-    _PP_RINGBACK_TAG,
-    _pp_unpack_bundle,
-)
+from sglang.srt.managers.scheduler_pp_mixin import _pp_split_bundle_frame
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -86,12 +88,11 @@ class _Demux:
                 continue
             if kind == PP_KIND_PYOBJ:
                 msg_kind, data = "pyobj", pickle.loads(payload)
-            elif kind == PP_KIND_BUNDLE:
-                data = _pp_unpack_bundle(payload)
-                if data and isinstance(data[0], str) and data[0] == _PP_RINGBACK_TAG:
-                    msg_kind, data = "ringback", data[1:]
-                else:
-                    msg_kind, data = "bundle", data
+            elif (kind & PP_KIND_MASK) == PP_KIND_BUNDLE:
+                # Sub-kind rides in the frame header bits 8..15; no tag.
+                sub = (kind >> 8) & PP_KIND_MASK
+                msg_kind = "ringback" if sub == PP_BUNDLE_SUB_RINGBACK else "bundle"
+                data = [pickle.loads(p) for p in _pp_split_bundle_frame(payload)]
             elif kind == PP_KIND_TENSOR:
                 raise AssertionError("unexpected TENSOR frame in this test flow")
             else:
@@ -160,7 +161,8 @@ def worker_main() -> None:
         # Fire the same interleaved order as the decode loop: the ring-back
         # bundle is posted before the req pyobj, the forward bundle after it.
         comm.send_pyobjs_bundle(
-            [ _PP_RINGBACK_TAG, rbk_retract, rbk_prealloc, rbk_release], dst
+            [rbk_retract, rbk_prealloc, rbk_release], dst,
+            sub_kind=PP_BUNDLE_SUB_RINGBACK,
         )
         comm.send_pyobj({"kind": "REQ"}, dst)
         comm.send_pyobjs_bundle(
@@ -178,10 +180,10 @@ def worker_main() -> None:
         # step1-like: ask for the req pyobj; the two bundles must be stashed.
         req = demux.recv_expect("pyobj")
         assert req == {"kind": "REQ"}, f"req mismatch: {req}"
-        # step2-like: the forward bundle (3 slots, no tag).
+        # step2-like: the forward bundle (3 sub-payloads, header sub-kind 0).
         fwd = demux.recv_expect("bundle")
         assert fwd == [fwd_retract, fwd_prealloc, fwd_transferred], f"fwd: {fwd}"
-        # step7-like: the ring-back bundle (3 slots, tag stripped).
+        # step7-like: the ring-back bundle (3 sub-payloads, header sub-kind 1).
         rbk = demux.recv_expect("ringback")
         assert rbk == [rbk_retract, rbk_prealloc, rbk_release], f"ringback: {rbk}"
 

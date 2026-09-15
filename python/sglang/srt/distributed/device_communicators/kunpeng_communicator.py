@@ -51,6 +51,13 @@ PP_KIND_TENSOR = 1
 PP_KIND_ACK = 2
 PP_KIND_BUNDLE = 3  # must match PP_KIND_BUNDLE in pp_comm.cpp
 PP_MSG_SLOTS = 8  # must match PP_MSG_SLOTS in pp_comm.cpp
+# Bundle sub-kind rides in the frame header kind's bits 8..15 (base kind stays
+# in the low byte): the receiver demuxes the forward consensus (step2) from
+# the ring-back consensus (step6/7) WITHOUT unpickling a tag string.
+# Must match PP_KIND_MASK / PP_BUNDLE_SUB_* in pp_comm.cpp.
+PP_KIND_MASK = 0xFF
+PP_BUNDLE_SUB_FORWARD = 0
+PP_BUNDLE_SUB_RINGBACK = 1
 
 SHM_ALIGN_SIZE = 7168
 
@@ -446,11 +453,15 @@ class KunpengPPCommunicator:
         """Fused: one pp_recv then copy all out tensors from the batch region."""
         kernel.pp_recv_batch_copy_kunpeng(src_rank, offsets, out_tensors)
 
-    def send_pyobjs_bundle(self, payloads, dst_rank: int):
+    def send_pyobjs_bundle(self, payloads, dst_rank: int,
+                           sub_kind: int = PP_BUNDLE_SUB_FORWARD):
         """Coalesce several pyobjs into ONE slot/message (single pp_put + 1 ack).
 
         Used to merge the per-microbatch consensus rids (retract / prealloc /
-        transfer) into a single ring message in the PP loop.
+        transfer) into a single ring message in the PP loop.  ``sub_kind`` rides
+        in the frame header (PP_BUNDLE_SUB_FORWARD / PP_BUNDLE_SUB_RINGBACK) so
+        the receiver demuxes the consensus direction without unpickling a tag.
+        The peer receives the bundle through ``recv_message`` like any frame.
         """
         self.pp_comm_init()
         assert kernel.pp_inflight_kunpeng(dst_rank) < PP_MSG_SLOTS, (
@@ -461,15 +472,7 @@ class KunpengPPCommunicator:
             torch.frombuffer(bytearray(pickle.dumps(p)), dtype=torch.uint8)
             for p in payloads
         ]
-        kernel.pp_send_pyobjs_bundle_kunpeng(dst_rank, payload_tensors)
-
-    def recv_pyobjs_bundle(self, src_rank: int):
-        """Receive one bundle and unpack its sub-pyobjects in order."""
-        self.pp_comm_init()
-        payload_tensors = kernel.pp_recv_pyobjs_bundle_kunpeng(src_rank)
-        return [
-            pickle.loads(p.numpy().tobytes()) for p in payload_tensors
-        ]
+        kernel.pp_send_pyobjs_bundle_kunpeng(dst_rank, payload_tensors, sub_kind)
 
     # === unified message send ===
 
@@ -551,8 +554,9 @@ class KunpengPPCommunicator:
 
         Returns -1 when no message is available yet (the sender has not written
         the current ring slot's magic); otherwise returns the message kind
-        WITHOUT consuming it.  The caller must later consume it with
-        recv_message / recv_pyobjs_bundle (or leave it for a later consumer).
+        WITHOUT consuming it (bundles include their sub-kind in bits 8..15).
+        The caller must later consume it with recv_message (or leave it for a
+        later consumer).
         """
         self.pp_comm_init()
         return int(kernel.pp_try_peek_msg_kunpeng(src_rank))

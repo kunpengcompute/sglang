@@ -47,6 +47,14 @@ extern bool g_global_comm_initialized;
 #define PP_KIND_TENSOR 1
 #define PP_KIND_ACK 2
 #define PP_KIND_BUNDLE 3  // one frame carrying N pyobj sub-payloads (consensus merge)
+// Bundle sub-kind rides in header[1] bits 8..15 (base kind stays in the low
+// byte), so receivers demux the forward consensus (step2) from the ring-back
+// consensus (step6/7) WITHOUT unpickling a tag string.  pp_recv_msg_kunpeng /
+// pp_try_peek_msg_kunpeng return header[1] verbatim, so the sub-kind flows to
+// Python at zero cost.
+#define PP_KIND_MASK 0xFF
+#define PP_BUNDLE_SUB_FORWARD 0
+#define PP_BUNDLE_SUB_RINGBACK 1
 #define PP_MSG_HEADER 12
 #define PP_MSG_SLOTS 8
 #define PP_MSG_SLOT_SIZE (1 * 1024 * 1024)
@@ -310,10 +318,10 @@ std::vector<at::Tensor> pp_recv_msg_kunpeng(int64_t src_rank)
 }
 
 // Non-blocking probe of the next message from `src_rank` WITHOUT consuming it.
-// Returns the message kind (`header[1]`), or -1 when no message is available
-// (the sender has not written the current ring slot's magic yet).  The caller
-// must still consume the message with pp_recv_msg_kunpeng /
-// pp_recv_pyobjs_bundle_kunpeng (or leave it for a later consumer; the probe is
+// Returns the message kind (`header[1]`, including any bundle sub-kind in bits
+// 8..15), or -1 when no message is available (the sender has not written the
+// current ring slot's magic yet).  The caller must still consume the message
+// with pp_recv_msg_kunpeng (or leave it for a later consumer; the probe is
 // side-effect free).  A stale "-1" is safe: it just makes the caller retry.
 int64_t pp_try_peek_msg_kunpeng(int64_t src_rank)
 {
@@ -389,14 +397,20 @@ void pp_recv_batch_copy_kunpeng(int64_t src_rank, at::Tensor offsets, at::Tensor
 
 // === Pyobj bundle (coalesce multiple rid/consensus lists into ONE slot) ===
 // One logical message, one slot, one pp_put, one ack.  Frame layout:
-//   header[magic][PP_KIND_BUNDLE][total]  (total = bytes of all sub-frames)
-//   then for each sub-payload: [len][payload]  (len = uint32, then len bytes)
-// All sub-payloads are PYOBJ pickles; the receiver unpacks the sub-frames.
+//   header[magic][PP_KIND_BUNDLE | (sub_kind << 8)][total]  (total = bytes of
+//   all sub-frames), then for each sub-payload: [len][payload]  (len = uint32,
+//   then len bytes)
+// All sub-payloads are PYOBJ pickles.  The receiver consumes bundles through
+// pp_recv_msg_kunpeng (which returns header[1] verbatim, sub-kind included)
+// and splits the frame body in Python; no separate bundle recv op is needed.
 
-void pp_send_pyobjs_bundle_kunpeng(int64_t dest_rank, at::TensorList payloads)
+void pp_send_pyobjs_bundle_kunpeng(int64_t dest_rank, at::TensorList payloads,
+                                   int64_t sub_kind)
 {
     TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
     TORCH_CHECK(dest_rank >= 0 && dest_rank < g_pp_world_size, "PP send bundle: bad dest_rank");
+    TORCH_CHECK(sub_kind >= 0 && sub_kind <= PP_KIND_MASK,
+                "PP send bundle: sub_kind must fit in header bits 8..15");
     // Single-iteration parallel_for: frame the whole bundle and issue the RDMA
     // put on a kutacc worker core.
     kutacc::parallel_for(0, 1, 1, [&](int64_t s, int64_t e) {
@@ -410,7 +424,9 @@ void pp_send_pyobjs_bundle_kunpeng(int64_t dest_rank, at::TensorList payloads)
                     "PP send bundle: combined payloads exceed one message slot");
 
         int64_t slot_off = pp_send_slot_off(dest_rank);
-        uint32_t header[3] = {PP_MSG_MAGIC, PP_KIND_BUNDLE, static_cast<uint32_t>(total)};
+        uint32_t header[3] = {PP_MSG_MAGIC,
+                              PP_KIND_BUNDLE | (static_cast<uint32_t>(sub_kind) << 8),
+                              static_cast<uint32_t>(total)};
         memcpy(g_pp_base_ptr + slot_off, header, PP_MSG_HEADER);
         int64_t off = PP_MSG_HEADER;
         for (const auto &p : payloads) {
@@ -428,47 +444,6 @@ void pp_send_pyobjs_bundle_kunpeng(int64_t dest_rank, at::TensorList payloads)
         g_pp_send_cnt[dest_rank]++;
         g_pp_inflight[dest_rank]++;  // occupies one ring slot -> one ack back
     });
-}
-
-// Receive one bundle and unpack its sub-payloads.  One pp_recv, then auto-ack
-// once so the sender's single inflight slot is freed.
-std::vector<at::Tensor> pp_recv_pyobjs_bundle_kunpeng(int64_t src_rank)
-{
-    TORCH_CHECK(g_pp_initialized, "PP communication not initialized");
-    TORCH_CHECK(src_rank >= 0 && src_rank < g_pp_world_size, "PP recv bundle: bad src_rank");
-    std::vector<at::Tensor> payloads;
-    // Single-iteration parallel_for: the whole recv (RDMA wait + unpack + ack)
-    // runs on a kutacc worker core.
-    kutacc::parallel_for(0, 1, 1, [&](int64_t s, int64_t e) {
-        kutacc::pp_recv(g_pp_to_world[src_rank], g_moe_comm_h->global_ds_conn_info);
-        int64_t slot_off = pp_recv_slot_off(src_rank);
-        uint32_t *header = reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off);
-        TORCH_CHECK(header[0] == PP_MSG_MAGIC, "PP recv bundle: bad message magic");
-        TORCH_CHECK(header[1] == PP_KIND_BUNDLE, "PP recv bundle: expected a BUNDLE frame");
-        header[0] = 0;  // consume: clear magic so a reused ring slot won't look new
-        int64_t total = header[2];
-        TORCH_CHECK(total <= PP_MSG_SLOT_SIZE - PP_MSG_HEADER, "PP recv bundle: oversized frame");
-
-        int64_t off = PP_MSG_HEADER;
-        int64_t end = PP_MSG_HEADER + total;
-        while (off < end) {
-            TORCH_CHECK(off + static_cast<int64_t>(sizeof(uint32_t)) <= end, "PP recv bundle: short len");
-            uint32_t len = *reinterpret_cast<uint32_t *>(g_pp_base_ptr + slot_off + off);
-            off += sizeof(uint32_t);
-            TORCH_CHECK(off + len <= end, "PP recv bundle: sub-payload exceeds frame");
-            auto payload = torch::empty({static_cast<int64_t>(len)},
-                                        torch::TensorOptions().dtype(torch::kUInt8));
-            if (len > 0) {
-                memcpy(payload.data_ptr(), g_pp_base_ptr + slot_off + off, len);
-                off += len;
-            }
-            payloads.push_back(payload);
-        }
-        TORCH_CHECK(off == end, "PP recv bundle: framing mismatch");
-        g_pp_recv_cnt[src_rank]++;
-        pp_send_ack_locked(src_rank);  // one ack for the whole bundle
-    });
-    return payloads;
 }
 
 void pp_comm_finalize_kunpeng()

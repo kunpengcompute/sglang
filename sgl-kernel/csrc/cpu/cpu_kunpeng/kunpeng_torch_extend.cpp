@@ -226,10 +226,10 @@ void pp_send_tensor_batch_kunpeng(int64_t dest_rank, at::TensorList tensors);
 
 void pp_recv_batch_copy_kunpeng(int64_t src_rank, at::Tensor offsets, at::TensorList out_tensors);
 
-// Fused pyobj bundle ops (coalesce multiple consensus lists into one slot)
-void pp_send_pyobjs_bundle_kunpeng(int64_t dest_rank, at::TensorList payloads);
-
-std::vector<at::Tensor> pp_recv_pyobjs_bundle_kunpeng(int64_t src_rank);
+// Fused pyobj bundle send (coalesce multiple consensus lists into one slot);
+// sub_kind rides in the frame header so receivers demux without unpickling.
+// Bundles are received through pp_recv_msg_kunpeng like any other frame.
+void pp_send_pyobjs_bundle_kunpeng(int64_t dest_rank, at::TensorList payloads, int64_t sub_kind);
 
 void broadcast_kunpeng_create(int64_t pg_ptr, int64_t max_buf_bytes);
 
@@ -787,12 +787,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("pp_recv_batch_copy_kunpeng(int src_rank, Tensor offsets, Tensor[] out_tensors) -> ()");
     m.impl("pp_recv_batch_copy_kunpeng", pp_recv_batch_copy_kunpeng);
 
-    // Fused pyobj bundle ops
-    m.def("pp_send_pyobjs_bundle_kunpeng(int dest_rank, Tensor[] payloads) -> ()");
+    // Fused pyobj bundle send (sub_kind in header; recv goes through pp_recv_msg_kunpeng)
+    m.def("pp_send_pyobjs_bundle_kunpeng(int dest_rank, Tensor[] payloads, int sub_kind) -> ()");
     m.impl("pp_send_pyobjs_bundle_kunpeng", pp_send_pyobjs_bundle_kunpeng);
-
-    m.def("pp_recv_pyobjs_bundle_kunpeng(int src_rank) -> Tensor[]");
-    m.impl("pp_recv_pyobjs_bundle_kunpeng", pp_recv_pyobjs_bundle_kunpeng);
 
     // kunpeng broadcast (fixed-cap persistent buffer owned by the comm layer)
     m.def("broadcast_kunpeng_create(int pg_ptr, int max_buf_bytes) -> ()");
