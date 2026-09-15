@@ -25,6 +25,13 @@ source "$SCRIPT_DIR/runtime/env_helper.sh"
 # ------------------------------------------------------------
 # Configuration variables (edit these as needed)
 # ------------------------------------------------------------
+# Deployment instances for `launch.sh all`: comma-separated entries, each
+# "<role>" or "<role>_<instance>". Each entry starts one server group via
+# `launch_cluster.sh <role> [instance]`; the instance suffix selects
+# per-instance user env overrides (runtime/.user_env_<role>_<instance>.sh),
+# e.g. "decode_128p" reads .user_env_decode_128p.sh on every node.
+INSTANCES="prefill,decode"
+
 # IP range, Master address/port for native nodes.
 # prefill/decode topology now lives in runtime/env_prefill.sh / env_decode.sh.
 # IP_FILE: file with one IP per line (e.g. "192.168.1.1" per line)

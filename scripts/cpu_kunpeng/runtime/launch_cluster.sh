@@ -14,34 +14,28 @@
 
 #!/bin/bash
 # launch_cluster.sh - Cluster launch for prefill/decode/native roles.
-# Invoked by: ./launch.sh <prefill|decode|native>
-# Or directly: bash runtime/launch_cluster.sh <prefill|decode|native>
+# Invoked by: ./launch.sh <prefill|decode|native> [instance]
+# Or directly: bash runtime/launch_cluster.sh <prefill|decode|native> [instance]
 
 show_usage() {
-    echo "Usage: $0 [prefill|decode|native]" >&2
+    echo "Usage: $0 [prefill|decode|native] [instance]" >&2
     echo "  prefill  - Launch prefill server (PD disaggregation, prefill side)" >&2
     echo "  decode   - Launch decode server (PD disaggregation, decode side)" >&2
     echo "  native   - Launch without PD disaggregation" >&2
+    echo "  instance - optional instance name (e.g. 128p); reads" >&2
+    echo "             runtime/.user_env_<role>_<instance>.sh overrides" >&2
 }
 
-# Parse args: ROLE (positional)
+# Parse args: ROLE ($1) + optional INSTANCE ($2, e.g. "128p")
 # Optional: SKIP_LOG=1 before running to skip tail -f (exit after launching)
-ROLE=""
-for arg in "$@"; do
-    case "$arg" in
-        prefill|decode|native)
-            ROLE="$arg"
-            ;;
-        *)
-            echo "Error: Unknown argument '$arg'" >&2
-            show_usage
-            exit 1
-            ;;
-    esac
-done
+ROLE="${1:-native}"
+INSTANCE="${2:-}"
 
-# Default role if none given
-ROLE="${ROLE:-native}"
+if [[ $# -gt 2 ]]; then
+    echo "Error: too many arguments" >&2
+    show_usage
+    exit 1
+fi
 
 # Re-validate role
 VALID_ROLES=("prefill" "decode" "native")
@@ -51,24 +45,30 @@ if [[ ! " ${VALID_ROLES[*]} " =~ " ${ROLE} " ]]; then
     exit 1
 fi
 
+# Instance name must be a plain identifier (used inside file names)
+if [[ -n "$INSTANCE" && ! "$INSTANCE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "Error: invalid instance name '$INSTANCE'" >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-# Source config for the specified role
+# Source config for the specified role (+ optional instance)
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
-source "$SCRIPT_DIR/env.sh" "$ROLE"
+source "$SCRIPT_DIR/env.sh" "$ROLE" "$INSTANCE" || exit 1
 
 mkdir -p "$LOG_DIR"
 # Refresh "latest" symlink to this run's time dir (e.g. latest -> 214700)
 ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/$ROLE/latest"
 
-sh "$SCRIPT_DIR/stop.sh" "$ROLE"
+sh "$SCRIPT_DIR/stop.sh" server "$ROLE" "$INSTANCE"
 
 # Convert space-separated IP list to array
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
 WORLD_SIZE=${#NODES[@]}
 
-echo "Launching $ROLE on $WORLD_SIZE node(s)"
+echo "Launching $ROLE${INSTANCE:+ ($INSTANCE)} on $WORLD_SIZE node(s)"
 
 for i in "${!NODES[@]}"; do
     node_ip="${NODES[i]}"
@@ -76,7 +76,7 @@ for i in "${!NODES[@]}"; do
     echo "[$(date +%T)] Starting node_rank $node_rank ($node_ip)"
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
         "root@$node_ip" \
-        "cd \"$PWD\" && sh ./server.sh \"$ROLE\" \"$node_rank\" \"$LOG_DIR\"" \
+        "cd \"$PWD\" && sh ./server.sh \"$ROLE\" \"$node_rank\" \"$LOG_DIR\" \"$INSTANCE\"" \
         >"$LOG_DIR/ssh_${ROLE}_rank${node_rank}.log" 2>&1 &
 done
 

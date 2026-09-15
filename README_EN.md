@@ -85,12 +85,18 @@ Startup and shutdown commands:
 ```shell
 # native mode (non-PD disaggregated)
 sh launch.sh native
-sh stop.sh native
+sh stop.sh server native
 
 # PD disaggregated mode (run on prefill, decode, and router nodes respectively)
 sh launch.sh prefill
 sh launch.sh decode
 sh launch.sh router
+
+# Stop (server takes prefill|decode|native, tokenizer takes prefill|decode|all)
+sh stop.sh server prefill
+sh stop.sh server decode
+sh stop.sh router
+sh stop.sh all
 ```
 
 ### 3.2 Using Non-DeepSeek Models

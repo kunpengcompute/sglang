@@ -74,7 +74,19 @@ export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-8}"
 export SGLANG_KUNPENG_MAX_CUR_LEN="${SGLANG_KUNPENG_MAX_CUR_LEN:-576}"
 export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-65536}"
 
-# Per-server overrides (sourced after role defaults so they take priority)
-if [[ -f "$SCRIPT_DIR/runtime/.user_env_prefill.sh" ]]; then
+# Per-server overrides (sourced after role defaults so they take priority).
+# With an instance (env.sh prefill 128p -> INSTANCE=128p), ONLY the instance
+# file .user_env_prefill_<instance>.sh is loaded; the default file
+# .user_env_prefill.sh is loaded only when no instance is given.
+if [[ -n "${INSTANCE:-}" ]]; then
+    if [[ -f "$SCRIPT_DIR/runtime/.user_env_prefill_${INSTANCE}.sh" ]]; then
+        source "$SCRIPT_DIR/runtime/.user_env_prefill_${INSTANCE}.sh"
+    else
+        echo "ERROR: instance file runtime/.user_env_prefill_${INSTANCE}.sh not found (required when an instance is specified)" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+elif [[ -f "$SCRIPT_DIR/runtime/.user_env_prefill.sh" ]]; then
     source "$SCRIPT_DIR/runtime/.user_env_prefill.sh"
+else
+    echo "WARNING: runtime/.user_env_prefill.sh not found, using role defaults only" >&2
 fi

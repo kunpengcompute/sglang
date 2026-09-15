@@ -13,12 +13,13 @@
 # ==============================================================================
 
 #!/bin/bash
-# server.sh - Single node execution for SGLang (prefill/decode/native/tokenizer).
+# server.sh - Single node execution for SGLang (prefill/decode/native).
 # Router (gateway) is launched by runtime/server_router.sh instead.
-# Usage: ./server.sh <role> <dp_rank> <log_path>
+# Tokenizer HTTP servers are launched by runtime/server_tokenizer.sh instead.
+# Usage: ./server.sh <role> <dp_rank> <log_path> [instance]
 
 if [[ $# -lt 3 ]]; then
-    echo "Usage: $0 <role> <dp_rank> <log_path>" >&2
+    echo "Usage: $0 <role> <dp_rank> <log_path> [instance]" >&2
     exit 1
 fi
 
@@ -28,10 +29,11 @@ ROLE="$1"
 # process is derived below from (node index, rank-in-node).
 NODE_RANK="$2"
 LOG_PATH="$3"
+INSTANCE="${4:-}"
 IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 
 # Source environment config (exports CONDA_ACTIVATE_CMD, PYTHON_SCRIPT, etc.)
-source ./env.sh "$ROLE"
+source ./env.sh "$ROLE" "$INSTANCE" || exit 1
 
 rmmod sdma_dae 2>/dev/null || true
 insmod "$SDMA_KO_PATH" safe_mode=0 share_chns=160
@@ -148,31 +150,10 @@ case "$ROLE" in
         )
         ;;
     tokenizer)
-        # ================= Router-node CPU / NUMA binding plan =================
-        # Example layout (adjust *_NUMA_BASE to match the router's real NUMAs;
-        # W = TOKENIZER_WORKER_NUM, each NUMA = 38 cores, last core isolated).
-        # 16 NUMAs total (0-15). With W=4 each role needs 5 (tok W + detok 1),
-        # 2 roles = 10 NUMAs; remaining NUMAs are left for the gateway & bootstrap:
-        #   prefill : BASE 0   -> tokenizer 0..(W-1),    detok W
-        #   decode  : BASE 10  -> tokenizer 10..(10+W-1), detok 10+W
-        export PREFILL_NUMA_BASE="${PREFILL_NUMA_BASE:-0}"
-        export DECODE_NUMA_BASE="${DECODE_NUMA_BASE:-10}"
-        export PREFILL_BOOTSTRAP_CPU="${PREFILL_BOOTSTRAP_CPU:-591-595}"
-        # Common args for tokenizer-side HTTP server
-        HTTP_COMMON_ARGS=(
-            --model "$MODEL_PATH"
-            --device cpu --trust-remote-code
-            --host "$ROUTER_IP"
-            --disaggregation-bootstrap-port 9001
-            --nnodes 1 --node-rank 0 --dist-timeout 600
-            --tp-size 1
-            --max-total-tokens 64
-            --tokenizer-worker-num "$TOKENIZER_WORKER_NUM"
-            --skip-server-warmup
-            --enable-dynamic-batch-tokenizer
-            --batch-notify-size "$SGLANG_KUNPENG_MAX_SEQ_NUM"
-            --tokenizer-backend "${SGLANG_TOKENIZER_BACKEND:-huggingface}"
-        )
+        # Tokenizer HTTP servers now live in runtime/server_tokenizer.sh,
+        # invoked by runtime/launch_tokenizer.sh. server.sh no longer handles it.
+        echo "Error: role 'tokenizer' is handled by runtime/server_tokenizer.sh" >&2
+        exit 1
         ;;
     router)
         # Router (gateway) launch now lives in runtime/server_router.sh,
@@ -185,55 +166,6 @@ case "$ROLE" in
         exit 1
         ;;
 esac
-
-# Combine and execute
-if [[ "$ROLE" == "tokenizer" ]]; then
-    # Launch prefill HTTP server (tokenizer side)
-    echo "Launching prefill HTTP server..."
-        SGLANG_KUNPENG_TOKENIZER_BASE_NUMA="$PREFILL_NUMA_BASE" \
-        SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU="$PREFILL_BOOTSTRAP_CPU" \
-        LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
-        python -m sglang.launch_server \
-            "${HTTP_COMMON_ARGS[@]}" \
-            --dp-size "$PREFILL_DP_SIZE" \
-            --port 30001 \
-            --dist-init-addr "$PREFILL_MASTER_ADDR:$PREFILL_MASTER_PORT" \
-            --disaggregation-mode prefill \
-            --disaggregation-bootstrap-port 9001 \
-        > "$LOG_PATH/tokenizer_prefill_http.log" 2>&1 &
-
-        # Launch decode HTTP server (tokenizer side)
-        echo "Launching decode HTTP server..."
-        SGLANG_KUNPENG_TOKENIZER_BASE_NUMA="$DECODE_NUMA_BASE" \
-        LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
-        python -m sglang.launch_server \
-            "${HTTP_COMMON_ARGS[@]}" \
-            --dp-size "$DECODE_DP_SIZE" \
-            --port 30002 \
-            --dist-init-addr "$DECODE_MASTER_ADDR:$DECODE_MASTER_PORT" \
-            --disaggregation-mode decode \
-        > "$LOG_PATH/tokenizer_decode_http.log" 2>&1 &
-
-        # Poll until the HTTP servers are ready (up to 30 minutes each)
-        HTTP_PORTS=(30001 30002)
-        for port in "${HTTP_PORTS[@]}"; do
-            echo "Waiting for HTTP server on port $port to be ready..."
-            ready=0
-            for i in $(seq 1 18000); do  # up to 30 minutes
-                if curl -sf --noproxy "*" --max-time 2 "http://${ROUTER_IP}:${port}/health" >/dev/null 2>&1; then
-                    ready=1
-                    break
-                fi
-                sleep 0.1
-            done
-            [[ "$ready" -eq 1 ]] || {
-                echo "ERROR: HTTP server on port $port not ready within 30 minutes" >&2
-                exit 1
-            }
-            echo "HTTP server on port $port ready"
-        done
-    exit 0
-fi
 
 # Build IB device args based on role.
 IB_DEVICE_ALL="roceroh0,roceroh1,roceroh2,roceroh3,roceroh4,roceroh5,roceroh6,roceroh7"
