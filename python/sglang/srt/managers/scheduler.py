@@ -4118,6 +4118,24 @@ def configure_scheduler_process(
     return dp_rank
 
 
+# Mooncake RDMA engine threads are spawned by the C++ TransferEngine during
+# model runner init and otherwise land on the base CPU via the
+# inherited-mask repin below. Pin them to the numa-local launcher core
+# (base+20) instead: it sits in the control-plane gap (17 main / 18 zmq /
+# 19 pd transport / 20 mooncake rdma) and is unused when the tokenizer is
+# separated onto the router node. Kernel comm names are truncated to 15
+# chars ("SocketHandShakePlugin" -> "SocketHandShake").
+_MOONCAKE_RDMA_THREAD_PREFIXES = (
+    "transferworker",
+    "monitorworker",
+    "sockethandshake",
+)
+
+
+def _is_mooncake_rdma_thread(name: str) -> bool:
+    return name.lower().startswith(_MOONCAKE_RDMA_THREAD_PREFIXES)
+
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -4156,6 +4174,10 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
+        # Snapshot the threads that already exist so the affinity pass below
+        # can tell threads spawned by the scheduler init (mooncake engine
+        # workers etc.) from pre-existing ones.
+        pre_ctor_tids = {int(x) for x in os.listdir("/proc/self/task")}
         scheduler = Scheduler(
             server_args,
             port_args,
@@ -4199,7 +4221,13 @@ def run_scheduler_process(
                     )
 
                 main_tid = os.getpid()
+                try:
+                    with open("/proc/self/comm") as f:
+                        proc_comm = f.read().strip()
+                except OSError:
+                    proc_comm = ""
                 repinned = 0
+                pinned_mooncake = 0
                 skipped_main = 0
                 skipped_pinned = 0
                 errors = 0
@@ -4216,6 +4244,25 @@ def run_scheduler_process(
                                 thread_name = f.read().strip()
                         except OSError:
                             pass
+                        if _is_mooncake_rdma_thread(thread_name):
+                            os.sched_setaffinity(tid, {base_cpu + 20})
+                            pinned_mooncake += 1
+                            continue
+                        # Some libmooncake builds never call pthread_setname_np,
+                        # so their engine workers show the process comm. They are
+                        # spawned by the scheduler ctor after kupl starts and
+                        # inherit the kupl-master core (base_cpu) instead of the
+                        # inherited mask. Identify them structurally: created
+                        # during the ctor, unnamed, single-core == base_cpu (or
+                        # still holding the inherited mask).
+                        if (
+                            tid not in pre_ctor_tids
+                            and thread_name == proc_comm
+                            and cur_affinity in ({base_cpu}, inherited_mask)
+                        ):
+                            os.sched_setaffinity(tid, {base_cpu + 20})
+                            pinned_mooncake += 1
+                            continue
                         if cur_affinity == inherited_mask:
                             os.sched_setaffinity(tid, {base_cpu})
                             repinned += 1
@@ -4228,9 +4275,10 @@ def run_scheduler_process(
                         errors += 1
 
                 logger.info(
-                    "PinNonComputeThreads: summary repinned=%d skipped_main=%d "
-                    "skipped_pinned=%d errors=%d total_threads=%d",
+                    "PinNonComputeThreads: summary repinned=%d mooncake=%d "
+                    "skipped_main=%d skipped_pinned=%d errors=%d total_threads=%d",
                     repinned,
+                    pinned_mooncake,
                     skipped_main,
                     skipped_pinned,
                     errors,
