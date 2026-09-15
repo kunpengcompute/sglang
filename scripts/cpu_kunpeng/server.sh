@@ -13,7 +13,8 @@
 # ==============================================================================
 
 #!/bin/bash
-# server.sh - Single node execution for SGLang (prefill or decode).
+# server.sh - Single node execution for SGLang (prefill/decode/native/tokenizer).
+# Router (gateway) is launched by runtime/server_router.sh instead.
 # Usage: ./server.sh <role> <dp_rank> <log_path>
 
 if [[ $# -lt 3 ]]; then
@@ -174,26 +175,10 @@ case "$ROLE" in
         )
         ;;
     router)
-        export GATEWAY_CPUS="${GATEWAY_CPUS:-570-590}"
-        if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
-            _router_prefill_url="http://${ROUTER_IP}:30001"
-            _router_decode_url="http://${ROUTER_IP}:30002"
-        else
-            _router_prefill_url="http://${PREFILL_MASTER_ADDR}:30000"
-            _router_decode_url="http://${DECODE_MASTER_ADDR}:30000"
-        fi
-        SPECIFIC_ARGS=(
-            --model-path "$MODEL_PATH"
-            --pd-disaggregation
-            --prefill "$_router_prefill_url" 9001
-            --decode "$_router_decode_url"
-            --policy cache_aware
-            --health-check-interval-secs 10000
-            --queue-timeout-secs 10000
-            --request-timeout-secs 10000
-            --health-check-timeout-secs 10000
-            --host "$IP"
-        )
+        # Router (gateway) launch now lives in runtime/server_router.sh,
+        # invoked by runtime/launch_router.sh. server.sh no longer handles it.
+        echo "Error: role 'router' is handled by runtime/server_router.sh" >&2
+        exit 1
         ;;
     *)
         echo "Error: unknown role '$ROLE'" >&2
@@ -247,26 +232,6 @@ if [[ "$ROLE" == "tokenizer" ]]; then
             }
             echo "HTTP server on port $port ready"
         done
-    exit 0
-fi
-
-if [[ "$ROLE" == "router" ]]; then
-    
-    # Launch sgl-model-gateway (Rust router) ----
-    echo "Launching PD disaggregation router..."
-    # Prefer the absolute path from .user_env.sh (MODEL_GATEWAY_BIN);
-    # fall back to the bare command name if the variable is not set.
-    GATEWAY_BIN="${MODEL_GATEWAY_BIN:-sgl-model-gateway}"
-    if [[ ! -x "$GATEWAY_BIN" ]] && ! command -v "$GATEWAY_BIN" >/dev/null 2>&1; then
-        echo "ERROR: sgl-model-gateway not found (MODEL_GATEWAY_BIN=${MODEL_GATEWAY_BIN:-<unset>})" >&2
-        exit 1
-    fi
-    # Pin the gateway to a dedicated core range so it does not collide with
-    # the tokenizer/detokenizer workers (see the NUMA plan above).
-    LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
-    taskset -c "$GATEWAY_CPUS" "$GATEWAY_BIN" "${SPECIFIC_ARGS[@]}" \
-        > "$LOG_PATH/router_$IP.log" 2>&1 &
-
     exit 0
 fi
 
