@@ -867,6 +867,19 @@ class EAGLEWorker(TpModelWorker):
     def draft(self, batch: ScheduleBatch):
         # Parse args
         if batch.forward_mode.is_idle():
+            if self.server_args.disaggregation_mode == "prefill":
+                # Prefill ranks never decode, so the idle draft chain's
+                # outputs are discarded. Skip it to keep per-iteration forward
+                # counts equal across the kutacc RDMA domain (idle: verify +
+                # draft extend = 2, extend: target extend + draft extend = 2),
+                # or the per-forward domain collectives mispair and deadlock.
+                # Decode ranks keep the chain (see PPNextNWorker).
+                return EagleVerifyInput.create_idle_input(
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
             self._draft_preprocess_idle(batch)
         else:
             self._draft_preprocess_decode(batch)

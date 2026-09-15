@@ -228,6 +228,20 @@ def is_kunpeng_graph_profile() -> bool:
     return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_GRAPH_PROFILE") == "1"
 
 
+_kunpeng_forward_count = 0
+
+
+def kunpeng_forward_count_inc() -> None:
+    # Process-global count of ModelRunner._forward_raw calls (target + draft
+    # runners); read by the DP-attention scheduler's forward-count check.
+    global _kunpeng_forward_count
+    _kunpeng_forward_count += 1
+
+
+def kunpeng_forward_count() -> int:
+    return _kunpeng_forward_count
+
+
 def is_kunpeng_extend_pad() -> bool:
     # Power-of-2 EXTEND padding must apply in BOTH graph and eager paths so
     # that a graph run and a graph-disabled run pad tokens identically

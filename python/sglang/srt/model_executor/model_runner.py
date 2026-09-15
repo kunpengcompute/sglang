@@ -191,6 +191,7 @@ from sglang.srt.utils import (
     is_host_cpu_arm64,
     is_kunpeng_graph_profile,
     is_npu,
+    kunpeng_forward_count_inc,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     require_attn_tp_gather,
@@ -3253,11 +3254,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         # With graph profiling on, sync the EP domain before each forward:
         # pre-forward variance (e.g. profile writes) then lands here instead
-        # of inflating in-graph comm ops. Each forward passes once per rank,
-        # keeping barrier counts consistent; no-ops before MoE comm init.
-        if _is_cpu_920f and is_kunpeng_graph_profile():
-            with pp_span("moe_comm_barrier"):
-                torch.ops.sgl_kernel.moe_comm_barrier_kunpeng()
+        # of inflating in-graph comm ops. Every rank must run the same number
+        # of forwards per iteration, or these per-forward barriers mispair
+        # with other ranks' a2a ops and deadlock the domain (guarded by the
+        # scheduler's forward-count check). No-ops before MoE comm init.
+        if _is_cpu_920f:
+            kunpeng_forward_count_inc()
+            if is_kunpeng_graph_profile():
+                with pp_span("moe_comm_barrier"):
+                    torch.ops.sgl_kernel.moe_comm_barrier_kunpeng()
 
         # Check whether can run cuda graph
         mode_check = (
