@@ -13,13 +13,19 @@
 # ==============================================================================
 
 #!/bin/bash
-# launch_router.sh - Launch router node (single-node, gateway + tokenizer HTTP).
+# launch_router.sh - Launch the gateway (sgl-model-gateway) on the router node.
+# Waits for all backends, then SSHes to ROUTER_IP to run runtime/server_router.sh.
 # Invoked by: ./launch.sh router
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-source "$SCRIPT_DIR/env.sh" router
+# No conda needed here: this control-side script only curls/ssh's; the
+# gateway binary itself is launched by runtime/server_router.sh (Rust, no
+# python env). SKIP_CONDA=1 skips the activation on this node.
+SKIP_CONDA=1 source "$SCRIPT_DIR/env.sh" router
+
+sh "$SCRIPT_DIR/stop.sh" router
 
 # Wait for ALL gateway backends to be ready (up to 20 minutes):
 # always the prefill/decode masters, plus the tokenizer HTTP servers
@@ -65,26 +71,17 @@ echo "[$(date +%T)] ===== Prefill and decode servers ready ====="
 mkdir -p "$LOG_DIR"
 # Refresh "latest" symlink to this run's time dir (e.g. latest -> 214700)
 ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/router/latest"
-sh "$SCRIPT_DIR/stop.sh" router
 
-IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
-WORLD_SIZE=${#NODES[@]}
 
-echo "Launching router on $WORLD_SIZE node(s)"
+echo "[$(date +%T)] Launching gateway on $ROUTER_IP"
+ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+    "root@$ROUTER_IP" \
+    "cd \"$PWD\" && bash runtime/server_router.sh \"$LOG_DIR\"" \
+    >"$LOG_DIR/ssh_router.log" 2>&1 &
 
-for i in "${!NODES[@]}"; do
-    node_ip="${NODES[i]}"
-    node_rank="$i"
-    echo "[$(date +%T)] Starting node_rank $node_rank ($node_ip)"
-    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-        "root@$node_ip" \
-        "cd \"$PWD\" && sh ./server.sh router \"$node_rank\" \"$LOG_DIR\"" \
-        >"$LOG_DIR/ssh_router_rank${node_rank}.log" 2>&1 &
-done
+echo "Gateway launched."
 
-echo "All router nodes launched."
-
-rank0_log_file="$LOG_DIR/router_${NODES[0]}.log"
+rank0_log_file="$LOG_DIR/router_${ROUTER_IP}.log"
 echo "Log file of rank_0: $rank0_log_file"
 
 if [[ "${SKIP_LOG:-0}" == "1" ]]; then

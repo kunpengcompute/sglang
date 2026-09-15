@@ -71,7 +71,11 @@ esac
 
 
 bash "$SCRIPT_DIR/runtime/update_time.sh"
-bash "$SCRIPT_DIR/runtime/update_numa_dup.sh"
+if [[ "$ROLE" == "router" ]]; then
+    echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update for role 'router'.\033[0m"
+else
+    bash "$SCRIPT_DIR/runtime/update_numa_dup.sh"
+fi
 
 if [[ "$ROLE" == "update" ]]; then
     exit 0
