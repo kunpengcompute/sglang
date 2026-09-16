@@ -16,6 +16,7 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
+    PP_LAYER_MAPPING_ENABLED,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -2071,10 +2072,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
         )
         start_layer = bootstrap_info.get("start_layer")
         num_layers = bootstrap_info.get("num_layers")
-        # Gated to 920F: on other platforms the legacy rank-ratio factor below is
-        # used verbatim, matching the previous behaviour.
+        # Same launch-env switch as the rank selection: only the prefill pp16 /
+        # decode pp2 topology uses the layer-overlap count. The pp sizes are also
+        # re-checked here so that a stale env cannot activate it in a topology the
+        # rank selection itself would not treat as layer-interval based. Every
+        # other topology falls through to the legacy rank-ratio factor below,
+        # which is unchanged.
         if (
-            _is_cpu_920f
+            PP_LAYER_MAPPING_ENABLED
+            and (self.prefill_info.pp_size or 1) > self.kv_mgr.pp_size
+            and self.kv_mgr.pp_size > 1
             and decode_layer_ranges
             and start_layer is not None
             and num_layers is not None
@@ -2088,9 +2095,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     if start_layer < range_end and range_start < prefill_end
                 ),
             )
-        # Fallback (the prefill side does not report its layer range): keep the
-        # historical assumption that every decode stage shares one prefill stage,
-        # which holds for prefill pp == 1 (and for prefill pp == decode pp).
+        # Legacy fallback, used by every topology outside the one above (including
+        # prefill pp == 1): keep the historical assumption that every decode stage
+        # shares one prefill stage, which holds for prefill pp == 1 (and for
+        # prefill pp == decode pp).
         return (
             self.kv_mgr.pp_size // (self.prefill_info.pp_size or 1)
             if self.kv_mgr.pp_size > (self.prefill_info.pp_size or 1)

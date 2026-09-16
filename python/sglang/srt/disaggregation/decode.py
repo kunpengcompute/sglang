@@ -364,9 +364,11 @@ class DecodePreallocQueue:
         feature is disabled (returns None) and the caller falls back to the legacy
         session accounting instead of sending a wrong count.
         """
-        if not PP_LAYER_MAPPING_ENABLED:
-            # Only the 920F layer-interval mapping consumes this; skip the work on
-            # every other platform.
+        if not PP_LAYER_MAPPING_ENABLED or self.scheduler.server_args.pp_size <= 1:
+            # Only the 920F layer-interval mapping (prefill pp coarser than decode
+            # pp, e.g. prefill pp16 -> decode pp2) consumes this. A single decode
+            # PP stage keeps the original rank-ratio accounting, so skip the work
+            # and leave kv_args untouched there.
             return None
         try:
             from sglang.srt.distributed import get_pp_indices
