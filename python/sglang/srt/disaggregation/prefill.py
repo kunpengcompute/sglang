@@ -146,6 +146,13 @@ class PrefillBootstrapQueue:
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        # Number of main-model layers owned by this prefill PP rank (MTP/draft
+        # layers live in draft_token_to_kv_pool and are excluded). Registered to the
+        # bootstrap server so the decode side can map its PP stages onto prefill PP
+        # ranks by layer interval when prefill pp != decode pp.
+        kv_args.prefill_num_layers = (
+            self.token_to_kv_pool.end_layer - self.token_to_kv_pool.start_layer
+        )
         # default to 0, will be filled from decode metadata per-request
         kv_args.decode_start_layer = 0
         kv_args.decode_num_layers = 0

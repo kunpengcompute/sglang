@@ -37,7 +37,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import is_http_only, is_tokenizer_separate
+from sglang.srt.utils.common import is_cpu_920f, is_http_only, is_tokenizer_separate
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -50,6 +50,48 @@ logger = logging.getLogger(__name__)
 _is_tokenizer_separate = is_tokenizer_separate()
 _is_http_only = is_http_only()
 
+# PP layer-interval mapping: map decode PP stages onto prefill PP ranks by layer
+# interval (instead of by rank index) and validate that every decode stage's
+# layer range is fully covered. Only the prefill pp16 / decode pp2 topology needs
+# it (with 61 layers the two partitions' boundaries do not nest there). The
+# switch is read from the launch environment (set by the role scripts, which
+# export PREFILL_PP_SIZE / DECODE_PP_SIZE into every server process), so for
+# every other topology the feature is completely off and the code below behaves
+# exactly like before it was introduced.
+def _pp_layer_mapping_enabled() -> bool:
+    if not is_cpu_920f():
+        return False
+    try:
+        return (
+            int(os.environ.get("PREFILL_PP_SIZE", "0")) == 16
+            and int(os.environ.get("DECODE_PP_SIZE", "0")) == 2
+        )
+    except ValueError:
+        return False
+
+
+PP_LAYER_MAPPING_ENABLED: bool = _pp_layer_mapping_enabled()
+
+
+class PPPartitionError(RuntimeError):
+    """Raised on the decode side when a decode PP stage's layer range cannot be
+    fully covered by the prefill PP ranks selected for KV transfer.
+
+    This is a deployment/configuration error (prefill pp != decode pp with layer
+    partitions whose boundaries do not nest), not a transient failure. It is
+    raised instead of silently transferring a subset of layers: a partial KV
+    transfer still reports KVPoll.Success, so the decode stage would attend over
+    uninitialized KV and produce wrong output without any error.
+    """
+
+
+def _layer_ranges_overlap(
+    a_start: int, a_end: int, b_start: int, b_end: int
+) -> bool:
+    """Whether two half-open layer intervals [start, end) intersect."""
+    return a_start < b_end and b_start < a_end
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
@@ -60,6 +102,12 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    # pp_rank -> [start_layer, num_layers] owned by each prefill PP rank, as
+    # aggregated by the bootstrap server. Used to map decode PP stages to prefill
+    # PP ranks by layer interval instead of by rank index. None when the prefill
+    # side does not report it (older build), in which case the legacy rank-index
+    # mapping is kept.
+    pp_layer_ranges: Optional[Dict[int, Tuple[int, int]]] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -79,16 +127,40 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        # JSON object keys are always strings, so normalize back to int keys.
+        if self.pp_layer_ranges:
+            self.pp_layer_ranges = {
+                int(pp): (int(rng[0]), int(rng[1]))
+                for pp, rng in self.pp_layer_ranges.items()
+            }
+        else:
+            self.pp_layer_ranges = None
+
+    def prefill_layer_range(self, pp_rank: int) -> Optional[Tuple[int, int]]:
+        """Layer range [start, num_layers] of a prefill PP rank, if known."""
+        if not self.pp_layer_ranges:
+            return None
+        return self.pp_layer_ranges.get(int(pp_rank))
 
 
 @dataclasses.dataclass
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    # Layer range owned by this prefill PP rank (main model, excluding draft/MTP
+    # layers). Reported by the prefill rank at registration time.
+    start_layer: Optional[int] = None
+    num_layers: Optional[int] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+        self.start_layer = (
+            int(self.start_layer) if self.start_layer is not None else None
+        )
+        self.num_layers = (
+            int(self.num_layers) if self.num_layers is not None else None
+        )
 
 
 class CommonKVManager(BaseKVManager):
@@ -338,6 +410,25 @@ class CommonKVManager(BaseKVManager):
             f"decode pp size > 1. "
             f"Got decode pp_size={self.pp_size}, prefill pp_size={info.pp_size}."
         )
+        # Layer range owned by this decode PP stage. Set by the decode side in
+        # DecodePreallocQueue._init_kv_manager. 0 means "not reported", in which
+        # case only the legacy rank-index mapping can be used.
+        decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0) or 0
+        decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0) or 0
+        # The layer-interval mapping needs the full prefill partition; a partial
+        # map (mixed prefill builds) would produce false coverage errors. It is
+        # only used when the prefill side is coarser than the decode side (prefill
+        # pp16 -> decode pp2 and alike); all other topologies take the original
+        # rank-index paths below unchanged.
+        has_prefill_layer_map = (
+            PP_LAYER_MAPPING_ENABLED
+            and info.pp_size > self.pp_size
+            and self.pp_size > 1
+            and bool(info.pp_layer_ranges)
+            and len(info.pp_layer_ranges) == info.pp_size
+            and decode_num_layers > 0
+        )
+
         if info.pp_size == self.pp_size:    # prefill pp_size == decode pp_size
             target_pp_ranks = [self.pp_rank]
         elif self.pp_size == 1:             # decode pp_size == 1
@@ -345,8 +436,41 @@ class CommonKVManager(BaseKVManager):
             required_prefill_response_num *= info.pp_size // self.pp_size
         elif info.pp_size == 1 and self.pp_size > 1:    # prefill pp_size == 1 
             target_pp_ranks = [0]
+        elif has_prefill_layer_map:
+            # prefill pp_size > decode pp_size: select by LAYER INTERVAL, not by
+            # rank index. A prefill rank is needed when its layer range overlaps
+            # this decode stage's range. The rank-index rule
+            # (start = pp_rank * prefill_pp // decode_pp) assumes the decode stage
+            # boundary falls exactly on a prefill stage boundary; when it does not
+            # (e.g. 61 layers, prefill pp16 -> boundaries 0,3,...,29,33,...;
+            # decode pp2 -> 0,36,61), prefill pp8/pp9 straddle decode pp0/pp1 and
+            # the layers of the straddling rank that belong to the "other" decode
+            # stage were silently never sent.
+            decode_end_layer = decode_start_layer + decode_num_layers
+            target_pp_ranks = [
+                pp
+                for pp, (start, num) in sorted(info.pp_layer_ranges.items())
+                if _layer_ranges_overlap(
+                    start,
+                    start + num,
+                    decode_start_layer,
+                    decode_end_layer,
+                )
+            ]
+            if not target_pp_ranks:
+                raise PPPartitionError(
+                    f"No prefill PP rank owns any layer of decode pp_rank="
+                    f"{self.pp_rank} (layers=[{decode_start_layer},"
+                    f"{decode_end_layer})). Prefill layer ranges: "
+                    f"{sorted(info.pp_layer_ranges.items())}."
+                )
+            # A prefill rank can now serve more than one decode stage (fan-out),
+            # so the expected response count is the number of selected prefill
+            # ranks rather than the rank ratio.
+            required_prefill_response_num *= len(target_pp_ranks)
         else:
-            # prefill pp_size > decode pp_size and prefill pp_size  % decode pp_size == 0
+            # Fallback: the prefill side does not report its layer ranges (older
+            # build), keep the legacy rank-index mapping.
             ratio = info.pp_size // self.pp_size
             start = self.pp_rank * ratio
             target_pp_ranks = list(range(start, start + ratio))
@@ -358,6 +482,65 @@ class CommonKVManager(BaseKVManager):
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
+
+        self._validate_layer_coverage(
+            info, target_pp_ranks, decode_start_layer, decode_num_layers
+        )
+
+    def _validate_layer_coverage(
+        self,
+        info: PrefillServerInfo,
+        target_pp_ranks: List[int],
+        decode_start_layer: int,
+        decode_num_layers: int,
+    ) -> None:
+        """Verify that the selected prefill PP ranks cover every layer this decode
+        stage owns.
+
+        Without this check an incomplete cover is invisible: the prefill ranks that
+        own the missing layers are simply never contacted, every contacted rank
+        reports KVPoll.Success, and the decode stage attends over uninitialized KV.
+        """
+        # Only the topologies that select prefill ranks by layer interval (prefill
+        # pp coarser than decode pp, e.g. prefill pp16 -> decode pp2) need this
+        # check; every other topology keeps the original code path untouched.
+        if (
+            not PP_LAYER_MAPPING_ENABLED
+            or info.pp_size <= self.pp_size
+            or self.pp_size <= 1
+            or not info.pp_layer_ranges
+            or len(info.pp_layer_ranges) != info.pp_size
+            or decode_num_layers <= 0
+        ):
+            return
+
+        decode_end_layer = decode_start_layer + decode_num_layers
+        covered_end = decode_start_layer
+        gaps: List[str] = []
+        for pp in sorted(target_pp_ranks):
+            layer_range = info.prefill_layer_range(pp)
+            if layer_range is None:
+                gaps.append(f"pp{pp}(not registered)")
+                continue
+            start, num = layer_range
+            if start > covered_end:
+                gaps.append(f"layers[{covered_end},{start})")
+            covered_end = max(covered_end, start + num)
+        if covered_end < decode_end_layer:
+            gaps.append(f"layers[{covered_end},{decode_end_layer})")
+
+        if gaps:
+            raise PPPartitionError(
+                f"Decode pp_rank={self.pp_rank} owns layers="
+                f"[{decode_start_layer},{decode_end_layer}) but prefill pp ranks "
+                f"{sorted(target_pp_ranks)} only cover up to layer {covered_end}; "
+                f"missing {gaps}. Prefill layer ranges: "
+                f"{sorted(info.pp_layer_ranges.items())}. "
+                f"Fix: make every decode stage boundary coincide with a prefill "
+                f"stage boundary, i.e. set SGLANG_PP_LAYER_PARTITION on the decode "
+                f"side to the merge of consecutive prefill partitions "
+                f"(decode pp_size={self.pp_size}, prefill pp_size={info.pp_size})."
+            )
 
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP POST."""
@@ -389,6 +572,23 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            # Layer range of this prefill PP rank (main model layers only). Lets the
+            # decode side map its PP stages to prefill PP ranks by layer interval
+            # when prefill pp != decode pp. Only reported on 920F, and only when
+            # this prefill has more than one PP stage: with prefill pp == 1 there
+            # is a single stage covering every layer, the original rank-index
+            # mapping is already correct, and the whole feature stays off (the
+            # payload is then identical to the pre-pp-layer-mapping one).
+            "start_layer": (
+                getattr(self.kv_args, "prefill_start_layer", None)
+                if PP_LAYER_MAPPING_ENABLED and self.pp_size > 1
+                else None
+            ),
+            "num_layers": (
+                getattr(self.kv_args, "prefill_num_layers", None)
+                if PP_LAYER_MAPPING_ENABLED and self.pp_size > 1
+                else None
+            ),
         }
 
         try:
@@ -454,17 +654,47 @@ class CommonKVManager(BaseKVManager):
                 + src_local_end
             ]
             num_send_layers = decode_num_layers
+            # src is sliced to decode's range, so dst starts at local index 0.
+            dst_local_start = 0
+            dst_local_end = num_send_layers
+        elif PP_LAYER_MAPPING_ENABLED and decode_num_layers > 0:
+            # decode is coarser/equal (decode pp_size <= prefill pp_size): this
+            # prefill stage is a sub-range [start_layer, +num_kv_layers) of the
+            # target decode stage [decode_start_layer, +decode_num_layers). Slice
+            # BOTH src and dst to the overlapping layers only.  When a prefill pp
+            # rank is assigned by rank-division but its layer range lies entirely
+            # outside this decode stage (prefill pp16 -> decode pp2, e.g. a
+            # second-half prefill stage starting before decode pp1's start_layer),
+            # skip the send instead of indexing the dst buffer with a negative
+            # slice, which wrote into garbage addresses and failed the transfer.
+            # Only taken when the layer-interval mapping is enabled; otherwise the
+            # legacy branch below is used unchanged.
+            overlap_begin = max(start_layer, decode_start_layer)
+            overlap_end = min(
+                start_layer + num_kv_layers, decode_start_layer + decode_num_layers
+            )
+            if overlap_end <= overlap_begin:
+                return [], [], [], [], 0
+            local_src_start = overlap_begin - start_layer
+            num_send_layers = overlap_end - overlap_begin
+            src_k_ptrs = src_kv_ptrs[
+                local_src_start : local_src_start + num_send_layers
+            ]
+            src_v_ptrs = src_kv_ptrs[
+                num_kv_layers
+                + local_src_start : num_kv_layers
+                + local_src_start
+                + num_send_layers
+            ]
+            dst_local_start = overlap_begin - decode_start_layer
+            dst_local_end = dst_local_start + num_send_layers
         else:
+            # Legacy/full-decode path: no decode layer info, send the whole stage.
             src_k_ptrs = src_kv_ptrs[:num_kv_layers]
             src_v_ptrs = src_kv_ptrs[num_kv_layers:]
             num_send_layers = num_kv_layers
-
-        # map prefill layer to decode dst buffer local index
-        dst_local_start = start_layer - decode_start_layer
-        # src is sliced to decode's range, so dst_local_start becomes 0
-        if decode_num_layers > 0 and decode_num_layers < num_kv_layers:
-            dst_local_start = 0
-        dst_local_end = dst_local_start + num_send_layers
+            dst_local_start = start_layer - decode_start_layer
+            dst_local_end = dst_local_start + num_send_layers
 
         if num_send_layers == dst_num_total_layers:
             dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
@@ -514,7 +744,29 @@ class CommonKVManager(BaseKVManager):
             sliced_src_kv_ptrs = src_kv_ptrs[src_local_start:src_local_end]
             dst_local_start = 0
             dst_local_end = decode_num_layers
+        elif PP_LAYER_MAPPING_ENABLED and decode_num_layers > 0:
+            # decode is coarser/equal (decode pp_size <= prefill pp_size): this
+            # prefill stage is a sub-range of the target decode stage. Slice both
+            # src and dst to the overlapping layers; skip when there is no overlap.
+            # Otherwise `dst_local_start = start_layer - decode_start_layer` is
+            # negative for a second-half prefill stage starting below the decode
+            # stage boundary (prefill pp16 -> decode pp2) and corrupts dst pointers.
+            # Only taken when the layer-interval mapping is enabled; otherwise the
+            # legacy branch below is used unchanged.
+            overlap_begin = max(start_layer, decode_start_layer)
+            overlap_end = min(
+                start_layer + num_prefill_layers, decode_start_layer + decode_num_layers
+            )
+            if overlap_end <= overlap_begin:
+                return [], [], 0
+            local_src_start = overlap_begin - start_layer
+            sliced_src_kv_ptrs = src_kv_ptrs[
+                local_src_start : local_src_start + (overlap_end - overlap_begin)
+            ]
+            dst_local_start = overlap_begin - decode_start_layer
+            dst_local_end = dst_local_start + (overlap_end - overlap_begin)
         else:
+            # Legacy/full-decode path: no decode layer info, send the whole stage.
             sliced_src_kv_ptrs = src_kv_ptrs
             dst_local_start = start_layer - decode_start_layer
             dst_local_end = dst_local_start + num_prefill_layers
@@ -855,6 +1107,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
+        # pp_rank -> (start_layer, num_layers) of the prefill layer partition. The
+        # partition is a process-wide setting, so any reporting rank yields the
+        # same map; the first report per pp_rank wins.
+        self.pp_layer_ranges: Dict[int, Tuple[int, int]] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
         self._registered_count = 0
         self.entry_cleanup_interval = (
@@ -918,6 +1174,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        start_layer = data.get("start_layer")
+        num_layers = data.get("num_layers")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -957,7 +1215,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                start_layer=start_layer,
+                num_layers=num_layers,
             )
+
+            if start_layer is not None and num_layers is not None:
+                self.pp_layer_ranges.setdefault(
+                    pp_rank, (int(start_layer), int(num_layers))
+                )
 
             self._registered_count += 1
 
@@ -994,6 +1259,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     f" ({self._registered_count} workers registered).",
                     status=503,
                 )
+            # JSON keys must be strings; PrefillServerInfo normalizes them back.
+            # Snapshot under the lock: registration mutates this dict concurrently.
+            async with self.lock:
+                pp_layer_ranges = {
+                    str(pp): [rng[0], rng[1]]
+                    for pp, rng in self.pp_layer_ranges.items()
+                }
             info = PrefillServerInfo(
                 attn_tp_size=self.attn_tp_size,
                 attn_cp_size=self.attn_cp_size,
@@ -1006,6 +1278,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                pp_layer_ranges=pp_layer_ranges or None,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

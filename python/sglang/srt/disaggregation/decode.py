@@ -34,7 +34,12 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    PP_LAYER_MAPPING_ENABLED,
+    CommonKVManager,
+    CommonKVReceiver,
+    PPPartitionError,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -350,6 +355,58 @@ class DecodePreallocQueue:
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
+    def _compute_decode_layer_ranges(self) -> Optional[List[List[int]]]:
+        """Layer range [start, end) of every decode PP stage, or None if unknown.
+
+        Recomputed from the same partition source the model used
+        (`get_pp_indices`, which honours SGLANG_PP_LAYER_PARTITION). The result is
+        cross-checked against this rank's actual KV pool range; on any mismatch the
+        feature is disabled (returns None) and the caller falls back to the legacy
+        session accounting instead of sending a wrong count.
+        """
+        if not PP_LAYER_MAPPING_ENABLED or self.scheduler.server_args.pp_size <= 1:
+            # Only the 920F layer-interval mapping (prefill pp coarser than decode
+            # pp, e.g. prefill pp16 -> decode pp2) consumes this. A single decode
+            # PP stage keeps the original rank-ratio accounting, so skip the work
+            # and leave kv_args untouched there.
+            return None
+        try:
+            from sglang.srt.distributed import get_pp_indices
+
+            model_config = self.scheduler.model_config
+            total_layers = max(
+                model_config.num_hidden_layers, model_config.num_attention_layers
+            )
+            pp_size = self.scheduler.server_args.pp_size
+            ranges = [
+                list(get_pp_indices(total_layers, pp_rank, pp_size))
+                for pp_rank in range(pp_size)
+            ]
+        except Exception as e:
+            logger.warning(
+                f"Could not compute decode PP layer ranges ({e}); falling back to "
+                f"rank-ratio based session accounting."
+            )
+            return None
+
+        own = ranges[self.pp_rank] if self.pp_rank < len(ranges) else None
+        pool_start = getattr(self.token_to_kv_pool, "start_layer", None)
+        pool_end = getattr(self.token_to_kv_pool, "end_layer", None)
+        if (
+            own is None
+            or pool_start is None
+            or pool_end is None
+            or own[0] != pool_start
+            or own[1] - own[0] != pool_end - pool_start
+        ):
+            logger.warning(
+                f"Decode PP layer ranges {ranges} do not match this rank's KV pool "
+                f"range [{pool_start}, {pool_end}) (pp_rank={self.pp_rank}); falling "
+                f"back to rank-ratio based session accounting."
+            )
+            return None
+        return ranges
+
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
@@ -364,6 +421,11 @@ class DecodePreallocQueue:
         kv_args.decode_num_layers = (
             self.token_to_kv_pool.end_layer - self.token_to_kv_pool.start_layer
         )
+        # Layer range of every decode PP stage. Used to count how many decode
+        # stages share a prefill PP rank (dst_session_num) when prefill pp !=
+        # decode pp and stage boundaries do not nest, so that a prefill rank
+        # serving two decode stages waits for both before releasing the room.
+        kv_args.decode_layer_ranges = self._compute_decode_layer_ranges()
         if self.scheduler.enable_hisparse:
             # Direct-to-host: register host pool pointers so P writes to D's host memory
             host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
@@ -661,7 +723,25 @@ class DecodePreallocQueue:
 
             self._ensure_last_attempt_time[bootstrap_addr] = now
 
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            try:
+                info_ready = self.kv_manager.try_ensure_parallel_info(bootstrap_addr)
+            except PPPartitionError as e:
+                # Permanent deployment error: the prefill layer partition cannot
+                # cover this decode stage, so part of the KV cache would never be
+                # transferred (and the transfer would still report Success). Fail
+                # these requests immediately with the real reason instead of
+                # retrying and transferring a partial cache.
+                logger.error(
+                    f"KV transfer layer mapping is invalid for prefill "
+                    f"{bootstrap_addr}; failing {len(reqs)} request(s): {e}"
+                )
+                for decode_req in reqs:
+                    room = decode_req.req.bootstrap_room
+                    self.kv_manager.record_failure(room, str(e))
+                    self.kv_manager.update_status(room, KVPoll.Failed)
+                continue
+
+            if info_ready:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
