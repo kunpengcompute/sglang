@@ -2053,6 +2053,50 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         super().init(prefill_dp_rank)
 
+    def _count_sharing_decode_stages(self, bootstrap_info: dict) -> int:
+        """Number of decode PP stages whose layer range overlaps this prefill PP rank.
+
+        When prefill pp != decode pp and the stage boundaries do not nest (e.g.
+        61 layers, prefill pp16 -> boundaries 0,3,...,29,33,...; decode pp2 ->
+        0,36,61), one prefill rank can straddle two decode stages and must serve
+        both: its layers are split between them. Each decode stage opens its own
+        Mooncake session towards that prefill rank, and the prefill only marks a
+        room as ready (and later releases it) once dst_session_num sessions have
+        registered. Under-counting lets the prefill release after a partial set of
+        sessions, so the remaining decode stages never receive their layers and
+        hang until SGLANG_DISAGGREGATION_WAITING_TIMEOUT.
+        """
+        decode_layer_ranges = getattr(
+            self.kv_mgr.kv_args, "decode_layer_ranges", None
+        )
+        start_layer = bootstrap_info.get("start_layer")
+        num_layers = bootstrap_info.get("num_layers")
+        # Gated to 920F: on other platforms the legacy rank-ratio factor below is
+        # used verbatim, matching the previous behaviour.
+        if (
+            _is_cpu_920f
+            and decode_layer_ranges
+            and start_layer is not None
+            and num_layers is not None
+        ):
+            prefill_end = start_layer + num_layers
+            return max(
+                1,
+                sum(
+                    1
+                    for range_start, range_end in decode_layer_ranges
+                    if start_layer < range_end and range_start < prefill_end
+                ),
+            )
+        # Fallback (the prefill side does not report its layer range): keep the
+        # historical assumption that every decode stage shares one prefill stage,
+        # which holds for prefill pp == 1 (and for prefill pp == decode pp).
+        return (
+            self.kv_mgr.pp_size // (self.prefill_info.pp_size or 1)
+            if self.kv_mgr.pp_size > (self.prefill_info.pp_size or 1)
+            else 1
+        )
+
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -2082,15 +2126,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             is_dummy = bootstrap_info["is_dummy"]
 
             # Sessions per prefill rank: required_dst_info_num covers the
-            # attn-tp dimension; with prefill pp=1 / decode pp>1 all decode
-            # PP stages bootstrap to the same prefill rank, adding
-            # decode_pp/prefill_pp. Under-counting makes prefill release
-            # after the first session, so late decode PP stages hang until
-            # timeout.
+            # attn-tp dimension; decode PP stages sharing the same prefill PP
+            # rank add a factor. Under-counting makes prefill release after the
+            # first session, so late decode PP stages hang until timeout.
             dst_session_num = self.required_dst_info_num * (
-                self.kv_mgr.pp_size // (self.prefill_info.pp_size or 1)
-                if self.kv_mgr.pp_size > (self.prefill_info.pp_size or 1)
-                else 1
+                self._count_sharing_decode_stages(bootstrap_info)
             )
 
             with lock:
