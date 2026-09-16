@@ -23,6 +23,12 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Load base user overrides (INSTANCES etc.) early so the dispatch logic
+# below can read them. "none" mode = base config only: no role config,
+# no conda activation, no toolchain paths — children set those up via
+# their own env.sh sourcing.
+source "$SCRIPT_DIR/env.sh" none
+
 show_usage() {
     cat <<EOF
 Usage: $0 <target> [side]
@@ -70,10 +76,6 @@ case "$TARGET" in
         bash "$SCRIPT_DIR/runtime/stop_tokenizer.sh" all
         # Stop servers per the deployment's instance list (same parsing
         # as launch.sh all): entries "<role>" or "<role>_<instance>".
-        INSTANCES="$(grep -E '^\s*INSTANCES=' "$SCRIPT_DIR/runtime/env_base.sh" | head -n1 | cut -d'"' -f2)"
-        if [[ -z "$INSTANCES" ]]; then
-            INSTANCES="prefill,decode"
-        fi
         IFS=',' read -ra _INST_LIST <<< "$INSTANCES"
         for _entry in "${_INST_LIST[@]}"; do
             _entry="${_entry//[[:space:]]/}"

@@ -50,6 +50,10 @@ source "$SCRIPT_DIR/env.sh" tokenizer "${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE
 mkdir -p "$LOG_DIR"
 # Refresh "latest" symlink to this run's time dir (e.g. latest -> 214700)
 ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/tokenizer/latest"
+
+# Refresh unified "$LOG_BASE_DIR/latest/tokenizer" -> this run's time dir
+mkdir -p "$LOG_BASE_DIR/latest"
+ln -sfn "$LOG_BASE_DIR/$LOG_DATE/tokenizer/$LOG_TIME" "$LOG_BASE_DIR/latest/tokenizer"
 sh "$SCRIPT_DIR/stop.sh" tokenizer "${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}"
 
 echo "[$(date +%T)] Launching $TOK_SIDE${TOK_INSTANCE:+ ($TOK_INSTANCE)} tokenizer HTTP server on $ROUTER_IP"

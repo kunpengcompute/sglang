@@ -54,6 +54,15 @@ fi
 
 TEST_NAME="$1"
 
+source "../../../scripts/cpu_kunpeng/env.sh" router
+source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
+
+export SGLANG_ENABLE_KUCCL=0
+export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/usr/lib64/libibverbs:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=${KUPL_PATH}/lib:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:${LD_LIBRARY_PATH}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 case "${TEST_NAME}" in
@@ -84,6 +93,7 @@ case "${TEST_NAME}" in
         ;;
     allreduce)
         TEST_FILE="${SCRIPT_DIR}/test_allreduce.py"
+        WORLD_SIZE=8
         MASTER_PORT=5004
         TEST_LABEL="SHM allreduce benchmark"
         ;;
@@ -139,14 +149,6 @@ fi
 
 # ---- Configuration -----------------------------------------------------------
 
-source ../../../scripts/cpu_kunpeng/env.sh native
-source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
-
-export SGLANG_ENABLE_KUCCL=0
-export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
-export LD_LIBRARY_PATH=/usr/lib64/libibverbs:${LD_LIBRARY_PATH}
-export LD_LIBRARY_PATH=${KUPL_PATH}/lib:${LD_LIBRARY_PATH}
-export LD_LIBRARY_PATH=${KUTACC_PATH}/install/lib:${LD_LIBRARY_PATH}
 
 PYTHON="${PYTHON:-python3}"
 CPU_PER_RANK="${CPU_PER_RANK:-38}"
@@ -179,7 +181,7 @@ PIDS=()
 
 for RANK in $(seq 0 $((WORLD_SIZE - 1))); do
     CPU_START=$((RANK * CPU_PER_RANK))
-    CPU_RANGE="${CPU_START}-$((CPU_START + 15)),$((CPU_START + 21))-$((CPU_START + 36))"
+    CPU_RANGE="${CPU_START}-$((CPU_START + 16)),$((CPU_START + 21))-$((CPU_START + 36))"
 
     export RANK
 

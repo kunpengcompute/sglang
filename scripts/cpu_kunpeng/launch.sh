@@ -81,6 +81,8 @@ esac
 bash "$SCRIPT_DIR/runtime/update_time.sh"
 if [[ "$ROLE" == "router" ]]; then
     echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update for role 'router'.\033[0m"
+elif [[ "${SGLANG_ENABLE_NUMA_DUPLICATION:-1}" != "1" ]]; then
+    echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update (SGLANG_ENABLE_NUMA_DUPLICATION='${SGLANG_ENABLE_NUMA_DUPLICATION:-unset}').\033[0m"
 else
     bash "$SCRIPT_DIR/runtime/update_numa_dup.sh"
 fi

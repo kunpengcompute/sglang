@@ -99,6 +99,10 @@ mkdir -p "$LOG_DIR"
 # Refresh "latest" symlink to this run's time dir (e.g. latest -> 214700)
 ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/router/latest"
 
+# Refresh unified "$LOG_BASE_DIR/latest/router" -> this run's time dir
+mkdir -p "$LOG_BASE_DIR/latest"
+ln -sfn "$LOG_BASE_DIR/$LOG_DATE/router/$LOG_TIME" "$LOG_BASE_DIR/latest/router"
+
 
 echo "[$(date +%T)] Launching gateway on $ROUTER_IP"
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \

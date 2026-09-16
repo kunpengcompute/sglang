@@ -184,3 +184,6 @@ if [[ -f "$SCRIPT_DIR/.user_env.sh" ]]; then
     source "$SCRIPT_DIR/.user_env.sh" "$USER_ENV_ROLE"
 fi
 
+if [[ -f "$SCRIPT_DIR/runtime/.user_env_base.sh" ]]; then
+    source "$SCRIPT_DIR/runtime/.user_env_base.sh" "$USER_ENV_ROLE"
+fi
