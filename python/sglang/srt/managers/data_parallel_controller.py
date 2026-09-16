@@ -716,6 +716,8 @@ class DataParallelController:
         # sampling_params.max_new_tokens always carries a concrete value at
         # this point (defaults to 128 when the client omits max_tokens), so
         # short/unspecified requests naturally stay in the regular pool.
+        if req.sampling_params.max_new_tokens is None:
+            req.sampling_params.max_new_tokens = 128
         return len(req.input_ids) + req.sampling_params.max_new_tokens
 
     def _round_robin_in_pool(self, req: Req, pool: List[int], counter_attr: str):
