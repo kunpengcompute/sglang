@@ -733,7 +733,7 @@ class KunpengMoE(FusedMoE):
         # (must match token_ids/packed_recv_x sizing in token_dispatcher/kunpeng.py)
         dispatch_multiple = _KunpengDispatcherState.get().moe_token_multiple
         recv_dense_size = (
-            dispatch_multiple * max_tokens
+            num_local_experts * dispatch_multiple * max_tokens
             if self.is_prefill
             else max_dispatch_tokens * self.moe_ep_size * num_local_experts
         )
