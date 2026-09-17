@@ -19,6 +19,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -27,6 +28,22 @@
 #include "tensor_meta.h"
 #include "op_record.h"
 
+// Runtime debug print switch (capture/replay per-op prints). Shares the same
+// environment variable as Python-side ops.py _DEBUG. Read once from the
+// environment on first use; set to a non-empty value other than "0" to
+// enable, e.g. SGLANG_GRAPH_DEBUG_PRINT=1.
+inline bool graph_debug_print_enabled()
+{
+    static const bool enabled = [] {
+        const char *env = std::getenv("SGLANG_GRAPH_DEBUG_PRINT");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+// Compile-time switch for detailed shape/layout prints (replay per-op tensor
+// details, capture op details, plan_memory layout). Kept separate from the
+// runtime switch so the verbose output stays fully compiled out by default.
 constexpr bool kGraphDebugPrint = false;
 
 class CaptureManager {

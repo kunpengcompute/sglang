@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 from sglang.srt.graph._capture import (
@@ -8,7 +10,10 @@ from sglang.srt.graph._capture import (
     upgrade_storage_memory_type,
 )
 
-_DEBUG = False
+# TEMP: unified debug print switch for eager/capture (here) and graph replay
+# (C++ graph_debug_print_enabled). Non-empty and not "0" enables; remove after
+# diagnosis.
+_DEBUG = os.environ.get("SGLANG_GRAPH_DEBUG_PRINT", "0") not in ("", "0")
 _IDLE = False
 
 class idle_forward_mode:
