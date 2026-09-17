@@ -32,49 +32,47 @@ def resolve_tokenizer_base_numa(server_args: ServerArgs) -> int:
     """Tokenizer base NUMA for the current role.
 
     Env override wins (lets the second prefill pick its own block); otherwise
-    decode => 4, prefill => 0.
+    decode => 8, prefill => 0.
     """
     v = os.getenv(SGLANG_KUNPENG_TOKENIZER_BASE_NUMA)
     if v is not None:
         return int(v)
-    return 4 if getattr(server_args, "disaggregation_mode", None) == "decode" else 0
+    return 8 if getattr(server_args, "disaggregation_mode", None) == "decode" else 0
+
+
+def tokenizer_parent_cpuset(base_numa: int) -> List[int]:
+    """Tokenizer main (parent) process: first half of the base NUMA.
+
+    The parent only holds HTTP/ZMQ control-plane threads (few), so it shares
+    its base NUMA with the bootstrap server, which takes the second half
+    (see SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU in the launch script).
+    """
+    return list(range(base_numa * 38, base_numa * 38 + 18))
 
 
 def tokenizer_worker_cpusets_from_base(
     base_numa: int, n: int
 ) -> List[List[int]]:
-    """Per-tokenizer-worker NUMA sets starting at base_numa (capped at 4)."""
-    n = min(n, 4)
-    return [
-        list(range((base_numa + i) * 38, (base_numa + i) * 38 + 37))
-        for i in range(n)
-    ]
+    """Per-tokenizer-worker half-NUMA sets (18 cores each, capped at 4).
 
-
-def tokenizer_numa_span(tokenizer_worker_num: int) -> int:
-    """NUMA nodes spanned by the tokenizer block.
-
-    A single worker gets 2 NUMA nodes for headroom; >=2 workers each take 1.
-    The detokenizer sits right after this block, so its offset must match the
-    span returned here.
+    Two workers share one NUMA node so a role with up to 4 workers only needs
+    2 worker NUMAs after the base NUMA:
+      worker 0 -> base+1 [0..17]   worker 1 -> base+1 [18..35]
+      worker 2 -> base+2 [0..17]   worker 3 -> base+2 [18..35]
+    The last 2 cores of each NUMA are isolated and never used.
     """
-    n = max(1, min(tokenizer_worker_num, 4))
-    return 2 if n == 1 else n
+    n = min(n, 4)
+    cpusets = []
+    for i in range(n):
+        numa = base_numa + 1 + i // 2
+        start = numa * 38 + (i % 2) * 18
+        cpusets.append(list(range(start, start + 18)))
+    return cpusets
 
 
-def tokenizer_worker_cpuset_for_span(base_numa: int, span: int) -> List[int]:
-    """One worker bound across `span` consecutive NUMA nodes starting at base."""
-    cpus = []
-    for i in range(span):
-        cpus += list(range((base_numa + i) * 38, (base_numa + i) * 38 + 37))
-    return cpus
-
-
-def detokenizer_cpuset_from_base(
-    base_numa: int, tokenizer_numa_count: int
-) -> List[int]:
-    """Detokenizer sits right after the tokenizer block: base + tokenizer count."""
-    d_numa = base_numa + max(1, tokenizer_numa_count)
+def detokenizer_cpuset_from_base(base_numa: int) -> List[int]:
+    """Detokenizer takes the whole NUMA right after the 2 worker NUMAs: base+3."""
+    d_numa = base_numa + 3
     return list(range(d_numa * 38, d_numa * 38 + 37))
 
 
@@ -305,6 +303,7 @@ def _query_numa_node_for_gpu(device_id: int):
 _cpu_to_node_cache = None
 _node_to_cpus_cache = {}
 _zmq_global_offset: int = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET.get()
+_zmq_slice_relative: bool = envs.SGLANG_SET_ZMQ_CPU_AFFINITY_SLICE_RELATIVE.get()
 
 
 def _get_max_node():
@@ -374,16 +373,36 @@ def _get_node_cpus(node: int) -> List[int]:
 
 
 def _resolve_offset_cpus(offset: int) -> List[int]:
-    nodes = _current_affinity_numa_nodes()
+    """Resolve a ZmqOffset into concrete CPU ids, one per NUMA node in the
+    current affinity.
+
+    Absolute mode (default): the offset is a node-local core id. Required for
+    processes whose cpuset deliberately excludes the control-plane gap -- e.g.
+    the scheduler mask [0..16, 21..36] with offset 18 targeting the reserved
+    ZMQ core 18, which no index into the filtered list can reach.
+
+    Slice-relative mode (SGLANG_SET_ZMQ_CPU_AFFINITY_SLICE_RELATIVE=1, router):
+    the offset is an index into the process's own share of the node, so
+    processes pinned to a half-NUMA slice (tokenizer parent / workers on the
+    router) land inside their cpuset instead of leaking onto the neighbouring
+    half.
+    """
+    my_cpus = os.sched_getaffinity(0)
     result = []
-    for node in sorted(nodes):
-        sorted_cpus = _get_node_cpus(node)
-        if offset < 0:
-            idx = len(sorted_cpus) + offset
-        else:
-            idx = offset
-        if 0 <= idx < len(sorted_cpus):
-            result.append(sorted_cpus[idx])
+    for node in sorted(_current_affinity_numa_nodes()):
+        node_cpus = _get_node_cpus(node)
+        if not _zmq_slice_relative:
+            base = node_cpus[0]
+            cpu = base + offset if offset >= 0 else node_cpus[-1] + 1 + offset
+            if cpu in node_cpus:
+                result.append(cpu)
+                continue
+        allowed = [cpu for cpu in node_cpus if cpu in my_cpus]
+        if not allowed:
+            continue
+        idx = offset if offset >= 0 else len(allowed) + offset
+        if 0 <= idx < len(allowed):
+            result.append(allowed[idx])
     return result
 
 

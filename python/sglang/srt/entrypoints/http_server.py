@@ -147,10 +147,13 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
-    get_tokenizer_worker_cpusets,
     monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
+)
+from sglang.srt.utils.numa_utils import (
+    resolve_tokenizer_base_numa,
+    tokenizer_parent_cpuset,
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
@@ -2421,15 +2424,16 @@ def launch_server(
 
     if is_http_only():
         # Router-node tokenizer HTTP server. Each NUMA has 38 cores, the last
-        # core of each NUMA is isolated and must not be used. The parent binds
-        # the union of the NUMA nodes its workers will use (computed from the
-        # actual tokenizer_worker_num); each spawn'd worker later narrows down
-        # to its own single NUMA in TokenizerWorker.
+        # core of each NUMA is isolated and must not be used. The parent (HTTP
+        # + MultiTokenizerRouter) takes the first half of the role's base NUMA
+        # ([0..17]); the bootstrap server takes the second half via
+        # SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU, the spawn'd workers take the
+        # next two NUMAs (18-core halves each) and the detokenizer takes
+        # NUMA base+3 (see numa_utils).
         p = psutil.Process(os.getpid())
-        affinity = [
-            cpu for cpuset in get_tokenizer_worker_cpusets(server_args) for cpu in cpuset
-        ]
-        p.cpu_affinity(affinity)
+        p.cpu_affinity(
+            tokenizer_parent_cpuset(resolve_tokenizer_base_numa(server_args))
+        )
         logger.info(
             f"[pp-affinity] http-only {server_args.disaggregation_mode} "
             f"cpus={p.cpu_affinity()}"
