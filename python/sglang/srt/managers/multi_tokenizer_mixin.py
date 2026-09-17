@@ -51,8 +51,6 @@ from sglang.srt.utils.common import is_http_only
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.numa_utils import (
     resolve_tokenizer_base_numa,
-    tokenizer_numa_span,
-    tokenizer_worker_cpuset_for_span,
     tokenizer_worker_cpusets_from_base,
     zmq_context_core_binding,
     ZmqOffset,
@@ -540,25 +538,24 @@ def get_tokenizer_worker_cpusets(server_args: ServerArgs) -> "list[list[int]]":
     role's tokenizer base NUMA (see numa_utils.resolve_tokenizer_base_numa).
 
     Layout (920F, each NUMA has 38 cores, the last core of each NUMA is
-    isolated and must not be used):
-      - prefill tokenizer workers: base=0  -> NUMA 0..0+n-1
-      - decode  tokenizer workers: base=4  -> NUMA 4..4+n-1
-    The tokenizer occupies [base, base+n); the detokenizer takes the next NUMA
-    (base+n) via numa_utils.detokenizer_cpuset_from_base. An env override
+    isolated and must not be used; workers take 18-core halves so two workers
+    share one NUMA):
+      - prefill tokenizer workers: base=0  -> NUMA 1..2, 2 workers per NUMA
+      - decode  tokenizer workers: base=8  -> NUMA 9..10, 2 workers per NUMA
+    The base NUMA holds the parent process ([0..17]) and the bootstrap server
+    ([18..35], via SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU); the detokenizer takes
+    NUMA base+3 via numa_utils.detokenizer_cpuset_from_base. An env override
     (SGLANG_KUNPENG_TOKENIZER_BASE_NUMA) picks a distinct block for a second
-    prefill. `tokenizer_worker_num` workers use that many NUMA nodes (capped 4).
+    prefill. `tokenizer_worker_num` workers use ceil(n/2) NUMA nodes (cap 4).
     """
     n = server_args.tokenizer_worker_num
     if n > 4:
         logger.warning(
             f"[MultiTokenizer] tokenizer_worker_num={n} > 4, capping per-server "
-            f"worker cpusets to 4 NUMA nodes."
+            f"worker cpusets to 4 NUMA halves."
         )
         n = 4
     base_numa = resolve_tokenizer_base_numa(server_args)
-    if n == 1:
-        # Single worker gets 2 NUMA nodes of headroom.
-        return [tokenizer_worker_cpuset_for_span(base_numa, tokenizer_numa_span(n))]
     return tokenizer_worker_cpusets_from_base(base_numa, n)
 
 
@@ -605,7 +602,14 @@ def claim_worker_index(main_pid: int) -> int:
 
 
 def bind_tokenizer_worker_cpu(server_args: ServerArgs):
-    """Bind the current tokenizer worker process to its dedicated NUMA node."""
+    """Bind the current tokenizer worker process to its dedicated cpuset.
+
+    Narrows EVERY existing thread, not just the current one: the HTTP worker
+    bootstrap may spawn helper threads (e.g. IPC readers blocked in os.read)
+    before TokenizerWorker runs, and those would otherwise keep the spawn
+    parent's cpuset and escape the half-NUMA plan. Threads spawned later
+    inherit their creator's (already narrowed) mask.
+    """
     if not (is_http_only() and server_args.tokenizer_worker_num > 1):
         return
     try:
@@ -623,6 +627,11 @@ def bind_tokenizer_worker_cpu(server_args: ServerArgs):
             )
             idx = idx % len(cpusets)
         cpuset = cpusets[idx]
+        for tid in os.listdir("/proc/self/task"):
+            try:
+                os.sched_setaffinity(int(tid), cpuset)
+            except OSError:
+                pass  # thread exited in the meantime
         os.sched_setaffinity(0, cpuset)
         logger.info(f"[MultiTokenizer] worker idx={idx} bound to cpus={cpuset}")
     except Exception:

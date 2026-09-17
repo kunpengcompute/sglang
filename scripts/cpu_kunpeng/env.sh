@@ -84,6 +84,9 @@ esac
 if [[ "$ACTION" == "tokenizer" && "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
     export RAYON_NUM_THREADS=16
     export SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET=17
+    # Router tokenizer parent/workers are pinned to half-NUMA slices: resolve
+    # the ZMQ offset as an index into each process's own slice (not absolute).
+    export SGLANG_SET_ZMQ_CPU_AFFINITY_SLICE_RELATIVE=1
 fi
 
 # Static routing (matches DeepSeek-V3-Sample 64p/128p-decode toml

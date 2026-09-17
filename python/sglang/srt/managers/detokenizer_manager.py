@@ -54,7 +54,6 @@ from sglang.srt.utils.common import is_cpu_920f, is_http_only
 from sglang.srt.utils.numa_utils import (
     detokenizer_cpuset_from_base,
     resolve_tokenizer_base_numa,
-    tokenizer_numa_span,
     zmq_context_core_binding,
     ZmqOffset,
 )
@@ -455,18 +454,13 @@ def run_detokenizer_process(
 
             p = psutil.Process(os.getpid())
             if is_http_only():
-                # Router-node detokenizer. Derive from the role's tokenizer base
-                # NUMA: tokenizer occupies [base, base+tok_numa), detokenizer
-                # takes the next NUMA (base+tok_numa). Env override lets a second
-                # prefill use a distinct block.
+                # Router-node detokenizer. Derived from the role's tokenizer
+                # base NUMA: the base NUMA holds the parent process + bootstrap
+                # server, NUMA base+1/base+2 hold the tokenizer workers, and
+                # the detokenizer takes the whole NUMA base+3.
                 if envs.SGLANG_SET_CPU_AFFINITY.get():
                     base = resolve_tokenizer_base_numa(server_args)
-                    p.cpu_affinity(
-                        detokenizer_cpuset_from_base(
-                            base,
-                            tokenizer_numa_span(server_args.tokenizer_worker_num),
-                        )
-                    )
+                    p.cpu_affinity(detokenizer_cpuset_from_base(base))
             else:
                 # TODO (kunpeng): hard code here, should use a more elegant way.
                 p.cpu_affinity({96})  # 20

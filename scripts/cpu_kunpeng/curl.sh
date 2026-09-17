@@ -17,6 +17,7 @@
 usage() {
   echo "Usage:"
   echo "  $0 [-n NUM] [-r RATE] [-m TOKENS] [-p] [-s] [-f FILE]                # paced batch (RATE req/s, default 32)"
+  echo "  $0 -S FILE [-n NUM] [-r RATE] [-m TOKENS] [-p] [-s] [-F] [-v]        # paced batch, prompts from safetensors"
   echo "  $0 -n NUM -r 0 [-m TOKENS] [-p] [-s] [-f FILE]                       # legacy batch: all prompts in one request"
   echo "  $0 -d RANGE [-n NUM] [-c CONC] [-m TOKENS] [-p] [-s] [-v] [-f FILE]  # round-robin benchmark"
   echo "  $0 [-i] [-d RANK] [-m TOKENS] [-h]                                   # interactive chat"
@@ -32,6 +33,10 @@ usage() {
   echo "  -m TOKENS   Max tokens per request / per turn (default: 10 batch, 128 chat)"
   echo "  -d RANK|RANGE  DP rank (e.g. 5) or range (e.g. 0-15, 0,2,5 → triggers round-robin)"
   echo "  -r RATE     Paced batch send rate in req/s (default: 32; 0 = legacy single array request)"
+  echo "  -S FILE     Paced batch from gen_st_prompts.py output: one JSON-string"
+  echo "              prompt per line, ordered so request k lands on dp k%N via"
+  echo "              server round-robin. -n 1 -s = single streaming request with"
+  echo "              TTFT/TPOT summary. Mutually exclusive with -f; needs -r > 0."
   echo ""
   echo "  --- batch & round-robin only ---"
   echo "  -p          Enable profiling (start/stop profile via separate curl calls)"
@@ -61,12 +66,15 @@ DP_RANK=0
 CONCURRENCY=256
 CONCURRENCY_SET=false
 PROMPT_FILE="prompts/128.txt"
+PROMPT_FILE_SET=false
+ST_FILE=""
+ST_MODE=false
 ROUND_ROBIN=false
 RATE=32
 PACED=false
 FAKE=false
 
-while getopts "d:hiFpsvn:m:c:r:f:" opt; do
+while getopts "d:hiFpsvn:m:c:r:f:S:" opt; do
   case $opt in
     h) usage ;;
     i) INTERACTIVE=true ;;
@@ -79,13 +87,44 @@ while getopts "d:hiFpsvn:m:c:r:f:" opt; do
     c) CONCURRENCY=$OPTARG; CONCURRENCY_SET=true ;;
     r) RATE=$OPTARG ;;
     m) MAX_TOKENS=$OPTARG; MAX_TOKENS_SET=true ;;
-    f) PROMPT_FILE=$OPTARG ;;
+    f) PROMPT_FILE=$OPTARG; PROMPT_FILE_SET=true ;;
+    S) ST_FILE=$OPTARG ;;
     *) echo "Invalid option: -$OPTARG" >&2
        exit 1 ;;
   esac
 done
 
 shift $((OPTIND - 1))
+
+# =============================================================================
+# Safetensors mode (-S): pre-ordered prompt txt from gen_st_prompts.py; lines
+# are JSON strings spliced verbatim, per-DP mapping comes from the send order.
+# =============================================================================
+
+if [ -n "$ST_FILE" ]; then
+  if [ "$INTERACTIVE" = true ]; then
+    echo "Error: -S is not supported in interactive mode" >&2
+    exit 1
+  fi
+  if [ "$PROMPT_FILE_SET" = true ]; then
+    echo "Error: -S and -f are mutually exclusive" >&2
+    exit 1
+  fi
+  if [ "$DP_ENABLED" = true ]; then
+    echo "Warning: -d with -S pins routed_dp_rank on every request, overriding" \
+         "the order-based DP steering; only for paths that accept it (e.g. -F)" >&2
+  fi
+  if [ "$RATE" -le 0 ]; then
+    echo "Error: -S requires paced sending (-r > 0, default 32)" >&2
+    exit 1
+  fi
+  if [ ! -f "$ST_FILE" ]; then
+    echo "Error: prompt txt not found: $ST_FILE (generate it with gen_st_prompts.py)" >&2
+    exit 1
+  fi
+  ST_MODE=true
+  PROMPT_FILE="$ST_FILE"
+fi
 
 # =============================================================================
 # Common setup
@@ -192,6 +231,7 @@ if [ "$INTERACTIVE" = false ]; then
   if [ "$RATE" -gt 0 ] && [ "$NUM_REQUESTS" -gt 1 ]; then
     PACED=true
   fi
+  # -S with -n 1 stays in Mode 1 for the single-request TTFT/TPOT summary.
 
   if [ "$PROFILE" = true ]; then
     curl --noproxy "*" http://${IP}:${PORT}/start_profile
@@ -208,11 +248,15 @@ if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ] && [ "$PACED" = fals
   PROMPT_JSON="["
   for ((i=0; i<NUM_REQUESTS; i++)); do
     idx=$((i % ${#PROMPTS[@]}))
-    escaped=$(json_escape "${PROMPTS[$idx]}")
     if [ $i -gt 0 ]; then
       PROMPT_JSON+=","
     fi
-    PROMPT_JSON+="\"$escaped\""
+    if [ "$ST_MODE" = true ]; then
+      # -S lines are already JSON string literals — splice verbatim.
+      PROMPT_JSON+="${PROMPTS[$idx]}"
+    else
+      PROMPT_JSON+="\"$(json_escape "${PROMPTS[$idx]}")\""
+    fi
   done
   PROMPT_JSON+="]"
 
@@ -319,13 +363,19 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
   RESULT_DIR=$(mktemp -d)
   _cleaned=0
   cleanup() {
-    # Idempotent cleanup: kill leftover send_request subshells first, wait for
-    # them to finish writing, then remove the temp dir. This avoids two races:
+    # Idempotent cleanup: kill leftover send_request subshells and the progress
+    # monitor first, wait for them to finish writing, then remove the temp
+    # dir. This avoids two races:
     #   (a) "Directory not empty" (rm while children still write), and
     #   (b) "No such file or directory" (dir removed while children still write).
+    # Both are killed by their RECORDED PIDs, not SIGINT: async subshells
+    # ignore SIGINT (Ctrl+C only reaches the main script), so a monitor that
+    # is not explicitly killed would outlive the script and keep redrawing
+    # the bar on the terminal forever.
     if [ "$_cleaned" != "1" ]; then
       _cleaned=1
-      kill $(jobs -pr) 2>/dev/null
+      [ -n "$_PROG_PID" ] && kill "$_PROG_PID" 2>/dev/null
+      [ "${#_REQ_PIDS[@]}" -gt 0 ] && kill "${_REQ_PIDS[@]}" 2>/dev/null
       wait 2>/dev/null
       rm -rf -- "$RESULT_DIR" 2>/dev/null || true
     fi
@@ -348,6 +398,7 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     elif [ "$DP_ENABLED" = true ]; then
       rank_line=",\"routed_dp_rank\": $DP_RANK"
     fi
+    # -S adds no rank field; the txt send order steers DP (line k -> dp k%N).
     # Fake transfer: unique room per request + magic host; the decode side
     # (_is_fake_transfer) then force-selects the FAKE receiver and decodes
     # without any KV transfer.
@@ -355,12 +406,17 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     if [ "$FAKE" = true ]; then
       fake_line=",\"bootstrap_host\": \"2.2.2.2\",\"bootstrap_room\": $((ROOM_BASE + idx))"
     fi
-    local escaped
-    escaped=$(json_escape "${PROMPTS[$((idx % ${#PROMPTS[@]}))]}")
+    local prompt_field
+    if [ "$ST_MODE" = true ]; then
+      # -S lines are JSON strings — splice verbatim.
+      prompt_field="${PROMPTS[$((idx % ${#PROMPTS[@]}))]}"
+    else
+      prompt_field="\"$(json_escape "${PROMPTS[$((idx % ${#PROMPTS[@]}))]}")\""
+    fi
 
     local body="{
         \"model\": \"DeepSeek-R1\",
-        \"prompt\": \"$escaped\",
+        \"prompt\": $prompt_field,
         \"stream\": $STREAM,
         \"max_tokens\": $MAX_TOKENS,
         \"temperature\": 0$rank_line$fake_line"
@@ -385,10 +441,22 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     local rid="${RUN_ID}-${idx}"
     echo "$rid" > "$RESULT_DIR/rid_${idx}"
 
-    curl --noproxy "*" -s "$URL" \
-      -H "Content-Type: application/json" \
-      -H "X-Request-Id: $rid" \
-      -d @"$body_file" > "$resp_file" 2>/dev/null
+    if [ "$STREAM" = true ]; then
+      # -o keeps the response body clean; -w captures TTFB (first streamed
+      # byte) so the TPOT summary can exclude prefill without a per-chunk
+      # timestamping pass.
+      curl --noproxy "*" -s "$URL" \
+        -H "Content-Type: application/json" \
+        -H "X-Request-Id: $rid" \
+        -o "$resp_file" \
+        -w '%{time_starttransfer}' \
+        -d @"$body_file" > "$RESULT_DIR/ttfb_${idx}" 2>/dev/null
+    else
+      curl --noproxy "*" -s "$URL" \
+        -H "Content-Type: application/json" \
+        -H "X-Request-Id: $rid" \
+        -d @"$body_file" > "$resp_file" 2>/dev/null
+    fi
 
     local end_ns
     end_ns=$(date +%s%N)
@@ -431,6 +499,9 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     echo "Paced batch: $NUM_REQUESTS requests, rate=$RATE req/s, concurrency=$CONCURRENCY"
   fi
   echo "  URL: $URL"
+  if [ "$ST_MODE" = true ]; then
+    echo "  Input: ordered safetensors prompts from $ST_FILE (line k -> dp k%N via server round-robin)"
+  fi
   echo "  Max tokens/req: $MAX_TOKENS, Stream: $STREAM"
   echo "  Run ID: $RUN_ID  (grep this in router logs)"
   echo ""
@@ -460,6 +531,9 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     (
       _S_W=28
       _PROG_FIRST=1
+      # Hard wall-clock cap (1h): if the monitor is ever orphaned without a
+      # cleanup kill, it still cannot redraw the bar forever.
+      _PROG_DEADLINE=$(( START_NS + 3600000000000 ))
       while :; do
         # Sent = rid_* (written before each curl fires); Done = time_* (written
         # after EVERY request ends, success or fail). Both monotone and every
@@ -493,6 +567,7 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
             "$_PROG_DONE" "$NUM_REQUESTS" "$_PROG_PCT" $'\033[K' >&2
         fi
         [ "$_PROG_DONE" -ge "$NUM_REQUESTS" ] && break
+        [ "$(date +%s%N)" -ge "$_PROG_DEADLINE" ] && break
         sleep 0.5
       done
       _D_FILL=$(( _PROG_DONE * _S_W / NUM_REQUESTS ))
@@ -506,12 +581,14 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     _PROG_PID=$!
   fi
 
+  _REQ_PIDS=()
   for ((i = 0; i < NUM_REQUESTS; i++)); do
     read -u 3
     {
       send_request "$i"
       echo >&3
     } &
+    _REQ_PIDS+=($!)
     if [ "$PACED" = true ] && (( (i + 1) % RATE == 0 )); then
       # Re-anchor to the schedule once per second (every RATE requests).
       # Per-request clock reads cost a fork each and fall behind under

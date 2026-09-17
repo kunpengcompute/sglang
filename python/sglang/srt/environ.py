@@ -212,6 +212,10 @@ class Envs:
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET = EnvInt(None)
+    # True: resolve the offset as an index into the process's allowed CPUs on
+    # each NUMA (router tokenizer half-NUMA slices). False (default): resolve
+    # it as an absolute node-local core id (scheduler gap cores 17-20).
+    SGLANG_SET_ZMQ_CPU_AFFINITY_SLICE_RELATIVE = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

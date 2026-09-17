@@ -35,15 +35,19 @@ TOK_INSTANCE="${3:-}"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/env.sh" tokenizer "${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}"
 
 # ================= Router-node CPU / NUMA binding plan =================
-# Example layout (adjust *_NUMA_BASE to match the router's real NUMAs;
-# W = TOKENIZER_WORKER_NUM, each NUMA = 38 cores, last core isolated).
-# 16 NUMAs total (0-15). With W=4 each role needs 5 (tok W + detok 1),
-# 2 roles = 10 NUMAs; remaining NUMAs are left for the gateway & bootstrap:
-#   prefill : BASE 0   -> tokenizer 0..(W-1),    detok W
-#   decode  : BASE 10  -> tokenizer 10..(10+W-1), detok 10+W
+# each NUMA = 38 cores, the last core is isolated, workers take
+# 18-core halves). 16 NUMAs total (0-15). Each role (tokenizer-separate
+# HTTP server) takes a contiguous 4-NUMA block:
+#   base   : parent [0..17]      + bootstrap server [18..35]
+#   base+1 : worker 0 [0..17]    + worker 1 [18..35]
+#   base+2 : worker 2 [0..17]    + worker 3 [18..35]
+#   base+3 : detokenizer (whole NUMA)
+# i.e. prefill = NUMA 0-3, second prefill = NUMA 4-7, decode = NUMA 8-11;
+# the decode role runs no bootstrap server (prefill-only), so its base
+# upper half stays spare. NUMA 15 is left for the gateway.
 export PREFILL_NUMA_BASE="${PREFILL_NUMA_BASE:-0}"
-export DECODE_NUMA_BASE="${DECODE_NUMA_BASE:-10}"
-export PREFILL_BOOTSTRAP_CPU="${PREFILL_BOOTSTRAP_CPU:-591-595}"
+export DECODE_NUMA_BASE="${DECODE_NUMA_BASE:-8}"
+export PREFILL_BOOTSTRAP_CPU="${PREFILL_BOOTSTRAP_CPU:-$((PREFILL_NUMA_BASE * 38 + 18))-$((PREFILL_NUMA_BASE * 38 + 35))}"
 
 # Common args for tokenizer-side HTTP server
 HTTP_COMMON_ARGS=(
