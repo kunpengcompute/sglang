@@ -247,14 +247,28 @@ class DeepseekMHAKunpengForwardMixin:
         ws_bytes += align64(threads_num * BR * f32_size) * 4
         workspace = kunpeng.alloc_buffer(ws_bytes)
 
-        attn_out = kunpeng.flash_attention_varlen_with_workspace_kunpeng(
+        # Allocate the attention output here (instead of inside the op) so the
+        # unfilled tail is under our control: the kernel only writes the live
+        # rows, and print_hash_kunpeng hashes the full tensor, so the tail must
+        # be deterministic. The zero must run on EVERY step (batch size varies
+        # across replays, so rows written in an earlier replay become stale
+        # tail later) — hence kunpeng.zero_, which is recorded into the graph
+        # and replayed each step. Gated behind SGLANG_KUNPENG_ZERO_OUT because
+        # the fill is an extra full-tensor pass.
+        out = kunpeng.alloc_buffer(
+            q.shape[0] * q.shape[1] * v.shape[2], dtype=q.dtype).view(
+            q.shape[0], q.shape[1], v.shape[2])
+        if envs.SGLANG_KUNPENG_ZERO_OUT.get():
+            kunpeng.zero_(out)
+
+        kunpeng.flash_attention_varlen_with_workspace_kunpeng(
             q, k, v, workspace,
-            forward_batch.extend_seq_lens, prefix_lens,
+            forward_batch.extend_seq_lens, prefix_lens, out,
             True,  # causal
             softmax_scale,
         )
 
-        return attn_out
+        return out
 
     def _set_mla_kv_buffer_kunpeng(
         self: DeepseekV2AttentionMLA,

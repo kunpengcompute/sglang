@@ -991,12 +991,14 @@ def _setup_flash_attention_varlen_with_workspace_kunpeng():
     # Varlen flash attention with prefix support on pre-packed K/V.
     # Eager path delegates to the existing flash_attention_with_workspace
     # torch op; graph path hits the C++ graph kernel of the same name.
+    # `out` is allocated (and optionally zeroed) by the caller so the
+    # unfilled-tail contents are under the call site's control.
     def shape_infer(q, k, v, workspace, extend_seq_lens, prefix_seq_lens,
-                    causal, softmax_scale):
-        return [((q.shape[0], q.shape[1], v.shape[2]), q.dtype)]
+                    out, causal, softmax_scale):
+        return []
 
     def eager_fn(q, k, v, workspace, extend_seq_lens, prefix_seq_lens,
-                 causal, softmax_scale):
+                 out, causal, softmax_scale):
         bs = extend_seq_lens.shape[0]
         ext = extend_seq_lens.to(torch.int32)
         if prefix_seq_lens is None:
@@ -1016,7 +1018,6 @@ def _setup_flash_attention_varlen_with_workspace_kunpeng():
         ksl = torch.zeros(bs + 1, dtype=torch.int32)
         ksl[1:] = torch.cumsum(total, dim=0)
 
-        out = torch.empty(q.shape[0], q.shape[1], v.shape[2], dtype=q.dtype)
         torch.ops.sgl_kernel.flash_attention_with_workspace(
             q=q, k=k, v=v, out=out, workspace=workspace,
             causal=bool(causal), softmax_scale=float(softmax_scale),

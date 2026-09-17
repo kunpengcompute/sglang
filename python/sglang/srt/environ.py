@@ -616,6 +616,14 @@ class Envs:
     # Software prefetch distance (in SVE vectors) for softmax_topk_kunpeng.
     # Runtime-tunable so Python tests can sweep it. Default 8.
     SGLANG_KUNPENG_SOFTMAX_TOPK_PRF_VECS = EnvInt(8)
+    # Zero output buffers whose kernels only write the live-row prefix (e.g.
+    # the attention output allocated at the forward_mha_kunpeng call site).
+    # The unfilled tail otherwise carries stale data from prior allocations
+    # (and from earlier graph replays with a larger batch), which makes
+    # print_hash_kunpeng non-deterministic. Zero via kunpeng.zero_ so it is
+    # recorded into the graph and replayed every step. Enable when running
+    # print_hash diagnosis; disable (default) for production perf.
+    SGLANG_KUNPENG_ZERO_OUT = EnvBool(False)
 
 envs = Envs()
 EnvField._allow_set_name = False
