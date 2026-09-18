@@ -407,6 +407,8 @@ std::vector<torch::Tensor> Graph::run(const std::vector<torch::Tensor> &inputs)
         }
 
         RECORD_FUNCTION(op_names_[op_idx].c_str(), std::vector<c10::IValue>{});
+        if (graph_debug_print_enabled())
+            std::cout << "[replay op " << op_idx << "] " << op_names_[op_idx] << std::endl;
         if constexpr (kGraphDebugPrint) {
             std::cout << "[replay op " << op_idx << "] " << op_names_[op_idx] << std::endl;
             const auto &op = op_records_[op_idx];

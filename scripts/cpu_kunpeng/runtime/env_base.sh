@@ -149,6 +149,7 @@ export SGLANG_ENABLE_GRAPH_CAPTURE=1
 export SGLANG_ENABLE_GRAPH_PROFILE=0
 export SGLANG_KUNPENG_GRAPH_CACHE_SIZE=10
 export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1 # Kunpeng prefill graph padding to power 2 size
+export SGLANG_GRAPH_DEBUG_PRINT=0  # 1 = per-op debug print in eager/capture (ops.py) and graph replay (C++)
 # Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
 # Drop OS page cache (echo 3 > /proc/sys/vm/drop_caches) during stop.sh node

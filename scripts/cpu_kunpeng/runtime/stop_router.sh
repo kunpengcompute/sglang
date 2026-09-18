@@ -19,8 +19,9 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-# Source config to get ROUTER_IP
-SKIP_CONDA=1 source ./env.sh router
+# Base config only: stop only needs ROUTER_IP (no role topology).
+# "none" mode skips env_decode/env_prefill + router_config entirely.
+SKIP_CONDA=1 source ./env.sh none
 
 echo "Killing gateway on $ROUTER_IP"
 ssh "root@$ROUTER_IP" '

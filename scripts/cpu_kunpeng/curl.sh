@@ -49,7 +49,8 @@ usage() {
   echo ""
   echo "  --- round-robin & paced batch only ---"
   echo "  -c CONC     Max concurrent requests (default: 256; paced batch defaults to unbounded)"
-  echo "  -v          Write per-request latency rows + response bodies to <run-id>_detail.txt"
+  echo "  -v          Write per-request latency + accept-rate rows and response
+              bodies to <run-id>_detail.txt (accept rate requires -s)"
   exit 0
 }
 
@@ -329,8 +330,10 @@ if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ] && [ "$PACED" = fals
           TTFT=$(awk -v s="$TURN_START" -v f="$FIRST_TOKEN_TS" 'BEGIN { printf "%.3f", f - s }')
           TOTAL=$(awk -v s="$TURN_START" -v e="$TURN_END" 'BEGIN { printf "%.3f", e - s }')
           TPOT=$(awk -v n="$TOKEN_COUNT" -v tt="$TTFT" -v total="$TOTAL" 'BEGIN { dn=n-1; if (dn>0) printf "%.1f", (total-tt)/dn*1000; else print "0" }')
+          # Exclude the first chunk: it carries the prefill's first token, and
+          # only decode steps (chunks 2+) can accept draft tokens.
           RATE=$(awk -v n="$TOKEN_COUNT" -v c="$CHUNK_COUNT" \
-              'BEGIN { if (c>0) printf "%.2f", n / c; else print "0" }')
+              'BEGIN { if (c>1) printf "%.2f", (n-1)/(c-1); else print "N/A" }')
           echo "" >&2
           echo "==================================================" >&2
           echo "TTFT: ${TTFT}s | Total: ${TOTAL}s | TPOT: ${TPOT} ms/tok" >&2
@@ -460,19 +463,22 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     echo "$start_ns $end_ns" > "$RESULT_DIR/time_${idx}"
 
     if [ "$STREAM" = true ]; then
-      local usage_raw comp_tokens chunks done_count
+      local usage_raw comp_tokens chunks
       usage_raw=$(grep -o '"usage":{[^}]*}' "$resp_file" 2>/dev/null | tail -n1)
       comp_tokens=$(echo "$usage_raw" | grep -o '"completion_tokens":[0-9]*' | head -n1 | cut -d':' -f2)
-      chunks=$(grep -c "^data:" "$resp_file" 2>/dev/null || true)
+      # Content chunks ≈ decode steps: spec decoding emits ALL tokens accepted
+      # in one step inside a single chunk, so tokens/chunks is the per-request
+      # accept rate. Count "text" keys only — usage-only chunks and
+      # "data: [DONE]" carry no text field.
+      chunks=$(grep -c '"text"' "$resp_file" 2>/dev/null || true)
       chunks="${chunks:-0}"
-      done_count=$(grep -c "\[DONE\]" "$resp_file" 2>/dev/null || true)
-      done_count="${done_count:-0}"
       # Prefer actual token count from usage; fall back to chunk count
       if [[ ! -z "$comp_tokens" ]]; then
         echo "$comp_tokens" > "$RESULT_DIR/tokens_${idx}"
       else
-        echo $((chunks - done_count)) > "$RESULT_DIR/tokens_${idx}"
+        echo "$chunks" > "$RESULT_DIR/tokens_${idx}"
       fi
+      echo "$chunks" > "$RESULT_DIR/chunks_${idx}"
     else
       local tokens
       tokens=$(grep -oP '"completion_tokens":\s*\K\d+' "$resp_file" 2>/dev/null | head -1)
@@ -658,7 +664,7 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     DETAIL_FILE="${RUN_ID}_detail.txt"
     {
       echo "Per-Request Latency (relative to test start)"
-      printf "%-6s %-6s %-12s %-12s %-10s %-8s %s\n" "Req#" "Rank" "Start(s)" "End(s)" "Latency(s)" "Tokens" "ReqID"
+      printf "%-6s %-6s %-12s %-12s %-10s %-8s %-8s %s\n" "Req#" "Rank" "Start(s)" "End(s)" "Latency(s)" "Tokens" "Accept" "ReqID"
     } > "$DETAIL_FILE"
   fi
 
@@ -676,10 +682,21 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
       echo "$dur" >> "$LAT_FILE"
       toks="?"
       rid="N/A"
+      acc="N/A"
       read -r toks < "$RESULT_DIR/tokens_${i}" 2>/dev/null || toks="?"
       read -r rid < "$RESULT_DIR/rid_${i}" 2>/dev/null || rid="N/A"
+      # Per-request accept rate = (tokens-1)/(chunks-1): the first chunk
+      # carries the prefill's first token; only decode steps can accept
+      # draft tokens.
+      if [ -f "$RESULT_DIR/chunks_${i}" ]; then
+        read -r ch < "$RESULT_DIR/chunks_${i}"
+        acc=$(awk -v t="$toks" -v c="$ch" 'BEGIN {
+          if (c > 1 && t ~ /^[0-9]+$/) printf "%.2f", (t-1)/(c-1); else print "N/A" }')
+        # Collect for overall summary (only valid rows).
+        [[ "$acc" != "N/A" ]] && echo "$toks $ch" >> "$RESULT_DIR/all_accepts"
+      fi
       if [ "$VERBOSE" = true ]; then
-        printf "%-6d %-6s %-12s %-12s %-10s %-8s %s\n" "$i" "$rank" "$rel_start" "$rel_end" "$dur" "$toks" "$rid" >> "$DETAIL_FILE"
+        printf "%-6d %-6s %-12s %-12s %-10s %-8s %-8s %s\n" "$i" "$rank" "$rel_start" "$rel_end" "$dur" "$toks" "$acc" "$rid" >> "$DETAIL_FILE"
       fi
     else
       if [ "$VERBOSE" = true ]; then
@@ -706,49 +723,29 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     }' "$LAT_FILE"
   fi
 
-  # --- Per-Request TPOT (streaming only) ---
-  # TPOT = (latency - TTFB) / (tokens - 1), where TTFB is curl's
-  # time_starttransfer (first streamed byte), so the prefill phase is
-  # excluded. Requests without a usable TTFB/timing or with < 2 tokens are
-  # skipped. Non-streaming runs have no intermediate bytes to measure and no
-  # TPOT summary.
-  if [ "$STREAM" = true ]; then
-    TPOT_FILE="$RESULT_DIR/all_tpots"
-    : > "$TPOT_FILE"
-    for ((i = 0; i < NUM_REQUESTS; i++)); do
-      [ -f "$RESULT_DIR/time_${i}" ] || continue
-      [ -f "$RESULT_DIR/ttfb_${i}" ] || continue
-      read -r s e < "$RESULT_DIR/time_${i}"
-      toks=$(cat "$RESULT_DIR/tokens_${i}" 2>/dev/null)
-      ttfb=$(cat "$RESULT_DIR/ttfb_${i}" 2>/dev/null)
-      [[ "$toks" =~ ^[0-9]+$ ]] || continue
-      [[ "$ttfb" =~ ^[0-9.]+$ ]] || continue
-      [ "$toks" -ge 2 ] || continue
-      ttfb_ns=$(awk -v t="$ttfb" 'BEGIN { printf "%d", t * 1000000000 }')
-      decode_ns=$(( (e - s) - ttfb_ns ))
-      [ "$decode_ns" -gt 0 ] || continue
-      awk -v ns="$decode_ns" -v n="$toks" \
-        'BEGIN { printf "%.3f\n", ns / (n - 1) / 1000000 }' >> "$TPOT_FILE"
-    done
-    if [ -s "$TPOT_FILE" ]; then
-      awk '{ a[NR]=$1; sum+=$1 } END {
-        n=NR; if(n==0) exit;
-        for(i=1;i<=n;i++) for(j=i+1;j<=n;j++) if(a[i]>a[j]){t=a[i];a[i]=a[j];a[j]=t}
-        p50=a[int((n+1)*0.5)]; p90=a[int((n+1)*0.9)];
-        if(p50=="") p50=a[n];
-        if(p90=="") p90=a[n];
+  # --- Accept Rate Summary (streaming only: needs decode-step counts) ---
+  # Rows are "tokens chunks"; both sides exclude the prefill first token/step.
+  if [ "$STREAM" = true ] && [ -s "$RESULT_DIR/all_accepts" ]; then
+    awk '
+      { t=$1+0; c=$2+0; if (c>1) {
+          n++; st+=t-1; sc+=c-1; r=(t-1)/(c-1);
+          if (min=="" || r<min) min=r;
+          if (max=="" || r>max) max=r;
+      } }
+      END {
+        if (n==0) exit;
         printf "\n===================================\n";
-        printf "TPOT Summary (ms/token)\n";
+        printf "Accept Rate Summary (tokens/decode step, excl. first)\n";
         printf "===================================\n";
-        printf "  Samples:  %d\n", n;
-        printf "  Min:      %.3f\n", a[1];
-        printf "  Max:      %.3f\n", a[n];
-        printf "  Avg:      %.3f\n", sum/n;
-        printf "  P50:      %.3f\n", p50;
-        printf "  P90:      %.3f\n", p90;
+        printf "  Requests:  %d\n", n;
+        printf "  Overall:   %.3f\n", st/sc;
+        printf "  Min:       %.3f\n", min;
+        printf "  Max:       %.3f\n", max;
         printf "===================================\n";
-      }' "$TPOT_FILE"
-    fi
+      }' "$RESULT_DIR/all_accepts"
+  elif [ "$STREAM" = false ]; then
+    echo ""
+    echo "Accept Rate: N/A (requires streaming mode -s)"
   fi
 
   if [ "$VERBOSE" = true ]; then
@@ -759,7 +756,17 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
       echo "==================================="
       for ((i = 0; i < NUM_REQUESTS; i++)); do
         if [ "$ROUND_ROBIN" = true ]; then rank=${DP_RANKS[$((i % NUM_RANKS))]} ; else rank="-"; fi
-        echo "----- Request #$i (rank=$rank) -----"
+        # Header carries the per-request accept stats (streaming only).
+        acc="N/A"
+        if [ -f "$RESULT_DIR/chunks_${i}" ]; then
+          read -r ch < "$RESULT_DIR/chunks_${i}"
+          read -r tk < "$RESULT_DIR/tokens_${i}" 2>/dev/null || tk="?"
+          acc=$(awk -v t="$tk" -v c="$ch" 'BEGIN {
+            if (c > 1 && t ~ /^[0-9]+$/) printf "%.2f", (t-1)/(c-1); else print "N/A" }')
+          echo "----- Request #$i (rank=$rank, tokens=$tk, steps=$ch, accept=$acc) -----"
+        else
+          echo "----- Request #$i (rank=$rank) -----"
+        fi
         if [ -s "$RESULT_DIR/resp_${i}" ]; then
           cat "$RESULT_DIR/resp_${i}"
           echo ""
@@ -912,7 +919,8 @@ if [ "$INTERACTIVE" = true ]; then
       TTFT=$(awk -v s="$TURN_START" -v f="$FIRST_TOKEN_TS" 'BEGIN { printf "%.3f", f - s }')
       TOTAL=$(awk -v s="$TURN_START" -v e="$TURN_END" 'BEGIN { printf "%.3f", e - s }')
       TPOT=$(awk -v n="$TOKEN_COUNT" -v tt="$TTFT" -v total="$TOTAL" 'BEGIN { dn=n-1; if (dn>0) printf "%.1f", (total-tt)/dn*1000; else print "0" }')
-      RATE=$(awk -v n="$TOKEN_COUNT" -v c="$CHUNK_COUNT" 'BEGIN { if (c>0) printf "%.2f", n / c; else print "0" }')
+      # Same convention as batch mode: exclude the first chunk (prefill token).
+      RATE=$(awk -v n="$TOKEN_COUNT" -v c="$CHUNK_COUNT" 'BEGIN { if (c>1) printf "%.2f", (n-1)/(c-1); else print "N/A" }')
       echo -e "\n=================================================="
       echo "TTFT: ${TTFT}s | Total: ${TOTAL}s | TPOT: ${TPOT} ms/tok"
       echo "Output Tokens: $TOKEN_COUNT | Chunks: $CHUNK_COUNT | Accept Rate: $RATE"
