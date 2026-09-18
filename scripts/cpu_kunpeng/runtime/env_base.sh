@@ -26,10 +26,23 @@ source "$SCRIPT_DIR/runtime/env_helper.sh"
 # Configuration variables (edit these as needed)
 # ------------------------------------------------------------
 # Deployment instances for `launch.sh all`: comma-separated entries, each
-# "<role>" or "<role>_<instance>". Each entry starts one server group via
-# `launch_cluster.sh <role> [instance]`; the instance suffix selects
+# "<role>" or "<role>_<instance>". Multiple entries per role are supported
+# (e.g. "prefill,decode_64p,decode_64p_2"): each entry starts one server
+# group via `launch_cluster.sh <role> [instance]`, one tokenizer HTTP
+# server, and one gateway backend; the instance suffix selects
 # per-instance user env overrides (runtime/.user_env_<role>_<instance>.sh),
-# e.g. "decode_128p" reads .user_env_decode_128p.sh on every node.
+# e.g. "decode_64p" reads .user_env_decode_64p.sh on every node.
+# Each entry's router-node resources are auto-derived from its position
+# in this list (see env_prefill.sh / env_decode.sh):
+#   tokenizer HTTP port     30001 + global entry index
+#   prefill bootstrap port  9001 + prefill entry index
+#   tokenizer NUMA block    prefill entries: 0,4,...  decode entries: 8,12,...
+#   master port             prefill: 5000+100*i, decode: 5010+100*i (the
+#                           tokenizer's ZMQ port block is derived from it)
+# (instance env files may still override TOK_PORT / BOOTSTRAP_PORT /
+# NUMA_BASE / MASTER_PORT explicitly). Instances of the same role must run
+# on disjoint node sets (stop_server.sh kills all sglang processes on an
+# instance's nodes).
 INSTANCES="prefill,decode"
 
 # IP range, Master address/port for native nodes.
@@ -43,6 +56,25 @@ NATIVE_MASTER_PORT="5010"
 
 # Router node IP (single IP for PD disaggregation router)
 export ROUTER_IP="xxx.xxx.xxx.1"
+
+# Gateway prefill routing policy (PD mode). Empty = use the main policy
+# (cache_aware). Set to "bucket" to enable the bucket policy for prefill
+# backends — requires >= 2 prefill entries in INSTANCES (e.g.
+# "prefill,prefill_lc,decode"): the gateway sizes request buckets per
+# prefill worker and rebalances them periodically.
+export ROUTER_PREFILL_POLICY=""
+# Bucket-policy tuning knobs (used only when ROUTER_PREFILL_POLICY=bucket):
+export ROUTER_BALANCE_ABS_THRESHOLD=64
+export ROUTER_BALANCE_REL_THRESHOLD=1.5
+export ROUTER_BUCKET_ADJUST_INTERVAL_SECS=5
+# Grouped mode (fixed short/long routing, used only when
+# ROUTER_PREFILL_SHORT_COUNT > 0): requests shorter than the character
+# threshold go to the first SHORT_COUNT prefill backends (by ascending
+# backend URL = tokenizer port order in INSTANCES), longer ones to the
+# rest. Leave SHORT_COUNT=0 for dynamic-boundary mode. Note the threshold
+# counts CHARACTERS, not tokens (~1.5-2 chars/token Chinese).
+export ROUTER_PREFILL_SHORT_COUNT=0
+export ROUTER_PREFILL_LENGTH_THRESHOLD=4096
 
 # Paths
 LOG_BASE_DIR="/path-to-logs"

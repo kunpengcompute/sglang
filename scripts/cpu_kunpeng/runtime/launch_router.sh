@@ -30,9 +30,10 @@ sh "$SCRIPT_DIR/stop.sh" router
 # Wait for ALL gateway backends to be ready (up to 20 minutes): one master
 # per INSTANCES entry (e.g. "prefill,decode_128p" -> prefill master +
 # decode 128p master; each entry's role env is sourced in a subshell to
-# read its real master address), plus the tokenizer HTTP servers
-# (30001/30002) in tokenizer-separate mode (tokenizer starts in parallel
-# with the compute servers, so its ports may not be up yet either).
+# read its real master address), plus each entry's tokenizer HTTP server
+# (per-instance <side>_TOK_PORT) in tokenizer-separate mode (tokenizer
+# starts in parallel with the compute servers, so its ports may not be up
+# yet either).
 endpoints=()
 for _entry in ${INSTANCES//,/ }; do
     _entry="${_entry//[[:space:]]/}"
@@ -46,27 +47,48 @@ for _entry in ${INSTANCES//,/ }; do
                 source '$SCRIPT_DIR/env.sh' prefill '$_inst' >/dev/null 2>&1
                 echo \"\$PREFILL_MASTER_ADDR\"")"
             endpoints+=("prefill${_inst:+-$_inst}|${_addr}:30000")
+            if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
+                _tok_port="$(SKIP_CONDA=1 bash -c "
+                    unset PREFILL_TOK_PORT PREFILL_BOOTSTRAP_PORT PREFILL_NUMA_BASE
+                    source '$SCRIPT_DIR/env.sh' prefill '$_inst' >/dev/null 2>&1
+                    echo \"\${PREFILL_TOK_PORT:-30001}\"")"
+                endpoints+=("tokenizer-prefill${_inst:+-$_inst}|${ROUTER_IP}:${_tok_port}")
+            fi
             ;;
         decode)
             _addr="$(SKIP_CONDA=1 bash -c "
                 source '$SCRIPT_DIR/env.sh' decode '$_inst' >/dev/null 2>&1
                 echo \"\$DECODE_MASTER_ADDR\"")"
             endpoints+=("decode${_inst:+-$_inst}|${_addr}:30000")
+            if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
+                _tok_port="$(SKIP_CONDA=1 bash -c "
+                    unset DECODE_TOK_PORT DECODE_BOOTSTRAP_PORT DECODE_NUMA_BASE
+                    source '$SCRIPT_DIR/env.sh' decode '$_inst' >/dev/null 2>&1
+                    echo \"\${DECODE_TOK_PORT:-30002}\"")"
+                endpoints+=("tokenizer-decode${_inst:+-$_inst}|${ROUTER_IP}:${_tok_port}")
+            fi
             ;;
     esac
 done
-# Fallback: INSTANCES empty/unparsed -> use this shell's role env.
+# Fallback: INSTANCES empty/unparsed -> resolve one backend per side via
+# the default (no-instance) role env in subshells.
 if [[ ${#endpoints[@]} -eq 0 ]]; then
+    _pf_addr="$(SKIP_CONDA=1 bash -c "
+        source '$SCRIPT_DIR/env.sh' prefill >/dev/null 2>&1
+        echo \"\$PREFILL_MASTER_ADDR\"")"
+    _de_addr="$(SKIP_CONDA=1 bash -c "
+        source '$SCRIPT_DIR/env.sh' decode >/dev/null 2>&1
+        echo \"\$DECODE_MASTER_ADDR\"")"
     endpoints=(
-        "prefill|${PREFILL_MASTER_ADDR}:30000"
-        "decode|${DECODE_MASTER_ADDR}:30000"
+        "prefill|${_pf_addr}:30000"
+        "decode|${_de_addr}:30000"
     )
-fi
-if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
-    endpoints+=(
-        "tokenizer-prefill|${ROUTER_IP}:30001"
-        "tokenizer-decode|${ROUTER_IP}:30002"
-    )
+    if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
+        endpoints+=(
+            "tokenizer-prefill|${ROUTER_IP}:30001"
+            "tokenizer-decode|${ROUTER_IP}:30002"
+        )
+    fi
 fi
 echo "[$(date +%T)] Waiting for backends to be ready (up to 20 minutes):"
 for _ep in "${endpoints[@]}"; do echo "  ${_ep%%|*}  ${_ep#*|}"; done

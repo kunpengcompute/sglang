@@ -38,7 +38,8 @@ Roles:
   native     Launch without PD disaggregation
   router     Launch gateway (route requests to prefill/decode)
   tokenizer  Launch one tokenizer HTTP server: $0 tokenizer <prefill|decode> [instance]
-             (prefill -> port 30001, decode -> port 30002; instance selects
+             (port auto-derived from the entry's position in INSTANCES,
+             default 30001/30002; instance selects
              runtime/.user_env_<side>_<instance>.sh)
   all        Launch prefill, decode, tokenizer, and router sequentially
   update     Regenerate .time_env.sh + update NUMA binary replicas
@@ -79,8 +80,8 @@ esac
 
 
 bash "$SCRIPT_DIR/runtime/update_time.sh"
-if [[ "$ROLE" == "router" ]]; then
-    echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update for role 'router'.\033[0m"
+if [[ "$ROLE" == "router" || "$ROLE" == "tokenizer" ]]; then
+    echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update for role '$ROLE'.\033[0m"
 elif [[ "${SGLANG_ENABLE_NUMA_DUPLICATION:-1}" != "1" ]]; then
     echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update (SGLANG_ENABLE_NUMA_DUPLICATION='${SGLANG_ENABLE_NUMA_DUPLICATION:-unset}').\033[0m"
 else
@@ -93,8 +94,11 @@ if [[ "$ROLE" == "update" ]]; then
 elif [[ "$ROLE" == "all" ]]; then
     # Deployment instance list: comma-separated entries, each "<role>" or
     # "<role>_<instance>" (e.g. "prefill,decode_128p" -> prefill + decode
-    # instance 128p). Default lives in runtime/env_base.sh; .user_env.sh
-    # (sourced via "env.sh none" at the top) may override it.
+    # instance 128p; same-role multi-instance also supported, e.g.
+    # "prefill,prefill_lc,decode" — see runtime/env_base.sh for the
+    # per-instance port/NUMA requirements). Default lives in
+    # runtime/env_base.sh; .user_env.sh (sourced via "env.sh none" at the
+    # top) may override it.
     echo "[$(date +%T)] ===== Launching all roles ($INSTANCES + tokenizer + router) ====="
 
     IFS=',' read -ra _INST_LIST <<< "$INSTANCES"

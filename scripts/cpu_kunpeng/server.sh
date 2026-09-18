@@ -123,7 +123,7 @@ case "$ROLE" in
             --max-running-requests $((8 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
             --load-balance-method round_robin
             --enable-dynamic-batch-tokenizer
-            --disaggregation-bootstrap-port 9001
+            --disaggregation-bootstrap-port "${PREFILL_BOOTSTRAP_PORT:-9001}"
         )
         ;;
     decode)
@@ -169,6 +169,15 @@ esac
 
 # Build IB device args based on role.
 IB_DEVICE_ALL="roceroh0,roceroh1,roceroh2,roceroh3,roceroh4,roceroh5,roceroh6,roceroh7"
+
+# Record this node's invocation and full environment for debugging
+# (written after env.sh sourcing so all role config is captured).
+{
+    echo "[$(date +%T)] invocation: $0 $*"
+    echo "[$(date +%T)] role=$ROLE node_rank=$NODE_RANK instance=${INSTANCE:-} world_size=${WORLD_SIZE:-}"
+    echo "---- environment ----"
+    env | sort
+} > "$LOG_PATH/env_node${NODE_RANK}_$IP.log"
 
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     # ── Log naming: translate (node index, rank-in-node) into the true
@@ -255,11 +264,13 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
             TP_RANK_ACTUAL=$((_IN_PP % ATTENTION_TP_SIZE))
         fi
 
+        _rank_log="${LOG_PATH}/pp${PP_RANK}_dp${DP_RANK_ACTUAL}_tp${TP_RANK_ACTUAL}_$IP.log"
+        echo "[$(date +%T)] command: taskset -c $((RANK_IN_NODE * 38 + 20)) $SERVER_BIN ${BASE_ARGS[*]} ${SPECIFIC_ARGS[*]} ${IB_ARGS[*]} --tp-rank-in-node ${RANK_IN_NODE} --port $((30000 + RANK_IN_NODE))" > "$_rank_log"
         taskset -c $((RANK_IN_NODE * 38 + 20)) \
         $SERVER_BIN "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
           --tp-rank-in-node ${RANK_IN_NODE} \
           --port $((30000 + RANK_IN_NODE)) \
-          > "${LOG_PATH}/pp${PP_RANK}_dp${DP_RANK_ACTUAL}_tp${TP_RANK_ACTUAL}_$IP.log" 2>&1 &
+          >> "$_rank_log" 2>&1 &
     done
 else
     # Non-binary launch: sglang forks workers internally, so pass all devices
@@ -273,7 +284,9 @@ else
     if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
         export PYTHONPATH="$KUCCL_PATH:${PYTHONPATH}"
     fi
+    _node_log="$LOG_PATH/${NODE_RANK}_$IP.log"
+    echo "[$(date +%T)] command: python -m sglang.launch_server ${BASE_ARGS[*]} ${SPECIFIC_ARGS[*]} ${IB_ARGS[*]} --port 30000" > "$_node_log"
     python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
       --port 30000 \
-      > "$LOG_PATH/${NODE_RANK}_$IP.log" 2>&1 &
+      >> "$_node_log" 2>&1 &
 fi

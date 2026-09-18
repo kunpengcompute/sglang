@@ -14,16 +14,18 @@
 
 #!/bin/bash
 # stop_tokenizer.sh - Kill the tokenizer HTTP server parent(s)
-# (python -m sglang.launch_server ... --port 30001/30002) and all their
+# (python -m sglang.launch_server ... --port <tok_port>) and all their
 # child workers (sglang::detokenizer / sglang::tokenizer_worker) on the
 # router node, so no orphan children survive a kill -9 fallback.
 # Invoked by: ./stop.sh tokenizer [prefill|decode|all]
 # Usage: bash runtime/stop_tokenizer.sh [prefill|decode|all]
+#   Each argument may carry an instance suffix (e.g. decode_128p); "all"
+#   resolves one port per INSTANCES entry (same parsing as launch.sh all).
 
 TOK_ENTRY="${1:-all}"
 # Accept "<side>[_<instance>]" (e.g. "decode_128p"): the instance selects
-# the side's instance env when sourcing; the kill pattern is still the
-# side's fixed port (30001/30002).
+# the side's instance env when sourcing; the kill pattern matches the
+# side's per-instance tokenizer HTTP port (<side>_TOK_PORT).
 if [[ "$TOK_ENTRY" == *_* ]]; then
     TOK_SIDE="${TOK_ENTRY%%_*}"
 else
@@ -38,22 +40,45 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 # Source config to get ROUTER_IP. Sides load only their own role env
-# (env.sh tokenizer "<side>[_<instance>]"); "all" needs just the base env.
+# (env.sh tokenizer "<side>[_<instance>]"); "all" iterates the INSTANCES
+# entries so every instance's tokenizer port is covered.
+ports=()
 if [[ "$TOK_SIDE" == "all" ]]; then
     SKIP_CONDA=1 source ./env.sh none
+    IFS=',' read -ra _INST_LIST <<< "$INSTANCES"
+    for _entry in "${_INST_LIST[@]}"; do
+        _entry="${_entry//[[:space:]]/}"
+        [[ -z "$_entry" ]] && continue
+        _side="${_entry%%_*}"
+        [[ "$_side" == "prefill" || "$_side" == "decode" ]] || continue
+        # Unset the derived vars so each entry re-derives its own values
+        # (sequential sourcing in this shell would otherwise keep the
+        # first entry's ports).
+        unset PREFILL_TOK_PORT PREFILL_BOOTSTRAP_PORT PREFILL_NUMA_BASE
+        unset DECODE_TOK_PORT DECODE_BOOTSTRAP_PORT DECODE_NUMA_BASE
+        SKIP_CONDA=1 source ./env.sh tokenizer "$_entry" >/dev/null 2>&1
+        if [[ "$_side" == "prefill" ]]; then
+            ports+=("${PREFILL_TOK_PORT:-30001}")
+        else
+            ports+=("${DECODE_TOK_PORT:-30002}")
+        fi
+    done
+    # Fallback: INSTANCES empty/unparsed -> both default ports.
+    [[ ${#ports[@]} -eq 0 ]] && ports=(30001 30002)
 else
     SKIP_CONDA=1 source ./env.sh tokenizer "$TOK_ENTRY"
+    if [[ "$TOK_SIDE" == "prefill" ]]; then
+        ports+=("${PREFILL_TOK_PORT:-30001}")
+    else
+        ports+=("${DECODE_TOK_PORT:-30002}")
+    fi
 fi
+# Dedupe (default + instance entries may resolve to the same port)
+ports=($(printf '%s\n' "${ports[@]}" | sort -u))
 
-if [[ "$TOK_SIDE" == "prefill" ]]; then
-    TOK_PAT="sglang[.]launch_server.*--port 30001"
-elif [[ "$TOK_SIDE" == "decode" ]]; then
-    TOK_PAT="sglang[.]launch_server.*--port 30002"
-else
-    TOK_PAT="sglang[.]launch_server.*--port 3000[12]"
-fi
+TOK_PAT="sglang[.]launch_server.*--port ($(IFS='|'; echo "${ports[*]}"))"
 
-echo "Killing tokenizer ($TOK_SIDE) HTTP server(s) on $ROUTER_IP"
+echo "Killing tokenizer ($TOK_SIDE) HTTP server(s) on $ROUTER_IP (port(s): ${ports[*]})"
 ssh "root@$ROUTER_IP" "
     MAIN_PIDS=\$(ps aux | grep -E '$TOK_PAT' | grep -v grep | awk '{print \$2}')
     echo \"Main tokenizer PID(s): \$MAIN_PIDS\"

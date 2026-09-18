@@ -59,12 +59,14 @@ cd "$SCRIPT_DIR"
 source "$SCRIPT_DIR/env.sh" "$ROLE" "$INSTANCE" || exit 1
 
 mkdir -p "$LOG_DIR"
-# Refresh "latest" symlink to this run's time dir (e.g. latest -> 214700)
-ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/$ROLE/latest"
+# Refresh "latest" symlink to this run's time dir (e.g. latest -> 214700).
+# LOG_SUBDIR is instance-qualified ("prefill" / "prefill_128p") so
+# same-role instances keep separate log trees.
+ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/$LOG_SUBDIR/latest"
 
-# Refresh unified "$LOG_BASE_DIR/latest/$ROLE" -> this run's time dir
+# Refresh unified "$LOG_BASE_DIR/latest/$LOG_SUBDIR" -> this run's time dir
 mkdir -p "$LOG_BASE_DIR/latest"
-ln -sfn "$LOG_BASE_DIR/$LOG_DATE/$ROLE/$LOG_TIME" "$LOG_BASE_DIR/latest/$ROLE"
+ln -sfn "$LOG_BASE_DIR/$LOG_DATE/$LOG_SUBDIR/$LOG_TIME" "$LOG_BASE_DIR/latest/$LOG_SUBDIR"
 
 sh "$SCRIPT_DIR/stop.sh" server "$ROLE" "$INSTANCE"
 
