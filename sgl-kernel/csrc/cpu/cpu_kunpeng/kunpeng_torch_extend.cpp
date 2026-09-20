@@ -285,6 +285,9 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info, at::Tensor s
                              int64_t num_max_dispatch_tokens_per_rank, int64_t max_tokens, int64_t multiple,
                              bool is_prefill);
 
+void record_expert_activation_kunpeng(at::Tensor experts_offset, at::Tensor counter,
+                                      int64_t layer_id, int64_t num_local_experts);
+
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
                                         int64_t num_experts, int64_t topk, bool force_balance,
                                         int64_t expert_offset);
@@ -873,6 +876,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int num_ranks, int num_local_experts, int num_max_dispatch_tokens_per_rank, int max_tokens, "
         "int multiple, bool is_prefill) -> int");
     m.impl("topk_convert_kunpeng", topk_convert_kunpeng);
+
+    m.def(
+        "record_expert_activation_kunpeng("
+        "Tensor experts_offset, Tensor(a!) counter, int layer_id, int num_local_experts) -> ()");
+    m.impl("record_expert_activation_kunpeng", record_expert_activation_kunpeng);
 
     // multinomial sampling
     m.def("multinomial_kunpeng(Tensor probs, Tensor(a!) out, int num_samples, bool replacement) -> ()");
