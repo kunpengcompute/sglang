@@ -201,7 +201,7 @@ else
 fi
 
 export SGLANG_KUNPENG_MOE_TOKEN_MULTIPLE=2
-
+export SGLANG_KUNPENG_SAVE_AT_TRACE=0 # set 1 to open record experts activation number
 # ------------------------------------------------------------
 # Load local config
 # ------------------------------------------------------------

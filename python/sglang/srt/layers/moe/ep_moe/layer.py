@@ -669,7 +669,7 @@ class KunpengMoE(FusedMoE):
         self.swap_mgr = KunpengSwapManager.get_instance()
 
         # Register the layer's local-slot -> global-expert-id mapping for the
-        # activation trace (mirrors ExpertsManager::init in DeepSeek-V3-Sample).
+        # activation trace.
         # Routed slots are contiguous per EP rank; fused shared experts occupy
         # the trailing slots with the global ids >= _num_global_routed.
         ensure_save_on_exit()
@@ -800,8 +800,7 @@ class KunpengMoE(FusedMoE):
         scale = packed_recv_x[:, hidden : hidden + 4].view(torch.float32)
 
         t_gateup_start = time.perf_counter()
-        # Record per-local-expert activation counts for the at_trace dump
-        # (mirrors graphapi_igemm_fusedmoe_gateup in DeepSeek-V3-Sample). The
+        # Record per-local-expert activation counts for the at_trace dump. The
         # C++ op mutates a fixed counter tensor in-place so it also runs under
         # graph replay, unlike the earlier Python-side counting.
         at_counter = get_counter_tensor()

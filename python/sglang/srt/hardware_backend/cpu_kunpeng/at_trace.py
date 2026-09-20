@@ -12,18 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""DeepSeek-style MoE expert activation trace (``at_trace``).
-
-Mirrors two pieces of DeepSeek-V3-Sample:
-
-* ``csrc/adapter/adapter_interface.cpp`` (``graphapi_igemm_fusedmoe_gateup``):
-  for every local expert slot, the per-forward-step number of tokens routed
-  to it is computed as ``recv_experts_offset[i + 1] - recv_experts_offset[i]``
-  and appended to a per-layer list.
-* ``csrc/infer/eplb.cpp`` (``ExpertsManager::save_activate_tokens_trace``):
-  each rank finally dumps a JSON file ``<logdir>/at_trace/<prefix>.json``
-  containing ``layer_<id>`` (flat per-slot activation counts) and
-  ``layer_<id>_deployment`` (the global expert id of every local slot).
+"""MoE expert activation trace (``at_trace``).
 
 The trace is accumulated by the C++ ``record_expert_activation_kunpeng`` op
 (a graph-replay-safe in-place counter registered as a fixed tensor) and the
@@ -45,11 +34,9 @@ from sglang.srt.distributed import (
 
 logger = logging.getLogger(__name__)
 
-# Output sub-directory, mirroring DeepSeek's ``context.logdir + "/at_trace/"``.
 _AT_TRACE_SUBDIR = "at_trace"
 
-# Enabled by default to match the DeepSeek sample behaviour (always records and
-# saves); set SGLANG_KUNPENG_SAVE_AT_TRACE=0 to disable.
+# Enabled by default; set SGLANG_KUNPENG_SAVE_AT_TRACE=0 to disable.
 _IS_ENABLED = os.environ.get("SGLANG_KUNPENG_SAVE_AT_TRACE", "1") != "0"
 
 
@@ -151,8 +138,8 @@ class _ActivationTraceState:
         os.makedirs(out_dir, exist_ok=True)
 
         world_rank, pp_rank, pp_size = self._rank_ids()
-        # Replicate generate.cpp: with PP enabled the file is prefixed by the
-        # pipeline rank, otherwise it is just the zero-padded world rank.
+        # With PP enabled the file is prefixed by the pipeline rank, otherwise
+        # it is just the zero-padded world rank.
         prefix = f"{world_rank:03d}"
         if pp_size > 1:
             prefix = f"{pp_rank}_{prefix}"
@@ -171,7 +158,7 @@ def format_activate_tokens_trace(
     activate_tokens_number_list: Dict[int, List[int]],
     actual_experts_id_list: Dict[int, List[int]],
 ) -> str:
-    """Render the DeepSeek ``save_activate_tokens_trace`` JSON body."""
+    """Render the activation trace JSON body."""
     layers = sorted(
         set(activate_tokens_number_list) | set(actual_experts_id_list)
     )
@@ -191,7 +178,6 @@ def format_activate_tokens_trace(
     return "{" + ",\n".join(entries) + "}\n"
 
 
-# Module-level singleton, mirrors DeepSeek's global ``ep_manager``.
 _state = _ActivationTraceState()
 
 
