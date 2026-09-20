@@ -29,6 +29,11 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.graph import ops as kunpeng
+from sglang.srt.hardware_backend.cpu_kunpeng.at_trace import (
+    ensure_save_on_exit,
+    get_counter_tensor,
+    set_layer_deployment,
+)
 from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
@@ -663,6 +668,21 @@ class KunpengMoE(FusedMoE):
 
         self.swap_mgr = KunpengSwapManager.get_instance()
 
+        # Register the layer's local-slot -> global-expert-id mapping for the
+        # activation trace.
+        # Routed slots are contiguous per EP rank; fused shared experts occupy
+        # the trailing slots with the global ids >= _num_global_routed.
+        ensure_save_on_exit()
+        routed_ids = [
+            self.moe_ep_rank * self._num_local_routed + j
+            for j in range(self._num_local_routed)
+        ]
+        shared_ids = [
+            self._num_global_routed + s
+            for s in range(self.num_fused_shared_experts)
+        ]
+        set_layer_deployment(self.layer_id, routed_ids + shared_ids)
+
     @KunpengProfiler(depth=1)
     def forward(
         self,
@@ -780,6 +800,17 @@ class KunpengMoE(FusedMoE):
         scale = packed_recv_x[:, hidden : hidden + 4].view(torch.float32)
 
         t_gateup_start = time.perf_counter()
+        # Record per-local-expert activation counts for the at_trace dump. The
+        # C++ op mutates a fixed counter tensor in-place so it also runs under
+        # graph replay, unlike the earlier Python-side counting.
+        at_counter = get_counter_tensor()
+        if at_counter is not None:
+            kunpeng.record_expert_activation_kunpeng(
+                dispatch_output.recv_experts_offset,
+                at_counter,
+                self.layer_id,
+                num_local_experts,
+            )
         kunpeng.igemm_fusedmoe_gateup_kunpeng(
             act,
             scale,

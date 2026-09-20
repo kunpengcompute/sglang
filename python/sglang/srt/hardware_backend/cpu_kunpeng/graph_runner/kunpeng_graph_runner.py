@@ -720,6 +720,19 @@ class KunpengGraphRunner:
                     fixed.append(t)
         except Exception:
             pass
+        # at_trace cumulative activation counter, mutated in-place by
+        # record_expert_activation_kunpeng on every replay. It must be a fixed
+        # storage so each replay writes into the same memory Python diffs later.
+        try:
+            from sglang.srt.hardware_backend.cpu_kunpeng.at_trace import (
+                get_counter_tensor,
+            )
+
+            at_counter = get_counter_tensor()
+            if at_counter is not None:
+                fixed.append(at_counter)
+        except Exception:
+            pass
         # EPLB static dispatch map (logical -> physical expert per layer),
         # consumed by remap_topk_ids_to_rank_slot_kunpeng during graph
         # capture.  Each MoE layer reads its own `[layer_id, :]` slice view,

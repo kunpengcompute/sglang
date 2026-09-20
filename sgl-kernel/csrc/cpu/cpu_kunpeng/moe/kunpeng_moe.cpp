@@ -742,6 +742,34 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
 }
 
 // ---------------------------------------------------------------------------
+// record_expert_activation_kunpeng
+//
+// Graph-replay-safe helper for the at_trace dump. In graph mode the Python
+// activation-counting code in layer.py executes only once during capture, so
+// the per-step expert token counts must instead be accumulated by a C++ op
+// that runs on every replay. It adds the running per-slot totals into
+// ``counter`` (int64, laid out as [num_layers, num_local_experts]); the Python
+// side diffs ``counter`` against the previous snapshot after each forward
+// batch to recover the per-step counts (see at_trace.py).
+// ---------------------------------------------------------------------------
+void record_expert_activation_kunpeng(at::Tensor experts_offset,  // [num_local_experts + 1] int32
+                                      at::Tensor counter,          // [num_layers * num_local_experts] int64
+                                      int64_t layer_id, int64_t num_local_experts)
+{
+    TORCH_CHECK(experts_offset.scalar_type() == at::kInt, "experts_offset must be int32");
+    TORCH_CHECK(experts_offset.size(0) == num_local_experts + 1,
+                "experts_offset size must be num_local_experts + 1");
+    TORCH_CHECK(counter.scalar_type() == at::kLong, "counter must be int64");
+    TORCH_CHECK((layer_id + 1) * num_local_experts <= counter.size(0), "counter capacity overflow");
+
+    const int32_t *off = experts_offset.data_ptr<int32_t>();
+    int64_t *cnt = counter.data_ptr<int64_t>() + layer_id * num_local_experts;
+    for (int64_t i = 0; i < num_local_experts; ++i) {
+        cnt[i] += (int64_t)(off[i + 1] - off[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // topk_convert_kunpeng
 //
 // Converts recv_src_info (per-expert, per-rank token counts) into a flat

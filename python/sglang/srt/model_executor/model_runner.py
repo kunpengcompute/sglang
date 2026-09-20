@@ -3242,6 +3242,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.elastic_ep_backend is not None:
             self.maybe_recover_ep_ranks()
 
+        # Persist the MoE expert activation trace after each forward batch so a
+        # long-lived server keeps the at_trace JSON up to date (atexit alone
+        # only fires on clean shutdown). No-op when nothing was recorded.
+        if _is_cpu_920f:
+            from sglang.srt.hardware_backend.cpu_kunpeng.at_trace import (
+                save_activate_tokens_trace,
+            )
+
+            save_activate_tokens_trace()
+
         return output
 
     def _forward_raw(

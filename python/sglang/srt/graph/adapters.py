@@ -1289,6 +1289,22 @@ def _setup_igemm_fusedmoe_down_kunpeng():
     register_op('igemm_fusedmoe_down_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_record_expert_activation_kunpeng():
+    # Accumulates per-local-expert activation counts into ``counter`` in-place.
+    # Runs on every graph replay (unlike Python-side counting, which only
+    # executes once during capture), so per-step token counts can be recovered
+    # afterwards by diffing ``counter`` against a saved snapshot.
+    def shape_infer(experts_offset, counter, layer_id, num_local_experts):
+        return []
+
+    def eager_fn(experts_offset, counter, layer_id, num_local_experts):
+        torch.ops.sgl_kernel.record_expert_activation_kunpeng(
+            experts_offset, counter, int(layer_id), int(num_local_experts))
+        return None
+
+    register_op('record_expert_activation_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_moe_comm_barrier_kunpeng():
     def shape_infer():
         return []
@@ -1389,5 +1405,6 @@ def setup():
     _setup_topk_convert_kunpeng()
     _setup_igemm_fusedmoe_gateup_kunpeng()
     _setup_igemm_fusedmoe_down_kunpeng()
+    _setup_record_expert_activation_kunpeng()
 
 setup()
