@@ -385,13 +385,24 @@ class MoEGate(nn.Module):
             elif _is_cpu_920f:
                 M, K = hidden_states.shape
                 N = self.weight.shape[0]
-                tile_m, tile_n, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+                tile_m, tile_n, tile_k = (
+                    torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+                )
                 blocks_in_k = K // tile_k
                 ws_numel = blocks_in_k * N * M + 1024 if blocks_in_k > 1 else 0
-                packed_hs = kunpeng.bf16_gemm_pack_kunpeng(hidden_states, tile_m, tile_k)
+                packed_hs = kunpeng.bf16_gemm_pack_kunpeng(
+                    hidden_states, tile_m, tile_k
+                )
                 logits = kunpeng.bf16_packed_gemm_kunpeng(
-                    packed_hs, self.weight,
-                    kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16), 32)
+                    packed_hs,
+                    self.weight,
+                    kunpeng.alloc_buffer(
+                        ws_numel,
+                        dtype=torch.bfloat16,
+                        alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get(),
+                    ),
+                    32,
+                )
             else:
                 logits = F.linear(hidden_states, self.weight, None)
 
@@ -448,8 +459,7 @@ class DeepseekV2MoE(nn.Module):
         self.is_nextn = is_nextn
 
         num_experts_for_tp_check = (
-            config.n_routed_experts
-            + get_global_server_args().ep_num_redundant_experts
+            config.n_routed_experts + get_global_server_args().ep_num_redundant_experts
         )
         if self.tp_size > num_experts_for_tp_check:
             raise ValueError(

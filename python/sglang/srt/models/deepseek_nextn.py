@@ -236,7 +236,11 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states = kunpeng.bf16_packed_gemm_kunpeng(
                     packed_eh,
                     self.eh_proj.weight,
-                    kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16),
+                    kunpeng.alloc_buffer(
+                        ws_numel,
+                        dtype=torch.bfloat16,
+                        alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get(),
+                    ),
                     32,
                 )
                 hidden_states = get_attention_tp_group().batch_all_gather(

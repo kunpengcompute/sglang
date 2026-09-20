@@ -227,9 +227,9 @@ at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t
         numel *= s;
     int64_t total_bytes = numel * element_size;
 
-    // 64B (cache line) alignment for memcpy fast paths; fall back to
+    // 4KB (page size) alignment for memcpy fast paths; fall back to
     // unaligned if padding would overflow the pool.
-    constexpr int64_t alignment = 64;
+    constexpr int64_t alignment = 4096;
     uint8_t *cur_ptr = reinterpret_cast<uint8_t *>(shm_available.ptr);
     int64_t align_gap = alignup(cur_ptr, alignment) - cur_ptr;
     if (total_bytes + align_gap > static_cast<int64_t>(shm_available.size)) {
