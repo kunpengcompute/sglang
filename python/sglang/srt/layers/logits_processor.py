@@ -956,7 +956,7 @@ class LogitsProcessor(nn.Module):
                     ),
                     32,
                 )
-                logits = logits[:M_aligned]
+                logits = logits[:M]
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
