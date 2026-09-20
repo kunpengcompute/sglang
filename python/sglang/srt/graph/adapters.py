@@ -15,6 +15,9 @@
 import torch
 
 from sglang.srt.graph import register_op
+from sglang.srt.environ import envs
+
+MEMORY_ALIGNMENT = envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get()
 
 
 def _setup_fused_add_rmsnorm_kunpeng():
@@ -278,7 +281,7 @@ def _setup_bf16_packed_gemm_kunpeng():
     def shape_infer(input, weight, workspace, num_threads):
         M = input.shape[0]
         N = weight.shape[0]
-        return [((M, N), input.dtype)]
+        return [((M, N), input.dtype, MEMORY_ALIGNMENT)]
 
     def eager_fn(input, weight, workspace, num_threads):
         M = input.shape[0]

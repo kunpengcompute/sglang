@@ -930,21 +930,33 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             elif _is_cpu_920f:
-                hs = hidden_states.to(lm_head.weight.dtype)
-                M, K = hs.shape
+                M, K = hidden_states.shape
+                # The optimal kernel of BGEMM requires M to be a multiple of 64, so we need to align M to 64.
+                M_aligned = (M + 63) // 64 * 64
                 N = lm_head.weight.shape[0]
-                tile_m, tile_n, tile_k = (
-                    torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+                hs = kunpeng.alloc_buffer(
+                    M_aligned * K,
+                    dtype=torch.bfloat16,
+                    alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get(),
+                ).view(M_aligned, K)
+                kunpeng.copy_kunpeng(hs[:M], hidden_states)
+                tile_m, _, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(
+                    M_aligned, N, K
                 )
                 blocks_in_k = K // tile_k
-                ws_numel = blocks_in_k * N * M + 1024 if blocks_in_k > 1 else 0
+                ws_numel = blocks_in_k * N * M_aligned + 1024 if blocks_in_k > 1 else 0
                 packed_hs = kunpeng.bf16_gemm_pack_kunpeng(hs, tile_m, tile_k)
                 logits = kunpeng.bf16_packed_gemm_kunpeng(
                     packed_hs,
                     lm_head.weight,
-                    kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16),
+                    kunpeng.alloc_buffer(
+                        ws_numel,
+                        dtype=torch.bfloat16,
+                        alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get(),
+                    ),
                     32,
                 )
+                logits = logits[:M_aligned]
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T

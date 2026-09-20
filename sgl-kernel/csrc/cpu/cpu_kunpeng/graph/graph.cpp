@@ -132,7 +132,7 @@ std::vector<PlaceEntry> pack_intervals(std::vector<Interval> intervals, int memo
         std::vector<size_t> candidates = {0};
         for (const auto &pe : placed) {
             if (intervals_overlap(born, death, pe.born, pe.death)) {
-                size_t aligned_end = (pe.offset + pe.size + memory_alignment - 1) / memory_alignment * memory_alignment;
+                size_t aligned_end = (pe.offset + pe.size + align - 1) / align * align;
                 candidates.push_back(aligned_end);
             }
         }
