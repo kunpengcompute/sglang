@@ -26,7 +26,7 @@
 PREFILL_IP_SPEC="${PREFILL_IP_SPEC:-}"
 PREFILL_IP_FILE="${PREFILL_IP_FILE:-}"
 PREFILL_MASTER_ADDR="${PREFILL_MASTER_ADDR:-xxx.xxx.xxx.1}"
-PREFILL_MASTER_PORT="${PREFILL_MASTER_PORT:-5000}"
+# PREFILL_MASTER_PORT is derived per instance below (5000 + 100 * index).
 
 # Prefill model paths (default to the shared MODEL_PATH)
 MODEL_PATH_PREFILL="${MODEL_PATH_PREFILL:-$MODEL_PATH}"
@@ -56,6 +56,29 @@ if [[ $LONG_PROMPT_PREFILL_INSTANCE == "1" ]]; then
     export PREFILL_EP_SIZE="${PREFILL_TP_SIZE}"
     export PREFILL_PP_SIZE=16
 fi
+
+# ------------------------------------------------------------
+# Prefill tokenizer-separate endpoints (router node), auto-derived from
+# the entry's position in INSTANCES so same-role instances never collide:
+#   PREFILL_TOK_PORT        30001 + global entry index
+#   PREFILL_BOOTSTRAP_PORT  9001  + prefill entry index
+#   PREFILL_NUMA_BASE       4 * prefill entry index (NUMA blocks 0,4,...)
+#   PREFILL_MASTER_PORT     5000 + 100 * prefill entry index — the
+#                          tokenizer's ZMQ port block is port_base..+37
+#                          (port_base = master_port + 1, see server_args
+#                          PortArgs), so instances need disjoint blocks.
+# Entries not listed in INSTANCES fall back to the single-instance
+# defaults (30001 / 9001 / 0 / 5000). Instance env files may still
+# override any of these.
+# ------------------------------------------------------------
+read -r _pf_g _pf_s <<< "$(_instance_indexes "prefill${INSTANCE:+_$INSTANCE}")"
+[[ "$_pf_s" -lt 0 ]] && _pf_s=0
+[[ "$_pf_g" -lt 0 ]] && _pf_g=0
+export PREFILL_TOK_PORT="${PREFILL_TOK_PORT:-$((30001 + _pf_g))}"
+export PREFILL_BOOTSTRAP_PORT="${PREFILL_BOOTSTRAP_PORT:-$((9001 + _pf_s))}"
+export PREFILL_NUMA_BASE="${PREFILL_NUMA_BASE:-$((4 * _pf_s))}"
+PREFILL_MASTER_PORT="${PREFILL_MASTER_PORT:-$((5000 + 100 * _pf_s))}"
+unset _pf_g _pf_s
 
 # ------------------------------------------------------------
 # Prefill SHM / HBW pool

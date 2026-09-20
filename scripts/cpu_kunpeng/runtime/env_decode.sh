@@ -26,7 +26,7 @@
 DECODE_IP_SPEC="${DECODE_IP_SPEC:-}"
 DECODE_IP_FILE="${DECODE_IP_FILE:-}"
 DECODE_MASTER_ADDR="${DECODE_MASTER_ADDR:-xxx.xxx.xxx.17}"
-DECODE_MASTER_PORT="${DECODE_MASTER_PORT:-5010}"
+# DECODE_MASTER_PORT is derived per instance below (5010 + 100 * index).
 
 # Decode model paths (default to the shared MODEL_PATH)
 MODEL_PATH_DECODE="${MODEL_PATH_DECODE:-$MODEL_PATH}"
@@ -43,6 +43,28 @@ export DECODE_REDUNDANT_EXPERTS="${DECODE_REDUNDANT_EXPERTS:-0}"
 export DECODE_INIT_EXPERT_LOCATION="${DECODE_INIT_EXPERT_LOCATION:-}"
 export DECODE_EP_DISPATCH_ALGORITHM="${DECODE_EP_DISPATCH_ALGORITHM:-}"
 export DECODE_SGLANG_KUNPENG_MOE_SHUFFLE_MODE="${DECODE_SGLANG_KUNPENG_MOE_SHUFFLE_MODE:-0}"
+
+# ------------------------------------------------------------
+# Decode tokenizer-separate endpoints (router node), auto-derived from
+# the entry's position in INSTANCES so same-role instances never collide:
+#   DECODE_TOK_PORT   30001 + global entry index (30002 for the classic
+#                     "prefill,decode" list)
+#   DECODE_NUMA_BASE  8 + 4 * decode entry index (NUMA blocks 8,12,...)
+#   DECODE_MASTER_PORT 5010 + 100 * decode entry index — the tokenizer's
+#                     ZMQ port block is port_base..+37 (port_base =
+#                     master_port + 1, see server_args PortArgs), so
+#                     instances need disjoint blocks.
+# Entries not listed in INSTANCES fall back to the single-instance
+# defaults (30002 / 8 / 5010). Instance env files may still override.
+# ------------------------------------------------------------
+read -r _de_g _de_s <<< "$(_instance_indexes "decode${INSTANCE:+_$INSTANCE}")"
+[[ "$_de_s" -lt 0 ]] && _de_s=0
+[[ "$_de_g" -lt 0 ]] && _de_g=1
+export DECODE_TOK_PORT="${DECODE_TOK_PORT:-$((30001 + _de_g))}"
+export DECODE_BOOTSTRAP_PORT="${DECODE_BOOTSTRAP_PORT:-9001}"
+export DECODE_NUMA_BASE="${DECODE_NUMA_BASE:-$((8 + 4 * _de_s))}"
+DECODE_MASTER_PORT="${DECODE_MASTER_PORT:-$((5010 + 100 * _de_s))}"
+unset _de_g _de_s
 
 # ------------------------------------------------------------
 # Decode SHM / HBW pool

@@ -37,18 +37,16 @@ fi
 
 # Role-dependent config + defaults.
 # prefill/native/build -> prefill config; decode -> decode config.
-# router needs BOTH sides' topology (master addrs, DP sizes); decode is
-# sourced first so shared role defaults keep the decode values.
-# tokenizer fronts ONE side: its INSTANCE arg is "<side>[_<instance>]"
-# (e.g. "prefill", "decode_128p") — only that side's role env is loaded,
-# with the side's instance file if an instance suffix is given.
+# router/tokenizer resolve each instance's role env themselves (per-entry
+# subshells in launch_router.sh / server_router.sh / launch_tokenizer.sh),
+# so they only load the base env here — no prefill/decode exports leak
+# into the control shell.
 case "$ACTION" in
     prefill|native|build)
         source "$SCRIPT_DIR/runtime/env_prefill.sh" || return 1
         ;;
     router)
-        source "$SCRIPT_DIR/runtime/env_decode.sh" || return 1
-        source "$SCRIPT_DIR/runtime/env_prefill.sh" || return 1
+        : # base env only; backends are resolved per INSTANCES entry
         ;;
     tokenizer)
         _tok_side="${INSTANCE%%_*}"
@@ -102,7 +100,17 @@ if [[ ! -f "${SCRIPT_DIR}/.time_env.sh" ]]; then
     bash "${SCRIPT_DIR}/runtime/update_time.sh"
 fi
 source "${SCRIPT_DIR}/.time_env.sh"
-export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/$ACTION/${LOG_TIME}"
+# Instance-qualified log subdir ("prefill", "prefill_128p", ...) so
+# same-role instances launched in one `launch.sh all` run never share a
+# log directory (ssh logs, rank logs and "latest" symlinks stay per-instance).
+# Exception: tokenizer — all its log files already carry the side/instance
+# in their names, so one shared "tokenizer/" dir is enough.
+if [[ "$ACTION" == "tokenizer" ]]; then
+    export LOG_SUBDIR="tokenizer"
+else
+    export LOG_SUBDIR="$ACTION${INSTANCE:+_$INSTANCE}"
+fi
+export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/${LOG_SUBDIR}/${LOG_TIME}"
 export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 
 if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]] || [[ "$ACTION" == "tokenizer" ]] || [[ "$ACTION" == "build" ]]; then

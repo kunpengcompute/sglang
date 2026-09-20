@@ -87,6 +87,33 @@ expand_ip_range() {
 
 
 # ------------------------------------------------------------
+# Helper: per-instance router-node resource indexes.
+# _instance_indexes <entry> prints "<global_idx> <side_idx>" for the entry
+# ("<role>" or "<role>_<instance>") within the comma-separated INSTANCES
+# list: global_idx = position among all entries, side_idx = position among
+# entries of the same role prefix. Both are -1 when the entry is not
+# listed (caller falls back to that side's single-instance defaults).
+# ------------------------------------------------------------
+_instance_indexes() {
+    local entry="$1" role="${1%%_*}"
+    local g=0 s=0 gidx=-1 sidx=-1 e r
+    IFS=',' read -ra _il <<< "${INSTANCES:-}"
+    for e in "${_il[@]}"; do
+        e="${e//[[:space:]]/}"
+        [[ -z "$e" ]] && continue
+        if [[ "$e" == "$entry" ]]; then
+            gidx=$g; sidx=$s
+            break
+        fi
+        ((g++))
+        r="${e%%_*}"
+        [[ "$r" == "$role" ]] && ((s++))
+    done
+    echo "$gidx $sidx"
+}
+
+
+# ------------------------------------------------------------
 # Helpers: resolve variables by role prefix (PREFILL / DECODE / NATIVE)
 # ------------------------------------------------------------
 _export_node_config() {

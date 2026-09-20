@@ -45,16 +45,38 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/env.sh" tokenizer "${TO
 # i.e. prefill = NUMA 0-3, second prefill = NUMA 4-7, decode = NUMA 8-11;
 # the decode role runs no bootstrap server (prefill-only), so its base
 # upper half stays spare. NUMA 15 is left for the gateway.
+# With multiple instances per side, each entry's NUMA base / HTTP port /
+# bootstrap port are auto-derived from its position in INSTANCES (see
+# env_prefill.sh / env_decode.sh); the values below are only fallbacks
+# for when the side's role env was not sourced.
 export PREFILL_NUMA_BASE="${PREFILL_NUMA_BASE:-0}"
 export DECODE_NUMA_BASE="${DECODE_NUMA_BASE:-8}"
-export PREFILL_BOOTSTRAP_CPU="${PREFILL_BOOTSTRAP_CPU:-$((PREFILL_NUMA_BASE * 38 + 18))-$((PREFILL_NUMA_BASE * 38 + 35))}"
+export PREFILL_BOOTSTRAP_CPU="${PREFILL_BOOTSTRAP_CPU:-$((PREFILL_NUMA_BASE * 38 + 18))}-$((PREFILL_NUMA_BASE * 38 + 35))"
+
+# Side-specific endpoints (per-instance overridable via the side's env):
+#   TOK_PORT            HTTP port on the router node (30001/30002 by default)
+#   TOK_BOOTSTRAP_PORT  disaggregation bootstrap server port (9001 by default)
+if [[ "$TOK_SIDE" == "prefill" ]]; then
+    TOK_PORT="${PREFILL_TOK_PORT:-30001}"
+    TOK_BOOTSTRAP_PORT="${PREFILL_BOOTSTRAP_PORT:-9001}"
+    TOK_DP_SIZE="$PREFILL_DP_SIZE"
+    TOK_DIST_ADDR="$PREFILL_MASTER_ADDR:$PREFILL_MASTER_PORT"
+    TOK_NUMA_BASE="$PREFILL_NUMA_BASE"
+    export SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU="$PREFILL_BOOTSTRAP_CPU"
+else
+    TOK_PORT="${DECODE_TOK_PORT:-30002}"
+    TOK_BOOTSTRAP_PORT="${DECODE_BOOTSTRAP_PORT:-9001}"
+    TOK_DP_SIZE="$DECODE_DP_SIZE"
+    TOK_DIST_ADDR="$DECODE_MASTER_ADDR:$DECODE_MASTER_PORT"
+    TOK_NUMA_BASE="$DECODE_NUMA_BASE"
+fi
 
 # Common args for tokenizer-side HTTP server
 HTTP_COMMON_ARGS=(
     --model "$MODEL_PATH"
     --device cpu --trust-remote-code
     --host "$ROUTER_IP"
-    --disaggregation-bootstrap-port 9001
+    --disaggregation-bootstrap-port "$TOK_BOOTSTRAP_PORT"
     --nnodes 1 --node-rank 0 --dist-timeout 600
     --tp-size 1
     --max-total-tokens 64
@@ -65,21 +87,16 @@ HTTP_COMMON_ARGS=(
     --tokenizer-backend "${SGLANG_TOKENIZER_BACKEND:-huggingface}"
 )
 
-# Launch the HTTP server for the requested side (tokenizer side)
-if [[ "$TOK_SIDE" == "prefill" ]]; then
-    TOK_PORT=30001
-    TOK_DP_SIZE="$PREFILL_DP_SIZE"
-    TOK_DIST_ADDR="$PREFILL_MASTER_ADDR:$PREFILL_MASTER_PORT"
-    TOK_NUMA_BASE="$PREFILL_NUMA_BASE"
-    export SGLANG_KUNPENG_BOOTSTRAP_SERVER_CPU="$PREFILL_BOOTSTRAP_CPU"
-else
-    TOK_PORT=30002
-    TOK_DP_SIZE="$DECODE_DP_SIZE"
-    TOK_DIST_ADDR="$DECODE_MASTER_ADDR:$DECODE_MASTER_PORT"
-    TOK_NUMA_BASE="$DECODE_NUMA_BASE"
-fi
-
-echo "Launching $TOK_SIDE HTTP server..."
+echo "Launching $TOK_SIDE${TOK_INSTANCE:+ ($TOK_INSTANCE)} HTTP server on port $TOK_PORT..."
+# Record this instance's invocation and full environment for debugging
+{
+    echo "[$(date +%T)] invocation: $0 $*"
+    echo "[$(date +%T)] side=$TOK_SIDE instance=${TOK_INSTANCE:-} port=$TOK_PORT bootstrap_port=$TOK_BOOTSTRAP_PORT numa_base=$TOK_NUMA_BASE"
+    echo "---- environment ----"
+    env | sort
+} > "$LOG_PATH/env_tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}.log"
+_tok_log="$LOG_PATH/tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}_http.log"
+echo "[$(date +%T)] command: SGLANG_KUNPENG_TOKENIZER_BASE_NUMA=$TOK_NUMA_BASE LD_PRELOAD=$LIBPTHREAD_HOOK_PATH python -m sglang.launch_server ${HTTP_COMMON_ARGS[*]} --dp-size $TOK_DP_SIZE --port $TOK_PORT --dist-init-addr $TOK_DIST_ADDR --disaggregation-mode $TOK_SIDE" > "$_tok_log"
 SGLANG_KUNPENG_TOKENIZER_BASE_NUMA="$TOK_NUMA_BASE" \
 LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
 python -m sglang.launch_server \
@@ -88,7 +105,7 @@ python -m sglang.launch_server \
     --port "$TOK_PORT" \
     --dist-init-addr "$TOK_DIST_ADDR" \
     --disaggregation-mode "$TOK_SIDE" \
-> "$LOG_PATH/tokenizer_${TOK_SIDE}_http.log" 2>&1 &
+>> "$_tok_log" 2>&1 &
 
 # Poll until the HTTP server is ready (up to 30 minutes)
 echo "Waiting for HTTP server on port $TOK_PORT to be ready..."
