@@ -115,18 +115,22 @@ fi
 # for multi-prefill-instance deployments (see env_base.sh). Applied after
 # the backend loop so the fallback arg-count check above stays intact.
 if [[ -n "${ROUTER_PREFILL_POLICY:-}" ]]; then
-    SPECIFIC_ARGS+=(
-        --prefill-policy "$ROUTER_PREFILL_POLICY"
-        --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-64}"
-        --balance-rel-threshold "${ROUTER_BALANCE_REL_THRESHOLD:-1.5}"
-        --bucket-adjust-interval-secs "${ROUTER_BUCKET_ADJUST_INTERVAL_SECS:-5}"
-    )
     # Grouped mode: short requests (< LENGTH_THRESHOLD chars) -> first
     # SHORT_COUNT prefill backends by ascending URL, long ones -> the rest.
+    # Balance thresholds / bucket adjust are bucket-policy knobs and are
+    # skipped in grouped mode.
     if [[ "${ROUTER_PREFILL_SHORT_COUNT:-0}" != "0" ]]; then
         SPECIFIC_ARGS+=(
+            --prefill-policy "$ROUTER_PREFILL_POLICY"
             --prefill-short-count "$ROUTER_PREFILL_SHORT_COUNT"
             --prefill-length-threshold "${ROUTER_PREFILL_LENGTH_THRESHOLD:-4096}"
+        )
+    else
+        SPECIFIC_ARGS+=(
+            --prefill-policy "$ROUTER_PREFILL_POLICY"
+            --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-64}"
+            --balance-rel-threshold "${ROUTER_BALANCE_REL_THRESHOLD:-1.5}"
+            --bucket-adjust-interval-secs "${ROUTER_BUCKET_ADJUST_INTERVAL_SECS:-5}"
         )
     fi
 fi
