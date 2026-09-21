@@ -18,12 +18,15 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
-    FINISH_ABORT,
+    FINISH_LENGTH,
+    FINISH_MATCHED_STR,
+    FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
+from sglang.srt.utils import is_cpu_920f
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler
 
@@ -38,6 +41,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
+
+# Sentinel for an unlimited max_new_tokens / vocab_size in the fused PP+MTP
+# finish-check kernel (a request with max_new_tokens=None can never hit the
+# FINISH_LENGTH branch, so INT32_MAX reproduces that semantics).
+_MTP_MNT_UNLIMITED = 2**31 - 1
 
 # Cross-process batch timeline switch (scheduler -> detokenizer -> router ->
 # tokenizer worker); see SGLANG_TOKENIZER_TIMELINE_LOG in environ.py.
@@ -109,7 +117,7 @@ class SchedulerOutputProcessorMixin:
             ):
                 # PP+MTP: aborts/timeout (`to_finish`) are arbitrated by the
                 # last rank's verify and reconciled via the ring `-1`
-                # placeholder (see `_pp_mtp_apply_verify_result`); keep the
+                # placeholder (see `_pp_mtp_apply_verify_batch`); keep the
                 # pending abort alive here.
                 req.check_finished(skip_to_finish=True)
             else:
@@ -492,6 +500,9 @@ class SchedulerOutputProcessorMixin:
         ):
             self._pp_mtp_apply_verify_batch(batch, result)
 
+        # Hoisted out of the per-request loop below (attribute lookup only).
+        pending_drafts = getattr(self, "_pp_pending_drafts", None)
+
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -504,7 +515,6 @@ class SchedulerOutputProcessorMixin:
             # finished before its verify) reaches this point. Must not be
             # gated on the current microbatch (pp_loop_size microbatch slots
             # share this scheduler-level dict), only on per-req terminal state.
-            pending_drafts = getattr(self, "_pp_pending_drafts", None)
             if pending_drafts is not None and (req.finished() or req.is_retracted):
                 pending_drafts.pop(req.rid, None)
 
@@ -620,118 +630,6 @@ class SchedulerOutputProcessorMixin:
             num_accepted_drafts=result.num_accepted_drafts,
         )
 
-    def _pp_mtp_apply_verify_result(
-        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult, i: int
-    ) -> None:
-        """Replicate the last rank's MTP verify updates for request i.
-
-        Mirrors the per-request updates of `EagleVerifyInput.verify()` so that
-        every PP rank keeps identical request state: the accepted tokens are
-        appended to output_ids, finish conditions are checked, and KV
-        bookkeeping advances. The rejected draft's KV slots are freed
-        batch-wide by `_pp_mtp_evict_rejected_drafts` after the per-request
-        loop (mirroring the last rank's single-pass eviction).
-        """
-        req = batch.reqs[i]
-        num_accepted = int(batch.pp_mtp_accepted_tokens[i])
-
-        if _DEBUG_PP_MTP:
-            pp_rank = getattr(self, "pp_rank", None)
-            logger.info(
-                f"[PP{pp_rank}] apply_verify: i={i} rid={req.rid} "
-                f"num_accepted={num_accepted}"
-            )
-
-        if num_accepted < 1:
-            # The kernel contract guarantees num_accepted >= 1 (the root is
-            # always accepted).  Skipping here would diverge the allocator
-            # state from the last rank (which already freed the rejected
-            # slots) and eventually desync the running batches -- fail loudly
-            # instead.
-            raise RuntimeError(
-                f"PP+MTP: num_accepted={num_accepted} < 1 for req {req.rid}; "
-                "ring message corrupt or kernel contract violated"
-            )
-
-        # The flattened accepted tokens (result.next_token_ids) split by the
-        # per-req accepted counts.
-        offset = sum(int(t) for t in batch.pp_mtp_accepted_tokens[:i])
-        if offset + num_accepted > result.next_token_ids.numel():
-            raise RuntimeError(
-                f"PP+MTP: next_token_ids slice [{offset}:{offset + num_accepted}] "
-                f"out of range ({result.next_token_ids.numel()}) for req "
-                f"{req.rid}; ring message misaligned"
-            )
-        accepted_tokens = result.next_token_ids[offset : offset + num_accepted]
-
-        think_end_id = batch.model_config.think_end_id
-        for tok in accepted_tokens.tolist():
-            req.output_ids.append(tok)
-            if req.require_reasoning and think_end_id is not None:
-                req.update_reasoning_tokens(tok, think_end_id)
-            # skip_to_finish: aborts/timeout (`to_finish`) are arbitrated
-            # exclusively by the last rank (which consumes them in the verify
-            # shell) and propagate here via the `-1` draft placeholder in the
-            # ring message.  Consuming them locally as well would race with
-            # the ring's per-hop AbortReq forwarding and desync the batches.
-            req.check_finished(skip_to_finish=True)
-            if not req.finished() and req.grammar is not None:
-                try:
-                    req.grammar.accept_token(tok)
-                except ValueError as e:
-                    logger.info(f"{req=}\n{e}")
-                    raise e
-                req.check_finished(skip_to_finish=True)
-            if req.finished():
-                break
-
-        # ── Finish reconciliation (single-arbiter semantics) ──────────────
-        # `pp_mtp_ring_finished[i]` <=> `draft_tokens[i] < 0` <=> the last
-        # rank's verify finished this req this round.
-        ring_finished = batch.pp_mtp_ring_finished
-        if ring_finished is not None:
-            if ring_finished[i] and not req.finished():
-                # The last rank finished this req this round (the `-1` draft
-                # placeholder IS the verdict).  Consume the local `to_finish`
-                # if one is pending (typical: the abort arrived while this
-                # rank was awaiting the ring); otherwise synthesize a generic
-                # abort (timeout boundary race).  Either way the req ends up
-                # finished with a FINISH_ABORT reason, matching the last
-                # rank's verdict.
-                if req.to_finish is not None:
-                    req.finished_reason = req.to_finish
-                    req.to_finish = None
-                else:
-                    req.finished_reason = FINISH_ABORT(
-                        "Finished by last rank's verify verdict "
-                        "(abort/timeout race resolved by ring placeholder)."
-                    )
-                    logger.warning(
-                        "PP+MTP: req %s finished by ring verdict without a "
-                        "local pending abort (timeout boundary race); "
-                        "generic FINISH_ABORT synthesized.",
-                        req.rid,
-                    )
-            elif not ring_finished[i] and req.finished():
-                # The kernel/official-verify on the last rank and the
-                # replicated token-level checks here must agree (a125f622d
-                # aligned the finish sets).  Disagreement means the
-                # replication semantics have drifted -- raise instead of
-                # silently desyncing the running batches.
-                raise RuntimeError(
-                    f"PP+MTP: req {req.rid} finished locally but the last "
-                    "rank's verify verdict is alive; finish-check semantics "
-                    "have diverged between PP ranks"
-                )
-
-        req.kv_committed_len += num_accepted
-        req.kv_allocated_len = req.kv_committed_len
-        req.spec_verify_ct += 1
-
-        # NOTE: the rejected draft KV slots are freed batch-wide (after the
-        # per-request loop) by `_pp_mtp_evict_rejected_drafts`, mirroring the
-        # last rank's single-pass eviction inside EagleVerifyInput.verify().
-
     def _pp_mtp_evict_rejected_drafts(
         self: Scheduler, batch: ScheduleBatch
     ) -> None:
@@ -744,6 +642,11 @@ class SchedulerOutputProcessorMixin:
         in a single pass. Runs only on non-last ranks, which never execute the
         verify phase.
 
+        On 920F the whole chain (mask + page alignment + free-slot compact)
+        runs inside `evict_rejected_drafts_kunpeng` — a single parallel_for
+        kernel using the exact page-alignment formula of the last rank's
+        `verify_mtp_kunpeng`, so both ranks free identical slot sets.
+
         The mask is allocated over the FULL `out_cache_loc` length so that any
         slots beyond the `bs * draft_token_num` real request rows (padding /
         dummy tokens) are masked out (False) and never freed here. Boolean
@@ -752,11 +655,7 @@ class SchedulerOutputProcessorMixin:
         the verify batch carries any padding. This matches the pre-batch
         per-request eviction, which tolerated such trailing padding.
         """
-        from sglang.srt.speculative.spec_utils import (
-            align_evict_mask_to_page_size,
-            align_evict_mask_to_page_size_native,
-        )
-        from sglang.srt.utils import is_cpu_920f
+        from sglang.srt.speculative.spec_utils import align_evict_mask_to_page_size
 
         num_accepted = batch.pp_mtp_accepted_tokens
         out_cache_loc = batch.out_cache_loc
@@ -780,6 +679,22 @@ class SchedulerOutputProcessorMixin:
                     f"need >= {bs * draft_token_num})"
                 )
             return
+        if is_cpu_920f():
+            # One parallel kernel replaces the arange / broadcast-compare /
+            # zeros / invert / page-align / bool-index aten chain. For
+            # page_size == 1 the kernel's alignment window never intersects
+            # the evicted window (verified in test_mtp_kernels.py), so it
+            # also reproduces the page_size == 1 fast path below.
+            free_slots = torch.ops.sgl_kernel.evict_rejected_drafts_kunpeng(
+                num_accepted,
+                out_cache_loc,
+                batch.seq_lens,
+                draft_token_num,
+                self.page_size,
+            )
+            if free_slots.numel() > 0:
+                self.token_to_kv_pool_allocator.free(free_slots)
+            return
         device = out_cache_loc.device
         # Per-req rule: keep columns [0, num_accepted), evict the trailing
         # columns [num_accepted, draft_token_num) of each real request row.
@@ -795,29 +710,24 @@ class SchedulerOutputProcessorMixin:
             self.token_to_kv_pool_allocator.free(out_cache_loc[evict_mask])
         else:
             # Only evict full empty pages; do not evict partial empty pages.
-            if is_cpu_920f():
-                align_evict_mask_to_page_size_native(
-                    batch.seq_lens, evict_mask, self.page_size, draft_token_num
-                )
-            else:
-                from sglang.srt.utils import next_power_of_2
+            from sglang.srt.utils import next_power_of_2
 
-                align_evict_mask_to_page_size[len(batch.seq_lens),](
-                    batch.seq_lens,
-                    evict_mask,
-                    self.page_size,
-                    draft_token_num,
-                    next_power_of_2(draft_token_num),
-                )
+            align_evict_mask_to_page_size[len(batch.seq_lens),](
+                batch.seq_lens,
+                evict_mask,
+                self.page_size,
+                draft_token_num,
+                next_power_of_2(draft_token_num),
+            )
             self.token_to_kv_pool_allocator.free(out_cache_loc[evict_mask])
 
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_mtp_apply_verify_batch(
         self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> None:
-        """Batch version of `_pp_mtp_apply_verify_result` over all requests.
+        """Replicate the last rank's MTP verify updates over all requests.
 
-        Semantics are identical to calling the per-request method once per req,
+        Semantics are identical to the former per-request replication,
         but two expensive per-request patterns are removed:
 
         * The accepted-token prefix offsets are computed once with a single O(n)
@@ -825,6 +735,15 @@ class SchedulerOutputProcessorMixin:
           which is O(n^2) across the batch).
         * Per-request output_ids / KV bookkeeping / spec-stats updates run off a
           single `.tolist()` slice.
+
+        On 920F the whole finish detection additionally runs inside
+        `pp_mtp_check_finish_kunpeng` (a single parallel_for C++ kernel
+        sharing the `check_finish_token` predicate with the last rank's
+        `verify_mtp_kunpeng`), replacing the per-request
+        `Req.check_finished` calls whose per-token tokenizer property
+        access and set membership tests dominated this stage. The Python
+        loop then only writes Req state (output_ids / finish reason / KV
+        bookkeeping).
 
         Rejected-draft KV eviction is intentionally NOT part of this method; it
         runs once, batch-wide, in `_pp_mtp_evict_rejected_drafts` (same guard),
@@ -835,7 +754,7 @@ class SchedulerOutputProcessorMixin:
         if n == 0:
             return
 
-        counts_int = [int(c) for c in batch.pp_mtp_accepted_tokens]
+        counts_int = batch.pp_mtp_accepted_tokens.tolist()
         # offsets[i] = sum(counts_int[:i]); single O(n) prefix pass.
         offsets = [0] * (n + 1)
         for i in range(n):
@@ -847,6 +766,13 @@ class SchedulerOutputProcessorMixin:
         # the python list directly.
         total_accepted = offsets[n]
         flat_toks = result.next_token_ids[:total_accepted].tolist()
+
+        # 920F fused finish verdict (None when the guard rejects the batch —
+        # the guard mirrors the last rank's verify() fused dispatch — in
+        # which case the per-request Python replication below stays
+        # authoritative and both ranks keep the same finish semantics).
+        verdict = self._pp_mtp_fused_finish_verdict(batch, result, total_accepted)
+
         for i, req in enumerate(batch.reqs):
             req: Req
             num_accepted = counts_int[i]
@@ -855,42 +781,69 @@ class SchedulerOutputProcessorMixin:
             offset = offsets[i]
             toks = flat_toks[offset : offset + num_accepted]
 
-            sp = req.sampling_params
-            need_reasoning = req.require_reasoning and think_end_id is not None
-            # Fast path: no grammar, no per-token reasoning update, and no way
-            # to finish mid-slice. MTP accepted tokens are by construction
-            # non-terminal (the verifier only accepts valid continuations), so
-            # token/stop finishes cannot trigger mid-slice; the budget and
-            # stop-str guards rule out the remaining intermediate finishes.
-            # One extend + one check_finished over the whole slice is then
-            # exactly equivalent to the per-token loop.
-            if (
-                req.grammar is None
-                and not need_reasoning
-                and (
-                    sp.max_new_tokens is None
-                    or len(req.output_ids) + num_accepted <= sp.max_new_tokens
-                )
-                and not sp.stop_strs
-                and not sp.stop_regex_strs
-            ):
+            if verdict is not None:
+                # Fused replica path: zero Req.check_finished calls. The
+                # verdict re-evaluates the shared kernel predicate on the
+                # same inputs, so it equals the last rank's in-kernel
+                # decision by construction.
                 req.output_ids.extend(toks)
-                req.check_finished(num_accepted)
+                if verdict[0][i]:
+                    reason = verdict[1][i]
+                    if reason == 0:
+                        req.finished_reason = FINISH_LENGTH(length=verdict[2][i])
+                    elif reason == 1:
+                        req.finished_reason = FINISH_MATCHED_TOKEN(
+                            matched=verdict[2][i]
+                        )
+                    else:
+                        req.finished_reason = FINISH_MATCHED_STR(
+                            matched="NaN happened"
+                        )
+                    req.finished_len = verdict[3][i]
+                elif req.to_finish is not None:
+                    # Mirror the last-rank shell ordering (eagle_info.py
+                    # `_verify_kunpeng`): the kernel verdict wins; a pending
+                    # to_finish is consumed only when the verdict kept the
+                    # request alive.
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
             else:
-                for tok in toks:
-                    req.output_ids.append(tok)
-                    if need_reasoning:
-                        req.update_reasoning_tokens(tok, think_end_id)
-                    req.check_finished()
-                    if not req.finished() and req.grammar is not None:
-                        try:
-                            req.grammar.accept_token(tok)
-                        except ValueError as e:
-                            logger.info(f"{req=}\n{e}")
-                            raise e
+                sp = req.sampling_params
+                need_reasoning = req.require_reasoning and think_end_id is not None
+                # Fast path: no grammar, no per-token reasoning update, and no way
+                # to finish mid-slice. MTP accepted tokens are by construction
+                # non-terminal (the verifier only accepts valid continuations), so
+                # token/stop finishes cannot trigger mid-slice; the budget and
+                # stop-str guards rule out the remaining intermediate finishes.
+                # One extend + one check_finished over the whole slice is then
+                # exactly equivalent to the per-token loop.
+                if (
+                    req.grammar is None
+                    and not need_reasoning
+                    and (
+                        sp.max_new_tokens is None
+                        or len(req.output_ids) + num_accepted <= sp.max_new_tokens
+                    )
+                    and not sp.stop_strs
+                    and not sp.stop_regex_strs
+                ):
+                    req.output_ids.extend(toks)
+                    req.check_finished(num_accepted)
+                else:
+                    for tok in toks:
+                        req.output_ids.append(tok)
+                        if need_reasoning:
+                            req.update_reasoning_tokens(tok, think_end_id)
                         req.check_finished()
-                    if req.finished():
-                        break
+                        if not req.finished() and req.grammar is not None:
+                            try:
+                                req.grammar.accept_token(tok)
+                            except ValueError as e:
+                                logger.info(f"{req=}\n{e}")
+                                raise e
+                            req.check_finished()
+                        if req.finished():
+                            break
 
             req.kv_committed_len += num_accepted
             req.kv_allocated_len = req.kv_committed_len
@@ -903,6 +856,127 @@ class SchedulerOutputProcessorMixin:
         # batch-wide, in `_pp_mtp_evict_rejected_drafts` (same guard as this
         # method), which mirrors the last rank's single-pass eviction inside
         # EagleVerifyInput.verify() for any speculative_num_steps.
+
+    def _pp_mtp_fused_finish_verdict(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        total_accepted: int,
+    ):
+        """Batch-level finish verdict for the non-last PP ranks (920F).
+
+        After a verify round, every non-last rank must answer, per request,
+        "did it finish this round, and why". The default path answers by
+        calling `Req.check_finished` per request — a serial Python walk whose
+        per-token `tokenizer.eos_token_id` property access and stop/eos set
+        membership tests dominate this stage. This method instead packs the
+        per-req pure-token finish parameters once (mirroring the last rank's
+        `_verify_kunpeng` packing in eagle_info.py, so both ranks evaluate
+        the identical predicate inputs) and runs `pp_mtp_check_finish_kunpeng`
+        — a single parallel_for C++ kernel whose `check_finish_token`
+        predicate is the same implementation used inside
+        `verify_mtp_kunpeng`, so the replicas cannot drift from the last
+        rank's in-kernel verdict.
+
+        The guard mirrors the last rank's `EagleVerifyInput.verify()` fused
+        dispatch (920F, no grammar / reasoning / stop-strs / stop-regex) so
+        both ranks always land on the same finish-semantics implementation:
+        whenever the last rank runs the fused kernel, the replicas run this
+        replica kernel; whenever it falls back to the official verify, the
+        replicas fall back to the Python replication path. Per-condition:
+
+        - grammar: the replica path never advances `grammar.accept_token`
+          (an external state machine fed per token, interleaved with the
+          finish break) — must fall back to the per-token Python path.
+        - reasoning: `update_reasoning_tokens` is per-token statistics only
+          (not a finish condition; the count is only surfaced through the
+          first rank's usage report), kept conservative here.
+        - stop_strs / stop_regex_strs: `check_finish_token` has no
+          string-level finish (it needs a tokenizer.decode of the output
+          tail, which cannot run in the kernel and would interleave with
+          the kernel's token-level truncation) — must fall back.
+
+        topk needs no guard: the PP+MTP verify batch is built by
+        `_pp_mtp_prepare_verify_batch` with `topk=1` hardcoded, so the last
+        rank's `topk == 1` dispatch condition is always true.
+
+        Returns (finished, reason, matched, fin_len) python lists, or None
+        when the guard rejects the batch.
+        """
+        from sglang.srt.speculative.eagle_info import _pack_id_sets
+
+        reqs = batch.reqs
+        if (
+            not is_cpu_920f()
+            or any(r.grammar is not None for r in reqs)
+            or any(r.require_reasoning for r in reqs)
+            or any(
+                r.sampling_params.stop_strs or r.sampling_params.stop_regex_strs
+                for r in reqs
+            )
+        ):
+            return None
+
+        device = batch.device
+        out_ids_len = torch.tensor(
+            [len(r.output_ids) for r in reqs], dtype=torch.int64, device=device
+        )
+        max_new_tokens = torch.tensor(
+            [
+                r.sampling_params.max_new_tokens
+                if r.sampling_params.max_new_tokens is not None
+                else _MTP_MNT_UNLIMITED
+                for r in reqs
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        vocab_size = torch.tensor(
+            [
+                r.vocab_size if r.vocab_size is not None else _MTP_MNT_UNLIMITED
+                for r in reqs
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        stop_sets = []
+        eos_sets = []
+        for r in reqs:
+            stop_sets.append(list(r.sampling_params.stop_token_ids or []))
+            eos_set = list(r.eos_token_ids or [])
+            if r.tokenizer is not None:
+                if r.tokenizer.eos_token_id is not None:
+                    eos_set.append(r.tokenizer.eos_token_id)
+                eos_set.extend(r.tokenizer.additional_stop_token_ids or [])
+            eos_sets.append(eos_set)
+        stop_flat, stop_off = _pack_id_sets(stop_sets, device)
+        eos_flat, eos_off = _pack_id_sets(eos_sets, device)
+        ignore_eos = torch.tensor(
+            [bool(r.sampling_params.ignore_eos) for r in reqs],
+            dtype=torch.bool,
+            device=device,
+        )
+
+        finished_t, reason_t, matched_t, fin_len_t = (
+            torch.ops.sgl_kernel.pp_mtp_check_finish_kunpeng(
+                result.next_token_ids[:total_accepted],
+                batch.pp_mtp_accepted_tokens,
+                out_ids_len,
+                max_new_tokens,
+                vocab_size,
+                stop_flat,
+                stop_off,
+                eos_flat,
+                eos_off,
+                ignore_eos,
+            )
+        )
+        return (
+            finished_t.tolist(),
+            reason_t.tolist(),
+            matched_t.tolist(),
+            fin_len_t.tolist(),
+        )
 
     def _handle_finished_req(
         self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput

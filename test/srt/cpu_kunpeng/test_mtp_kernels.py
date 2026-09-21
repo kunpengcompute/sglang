@@ -766,6 +766,164 @@ def _check_verify_mtp_sampling(bs, nv, vocab, page_size, seq_lens_cpu_dtype,
 
 
 # ---------------------------------------------------------------------------
+# pp_mtp_check_finish_kunpeng: non-last PP rank finish-verdict replica
+# ---------------------------------------------------------------------------
+
+def _ref_pp_mtp_check_finish(toks_per_req, out_lens, mnts, vss, stop_sets,
+                             eos_sets, ignore_eos_flags):
+    """Mirror of pp_mtp_check_finish_kunpeng: re-evaluate the shared
+    `_check_finish_token` predicate (see above) over each req's accepted
+    segment.  Returns (finished, reason, matched, fin_len) python lists."""
+    finished, reasons, matched, fin_len = [], [], [], []
+    for toks, out_len, mnt, vs, stop, eos, ig in zip(
+        toks_per_req, out_lens, mnts, vss, stop_sets, eos_sets, ignore_eos_flags
+    ):
+        fin, reason, m, fl = 0, -1, 0, 0
+        for k, tok in enumerate(toks):
+            reason, m, fl = _check_finish_token(
+                tok, out_len + k + 1, mnt, vs, stop, eos, ig
+            )
+            if reason != -1:
+                fin = 1
+                break
+        finished.append(fin)
+        reasons.append(reason)
+        matched.append(m)
+        fin_len.append(fl)
+    return finished, reasons, matched, fin_len
+
+
+def _pack_stop_eos(stop_sets, eos_sets):
+    stop_flat = torch.tensor(sum(stop_sets, []), dtype=torch.int32)
+    stop_off = torch.tensor([0] + [len(s) for s in stop_sets], dtype=torch.int32).cumsum(0)
+    eos_flat = torch.tensor(sum(eos_sets, []), dtype=torch.int32)
+    eos_off = torch.tensor([0] + [len(s) for s in eos_sets], dtype=torch.int32).cumsum(0)
+    return stop_flat, stop_off, eos_flat, eos_off
+
+
+def _check_pp_mtp_check_finish(bs, dtn, toks_dtype):
+    torch.manual_seed(11)
+    vocab = 1024
+    counts = [random.randint(1, dtn) for _ in range(bs)]
+    toks_per_req = [[random.randint(0, vocab - 1) for _ in range(c)] for c in counts]
+    out_lens = [random.randint(0, 64) for _ in range(bs)]
+    mnts = [out_lens[b] + 100 for b in range(bs)]  # default: LENGTH cannot hit
+    vss = [vocab] * bs
+    stop_sets = [[] for _ in range(bs)]
+    eos_sets = [[vocab - 1] for _ in range(bs)]  # fixed eos id, distinct from body tokens
+    ig_flags = [False] * bs
+
+    if bs >= 1:
+        # req0: LENGTH hits exactly at the LAST token (cur == mnt on final k)
+        counts[0] = dtn
+        toks_per_req[0] = [7] * dtn
+        mnts[0] = out_lens[0] + dtn
+    if bs >= 2:
+        # req1: eos hit mid-chain (second token)
+        counts[1] = dtn if dtn >= 2 else 1
+        toks_per_req[1] = [3] * counts[1]
+        toks_per_req[1][min(1, counts[1] - 1)] = eos_sets[1][0]
+    if bs >= 3:
+        # req2: same eos tokens but ignore_eos gates the match -> no finish
+        ig_flags[2] = True
+        toks_per_req[2] = [eos_sets[2][0]] * counts[2]
+    if bs >= 4:
+        # req3: max_new_tokens None sentinel (INT32_MAX) behaves as unlimited
+        mnts[3] = 2**31 - 1
+    if bs >= 5:
+        # req4: vocab-boundary mirror branch.  The healthy pipeline never
+        # sees an out-of-range token here (the last rank repairs it before
+        # it enters the ring), but the kernel must mirror the shared
+        # predicate.
+        toks_per_req[4] = [vocab + 5] * counts[4]
+
+    accepted = torch.tensor(sum(toks_per_req, []), dtype=toks_dtype)
+    num_accepted = torch.tensor(counts, dtype=torch.int32)
+    out_ids_len = torch.tensor(out_lens, dtype=torch.int64)
+    max_new_tokens = torch.tensor(mnts, dtype=torch.int32)
+    vocab_size = torch.tensor(vss, dtype=torch.int32)
+    stop_flat, stop_off, eos_flat, eos_off = _pack_stop_eos(stop_sets, eos_sets)
+    ignore_eos = torch.tensor(ig_flags, dtype=torch.bool)
+
+    got = kernel.pp_mtp_check_finish_kunpeng(
+        accepted, num_accepted, out_ids_len, max_new_tokens, vocab_size,
+        stop_flat, stop_off, eos_flat, eos_off, ignore_eos,
+    )
+    ref = _ref_pp_mtp_check_finish(
+        toks_per_req, out_lens, mnts, vss, stop_sets, eos_sets, ig_flags
+    )
+    assert got[0].tolist() == ref[0], f"finished mismatch\n{got[0].tolist()}\n{ref[0]}"
+    assert got[1].tolist() == ref[1], f"finish_reason mismatch\n{got[1].tolist()}\n{ref[1]}"
+    assert got[2].tolist() == ref[2], f"finish_matched mismatch\n{got[2].tolist()}\n{ref[2]}"
+    assert got[3].tolist() == ref[3], f"finish_len mismatch\n{got[3].tolist()}\n{ref[3]}"
+
+    # empty batch
+    got0 = kernel.pp_mtp_check_finish_kunpeng(
+        torch.empty((0,), dtype=toks_dtype),
+        torch.empty((0,), dtype=torch.int32),
+        torch.empty((0,), dtype=torch.int64),
+        torch.empty((0,), dtype=torch.int32),
+        torch.empty((0,), dtype=torch.int32),
+        stop_flat[:0], torch.zeros((1,), dtype=torch.int32),
+        eos_flat[:0], torch.zeros((1,), dtype=torch.int32),
+        torch.empty((0,), dtype=torch.bool),
+    )
+    assert got0[0].numel() == 0 and got0[1].numel() == 0
+
+
+# ---------------------------------------------------------------------------
+# evict_rejected_drafts_kunpeng: non-last PP rank evict replica
+# ---------------------------------------------------------------------------
+
+def _ref_evict_rejected_drafts(counts, out_cache_loc, seq_lens, dtn, page_size):
+    """Mirror of the Python eviction path (evict mask + page alignment via
+    align_evict_mask_to_page_size_native + boolean index) over the real
+    bs*dtn rows; padding rows beyond bs*dtn are never freed."""
+    bs = len(counts)
+    free = []
+    for b in range(bs):
+        num_acc = counts[b]
+        row = [j >= num_acc for j in range(dtn)]
+        sum_true = sum(row)
+        num_false = dtn - sum_true  # == num_acc (kept slots)
+        start_raw = (
+            (seq_lens[b] + num_false - 1) // page_size
+        ) * page_size - seq_lens[b]
+        start = max(start_raw, 0)
+        end = min(start_raw + page_size, dtn)
+        for j in range(start, end):
+            row[j] = False
+        for j in range(dtn):
+            if row[j]:
+                free.append(int(out_cache_loc[b * dtn + j]))
+    return free
+
+
+def _check_evict_rejected_drafts(bs, dtn, page_size):
+    torch.manual_seed(13)
+    counts = [random.randint(1, dtn) for _ in range(bs)]
+    seq_lens = torch.randint(1, 200, (bs,), dtype=torch.int64)
+    if bs >= 1 and page_size > 1:
+        # page-boundary case: seq_len exactly on a page boundary
+        seq_lens[0] = (int(seq_lens[0]) // page_size) * page_size
+    if bs >= 2 and page_size > 1:
+        # offset-1 case: seq_len one past a page boundary
+        seq_lens[1] = (int(seq_lens[1]) // page_size) * page_size + 1
+    # padding rows beyond bs*dtn must never be freed
+    n_total = bs * dtn + random.randint(0, 5)
+    out_cache_loc = torch.arange(1000, 1000 + n_total, dtype=torch.int64)
+
+    num_accepted = torch.tensor(counts, dtype=torch.int32)
+    got = kernel.evict_rejected_drafts_kunpeng(
+        num_accepted, out_cache_loc, seq_lens, dtn, page_size
+    )
+    ref = _ref_evict_rejected_drafts(
+        counts, out_cache_loc.tolist(), seq_lens.tolist(), dtn, page_size
+    )
+    assert got.tolist() == ref, f"free slots mismatch\n{got.tolist()}\n{ref}"
+
+
+# ---------------------------------------------------------------------------
 # perf driver
 # ---------------------------------------------------------------------------
 
@@ -820,6 +978,23 @@ def run(args):
         _check_verify_mtp_sampling(0, 2, 64, 1, torch.int32)  # empty batch
     except (RuntimeError, AttributeError, NotImplementedError):
         print("  verify_mtp_kunpeng sampling path unavailable, skipping sampling checks")
+    try:
+        # non-last PP rank finish-verdict replica (LENGTH / eos / ignore_eos /
+        # INT32_MAX sentinel / vocab-boundary mirror, incl. empty batch)
+        _check_pp_mtp_check_finish(8, 2, torch.int32)
+        _check_pp_mtp_check_finish(8, 3, torch.int64)  # int64 ring token stream + dtn=3
+    except (RuntimeError, AttributeError, NotImplementedError):
+        print("  pp_mtp_check_finish_kunpeng unavailable, skipping replica finish checks")
+    try:
+        # non-last PP rank evict replica (page_size==1 alignment no-op,
+        # page boundaries, dtn sweep, padding rows, incl. empty batch)
+        _check_evict_rejected_drafts(8, 2, 1)
+        _check_evict_rejected_drafts(8, 2, 64)
+        _check_evict_rejected_drafts(8, 3, 8)
+        _check_evict_rejected_drafts(8, 4, 16)
+        _check_evict_rejected_drafts(0, 2, 1)
+    except (RuntimeError, AttributeError, NotImplementedError):
+        print("  evict_rejected_drafts_kunpeng unavailable, skipping evict checks")
     print("  all functional assertions passed")
 
     print()

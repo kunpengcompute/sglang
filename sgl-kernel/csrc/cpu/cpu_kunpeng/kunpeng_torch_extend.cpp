@@ -460,6 +460,22 @@ void gather_index_kunpeng(at::Tensor src_logits, at::Tensor src_hidden,
                           at::Tensor indices, at::Tensor out_logits,
                           at::Tensor out_hidden);
 
+// pp_mtp_check_finish_kunpeng: non-last PP rank replica of the last rank's
+// in-kernel finish detection (shared check_finish_token predicate, one
+// parallel_for; verdict tensors only, inputs never mutated).
+std::vector<at::Tensor> pp_mtp_check_finish_kunpeng(
+    at::Tensor accepted_tokens, at::Tensor num_accepted, at::Tensor out_ids_len,
+    at::Tensor max_new_tokens, at::Tensor vocab_size,
+    at::Tensor stop_ids_flat, at::Tensor stop_ids_off,
+    at::Tensor eos_ids_flat, at::Tensor eos_ids_off, at::Tensor ignore_eos);
+
+// evict_rejected_drafts_kunpeng: non-last PP rank replica of the last
+// rank's rejected-slot eviction (evict mask + page alignment + free-slot
+// compact in one parallel kernel).
+at::Tensor evict_rejected_drafts_kunpeng(at::Tensor num_accepted, at::Tensor out_cache_loc,
+                                         at::Tensor seq_lens, int64_t draft_token_num,
+                                         int64_t page_size);
+
 void register_graph_kernels();
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
@@ -1129,6 +1145,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "gather_index_kunpeng(Tensor src_logits, Tensor src_hidden, "
         "Tensor indices, Tensor(a!) out_logits, Tensor(b!) out_hidden) -> ()");
     m.impl("gather_index_kunpeng", gather_index_kunpeng);
+
+    // PP+MTP non-last-rank replication kernels (single parallel_for each,
+    // shared predicates with verify_mtp_kunpeng; not graph ops)
+    m.def(
+        "pp_mtp_check_finish_kunpeng("
+        "Tensor accepted_tokens, Tensor num_accepted, Tensor out_ids_len, "
+        "Tensor max_new_tokens, Tensor vocab_size, "
+        "Tensor stop_ids_flat, Tensor stop_ids_off, "
+        "Tensor eos_ids_flat, Tensor eos_ids_off, Tensor ignore_eos"
+        ") -> Tensor[]");
+    m.impl("pp_mtp_check_finish_kunpeng", pp_mtp_check_finish_kunpeng);
+
+    m.def(
+        "evict_rejected_drafts_kunpeng(Tensor num_accepted, Tensor out_cache_loc, "
+        "Tensor seq_lens, int draft_token_num, int page_size) -> Tensor");
+    m.impl("evict_rejected_drafts_kunpeng", evict_rejected_drafts_kunpeng);
 
     // set_kv_buffer (MLA KV cache write)
     m.def("set_kv_buffer_kunpeng(Tensor(a!) kv_buffer, Tensor loc, Tensor cache_k) -> ()");
