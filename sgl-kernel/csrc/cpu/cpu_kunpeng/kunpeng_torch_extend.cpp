@@ -98,6 +98,9 @@ int64_t flash_mla_dense_decode_sched_kunpeng(const at::Tensor &seqlens_kv, int64
                                              int64_t head_dim, int64_t head_dim_v, int64_t page_block_size,
                                              bool is_kv_packed, c10::optional<at::Tensor> meta);
 
+at::Tensor build_block_table_kunpeng(const at::Tensor &req_to_token, const at::Tensor &req_pool_indices,
+                                     const at::Tensor &seq_lens, int64_t page_size);
+
 int64_t flash_mla_sparse_decode_sched_kunpeng(const at::Tensor &topk_length, int64_t seqlen_q, int64_t num_heads_q,
                                               int64_t head_dim, int64_t head_dim_v, c10::optional<at::Tensor> meta);
 
@@ -581,6 +584,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int head_dim, int head_dim_v, int page_block_size, bool is_kv_packed,"
         "Tensor? meta=None) -> int");
     m.impl("flash_mla_dense_decode_sched_kunpeng", flash_mla_dense_decode_sched_kunpeng);
+
+    // Dense-mode block_table build (replaces the Python per-page loop).
+    m.def(
+        "build_block_table_kunpeng(Tensor req_to_token, Tensor req_pool_indices, "
+        "Tensor seq_lens, int page_size) -> Tensor");
+    m.impl("build_block_table_kunpeng", build_block_table_kunpeng);
 
     // Sparse (long-context) MLA decode: local-shard attention with top-k indices.
     m.def(

@@ -127,6 +127,71 @@ int64_t flash_mla_sparse_decode_sched_kunpeng(const at::Tensor &topk_length, int
     return extra_bytes_sizes;
 }
 
+// build_block_table_kunpeng: fused dense-mode block_table build.
+//
+// Replaces the Python per-page loop (and its numpy fast path) in
+// KunpengCpuBackend._init_block_table with a single op: for each sequence b,
+// column j < ceil(seq_len/page) of the output holds
+//   req_to_token[req_pool_indices[b]][j*page] / page
+// and all remaining columns (plus rows with seq_len <= 0) keep the zero-fill
+// of the output allocation -- identical to the previous semantics.
+at::Tensor build_block_table_kunpeng(const at::Tensor &req_to_token,
+                                     const at::Tensor &req_pool_indices,
+                                     const at::Tensor &seq_lens,
+                                     int64_t page_size)
+{
+    TORCH_CHECK(req_to_token.scalar_type() == at::kInt, "req_to_token must be int32");
+    TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong || req_pool_indices.scalar_type() == at::kInt,
+               "req_pool_indices must be int32 or int64");
+    TORCH_CHECK(seq_lens.scalar_type() == at::kLong || seq_lens.scalar_type() == at::kInt,
+               "seq_lens must be int32 or int64");
+    TORCH_CHECK(req_to_token.dim() == 2, "req_to_token must be 2-D");
+    TORCH_CHECK(req_pool_indices.size(0) == seq_lens.size(0),
+               "req_pool_indices/seq_lens batch size mismatch");
+    TORCH_CHECK(page_size > 0, "page_size must be positive");
+
+    const int64_t batch = seq_lens.size(0);
+    const int64_t row_stride = req_to_token.size(1);
+    const bool sl_long = seq_lens.scalar_type() == at::kLong;
+    const int64_t *sl64 = sl_long ? seq_lens.data_ptr<int64_t>() : nullptr;
+    const int32_t *sl32 = sl_long ? nullptr : seq_lens.data_ptr<int32_t>();
+    auto seq_at = [&](int64_t b) -> int64_t { return sl_long ? sl64[b] : (int64_t)sl32[b]; };
+    const bool req_long = req_pool_indices.scalar_type() == at::kLong;
+    const int64_t *req64 = req_long ? req_pool_indices.data_ptr<int64_t>() : nullptr;
+    const int32_t *req32 = req_long ? nullptr : req_pool_indices.data_ptr<int32_t>();
+    auto req_at = [&](int64_t b) -> int64_t { return req_long ? req64[b] : (int64_t)req32[b]; };
+
+    int64_t max_blocks = 0;
+    for (int64_t b = 0; b < batch; ++b) {
+        const int64_t len = seq_at(b);
+        if (len > 0) {
+            const int64_t nb = (len + page_size - 1) / page_size;
+            if (nb > max_blocks) max_blocks = nb;
+        }
+    }
+
+    at::Tensor block_table = at::zeros({batch, max_blocks}, seq_lens.options().dtype(at::kInt));
+    if (batch == 0 || max_blocks == 0) return block_table;
+
+    const int32_t *rtt = req_to_token.data_ptr<int32_t>();
+    int32_t *out = block_table.data_ptr<int32_t>();
+
+    kutacc::parallel_for(0, batch, 1, [&](int64_t s, int64_t e) {
+        for (int64_t b = s; b < e; ++b) {
+            const int64_t len = seq_at(b);
+            if (len <= 0) continue;
+            const int64_t nb = (len + page_size - 1) / page_size;
+            // Safe by construction: (ceil(len/page)-1)*page < len <= row_stride,
+            // so every read stays inside the request's pool row.
+            const int32_t *row = rtt + req_at(b) * row_stride;
+            int32_t *dst = out + b * max_blocks;
+            for (int64_t j = 0; j < nb; ++j)
+                dst[j] = row[j * page_size] / (int32_t)page_size;
+        }
+    });
+    return block_table;
+}
+
 void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache, at::Tensor indices, at::Tensor topk_length,
                                      at::Tensor o, at::Tensor softmax_lse, double softmax_scale,
                                      at::Tensor extra_buffer, c10::optional<at::Tensor> meta)

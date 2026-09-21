@@ -1098,25 +1098,18 @@ class KunpengCpuBackend(AttentionBackend):
         DDR blocks that must be swapped in (block_table blocks + new-token
         blocks) and derives the remapped block_table.
         """
-        batch_size = seq_lens.shape[0]
-        max_seq_len = seq_lens.max().item()
-        max_blocks = (max_seq_len + metadata.page_size - 1) // metadata.page_size
-
-        metadata.block_table = torch.zeros(
-            (batch_size, max_blocks),
-            dtype=torch.int32,
-            device=seq_lens.device,
+        # Single fused C++ op (see kunpeng_attention.cpp): builds the
+        # (batch, max_blocks) int32 table where column j of sequence b is
+        # req_to_token[req, j*page] // page for j < ceil(seq_len/page) and 0
+        # beyond (seq_len <= 0 rows stay all-zero). One op call replaces the
+        # whole numpy/Python pipeline -- the remaining per-step cost is just
+        # the torch dispatch (~10us) plus the parallel_for fill itself.
+        metadata.block_table = torch.ops.sgl_kernel.build_block_table_kunpeng(
+            forward_batch.req_to_token_pool.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            metadata.page_size,
         )
-        req_to_token = forward_batch.req_to_token_pool.req_to_token.to(torch.int32)
-        for b in range(batch_size):
-            req_idx = req_pool_indices[b].item()
-            seq_len = seq_lens[b].item()
-            if seq_len == 0:
-                continue
-            num_blocks = (seq_len + metadata.page_size - 1) // metadata.page_size
-            for j in range(num_blocks):
-                token_idx = req_to_token[req_idx, j * metadata.page_size].item()
-                metadata.block_table[b, j] = token_idx // metadata.page_size
 
         if not enable_blockwise:
             return
