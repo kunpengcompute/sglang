@@ -1,3 +1,4 @@
+#!/bin/bash
 # Copyright 2026 Huawei Technologies Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,45 +13,36 @@
 # limitations under the License.
 # ==============================================================================
 
-#!/bin/bash
-
 usage() {
   echo "Usage:"
-  echo "  $0 [-n NUM] [-r RATE] [-m TOKENS] [-p] [-s] [-f FILE]                # paced batch (RATE req/s, default 32)"
-  echo "  $0 -S FILE [-n NUM] [-r RATE] [-m TOKENS] [-p] [-s] [-F] [-v]        # paced batch, prompts from safetensors"
-  echo "  $0 -n NUM -r 0 [-m TOKENS] [-p] [-s] [-f FILE]                       # legacy batch: all prompts in one request"
-  echo "  $0 -d RANGE [-n NUM] [-c CONC] [-m TOKENS] [-p] [-s] [-v] [-f FILE]  # round-robin benchmark"
+  echo "  $0 -f FILE [-s] [-m TOKENS] [-d RANK|RANGE] [-n NUM] [-r RATE] [-v] [-F] [-p] [-c CONC]"
   echo "  $0 [-i] [-d RANK] [-m TOKENS] [-h]                                   # interactive chat"
   echo ""
-  echo "Modes (mutually exclusive):"
-  echo "  (default)   Paced batch — one prompt per request, sent at -r RATE req/s (default 32)."
-  echo "  -d RANGE    Round-robin benchmark — triggered by -d with a range (e.g. 0-15, 0,2,5)."
-  echo "              Reports: throughput (req/s, tok/s) + per-request latency (P50/P99)."
-  echo "  -i          Interactive chat mode — multi-turn streaming conversation."
+  echo "Benchmark mode (default, non-interactive): one prompt per request,"
+  echo "sent at -r RATE req/s. -i starts a multi-turn interactive chat instead."
   echo ""
   echo "Options:"
   echo "  -h          Show this help message"
-  echo "  -m TOKENS   Max tokens per request / per turn (default: 10 batch, 128 chat)"
-  echo "  -d RANK|RANGE  DP rank (e.g. 5) or range (e.g. 0-15, 0,2,5 → triggers round-robin)"
-  echo "  -r RATE     Paced batch send rate in req/s (default: 32; 0 = legacy single array request)"
-  echo "  -S FILE     Paced batch from gen_st_prompts.py output: one JSON-string"
-  echo "              prompt per line, ordered so request k lands on dp k%N via"
-  echo "              server round-robin. -n 1 -s = single streaming request with"
-  echo "              TTFT/TPOT summary. Mutually exclusive with -f; needs -r > 0."
-  echo ""
-  echo "  --- batch & round-robin only ---"
-  echo "  -p          Enable profiling (start/stop profile via separate curl calls)"
+  echo "  -f FILE     Prompt file, one prompt per line (default: prompts/128.txt)."
+  echo "              JSON-string lines (gen_st_prompts.py output) are spliced"
+  echo "              verbatim."
   echo "  -s          Enable streaming mode"
-  echo "  -f FILE     Prompt file, one prompt per line (default: prompts/128.txt)"
-  echo "  -n NUM      Number of requests to send (default: all lines from file)"
+  echo "  -m TOKENS   Max tokens per request / per turn (default: 10 benchmark, 1024 chat)"
+  echo "  -d RANK|RANGE  DP rank (e.g. 5: every request pinned to it) or ranks"
+  echo "              (e.g. 0-15, 0,2,5: requests round-robin across them)."
+  echo "              Omit -d for the server default load balancing (round robin)."
+  echo "  -n NUM      Number of requests (default: all lines from file; prompts"
+  echo "              cycle when NUM exceeds the file size)"
+  echo "  -r RATE     Send rate in req/s (default: 32, must be > 0)"
+  echo "  -v          Verbose stats (only active when NUM > 1): decode throughput"
+  echo "              table; with -s also accept rate. Writes per-request latency"
+  echo "              rows + response bodies to <run-id>_detail.txt"
   echo "  -F          Fake-transfer mode: inject bootstrap_host=2.2.2.2 + a unique"
   echo "              bootstrap_room per request; decode skips KV transfer without"
   echo "              --disaggregation-transfer-backend. Port defaults to 30002."
-  echo ""
-  echo "  --- round-robin & paced batch only ---"
-  echo "  -c CONC     Max concurrent requests (default: 256; paced batch defaults to unbounded)"
-  echo "  -v          Write per-request latency + accept-rate rows and response
-              bodies to <run-id>_detail.txt (accept rate requires -s)"
+  echo "  -p          Enable profiling (start/stop profile via separate curl calls)"
+  echo "  -c CONC     Max concurrent requests (default: unbounded)"
+  echo "  -i          Interactive chat mode — multi-turn streaming conversation"
   exit 0
 }
 
@@ -67,14 +59,11 @@ CONCURRENCY=256
 CONCURRENCY_SET=false
 PROMPT_FILE="prompts/128.txt"
 PROMPT_FILE_SET=false
-ST_FILE=""
-ST_MODE=false
 ROUND_ROBIN=false
 RATE=32
-PACED=false
 FAKE=false
 
-while getopts "d:hiFpsvn:m:c:r:f:S:" opt; do
+while getopts "d:hiFpsvn:m:c:r:f:" opt; do
   case $opt in
     h) usage ;;
     i) INTERACTIVE=true ;;
@@ -88,7 +77,6 @@ while getopts "d:hiFpsvn:m:c:r:f:S:" opt; do
     r) RATE=$OPTARG ;;
     m) MAX_TOKENS=$OPTARG; MAX_TOKENS_SET=true ;;
     f) PROMPT_FILE=$OPTARG; PROMPT_FILE_SET=true ;;
-    S) ST_FILE=$OPTARG ;;
     *) echo "Invalid option: -$OPTARG" >&2
        exit 1 ;;
   esac
@@ -96,34 +84,15 @@ done
 
 shift $((OPTIND - 1))
 
-# =============================================================================
-# Safetensors mode (-S): pre-ordered prompt txt from gen_st_prompts.py; lines
-# are JSON strings spliced verbatim, per-DP mapping comes from the send order.
-# =============================================================================
-
-if [ -n "$ST_FILE" ]; then
-  if [ "$INTERACTIVE" = true ]; then
-    echo "Error: -S is not supported in interactive mode" >&2
-    exit 1
-  fi
-  if [ "$PROMPT_FILE_SET" = true ]; then
-    echo "Error: -S and -f are mutually exclusive" >&2
-    exit 1
-  fi
-  if [ "$DP_ENABLED" = true ]; then
-    echo "Warning: -d with -S pins routed_dp_rank on every request, overriding" \
-         "the order-based DP steering; only for paths that accept it (e.g. -F)" >&2
-  fi
-  if [ "$RATE" -le 0 ]; then
-    echo "Error: -S requires paced sending (-r > 0, default 32)" >&2
-    exit 1
-  fi
-  if [ ! -f "$ST_FILE" ]; then
-    echo "Error: prompt txt not found: $ST_FILE (generate it with gen_st_prompts.py)" >&2
-    exit 1
-  fi
-  ST_MODE=true
-  PROMPT_FILE="$ST_FILE"
+# Pacing is always on: -r must be a positive rate (the old unlimited
+# single-array-request mode is gone) and -n a non-negative count (0 = all).
+if ! [[ "$RATE" =~ ^[0-9]+$ ]] || [ "$RATE" -le 0 ]; then
+  echo "Error: -r must be a positive integer (req/s)" >&2
+  exit 1
+fi
+if ! [[ "$NUM_REQUESTS" =~ ^[0-9]+$ ]]; then
+  echo "Error: -n must be a non-negative integer" >&2
+  exit 1
 fi
 
 # =============================================================================
@@ -201,18 +170,19 @@ URL="http://${IP}:${PORT}/v1/completions"
 
 # Fake-transfer injection: per-request unique bootstrap_room (ns timestamp
 # base) + the magic fake host recognized by decode._is_fake_transfer.
-FAKE_LINE=""
+ROOM_BASE=0
 if [ "$FAKE" = true ]; then
   ROOM_BASE=$(date +%s%N)
-  FAKE_LINE=",\"bootstrap_host\": \"2.2.2.2\""
 fi
 
 # =============================================================================
-# Non-interactive dispatch: round-robin detection + profile start
+# Non-interactive dispatch: DP rank parsing + profile start
 # =============================================================================
 
 if [ "$INTERACTIVE" = false ]; then
-  # Detect round-robin mode: -d value contains '-' or ','
+  # -d with a range (e.g. 0-15, 0,2,5): requests round-robin across ranks.
+  # -d with a single rank: every request pinned to that rank.
+  # No -d: no routed_dp_rank — server default load balancing (round robin).
   ROUND_ROBIN=false
   DP_RANKS=()
   NUM_RANKS=0
@@ -226,140 +196,17 @@ if [ "$INTERACTIVE" = false ]; then
     fi
   fi
 
-  # Paced batch mode: without -d, send one prompt per HTTP request at RATE
-  # req/s instead of one request carrying all prompts (RATE=0 restores that).
-  if [ "$RATE" -gt 0 ] && [ "$NUM_REQUESTS" -gt 1 ]; then
-    PACED=true
-  fi
-  # -S with -n 1 stays in Mode 1 for the single-request TTFT/TPOT summary.
-
   if [ "$PROFILE" = true ]; then
     curl --noproxy "*" http://${IP}:${PORT}/start_profile
   fi
 fi
 
 # =============================================================================
-# Mode 1: Original batch — single request with array of prompts
+# Benchmark mode: paced concurrent requests — one prompt per request,
+# routed via -d (single rank / rank range / server default), paced via -r.
 # =============================================================================
 
-if [ "$INTERACTIVE" = false ] && [ "$ROUND_ROBIN" = false ] && [ "$PACED" = false ]; then
-
-  # Build prompt JSON array from PROMPTS, cycling if NUM_REQUESTS exceeds list length
-  PROMPT_JSON="["
-  for ((i=0; i<NUM_REQUESTS; i++)); do
-    idx=$((i % ${#PROMPTS[@]}))
-    if [ $i -gt 0 ]; then
-      PROMPT_JSON+=","
-    fi
-    if [ "$ST_MODE" = true ]; then
-      # -S lines are already JSON string literals — splice verbatim.
-      PROMPT_JSON+="${PROMPTS[$idx]}"
-    else
-      PROMPT_JSON+="\"$(json_escape "${PROMPTS[$idx]}")\""
-    fi
-  done
-  PROMPT_JSON+="]"
-
-  if [ "$DP_ENABLED" = true ]; then
-    DP_LINE=",\"routed_dp_rank\": $DP_RANK"
-  else
-    DP_LINE=""
-  fi
-
-  # Fake transfer: scalar bootstrap_room is auto-incremented per batch item
-  # by GenerateReqInput._normalize_bootstrap_params.
-  if [ "$FAKE" = true ]; then
-    FAKE_LINE="$FAKE_LINE,\"bootstrap_room\": $ROOM_BASE"
-  fi
-
-  BODY="{
-      \"model\": \"DeepSeek-R1\",
-      \"prompt\": $PROMPT_JSON,
-      \"stream\": $STREAM,
-      \"max_tokens\": $MAX_TOKENS,
-      \"temperature\": 0$DP_LINE$FAKE_LINE"
-
-  if [ "$STREAM" = true ]; then
-    BODY+=",\"stream_options\":{\"include_usage\":true}"
-  fi
-
-  BODY+="
-    }"
-
-  BODY_FILE=$(mktemp)
-  printf '%s' "$BODY" > "$BODY_FILE"
-
-  if [ "$STREAM" = true ]; then
-      TURN_START=$(date +%s.%N)
-      FIRST_TOKEN_TS=""
-      CHUNK_COUNT=0
-      USAGE_COMP_TOKENS=""
-      USAGE_RAW=""
-
-      while read -r line; do
-        echo "$line"
-        # Count chunks that carry actual content. The completions endpoint
-        # puts the generated text in a "text" field; usage-only chunks have
-        # empty choices and no "text" field. Counting "text" occurrences
-        # avoids miscounting when continuous_usage_stats embeds usage in
-        # every chunk.
-        TEXT=$(echo "$line" | grep -o '"text":"[^"]*"' | cut -d'"' -f4)
-        if [[ ! -z "$TEXT" ]]; then
-          if [ -z "$FIRST_TOKEN_TS" ]; then
-            FIRST_TOKEN_TS=$(date +%s.%N)
-          fi
-          CHUNK_COUNT=$((CHUNK_COUNT + 1))
-        fi
-        # Capture the usage block emitted in the final chunk when
-        # stream_options.include_usage is set.
-        USAGE_OBJ=$(echo "$line" | grep -o '"usage":{[^}]*}')
-        if [[ ! -z "$USAGE_OBJ" ]]; then
-          USAGE_RAW="$USAGE_OBJ"
-          COMP=$(echo "$USAGE_OBJ" | grep -o '"completion_tokens":[0-9]*' | head -n1 | cut -d':' -f2)
-          if [[ ! -z "$COMP" ]]; then
-            USAGE_COMP_TOKENS="$COMP"
-          fi
-        fi
-      done < <(curl --noproxy "*" -N -s http://${IP}:${PORT}/v1/completions \
-        -H "Content-Type: application/json" \
-        -d @"$BODY_FILE")
-      TURN_END=$(date +%s.%N)
-
-      if [ "$CHUNK_COUNT" -gt 0 ]; then
-          TOKEN_COUNT="${USAGE_COMP_TOKENS:-$MAX_TOKENS}"
-          TTFT=$(awk -v s="$TURN_START" -v f="$FIRST_TOKEN_TS" 'BEGIN { printf "%.3f", f - s }')
-          TOTAL=$(awk -v s="$TURN_START" -v e="$TURN_END" 'BEGIN { printf "%.3f", e - s }')
-          TPOT=$(awk -v n="$TOKEN_COUNT" -v tt="$TTFT" -v total="$TOTAL" 'BEGIN { dn=n-1; if (dn>0) printf "%.1f", (total-tt)/dn*1000; else print "0" }')
-          # Exclude the first chunk: it carries the prefill's first token, and
-          # only decode steps (chunks 2+) can accept draft tokens.
-          RATE=$(awk -v n="$TOKEN_COUNT" -v c="$CHUNK_COUNT" \
-              'BEGIN { if (c>1) printf "%.2f", (n-1)/(c-1); else print "N/A" }')
-          echo "" >&2
-          echo "==================================================" >&2
-          echo "TTFT: ${TTFT}s | Total: ${TOTAL}s | TPOT: ${TPOT} ms/tok" >&2
-          echo "Output Tokens: $TOKEN_COUNT | Chunks: $CHUNK_COUNT | Accept Rate: $RATE" >&2
-          echo "==================================================" >&2
-      fi
-  else
-      time curl --noproxy "*" -s http://${IP}:${PORT}/v1/completions \
-        -H "Content-Type: application/json" \
-        -d @"$BODY_FILE"
-  fi
-
-  rm -f "$BODY_FILE"
-
-  if [ "$PROFILE" = true ]; then
-    curl --noproxy "*" http://${IP}:${PORT}/stop_profile
-  fi
-
-  exit 0
-fi
-
-# =============================================================================
-# Mode 2: Round-robin benchmark — concurrent requests across DP ranks
-# =============================================================================
-
-if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
+if [ "$INTERACTIVE" = false ]; then
   RESULT_DIR=$(mktemp -d)
   _cleaned=0
   cleanup() {
@@ -398,7 +245,6 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     elif [ "$DP_ENABLED" = true ]; then
       rank_line=",\"routed_dp_rank\": $DP_RANK"
     fi
-    # -S adds no rank field; the txt send order steers DP (line k -> dp k%N).
     # Fake transfer: unique room per request + magic host; the decode side
     # (_is_fake_transfer) then force-selects the FAKE receiver and decodes
     # without any KV transfer.
@@ -406,19 +252,22 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     if [ "$FAKE" = true ]; then
       fake_line=",\"bootstrap_host\": \"2.2.2.2\",\"bootstrap_room\": $((ROOM_BASE + idx))"
     fi
+    local raw="${PROMPTS[$((idx % ${#PROMPTS[@]}))]}"
     local prompt_field
-    if [ "$ST_MODE" = true ]; then
-      # -S lines are JSON strings — splice verbatim.
-      prompt_field="${PROMPTS[$((idx % ${#PROMPTS[@]}))]}"
-    else
-      prompt_field="\"$(json_escape "${PROMPTS[$((idx % ${#PROMPTS[@]}))]}")\""
-    fi
+    # JSON string lines (gen_st_prompts.py) splice verbatim — they may carry
+    # escaped newlines a plain-line re-escape would corrupt. Heuristic: a
+    # line both starting and ending with '"' is taken as a JSON string.
+    case "$raw" in
+      '"'*'"') prompt_field="$raw" ;;
+      *) prompt_field="\"$(json_escape "$raw")\"" ;;
+    esac
 
     local body="{
         \"model\": \"DeepSeek-R1\",
         \"prompt\": $prompt_field,
         \"stream\": $STREAM,
         \"max_tokens\": $MAX_TOKENS,
+        \"ignore_eos\": true,
         \"temperature\": 0$rank_line$fake_line"
 
     if [ "$STREAM" = true ]; then
@@ -441,70 +290,87 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     local rid="${RUN_ID}-${idx}"
     echo "$rid" > "$RESULT_DIR/rid_${idx}"
 
-    if [ "$STREAM" = true ]; then
-      # -o keeps the response body clean; -w captures TTFB (first streamed
-      # byte) so the TPOT summary can exclude prefill without a per-chunk
-      # timestamping pass.
-      curl --noproxy "*" -s "$URL" \
+    # -o keeps the response body clean; -w captures curl-INTERNAL clocks so
+    # the TPOT decode span (time_total - starttransfer) is sampled inside
+    # the curl process, immune to subshell scheduling gaps around fork/exit.
+    # Captured in both modes: non-streaming stats use tokens/throughput only.
+    if [ "$STREAM" = true ] && [ "$NUM_REQUESTS" -eq 1 ]; then
+      # Single streaming request: echo each SSE line live (like the old
+      # single-request path) while still capturing the body for parsing.
+      # A FIFO splits curl's two outputs: body -> FIFO (read + echoed here),
+      # -w clocks -> ttfb file, so the TPOT math stays curl-internal.
+      local fifo="$RESULT_DIR/body_${idx}.fifo"
+      mkfifo "$fifo"
+      curl --noproxy "*" -N -s "$URL" \
         -H "Content-Type: application/json" \
         -H "X-Request-Id: $rid" \
-        -o "$resp_file" \
-        -w '%{time_starttransfer}' \
-        -d @"$body_file" > "$RESULT_DIR/ttfb_${idx}" 2>/dev/null
+        -o "$fifo" \
+        -w '%{time_starttransfer} %{time_total}' \
+        -d @"$body_file" > "$RESULT_DIR/ttfb_${idx}" 2>/dev/null &
+      local curl_pid=$!
+      while IFS= read -r line; do
+        printf '%s\n' "$line"
+        printf '%s\n' "$line" >> "$resp_file"
+      done < "$fifo"
+      wait "$curl_pid" 2>/dev/null
+      rm -f "$fifo"
     else
       curl --noproxy "*" -s "$URL" \
         -H "Content-Type: application/json" \
         -H "X-Request-Id: $rid" \
-        -d @"$body_file" > "$resp_file" 2>/dev/null
+        -o "$resp_file" \
+        -w '%{time_starttransfer} %{time_total}' \
+        -d @"$body_file" > "$RESULT_DIR/ttfb_${idx}" 2>/dev/null
     fi
 
     local end_ns
     end_ns=$(date +%s%N)
     echo "$start_ns $end_ns" > "$RESULT_DIR/time_${idx}"
 
+    # Usage parsing is mode-agnostic: streaming carries usage in the final
+    # chunk (continuous stats embed it in every chunk — take the last),
+    # non-streaming in the response body. \s* tolerates spaced JSON.
+    local comp_tokens prompt_tokens
+    comp_tokens=$(grep -oP '"completion_tokens":\s*\K\d+' "$resp_file" 2>/dev/null | tail -n1)
+    prompt_tokens=$(grep -oP '"prompt_tokens":\s*\K\d+' "$resp_file" 2>/dev/null | tail -n1)
     if [ "$STREAM" = true ]; then
-      local usage_raw comp_tokens chunks
-      usage_raw=$(grep -o '"usage":{[^}]*}' "$resp_file" 2>/dev/null | tail -n1)
-      comp_tokens=$(echo "$usage_raw" | grep -o '"completion_tokens":[0-9]*' | head -n1 | cut -d':' -f2)
       # Content chunks ≈ decode steps: spec decoding emits ALL tokens accepted
       # in one step inside a single chunk, so tokens/chunks is the per-request
       # accept rate. Count "text" keys only — usage-only chunks and
       # "data: [DONE]" carry no text field.
+      local chunks
       chunks=$(grep -c '"text"' "$resp_file" 2>/dev/null || true)
       chunks="${chunks:-0}"
       # Prefer actual token count from usage; fall back to chunk count
-      if [[ ! -z "$comp_tokens" ]]; then
-        echo "$comp_tokens" > "$RESULT_DIR/tokens_${idx}"
-      else
-        echo "$chunks" > "$RESULT_DIR/tokens_${idx}"
-      fi
+      echo "${comp_tokens:-$chunks}" > "$RESULT_DIR/tokens_${idx}"
       echo "$chunks" > "$RESULT_DIR/chunks_${idx}"
     else
-      local tokens
-      tokens=$(grep -oP '"completion_tokens":\s*\K\d+' "$resp_file" 2>/dev/null | head -1)
-      echo "${tokens:-0}" > "$RESULT_DIR/tokens_${idx}"
+      echo "${comp_tokens:-0}" > "$RESULT_DIR/tokens_${idx}"
     fi
+    # Prompt token count (aisbench InputTokens row)
+    [[ ! -z "$prompt_tokens" ]] && echo "$prompt_tokens" > "$RESULT_DIR/ptokens_${idx}"
 
     rm -f "$body_file"
   }
 
-  # Paced mode is open-loop: don't throttle on the client unless -c is given.
-  if [ "$PACED" = true ] && [ "$CONCURRENCY_SET" = false ]; then
+  # Open-loop pacing: don't throttle on the client unless -c is given.
+  if [ "$CONCURRENCY_SET" = false ]; then
     CONCURRENCY=$NUM_REQUESTS
   fi
 
-  if [ "$ROUND_ROBIN" = true ]; then
-    echo "Round-robin: $NUM_REQUESTS requests, concurrency=$CONCURRENCY, $NUM_RANKS DP ranks ($DP_RANK)"
-  else
+  # Single request runs silent: only the response + TTFT/TPOT summary.
+  if [ "$NUM_REQUESTS" -gt 1 ]; then
     echo "Paced batch: $NUM_REQUESTS requests, rate=$RATE req/s, concurrency=$CONCURRENCY"
+    if [ "$ROUND_ROBIN" = true ]; then
+      echo "  DP ranks: $DP_RANK ($NUM_RANKS ranks, round-robin)"
+    elif [ "$DP_ENABLED" = true ]; then
+      echo "  DP rank: $DP_RANK"
+    fi
+    echo "  URL: $URL"
+    echo "  Max tokens/req: $MAX_TOKENS, Stream: $STREAM"
+    echo "  Run ID: $RUN_ID  (grep this in router logs)"
+    echo ""
   fi
-  echo "  URL: $URL"
-  if [ "$ST_MODE" = true ]; then
-    echo "  Input: ordered safetensors prompts from $ST_FILE (line k -> dp k%N via server round-robin)"
-  fi
-  echo "  Max tokens/req: $MAX_TOKENS, Stream: $STREAM"
-  echo "  Run ID: $RUN_ID  (grep this in router logs)"
-  echo ""
 
   # FIFO-based concurrency semaphore
   FIFO=$(mktemp -u)
@@ -527,7 +393,7 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
   # `wait` (which would block script exit forever if some requests fail and
   # tokens_* never reaches NUM_REQUESTS).
   _PROG_PID=""
-  if [ "$NUM_REQUESTS" -gt 0 ]; then
+  if [ "$NUM_REQUESTS" -gt 1 ]; then
     (
       _S_W=28
       _PROG_FIRST=1
@@ -589,7 +455,7 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
       echo >&3
     } &
     _REQ_PIDS+=($!)
-    if [ "$PACED" = true ] && (( (i + 1) % RATE == 0 )); then
+    if (( (i + 1) % RATE == 0 )); then
       # Re-anchor to the schedule once per second (every RATE requests).
       # Per-request clock reads cost a fork each and fall behind under
       # load (iter cost > 1/RATE), so pace in 1s batches instead: fire
@@ -619,6 +485,46 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
   # --- Compute and print results ---
   WALL_TIME=$(awk -v s="$WALL_START" -v e="$WALL_END" 'BEGIN { printf "%.3f", e - s }')
 
+  # Single request: echo the response + a TTFT/TPOT summary (the old
+  # single-request output format). -v is a no-op here by design.
+  if [ "$NUM_REQUESTS" -eq 1 ]; then
+    # Streaming already echoed the body live from the FIFO; only
+    # non-streaming (buffered to the resp file) prints it here.
+    if [ "$STREAM" = true ]; then
+      echo ""
+    elif [ -s "$RESULT_DIR/resp_0" ]; then
+      cat "$RESULT_DIR/resp_0"
+      echo ""
+    else
+      echo "<no response>"
+    fi
+    ttfb=""; total=""
+    read -r ttfb total 2>/dev/null < "$RESULT_DIR/ttfb_0" || true
+    toks=""; read -r toks 2>/dev/null < "$RESULT_DIR/tokens_0" || toks="?"
+    echo ""
+    echo "=================================================="
+    if [[ "$ttfb" =~ ^[0-9.]+$ ]] && [[ "$total" =~ ^[0-9.]+$ ]]; then
+      if [ "$STREAM" = true ]; then
+        ch=0; read -r ch 2>/dev/null < "$RESULT_DIR/chunks_0" || ch=0
+        # TPOT from curl-internal clocks: (time_total - starttransfer) /
+        # (tokens - 1). Accept rate = (tokens-1)/(chunks-1). Both exclude
+        # the prefill's first token/chunk.
+        TPOT=$(awk -v t="$ttfb" -v tot="$total" -v n="$toks" \
+          'BEGIN { dn=n-1; if (dn>0 && tot>t) printf "%.1f", (tot-t)/dn*1000; else print "N/A" }')
+        ACC=$(awk -v t="$toks" -v c="$ch" \
+          'BEGIN { if (c>1 && t ~ /^[0-9]+$/) printf "%.2f", (t-1)/(c-1); else print "N/A" }')
+        echo "TTFT: ${ttfb}s | Total: ${total}s | TPOT: ${TPOT} ms/tok"
+        echo "Output Tokens: $toks | Chunks: $ch | Accept Rate: $ACC"
+      else
+        echo "Total: ${total}s | Output Tokens: $toks"
+      fi
+    else
+      echo "(no timing data)"
+    fi
+    echo "=================================================="
+    exit 0
+  fi
+
   TOTAL_TOKENS=0
   FAILED=0
   for ((i = 0; i < NUM_REQUESTS; i++)); do
@@ -641,9 +547,10 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
   echo "  Concurrency:         $CONCURRENCY"
   if [ "$ROUND_ROBIN" = true ]; then
     echo "  DP ranks:            $DP_RANK ($NUM_RANKS ranks, round-robin)"
-  else
-    echo "  Send rate:           $RATE req/s"
+  elif [ "$DP_ENABLED" = true ]; then
+    echo "  DP rank:             $DP_RANK"
   fi
+  echo "  Send rate:           $RATE req/s"
   echo "  Max tokens/req:      $MAX_TOKENS"
   echo "  Stream:              $STREAM"
   echo "  Total wall time:     ${WALL_TIME}s"
@@ -723,9 +630,9 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
     }' "$LAT_FILE"
   fi
 
-  # --- Accept Rate Summary (streaming only: needs decode-step counts) ---
+  # --- Accept Rate Summary (-v + streaming: needs decode-step counts) ---
   # Rows are "tokens chunks"; both sides exclude the prefill first token/step.
-  if [ "$STREAM" = true ] && [ -s "$RESULT_DIR/all_accepts" ]; then
+  if [ "$VERBOSE" = true ] && [ "$STREAM" = true ] && [ -s "$RESULT_DIR/all_accepts" ]; then
     awk '
       { t=$1+0; c=$2+0; if (c>1) {
           n++; st+=t-1; sc+=c-1; r=(t-1)/(c-1);
@@ -743,9 +650,120 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
         printf "  Max:       %.3f\n", max;
         printf "===================================\n";
       }' "$RESULT_DIR/all_accepts"
-  elif [ "$STREAM" = false ]; then
+  elif [ "$VERBOSE" = true ] && [ "$STREAM" = false ]; then
     echo ""
     echo "Accept Rate: N/A (requires streaming mode -s)"
+  fi
+  # --- Per-Request TPOT + aisbench-style decode table (-v only) ---
+  # TPOT = (latency - TTFB) / (tokens - 1) — same semantics as ais_bench:
+  # decode span (first streamed byte -> last byte) over the output-token
+  # gaps; tokens is the usage completion_tokens, not max_tokens.
+  # TPOT needs streaming (first-token timing); the other rows — per-request
+  # InputTokens / OutputTokens / OutputTokenThroughput (= tokens / E2E
+  # latency, ais_bench semantics) — are valid for non-streaming too.
+  # Fork-free: builtin reads + integer-ns math, so large -n does not stall
+  # on loaded nodes.
+  if [ "$VERBOSE" = true ]; then
+    AIS_FILE="$RESULT_DIR/ais_rows"
+    : > "$AIS_FILE"
+    for ((i = 0; i < NUM_REQUESTS; i++)); do
+      [ -f "$RESULT_DIR/time_${i}" ] || continue
+      [ -f "$RESULT_DIR/ttfb_${i}" ] || continue
+      read -r s e < "$RESULT_DIR/time_${i}"
+      toks=""; read -r toks < "$RESULT_DIR/tokens_${i}" 2>/dev/null || true
+      ttfb=""; total=""; read -r ttfb total < "$RESULT_DIR/ttfb_${i}" 2>/dev/null || true
+      # 2>/dev/null BEFORE <file: bash applies redirections left-to-right, so
+      # a missing-file error must hit an already-redirected stderr.
+      ptok=""; read -r ptok 2>/dev/null < "$RESULT_DIR/ptokens_${i}" || true
+      [[ "$toks" =~ ^[0-9]+$ ]] || continue
+      [ "$toks" -ge 1 ] || continue
+      e2e_ns=$(( e - s ))
+      [ "$e2e_ns" -gt 0 ] || continue
+      # TPOT (streaming only — non-streaming TTFB ≈ total): decode span from
+      # curl-internal clocks (time_total - starttransfer), no subshell
+      # scheduling gaps, falling back to the subshell E2E clock for old
+      # single-field files. Float seconds -> integer ns without awk forks.
+      tpot="-"
+      if [ "$STREAM" = true ] && [[ "$ttfb" =~ ^[0-9.]+$ ]] && [ "$toks" -ge 2 ]; then
+        if [[ "$ttfb" == *.* ]]; then
+          ttfb_s=${ttfb%%.*}; ttfb_f=${ttfb#*.}
+          [[ "$ttfb_f" =~ ^[0-9]+$ ]] || ttfb_f=0
+          ttfb_f="${ttfb_f}000000000"; ttfb_f="${ttfb_f:0:9}"
+        else
+          ttfb_s=$ttfb; ttfb_f=0
+        fi
+        ttfb_ns=$(( 10#${ttfb_s:-0} * 1000000000 + 10#$ttfb_f ))
+        if [[ "$total" =~ ^[0-9.]+$ ]]; then
+          if [[ "$total" == *.* ]]; then
+            tot_s=${total%%.*}; tot_f=${total#*.}
+            [[ "$tot_f" =~ ^[0-9]+$ ]] || tot_f=0
+            tot_f="${tot_f}000000000"; tot_f="${tot_f:0:9}"
+          else
+            tot_s=$total; tot_f=0
+          fi
+          decode_ns=$(( (10#${tot_s:-0} * 1000000000 + 10#$tot_f) - ttfb_ns ))
+        else
+          decode_ns=$(( e2e_ns - ttfb_ns ))
+        fi
+        if [ "$decode_ns" -gt 0 ]; then
+          per_tok_ns=$(( decode_ns / (toks - 1) ))
+          printf -v tpot '%d.%03d' $(( per_tok_ns / 1000000 )) $(( (per_tok_ns / 1000) % 1000 ))
+        fi
+      fi
+      # aisbench per-request throughput: output tokens / E2E latency (tok/s).
+      thr_scaled=$(( toks * 10000000000000 / e2e_ns ))
+      printf -v thr '%d.%04d' $(( thr_scaled / 10000 )) $(( thr_scaled % 10000 ))
+      printf '%s %s %s %s\n' "$tpot" "${ptok:-?}" "$toks" "$thr" >> "$AIS_FILE"
+    done
+    # aisbench CSV layout: Average/Min/Max/Median/P75/P90/P99/N per metric;
+    # N counts the requests that contributed to that row. The TPOT row is
+    # emitted only for streaming (first-token timing exists).
+    if [ -s "$AIS_FILE" ]; then
+      if [ "$STREAM" = true ]; then SHOW_TPOT=1; else SHOW_TPOT=0; fi
+      awk -v show_tpot="$SHOW_TPOT" '
+        function pidx(n, p,   i) {
+          i = int((n + 1) * p / 100)
+          return i < 1 ? 1 : (i > n ? n : i)
+        }
+        function fmtc(v) { return (v == int(v)) ? sprintf("%d", v) : sprintf("%.4f", v) }
+        function row(name, a, n, unit,   i, j, t, sum, s) {
+          if (n == 0) { printf "%-22s %-7s %s\n", name, "total", "(no data)"; return }
+          for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++)
+            if (a[i] > a[j]) { t = a[i]; a[i] = a[j]; a[j] = t }
+          for (i = 1; i <= n; i++) sum += a[i]
+          s = sprintf("%-22s %-7s", name, "total")
+          if (unit == "")
+            s = s sprintf(" %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-7s", \
+              fmtc(sum / n), fmtc(a[1]), fmtc(a[n]), fmtc(a[pidx(n, 50)]), \
+              fmtc(a[pidx(n, 75)]), fmtc(a[pidx(n, 90)]), fmtc(a[pidx(n, 99)]), n)
+          else
+            s = s sprintf(" %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-7d", \
+              sprintf("%.4f", sum / n) unit, sprintf("%.4f", a[1]) unit, \
+              sprintf("%.4f", a[n]) unit, sprintf("%.4f", a[pidx(n, 50)]) unit, \
+              sprintf("%.4f", a[pidx(n, 75)]) unit, sprintf("%.4f", a[pidx(n, 90)]) unit, \
+              sprintf("%.4f", a[pidx(n, 99)]) unit, n)
+          print s
+        }
+        {
+          if ($1 ~ /^[0-9]+(\.[0-9]+)?$/) T[++nt] = $1 + 0
+          if ($2 ~ /^[0-9]+$/) PI[++ni] = $2 + 0
+          if ($3 ~ /^[0-9]+$/) PO[++no] = $3 + 0
+          if ($4 ~ /^[0-9]+(\.[0-9]+)?$/) TH[++nh] = $4 + 0
+        }
+        END {
+          printf "\n===============================================================\n"
+          printf "Decode Throughput (aisbench style)\n"
+          printf "===============================================================\n"
+          printf "%-22s %-7s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-7s\n", \
+            "Metric", "Stage", "Average", "Min", "Max", "Median", "P75", "P90", "P99", "N"
+          if (show_tpot) row("TPOT", T, nt, " ms")
+          row("InputTokens", PI, ni, "")
+          row("OutputTokens", PO, no, "")
+          row("OutputTokenThroughput", TH, nh, " token/s")
+          printf "===============================================================\n"
+        }
+      ' "$AIS_FILE"
+    fi
   fi
 
   if [ "$VERBOSE" = true ]; then
@@ -784,7 +802,7 @@ if [ "$ROUND_ROBIN" = true ] || [ "$PACED" = true ]; then
 fi
 
 # =============================================================================
-# Mode 3: Interactive chat — multi-turn streaming conversation
+# Mode 2: Interactive chat — multi-turn streaming conversation
 # =============================================================================
 
 if [ "$INTERACTIVE" = true ]; then

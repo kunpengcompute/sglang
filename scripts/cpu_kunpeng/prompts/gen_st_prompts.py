@@ -25,8 +25,11 @@ must carry the prompt of file (k % num_files), row (k // num_files):
     ...
 
 i.e. the rows of the 64 files are interleaved. Each output line is a JSON
-string (the detokenized prompt), which curl.sh -S splices verbatim into
-/v1/completions — the router's typed parser only accepts string prompts.
+string literal of the detokenized prompt — prompts contain embedded newlines
+(GSM8K question text), which a plain one-per-line file cannot represent
+losslessly. curl.sh -f accepts both formats: JSON-string lines are spliced
+verbatim, other lines are escaped. The router's typed parser only accepts
+string prompts.
 
 File formats (same keys as DeepSeek-V3-Sample input_process.py/token_decode.py):
   'data'                   — [bs, seq_len] padded raw rows; every row is
@@ -52,7 +55,8 @@ TEMPLATE_PREFIX = [0, 128803]            # <bos>, <User>
 TEMPLATE_SUFFIX = [128804, 128798, 201]  # <Assistant>, <think>, '\n'
 TRIM_HEAD = 1
 TRIM_TAIL = 4 + 256
-FILE_RE = re.compile(r"^(?:bs(\d+)_)?input_?(\d+)_(\d+)\.safetensors$")
+# {len} may be digits (1024) or k-suffixed (1k/2k); {id} is group 3
+FILE_RE = re.compile(r"^(?:bs(\d+)_)?input_?([^_]+)_(\d+)\.safetensors$")
 
 
 def discover_files(input_dir):
@@ -193,7 +197,8 @@ def main():
 
     # Pass 2: interleave — global request k -> file (k % num_files),
     # row (k // num_files) — so server-side round-robin DP assignment puts
-    # file f's prompts on dp f.
+    # file f's prompts on dp f. Each line is a JSON string literal (embedded
+    # newlines escaped); curl.sh -f splices such lines verbatim.
     dp_count = len(files)
     total = 0
     with open(args.out, "w", encoding="utf-8") as fo:
@@ -208,16 +213,18 @@ def main():
     meta = {
         "input_dir": str(Path(args.dir).resolve()),
         "tokenizer": str(args.tokenizer),
-        "output": "text (decode skip_special_tokens=False, "
-                  "cleanup_tokenization_spaces=False)",
+        "output": "one JSON string literal per line (newlines escaped); "
+        "curl.sh -f splices JSON lines verbatim, escapes plain lines",
         "order": "line k -> dp k%N, file k%N, row k//N (N = number of files)",
         "max_tokens": args.max_tokens,
         "dp_count": dp_count,
         "total_requests": total,
         "prompt_len": prompt_len,
         "padding_files": pad_files,
-        "files": [{"id": fid, "name": path.name, "seqs": rows_per_file[fid]}
-                  for fid, path in files],
+        "files": [
+            {"id": fid, "name": path.name, "seqs": rows_per_file[fid]}
+            for fid, path in files
+        ],
     }
     with open(f"{args.out}.meta.json", "w") as fm:
         json.dump(meta, fm, indent=2)
