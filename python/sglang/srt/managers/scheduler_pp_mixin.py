@@ -1697,7 +1697,7 @@ class SchedulerPPMixin:
                 # `-1` placeholder is also the finish-verdict channel: it marks
                 # exactly the requests the last rank's verify finished this
                 # round (single-arbiter semantics reconciled by
-                # `_pp_mtp_apply_verify_result`).
+                # `_pp_mtp_apply_verify_batch`).
                 flat = draft_tokens.tolist()
                 batch.pp_mtp_ring_finished = [
                     any(

@@ -1430,7 +1430,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # PP + MTP: per-req finish verdict of the last rank's verify round,
     # derived from the `-1` draft placeholders in the ring message
     # (`draft_tokens[i] < 0` <=> the last rank finished req i this round).
-    # Consumed by `_pp_mtp_apply_verify_result` to reconcile the replicated
+    # Consumed by `_pp_mtp_apply_verify_batch` to reconcile the replicated
     # finish state on non-last ranks (single-arbiter finish semantics).
     pp_mtp_ring_finished: Optional[List[bool]] = None
 

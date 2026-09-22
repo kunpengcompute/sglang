@@ -43,6 +43,21 @@
 // gather_index_kunpeng: keeps replacing the two aten::index ops in the
 // workers (logits_output.next_token_logits/hidden_states[accepted_indices])
 // with a parallel row gather.  Still used by the PP path (pp_nextn_worker).
+//
+// pp_mtp_check_finish_kunpeng: non-last PP rank replica of the last rank's
+// in-kernel finish detection.  Re-evaluates the shared check_finish_token
+// predicate over the ring's accepted-token stream (already repaired for
+// vocab-boundary NaN and already truncated at the finishing token by the
+// last rank's kernel) in one parallel_for, so the non-last ranks never call
+// Req.check_finished (no per-token tokenizer property access, no stop-str
+// decode).  Sharing check_finish_token with verify_mtp_kunpeng keeps the
+// two ranks from drifting apart in finish semantics.
+//
+// evict_rejected_drafts_kunpeng: non-last PP rank replica of the last
+// rank's rejected-slot eviction (evict mask + page alignment + free-slot
+// compact) in one parallel kernel, replacing the ~15 serial aten ops of
+// _pp_mtp_evict_rejected_drafts on 920F.  Uses the exact page-alignment
+// formula of verify_mtp_kunpeng so both ranks free identical slot sets.
 
 #include <ATen/ATen.h>
 #include <arm_sve.h>
@@ -1088,4 +1103,275 @@ void gather_index_kunpeng(at::Tensor src_logits, at::Tensor src_hidden, at::Tens
             std::memcpy(out_hidden_ptr + k * H, hidden_ptr + src * H, H * sizeof(at::BFloat16));
         }
     });
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// pp_mtp_check_finish_kunpeng
+//
+// Non-last PP rank replica of the last rank's in-kernel finish detection
+// (`verify_mtp_kunpeng` pass 1).  The accepted tokens arrive via the PP
+// output ring (already repaired for vocab-boundary NaN and already
+// truncated at the finishing token by the last rank's kernel), so this
+// kernel only re-evaluates the per-token finish predicates over that
+// stream and returns the verdict tensors; it never mutates its inputs and
+// never recomputes num_accepted (the ring value is authoritative).
+//
+// The per-token predicate is the shared `check_finish_token` (the single
+// C++ implementation also used inside verify_mtp_kunpeng), so the last rank
+// and the replica ranks cannot drift apart in finish semantics.
+//
+// Inputs (all contiguous, CPU):
+//   accepted_tokens [K] int32|int64 : ring next_token_ids (compact; per-req
+//                                     segments of length num_accepted[b])
+//   num_accepted    [bs] int32      : ring pp_mtp_accepted_tokens
+//   out_ids_len     [bs] int64      : len(req.output_ids) BEFORE this round
+//   max_new_tokens  [bs] int32      : INT32_MAX sentinel for None (unlimited)
+//   vocab_size      [bs] int32      : INT32_MAX sentinel for None
+//   stop_ids_flat   [N_stop] int32 / stop_ids_off [bs+1] int32
+//   eos_ids_flat    [N_eos] int32  / eos_ids_off  [bs+1] int32
+//   ignore_eos      [bs] bool
+//
+// Returns:
+//   finished       [bs] int32
+//   finish_reason  [bs] int32   (0=LENGTH, 1=MATCHED_TOKEN, 2=NaN, -1=none)
+//   finish_matched [bs] int64   (reason 0: the length value; reason 1: token)
+//   finish_len     [bs] int32
+std::vector<at::Tensor> pp_mtp_check_finish_kunpeng(
+    at::Tensor accepted_tokens, at::Tensor num_accepted, at::Tensor out_ids_len,
+    at::Tensor max_new_tokens, at::Tensor vocab_size,
+    at::Tensor stop_ids_flat, at::Tensor stop_ids_off,
+    at::Tensor eos_ids_flat, at::Tensor eos_ids_off, at::Tensor ignore_eos)
+{
+    CHECK_INPUT(accepted_tokens);
+    CHECK_INPUT(num_accepted);
+    CHECK_INPUT(out_ids_len);
+    CHECK_INPUT(max_new_tokens);
+    CHECK_INPUT(vocab_size);
+    CHECK_INPUT(stop_ids_flat);
+    CHECK_INPUT(stop_ids_off);
+    CHECK_INPUT(eos_ids_flat);
+    CHECK_INPUT(eos_ids_off);
+    CHECK_INPUT(ignore_eos);
+
+    TORCH_CHECK(accepted_tokens.scalar_type() == at::kInt ||
+                accepted_tokens.scalar_type() == at::kLong,
+                "accepted_tokens must be int32 or int64");
+    TORCH_CHECK(num_accepted.scalar_type() == at::kInt, "num_accepted must be int32");
+    TORCH_CHECK(out_ids_len.scalar_type() == at::kLong, "out_ids_len must be int64");
+    TORCH_CHECK(max_new_tokens.scalar_type() == at::kInt, "max_new_tokens must be int32");
+    TORCH_CHECK(vocab_size.scalar_type() == at::kInt, "vocab_size must be int32");
+    TORCH_CHECK(stop_ids_flat.scalar_type() == at::kInt, "stop_ids_flat must be int32");
+    TORCH_CHECK(stop_ids_off.scalar_type() == at::kInt, "stop_ids_off must be int32");
+    TORCH_CHECK(eos_ids_flat.scalar_type() == at::kInt, "eos_ids_flat must be int32");
+    TORCH_CHECK(eos_ids_off.scalar_type() == at::kInt, "eos_ids_off must be int32");
+    TORCH_CHECK(ignore_eos.scalar_type() == at::kBool, "ignore_eos must be bool");
+
+    const int64_t bs = num_accepted.size(0);
+    TORCH_CHECK(out_ids_len.size(0) == bs, "out_ids_len length mismatch");
+    TORCH_CHECK(max_new_tokens.size(0) == bs, "max_new_tokens length mismatch");
+    TORCH_CHECK(vocab_size.size(0) == bs, "vocab_size length mismatch");
+    TORCH_CHECK(stop_ids_off.size(0) == bs + 1, "stop_ids_off must have bs+1 entries");
+    TORCH_CHECK(eos_ids_off.size(0) == bs + 1, "eos_ids_off must have bs+1 entries");
+    TORCH_CHECK(ignore_eos.size(0) == bs, "ignore_eos length mismatch");
+
+    if (bs == 0) {
+        at::Tensor empty_i32 = at::empty({0}, num_accepted.options());
+        at::Tensor empty_i64 = at::empty({0}, out_ids_len.options());
+        return {empty_i32, empty_i32, empty_i64, empty_i32};
+    }
+
+    const bool toks_is_i64 = accepted_tokens.scalar_type() == at::kLong;
+    const int32_t *toks_i32_ptr = nullptr;
+    const int64_t *toks_i64_ptr = nullptr;
+    if (toks_is_i64) {
+        toks_i64_ptr = accepted_tokens.data_ptr<int64_t>();
+    } else {
+        toks_i32_ptr = accepted_tokens.data_ptr<int32_t>();
+    }
+    const int32_t *num_acc_ptr = num_accepted.data_ptr<int32_t>();
+    const int64_t *out_len_ptr = out_ids_len.data_ptr<int64_t>();
+    const int32_t *mnt_ptr = max_new_tokens.data_ptr<int32_t>();
+    const int32_t *vocab_ptr = vocab_size.data_ptr<int32_t>();
+    const int32_t *stop_flat_ptr = stop_ids_flat.data_ptr<int32_t>();
+    const int32_t *stop_off_ptr = stop_ids_off.data_ptr<int32_t>();
+    const int32_t *eos_flat_ptr = eos_ids_flat.data_ptr<int32_t>();
+    const int32_t *eos_off_ptr = eos_ids_off.data_ptr<int32_t>();
+    const bool *ignore_eos_ptr = ignore_eos.data_ptr<bool>();
+
+    // Serial prefix sums of num_accepted -> per-req token offsets (bs small).
+    std::vector<int64_t> tok_off(bs + 1, 0);
+    for (int64_t b = 0; b < bs; b++) {
+        tok_off[b + 1] = tok_off[b] + num_acc_ptr[b];
+    }
+    TORCH_CHECK(tok_off[bs] <= accepted_tokens.size(0),
+                "accepted_tokens shorter than sum(num_accepted)");
+
+    at::Tensor finished_t = at::empty({bs}, num_accepted.options());
+    at::Tensor finish_reason_t = at::empty({bs}, num_accepted.options());
+    at::Tensor finish_matched_t = at::empty({bs}, out_ids_len.options());
+    at::Tensor finish_len_t = at::empty({bs}, num_accepted.options());
+    int32_t *finished_ptr = finished_t.data_ptr<int32_t>();
+    int32_t *reason_ptr = finish_reason_t.data_ptr<int32_t>();
+    int64_t *matched_ptr = finish_matched_t.data_ptr<int64_t>();
+    int32_t *fin_len_ptr = finish_len_t.data_ptr<int32_t>();
+
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        for (int64_t b = start; b < end; b++) {
+            const int64_t mnt = mnt_ptr[b];
+            const int64_t vs = vocab_ptr[b];
+            const int64_t base_out_len = out_len_ptr[b];
+            const bool req_ignore_eos = ignore_eos_ptr[b];
+            const int64_t num_acc = num_acc_ptr[b];
+
+            int32_t is_fin = 0;
+            int32_t reason = -1;
+            int64_t matched = 0;
+            int32_t fin_len = 0;
+            for (int64_t k = 0; k < num_acc; k++) {
+                int32_t tok;
+                if (toks_is_i64) {
+                    tok = (int32_t)toks_i64_ptr[tok_off[b] + k];
+                } else {
+                    tok = toks_i32_ptr[tok_off[b] + k];
+                }
+                // NOTE: no vocab-boundary repair here — the last rank's
+                // kernel already repaired the token before it entered the
+                // ring.  The vocab-boundary branch inside check_finish_token
+                // only mirrors the shared predicate for completeness and
+                // should never fire on a healthy pipeline.
+                const int64_t cur_out_len = base_out_len + (k + 1);
+                FinishState st = check_finish_token(tok, cur_out_len, mnt, vs, stop_flat_ptr,
+                                                    stop_off_ptr[b], stop_off_ptr[b + 1],
+                                                    eos_flat_ptr, eos_off_ptr[b], eos_off_ptr[b + 1],
+                                                    req_ignore_eos);
+                if (st.hit) {
+                    is_fin = 1;
+                    reason = st.reason;
+                    matched = st.matched;
+                    fin_len = st.fin_len;
+                    break;
+                }
+            }
+            finished_ptr[b] = is_fin;
+            reason_ptr[b] = reason;
+            matched_ptr[b] = matched;
+            fin_len_ptr[b] = fin_len;
+        }
+    });
+
+    return {finished_t, finish_reason_t, finish_matched_t, finish_len_t};
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// evict_rejected_drafts_kunpeng
+//
+// Non-last PP rank replica of the last rank's in-kernel rejected-slot
+// eviction (verify_mtp_kunpeng pass 1's evict mask + page alignment +
+// pass 2's free-slot compact), replacing _pp_mtp_evict_rejected_drafts'
+// ~15 serial aten ops (arange/broadcast-compare/zeros/invert/slice-assign/
+// align/bool-index) with one parallel kernel.
+//
+// Per-req rule (identical inputs -> identical free set as the last rank):
+//   evict[j] = (j >= num_accepted[b])   for j in [0, dtn)
+// then page alignment ("never evict the first partial page of a request")
+// with the exact formula of verify_mtp_kunpeng / align_evict_mask_to_page_
+// size_native.  Slots at or beyond bs*dtn (padding rows) are never freed,
+// matching the Python mask that only covers the real request rows.
+//
+// Inputs (all contiguous, CPU):
+//   num_accepted    [bs] int32 : ring pp_mtp_accepted_tokens (>= 1 per req)
+//   out_cache_loc   [N] int64  : verify batch slots, N >= bs*dtn
+//   seq_lens        [bs] int64 : verify-round root positions
+//   draft_token_num int        : dtn = speculative_num_steps + 1
+//   page_size       int
+//
+// Returns:
+//   free_cache_loc  [M] int64 : page-aligned rejected slots, compact
+at::Tensor evict_rejected_drafts_kunpeng(at::Tensor num_accepted, at::Tensor out_cache_loc,
+                                         at::Tensor seq_lens, int64_t draft_token_num,
+                                         int64_t page_size)
+{
+    CHECK_INPUT(num_accepted);
+    CHECK_INPUT(out_cache_loc);
+    CHECK_INPUT(seq_lens);
+
+    TORCH_CHECK(num_accepted.scalar_type() == at::kInt, "num_accepted must be int32");
+    TORCH_CHECK(out_cache_loc.scalar_type() == at::kLong, "out_cache_loc must be int64");
+    TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "seq_lens must be int64");
+    TORCH_CHECK(draft_token_num > 0 && draft_token_num <= 64,
+                "draft_token_num must be in (0, 64]");
+    TORCH_CHECK(page_size > 0, "page_size must be positive");
+
+    const int64_t bs = num_accepted.size(0);
+    TORCH_CHECK(seq_lens.size(0) == bs, "seq_lens length mismatch");
+    TORCH_CHECK(out_cache_loc.size(0) >= bs * draft_token_num,
+                "out_cache_loc must hold bs*draft_token_num slots");
+
+    if (bs == 0) {
+        return at::empty({0}, out_cache_loc.options());
+    }
+
+    const int32_t *num_acc_ptr = num_accepted.data_ptr<int32_t>();
+    const int64_t *outloc_ptr = out_cache_loc.data_ptr<int64_t>();
+    const int64_t *seq_ptr = seq_lens.data_ptr<int64_t>();
+    const int64_t dtn = draft_token_num;
+
+    // Pass 1: per-req evict bitmask (uint64, dtn <= 64) + page alignment.
+    // The alignment formula is the one of verify_mtp_kunpeng pass 1, which
+    // mirrors align_evict_mask_to_page_size_native exactly.
+    std::vector<uint64_t> evict_mask(bs, 0);
+    std::vector<int64_t> free_count(bs, 0);
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        for (int64_t b = start; b < end; b++) {
+            const int64_t num_acc = num_acc_ptr[b];
+            uint64_t mask = 0;
+            for (int64_t j = num_acc; j < dtn; j++) {
+                mask |= (uint64_t)1 << j;
+            }
+            // Page alignment: never evict the first partial page of a req.
+            // num_false = kept slots = num_acc (nv - sum_true in the mask
+            // formulation).  For page_size == 1 the cleared window never
+            // intersects the evicted window, so the formula is a no-op and
+            // matches the Python page_size == 1 fast path.
+            const int64_t num_false = num_acc;
+            int64_t start_raw =
+                ((seq_ptr[b] + num_false - 1) / page_size) * page_size - seq_ptr[b];
+            int64_t s = start_raw < 0 ? 0 : start_raw;
+            int64_t e = start_raw + page_size;
+            if (e > dtn) {
+                e = dtn;
+            }
+            for (int64_t j = s; j < e; j++) {
+                mask &= ~((uint64_t)1 << j);
+            }
+            evict_mask[b] = mask;
+            free_count[b] = (int64_t)__builtin_popcountll(mask);
+        }
+    });
+
+    // Serial prefix sums (bs small).
+    std::vector<int64_t> f_prefix(bs + 1, 0);
+    for (int64_t b = 0; b < bs; b++) {
+        f_prefix[b + 1] = f_prefix[b] + free_count[b];
+    }
+    const int64_t M = f_prefix[bs];
+
+    at::Tensor free_cache_loc_t = at::empty({M}, out_cache_loc.options());
+    int64_t *free_ptr = free_cache_loc_t.data_ptr<int64_t>();
+
+    // Pass 2: compact the evicted slots (parallel over requests).
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        for (int64_t b = start; b < end; b++) {
+            const int64_t base = b * dtn;
+            uint64_t mask = evict_mask[b];
+            int64_t m = f_prefix[b];
+            while (mask) {
+                const int64_t j = __builtin_ctzll(mask);
+                mask &= mask - 1;
+                free_ptr[m++] = outloc_ptr[base + j];
+            }
+        }
+    });
+
+    return free_cache_loc_t;
 }
