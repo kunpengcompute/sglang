@@ -298,6 +298,9 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    # Per-transfer HiCache tracing (L1<->L2 and L2<->L3 copies). One log line per
+    # transfer, so it is off by default: expect a lot of output under load.
+    SGLANG_HICACHE_DEBUG = EnvBool(False)
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)

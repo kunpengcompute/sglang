@@ -1,0 +1,220 @@
+# Copyright 2026 Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Kunpeng CPU glue for the hierarchical cache (HiCache).
+
+Two pieces live here:
+
+1. ``cpu_device_module`` -- a synchronous stand-in for the accelerator device
+   module that ``sglang.srt.managers.cache_controller`` expects.
+
+   On CUDA/HIP the L1 -> L2 (device -> host) transfer is an asynchronous DMA
+   posted on a dedicated stream, and the controller tracks its completion with
+   events before the L2 -> L1 direction is allowed to run. Kunpeng has no
+   accelerator: both tiers are host DDR, so the transfer is a plain synchronous
+   row copy executed in the calling thread. Therefore:
+
+   * an ``Event`` is always already signalled (``query() -> True``), and
+   * ``wait`` / ``stream`` / ``synchronize`` are no-ops.
+
+   That keeps ``LayerDoneCounter`` and ``LayerLoadingEvent`` correct without
+   touching the shared controller code, and it means a finished load is visible
+   before the forward batch is dispatched -- including when static graph capture
+   is enabled, because no cross-thread handshake is left dangling.
+
+2. ``hicache_page_copy`` / ``hicache_page_flatten`` / ``hicache_page_unflatten``
+   -- the Python wrappers around the ``hicache_page_*_kunpeng`` kernels, which
+   move KV between the L1 and L2 pools and (de)serialize one L2 page into the
+   flat blob layout used by the L3 storage backend. See
+   ``sgl-kernel/csrc/cpu/cpu_kunpeng/adapters/hicache_page_copy.cpp``.
+"""
+
+import numpy as np
+import torch
+
+from sglang.srt.utils import is_cpu_920f
+
+__all__ = [
+    "cpu_device_module",
+    "hicache_page_copy",
+    "hicache_page_flatten",
+    "hicache_page_unflatten",
+    "hicache_zeros",
+]
+
+
+def hicache_zeros(numel: int, dtype: torch.dtype) -> torch.Tensor:
+    """Zero-filled 1-D CPU tensor allocated without torch's parallel fill.
+
+    ``torch.zeros`` runs ``fill_`` through ``TensorIterator``, which parallelizes
+    for large tensors. On this build that lands in libkupl's ``kupl_parallel_for``
+    and has been observed to SIGSEGV when issued from HiCache's storage threads
+    (the dummy-page scratch buffer of an L3 read is ~2.25M elements for
+    DeepSeek, well above torch's parallel threshold). numpy's ``zeros`` is a plain
+    memset, so it is safe from any thread.
+    """
+    nbytes = numel * torch.empty(0, dtype=dtype).element_size()
+    return torch.from_numpy(np.zeros(nbytes, dtype=np.uint8)).view(dtype)
+
+
+class _CpuEvent:
+    """Synchronous event: recorded work is always already complete."""
+
+    def record(self) -> None:
+        pass
+
+    def wait(self, *args, **kwargs) -> None:
+        pass
+
+    def query(self) -> bool:
+        return True
+
+    def synchronize(self) -> None:
+        pass
+
+    def wait_event(self, *args, **kwargs) -> None:
+        pass
+
+
+class _CpuStream:
+    """No-op stream. There is no asynchronous queue to order against."""
+
+    def record_event(self, event=None):
+        return event
+
+    def wait_event(self, event) -> None:
+        pass
+
+    def wait_stream(self, stream) -> None:
+        pass
+
+    def synchronize(self) -> None:
+        pass
+
+
+class _CpuStreamContext:
+    def __init__(self, stream: _CpuStream):
+        self._stream = stream
+
+    def __enter__(self) -> _CpuStream:
+        return self._stream
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+_current_stream = _CpuStream()
+
+
+class CpuDeviceModule:
+    """Minimal accelerator-module surface used by ``HiCacheController``.
+
+    Only the attributes the controller touches are provided; anything else is a
+    genuine porting gap and must fail loudly with ``AttributeError``.
+    """
+
+    Event = _CpuEvent
+    Stream = _CpuStream
+
+    @staticmethod
+    def stream(stream=None) -> _CpuStreamContext:
+        return _CpuStreamContext(_current_stream if stream is None else stream)
+
+    @staticmethod
+    def current_stream(*args, **kwargs) -> _CpuStream:
+        return _current_stream
+
+    @staticmethod
+    def synchronize() -> None:
+        pass
+
+
+cpu_device_module = CpuDeviceModule()
+
+
+def hicache_page_copy(dst, src, dst_indices, src_indices) -> None:
+    """Copy KV rows between the L1 (device pool) and L2 (host pool) buffers.
+
+    Semantics, for every ``i``::
+
+        dst[dst_indices[i]] = src[src_indices[i]]
+
+    Args:
+        dst: destination KV buffer, shape ``(slots, 1, kv_cache_dim)`` for the
+            MLA layer-first layout (any trailing width is accepted).
+        src: source KV buffer, same row width as ``dst``.
+        dst_indices: 1-D int32/int64 slot indices into ``dst``.
+        src_indices: 1-D int32/int64 slot indices into ``src``, same length as
+            ``dst_indices``.
+
+    No temporary buffer is allocated (the kernel is a fused row gather-scatter).
+    ``view`` is used on purpose instead of ``reshape``: a non-viewable buffer
+    means the caller handed over a non-contiguous slice, which must fail loudly
+    rather than silently degrade into a copy through a temporary.
+    """
+    if not is_cpu_920f():
+        raise RuntimeError(
+            "hicache_page_copy is only supported on the Kunpeng CPU path "
+            "(SGLANG_USE_CPU_920F=1); the CUDA/HIP paths use sgl_kernel.kvcacheio."
+        )
+    torch.ops.sgl_kernel.hicache_page_copy_kunpeng(
+        dst.view(-1, dst.size(-1)),
+        src.view(-1, src.size(-1)),
+        dst_indices,
+        src_indices,
+    )
+
+
+def hicache_page_flatten(kv_buffer, out, index: int, page_size: int) -> None:
+    """Serialize one L2 page into the flat blob layout used by L3.
+
+    The blob encoding is ``(layer, token, 1, kv_dim)`` flattened, which is what
+    the file backend stores as one ``*.bin`` per page.
+
+    Args:
+        kv_buffer: the L2 host pool buffer, 4-D ``(layer_num, slots, 1, kv_dim)``
+            (MLA ``layer_first`` layout), contiguous CPU tensor.
+        out: destination flat buffer, 1-D contiguous with ``layer_num *
+            page_size * kv_dim`` elements and the same dtype as ``kv_buffer``.
+        index: page-aligned first slot of the page inside ``kv_buffer``.
+        page_size: tokens per page.
+
+    The kernel is serial on purpose: it runs on HiCache's storage threads, which
+    libkupl does not know about (see the kernel header for the full rationale).
+    """
+    if not is_cpu_920f():
+        raise RuntimeError(
+            "hicache_page_flatten is only supported on the Kunpeng CPU path "
+            "(SGLANG_USE_CPU_920F=1)."
+        )
+    # Callers index host_indices[k], which yields a 0-dim tensor; the kernel
+    # schema takes an int, so coerce explicitly.
+    torch.ops.sgl_kernel.hicache_page_flatten_kunpeng(
+        kv_buffer, out, int(index), int(page_size)
+    )
+
+
+def hicache_page_unflatten(kv_buffer, flat, index: int, page_size: int) -> None:
+    """Scatter a flat L3 page blob back into its L2 page slots.
+
+    Inverse of :func:`hicache_page_flatten`; arguments mirror it with ``flat`` as
+    the 1-D contiguous source blob.
+    """
+    if not is_cpu_920f():
+        raise RuntimeError(
+            "hicache_page_unflatten is only supported on the Kunpeng CPU path "
+            "(SGLANG_USE_CPU_920F=1)."
+        )
+    torch.ops.sgl_kernel.hicache_page_unflatten_kunpeng(
+        kv_buffer, flat, int(index), int(page_size)
+    )

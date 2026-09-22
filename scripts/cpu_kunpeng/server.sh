@@ -167,6 +167,32 @@ case "$ROLE" in
         ;;
 esac
 
+# Kunpeng multi-level KV cache (L1 DDR -> L2 DDR -> L3 directory).
+# Only the prefill role participates. L3 is OPTIONAL: leave KUNPENG_HICACHE_L3_DIR
+# empty to run the L1<->L2 tiers only; set it to an NFS directory to also enable
+# the per-page file store shared by every prefill node.
+# Disabled unless ENABLE_KUNPENG_HICACHE=1.
+if [[ "$ROLE" == "prefill" && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
+    BASE_ARGS+=(
+        --enable-hierarchical-cache
+        --hicache-io-backend kunpeng
+        --hicache-mem-layout layer_first
+        --hicache-write-policy "${KUNPENG_HICACHE_WRITE_POLICY:-write_through}"
+    )
+    if [[ -n "${KUNPENG_HICACHE_SIZE:-}" ]]; then
+        BASE_ARGS+=(--hicache-size "$KUNPENG_HICACHE_SIZE")
+    else
+        BASE_ARGS+=(--hicache-ratio "${KUNPENG_HICACHE_RATIO:-2.0}")
+    fi
+    if [[ -n "${KUNPENG_HICACHE_L3_DIR:-}" ]]; then
+        mkdir -p "$KUNPENG_HICACHE_L3_DIR"
+        export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$KUNPENG_HICACHE_L3_DIR"
+        BASE_ARGS+=(--hicache-storage-backend file)
+    else
+        echo "KUNPENG_HICACHE_L3_DIR is empty: HiCache L3 disabled, running L1<->L2 only" >&2
+    fi
+fi
+
 # Build IB device args based on role.
 IB_DEVICE_ALL="roceroh0,roceroh1,roceroh2,roceroh3,roceroh4,roceroh5,roceroh6,roceroh7"
 

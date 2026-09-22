@@ -43,6 +43,12 @@ void set_kv_buffer_kunpeng(at::Tensor kv_buffer, at::Tensor loc, at::Tensor cach
 
 void set_kv_buffer_2_kunpeng(at::Tensor kv_buffer, at::Tensor loc, at::Tensor k_nope, at::Tensor k_pe);
 
+void hicache_page_copy_kunpeng(at::Tensor dst, at::Tensor src, at::Tensor dst_indices, at::Tensor src_indices);
+
+void hicache_page_flatten_kunpeng(at::Tensor kv_buffer, at::Tensor out, int64_t index, int64_t page_size);
+
+void hicache_page_unflatten_kunpeng(at::Tensor kv_buffer, at::Tensor flat, int64_t index, int64_t page_size);
+
 void kupl_sdma_set_kv_buffer_2(at::Tensor kv_buffer, at::Tensor loc, at::Tensor k_nope, at::Tensor k_pe,
                                at::Tensor event_tensor, at::Tensor event_num_tensor);
 
@@ -1260,6 +1266,23 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("set_kv_buffer_2_kunpeng(Tensor(a!) kv_buffer, Tensor loc, Tensor k_nope, Tensor k_pe) -> ()");
     m.impl("set_kv_buffer_2_kunpeng", set_kv_buffer_2_kunpeng);
+
+    // hicache_page_copy (L1 <-> L2 page gather-scatter for the hierarchical cache)
+    m.def(
+        "hicache_page_copy_kunpeng("
+        "Tensor(a!) dst, Tensor src, Tensor dst_indices, Tensor src_indices) -> ()");
+    m.impl("hicache_page_copy_kunpeng", hicache_page_copy_kunpeng);
+
+    // Serial L2 <-> L3 page (de)serialization (safe from HiCache storage threads).
+    m.def(
+        "hicache_page_flatten_kunpeng("
+        "Tensor kv_buffer, Tensor(a!) out, int index, int page_size) -> ()");
+    m.impl("hicache_page_flatten_kunpeng", hicache_page_flatten_kunpeng);
+
+    m.def(
+        "hicache_page_unflatten_kunpeng("
+        "Tensor(a!) kv_buffer, Tensor flat, int index, int page_size) -> ()");
+    m.impl("hicache_page_unflatten_kunpeng", hicache_page_unflatten_kunpeng);
 
     // copy (tensor copy for graph tracking)
     m.def("copy_kunpeng(Tensor(a!) dst, Tensor src) -> ()");

@@ -90,6 +90,30 @@ export PREFILL_SWAP_KV_OUT="${PREFILL_SWAP_KV_OUT:-0}"
 export PREFILL_SWAP_KV_BLOCKWISE="${PREFILL_SWAP_KV_BLOCKWISE:-0}"
 
 # ------------------------------------------------------------
+# Prefill hierarchical cache (multi-level KV cache)
+# ------------------------------------------------------------
+# L1 = the main DDR KV pool (--max-total-tokens), L2 = an extra DDR pool sized
+# by --hicache-ratio / --hicache-size, L3 = an optional per-page file store under
+# KUNPENG_HICACHE_L3_DIR (expected to be an NFS mount so all prefill nodes share
+# one pool). Leaving KUNPENG_HICACHE_L3_DIR empty disables L3 and runs the
+# L1<->L2 tiers only. Off by default; server.sh only wires it for the prefill role.
+export ENABLE_KUNPENG_HICACHE="${ENABLE_KUNPENG_HICACHE:-0}"
+# Empty = L3 disabled (L1<->L2 only). Non-empty = also enable the file backend.
+export KUNPENG_HICACHE_L3_DIR="${KUNPENG_HICACHE_L3_DIR:-}"
+# L2 size: KUNPENG_HICACHE_SIZE (GB, absolute) wins over KUNPENG_HICACHE_RATIO.
+# NOTE: the ratio/size is PER RANK, and every rank on a node allocates its own
+# L2 pool (MLA KV is replicated across the attention-TP ranks), so the node-level
+# DDR cost is (ranks per node) x (size_per_token x max_total_tokens x ratio).
+# Check the free DDR against that product before turning this on; the host pool
+# also refuses to start when it would leave less than 10 GB free.
+export KUNPENG_HICACHE_RATIO="${KUNPENG_HICACHE_RATIO:-2.0}"
+export KUNPENG_HICACHE_SIZE="${KUNPENG_HICACHE_SIZE:-}"
+export KUNPENG_HICACHE_WRITE_POLICY="${KUNPENG_HICACHE_WRITE_POLICY:-write_through}"
+# Per-transfer HiCache tracing (L1<->L2 and L2<->L3 copies, plus L3 hit queries),
+# logged with a "[hicache]" prefix. Very verbose: debug only.
+export SGLANG_HICACHE_DEBUG="${SGLANG_HICACHE_DEBUG:-0}"
+
+# ------------------------------------------------------------
 # Prefill role defaults
 # ------------------------------------------------------------
 export SGLANG_KUNPENG_SWAP_EXPERT="${SGLANG_KUNPENG_SWAP_EXPERT:-1}"

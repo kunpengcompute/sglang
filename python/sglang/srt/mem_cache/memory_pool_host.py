@@ -37,8 +37,9 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cpu_920f, is_cuda, is_mps, is_npu, is_xpu
 
+_is_cpu_920f = is_cpu_920f()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -61,6 +62,18 @@ if not (_is_npu or _is_xpu or _is_mps):
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+
+if _is_cpu_920f:
+    # CPU-only backend: L1 <-> L2 is a host-DDR row gather-scatter instead of the
+    # CUDA transfer_kv_* kernels (see io_backend == "kunpeng" below), and the
+    # L2 <-> L3 page blobs are (de)serialized by serial Kunpeng kernels so that
+    # the HiCache storage threads never trigger torch's parallel copy.
+    from sglang.srt.hardware_backend.cpu_kunpeng.hicache import (
+        hicache_page_copy,
+        hicache_page_flatten,
+        hicache_page_unflatten,
+        hicache_zeros,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -143,11 +156,32 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def alloc_with_cpu_plain_memory(
+    dims,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: HostTensorAllocator,
+) -> torch.Tensor:
+    """Allocate the L2 host pool in ordinary host memory (Kunpeng 920F).
+
+    A CPU-only machine has neither ``cudaHostRegister`` nor PyTorch's pinned
+    allocator, so the two CUDA-oriented helpers above cannot be used. The L2
+    tier therefore lives in plain DDR; ``pin_memory`` is intentionally ignored
+    instead of raising, because callers (e.g. MLATokenToKVPoolHost) default it
+    to True and only the transport really cares about pinning.
+    """
+    return allocator.allocate(dims, dtype=dtype, device=device)
+
+
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        # CPU-only backends: the device pool "device" of the Kunpeng path is
+        # "cpu", so this entry is what the L2 host pool picks up there.
+        "cpu": alloc_with_cpu_plain_memory,
     },
 )
 
@@ -168,6 +202,11 @@ class HostKVCache(abc.ABC):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
+        if _is_cpu_920f:
+            # CPU-only backend: force pinning off so the flat/dummy page helpers
+            # below (which hand pin_memory straight to torch) also stay on plain
+            # host memory instead of requiring a pinned allocator.
+            pin_memory = False
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
@@ -205,6 +244,19 @@ class HostKVCache(abc.ABC):
             )
 
         self.kv_buffer = self.init_kv_buffer()
+
+        if _is_cpu_920f:
+            logger.info(
+                "[hicache] L2 host pool ready: %d slots (%.2f GB per rank), "
+                "layout=%s dtype=%s layers=%d page_size=%d pin_memory=%s",
+                self.size,
+                self.size * self.size_per_token / 1e9,
+                self.layout,
+                self.dtype,
+                self.layer_num,
+                self.page_size,
+                self.pin_memory,
+            )
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
@@ -633,6 +685,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
+        if _is_cpu_920f:
+            # See MLATokenToKVPoolHost.get_dummy_flat_data_page / hicache_zeros.
+            return hicache_zeros(
+                2 * self.layer_num * self.page_size * self.head_num * self.head_dim,
+                self.dtype,
+            )
         return torch.zeros(
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
@@ -1002,6 +1060,21 @@ class MLATokenToKVPoolHost(HostKVCache):
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "kunpeng":
+            # CPU-only backend (Kunpeng 920F): the L2 host pool and the L1 device
+            # pool are both host DDR, so host -> device is just a row
+            # gather-scatter, replacing transfer_kv_per_layer_mla.
+            if self.layout != "layer_first":
+                raise ValueError(
+                    "io backend 'kunpeng' supports the layer_first host layout "
+                    f"only, got {self.layout!r}"
+                )
+            hicache_page_copy(
+                dst=device_pool.kv_buffer[layer_id],
+                src=self.kv_buffer[layer_id],
+                dst_indices=device_indices,
+                src_indices=host_indices,
+            )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -1087,6 +1160,21 @@ class MLATokenToKVPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "kunpeng":
+            # Unlike load_to_device_per_layer this helper is not called per layer,
+            # so walk every layer owned by this PP stage.
+            if self.layout != "layer_first":
+                raise ValueError(
+                    "io backend 'kunpeng' supports the layer_first host layout "
+                    f"only, got {self.layout!r}"
+                )
+            for layer_id in range(self.layer_num):
+                hicache_page_copy(
+                    dst=self.kv_buffer[layer_id],
+                    src=device_pool.kv_buffer[layer_id],
+                    dst_indices=host_indices,
+                    src_indices=device_indices,
+                )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -1101,10 +1189,29 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         if flat:
+            if _is_cpu_920f and self.layout == "layer_first":
+                # The layer_first page slice is not contiguous, so a plain
+                # flatten() would run torch's parallel copy. That is unsafe on
+                # the HiCache storage threads, so serialize with the serial
+                # Kunpeng kernel instead (see hicache_page_flatten_kunpeng).
+                out = torch.empty(
+                    self.kv_buffer.size(0) * self.page_size * self.kv_buffer.size(3),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                hicache_page_flatten(self.kv_buffer, out, index, self.page_size)
+                return out
             data_page = data_page.flatten()
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
+        if _is_cpu_920f:
+            # numpy memset instead of torch.zeros: the fill would be parallel and
+            # this runs on the HiCache storage threads (see hicache_zeros).
+            return hicache_zeros(
+                self.layer_num * self.page_size * 1 * self.kv_cache_dim,
+                self.dtype,
+            )
         return torch.zeros(
             (
                 self.layer_num,
@@ -1118,6 +1225,16 @@ class MLATokenToKVPoolHost(HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        if _is_cpu_920f and self.layout == "layer_first":
+            # Assigning into this non-contiguous slice would run torch's parallel
+            # copy, which is unsafe on the HiCache storage threads; scatter with
+            # the serial Kunpeng kernel instead. view() (not reshape()) is used on
+            # purpose: a non-contiguous blob is a caller bug and must fail loudly
+            # rather than silently copying through a temporary.
+            hicache_page_unflatten(
+                self.kv_buffer, data_page.view(-1), index, self.page_size
+            )
+            return
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,

@@ -39,6 +39,7 @@
 #   pp_comm          -- PP unified RDMA message (pyobj/tensor/ack) correctness
 #   pp_bundle        -- PP consensus bundle (forward/ring-back) demux correctness
 #   broadcast        -- kunpeng broadcast (functional + perf vs gloo)
+#   hicache          -- HiCache L1<->L2 page copy + L2 host pool correctness
 #
 # Options (environment variables):
 #   PYTHON        -- python interpreter       (default: python3)
@@ -135,9 +136,17 @@ case "${TEST_NAME}" in
         export PP_TEST_WORLD_SIZE=2
         export PP_TEST_MASTER_PORT=5014
         ;;
+    hicache)
+        TEST_FILE="${SCRIPT_DIR}/test_hicache.py"
+        # Single process: the L1<->L2 page copy, the L2 host pool and the L2<->L3
+        # flat-page encoding are all local, no ranks/rendezvous needed.
+        WORLD_SIZE=1
+        MASTER_PORT=5015
+        TEST_LABEL="HiCache L1<->L2 page copy + L2 host pool + L2->L3->L2 (file)"
+        ;;
     *)
         echo "ERROR: unknown test '${TEST_NAME}'" >&2
-        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8, mla_alltoall, rdma_allgather, pp_comm, pp_bundle, broadcast" >&2
+        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8, mla_alltoall, rdma_allgather, pp_comm, pp_bundle, broadcast, hicache" >&2
         exit 1
         ;;
 esac

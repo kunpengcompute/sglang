@@ -41,11 +41,34 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_cpu_920f
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-device_module = get_device_module()
+
+def _hicache_debug() -> bool:
+    """True when per-transfer HiCache tracing is on (SGLANG_HICACHE_DEBUG=1)."""
+    return envs.SGLANG_HICACHE_DEBUG.get()
+
+
+def _idx_range(idx: torch.Tensor) -> str:
+    """Compact '[min..max]' span of a slot-index tensor, for debug logs."""
+    if idx is None or idx.numel() == 0:
+        return "-"
+    return f"[{int(idx.min())}..{int(idx.max())}]"
+
+
+if is_cpu_920f():
+    # Kunpeng CPU: no accelerator streams/events. Both HiCache tiers are host
+    # DDR and every transfer is a synchronous copy in the calling thread, so the
+    # stream/event API is served by a synchronous stand-in (see the module
+    # docstring of hardware_backend/cpu_kunpeng/hicache.py).
+    from sglang.srt.hardware_backend.cpu_kunpeng.hicache import (
+        cpu_device_module as device_module,
+    )
+else:
+    device_module = get_device_module()
 
 
 class LayerLoadingEvent:
@@ -343,6 +366,18 @@ class HiCacheController:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
+        if is_cpu_920f():
+            logger.info(
+                "[hicache] controller ready: io_backend=%s write_policy=%s "
+                "page_size=%d layers=%d device=%s L3=%s",
+                self.io_backend,
+                self.write_policy,
+                self.page_size,
+                self.layer_num,
+                self.mem_pool_device.device,
+                self.storage_backend_type if self.enable_storage else "disabled",
+            )
+
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
         if self.attn_cp_group is not None:
@@ -539,6 +574,20 @@ class HiCacheController:
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
+            if is_cpu_920f():
+                logger.info(
+                    "[hicache] L3 storage ready: backend=%s dir=%s page_size=%d "
+                    "page_bytes=%d batch_pages=%d prefetch_threshold=%d "
+                    "prefetch_capacity_limit=%d backup_skip=%s",
+                    self.storage_backend_type,
+                    getattr(self.storage_backend, "file_path", "-"),
+                    self.page_size,
+                    self.mem_pool_host.get_size_per_token() * self.page_size,
+                    self.storage_batch_size,
+                    self.prefetch_threshold,
+                    self.prefetch_capacity_limit,
+                    self.backup_skip,
+                )
         except Exception:
             # Best-effort cleanup for partial init.
             try:
@@ -714,6 +763,15 @@ class HiCacheController:
         )
         self.write_queue.clear()
 
+        if _hicache_debug():
+            logger.info(
+                "[hicache] L1->L2 copy: %d tokens, %d node(s), host%s <- device%s",
+                host_indices.numel(),
+                len(op.node_ids),
+                _idx_range(host_indices),
+                _idx_range(device_indices),
+            )
+
         start_event = device_module.Event()
         finish_event = device_module.Event()
 
@@ -775,6 +833,12 @@ class HiCacheController:
                 raise ValueError(
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
+        elif self.io_backend == "kunpeng":
+            # CPU-only backend: the L1 device pool and the L2 host pool are both
+            # host DDR, so the indices are already on the right device and no
+            # layout shuffle is needed -- hicache_page_copy_kunpeng pairs the
+            # two index tensors directly.
+            return host_indices, device_indices.cpu()
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         else:
@@ -792,6 +856,15 @@ class HiCacheController:
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+
+        if _hicache_debug():
+            logger.info(
+                "[hicache] L2->L1 copy: %d tokens, %d node(s), device%s <- host%s",
+                device_indices.numel(),
+                len(op.node_ids),
+                _idx_range(device_indices),
+                _idx_range(host_indices),
+            )
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
@@ -937,6 +1010,17 @@ class HiCacheController:
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+
+            if _hicache_debug():
+                logger.info(
+                    "[hicache] L3->L2 read: req=%s, %d page(s), host%s, done=%d/%d",
+                    operation.request_id,
+                    len(batch_hashes),
+                    _idx_range(batch_host_indices),
+                    operation.completed_tokens,
+                    len(operation.hash_value) * self.page_size,
+                )
+
             # Check termination
             if (
                 operation.completed_tokens
@@ -1030,6 +1114,20 @@ class HiCacheController:
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
+                if _hicache_debug():
+                    logger.info(
+                        "[hicache] L3 hit query: req=%s, hit=%d token(s), "
+                        "threshold=%d, %s",
+                        operation.request_id,
+                        storage_hit_count,
+                        self.prefetch_threshold,
+                        (
+                            "prefetch"
+                            if storage_hit_count >= self.prefetch_threshold
+                            else "revoke"
+                        ),
+                    )
+
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
@@ -1038,6 +1136,13 @@ class HiCacheController:
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
+                    if _hicache_debug():
+                        logger.info(
+                            "[hicache] L3->L2 start: req=%s, %d page(s), host%s",
+                            operation.request_id,
+                            storage_hit_count // self.page_size,
+                            _idx_range(operation.host_indices),
+                        )
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
@@ -1068,6 +1173,14 @@ class HiCacheController:
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
         self.backup_queue.put(operation)
+        if _hicache_debug():
+            logger.info(
+                "[hicache] L2->L3 queued: op=%d, %d page(s), host%s, %d token(s)",
+                operation.id,
+                len(operation.hash_value),
+                _idx_range(host_indices),
+                len(token_ids),
+            )
         return operation.id
 
     # todo: deprecate
@@ -1148,6 +1261,16 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
+
+            if _hicache_debug():
+                logger.info(
+                    "[hicache] L2->L3 write: op=%d, %d page(s), host%s, done=%d/%d",
+                    operation.id,
+                    len(batch_hashes),
+                    _idx_range(batch_host_indices),
+                    operation.completed_tokens,
+                    len(operation.hash_value) * self.page_size,
+                )
 
     def backup_thread_func(self):
         """
