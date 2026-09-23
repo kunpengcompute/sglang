@@ -187,7 +187,10 @@ if [[ "$ROLE" == "prefill" && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
     if [[ -n "${KUNPENG_HICACHE_L3_DIR:-}" ]]; then
         mkdir -p "$KUNPENG_HICACHE_L3_DIR"
         export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$KUNPENG_HICACHE_L3_DIR"
-        BASE_ARGS+=(--hicache-storage-backend file)
+        BASE_ARGS+=(
+            --hicache-storage-backend file
+            --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-wait_complete}"
+        )
     else
         echo "KUNPENG_HICACHE_L3_DIR is empty: HiCache L3 disabled, running L1<->L2 only" >&2
     fi

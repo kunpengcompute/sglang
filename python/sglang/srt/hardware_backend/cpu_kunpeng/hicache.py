@@ -37,6 +37,7 @@ Two pieces live here:
    move KV between the L1 and L2 pools and (de)serialize one L2 page into the
    flat blob layout used by the L3 storage backend. See
    ``sgl-kernel/csrc/cpu/cpu_kunpeng/adapters/hicache_page_copy.cpp``.
+   ``hicache_page_load_coalesced_batch`` is the batched L3 -> L2 counterpart.
 """
 
 import numpy as np
@@ -48,6 +49,7 @@ __all__ = [
     "cpu_device_module",
     "hicache_page_copy",
     "hicache_page_flatten",
+    "hicache_page_load_coalesced_batch",
     "hicache_page_unflatten",
     "hicache_zeros",
 ]
@@ -218,3 +220,53 @@ def hicache_page_unflatten(kv_buffer, flat, index: int, page_size: int) -> None:
     torch.ops.sgl_kernel.hicache_page_unflatten_kunpeng(
         kv_buffer, flat, int(index), int(page_size)
     )
+
+
+def hicache_page_load_coalesced_batch(
+    target_kv_buffer: torch.Tensor,
+    target_indices: torch.Tensor,
+    target_page_size: int,
+    paths: list,
+    draft_kv_buffer: torch.Tensor = None,
+    draft_indices: torch.Tensor = None,
+    draft_page_size: int = 0,
+) -> tuple:
+    """Read a whole batch of coalesced page files straight into the L2 pools.
+
+    Batched form of :func:`hicache_page_unflatten` (one file read + one scatter
+    per page, all in a single Python -> C++ call), for HiCache storage threads
+    where each torch.ops call costs a GIL round trip.
+
+    Args:
+        target_kv_buffer: L2 host pool buffer, 4-D ``(layers, slots, 1, kv_dim)``
+            (MLA ``layer_first``).
+        target_indices: 1-D int32/int64 host slots, ``len(paths) *
+            target_page_size`` long; page ``i`` starts at
+            ``target_indices[i * target_page_size]``.
+        target_page_size: tokens per page of the target pool.
+        paths: one file per page, each laid out as ``[target blob][draft blob]``
+            (see ``HiCacheFile.batch_set_coalesced_pages``).
+        draft_kv_buffer/draft_indices/draft_page_size: the draft pool, same
+            convention; the two first are required together, and passing neither
+            reads the target blobs only.
+
+    Returns ``(target_hit, draft_hit)``: 0/1 per page. 0 = the blob (or, for a
+    page stored before coalescing, the draft section) was not read in full.
+    """
+    if not is_cpu_920f():
+        raise RuntimeError(
+            "hicache_page_load_coalesced_batch is only supported on the Kunpeng "
+            "CPU path (SGLANG_USE_CPU_920F=1)."
+        )
+    target_hit, draft_hit = (
+        torch.ops.sgl_kernel.hicache_page_load_coalesced_batch_kunpeng(
+            target_kv_buffer,
+            target_indices,
+            int(target_page_size),
+            draft_kv_buffer,
+            draft_indices,
+            int(draft_page_size),
+            paths,
+        )
+    )
+    return target_hit.tolist(), draft_hit.tolist()

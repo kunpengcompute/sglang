@@ -19,6 +19,8 @@
 #include <torch/extension.h>
 
 #include <tuple>
+#include <string>
+#include <vector>
 
 #include "sgl_kernel_ops.h"
 
@@ -48,6 +50,11 @@ void hicache_page_copy_kunpeng(at::Tensor dst, at::Tensor src, at::Tensor dst_in
 void hicache_page_flatten_kunpeng(at::Tensor kv_buffer, at::Tensor out, int64_t index, int64_t page_size);
 
 void hicache_page_unflatten_kunpeng(at::Tensor kv_buffer, at::Tensor flat, int64_t index, int64_t page_size);
+
+std::tuple<at::Tensor, at::Tensor> hicache_page_load_coalesced_batch_kunpeng(
+    at::Tensor target_kv_buffer, at::Tensor target_indices, int64_t target_page_size,
+    c10::optional<at::Tensor> draft_kv_buffer, c10::optional<at::Tensor> draft_indices,
+    int64_t draft_page_size, std::vector<std::string> paths);
 
 void kupl_sdma_set_kv_buffer_2(at::Tensor kv_buffer, at::Tensor loc, at::Tensor k_nope, at::Tensor k_pe,
                                at::Tensor event_tensor, at::Tensor event_num_tensor);
@@ -1283,6 +1290,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "hicache_page_unflatten_kunpeng("
         "Tensor(a!) kv_buffer, Tensor flat, int index, int page_size) -> ()");
     m.impl("hicache_page_unflatten_kunpeng", hicache_page_unflatten_kunpeng);
+
+    // Whole-batch L3 -> L2 load: one call reads a batch of coalesced page files
+    // and scatters them into the L2 pools (see the kernel header comment in
+    // hicache_page_copy.cpp: per-page calls make a HiCache storage thread
+    // re-acquire the GIL once per page, which dominates the L3 prefetch cost).
+    m.def(
+        "hicache_page_load_coalesced_batch_kunpeng("
+        "Tensor(a!) target_kv_buffer, Tensor target_indices, int target_page_size, "
+        "Tensor? draft_kv_buffer, Tensor? draft_indices, int draft_page_size, str[] paths) "
+        "-> (Tensor, Tensor)");
+    m.impl("hicache_page_load_coalesced_batch_kunpeng",
+           hicache_page_load_coalesced_batch_kunpeng);
 
     // copy (tensor copy for graph tracking)
     m.def("copy_kunpeng(Tensor(a!) dst, Tensor src) -> ()");

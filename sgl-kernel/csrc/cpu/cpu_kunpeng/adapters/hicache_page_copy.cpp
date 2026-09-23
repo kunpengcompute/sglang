@@ -15,8 +15,16 @@
  */
 
 #include <ATen/Tensor.h>
+#include <ATen/ops/empty.h>
+#include <c10/util/Optional.h>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
+#include <string>
+#include <tuple>
+#include <unistd.h>
+#include <vector>
 
 #include <kutacc.h>
 
@@ -222,4 +230,225 @@ void hicache_page_unflatten_kunpeng(at::Tensor kv_buffer, at::Tensor flat,
                     src + layer * page_bytes,
                     page_bytes);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Whole-batch L3 -> L2 load: read a batch of coalesced page files and scatter
+// them into the L2 host pools in ONE Python -> C++ call. The caller is a HiCache
+// storage thread (a plain Python thread), and every torch.ops call costs it one
+// GIL round trip -- tens of ms under load, so batching them matters more than
+// the copies themselves.
+//
+// File layout (HiCacheFile.batch_set_coalesced_pages): one .bin per page holding
+// [target blob][draft blob], each blob (layer, token, 1, kv_dim) flattened. A
+// page written before coalescing has no draft section: the short read is
+// reported as draft_hit=0, not as an error.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Where one page of an L2 host pool lives, precomputed once per call.
+struct PageLayout {
+    uint8_t *base = nullptr;
+    int64_t layers = 0;
+    int64_t layer_stride_bytes = 0;  // one layer of the pool
+    int64_t page_bytes = 0;          // one layer's slice of a page
+    int64_t blob_bytes = 0;          // a whole page = layers * page_bytes
+    int64_t row_bytes = 0;           // one token
+};
+
+PageLayout make_page_layout(const at::Tensor &kv_buffer, int64_t page_size, const char *op)
+{
+    TORCH_CHECK(kv_buffer.dim() == 4, op, ": kv_buffer must be 4D (layer, slots, 1, kv_dim), got dim=", kv_buffer.dim());
+    TORCH_CHECK(kv_buffer.size(2) == 1, op, ": kv_buffer dim-2 must be 1, got ", kv_buffer.size(2));
+    TORCH_CHECK(kv_buffer.is_cpu() && kv_buffer.is_contiguous(), op, ": kv_buffer must be a contiguous CPU tensor");
+    TORCH_CHECK(page_size > 0, op, ": page_size must be positive, got ", page_size);
+
+    const int64_t kv_dim = kv_buffer.size(3);
+    TORCH_CHECK(kv_dim > 0, op, ": kv_buffer dim-3 must be positive, got ", kv_dim);
+
+    PageLayout layout;
+    layout.base = static_cast<uint8_t *>(kv_buffer.data_ptr());
+    layout.layers = kv_buffer.size(0);
+    layout.row_bytes = kv_dim * kv_buffer.element_size();
+    layout.page_bytes = page_size * layout.row_bytes;
+    layout.blob_bytes = layout.layers * layout.page_bytes;
+    layout.layer_stride_bytes = kv_buffer.size(1) * layout.row_bytes;
+    return layout;
+}
+
+// Same copy as hicache_page_unflatten_kunpeng, one page at a time: the blob is
+// (layer, token, 1, kv_dim) flattened, so layer l lives at blob + l * page_bytes.
+void scatter_page(const PageLayout &pool, const uint8_t *src, int64_t index)
+{
+    for (int64_t layer = 0; layer < pool.layers; layer++) {
+        std::memcpy(pool.base + layer * pool.layer_stride_bytes + index * pool.row_bytes,
+                    src + layer * pool.page_bytes,
+                    pool.page_bytes);
+    }
+}
+
+// Fill dst with exactly count bytes; returns what was actually read, so a short
+// count (missing or truncated section) is reported to the caller as a miss.
+int64_t read_full(int fd, uint8_t *dst, int64_t count)
+{
+    int64_t done = 0;
+    while (done < count) {
+        const ssize_t got = ::read(fd, dst + done, static_cast<size_t>(count - done));
+        if (got > 0) {
+            done += got;
+        } else if (got < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;  // EOF or read error: stop here, caller treats it as a miss
+        }
+    }
+    return done;
+}
+
+// 1-D int32/int64 slot reader; the host allocator hands out int64, but the same
+// operator is usable with int32 indices (see hicache_page_copy_kunpeng).
+struct IndexReader {
+    const int32_t *i32 = nullptr;
+    const int64_t *i64 = nullptr;
+    bool is_i32 = false;
+
+    static IndexReader bind(const at::Tensor &indices, const char *op, const char *name)
+    {
+        TORCH_CHECK(indices.dim() == 1, op, ": ", name, " must be 1D, got dim=", indices.dim());
+        const bool is_i32 = indices.scalar_type() == at::kInt;
+        TORCH_CHECK(is_i32 || indices.scalar_type() == at::kLong,
+                    op, ": ", name, " must be int32 or int64, got ", indices.scalar_type());
+        IndexReader reader;
+        reader.is_i32 = is_i32;
+        reader.i32 = is_i32 ? indices.data_ptr<int32_t>() : nullptr;
+        reader.i64 = is_i32 ? nullptr : indices.data_ptr<int64_t>();
+        return reader;
+    }
+
+    int64_t at(int64_t i) const
+    {
+        return is_i32 ? static_cast<int64_t>(i32[i]) : i64[i];
+    }
+};
+
+}  // namespace
+
+std::tuple<at::Tensor, at::Tensor> hicache_page_load_coalesced_batch_kunpeng(
+    at::Tensor target_kv_buffer, at::Tensor target_indices, int64_t target_page_size,
+    c10::optional<at::Tensor> draft_kv_buffer, c10::optional<at::Tensor> draft_indices,
+    int64_t draft_page_size, std::vector<std::string> paths)
+{
+    constexpr const char *op = "hicache_page_load_coalesced_batch_kunpeng";
+    const int64_t pages = static_cast<int64_t>(paths.size());
+    const bool has_draft = draft_kv_buffer.has_value();
+
+    const PageLayout target = make_page_layout(target_kv_buffer, target_page_size, op);
+    const IndexReader target_reader = IndexReader::bind(target_indices, op, "target_indices");
+    TORCH_CHECK(target_indices.numel() == pages * target_page_size,
+                op, ": target_indices numel mismatch (", target_indices.numel(),
+                " != ", pages * target_page_size, ")");
+
+    PageLayout draft;
+    IndexReader draft_reader;
+    if (has_draft) {
+        TORCH_CHECK(draft_indices.has_value(),
+                    op, ": draft_indices must be given together with draft_kv_buffer");
+        draft = make_page_layout(*draft_kv_buffer, draft_page_size, op);
+        draft_reader = IndexReader::bind(*draft_indices, op, "draft_indices");
+        TORCH_CHECK(draft_kv_buffer->scalar_type() == target_kv_buffer.scalar_type(),
+                    op, ": draft/target dtype mismatch (draft=", draft_kv_buffer->scalar_type(),
+                    ", target=", target_kv_buffer.scalar_type(), ")");
+        TORCH_CHECK((*draft_indices).numel() == pages * draft_page_size,
+                    op, ": draft_indices numel mismatch (", (*draft_indices).numel(),
+                    " != ", pages * draft_page_size, ")");
+    }
+
+    // Validate every page start slot up front, so the read loop below needs no
+    // error path of its own. A negative slot is the non-local page hole used by
+    // long-context decode CP; such a page has nothing to fill, so it is skipped
+    // rather than rejected -- same convention as hicache_page_copy_kunpeng.
+    for (int64_t p = 0; p < pages; p++) {
+        const int64_t index = target_reader.at(p * target_page_size);
+        TORCH_CHECK(index < target_kv_buffer.size(1),
+                    op, ": page ", p, " target slot out of range (index=", index,
+                    ", slots=", target_kv_buffer.size(1), ")");
+        TORCH_CHECK(index < 0 || index + target_page_size <= target_kv_buffer.size(1),
+                    op, ": page ", p, " target page out of range (index=", index,
+                    ", page_size=", target_page_size,
+                    ", slots=", target_kv_buffer.size(1), ")");
+        if (has_draft) {
+            const int64_t draft_index = draft_reader.at(p * draft_page_size);
+            TORCH_CHECK(draft_index < draft_kv_buffer->size(1),
+                        op, ": page ", p, " draft slot out of range (index=", draft_index,
+                        ", slots=", draft_kv_buffer->size(1), ")");
+            TORCH_CHECK(draft_index < 0 || draft_index + draft_page_size <= draft_kv_buffer->size(1),
+                        op, ": page ", p, " draft page out of range (index=", draft_index,
+                        ", page_size=", draft_page_size,
+                        ", slots=", draft_kv_buffer->size(1), ")");
+        }
+    }
+
+    // 0/1 per page, written by the loop below; empty() + memset instead of
+    // zeros() because this runs on a storage thread (see hicache_zeros).
+    auto target_hit = at::empty({pages}, target_kv_buffer.options().dtype(at::kByte));
+    auto draft_hit = at::empty({pages}, target_kv_buffer.options().dtype(at::kByte));
+    uint8_t *hit_target = target_hit.data_ptr<uint8_t>();
+    uint8_t *hit_draft = draft_hit.data_ptr<uint8_t>();
+    std::memset(hit_target, 0, pages);
+    std::memset(hit_draft, 0, pages);
+    if (pages == 0) {
+        return {target_hit, draft_hit};
+    }
+
+    // Staging area for the blob of one page (all layers, i.e. blob_bytes), which
+    // the scatter below turns into the layer-sliced pool layout.
+    auto target_flat = at::empty({pages, target.blob_bytes}, at::kByte);
+    at::Tensor draft_flat;
+    uint8_t *flat_draft = nullptr;
+    if (has_draft) {
+        draft_flat = at::empty({pages, draft.blob_bytes}, at::kByte);
+        flat_draft = draft_flat.data_ptr<uint8_t>();
+    }
+    uint8_t *flat_target = target_flat.data_ptr<uint8_t>();
+
+    // File I/O. Already runs with the GIL released -- torch's dispatcher enters
+    // custom-op kernels that way (an explicit PyEval_SaveThread here aborts with
+    // "the current Python thread state is NULL"). Nothing below touches a Python
+    // object, so nothing needs the GIL.
+    for (int64_t p = 0; p < pages; p++) {
+        // Negative slots are the non-local page holes: nothing to fill, and
+        // the hit flags stay 0 (see the validation above).
+        if (target_reader.at(p * target_page_size) < 0) {
+            continue;
+        }
+        if (has_draft && draft_reader.at(p * draft_page_size) < 0) {
+            continue;
+        }
+        const int fd = ::open(paths[p].c_str(), O_RDONLY);
+        if (fd < 0) {
+            continue;  // page not in storage: reported as a miss
+        }
+        // One whole page per blob: all layers, not just the first layer's slice.
+        if (read_full(fd, flat_target + p * target.blob_bytes, target.blob_bytes) == target.blob_bytes) {
+            hit_target[p] = 1;
+            if (has_draft) {
+                // The draft blob follows the target blob in the same object.
+                hit_draft[p] = read_full(fd, flat_draft + p * draft.blob_bytes, draft.blob_bytes)
+                               == draft.blob_bytes;
+            }
+        }
+        ::close(fd);
+    }
+
+    for (int64_t p = 0; p < pages; p++) {
+        if (hit_target[p]) {
+            scatter_page(target, flat_target + p * target.blob_bytes, target_reader.at(p * target_page_size));
+        }
+        if (has_draft && hit_draft[p]) {
+            scatter_page(draft, flat_draft + p * draft.blob_bytes, draft_reader.at(p * draft_page_size));
+        }
+    }
+
+    return {target_hit, draft_hit};
 }

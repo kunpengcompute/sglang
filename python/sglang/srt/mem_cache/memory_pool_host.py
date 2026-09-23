@@ -310,6 +310,15 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def supports_batched_flat_io(self) -> bool:
+        """True when a whole batch of flat pages can be written in one call.
+
+        Only the Kunpeng 4-D ``layer_first`` buffer matches the encoding of that
+        batched kernel (``hicache_page_load_coalesced_batch_kunpeng``); pools with
+        their own layout (page_first, MHA, hybrid) keep the per-page path.
+        """
+        return False
+
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
@@ -1261,6 +1270,10 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def supports_batched_flat_io(self) -> bool:
+        # Same condition as the kunpeng branch of set_from_flat_data_page above.
+        return _is_cpu_920f and self.layout == "layer_first"
+
     def get_page_buffer_meta(self, indices):
         """ "
         meta data for zero copy
@@ -1838,6 +1851,12 @@ class HostPoolGroup:
 
     def get_page_buffer_meta(self, indices):
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
+
+    def supports_batched_flat_io(self) -> bool:
+        # A group holds several pools (KV + indexer / Mamba) while the batched
+        # kernel fills one buffer, so it always takes the per-page path. Defined
+        # here because a group is not a HostKVCache.
+        return False
 
     def clear(self) -> None:
         for entry in self.entries:

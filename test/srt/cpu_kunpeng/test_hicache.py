@@ -29,6 +29,11 @@ Covers the Kunpeng-specific pieces of the multi-level KV cache:
                                        context where the earlier L2 -> L3
                                        SIGSEGV happened, so it doubles as the
                                        regression test for it.
+  5. ``hicache_page_load_coalesced_batch`` -- the whole-batch L3 -> L2 load that
+                                       reads N page files and scatters them into
+                                       the L2 pools in one call (the per-page
+                                       variant costs the storage thread one GIL
+                                       re-acquisition per page).
 
 Run:
     bash run.sh hicache        # shared launcher (WORLD_SIZE=1, port 5015)
@@ -50,6 +55,7 @@ from sglang.srt.hardware_backend.cpu_kunpeng.hicache import (
     cpu_device_module,
     hicache_page_copy,
     hicache_page_flatten,
+    hicache_page_load_coalesced_batch,
     hicache_page_unflatten,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
@@ -506,6 +512,213 @@ def test_page_flatten_unflatten_ops():
             pass
 
 
+def _flat_page_bytes(pool, index: int) -> torch.Tensor:
+    """One page of *pool* as raw bytes, in the (layer, token, 1, kv_dim) encoding."""
+    blob = torch.stack(
+        [buf[index : index + pool.page_size] for buf in pool.kv_buffer]
+    ).flatten()
+    return blob.view(torch.uint8)
+
+
+def test_batch_coalesced_load():
+    """The whole-batch load reads N page files into the L2 pools in one call."""
+    import os
+    import shutil
+    import tempfile
+
+    _, target_pool = _build_pools()
+    _, draft_pool = _build_pools()
+
+    for layer_id in range(LAYER_NUM):
+        target_pool.kv_buffer[layer_id].copy_(
+            _pattern(target_pool.kv_buffer[layer_id].shape, seed=600 + layer_id)
+        )
+        draft_pool.kv_buffer[layer_id].copy_(
+            _pattern(draft_pool.kv_buffer[layer_id].shape, seed=700 + layer_id)
+        )
+
+    # Three coalesced pages, whose target/draft pages sit at unrelated slots.
+    # A fourth page was stored before coalescing and therefore carries no draft
+    # section (target blob only), and a fifth one is not in storage at all --
+    # both are hit flags, not errors.
+    pages = 3
+    target_index = [PAGE_SIZE * 9, PAGE_SIZE * 2, PAGE_SIZE * 20]
+    draft_index = [PAGE_SIZE * 4, PAGE_SIZE * 11, PAGE_SIZE * 1]
+    missing_index = PAGE_SIZE * 24
+    target_only_index = PAGE_SIZE * 28
+    target_only_draft_index = PAGE_SIZE * 26
+    all_index = target_index + [target_only_index, missing_index]
+    all_draft_index = draft_index + [PAGE_SIZE * 22, target_only_draft_index]
+    # The pools are small in this test; make sure every page above fits in them.
+    assert max(all_index) + PAGE_SIZE <= target_pool.size
+    assert max(all_draft_index) + PAGE_SIZE <= draft_pool.size
+
+    expected_target = [
+        [buf[i : i + PAGE_SIZE].clone() for buf in target_pool.kv_buffer]
+        for i in target_index
+    ]
+    expected_draft = [
+        [buf[i : i + PAGE_SIZE].clone() for buf in draft_pool.kv_buffer]
+        for i in draft_index
+    ]
+    expected_target_only = [
+        buf[target_only_index : target_only_index + PAGE_SIZE].clone()
+        for buf in target_pool.kv_buffer
+    ]
+
+    tmpdir = tempfile.mkdtemp(prefix="hicache_batch_")
+    try:
+        paths = []
+        for p in range(pages):
+            path = os.path.join(tmpdir, f"page{p}.bin")
+            with open(path, "wb") as f:
+                f.write(_flat_page_bytes(target_pool, target_index[p]).numpy().tobytes())
+                f.write(_flat_page_bytes(draft_pool, draft_index[p]).numpy().tobytes())
+            paths.append(path)
+        missing_path = os.path.join(tmpdir, "missing.bin")
+        target_only_path = os.path.join(tmpdir, "target_only.bin")
+        with open(target_only_path, "wb") as f:
+            f.write(_flat_page_bytes(target_pool, target_only_index).numpy().tobytes())
+        # Same order as all_index: page 3 is the draft-less one, page 4 the missing
+        # one -- the operator pairs paths[p] with the p-th page slot by position.
+        paths += [target_only_path, missing_path]
+
+        def indices_for(slots):
+            # Same shape as the controller's host_indices: page p owns
+            # [p * page_size, (p + 1) * page_size).
+            return torch.cat(
+                [
+                    torch.arange(slot, slot + PAGE_SIZE, dtype=torch.int64)
+                    for slot in slots
+                ]
+            )
+
+        target_indices = indices_for(all_index)
+        draft_indices = indices_for(all_draft_index)
+
+        for buf in target_pool.kv_buffer:
+            buf.zero_()
+        for buf in draft_pool.kv_buffer:
+            buf.zero_()
+
+        target_hit, draft_hit = hicache_page_load_coalesced_batch(
+            target_pool.kv_buffer,
+            target_indices,
+            PAGE_SIZE,
+            paths,
+            draft_pool.kv_buffer,
+            draft_indices,
+            PAGE_SIZE,
+        )
+
+        assert target_hit == [1] * pages + [1, 0], f"target hits {target_hit}"
+        assert draft_hit == [1] * pages + [0, 0], f"draft hits {draft_hit}"
+
+        # Pages 0..2 came back into both pools at their own slots.
+        for p in range(pages):
+            for layer_id in range(LAYER_NUM):
+                base = all_index[p]
+                assert torch.equal(
+                    target_pool.kv_buffer[layer_id][base : base + PAGE_SIZE],
+                    expected_target[p][layer_id],
+                ), f"page {p} layer {layer_id} target mismatch"
+                assert torch.equal(
+                    draft_pool.kv_buffer[layer_id][
+                        all_draft_index[p] : all_draft_index[p] + PAGE_SIZE
+                    ],
+                    expected_draft[p][layer_id],
+                ), f"page {p} layer {layer_id} draft mismatch"
+
+        # The draft-less page still lands in the target pool, with its draft slot
+        # untouched, and every slot outside the written pages stays zero.
+        written_target = all_index[: pages] + [target_only_index]
+        written_draft = all_draft_index[:pages]
+        for pool, written in ((target_pool, written_target), (draft_pool, written_draft)):
+            mask = torch.zeros(pool.size, dtype=torch.bool)
+            for slot in written:
+                mask[slot : slot + PAGE_SIZE] = True
+            for layer_id in range(LAYER_NUM):
+                assert float(pool.kv_buffer[layer_id][~mask].abs().max()) == 0.0, (
+                    f"layer {layer_id} wrote outside the requested pages"
+                )
+        for layer_id in range(LAYER_NUM):
+            assert torch.equal(
+                target_pool.kv_buffer[layer_id][
+                    target_only_index : target_only_index + PAGE_SIZE
+                ],
+                expected_target_only[layer_id],
+            ), f"layer {layer_id} draft-less page mismatch"
+
+        # Without a draft pool (the no-draft HiCache configuration) the same call
+        # must work, reporting a zero draft hit for every page.
+        for buf in target_pool.kv_buffer:
+            buf.zero_()
+        target_hit, draft_hit = hicache_page_load_coalesced_batch(
+            target_pool.kv_buffer,
+            target_indices[: pages * PAGE_SIZE],
+            PAGE_SIZE,
+            paths[:pages],
+        )
+        assert target_hit == [1] * pages, f"target hits without draft {target_hit}"
+        assert draft_hit == [0] * pages, f"draft hits without draft {draft_hit}"
+        for p in range(pages):
+            for layer_id in range(LAYER_NUM):
+                assert torch.equal(
+                    target_pool.kv_buffer[layer_id][
+                        all_index[p] : all_index[p] + PAGE_SIZE
+                    ],
+                    expected_target[p][layer_id],
+                ), f"page {p} layer {layer_id} target mismatch (no draft)"
+
+        bad_calls = [
+            (
+                "index count mismatch",
+                lambda: hicache_page_load_coalesced_batch(
+                    target_pool.kv_buffer, target_indices, PAGE_SIZE, paths[:pages]
+                ),
+            ),
+            (
+                "target slot out of range",
+                lambda: hicache_page_load_coalesced_batch(
+                    target_pool.kv_buffer,
+                    indices_for([target_pool.size]),
+                    PAGE_SIZE,
+                    paths[:1],
+                ),
+            ),
+            (
+                "draft slot out of range",
+                lambda: hicache_page_load_coalesced_batch(
+                    draft_pool.kv_buffer,
+                    target_indices[: PAGE_SIZE],
+                    PAGE_SIZE,
+                    paths[:1],
+                    draft_pool.kv_buffer,
+                    indices_for([draft_pool.size]),
+                    PAGE_SIZE,
+                ),
+            ),
+            (
+                "draft buffer without indices",
+                lambda: hicache_page_load_coalesced_batch(
+                    target_pool.kv_buffer,
+                    target_indices[: PAGE_SIZE],
+                    PAGE_SIZE,
+                    paths[:1],
+                    draft_pool.kv_buffer,
+                ),
+            ),
+        ]
+        for label, call in bad_calls:
+            try:
+                call()
+                assert False, f"{label} must raise"
+            except RuntimeError:
+                pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _build_allocator(device_pool):
     """Wrap *device_pool* in the Kunpeng paged allocator (needed by the L2/L3 test)."""
     from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_allocator import (
@@ -660,6 +873,7 @@ if __name__ == "__main__":
         ("move_indices kunpeng passthrough", test_move_indices_kunpeng_passthrough),
         ("flat page roundtrip", test_flat_page_roundtrip),
         ("page flatten/unflatten ops", test_page_flatten_unflatten_ops),
+        ("batch coalesced load", test_batch_coalesced_load),
         # Last on purpose: this is the only test that exercises the storage
         # threads, so if the L2 -> L3 path still segfaults it kills the process
         # here and the results above are already printed.
