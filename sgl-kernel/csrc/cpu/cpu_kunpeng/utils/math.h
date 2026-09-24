@@ -56,11 +56,11 @@ inline int64_t divup(int64_t x, int64_t y)
     return (x + y - 1) / y;
 }
 
-inline svfloat32_t sigmoid(svbool_t pg, svfloat32_t x, int vl)
+inline svfloat32_t sigmoid(svbool_t pg, svfloat32_t x)
 {
-    // const int vl = __ARM_FEATURE_SVE_BITS / 32;
-    float data[vl];
+    float data[64];
     svst1(pg, data, x);
+    int vl = svcntw();
     for (int i = 0; i < vl; i++) {
         data[i] = 1 / (std::exp(-data[i]) + 1);
     }

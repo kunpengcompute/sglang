@@ -345,120 +345,126 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
     int64_t token_ids_stride = token_ids.stride(0);
     int64_t token_weights_stride1 = token_weights.stride(1);
     int64_t token_ids_stride1 = token_ids.stride(1);
+    float *token_weights_data = token_weights.data_ptr<float>();
+    int16_t *token_ids_data = token_ids.data_ptr<int16_t>();
     struct Active {
         int index;
         float origin_score;
     };
-    SmallVector<Active, 128 * 8> active_expert_(num_token * topk);
-    auto active_expert = active_expert_.data();
 
-    // bool moe_balance = context.moe_balance();
-    kutacc::parallel_for(0, num_token, 1, [&](int64_t start, int64_t end) {
-        SmallVector<float, 256> origin_score_(num_expert);
-        auto origin_score = origin_score_.data();
-        SmallVector<float, 256> score_(num_expert);
-        auto score = score_.data();
-        SmallVector<int, 256> sorted_expert_(num_expert);
-        auto sorted_expert = sorted_expert_.data();
-        struct Group {
-            int index;
-            float score;
-        };
-        SmallVector<Group, 8> sorted_group_(num_expert_group);
-        auto sorted_group = sorted_group_.data();
-        for (int64_t bi = start; bi < end; bi++) {
-            const int64_t vl = svcntw();
-            // copy to origin_score, apply scoring_func
-            for (int64_t i = 0; i < num_expert; i += vl) {
-                svbool_t pg32 = svwhilelt_b32(i, num_expert);
-                svbool_t pg16_half = svuzp1_b16(pg32, svpfalse());
-                auto bf16 = svld1(pg16_half, router_logits_data + bi * router_logits_stride + i);
-                auto f32 = svreinterpret_f32(svzip1(svdup_bf16(0), bf16));
-                if (scoring_func_sigmoid) {
-                    f32 = kmath::sigmoid(pg32, f32, vl);
+    auto run = [&](auto sort_ctv) {
+        constexpr bool SORT_BY_EXPERTS = decltype(sort_ctv)::value;
+        SmallVector<Active, 128 * 8> active_expert_(SORT_BY_EXPERTS ? num_token * topk : 0);
+        auto active_expert = active_expert_.data();
+        kutacc::parallel_for(0, num_token, 1, [&](int64_t start, int64_t end) {
+            SmallVector<float, 256> origin_score_(num_expert);
+            auto origin_score = origin_score_.data();
+            SmallVector<float, 256> score_(num_expert);
+            auto score = score_.data();
+            SmallVector<int, 256> sorted_expert_(num_expert);
+            auto sorted_expert = sorted_expert_.data();
+            struct Group {
+                int index;
+                float score;
+            };
+            SmallVector<Group, 8> sorted_group_(num_expert_group);
+            auto sorted_group = sorted_group_.data();
+            for (int64_t bi = start; bi < end; bi++) {
+                const int64_t vl = svcntw();
+                // copy to origin_score, apply scoring_func
+                for (int64_t i = 0; i < num_expert; i += vl) {
+                    svbool_t pg32 = svwhilelt_b32(i, num_expert);
+                    svbool_t pg16_half = svuzp1_b16(pg32, svpfalse());
+                    auto bf16 = svld1(pg16_half, router_logits_data + bi * router_logits_stride + i);
+                    auto f32 = svreinterpret_f32(svzip1(svdup_bf16(0), bf16));
+                    if (scoring_func_sigmoid) {
+                        f32 = kmath::sigmoid(pg32, f32);
+                    }
+                    svst1(pg32, origin_score + i, f32);
                 }
-                svst1(pg32, origin_score + i, f32);
-            }
-            if (!scoring_func_sigmoid) {
-                kmath::softmax_fusion_kernel(num_expert, origin_score, 1, std::nullopt);
-            }
-            // copy to score, add bias
-            for (int64_t i = 0; i < num_expert; i += vl) {
-                svbool_t pg32 = svwhilelt_b32(i, num_expert);
-                auto value = svld1(pg32, origin_score + i);
-                if (bias_data) {
-                    auto bias_f32 = svld1(pg32, bias_data + i);
-                    value = svadd_x(pg32, value, bias_f32);
+                if (!scoring_func_sigmoid) {
+                    kmath::softmax_fusion_kernel(num_expert, origin_score, 1, std::nullopt);
                 }
-                svst1(pg32, score + i, value);
-            }
-            // sort experts
-            auto cmp_expert = [score](int x, int y) { return score[x] > score[y]; };
-            for (int gi = 0; gi < num_expert_group; gi++) {
-                int *sorted_expert_data = sorted_expert + gi * group_size;
-                for (int i = 0; i < group_size; ++i) {
-                    sorted_expert_data[i] = gi * group_size + i;
+                // copy to score, add bias
+                for (int64_t i = 0; i < num_expert; i += vl) {
+                    svbool_t pg32 = svwhilelt_b32(i, num_expert);
+                    auto value = svld1(pg32, origin_score + i);
+                    if (bias_data) {
+                        auto bias_f32 = svld1(pg32, bias_data + i);
+                        value = svadd_x(pg32, value, bias_f32);
+                    }
+                    svst1(pg32, score + i, value);
                 }
-                std::partial_sort(sorted_expert_data, sorted_expert_data + topk, sorted_expert_data + group_size,
-                                  cmp_expert);
-                sorted_group[gi].index = gi;
-                sorted_group[gi].score = score[sorted_expert_data[0]] + (bias_data ? score[sorted_expert_data[1]] : 0);
-            }
-            std::nth_element(sorted_group, sorted_group + topk_group, sorted_group + num_expert_group,
-                             [](Group x, Group y) { return x.score > y.score; });
-            std::sort(sorted_group, sorted_group + topk_group, [](Group x, Group y) { return x.index < y.index; });
-            for (int i = 0; i < topk_group; ++i) {
-                int *src = sorted_expert + sorted_group[i].index * group_size;
-                int *dst = sorted_expert + i * topk;
-                memmove(dst, src, topk * sizeof(int));
-            }
-            std::nth_element(sorted_expert, sorted_expert + topk, sorted_expert + topk_group * topk, cmp_expert);
-            if (!sort_by_experts) {
-                std::sort(sorted_expert, sorted_expert + topk);
-            }
+                // sort experts
+                auto cmp_expert = [score](int x, int y) { return score[x] > score[y]; };
+                for (int gi = 0; gi < num_expert_group; gi++) {
+                    int *sorted_expert_data = sorted_expert + gi * group_size;
+                    for (int i = 0; i < group_size; ++i) {
+                        sorted_expert_data[i] = gi * group_size + i;
+                    }
+                    std::partial_sort(sorted_expert_data, sorted_expert_data + topk, sorted_expert_data + group_size,
+                                      cmp_expert);
+                    sorted_group[gi].index = gi;
+                    sorted_group[gi].score = score[sorted_expert_data[0]] + (bias_data ? score[sorted_expert_data[1]] : 0);
+                }
+                std::nth_element(sorted_group, sorted_group + topk_group, sorted_group + num_expert_group,
+                                 [](Group x, Group y) { return x.score > y.score; });
+                std::sort(sorted_group, sorted_group + topk_group, [](Group x, Group y) { return x.index < y.index; });
+                for (int i = 0; i < topk_group; ++i) {
+                    int *src = sorted_expert + sorted_group[i].index * group_size;
+                    int *dst = sorted_expert + i * topk;
+                    memmove(dst, src, topk * sizeof(int));
+                }
+                std::nth_element(sorted_expert, sorted_expert + topk, sorted_expert + topk_group * topk, cmp_expert);
+                if constexpr (!SORT_BY_EXPERTS) {
+                    std::sort(sorted_expert, sorted_expert + topk);
+                }
 
-            float sum = 0;
-            for (int64_t i = 0; i < topk; i++) {
-                active_expert[bi * topk + i].index = sorted_expert[i];
-                active_expert[bi * topk + i].origin_score = origin_score[sorted_expert[i]];
-                sum += origin_score[sorted_expert[i]];
+                float sum = 0;
+                for (int64_t i = 0; i < topk; i++) {
+                    sum += origin_score[sorted_expert[i]];
+                }
+                if constexpr (SORT_BY_EXPERTS) {
+                    for (int64_t i = 0; i < topk; i++) {
+                        active_expert[bi * topk + i].index = sorted_expert[i];
+                        active_expert[bi * topk + i].origin_score =
+                            renormalize ? origin_score[sorted_expert[i]] / sum : origin_score[sorted_expert[i]];
+                    }
+                } else {
+                    for (int64_t i = 0; i < topk; i++) {
+                        float w = renormalize ? origin_score[sorted_expert[i]] / sum : origin_score[sorted_expert[i]];
+                        token_weights_data[bi * token_weights_stride + i * token_weights_stride1] = w;
+                        token_ids_data[bi * token_ids_stride + i * token_ids_stride1] =
+                            static_cast<int16_t>(sorted_expert[i]);
+                    }
+                }
             }
-            if (renormalize) {
-                for (int64_t i = 0; i < topk; i++)
-                    active_expert[bi * topk + i].origin_score /= sum;
+        });
+        if constexpr (SORT_BY_EXPERTS) {
+            int *experts_offset_data = experts_offset->data_ptr<int>();
+            memset(experts_offset_data, 0, (num_expert + 1) * sizeof(int));
+            for (int i = 0; i < num_token * topk; ++i) {
+                experts_offset_data[active_expert[i].index]++;
+            }
+            for (int i = 1; i <= num_expert; ++i) {
+                experts_offset_data[i] += experts_offset_data[i - 1];
+            }
+            for (int i = num_token - 1; i >= 0; --i) {
+                Active *active_expert_data = active_expert + i * topk;
+                for (int j = 0; j < topk; ++j) {
+                    int k = active_expert_data[j].index;
+                    int &idx = experts_offset_data[k];
+                    idx--;
+                    token_weights_data[idx] = active_expert_data[j].origin_score;
+                    token_ids_data[idx] = active_expert_data[j].index;
+                }
             }
         }
-    });
-    float *token_weights_data = token_weights.data_ptr<float>();
-    int16_t *token_ids_data = token_ids.data_ptr<int16_t>();
-    if (!sort_by_experts) {
-        for (int i = 0; i < num_token; ++i) {
-            Active *active_expert_data = active_expert + i * topk;
-            for (int j = 0; j < topk; ++j) {
-                token_weights_data[i * token_weights_stride + j * token_weights_stride1] =
-                    active_expert_data[j].origin_score;
-                token_ids_data[i * token_ids_stride + j * token_ids_stride1] = active_expert_data[j].index;
-            }
-        }
-        return;
-    }
-    int *experts_offset_data = experts_offset->data_ptr<int>();
-    memset(experts_offset_data, 0, (num_expert + 1) * sizeof(int));
-    for (int i = 0; i < num_token * topk; ++i) {
-        experts_offset_data[active_expert[i].index]++;
-    }
-    for (int i = 1; i <= num_expert; ++i) {
-        experts_offset_data[i] += experts_offset_data[i - 1];
-    }
-    for (int i = num_token - 1; i >= 0; --i) {
-        Active *active_expert_data = active_expert + i * topk;
-        for (int j = 0; j < topk; ++j) {
-            int k = active_expert_data[j].index;
-            int &idx = experts_offset_data[k];
-            idx--;
-            token_weights_data[idx] = active_expert_data[j].origin_score;
-            token_ids_data[idx] = active_expert_data[j].index;
-        }
+    };
+    if (sort_by_experts) {
+        run(std::true_type{});
+    } else {
+        run(std::false_type{});
     }
 }
 
