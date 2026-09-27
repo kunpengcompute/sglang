@@ -183,16 +183,11 @@ def _ensure_rdma_initialized(
         state.attn_tp_size = get_attn_tensor_model_parallel_world_size()
         state.attn_tp_rank = get_attn_tensor_model_parallel_rank()
         state.use_static_route = use_static_route
-        # Per-expert recv multiplier for prefill; matches DeepSeek-V3-Sample
-        # (context.h: moe_token_multiple = 2). Only used in the prefill path.
-        # Capacity per local expert = multiple * max_tokens_per_mb rows.  The
-        # uniform per-expert fan-in per step is
-        #   max_tokens_per_mb * num_ranks * topk / (attn_tp * num_experts)
-        # so multiple=2 only tolerates ~4x routing skew at EP=256/topk=8.
-        # A hot DeepSeek expert reached ~4.0x and its RDMA token puts
-        # overran the expert region, trashing the src_info metadata area
-        # (observed as "token_bias overflow" in topk_convert).  Default 8
-        # gives ~16x headroom at ~+450MB/rank prefill working set.
+        # Legacy per-expert recv multiplier from DeepSeek-V3-Sample
+        # (context.h: moe_token_multiple = 2).  Prefill now shares the decode
+        # worst-case per-(expert, rank) slot layout, so this value no longer
+        # participates in buffer sizing; it is still passed to kutacc
+        # moe_dispatch_init / topk_convert for signature compatibility only.
         state.moe_token_multiple = int(
             os.environ.get("SGLANG_KUNPENG_MOE_TOKEN_MULTIPLE", "2")
         )
@@ -368,16 +363,18 @@ def _hbw_pool_or_none():
 def _init_buffers(state: _KunpengDispatcherState):
     num_ranks = state.ep_size
     max_dispatch_tokens = state.num_max_dispatch_tokens_per_rank
-    multiple = state.moe_token_multiple
 
     # Communication buffers live on the HBW (on-package) pool when available,
     # matching DeepSeek-V3-Sample init_low_latency() which allocates
     # dispatch/combine buffers from on_package_memory.  Falls back to normal
     # DDR tensors when the pool is disabled or not yet initialized.
+    # Prefill's worst-case buffers (~1.4GB/rank at 32p: tp=256, attn_tp=16,
+    # EP=256, 4K tokens: dispatch_recv 449MiB + combine_send 896MiB) would
+    # crowd the HBW weights pool (~3.4GB/rank), hence force_ddr=True.
     hbw = _hbw_pool_or_none()
 
-    def _zeros(shape, dtype, name):
-        if hbw is not None:
+    def _zeros(shape, dtype, name, force_ddr=False):
+        if hbw is not None and not force_ddr:
             t = hbw.alloc(shape, dtype)
             t.zero_()
             logger.info(
@@ -393,9 +390,10 @@ def _init_buffers(state: _KunpengDispatcherState):
             )
             return t
         logger.info(
-            "[KunpengMoE rank=%s] %s allocated on DDR (HBW pool unavailable)",
+            "[KunpengMoE rank=%s] %s allocated on DDR (%s)",
             state.ep_rank,
             name,
+            "forced for prefill" if force_ddr else "HBW pool unavailable",
         )
         return torch.zeros(shape, dtype=dtype)
 
@@ -405,38 +403,29 @@ def _init_buffers(state: _KunpengDispatcherState):
         torch.uint8, [state.max_tokens_per_mb, state.hidden_size + 4]
     )
 
-    if state.is_prefill:
-        state.dispatch_recv_size = (
-            state.num_local_experts
-            * multiple
-            * state.max_tokens_per_mb
-            * (state.hidden_size + 4)
-            + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
-        )
-        state.dispatch_recv_buf = _zeros(
-            (state.dispatch_recv_size,), torch.uint8, "dispatch_recv_buf"
-        )
-        state.combine_send_buf = _zeros(
-            (
-                state.num_local_experts * multiple * state.max_tokens_per_mb,
-                state.hidden_size,
-            ),
-            torch.bfloat16,
-            "combine_send_buf",
-        )
-    else:
-        state.dispatch_recv_size = (
-            state.num_experts * max_dispatch_tokens * (state.hidden_size + 4)
-            + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
-        )
-        state.dispatch_recv_buf = _zeros(
-            (state.dispatch_recv_size,), torch.uint8, "dispatch_recv_buf"
-        )
-        state.combine_send_buf = _zeros(
-            (state.num_experts * max_dispatch_tokens, state.hidden_size),
-            torch.bfloat16,
-            "combine_send_buf",
-        )
+    # Prefill and decode share the same worst-case per-(expert, rank) slot
+    # layout: every rank can send at most max_dispatch_tokens tokens to any
+    # single expert, so num_experts * max_dispatch_tokens rows per expert
+    # region bounds the routing exactly (no statistical capacity estimate).
+    # The legacy prefill sizing (num_local_experts * moe_token_multiple *
+    # max_tokens_per_mb) overflowed when a hot expert gathered tokens from
+    # all DP ranks (e.g. 32p: 16 DP x 4096 tokens on one expert).
+    state.dispatch_recv_size = (
+        state.num_experts * max_dispatch_tokens * (state.hidden_size + 4)
+        + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
+    )
+    state.dispatch_recv_buf = _zeros(
+        (state.dispatch_recv_size,),
+        torch.uint8,
+        "dispatch_recv_buf",
+        force_ddr=state.is_prefill,
+    )
+    state.combine_send_buf = _zeros(
+        (state.num_experts * max_dispatch_tokens, state.hidden_size),
+        torch.bfloat16,
+        "combine_send_buf",
+        force_ddr=state.is_prefill,
+    )
 
     if state.use_static_route:
         state.combine_recv_size = (
@@ -451,33 +440,23 @@ def _init_buffers(state: _KunpengDispatcherState):
             max_dispatch_tokens * state.router_topk * state.hidden_size * 2
         )
         state.combine_recv_buf = _zeros(
-            (state.combine_recv_size,), torch.uint8, "combine_recv_buf"
+            (state.combine_recv_size,),
+            torch.uint8,
+            "combine_recv_buf",
+            force_ddr=state.is_prefill,
         )
 
-    if state.is_prefill:
-        packed_recv_x_bytes = (
-            state.num_local_experts
-            * multiple
-            * state.max_tokens_per_mb
-            * (state.hidden_size + 4)
-        )
-        state.packed_recv_x = state.dispatch_recv_buf[:packed_recv_x_bytes].view(
-            state.num_local_experts,
-            multiple * state.max_tokens_per_mb,
-            (state.hidden_size + 4),
-        )
-    else:
-        packed_recv_x_bytes = (
-            state.num_local_experts
-            * num_ranks
-            * max_dispatch_tokens
-            * (state.hidden_size + 4)
-        )
-        state.packed_recv_x = state.dispatch_recv_buf[:packed_recv_x_bytes].view(
-            state.num_local_experts,
-            num_ranks * max_dispatch_tokens,
-            (state.hidden_size + 4),
-        )
+    packed_recv_x_bytes = (
+        state.num_local_experts
+        * num_ranks
+        * max_dispatch_tokens
+        * (state.hidden_size + 4)
+    )
+    state.packed_recv_x = state.dispatch_recv_buf[:packed_recv_x_bytes].view(
+        state.num_local_experts,
+        num_ranks * max_dispatch_tokens,
+        (state.hidden_size + 4),
+    )
 
     state.recv_src_info_count = (
         state.num_local_experts * num_ranks * (max_dispatch_tokens * 2 + 1)
@@ -500,15 +479,9 @@ def _init_buffers(state: _KunpengDispatcherState):
         .view(state.num_local_experts, num_ranks * (max_dispatch_tokens * 2 + 1))
     )
 
-    if state.is_prefill:
-        state.recv_token_ids_buf = torch.zeros(
-            state.num_local_experts * multiple * state.max_tokens_per_mb,
-            dtype=torch.int32,
-        )
-    else:
-        state.recv_token_ids_buf = torch.zeros(
-            state.num_experts * max_dispatch_tokens, dtype=torch.int32
-        )
+    state.recv_token_ids_buf = torch.zeros(
+        state.num_experts * max_dispatch_tokens, dtype=torch.int32
+    )
     state.recv_experts_offset = torch.zeros(
         state.num_local_experts + 1, dtype=torch.int32
     )

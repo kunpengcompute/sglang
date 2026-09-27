@@ -15,6 +15,7 @@
  */
 
 #include <torch/extension.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -570,32 +571,29 @@ static uint64_t fusedmoe_encode_pair(int x, int y)
 // n_slice splits N so the two experts' tile_n work is balanced across the
 // 16+16 thread halves; *_default = full N (no split).
 static const std::unordered_map<uint64_t, int> g_fusedmoe_nslice_gateup = {
-    {fusedmoe_encode_pair(64, 64), 4096}, {fusedmoe_encode_pair(64, 48), 4096},
-    {fusedmoe_encode_pair(64, 32), 2816}, {fusedmoe_encode_pair(48, 48), 4096},
-    {fusedmoe_encode_pair(48, 32), 2944}, {fusedmoe_encode_pair(48, 16), 2560},
+    {fusedmoe_encode_pair(64, 64), 4096}, {fusedmoe_encode_pair(64, 48), 4096}, {fusedmoe_encode_pair(64, 32), 2816},
+    {fusedmoe_encode_pair(48, 48), 4096}, {fusedmoe_encode_pair(48, 32), 2944}, {fusedmoe_encode_pair(48, 16), 2560},
     {fusedmoe_encode_pair(32, 32), 4096}, {fusedmoe_encode_pair(16, 16), 4096},
 };
 static const std::unordered_map<uint64_t, int> g_fusedmoe_nslice_down = {
-    {fusedmoe_encode_pair(64, 64), 7168}, {fusedmoe_encode_pair(64, 48), 7168},
-    {fusedmoe_encode_pair(64, 32), 5120}, {fusedmoe_encode_pair(64, 16), 5120},
-    {fusedmoe_encode_pair(48, 48), 7168}, {fusedmoe_encode_pair(48, 32), 6144},
-    {fusedmoe_encode_pair(48, 16), 5120}, {fusedmoe_encode_pair(32, 32), 7168},
-    {fusedmoe_encode_pair(32, 16), 7168}, {fusedmoe_encode_pair(16, 16), 7168},
+    {fusedmoe_encode_pair(64, 64), 7168}, {fusedmoe_encode_pair(64, 48), 7168}, {fusedmoe_encode_pair(64, 32), 5120},
+    {fusedmoe_encode_pair(64, 16), 5120}, {fusedmoe_encode_pair(48, 48), 7168}, {fusedmoe_encode_pair(48, 32), 6144},
+    {fusedmoe_encode_pair(48, 16), 5120}, {fusedmoe_encode_pair(32, 32), 7168}, {fusedmoe_encode_pair(32, 16), 7168},
+    {fusedmoe_encode_pair(16, 16), 7168},
 };
 
 // ne == 2 only: look up n_slice by the 16-aligned (bigger, smaller) local
 // expert token counts. nullopt when the pair is not in the table (kutacc
 // then takes the regular expansion path).
-static std::optional<int64_t> fusedmoe_lookup_nslice(
-    const int *experts_offset_data, const std::unordered_map<uint64_t, int> &table)
+static std::optional<int64_t> fusedmoe_lookup_nslice(const int *experts_offset_data,
+                                                     const std::unordered_map<uint64_t, int> &table)
 {
     int64_t m0 = experts_offset_data[1] - experts_offset_data[0];
     int64_t m1 = experts_offset_data[2] - experts_offset_data[1];
     int m0_aligned = static_cast<int>((m0 + 15) / 16 * 16);
     int m1_aligned = static_cast<int>((m1 + 15) / 16 * 16);
-    uint64_t key = m0_aligned >= m1_aligned
-                       ? fusedmoe_encode_pair(m0_aligned, m1_aligned)
-                       : fusedmoe_encode_pair(m1_aligned, m0_aligned);
+    uint64_t key = m0_aligned >= m1_aligned ? fusedmoe_encode_pair(m0_aligned, m1_aligned)
+                                            : fusedmoe_encode_pair(m1_aligned, m0_aligned);
     auto it = table.find(key);
     if (it == table.end()) return std::nullopt;
     return static_cast<int64_t>(it->second);
@@ -638,11 +636,10 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     // replay is safe: experts_offset is a fixed tensor refreshed by
     // topk_convert before every call.
     int64_t bs = experts_offset_data[ne] - experts_offset_data[0];
-    TORCH_CHECK(bs >= 0 && bs <= token_ids.size(0),
-                "fusedmoe_gateup: experts_offset token count (", bs,
+    TORCH_CHECK(bs >= 0 && bs <= token_ids.size(0), "fusedmoe_gateup: experts_offset token count (", bs,
                 ") is outside [0, token_ids.size(0)=", token_ids.size(0), "]");
-    int64_t K = act.size(1);           // hidden
-    int64_t N = experts_w13.size(1);   // 2 * inter_dim
+    int64_t K = act.size(1);          // hidden
+    int64_t N = experts_w13.size(1);  // 2 * inter_dim
 
     int8_t *acts_data = act.data_ptr<int8_t>();
     int *token_ids_data = token_ids.data_ptr<int>();
@@ -679,8 +676,7 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     // DeepSeek-V3-Sample; consumed by kutacc only on the bs <= tilebuf
     // dualexst path, ignored otherwise.
     std::optional<int64_t> n_slice =
-        (ne == 2) ? fusedmoe_lookup_nslice(experts_offset_data, g_fusedmoe_nslice_gateup)
-                  : std::nullopt;
+        (ne == 2) ? fusedmoe_lookup_nslice(experts_offset_data, g_fusedmoe_nslice_gateup) : std::nullopt;
 
     kutacc::fusedmoe_gateup(bs, K, N, ne, acts_stride, acts_scale_stride, acts_data, weights_data, acts_scale_data,
                             weights_scale_data, token_ids_data, experts_offset_data, output_data, pbx_data, pby_data,
@@ -719,8 +715,7 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
     // bs = actual received tokens (ti), same as gateup (see the comment
     // there for why the whole recv_token_ids_buf cannot be used as bs).
     int64_t bs = experts_offset_data[ne] - experts_offset_data[0];
-    TORCH_CHECK(bs >= 0 && bs <= token_ids.size(0),
-                "fusedmoe_down: experts_offset token count (", bs,
+    TORCH_CHECK(bs >= 0 && bs <= token_ids.size(0), "fusedmoe_down: experts_offset token count (", bs,
                 ") is outside [0, token_ids.size(0)=", token_ids.size(0), "]");
 
     if (bs == 0) return;
@@ -740,8 +735,7 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
     // DeepSeek-V3-Sample; consumed by kutacc only on the bs <= tilebuf
     // dualexst path, ignored otherwise.
     std::optional<int64_t> n_slice =
-        (ne == 2) ? fusedmoe_lookup_nslice(experts_offset_data, g_fusedmoe_nslice_down)
-                  : std::nullopt;
+        (ne == 2) ? fusedmoe_lookup_nslice(experts_offset_data, g_fusedmoe_nslice_down) : std::nullopt;
 
     kutacc::fusedmoe_down(bs, K, N, ne, acts_data, weights_data, acts_scale_data, weights_scale_data,
                           experts_offset_data, output_data, pbx_data, pby_data, t, fusedmoe_tilebuf_size, n_slice);
@@ -759,12 +753,11 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
 // batch to recover the per-step counts (see at_trace.py).
 // ---------------------------------------------------------------------------
 void record_expert_activation_kunpeng(at::Tensor experts_offset,  // [num_local_experts + 1] int32
-                                      at::Tensor counter,          // [num_layers * num_local_experts] int64
+                                      at::Tensor counter,         // [num_layers * num_local_experts] int64
                                       int64_t layer_id, int64_t num_local_experts)
 {
     TORCH_CHECK(experts_offset.scalar_type() == at::kInt, "experts_offset must be int32");
-    TORCH_CHECK(experts_offset.size(0) == num_local_experts + 1,
-                "experts_offset size must be num_local_experts + 1");
+    TORCH_CHECK(experts_offset.size(0) == num_local_experts + 1, "experts_offset size must be num_local_experts + 1");
     TORCH_CHECK(counter.scalar_type() == at::kLong, "counter must be int64");
     TORCH_CHECK((layer_id + 1) * num_local_experts <= counter.size(0), "counter capacity overflow");
 
@@ -798,34 +791,24 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info,
     int32_t *experts_offset_data = experts_offset.data_ptr<int32_t>();
 
     int64_t ti = 0;
-    if (is_prefill) {
-        for (int64_t ei = 0; ei < num_local_experts; ei++) {
-            experts_offset_data[ei] = ti;
-            int token_bias = ei * multiple * max_tokens;
-            int bias_bound = token_bias + multiple * max_tokens;
-            for (int64_t ri = 0; ri < num_ranks; ri++) {
-                int64_t slot_idx = (ei * num_ranks + ri) * (num_max_dispatch_tokens_per_rank * 2 + 1);
-                int size = src_info_data[slot_idx];
-                for (int64_t i = 0; i < size; i++) {
-                    token_ids_data[ti] = token_bias;
-                    token_bias++;
-                    ti++;
-                    TORCH_CHECK(token_bias <= bias_bound, "token_bias overflow: token_bias=", token_bias,
-                                " bias_bound=", bias_bound);
-                }
-            }
-        }
-    } else {
-        for (int64_t ei = 0; ei < num_local_experts; ei++) {
-            experts_offset_data[ei] = ti;
-            for (int64_t ri = 0; ri < num_ranks; ri++) {
-                // size: the num of tokens received from this rank
-                int64_t size = src_info_data[(ei * num_ranks + ri) * (num_max_dispatch_tokens_per_rank * 2 + 1)];
-                for (int64_t i = 0; i < size; i++) {
-                    // index of token received in packed_recv_x
-                    token_ids_data[ti] = (ei * num_ranks + ri) * num_max_dispatch_tokens_per_rank + i;
-                    ti++;
-                }
+    // Prefill and decode share the same per-(expert, rank) slot layout, so
+    // one enumeration covers both: token_ids[i] is the row index of the i-th
+    // token from rank ri inside expert ei's slot region in packed_recv_x.
+    // (`multiple` / `max_tokens` / `is_prefill` are kept in the signature for
+    // compatibility with the legacy tight-packing prefill layout and are no
+    // longer used.)
+    (void)max_tokens;
+    (void)multiple;
+    (void)is_prefill;
+    for (int64_t ei = 0; ei < num_local_experts; ei++) {
+        experts_offset_data[ei] = ti;
+        for (int64_t ri = 0; ri < num_ranks; ri++) {
+            // size: the num of tokens received from this rank
+            int64_t size = src_info_data[(ei * num_ranks + ri) * (num_max_dispatch_tokens_per_rank * 2 + 1)];
+            for (int64_t i = 0; i < size; i++) {
+                // index of token received in packed_recv_x
+                token_ids_data[ti] = (ei * num_ranks + ri) * num_max_dispatch_tokens_per_rank + i;
+                ti++;
             }
         }
     }
@@ -857,12 +840,12 @@ void mul_scalar_add_kunpeng(at::Tensor input, at::Tensor out, double alpha)
 // Mirrors DeepSeek-V3-Sample's mpi::local_dispatch / mpi::local_combine.
 // ---------------------------------------------------------------------------
 
-static std::vector<uint8_t *> g_local_disp_send_ptrs;   // peer dispatch_send_buf base ptrs
+static std::vector<uint8_t *> g_local_disp_send_ptrs;    // peer dispatch_send_buf base ptrs
 static std::vector<bfloat16_t *> g_local_combined_ptrs;  // peer combined_x base ptrs
 static bool g_local_dispatch_initialized = false;
 
-void moe_local_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor combined_x,
-                                     int64_t local_rank, int64_t local_size)
+void moe_local_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor combined_x, int64_t local_rank,
+                                     int64_t local_size)
 {
     TORCH_CHECK(is_shm(dispatch_send_buf.data_ptr()), "dispatch_send_buf must be SHM tensor");
     TORCH_CHECK(is_shm(combined_x.data_ptr()), "combined_x must be SHM tensor");
@@ -886,9 +869,8 @@ void moe_local_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor co
 }
 
 void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::Tensor experts_offset,
-                                at::Tensor packed_recv_x, at::Tensor dispatch_send_buf,
-                                int64_t num_experts, int64_t num_local_experts, int64_t num_tokens,
-                                int64_t batch_size, int64_t hidden)
+                                at::Tensor packed_recv_x, at::Tensor dispatch_send_buf, int64_t num_experts,
+                                int64_t num_local_experts, int64_t num_tokens, int64_t batch_size, int64_t hidden)
 {
     TORCH_CHECK(g_local_dispatch_initialized, "local dispatch not initialized");
 
@@ -901,19 +883,16 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
     int local_size = get_intra_node_size();
     int64_t n_local_tokens = batch_size / local_size;
 
-    // dispatch_send_buf row size = hidden + 4 (scale)
-    int64_t row_size = hidden + 4;
-
     // Build token_ids and experts_offset from topk_idx.
     // token_ids stores the ROW INDEX into packed_recv_x (2D view), NOT the
-    // global token ID. This matches topk_convert_kunpeng's convention where
-    // token_ids[ti] = ei * 2 * max_tokens + offset (position in packed_recv_x).
-    //
-    // For local dispatch: token_ids[ti] = expert_id_off * packed_stride + ti
-    // where packed_stride = packed_recv_x.size(1) (multiple * max_tokens)
-    //
-    // We also store the global token ID separately for data copy.
-    int64_t packed_stride = packed_recv_x.size(1);  // multiple * max_tokens
+    // global token ID. It matches the unified per-(expert, rank) slot layout
+    // used by topk_convert_kunpeng: token_ids[ti] is the position of the
+    // token inside expert expert_id_off's slot region of source rank
+    // src_rank = token / n_local_tokens (num_ranks = intra-node ranks).
+    TORCH_CHECK(packed_recv_x.size(1) % local_size == 0, "packed_recv_x dim1 (", packed_recv_x.size(1),
+                ") not divisible by local_size=", local_size);
+    int64_t slot_rows = packed_recv_x.size(1) / local_size;
+    std::vector<int64_t> slot_cnt(num_local_experts * local_size, 0);
     int64_t ti = 0;
     for (int64_t expert_id_off = 0; expert_id_off < num_local_experts; expert_id_off++) {
         experts_offset_data[expert_id_off] = ti;
@@ -923,8 +902,12 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
                 int64_t peer_rank = global_expert / num_local_experts;
                 int64_t local_exp = global_expert % num_local_experts;
                 if (peer_rank == local_rank && local_exp == expert_id_off) {
+                    int64_t src_rank = token / n_local_tokens;
+                    int64_t &cnt = slot_cnt[expert_id_off * local_size + src_rank];
                     // Store the position in packed_recv_x (2D row index)
-                    token_ids_data[ti] = static_cast<int32_t>(expert_id_off * packed_stride + ti);
+                    token_ids_data[ti] =
+                        static_cast<int32_t>((expert_id_off * local_size + src_rank) * slot_rows + cnt);
+                    cnt++;
                     ti++;
                     break;
                 }
@@ -935,12 +918,12 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
     TORCH_CHECK(ti <= token_ids.size(0), "token_ids overflow: ti=", ti, " capacity=", token_ids.size(0));
 
     // Fill packed_recv_x: copy quantized data from peers' dispatch_send_buf.
-    // packed_recv_x layout (prefill): [num_local_experts, multiple * max_tokens, hidden+4]
+    // packed_recv_x layout: [num_local_experts, num_ranks * slot_rows, hidden+4]
     // For each local expert, for each token assigned to it:
-    //   Copy dispatch_send_buf[global_token] from peer_rank's SHM to packed_recv_x[expert_id_off][ti2]
+    //   Copy dispatch_send_buf[global_token] from peer_rank's SHM to
+    //   packed_recv_x[expert_id_off][slot base + cnt]
     uint8_t *packed_data = reinterpret_cast<uint8_t *>(packed_recv_x.data_ptr());
     int64_t packed_row_size = hidden + 4;
-    int64_t packed_stride_expert = packed_stride * packed_row_size; // multiple * max_tokens * (hidden+4)
 
     // Barrier before reading peers' dispatch_send_buf: each rank quantizes its
     // own slice of the SHM buffer in `quant_inplace_kunpeng`, so a fast rank
@@ -949,6 +932,7 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
     kupl_shm_fence(kupl_win_intra_node);
 
     // Re-iterate to copy data (need both global token and position)
+    std::fill(slot_cnt.begin(), slot_cnt.end(), 0);
     int64_t ti2 = 0;
     for (int64_t expert_id_off = 0; expert_id_off < num_local_experts; expert_id_off++) {
         for (int64_t token = 0; token < batch_size; token++) {
@@ -959,10 +943,15 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
                 int64_t local_exp = global_expert % num_local_experts;
                 if (peer_rank == local_rank && local_exp == expert_id_off) {
                     // Source: peer's dispatch_send_buf[token]
-                    uint8_t *src = g_local_disp_send_ptrs[token / n_local_tokens] + token * row_size;
-                    // Dest: packed_recv_x[expert_id_off][ti2]
-                    uint8_t *dst = packed_data + expert_id_off * packed_stride_expert + ti2 * packed_row_size;
-                    memcpy(dst, src, row_size);
+                    int64_t src_rank = token / n_local_tokens;
+                    int64_t &cnt = slot_cnt[expert_id_off * local_size + src_rank];
+                    uint8_t *src = g_local_disp_send_ptrs[src_rank] + token * packed_row_size;
+                    // Dest: packed_recv_x[expert_id_off][slot base + cnt]
+                    uint8_t *dst = packed_data +
+                                   ((int64_t)expert_id_off * local_size + src_rank) * slot_rows * packed_row_size +
+                                   cnt * packed_row_size;
+                    memcpy(dst, src, packed_row_size);
+                    cnt++;
                     ti2++;
                     found = true;
                     break;
@@ -975,9 +964,8 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
 }
 
 void moe_local_combine_send_kunpeng(at::Tensor moe_down, at::Tensor token_ids, at::Tensor experts_offset,
-                                    at::Tensor combined_x, at::Tensor topk_idx,
-                                    int64_t num_local_experts, int64_t hidden,
-                                    int64_t batch_size)
+                                    at::Tensor combined_x, at::Tensor topk_idx, int64_t num_local_experts,
+                                    int64_t hidden, int64_t batch_size)
 {
     TORCH_CHECK(g_local_dispatch_initialized, "local dispatch not initialized");
 
@@ -1023,8 +1011,7 @@ void moe_local_combine_send_kunpeng(at::Tensor moe_down, at::Tensor token_ids, a
                 if (peer_rank == local_rank && local_exp == expert_id_off) {
                     int64_t owner_rank = token / n_local_tokens;
                     int64_t local_token = token % n_local_tokens;
-                    bfloat16_t *dst = g_local_combined_ptrs[owner_rank]
-                        + (local_token * num_topk + j) * hidden;
+                    bfloat16_t *dst = g_local_combined_ptrs[owner_rank] + (local_token * num_topk + j) * hidden;
                     bfloat16_t *src = moe_down_data + ti * hidden;
                     memcpy(dst, src, hidden * sizeof(bfloat16_t));
                     ti++;
@@ -1039,7 +1026,7 @@ void moe_local_combine_send_kunpeng(at::Tensor moe_down, at::Tensor token_ids, a
 }
 
 void moe_local_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights,
-                                   int64_t num_local_experts, int64_t hidden, int64_t batch_size)
+                                    int64_t num_local_experts, int64_t hidden, int64_t batch_size)
 {
     TORCH_CHECK(g_local_dispatch_initialized, "local dispatch not initialized");
 
@@ -1080,8 +1067,7 @@ void moe_local_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, 
 
         for (int64_t j = 0; j < num_topk; ++j) {
             float weight = topk_weights_data[token * num_topk + j];
-            bfloat16_t *src = g_local_combined_ptrs[local_rank]
-                + (lt * num_topk + j) * hidden;
+            bfloat16_t *src = g_local_combined_ptrs[local_rank] + (lt * num_topk + j) * hidden;
 
             for (int64_t d = 0; d < hidden; ++d) {
                 accum[d] += weight * (float)src[d];
@@ -1097,8 +1083,7 @@ void moe_local_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, 
     kupl_shm_fence(kupl_win_intra_node);
 
     // Phase 2: write reduced results to combined_x
-    memcpy(combined_x_data + my_start * hidden, reduced.data(),
-           n_local_tokens * hidden * sizeof(bfloat16_t));
+    memcpy(combined_x_data + my_start * hidden, reduced.data(), n_local_tokens * hidden * sizeof(bfloat16_t));
 
     // SHM barrier — ensure all ranks have finished writing results
     kupl_shm_fence(kupl_win_intra_node);
@@ -1114,4 +1099,3 @@ void moe_local_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, 
     // SHM barrier — ensure allgather is complete
     kupl_shm_fence(kupl_win_intra_node);
 }
-
