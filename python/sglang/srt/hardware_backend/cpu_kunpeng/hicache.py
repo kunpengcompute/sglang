@@ -154,7 +154,9 @@ def hicache_page_copy(dst, src, dst_indices, src_indices) -> None:
     Args:
         dst: destination KV buffer, shape ``(slots, 1, kv_cache_dim)`` for the
             MLA layer-first layout (any trailing width is accepted).
-        src: source KV buffer, same row width as ``dst``.
+        src: source KV buffer, same row width as ``dst``. Its rows may be
+            strided: the page_first L2 pool keeps a slot's layers adjacent, so
+            a per-layer view of it is strided by ``layer_num * kv_cache_dim``.
         dst_indices: 1-D int32/int64 slot indices into ``dst``.
         src_indices: 1-D int32/int64 slot indices into ``src``, same length as
             ``dst_indices``.
@@ -177,19 +179,23 @@ def hicache_page_copy(dst, src, dst_indices, src_indices) -> None:
     )
 
 
-def hicache_page_flatten(kv_buffer, out, index: int, page_size: int) -> None:
+def hicache_page_flatten(
+    kv_buffer, out, index: int, page_size: int, page_first: bool = False
+) -> None:
     """Serialize one L2 page into the flat blob layout used by L3.
 
     The blob encoding is ``(layer, token, 1, kv_dim)`` flattened, which is what
     the file backend stores as one ``*.bin`` per page.
 
     Args:
-        kv_buffer: the L2 host pool buffer, 4-D ``(layer_num, slots, 1, kv_dim)``
-            (MLA ``layer_first`` layout), contiguous CPU tensor.
+        kv_buffer: the L2 host pool buffer, 4-D contiguous CPU tensor, either
+            ``(layer_num, slots, 1, kv_dim)`` (``layer_first``) or
+            ``(slots, layer_num, 1, kv_dim)`` (``page_first``).
         out: destination flat buffer, 1-D contiguous with ``layer_num *
             page_size * kv_dim`` elements and the same dtype as ``kv_buffer``.
         index: page-aligned first slot of the page inside ``kv_buffer``.
         page_size: tokens per page.
+        page_first: which of the two dim orders above ``kv_buffer`` uses.
 
     The kernel is serial on purpose: it runs on HiCache's storage threads, which
     libkupl does not know about (see the kernel header for the full rationale).
@@ -202,11 +208,13 @@ def hicache_page_flatten(kv_buffer, out, index: int, page_size: int) -> None:
     # Callers index host_indices[k], which yields a 0-dim tensor; the kernel
     # schema takes an int, so coerce explicitly.
     torch.ops.sgl_kernel.hicache_page_flatten_kunpeng(
-        kv_buffer, out, int(index), int(page_size)
+        kv_buffer, out, int(index), int(page_size), bool(page_first)
     )
 
 
-def hicache_page_unflatten(kv_buffer, flat, index: int, page_size: int) -> None:
+def hicache_page_unflatten(
+    kv_buffer, flat, index: int, page_size: int, page_first: bool = False
+) -> None:
     """Scatter a flat L3 page blob back into its L2 page slots.
 
     Inverse of :func:`hicache_page_flatten`; arguments mirror it with ``flat`` as
@@ -218,7 +226,7 @@ def hicache_page_unflatten(kv_buffer, flat, index: int, page_size: int) -> None:
             "(SGLANG_USE_CPU_920F=1)."
         )
     torch.ops.sgl_kernel.hicache_page_unflatten_kunpeng(
-        kv_buffer, flat, int(index), int(page_size)
+        kv_buffer, flat, int(index), int(page_size), bool(page_first)
     )
 
 

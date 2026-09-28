@@ -3246,7 +3246,9 @@ class ServerArgs:
 
         Kunpeng has no accelerator: the L1 device pool and the L2 host pool both
         live in host DDR, so the row copy is done by the `kunpeng` IO backend and
-        the host pool must use the `layer_first` layout. The generic knobs only
+        the host pool uses the `layer_first` layout -- except with the mooncake
+        L3 backend, whose store is page_first-only (see
+        `_resolve_storage_layout_compatibility`). The generic knobs only
         describe CUDA/HIP transfers and carry no meaning here, so instead of
         rejecting a mismatching request we override it with a warning -- the
         alternative would be a silent bad-configuration run.
@@ -3265,11 +3267,15 @@ class ServerArgs:
             )
             self.hicache_io_backend = "kunpeng"
 
-        if self.hicache_mem_layout != "layer_first":
+        mooncake_page_first = (
+            self.hicache_storage_backend == "mooncake"
+            and self.hicache_mem_layout == "page_first"
+        )
+        if self.hicache_mem_layout != "layer_first" and not mooncake_page_first:
             logger.warning(
                 "[hicache] Kunpeng CPU only supports --hicache-mem-layout "
-                "layer_first for the hierarchical cache; overriding the "
-                "requested %r.",
+                "layer_first (or page_first with the mooncake storage backend) "
+                "for the hierarchical cache; overriding the requested %r.",
                 self.hicache_mem_layout,
             )
             self.hicache_mem_layout = "layer_first"

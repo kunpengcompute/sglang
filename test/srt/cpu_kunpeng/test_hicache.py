@@ -19,7 +19,9 @@ Covers the Kunpeng-specific pieces of the multi-level KV cache:
   1. ``hicache_page_copy_kunpeng``  -- the L1 <-> L2 row gather-scatter op
   2. ``MLATokenToKVPoolHost``       -- L2 host pool allocation (plain DDR, no
                                        CUDA pinning) and the L1 <-> L2 round
-                                       trip through ``io_backend="kunpeng"``
+                                       trip through ``io_backend="kunpeng"``,
+                                       for both the layer_first and the
+                                       page_first (mooncake L3) host layouts
   3. ``cpu_device_module``          -- the synchronous stream/event stand-in
   4. ``get_data_page`` / ``set_from_flat_data_page`` -- the L2 <-> L3 flat-page
                                        encoding, plus a controller-driven
@@ -315,9 +317,55 @@ def test_l1_l2_roundtrip_permuted_slots():
         )
 
 
-def test_io_backend_kunpeng_rejects_non_layer_first():
-    """The kunpeng backend only implements the layer_first host layout."""
+def test_l1_l2_roundtrip_page_first():
+    """The kunpeng backend must also round trip the page_first host layout.
+
+    A page_first pool keeps a slot's layers adjacent, so the per-layer view
+    handed to the kernel is row-strided by layer_num * kv_dim. Distinct seeds
+    per layer make a layer/layout mix-up fail rather than cancel out.
+    """
     device_pool, host_pool = _build_pools(layout="page_first")
+    assert host_pool.kv_buffer.shape == (host_pool.size, LAYER_NUM, 1, KV_DIM), (
+        f"unexpected page_first host buffer shape {tuple(host_pool.kv_buffer.shape)}"
+    )
+
+    n = PAGE_SIZE * 2
+    for layer_id in range(LAYER_NUM):
+        device_pool.kv_buffer[layer_id].copy_(
+            _pattern(device_pool.kv_buffer[layer_id].shape, seed=800 + layer_id)
+        )
+    original = [buf.clone() for buf in device_pool.kv_buffer]
+
+    host_idx = host_pool.alloc(n)
+    # Non-sorted, non-contiguous L1 slots.
+    dev_idx = torch.tensor(list(range(300, 300 + n)), dtype=torch.int64).flip(0)
+
+    host_pool.backup_from_device_all_layer(
+        device_pool, host_idx, dev_idx, "kunpeng"
+    )
+    for buf in device_pool.kv_buffer:
+        buf.zero_()
+    for layer_id in range(LAYER_NUM):
+        host_pool.load_to_device_per_layer(
+            device_pool, host_idx, dev_idx, layer_id, "kunpeng"
+        )
+
+    for layer_id in range(LAYER_NUM):
+        assert torch.equal(
+            device_pool.kv_buffer[layer_id][dev_idx], original[layer_id][dev_idx]
+        ), f"layer {layer_id} page_first round trip mismatch"
+        untouched = torch.ones(
+            device_pool.kv_buffer[layer_id].shape[0], dtype=torch.bool
+        )
+        untouched[dev_idx] = False
+        assert float(device_pool.kv_buffer[layer_id][untouched].abs().max()) == 0.0, (
+            f"layer {layer_id} wrote rows outside dev_idx"
+        )
+
+
+def test_io_backend_kunpeng_rejects_unknown_layout():
+    """The kunpeng backend implements layer_first and page_first only."""
+    device_pool, host_pool = _build_pools(layout="page_first_direct")
     host_idx = host_pool.alloc(PAGE_SIZE)
     dev_idx = torch.arange(PAGE_SIZE, dtype=torch.int64)
 
@@ -331,7 +379,7 @@ def test_io_backend_kunpeng_rejects_non_layer_first():
     ):
         try:
             call()
-            assert False, "page_first must be rejected for io_backend='kunpeng'"
+            assert False, "page_first_direct must be rejected for io_backend='kunpeng'"
         except ValueError:
             pass
 
@@ -437,6 +485,44 @@ def test_flat_page_roundtrip():
             expected[layer_id][page_range],
         ), f"layer {layer_id} flat page restore mismatch"
         assert float(host_pool.kv_buffer[layer_id][outside].abs().max()) == 0.0, (
+            f"layer {layer_id} wrote outside the restored page"
+        )
+
+
+def test_flat_page_roundtrip_page_first():
+    """Same as above for the page_first layout, where a slot's layers are adjacent.
+
+    The blob encoding must be identical to the layer_first one, i.e. the kernel
+    has to transpose (token, layer) back into (layer, token).
+    """
+    _, host_pool = _build_pools(layout="page_first")
+    host_pool.kv_buffer.copy_(_pattern(host_pool.kv_buffer.shape, seed=900))
+
+    page_index = PAGE_SIZE * 5
+    expected = host_pool.kv_buffer.clone()
+    page = host_pool.get_data_page(page_index, flat=True)
+
+    assert page.numel() == LAYER_NUM * PAGE_SIZE * KV_DIM, (
+        f"flat page length {page.numel()} != {LAYER_NUM * PAGE_SIZE * KV_DIM}"
+    )
+    ref = (
+        expected[page_index : page_index + PAGE_SIZE].permute(1, 0, 2, 3).flatten()
+    )
+    assert torch.equal(page, ref), "page_first flat page encoding mismatch"
+    assert page.is_contiguous(), "the serial flatten kernel must return a flat tensor"
+
+    host_pool.kv_buffer.zero_()
+    host_pool.set_from_flat_data_page(page_index, page)
+
+    page_range = slice(page_index, page_index + PAGE_SIZE)
+    outside = torch.ones(host_pool.size, dtype=torch.bool)
+    outside[page_range] = False
+    for layer_id in range(LAYER_NUM):
+        assert torch.equal(
+            host_pool.kv_buffer[page_range, layer_id],
+            expected[page_range, layer_id],
+        ), f"layer {layer_id} page_first flat page restore mismatch"
+        assert float(host_pool.kv_buffer[outside, layer_id].abs().max()) == 0.0, (
             f"layer {layer_id} wrote outside the restored page"
         )
 
@@ -864,14 +950,16 @@ if __name__ == "__main__":
         ("host pool allocates plain ddr", test_host_pool_allocates_plain_ddr),
         ("l1<->l2 roundtrip (same order)", test_l1_l2_roundtrip_same_order),
         ("l1<->l2 roundtrip (permuted)", test_l1_l2_roundtrip_permuted_slots),
+        ("l1<->l2 roundtrip (page_first)", test_l1_l2_roundtrip_page_first),
         (
-            "io backend kunpeng rejects page_first",
-            test_io_backend_kunpeng_rejects_non_layer_first,
+            "io backend kunpeng rejects unknown layout",
+            test_io_backend_kunpeng_rejects_unknown_layout,
         ),
         ("cpu device module is synchronous", test_cpu_device_module_is_synchronous),
         ("cache controller uses cpu shim", test_cache_controller_uses_the_cpu_shim),
         ("move_indices kunpeng passthrough", test_move_indices_kunpeng_passthrough),
         ("flat page roundtrip", test_flat_page_roundtrip),
+        ("flat page roundtrip (page_first)", test_flat_page_roundtrip_page_first),
         ("page flatten/unflatten ops", test_page_flatten_unflatten_ops),
         ("batch coalesced load", test_batch_coalesced_load),
         # Last on purpose: this is the only test that exercises the storage

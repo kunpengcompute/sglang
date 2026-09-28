@@ -37,10 +37,13 @@
 // transfer is a pure in-memory row permutation instead of the CUDA
 // `transfer_kv_*` kernels used on GPU/HIP.
 //
-// Interface (all CPU, all fully contiguous):
+// Interface (all CPU, rows dense):
 //   dst, src                 : 2D tensors, same dtype and same size(1).
 //                              Row strides may differ, because the two pools
-//                              have different slot counts / paddings.
+//                              have different slot counts / paddings, and the
+//                              page_first L2 pool keeps a slot's layers
+//                              together, so a per-layer view of it is strided
+//                              by layer_num * kv_dim (rows stay dense).
 //   dst_indices, src_indices : 1D int32 or int64 with equal numel. Their
 //                              integer widths may differ (host slots are int64,
 //                              paged device slots can be int32).
@@ -60,8 +63,11 @@ void hicache_page_copy_kunpeng(at::Tensor dst, at::Tensor src,
     TORCH_CHECK(src.dim() == 2, "hicache_page_copy_kunpeng: src must be 2D, got dim=", src.dim());
     TORCH_CHECK(dst.is_cpu() && src.is_cpu(),
                 "hicache_page_copy_kunpeng: dst/src must be CPU tensors");
-    TORCH_CHECK(dst.is_contiguous() && src.is_contiguous(),
-                "hicache_page_copy_kunpeng: dst/src must be contiguous");
+    // Only each row has to be dense: the page_first L2 pool is (slots, layers,
+    // 1, kv_dim), so a per-layer view of it is strided by layer_num * kv_dim.
+    // The body below walks rows through stride(0), so both layouts work.
+    TORCH_CHECK(dst.stride(-1) == 1 && src.stride(-1) == 1,
+                "hicache_page_copy_kunpeng: dst/src rows must be dense");
     TORCH_CHECK(dst.scalar_type() == src.scalar_type(),
                 "hicache_page_copy_kunpeng: dtype mismatch (dst=", dst.scalar_type(),
                 ", src=", src.scalar_type(), ")");
@@ -148,27 +154,30 @@ void hicache_page_copy_kunpeng(at::Tensor dst, at::Tensor src,
 }
 
 // ---------------------------------------------------------------------------
-// L2 <-> L3 page (de)serialization for the layer_first MLA host pool.
+// L2 <-> L3 page (de)serialization for the MLA host pool.
 //
 // The storage backend stores one page as a flat blob whose encoding is
-// (layer, token, 1, kv_dim) flattened. For layer_first the page slice lives at
-// kv_buffer[layer, index:index+page_size, 0, :], which is NOT contiguous across
-// layers, so producing / consuming that blob needs a real copy.
+// (layer, token, 1, kv_dim) flattened. Neither host layout exposes that slice
+// contiguously, so producing / consuming the blob needs a real copy:
+//
+//   layer_first (layers, slots, 1, kv_dim) : the page slice is dense *within*
+//       one layer -> one memcpy per layer (page_size * kv_dim elements).
+//   page_first  (slots, layers, 1, kv_dim) : a slot's layers are adjacent, so
+//       the blob is gathered row by row -> one memcpy per (token, layer).
 //
 // Both ops below are deliberately SERIAL (no kutacc::parallel_for, no torch
 // elementwise op): they are called from HiCache's prefetch/backup threads, which
 // are plain Python threads that libkupl does not know about, and a parallel copy
 // issued from such a thread has been observed to segfault inside
-// kupl_parallel_for. The work is small anyway -- because a page slice is
-// contiguous *within* one layer, each op is just one memcpy per layer
-// (page_size * kv_dim elements), i.e. 61 memcpys of 72 KB for a DeepSeek page.
+// kupl_parallel_for. The work is small anyway: for a DeepSeek page that is 61
+// memcpys of 72 KB (layer_first) or 64 x 61 memcpys of 1.1 KB (page_first).
 // ---------------------------------------------------------------------------
 
 void hicache_page_flatten_kunpeng(at::Tensor kv_buffer, at::Tensor out,
-                                 int64_t index, int64_t page_size)
+                                 int64_t index, int64_t page_size, bool page_first)
 {
     constexpr const char *op = "hicache_page_flatten_kunpeng";
-    TORCH_CHECK(kv_buffer.dim() == 4, op, ": kv_buffer must be 4D (layer, slots, 1, kv_dim), got dim=", kv_buffer.dim());
+    TORCH_CHECK(kv_buffer.dim() == 4, op, ": kv_buffer must be 4D, got dim=", kv_buffer.dim());
     TORCH_CHECK(kv_buffer.size(2) == 1, op, ": kv_buffer dim-2 must be 1, got ", kv_buffer.size(2));
     TORCH_CHECK(kv_buffer.is_cpu() && kv_buffer.is_contiguous(), op, ": kv_buffer must be a contiguous CPU tensor");
     TORCH_CHECK(out.dim() == 1, op, ": out must be 1D, got dim=", out.dim());
@@ -177,10 +186,13 @@ void hicache_page_flatten_kunpeng(at::Tensor kv_buffer, at::Tensor out,
                 op, ": dtype mismatch (out=", out.scalar_type(), ", kv_buffer=", kv_buffer.scalar_type(), ")");
     TORCH_CHECK(page_size > 0, op, ": page_size must be positive, got ", page_size);
 
-    const int64_t layers = kv_buffer.size(0);
-    const int64_t slots = kv_buffer.size(1);
+    // dims are (layers, slots, 1, kv_dim) for layer_first and
+    // (slots, layers, 1, kv_dim) for page_first.
+    const int64_t layers = page_first ? kv_buffer.size(1) : kv_buffer.size(0);
+    const int64_t slots = page_first ? kv_buffer.size(0) : kv_buffer.size(1);
     const int64_t kv_dim = kv_buffer.size(3);
-    const int64_t page_bytes = page_size * kv_dim * kv_buffer.element_size();
+    const int64_t elem_sz = kv_buffer.element_size();
+    const int64_t page_bytes = page_size * kv_dim * elem_sz;
     TORCH_CHECK(index >= 0 && index + page_size <= slots,
                 op, ": page out of range (index=", index, ", page_size=", page_size, ", slots=", slots, ")");
     TORCH_CHECK(out.numel() * out.element_size() == layers * page_bytes,
@@ -189,20 +201,32 @@ void hicache_page_flatten_kunpeng(at::Tensor kv_buffer, at::Tensor out,
 
     const uint8_t *src = static_cast<const uint8_t *>(kv_buffer.data_ptr());
     uint8_t *dst = static_cast<uint8_t *>(out.data_ptr());
-    const int64_t layer_stride_bytes = slots * kv_dim * kv_buffer.element_size();
 
+    if (page_first) {
+        const int64_t row_bytes = kv_dim * elem_sz;
+        for (int64_t token = 0; token < page_size; token++) {
+            const uint8_t *src_slot = src + (index + token) * layers * row_bytes;
+            for (int64_t layer = 0; layer < layers; layer++) {
+                std::memcpy(dst + (layer * page_size + token) * row_bytes,
+                            src_slot + layer * row_bytes, row_bytes);
+            }
+        }
+        return;
+    }
+
+    const int64_t layer_stride_bytes = slots * kv_dim * elem_sz;
     for (int64_t layer = 0; layer < layers; layer++) {
         std::memcpy(dst + layer * page_bytes,
-                    src + layer * layer_stride_bytes + index * kv_dim * kv_buffer.element_size(),
+                    src + layer * layer_stride_bytes + index * kv_dim * elem_sz,
                     page_bytes);
     }
 }
 
 void hicache_page_unflatten_kunpeng(at::Tensor kv_buffer, at::Tensor flat,
-                                   int64_t index, int64_t page_size)
+                                   int64_t index, int64_t page_size, bool page_first)
 {
     constexpr const char *op = "hicache_page_unflatten_kunpeng";
-    TORCH_CHECK(kv_buffer.dim() == 4, op, ": kv_buffer must be 4D (layer, slots, 1, kv_dim), got dim=", kv_buffer.dim());
+    TORCH_CHECK(kv_buffer.dim() == 4, op, ": kv_buffer must be 4D, got dim=", kv_buffer.dim());
     TORCH_CHECK(kv_buffer.size(2) == 1, op, ": kv_buffer dim-2 must be 1, got ", kv_buffer.size(2));
     TORCH_CHECK(kv_buffer.is_cpu() && kv_buffer.is_contiguous(), op, ": kv_buffer must be a contiguous CPU tensor");
     TORCH_CHECK(flat.dim() == 1, op, ": flat must be 1D, got dim=", flat.dim());
@@ -211,10 +235,11 @@ void hicache_page_unflatten_kunpeng(at::Tensor kv_buffer, at::Tensor flat,
                 op, ": dtype mismatch (flat=", flat.scalar_type(), ", kv_buffer=", kv_buffer.scalar_type(), ")");
     TORCH_CHECK(page_size > 0, op, ": page_size must be positive, got ", page_size);
 
-    const int64_t layers = kv_buffer.size(0);
-    const int64_t slots = kv_buffer.size(1);
+    const int64_t layers = page_first ? kv_buffer.size(1) : kv_buffer.size(0);
+    const int64_t slots = page_first ? kv_buffer.size(0) : kv_buffer.size(1);
     const int64_t kv_dim = kv_buffer.size(3);
-    const int64_t page_bytes = page_size * kv_dim * kv_buffer.element_size();
+    const int64_t elem_sz = kv_buffer.element_size();
+    const int64_t page_bytes = page_size * kv_dim * elem_sz;
     TORCH_CHECK(index >= 0 && index + page_size <= slots,
                 op, ": page out of range (index=", index, ", page_size=", page_size, ", slots=", slots, ")");
     TORCH_CHECK(flat.numel() * flat.element_size() == layers * page_bytes,
@@ -223,10 +248,23 @@ void hicache_page_unflatten_kunpeng(at::Tensor kv_buffer, at::Tensor flat,
 
     const uint8_t *src = static_cast<const uint8_t *>(flat.data_ptr());
     uint8_t *dst = static_cast<uint8_t *>(kv_buffer.data_ptr());
-    const int64_t layer_stride_bytes = slots * kv_dim * kv_buffer.element_size();
 
+    if (page_first) {
+        const int64_t row_bytes = kv_dim * elem_sz;
+        for (int64_t token = 0; token < page_size; token++) {
+            uint8_t *dst_slot = dst + (index + token) * layers * row_bytes;
+            for (int64_t layer = 0; layer < layers; layer++) {
+                std::memcpy(dst_slot + layer * row_bytes,
+                            src + (layer * page_size + token) * row_bytes,
+                            row_bytes);
+            }
+        }
+        return;
+    }
+
+    const int64_t layer_stride_bytes = slots * kv_dim * elem_sz;
     for (int64_t layer = 0; layer < layers; layer++) {
-        std::memcpy(dst + layer * layer_stride_bytes + index * kv_dim * kv_buffer.element_size(),
+        std::memcpy(dst + layer * layer_stride_bytes + index * kv_dim * elem_sz,
                     src + layer * page_bytes,
                     page_bytes);
     }

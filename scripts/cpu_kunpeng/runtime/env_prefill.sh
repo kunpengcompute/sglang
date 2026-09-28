@@ -93,13 +93,18 @@ export PREFILL_SWAP_KV_BLOCKWISE="${PREFILL_SWAP_KV_BLOCKWISE:-0}"
 # Prefill hierarchical cache. L1 = main DDR KV pool; L2 = extra DDR pool sized by
 # RATIO/SIZE (per rank; SIZE in GB wins over RATIO; node DDR cost = ranks/node x
 # size_per_token x max_total_tokens x RATIO, and the host pool refuses to start
-# if that leaves <10 GB free); L3 = per-page file store in a directory shared by
-# all prefill nodes (empty dir = L3 off, L1<->L2 only).
+# if that leaves <10 GB free); L3 = the storage backend selected by BACKEND:
+#   file     per-page file store in L3_DIR, shared by all prefill nodes
+#            (empty L3_DIR = L3 off, L1<->L2 only); layer_first host layout.
+#   mooncake mooncake store master (runtime/env_mooncake.sh), needs
+#            MOONCAKE_MASTER* and the RDMA settings in .user_env.sh; the store
+#            is page_first-only, so server.sh selects that layout.
 # PREFETCH_POLICY: wait_complete blocks the request until the whole L3->L2 load
 # is done (so no recompute); timeout/best_effort give up early. DEBUG = verbose
 # per-transfer "[hicache]" logs. Off by default; server.sh wires it for prefill.
 # ------------------------------------------------------------
 export ENABLE_KUNPENG_HICACHE="${ENABLE_KUNPENG_HICACHE:-0}"
+export KUNPENG_HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
 export KUNPENG_HICACHE_L3_DIR="${KUNPENG_HICACHE_L3_DIR:-}"
 export KUNPENG_HICACHE_RATIO="${KUNPENG_HICACHE_RATIO:-2.0}"
 export KUNPENG_HICACHE_SIZE="${KUNPENG_HICACHE_SIZE:-}"

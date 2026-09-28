@@ -301,6 +301,11 @@ class Envs:
     # Per-transfer HiCache tracing (L1<->L2 and L2<->L3 copies). One log line per
     # transfer, so it is off by default: expect a lot of output under load.
     SGLANG_HICACHE_DEBUG = EnvBool(False)
+    # Kunpeng CPU: base CPU index for the HiCache storage threads (prefetch,
+    # backup and the prefetch I/O aux thread). They are plain Python threads
+    # that the scheduler never places, so they are pinned here to keep them off
+    # the cores owned by the kupl executor pool.
+    SGLANG_KUNPENG_HICACHE_CPU_OFFSET = EnvInt(19)
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)

@@ -208,7 +208,7 @@ export SGLANG_KUNPENG_SAVE_AT_TRACE=0 # set 1 to open record experts activation 
 USER_ENV_ROLE="${1:-native}"
 
 case "$USER_ENV_ROLE" in
-    decode|router|tokenizer) IS_PREFILL=0 ;;
+    decode|router|tokenizer|mooncake) IS_PREFILL=0 ;;
     *) IS_PREFILL=1 ;;
 esac
 export IS_PREFILL
@@ -220,3 +220,13 @@ fi
 if [[ -f "$SCRIPT_DIR/runtime/.user_env_base.sh" ]]; then
     source "$SCRIPT_DIR/runtime/.user_env_base.sh" "$USER_ENV_ROLE"
 fi
+
+# ------------------------------------------------------------
+# Mooncake store master (KUNPENG_HICACHE_BACKEND=mooncake). Resolved after
+# .user_env.sh so an override there wins. Defaults to the router node, which is
+# outside the prefill/decode node sets. MOONCAKE_MASTER is the address handed to
+# the transfer engine clients and to mooncake_master itself.
+# ------------------------------------------------------------
+export MOONCAKE_MASTER_NODE="${MOONCAKE_MASTER_NODE:-$ROUTER_IP}"
+export MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-50051}"
+export MOONCAKE_MASTER="${MOONCAKE_MASTER:-$MOONCAKE_MASTER_NODE:$MOONCAKE_MASTER_PORT}"

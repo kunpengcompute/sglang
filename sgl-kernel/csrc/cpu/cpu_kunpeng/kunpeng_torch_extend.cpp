@@ -47,9 +47,11 @@ void set_kv_buffer_2_kunpeng(at::Tensor kv_buffer, at::Tensor loc, at::Tensor k_
 
 void hicache_page_copy_kunpeng(at::Tensor dst, at::Tensor src, at::Tensor dst_indices, at::Tensor src_indices);
 
-void hicache_page_flatten_kunpeng(at::Tensor kv_buffer, at::Tensor out, int64_t index, int64_t page_size);
+void hicache_page_flatten_kunpeng(at::Tensor kv_buffer, at::Tensor out, int64_t index, int64_t page_size,
+                                 bool page_first);
 
-void hicache_page_unflatten_kunpeng(at::Tensor kv_buffer, at::Tensor flat, int64_t index, int64_t page_size);
+void hicache_page_unflatten_kunpeng(at::Tensor kv_buffer, at::Tensor flat, int64_t index, int64_t page_size,
+                                   bool page_first);
 
 std::tuple<at::Tensor, at::Tensor> hicache_page_load_coalesced_batch_kunpeng(
     at::Tensor target_kv_buffer, at::Tensor target_indices, int64_t target_page_size,
@@ -1283,12 +1285,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     // Serial L2 <-> L3 page (de)serialization (safe from HiCache storage threads).
     m.def(
         "hicache_page_flatten_kunpeng("
-        "Tensor kv_buffer, Tensor(a!) out, int index, int page_size) -> ()");
+        "Tensor kv_buffer, Tensor(a!) out, int index, int page_size, bool page_first) -> ()");
     m.impl("hicache_page_flatten_kunpeng", hicache_page_flatten_kunpeng);
 
     m.def(
         "hicache_page_unflatten_kunpeng("
-        "Tensor(a!) kv_buffer, Tensor flat, int index, int page_size) -> ()");
+        "Tensor(a!) kv_buffer, Tensor flat, int index, int page_size, bool page_first) -> ()");
     m.impl("hicache_page_unflatten_kunpeng", hicache_page_unflatten_kunpeng);
 
     // Whole-batch L3 -> L2 load: one call reads a batch of coalesced page files

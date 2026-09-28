@@ -892,16 +892,30 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # TODO: return the number of consecutive successful operations from the start.
         return success_count == len(keys)
 
+    @staticmethod
+    def _buffer_args(target_location, target_size: Optional[Any] = None) -> tuple:
+        """Normalize one I/O target into a ``(pointer, byte size)`` pair.
+
+        Callers hand over either a registered tensor (whose address and byte
+        size are derived here) or an explicit raw pointer plus its size.
+        """
+        if isinstance(target_location, torch.Tensor):
+            return (
+                target_location.data_ptr(),
+                target_location.numel() * target_location.element_size(),
+            )
+        return target_location, target_size
+
     def get(
         self,
         key,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        assert target_location is not None and target_sizes is not None
-        get_result = self._get_batch_zero_copy_impl(
-            [key], [target_location], [target_sizes]
-        )
+        assert target_location is not None
+        location, size = self._buffer_args(target_location, target_sizes)
+        assert size is not None
+        get_result = self._get_batch_zero_copy_impl([key], [location], [size])
         return get_result[0] >= 0
 
     def batch_get(
@@ -910,14 +924,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> int:
-        assert len(keys) == len(target_locations) == len(target_sizes)
+        assert target_locations is not None and len(keys) == len(target_locations)
+        if target_sizes is None:
+            target_sizes = [None] * len(keys)
+        assert len(keys) == len(target_sizes)
         if len(keys) == 0:
             return 0
 
+        locations, sizes = [], []
+        for location, size in zip(target_locations, target_sizes):
+            location, size = self._buffer_args(location, size)
+            assert size is not None
+            locations.append(location)
+            sizes.append(size)
+
         start_time = time.perf_counter()
-        get_result = self._get_batch_zero_copy_impl(
-            keys, target_locations, target_sizes
-        )
+        get_result = self._get_batch_zero_copy_impl(keys, locations, sizes)
         end_time = time.perf_counter()
 
         if self.is_mla_backend:

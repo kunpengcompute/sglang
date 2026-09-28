@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -50,6 +51,58 @@ logger = logging.getLogger(__name__)
 def _hicache_debug() -> bool:
     """True when per-transfer HiCache tracing is on (SGLANG_HICACHE_DEBUG=1)."""
     return envs.SGLANG_HICACHE_DEBUG.get()
+
+
+# CPU added to SGLANG_KUNPENG_HICACHE_CPU_OFFSET per storage thread, so the three
+# threads of one rank never share a core.
+_STORAGE_THREAD_CPU_DELTA = {"prefetch": 0, "backup": 1, "prefetch_io_aux": 2}
+
+
+def _fmt_cpus(cpus) -> str:
+    """Render a CPU set as "a-b,c" for log lines."""
+    spans = []
+    start = prev = None
+    for cpu in sorted(cpus):
+        if start is None:
+            start = prev = cpu
+        elif cpu == prev + 1:
+            prev = cpu
+        else:
+            spans.append(f"{start}" if start == prev else f"{start}-{prev}")
+            start = prev = cpu
+    if start is not None:
+        spans.append(f"{start}" if start == prev else f"{start}-{prev}")
+    return ",".join(spans)
+
+
+def _pin_storage_thread(name: str) -> None:
+    """Pin the calling HiCache storage thread to a dedicated CPU.
+
+    The prefetch/backup threads (and the prefetch I/O aux thread) are created by
+    Python, not by kupl, so nothing places them and they end up competing with
+    the kupl executor pool, whose threads the SDK pins itself. Under load that
+    starves them. The core is ``SGLANG_KUNPENG_HICACHE_CPU_OFFSET`` plus a
+    per-thread delta.
+
+    The mask is set outright, so it also overrides the single CPU ``taskset``
+    handed the process. No-op off the Kunpeng path.
+    """
+    if not is_cpu_920f():
+        return
+    cpu = envs.SGLANG_KUNPENG_HICACHE_CPU_OFFSET.get() + _STORAGE_THREAD_CPU_DELTA.get(
+        name, 0
+    )
+    try:
+        previous = os.sched_getaffinity(0)
+        os.sched_setaffinity(0, {cpu})
+        logger.info(
+            "[hicache] %s thread pinned to CPU %d (process mask was %s)",
+            name,
+            cpu,
+            _fmt_cpus(previous),
+        )
+    except (AttributeError, OSError) as e:
+        logger.warning("[hicache] %s thread pinning failed: %s", name, e)
 
 
 def _idx_range(idx: torch.Tensor) -> str:
@@ -1198,6 +1251,7 @@ class HiCacheController:
         """
         Auxiliary function conducting IO operations for prefetching.
         """
+        _pin_storage_thread("prefetch_io_aux")
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
@@ -1257,6 +1311,7 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
+        _pin_storage_thread("prefetch")
         self.prefetch_buffer = Queue()
         self.prefetch_io_aux_thread = threading.Thread(
             target=self.prefetch_io_aux_func, daemon=True
@@ -1466,6 +1521,7 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
+        _pin_storage_thread("backup")
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)

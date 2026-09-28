@@ -167,16 +167,24 @@ case "$ROLE" in
         ;;
 esac
 
-# Kunpeng multi-level KV cache (L1 DDR -> L2 DDR -> L3 directory).
-# Only the prefill role participates. L3 is OPTIONAL: leave KUNPENG_HICACHE_L3_DIR
-# empty to run the L1<->L2 tiers only; set it to an NFS directory to also enable
-# the per-page file store shared by every prefill node.
+# Kunpeng multi-level KV cache (L1 DDR -> L2 DDR -> L3 storage).
+# Only the prefill role participates. KUNPENG_HICACHE_BACKEND picks the L3 store:
+#   file     per-page files under KUNPENG_HICACHE_L3_DIR (a directory shared by
+#            all prefill nodes); leave it empty to run L1<->L2 only. layer_first.
+#   mooncake mooncake store master (launch.sh mooncake / launch.sh all); the
+#            store is page_first-only, so the host pool switches layout.
 # Disabled unless ENABLE_KUNPENG_HICACHE=1.
 if [[ "$ROLE" == "prefill" && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
+    HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
+    if [[ "$HICACHE_BACKEND" == "mooncake" ]]; then
+        HICACHE_MEM_LAYOUT="page_first"
+    else
+        HICACHE_MEM_LAYOUT="layer_first"
+    fi
     BASE_ARGS+=(
         --enable-hierarchical-cache
         --hicache-io-backend kunpeng
-        --hicache-mem-layout layer_first
+        --hicache-mem-layout "$HICACHE_MEM_LAYOUT"
         --hicache-write-policy "${KUNPENG_HICACHE_WRITE_POLICY:-write_through}"
     )
     if [[ -n "${KUNPENG_HICACHE_SIZE:-}" ]]; then
@@ -184,16 +192,31 @@ if [[ "$ROLE" == "prefill" && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
     else
         BASE_ARGS+=(--hicache-ratio "${KUNPENG_HICACHE_RATIO:-2.0}")
     fi
-    if [[ -n "${KUNPENG_HICACHE_L3_DIR:-}" ]]; then
-        mkdir -p "$KUNPENG_HICACHE_L3_DIR"
-        export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$KUNPENG_HICACHE_L3_DIR"
-        BASE_ARGS+=(
-            --hicache-storage-backend file
-            --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-wait_complete}"
-        )
-    else
-        echo "KUNPENG_HICACHE_L3_DIR is empty: HiCache L3 disabled, running L1<->L2 only" >&2
-    fi
+    case "$HICACHE_BACKEND" in
+        mooncake)
+            # MOONCAKE_MASTER* come from env_base.sh / .user_env.sh.
+            BASE_ARGS+=(
+                --hicache-storage-backend mooncake
+                --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-wait_complete}"
+            )
+            ;;
+        file)
+            if [[ -n "${KUNPENG_HICACHE_L3_DIR:-}" ]]; then
+                mkdir -p "$KUNPENG_HICACHE_L3_DIR"
+                export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$KUNPENG_HICACHE_L3_DIR"
+                BASE_ARGS+=(
+                    --hicache-storage-backend file
+                    --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-wait_complete}"
+                )
+            else
+                echo "KUNPENG_HICACHE_L3_DIR is empty: HiCache L3 disabled, running L1<->L2 only" >&2
+            fi
+            ;;
+        *)
+            echo "Error: unknown KUNPENG_HICACHE_BACKEND '$HICACHE_BACKEND' (expected file or mooncake)" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 # Build IB device args based on role.

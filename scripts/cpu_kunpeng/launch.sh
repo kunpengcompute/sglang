@@ -17,7 +17,9 @@
 # Usage: ./launch.sh <role> [args...]
 #   prefill/decode/native -> runtime/launch_cluster.sh
 #   router                -> runtime/launch_router.sh
-#   all                   -> inline: prefill + decode + health-check + router
+#   mooncake              -> runtime/launch_mooncake.sh (HiCache L3 store master)
+#   all                   -> inline: [mooncake] + prefill + decode + health-check
+#                            + router
 #   update                -> inline: update_time + update_numa_dup
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,7 +43,9 @@ Roles:
              (port auto-derived from the entry's position in INSTANCES,
              default 30001/30002; instance selects
              runtime/.user_env_<side>_<instance>.sh)
+  mooncake   Launch the mooncake store master (HiCache L3 backend mooncake)
   all        Launch prefill, decode, tokenizer, and router sequentially
+             (the mooncake master first, when a prefill entry selects it)
   update     Regenerate .time_env.sh + update NUMA binary replicas
 
 Options:
@@ -50,6 +54,7 @@ Options:
 Examples:
   $0 prefill
   $0 all
+  $0 mooncake
   $0 update
 EOF
 }
@@ -68,7 +73,7 @@ case "$CMD" in
         show_usage
         exit 0
         ;;
-    prefill|decode|native|router|tokenizer|all|update)
+    prefill|decode|native|router|tokenizer|mooncake|all|update)
         ROLE="$CMD"
         ;;
     *)
@@ -80,7 +85,7 @@ esac
 
 
 bash "$SCRIPT_DIR/runtime/update_time.sh"
-if [[ "$ROLE" == "router" || "$ROLE" == "tokenizer" ]]; then
+if [[ "$ROLE" == "router" || "$ROLE" == "tokenizer" || "$ROLE" == "mooncake" ]]; then
     echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update for role '$ROLE'.\033[0m"
 elif [[ "${SGLANG_ENABLE_NUMA_DUPLICATION:-1}" != "1" ]]; then
     echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update (SGLANG_ENABLE_NUMA_DUPLICATION='${SGLANG_ENABLE_NUMA_DUPLICATION:-unset}').\033[0m"
@@ -102,6 +107,28 @@ elif [[ "$ROLE" == "all" ]]; then
     echo "[$(date +%T)] ===== Launching all roles ($INSTANCES + tokenizer + router) ====="
 
     IFS=',' read -ra _INST_LIST <<< "$INSTANCES"
+
+    # HiCache L3 = mooncake: the store master has to be up before the prefill
+    # servers register their L2 host pools with it. The backend is chosen in the
+    # prefill entry's own role env, so resolve it there (a subshell, like
+    # launch_router.sh does for the master addresses).
+    _start_mooncake=0
+    for _entry in "${_INST_LIST[@]}"; do
+        _entry="${_entry//[[:space:]]/}"
+        [[ -z "$_entry" ]] && continue
+        _role="${_entry%%_*}"
+        [[ "$_role" == "prefill" ]] || continue
+        _inst=""
+        [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
+        _backend="$(SKIP_CONDA=1 bash -c "
+            source '$SCRIPT_DIR/env.sh' prefill '$_inst' >/dev/null 2>&1
+            echo \"\${KUNPENG_HICACHE_BACKEND:-file}\"")"
+        [[ "$_backend" == "mooncake" ]] && _start_mooncake=1
+    done
+    if [[ "$_start_mooncake" == "1" ]]; then
+        SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_mooncake.sh"
+    fi
+
     for _entry in "${_INST_LIST[@]}"; do
         _entry="${_entry//[[:space:]]/}"
         [[ -z "$_entry" ]] && continue
@@ -128,6 +155,9 @@ elif [[ "$ROLE" == "router" ]]; then
 
 elif [[ "$ROLE" == "tokenizer" ]]; then
     bash "$SCRIPT_DIR/runtime/launch_tokenizer.sh" "$@"
+
+elif [[ "$ROLE" == "mooncake" ]]; then
+    bash "$SCRIPT_DIR/runtime/launch_mooncake.sh" "$@"
 
 else
     # prefill/decode/native

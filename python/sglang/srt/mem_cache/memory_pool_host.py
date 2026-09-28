@@ -989,6 +989,18 @@ class MLATokenToKVPoolHost(HostKVCache):
         )
         return buffer
 
+    def _host_layer_view(self, layer_id: int) -> torch.Tensor:
+        """One layer of the L2 host pool as ``(slots, kv_dim)``, for the Kunpeng
+        row gather-scatter.
+
+        layer_first: dense. page_first: rows strided by ``layer_num * kv_dim``,
+        because a slot's layers are adjacent. Rows stay dense, which is all
+        ``hicache_page_copy_kunpeng`` needs.
+        """
+        if self.layout == "page_first":
+            return self.kv_buffer[:, layer_id].squeeze(1)
+        return self.kv_buffer[layer_id].squeeze(1)
+
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
@@ -1073,14 +1085,14 @@ class MLATokenToKVPoolHost(HostKVCache):
             # CPU-only backend (Kunpeng 920F): the L2 host pool and the L1 device
             # pool are both host DDR, so host -> device is just a row
             # gather-scatter, replacing transfer_kv_per_layer_mla.
-            if self.layout != "layer_first":
+            if self.layout not in ("layer_first", "page_first"):
                 raise ValueError(
-                    "io backend 'kunpeng' supports the layer_first host layout "
-                    f"only, got {self.layout!r}"
+                    "io backend 'kunpeng' supports the layer_first and "
+                    f"page_first host layouts, got {self.layout!r}"
                 )
             hicache_page_copy(
                 dst=device_pool.kv_buffer[layer_id],
-                src=self.kv_buffer[layer_id],
+                src=self._host_layer_view(layer_id),
                 dst_indices=device_indices,
                 src_indices=host_indices,
             )
@@ -1172,14 +1184,14 @@ class MLATokenToKVPoolHost(HostKVCache):
         elif io_backend == "kunpeng":
             # Unlike load_to_device_per_layer this helper is not called per layer,
             # so walk every layer owned by this PP stage.
-            if self.layout != "layer_first":
+            if self.layout not in ("layer_first", "page_first"):
                 raise ValueError(
-                    "io backend 'kunpeng' supports the layer_first host layout "
-                    f"only, got {self.layout!r}"
+                    "io backend 'kunpeng' supports the layer_first and "
+                    f"page_first host layouts, got {self.layout!r}"
                 )
             for layer_id in range(self.layer_num):
                 hicache_page_copy(
-                    dst=self.kv_buffer[layer_id],
+                    dst=self._host_layer_view(layer_id),
                     src=device_pool.kv_buffer[layer_id],
                     dst_indices=host_indices,
                     src_indices=device_indices,
@@ -1198,17 +1210,23 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         if flat:
-            if _is_cpu_920f and self.layout == "layer_first":
-                # The layer_first page slice is not contiguous, so a plain
+            if _is_cpu_920f and self.layout in ("layer_first", "page_first"):
+                # Neither host layout has a contiguous page slice, so a plain
                 # flatten() would run torch's parallel copy. That is unsafe on
                 # the HiCache storage threads, so serialize with the serial
                 # Kunpeng kernel instead (see hicache_page_flatten_kunpeng).
                 out = torch.empty(
-                    self.kv_buffer.size(0) * self.page_size * self.kv_buffer.size(3),
+                    self.layer_num * self.page_size * self.kv_cache_dim,
                     dtype=self.dtype,
                     device=self.device,
                 )
-                hicache_page_flatten(self.kv_buffer, out, index, self.page_size)
+                hicache_page_flatten(
+                    self.kv_buffer,
+                    out,
+                    index,
+                    self.page_size,
+                    self.layout == "page_first",
+                )
                 return out
             data_page = data_page.flatten()
         return data_page
@@ -1234,14 +1252,18 @@ class MLATokenToKVPoolHost(HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        if _is_cpu_920f and self.layout == "layer_first":
+        if _is_cpu_920f and self.layout in ("layer_first", "page_first"):
             # Assigning into this non-contiguous slice would run torch's parallel
             # copy, which is unsafe on the HiCache storage threads; scatter with
             # the serial Kunpeng kernel instead. view() (not reshape()) is used on
             # purpose: a non-contiguous blob is a caller bug and must fail loudly
             # rather than silently copying through a temporary.
             hicache_page_unflatten(
-                self.kv_buffer, data_page.view(-1), index, self.page_size
+                self.kv_buffer,
+                data_page.view(-1),
+                index,
+                self.page_size,
+                self.layout == "page_first",
             )
             return
         if self.layout == "layer_first":

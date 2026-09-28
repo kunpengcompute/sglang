@@ -19,7 +19,9 @@
 #   server    [prefill|decode|native] [instance] -> runtime/stop_server.sh
 #   router                                       -> runtime/stop_router.sh
 #   tokenizer [prefill|decode|all]               -> runtime/stop_tokenizer.sh
+#   mooncake                                     -> runtime/stop_mooncake.sh
 #   all    -> router + tokenizer(both) + server(per INSTANCES in env_base.sh)
+#             + mooncake
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -37,7 +39,8 @@ Targets:
   server    Kill sglang on the role's cluster nodes (side: prefill|decode|native, optional instance)
   router    Kill the gateway on the router node
   tokenizer Kill tokenizer HTTP server(s) (side: prefill|decode|all, default all)
-  all       Stop router + both tokenizer sides + servers per INSTANCES
+  mooncake  Kill the mooncake store master on MOONCAKE_MASTER_NODE
+  all       Stop router + both tokenizer sides + servers per INSTANCES + mooncake
 
 Options:
   -h, --help    show this help and exit
@@ -46,6 +49,7 @@ Examples:
   $0 server decode
   $0 server decode 128p
   $0 tokenizer prefill
+  $0 mooncake
   $0 all
 EOF
 }
@@ -71,6 +75,10 @@ case "$TARGET" in
         bash "$SCRIPT_DIR/runtime/stop_tokenizer.sh" "${1:-all}"
         exit $?
         ;;
+    mooncake)
+        bash "$SCRIPT_DIR/runtime/stop_mooncake.sh"
+        exit $?
+        ;;
     all)
         bash "$SCRIPT_DIR/runtime/stop_router.sh"
         bash "$SCRIPT_DIR/runtime/stop_tokenizer.sh" all
@@ -85,6 +93,8 @@ case "$TARGET" in
             [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
             bash "$SCRIPT_DIR/runtime/stop_server.sh" "$_role" "$_inst"
         done
+        # Last: the prefill servers deregister from the store on the way down.
+        bash "$SCRIPT_DIR/runtime/stop_mooncake.sh"
         exit $?
         ;;
     *)
