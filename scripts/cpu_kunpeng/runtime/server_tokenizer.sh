@@ -111,7 +111,7 @@ python -m sglang.launch_server \
 echo "Waiting for HTTP server on port $TOK_PORT to be ready..."
 ready=0
 for i in $(seq 1 18000); do  # up to 30 minutes
-    if curl -sf --noproxy "*" --max-time 2 "http://${ROUTER_IP}:${TOK_PORT}/health" >/dev/null 2>&1; then
+    if curl -sf --noproxy "*" --max-time 5 "http://${ROUTER_IP}:${TOK_PORT}/health" >/dev/null 2>&1; then
         ready=1
         break
     fi
