@@ -15,7 +15,6 @@
  */
 
 #include <torch/extension.h>
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -883,16 +882,24 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
     int local_size = get_intra_node_size();
     int64_t n_local_tokens = batch_size / local_size;
 
+    // dispatch_send_buf row size = hidden + 4 (scale)
+    int64_t row_size = hidden + 4;
+
     // Build token_ids and experts_offset from topk_idx.
     // token_ids stores the ROW INDEX into packed_recv_x (2D view), NOT the
-    // global token ID. It matches the unified per-(expert, rank) slot layout
-    // used by topk_convert_kunpeng: token_ids[ti] is the position of the
-    // token inside expert expert_id_off's slot region of source rank
-    // src_rank = token / n_local_tokens (num_ranks = intra-node ranks).
-    TORCH_CHECK(packed_recv_x.size(1) % local_size == 0, "packed_recv_x dim1 (", packed_recv_x.size(1),
-                ") not divisible by local_size=", local_size);
-    int64_t slot_rows = packed_recv_x.size(1) / local_size;
-    std::vector<int64_t> slot_cnt(num_local_experts * local_size, 0);
+    // global token ID. This matches topk_convert_kunpeng's convention where
+    // token_ids[ti] = ei * 2 * max_tokens + offset (position in packed_recv_x).
+    //
+    // For local dispatch: token_ids[ti] = expert_id_off * packed_stride + ti
+    // where packed_stride = packed_recv_x.size(1) (multiple * max_tokens)
+    //
+    // We also store the global token ID separately for data copy.
+    // NOTE: the local (pp16 single-node SHM) path keeps the legacy
+    // tight-packing prefill layout on purpose — with a single DP group the
+    // per-expert fan-in is bounded by the chunked-prefill size, so the
+    // multiple * max_tokens region can never overflow and the decode-style
+    // worst-case slot layout is unnecessary.
+    int64_t packed_stride = packed_recv_x.size(1);  // multiple * max_tokens
     int64_t ti = 0;
     for (int64_t expert_id_off = 0; expert_id_off < num_local_experts; expert_id_off++) {
         experts_offset_data[expert_id_off] = ti;
@@ -902,12 +909,8 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
                 int64_t peer_rank = global_expert / num_local_experts;
                 int64_t local_exp = global_expert % num_local_experts;
                 if (peer_rank == local_rank && local_exp == expert_id_off) {
-                    int64_t src_rank = token / n_local_tokens;
-                    int64_t &cnt = slot_cnt[expert_id_off * local_size + src_rank];
                     // Store the position in packed_recv_x (2D row index)
-                    token_ids_data[ti] =
-                        static_cast<int32_t>((expert_id_off * local_size + src_rank) * slot_rows + cnt);
-                    cnt++;
+                    token_ids_data[ti] = static_cast<int32_t>(expert_id_off * packed_stride + ti);
                     ti++;
                     break;
                 }
@@ -918,12 +921,12 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
     TORCH_CHECK(ti <= token_ids.size(0), "token_ids overflow: ti=", ti, " capacity=", token_ids.size(0));
 
     // Fill packed_recv_x: copy quantized data from peers' dispatch_send_buf.
-    // packed_recv_x layout: [num_local_experts, num_ranks * slot_rows, hidden+4]
+    // packed_recv_x layout (prefill): [num_local_experts, multiple * max_tokens, hidden+4]
     // For each local expert, for each token assigned to it:
-    //   Copy dispatch_send_buf[global_token] from peer_rank's SHM to
-    //   packed_recv_x[expert_id_off][slot base + cnt]
+    //   Copy dispatch_send_buf[global_token] from peer_rank's SHM to packed_recv_x[expert_id_off][ti2]
     uint8_t *packed_data = reinterpret_cast<uint8_t *>(packed_recv_x.data_ptr());
     int64_t packed_row_size = hidden + 4;
+    int64_t packed_stride_expert = packed_stride * packed_row_size;  // multiple * max_tokens * (hidden+4)
 
     // Barrier before reading peers' dispatch_send_buf: each rank quantizes its
     // own slice of the SHM buffer in `quant_inplace_kunpeng`, so a fast rank
@@ -932,7 +935,6 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
     kupl_shm_fence(kupl_win_intra_node);
 
     // Re-iterate to copy data (need both global token and position)
-    std::fill(slot_cnt.begin(), slot_cnt.end(), 0);
     int64_t ti2 = 0;
     for (int64_t expert_id_off = 0; expert_id_off < num_local_experts; expert_id_off++) {
         for (int64_t token = 0; token < batch_size; token++) {
@@ -943,15 +945,10 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
                 int64_t local_exp = global_expert % num_local_experts;
                 if (peer_rank == local_rank && local_exp == expert_id_off) {
                     // Source: peer's dispatch_send_buf[token]
-                    int64_t src_rank = token / n_local_tokens;
-                    int64_t &cnt = slot_cnt[expert_id_off * local_size + src_rank];
-                    uint8_t *src = g_local_disp_send_ptrs[src_rank] + token * packed_row_size;
-                    // Dest: packed_recv_x[expert_id_off][slot base + cnt]
-                    uint8_t *dst = packed_data +
-                                   ((int64_t)expert_id_off * local_size + src_rank) * slot_rows * packed_row_size +
-                                   cnt * packed_row_size;
-                    memcpy(dst, src, packed_row_size);
-                    cnt++;
+                    uint8_t *src = g_local_disp_send_ptrs[token / n_local_tokens] + token * row_size;
+                    // Dest: packed_recv_x[expert_id_off][ti2]
+                    uint8_t *dst = packed_data + expert_id_off * packed_stride_expert + ti2 * packed_row_size;
+                    memcpy(dst, src, row_size);
                     ti2++;
                     found = true;
                     break;

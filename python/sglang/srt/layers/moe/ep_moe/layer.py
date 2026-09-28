@@ -734,6 +734,7 @@ class KunpengMoE(FusedMoE):
         dispatch_output: KunpengDispatchOutput,
     ) -> KunpengCombineInput:
         from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+            _KunpengDispatcherState,
             KunpengCombineInput,
         )
 
@@ -745,10 +746,23 @@ class KunpengMoE(FusedMoE):
         num_local_experts = self.num_local_experts
         max_dispatch_tokens = dispatch_output.max_dispatch_tokens_per_rank
         inter_dim = w13_weight.shape[1] // 2
-        # Prefill and decode share the decode worst-case per-(expert, rank)
-        # slot layout (must match token_ids/packed_recv_x sizing in
-        # token_dispatcher/kunpeng.py)
-        recv_dense_size = max_dispatch_tokens * self.moe_ep_size * num_local_experts
+        if self.is_prefill and _KunpengDispatcherState.get().use_local_dis_com:
+            # pp16 single-node local SHM mode keeps the legacy tight-packing
+            # prefill layout (must match packed_recv_x/token_ids sizing in
+            # token_dispatcher/kunpeng.py)
+            max_tokens = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")) * int(
+                os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024")
+            )
+            recv_dense_size = (
+                num_local_experts
+                * _KunpengDispatcherState.get().moe_token_multiple
+                * max_tokens
+            )
+        else:
+            # Prefill (RDMA) and decode share the decode worst-case
+            # per-(expert, rank) slot layout (must match token_ids/packed_recv_x
+            # sizing in token_dispatcher/kunpeng.py)
+            recv_dense_size = max_dispatch_tokens * self.moe_ep_size * num_local_experts
 
         # Reuse it for gateup output when inter_dim*2 <= hidden (e.g. v3);
         moe_down = dispatch_output.combine_send_buf

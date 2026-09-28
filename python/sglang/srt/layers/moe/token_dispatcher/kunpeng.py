@@ -403,29 +403,58 @@ def _init_buffers(state: _KunpengDispatcherState):
         torch.uint8, [state.max_tokens_per_mb, state.hidden_size + 4]
     )
 
-    # Prefill and decode share the same worst-case per-(expert, rank) slot
-    # layout: every rank can send at most max_dispatch_tokens tokens to any
-    # single expert, so num_experts * max_dispatch_tokens rows per expert
+    # Prefill (RDMA) and decode share the same worst-case per-(expert, rank)
+    # slot layout: every rank can send at most max_dispatch_tokens tokens to
+    # any single expert, so num_experts * max_dispatch_tokens rows per expert
     # region bounds the routing exactly (no statistical capacity estimate).
     # The legacy prefill sizing (num_local_experts * moe_token_multiple *
     # max_tokens_per_mb) overflowed when a hot expert gathered tokens from
     # all DP ranks (e.g. 32p: 16 DP x 4096 tokens on one expert).
-    state.dispatch_recv_size = (
-        state.num_experts * max_dispatch_tokens * (state.hidden_size + 4)
-        + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
-    )
-    state.dispatch_recv_buf = _zeros(
-        (state.dispatch_recv_size,),
-        torch.uint8,
-        "dispatch_recv_buf",
-        force_ddr=state.is_prefill,
-    )
-    state.combine_send_buf = _zeros(
-        (state.num_experts * max_dispatch_tokens, state.hidden_size),
-        torch.bfloat16,
-        "combine_send_buf",
-        force_ddr=state.is_prefill,
-    )
+    #
+    # Exception — pp16 single-node local SHM dispatch (one DP group): the
+    # per-expert fan-in is bounded by the chunked-prefill size, so the legacy
+    # tight-packing layout (multiple * max_tokens_per_mb rows per expert)
+    # can never overflow.  It is kept there to avoid the worst-case memory
+    # footprint and preserve the original local dispatch/combine mode.
+    local_layout = state.use_local_dis_com
+    multiple = state.moe_token_multiple
+
+    if local_layout:
+        state.dispatch_recv_size = (
+            state.num_local_experts
+            * multiple
+            * state.max_tokens_per_mb
+            * (state.hidden_size + 4)
+            + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
+        )
+        state.dispatch_recv_buf = _zeros(
+            (state.dispatch_recv_size,), torch.uint8, "dispatch_recv_buf"
+        )
+        state.combine_send_buf = _zeros(
+            (
+                state.num_local_experts * multiple * state.max_tokens_per_mb,
+                state.hidden_size,
+            ),
+            torch.bfloat16,
+            "combine_send_buf",
+        )
+    else:
+        state.dispatch_recv_size = (
+            state.num_experts * max_dispatch_tokens * (state.hidden_size + 4)
+            + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
+        )
+        state.dispatch_recv_buf = _zeros(
+            (state.dispatch_recv_size,),
+            torch.uint8,
+            "dispatch_recv_buf",
+            force_ddr=state.is_prefill,
+        )
+        state.combine_send_buf = _zeros(
+            (state.num_experts * max_dispatch_tokens, state.hidden_size),
+            torch.bfloat16,
+            "combine_send_buf",
+            force_ddr=state.is_prefill,
+        )
 
     if state.use_static_route:
         state.combine_recv_size = (
@@ -443,20 +472,33 @@ def _init_buffers(state: _KunpengDispatcherState):
             (state.combine_recv_size,),
             torch.uint8,
             "combine_recv_buf",
-            force_ddr=state.is_prefill,
+            force_ddr=state.is_prefill and not local_layout,
         )
 
-    packed_recv_x_bytes = (
-        state.num_local_experts
-        * num_ranks
-        * max_dispatch_tokens
-        * (state.hidden_size + 4)
-    )
-    state.packed_recv_x = state.dispatch_recv_buf[:packed_recv_x_bytes].view(
-        state.num_local_experts,
-        num_ranks * max_dispatch_tokens,
-        (state.hidden_size + 4),
-    )
+    if local_layout:
+        packed_recv_x_bytes = (
+            state.num_local_experts
+            * multiple
+            * state.max_tokens_per_mb
+            * (state.hidden_size + 4)
+        )
+        state.packed_recv_x = state.dispatch_recv_buf[:packed_recv_x_bytes].view(
+            state.num_local_experts,
+            multiple * state.max_tokens_per_mb,
+            (state.hidden_size + 4),
+        )
+    else:
+        packed_recv_x_bytes = (
+            state.num_local_experts
+            * num_ranks
+            * max_dispatch_tokens
+            * (state.hidden_size + 4)
+        )
+        state.packed_recv_x = state.dispatch_recv_buf[:packed_recv_x_bytes].view(
+            state.num_local_experts,
+            num_ranks * max_dispatch_tokens,
+            (state.hidden_size + 4),
+        )
 
     state.recv_src_info_count = (
         state.num_local_experts * num_ranks * (max_dispatch_tokens * 2 + 1)
@@ -479,9 +521,15 @@ def _init_buffers(state: _KunpengDispatcherState):
         .view(state.num_local_experts, num_ranks * (max_dispatch_tokens * 2 + 1))
     )
 
-    state.recv_token_ids_buf = torch.zeros(
-        state.num_experts * max_dispatch_tokens, dtype=torch.int32
-    )
+    if local_layout:
+        state.recv_token_ids_buf = torch.zeros(
+            state.num_local_experts * multiple * state.max_tokens_per_mb,
+            dtype=torch.int32,
+        )
+    else:
+        state.recv_token_ids_buf = torch.zeros(
+            state.num_experts * max_dispatch_tokens, dtype=torch.int32
+        )
     state.recv_experts_offset = torch.zeros(
         state.num_local_experts + 1, dtype=torch.int32
     )
