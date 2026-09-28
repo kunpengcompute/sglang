@@ -99,7 +99,7 @@ for i in $(seq 1 12000); do
         _role="${endpoints[$j]%%|*}"
         _addr="${endpoints[$j]#*|}"
         if [[ "${ready[$j]}" -eq 0 ]] &&
-            curl -sf --noproxy "*" --max-time 2 "http://${_addr}/health" >/dev/null 2>&1; then
+            curl -sf --noproxy "*" --max-time 5 "http://${_addr}/health" >/dev/null 2>&1; then
             ready[$j]=1
             echo "[$(date +%T)] ${_role} ${_addr} ready"
         fi
