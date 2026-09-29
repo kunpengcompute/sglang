@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
+    is_cpu_920f,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -177,6 +178,7 @@ class Indexer(MultiPlatformOp):
         is_neox_style: bool = True,
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
+        unquantized_wk: bool = False,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
@@ -215,7 +217,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.head_dim,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None if unquantized_wk else quant_config,
             prefix=add_prefix("wk", prefix),
         )
         self.weights_proj = ReplicatedLinear(
@@ -1061,6 +1063,55 @@ class Indexer(MultiPlatformOp):
             index_k=k_fp8,
             index_k_scale=k_scale,
         )
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """CPU dispatch hook (MultiPlatformOp): only Kunpeng 920F has an
+        indexer implementation (the bring-up fake) for now.
+
+        The fake: with the bring-up regime (total context <= index_topk)
+        every token is selected, so the top-k selection degenerates to
+        emitting ALL token positions [0, seq_len) per sequence (-1 padded to
+        topk) -- under that regime the sparse decode path is exactly
+        equivalent to dense attention.
+
+        Raises when any sequence exceeds index_topk (beyond it the fake
+        would select the wrong tokens; needs the real indexer) or on a
+        non-920F CPU (no indexer implementation).
+
+        Output contract matches the CUDA decode path: [q_rows, topk] int32,
+        valid entries form the leading prefix, -1 padding.
+        """
+        if not is_cpu_920f():
+            raise NotImplementedError(
+                "CPU indexer forward is only implemented for Kunpeng 920F"
+            )
+
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
+            max_len = int(max(seq_lens_cpu))
+            if max_len > self.index_topk:
+                raise NotImplementedError(
+                    f"fake CPU indexer requires seq_len ({max_len}) <= "
+                    f"index_topk ({self.index_topk}); the real CPU indexer "
+                    f"is not implemented yet"
+                )
+
+        from sglang.srt.graph import ops as kunpeng
+
+        backend = forward_batch.attn_backend
+        # Full-batch persistent seq lens (graph input; see
+        # KunpengCpuBackend._init_decode_metadata). q_lora rows == batch
+        # rows for decode steps.
+        seq_lens = backend.forward_metadata.full_seq_lens[: q_lora.shape[0]]
+        return kunpeng.fake_indexer_topk_kunpeng(seq_lens, self.index_topk)
 
     def forward_cuda(
         self,

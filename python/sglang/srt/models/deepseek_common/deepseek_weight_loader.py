@@ -517,6 +517,8 @@ class DeepseekV2WeightLoaderMixin:
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
+            # 仅 int8 kv_b 路径会赋值; GLM-5 的 bf16 kv_b 保持 None, 走下方吸收路径
+            w_kc_int8 = w_vc_int8 = w_kc_scale = w_vc_scale = None
 
             if w.dtype in (
                 torch.float8_e4m3fn,
@@ -652,7 +654,7 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
-                if _is_cpu_920f:
+                if _is_cpu_920f and w_kc_int8 is not None:
                     self_attn.w_kc_int8 = bind_or_assign(
                         self_attn.w_kc_int8, w_kc_int8.contiguous()
                     )
@@ -668,7 +670,7 @@ class DeepseekV2WeightLoaderMixin:
                 if _is_npu:
                     w_vc = w_vc.contiguous()
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
-                if _is_cpu_920f:
+                if _is_cpu_920f and w_vc_int8 is not None:
                     self_attn.w_vc_int8 = bind_or_assign(
                         self_attn.w_vc_int8, w_vc_int8.contiguous()
                     )
@@ -688,6 +690,20 @@ class DeepseekV2WeightLoaderMixin:
                             self_attn.w_kc, batch_size)
                     self_attn.w_vc_packed = \
                         torch.ops.sgl_kernel.bf16_bmm_prepack_kunpeng(
+                            self_attn.w_vc, batch_size)
+                if (
+                    _is_cpu_920f
+                    and self_attn.q_lora_rank is not None
+                    and getattr(self_attn, "w_kc_int8_packed", None) is None
+                ):
+                    # GLM-5: bf16 kv_b + q_lora -> 吸收后的 w_kc/w_vc 走 bgemm
+                    # 路径 (纯转置预打包), 与 int8 igemm / bmm 路径互不影响.
+                    batch_size = get_global_server_args().max_prefill_tokens
+                    self_attn.w_kc_bf16_packed = \
+                        torch.ops.sgl_kernel.bgemm_prepack_kunpeng(
+                            self_attn.w_kc, batch_size)
+                    self_attn.w_vc_bf16_packed = \
+                        torch.ops.sgl_kernel.bgemm_prepack_kunpeng(
                             self_attn.w_vc, batch_size)
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
@@ -735,9 +751,23 @@ class DeepseekV2WeightLoaderMixin:
                     "kv_b_proj",
                 ]:
                     if hasattr(self_attn, proj):
+                        _proj_w = getattr(self_attn, proj).weight
+                        if _proj_w.dtype != torch.int8:
+                            # GLM-5: bf16 kv_b_proj on the chunked-prefill path
+                            # feeds the SME packed bgemm chain -> prepack
+                            # in-place (non-chunked forward reads raw weight).
+                            if (
+                                proj == "kv_b_proj"
+                                and get_global_server_args().chunked_prefill_size
+                            ):
+                                torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                                    _proj_w,
+                                    get_global_server_args().max_prefill_tokens,
+                                )
+                            continue
                         # Note: kv_b_proj is prepacked as well, but during decode
                         # with weight absorption it is not actually used.
-                        _kunpeng_prepack_igemm_weight(getattr(self_attn, proj).weight)
+                        _kunpeng_prepack_igemm_weight(_proj_w)
 
                 # mlp gate_up_proj and down_proj prepack
                 mlp = (

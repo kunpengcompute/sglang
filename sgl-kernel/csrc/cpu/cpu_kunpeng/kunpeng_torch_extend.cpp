@@ -102,11 +102,24 @@ at::Tensor build_block_table_kunpeng(const at::Tensor &req_to_token, const at::T
                                      const at::Tensor &seq_lens, int64_t page_size);
 
 int64_t flash_mla_sparse_decode_sched_kunpeng(const at::Tensor &topk_length, int64_t seqlen_q, int64_t num_heads_q,
-                                              int64_t head_dim, int64_t head_dim_v, c10::optional<at::Tensor> meta);
+                                              int64_t head_dim, int64_t head_dim_v, c10::optional<at::Tensor> meta,
+                                              int64_t topk = 1, int64_t extra_topk = 0,
+                                              c10::optional<at::Tensor> extra_topk_length = std::nullopt);
 
 void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache, at::Tensor indices, at::Tensor topk_length,
+                                     c10::optional<at::Tensor> extra_kvcache, c10::optional<at::Tensor> extra_indices,
+                                     c10::optional<at::Tensor> extra_topk_length, c10::optional<at::Tensor> attn_sink,
                                      at::Tensor o, at::Tensor softmax_lse, double softmax_scale,
                                      at::Tensor extra_buffer, c10::optional<at::Tensor> meta);
+
+void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &topk_indices,
+                            const at::Tensor &seq_lens, int64_t page_size, int64_t row_start,
+                            at::Tensor slots, at::Tensor topk_length);
+
+void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices);
+void bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output);
+
+at::Tensor bgemm_prepack_kunpeng(const at::Tensor &weight, int64_t batch_size);
 
 std::tuple<int64_t, int64_t> get_flash_attention_block_kunpeng();
 int64_t get_flash_attention_thread_num();
@@ -171,6 +184,15 @@ void cat_rows_kunpeng(
 void contiguous_rows_kunpeng(
     at::Tensor x, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
     at::Tensor out);
+
+void bf16_gemm_pack_rows_kunpeng(
+    at::Tensor input, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor out, int64_t split_c);
+
+void bf16_packed_gemm_rows_kunpeng(
+    at::Tensor input, at::Tensor weight, at::Tensor workspace,
+    at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor output);
 
 // === Memory operator definition ===
 at::Tensor hbw_allocator_kunpeng(int64_t size);
@@ -610,16 +632,43 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     // Sparse (long-context) MLA decode: local-shard attention with top-k indices.
     m.def(
         "flash_mla_sparse_decode_sched_kunpeng(Tensor topk_length, int seqlen_q, int num_heads_q, "
-        "int head_dim, int head_dim_v, Tensor? meta=None) -> int");
+        "int head_dim, int head_dim_v, Tensor? meta=None, int topk=1, int extra_topk=0, "
+        "Tensor? extra_topk_length=None) -> int");
     m.impl("flash_mla_sparse_decode_sched_kunpeng", flash_mla_sparse_decode_sched_kunpeng);
 
     m.def(
         "flash_mla_sparse_decode_kunpeng(Tensor q, Tensor kcache, "
         "Tensor indices, Tensor topk_length, "
+        "Tensor? extra_kvcache, Tensor? extra_indices, "
+        "Tensor? extra_topk_length, Tensor? attn_sink, "
         "Tensor o, Tensor softmax_lse, "
         "float softmax_scale, "
         "Tensor extra_buffer=None, Tensor? meta=None) -> ()");
     m.impl("flash_mla_sparse_decode_kunpeng", flash_mla_sparse_decode_kunpeng);
+
+    // DSA (NSA) decode: indexer top-k token positions -> flat KV-cache slots
+    // (+ per-sequence valid counts) for the sparse flash MLA kernel.
+    // Direct-write outputs (graph replay discards return values).
+    m.def(
+        "dsa_topk_slots_kunpeng(Tensor block_table, Tensor topk_indices, "
+        "Tensor seq_lens, int page_size, int row_start, "
+        "Tensor(a!) slots, Tensor(b!) topk_length) -> ()");
+    m.impl("dsa_topk_slots_kunpeng", dsa_topk_slots_kunpeng);
+
+    // Fake indexer (920F DSA bring-up): all-ids selection, exact when
+    // seq_len <= index_topk (guarded on the Python side).
+    m.def(
+        "fake_indexer_topk_kunpeng(Tensor seq_lens, int topk, "
+        "Tensor(a!) indices) -> ()");
+    m.impl("fake_indexer_topk_kunpeng", fake_indexer_topk_kunpeng);
+
+    // Simple bf16 batched GEMM (naive fp32 accumulation, no SME packed
+    // kernels) for the bf16 kv_b_proj MLA absorb path (e.g. GLM-5).
+    m.def("bgemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output) -> ()");
+    m.impl("bgemm_kunpeng", bgemm_kunpeng);
+
+    m.def("bgemm_prepack_kunpeng(Tensor weight, int batch_size) -> Tensor");
+    m.impl("bgemm_prepack_kunpeng", bgemm_prepack_kunpeng);
 
     // Flash attn (prefill attention kernel)
     m.def("get_flash_attention_block_kunpeng() -> (int, int)");
@@ -721,6 +770,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor x, Tensor extend_seq_lens, Tensor prefix_lens, "
         "Tensor out) -> ()");
     m.impl("contiguous_rows_kunpeng", contiguous_rows_kunpeng);
+
+    m.def(
+        "bf16_gemm_pack_rows_kunpeng("
+        "Tensor input, Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor out, int split_c) -> ()");
+    m.impl("bf16_gemm_pack_rows_kunpeng", bf16_gemm_pack_rows_kunpeng);
+
+    m.def(
+        "bf16_packed_gemm_rows_kunpeng("
+        "Tensor input, Tensor weight, Tensor workspace, "
+        "Tensor extend_seq_lens, Tensor prefix_lens, "
+        "Tensor output) -> ()");
+    m.impl("bf16_packed_gemm_rows_kunpeng", bf16_packed_gemm_rows_kunpeng);
 
     // hbw_allocator
     m.def("hbw_allocator_kunpeng(int size) -> Tensor");

@@ -1112,6 +1112,37 @@ def _setup_contiguous_rows_kunpeng():
     register_op('contiguous_rows_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_bf16_gemm_pack_rows_kunpeng():
+    # Live-bounded bf16 pack (GLM-5 unquantized kv_b chain). split_c is the
+    # tile_k of the {N,K}-keyed bgemm tiling plan, which is M-independent.
+    def shape_infer(input, extend_seq_lens, prefix_lens, split_c):
+        return [((input.shape[0], input.shape[1]), input.dtype)]
+
+    def eager_fn(input, extend_seq_lens, prefix_lens, split_c):
+        out = torch.empty(input.shape, dtype=input.dtype)
+        torch.ops.sgl_kernel.bf16_gemm_pack_rows_kunpeng(
+            input, extend_seq_lens, prefix_lens, out, int(split_c))
+        return out
+
+    register_op('bf16_gemm_pack_rows_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_bf16_packed_gemm_rows_kunpeng():
+    # Live-bounded bf16 GEMM: out[:live] = packed_input[:live] @ weight.T.
+    # The tiling plan is re-derived inside the kernel from the live extent.
+    def shape_infer(input, weight, workspace, extend_seq_lens, prefix_lens):
+        return [((input.shape[0], weight.shape[0]), torch.bfloat16)]
+
+    def eager_fn(input, weight, workspace, extend_seq_lens, prefix_lens):
+        output = torch.empty((input.shape[0], weight.shape[0]),
+                             dtype=torch.bfloat16)
+        torch.ops.sgl_kernel.bf16_packed_gemm_rows_kunpeng(
+            input, weight, workspace, extend_seq_lens, prefix_lens, output)
+        return output
+
+    register_op('bf16_packed_gemm_rows_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_flash_mla_dense_decode_kunpeng():
     def shape_infer(q, kcache, block_table, seqlens_kv,
                     softmax_scale, is_causal, extra_buffer, meta,
@@ -1142,21 +1173,92 @@ def _setup_flash_mla_dense_decode_kunpeng():
 
 
 def _setup_flash_mla_sparse_decode_kunpeng():
-    # Sparse paged MLA decode (long-context decode CP only). Writes O/LSE
+    # Sparse paged MLA decode (long-context decode CP + DSA). Writes O/LSE
     # directly into the caller-provided persistent SHM region views (fixed
     # storage), so shape_infer returns nothing -- the outputs are inputs.
-    def shape_infer(q, kcache, indices, topk_length, o, softmax_lse,
-                    softmax_scale, extra_buffer, meta):
+    # extra_kvcache/extra_indices/extra_topk_length (window KV set) and
+    # attn_sink (per-head sink logits) mirror the sparse prefill op's
+    # semantics; all optional (LC passes None).
+    def shape_infer(q, kcache, indices, topk_length, extra_kvcache,
+                    extra_indices, extra_topk_length, attn_sink, o,
+                    softmax_lse, softmax_scale, extra_buffer, meta):
         return []
 
-    def eager_fn(q, kcache, indices, topk_length, o, softmax_lse,
-                 softmax_scale, extra_buffer, meta):
+    def eager_fn(q, kcache, indices, topk_length, extra_kvcache,
+                 extra_indices, extra_topk_length, attn_sink, o,
+                 softmax_lse, softmax_scale, extra_buffer, meta):
         torch.ops.sgl_kernel.flash_mla_sparse_decode_kunpeng(
-            q, kcache, indices, topk_length, o, softmax_lse,
+            q, kcache, indices, topk_length,
+            extra_kvcache, extra_indices, extra_topk_length, attn_sink,
+            o, softmax_lse,
             float(softmax_scale), extra_buffer, meta)
         return None
 
     register_op('flash_mla_sparse_decode_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_dsa_topk_slots_kunpeng():
+    # DSA (NSA) decode index transform: indexer top-k token positions ->
+    # flat KV-cache slot ids (+ per-sequence valid counts) for the sparse
+    # flash MLA kernel. Direct-write outputs (bmm-style: eager allocates,
+    # capture registers via shape_infer; the C++ graph registrar lists
+    # [inputs..., outputs...] in the same order).
+    def _out_shapes(block_table, topk_indices):
+        bs = block_table.shape[0]
+        topk = (topk_indices.shape[2] if topk_indices.dim() == 3
+                else topk_indices.shape[1])
+        return bs, topk
+
+    def shape_infer(block_table, topk_indices, seq_lens, page_size, row_start):
+        bs, topk = _out_shapes(block_table, topk_indices)
+        return [((bs, 1, topk), torch.int32), ((bs,), torch.int32)]
+
+    def eager_fn(block_table, topk_indices, seq_lens, page_size, row_start):
+        bs, topk = _out_shapes(block_table, topk_indices)
+        slots = torch.empty((bs, 1, topk), dtype=torch.int32)
+        topk_length = torch.empty((bs,), dtype=torch.int32)
+        torch.ops.sgl_kernel.dsa_topk_slots_kunpeng(
+            block_table, topk_indices, seq_lens, page_size, row_start,
+            slots, topk_length)
+        return slots, topk_length
+
+    register_op('dsa_topk_slots_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_fake_indexer_topk_kunpeng():
+    # Fake indexer (920F DSA bring-up): all-ids selection
+    # ([0..seq_len) per row, -1 padded to topk) -- exact when
+    # seq_len <= index_topk. Output consumed by dsa_topk_slots_kunpeng.
+    # Direct-write output (bmm-style).
+    def shape_infer(seq_lens, topk):
+        return [((seq_lens.shape[0], topk), torch.int32)]
+
+    def eager_fn(seq_lens, topk):
+        indices = torch.empty((seq_lens.shape[0], topk), dtype=torch.int32)
+        torch.ops.sgl_kernel.fake_indexer_topk_kunpeng(seq_lens, topk, indices)
+        return indices
+
+    register_op('fake_indexer_topk_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_bgemm_kunpeng():
+    # Simple bf16 batched GEMM (naive fp32 accumulation) for the bf16
+    # kv_b_proj MLA absorb path (e.g. GLM-5): out = input @ weight^T per
+    # batch item. weight is the bgemm_prepack_kunpeng transpose output
+    # ([B, N, K]); input [B, M, K] (outer dims may be strided views).
+    def shape_infer(input, weight):
+        B, M, K = input.shape
+        N = weight.shape[1]
+        return [((B, M, N), input.dtype)]
+
+    def eager_fn(input, weight):
+        B, M, K = input.shape
+        N = weight.shape[1]
+        out = torch.empty((B, M, N), dtype=input.dtype, device=input.device)
+        torch.ops.sgl_kernel.bgemm_kunpeng(input, weight, out)
+        return out
+
+    register_op('bgemm_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_shm_mla_o_alltoall_long_context_kunpeng():
@@ -1388,6 +1490,9 @@ def setup():
     _setup_print_hash_kunpeng()
     _setup_flash_mla_dense_decode_kunpeng()
     _setup_flash_mla_sparse_decode_kunpeng()
+    _setup_dsa_topk_slots_kunpeng()
+    _setup_fake_indexer_topk_kunpeng()
+    _setup_bgemm_kunpeng()
     _setup_shm_mla_o_alltoall_long_context_kunpeng()
     _setup_lc_mark_empty_lse_kunpeng()
     _setup_flash_mla_reduce_kunpeng()
@@ -1400,6 +1505,8 @@ def setup():
     _setup_s8_s8_packed_gemm_bf16_dq_rows_kunpeng()
     _setup_cat_rows_kunpeng()
     _setup_contiguous_rows_kunpeng()
+    _setup_bf16_gemm_pack_rows_kunpeng()
+    _setup_bf16_packed_gemm_rows_kunpeng()
     _setup_pad_q_left_mtp_kunpeng()
     _setup_unpad_o_right_mtp_kunpeng()
     _setup_topk_convert_kunpeng()

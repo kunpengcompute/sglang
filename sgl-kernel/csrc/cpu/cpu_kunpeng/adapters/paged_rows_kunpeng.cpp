@@ -44,6 +44,15 @@ void contiguous_rows_kunpeng(
     at::Tensor x, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
     at::Tensor out);
 
+void bf16_gemm_pack_rows_kunpeng(
+    at::Tensor input, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor out, int64_t split_c);
+
+void bf16_packed_gemm_rows_kunpeng(
+    at::Tensor input, at::Tensor weight, at::Tensor workspace,
+    at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor output);
+
 static KernelRegistrar _r_quant_rows(
     "quant_rows_kunpeng",
     make_dispatch_v<decltype(&quant_rows_kunpeng), &quant_rows_kunpeng>);
@@ -66,3 +75,13 @@ static KernelRegistrar _r_contiguous_rows(
     "contiguous_rows_kunpeng",
     make_dispatch_v<decltype(&contiguous_rows_kunpeng),
                     &contiguous_rows_kunpeng>);
+
+static KernelRegistrar _r_bf16_gemm_pack_rows(
+    "bf16_gemm_pack_rows_kunpeng",
+    make_dispatch_v<decltype(&bf16_gemm_pack_rows_kunpeng),
+                    &bf16_gemm_pack_rows_kunpeng>);
+
+static KernelRegistrar _r_bf16_packed_gemm_rows(
+    "bf16_packed_gemm_rows_kunpeng",
+    make_dispatch_v<decltype(&bf16_packed_gemm_rows_kunpeng),
+                    &bf16_packed_gemm_rows_kunpeng>);

@@ -26,7 +26,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     Phi3LongRoPEScaledRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cpu_920f, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +414,87 @@ def get_rope_cpu(
     return rotary_emb
 
 
+def get_rope_kunpeng(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: int,
+    is_neox_style: bool = True,
+    rope_scaling: Optional[Dict[str, Any]] = None,
+    dtype: Optional[torch.dtype] = None,
+    partial_rotary_factor: float = 1.0,
+    device: Optional[str] = None,
+) -> RotaryEmbedding:
+    # Kunpeng 920F CPU variant of get_rope_cpu: additionally supports plain
+    # (unscaled) RoPE, mirroring the CUDA get_rope path. Needed by models
+    # without a deepseek_yarn scaling config (e.g. the GLM-5 NSA indexer).
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if rope_scaling is not None:
+        rope_scaling_tuple = {
+            k: tuple(v) if isinstance(v, list) else v for k, v in rope_scaling.items()
+        }
+        rope_scaling_args = tuple(rope_scaling_tuple.items())
+    else:
+        rope_scaling_args = None
+    if partial_rotary_factor < 1.0:
+        rotary_dim = int(rotary_dim * partial_rotary_factor)
+    key = (
+        head_size,
+        rotary_dim,
+        max_position,
+        base,
+        is_neox_style,
+        rope_scaling_args,
+        dtype,
+    )
+    if key in _ROPE_DICT:
+        return _ROPE_DICT[key]
+
+    if rope_scaling is None:
+        rotary_emb = RotaryEmbedding(
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+        )
+        _ROPE_DICT[key] = rotary_emb
+        return rotary_emb
+
+    scaling_type = rope_scaling["rope_type"]
+    assert (
+        scaling_type == "deepseek_yarn"
+    ), "Only deepseek_yarn is supported for Kunpeng 920F for now"
+
+    scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+    original_max_position = _get_rope_param(
+        rope_scaling, "original_max_position_embeddings", max_position, scaling_type
+    )
+    extra_kwargs = {
+        k: v
+        for k, v in rope_scaling.items()
+        if k
+        in (
+            "extrapolation_factor",
+            "attn_factor",
+            "beta_fast",
+            "beta_slow",
+            "mscale",
+            "mscale_all_dim",
+        )
+    }
+    extra_kwargs["device"] = device
+    rotary_emb = DeepseekScalingRotaryEmbedding(
+        head_size,
+        rotary_dim,
+        original_max_position,
+        base,
+        is_neox_style,
+        scaling_factor,
+        dtype,
+        **extra_kwargs,
+    )
+    _ROPE_DICT[key] = rotary_emb
+    return rotary_emb
+
+
 def get_rope_wrapper(
     head_size: int,
     rotary_dim: int,
@@ -436,6 +517,19 @@ def get_rope_wrapper(
             rope_scaling,
             dtype,
             partial_rotary_factor,
+        )
+
+    if is_cpu_920f():
+        return get_rope_kunpeng(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            rope_scaling,
+            dtype,
+            partial_rotary_factor,
+            device,
         )
 
     return get_rope_cpu(

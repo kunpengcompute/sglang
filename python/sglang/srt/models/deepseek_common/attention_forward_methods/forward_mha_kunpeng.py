@@ -139,9 +139,13 @@ class DeepseekMHAKunpengForwardMixin:
         # Get the paged MLA latent KV cache.
         latent_cache = self.swap_mgr.get_kv_cache()
 
-        # kv_b_proj: int8 weight + per-row scale; C++ quantizes kv_a and runs int8 GEMM.
+        # kv_b_proj: int8 weight + per-row scale (DSV3.2) -> quantized s8 GEMM
+        # chain, C++ quantizes kv_a and runs int8 GEMM; bf16 (GLM-5) ->
+        # live-row bf16 (bgemm) pack/GEMM chain.
         kv_b_weight = self.kv_b_proj.weight
-        kv_b_weight_scale = self.kv_b_proj.weight_scale.view(-1)
+        kv_b_weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
+        if kv_b_weight_scale is not None:
+            kv_b_weight_scale = kv_b_weight_scale.view(-1)
 
         # Build workspace for kutacc internal scratch tensors.
         softmax_scale = (
@@ -187,7 +191,7 @@ class DeepseekMHAKunpengForwardMixin:
         # When SGLANG_KUNPENG_FUSED_GATHER_QUANT is enabled, kv_a is
         # per-row-quantized to int8 during the gather itself, replacing the
         # separate quant_rows_kunpeng pass below.
-        if envs.SGLANG_KUNPENG_FUSED_GATHER_QUANT.get():
+        if kv_b_weight_scale is not None and envs.SGLANG_KUNPENG_FUSED_GATHER_QUANT.get():
             kv_a_int8, kv_a_scale, k_pe = kunpeng.gather_split_latent_paged_quant_kunpeng(
                 latent_cache, meta.block_table,
                 forward_batch.extend_seq_lens, prefix_lens,
@@ -200,26 +204,40 @@ class DeepseekMHAKunpengForwardMixin:
                 meta.page_size, self.kv_lora_rank, self.qk_rope_head_dim,
                 max_total)
 
-            # 2. int8-quantize kv_a for the kv_b_proj GEMM (live rows only).
-            kv_a_int8, kv_a_scale = kunpeng.quant_rows_kunpeng(
-                kv_a, forward_batch.extend_seq_lens, prefix_lens)
+            if kv_b_weight_scale is not None:
+                # 2. int8-quantize kv_a for the kv_b_proj GEMM (live rows only).
+                kv_a_int8, kv_a_scale = kunpeng.quant_rows_kunpeng(
+                    kv_a, forward_batch.extend_seq_lens, prefix_lens)
 
-        # 3. kv_b_proj int8 GEMM: buffers stay max-sized (baked at capture)
-        # but only the live rows are packed/computed each round. The kernels
-        # re-derive the row tile from the live extent (tile_m = m = live);
-        # tile_n/tile_k from the plan are still used as baked.
-        tile_m, tile_n, tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(
-            max_total, n_out, self.kv_lora_rank)
-        pack_a = kunpeng.s8_gemm_pack_rows_kunpeng(
-            kv_a_int8, forward_batch.extend_seq_lens, prefix_lens,
-            tile_m, tile_k)
-        blocks_in_k = self.kv_lora_rank // tile_k
-        ws_numel = blocks_in_k * n_out * max_total * 2 if blocks_in_k > 1 else 1
-        gemm_ws = kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16)
-        kv_b_out = kunpeng.s8_s8_packed_gemm_bf16_dq_rows_kunpeng(
-            pack_a, kv_b_weight, kv_b_weight_scale, kv_a_scale, gemm_ws,
-            forward_batch.extend_seq_lens, prefix_lens,
-            tile_m, tile_n, tile_k)
+        # 3. kv_b_proj GEMM: buffers stay max-sized (baked at capture); the
+        # kernels re-derive tile_m from the live extent, tile_n/tile_k stay baked.
+        if kv_b_weight_scale is not None:
+            tile_m, tile_n, tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(
+                max_total, n_out, self.kv_lora_rank)
+            pack_a = kunpeng.s8_gemm_pack_rows_kunpeng(
+                kv_a_int8, forward_batch.extend_seq_lens, prefix_lens,
+                tile_m, tile_k)
+            blocks_in_k = self.kv_lora_rank // tile_k
+            ws_numel = blocks_in_k * n_out * max_total * 2 if blocks_in_k > 1 else 1
+            gemm_ws = kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16)
+            kv_b_out = kunpeng.s8_s8_packed_gemm_bf16_dq_rows_kunpeng(
+                pack_a, kv_b_weight, kv_b_weight_scale, kv_a_scale, gemm_ws,
+                forward_batch.extend_seq_lens, prefix_lens,
+                tile_m, tile_n, tile_k)
+        else:
+            # GLM-5 bf16 kv_b: the {N,K}-keyed plan's tile_k is M-independent,
+            # so the capture-time plan matches the live-extent plan.
+            _, _, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(
+                max_total, n_out, self.kv_lora_rank)
+            pack_a = kunpeng.bf16_gemm_pack_rows_kunpeng(
+                kv_a, forward_batch.extend_seq_lens, prefix_lens, tile_k)
+            blocks_in_k = self.kv_lora_rank // tile_k
+            ws_numel = (blocks_in_k * n_out * max_total + 1024
+                        if blocks_in_k > 1 else 1)
+            gemm_ws = kunpeng.alloc_buffer(ws_numel, dtype=torch.bfloat16)
+            kv_b_out = kunpeng.bf16_packed_gemm_rows_kunpeng(
+                pack_a, kv_b_weight, gemm_ws,
+                forward_batch.extend_seq_lens, prefix_lens)
 
         # 4. Assemble MHA K/V (views + registered copy ops, live rows only).
         kv_b_3d = kv_b_out.view(

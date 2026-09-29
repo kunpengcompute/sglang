@@ -1345,8 +1345,23 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = None
         self.next_skip_topk = None
+        # GLM-5 (GlmMoeDsa) on kunpeng 920F: kv_b_proj / indexer.wk 为 bf16,
+        # kv_b 走 bgemm 吸收路径 (见 deepseek_weight_loader)
+        _glm5_920f = (
+            _is_cpu_920f
+            and bool(getattr(config, "architectures", None))
+            and config.architectures[0] == "GlmMoeDsaForCausalLM"
+        )
         if self.use_nsa:
-            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+            # GlmMoeDsa: indexer 用 interleaved RoPE (DSV3.2 是 half-split),
+            # 且 HF config 无 indexer_rope_interleave 字段, 故默认 interleave.
+            _glm_moe_dsa = (
+                bool(getattr(config, "architectures", None))
+                and config.architectures[0] == "GlmMoeDsaForCausalLM"
+            )
+            is_neox_style = not getattr(
+                config, "indexer_rope_interleave", _glm_moe_dsa
+            )
             self.indexer = Indexer(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
@@ -1362,6 +1377,7 @@ class DeepseekV2AttentionMLA(
                 is_neox_style=is_neox_style,
                 prefix=add_prefix("indexer", prefix),
                 quant_config=quant_config,
+                unquantized_wk=_glm5_920f,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
             )
@@ -1373,7 +1389,17 @@ class DeepseekV2AttentionMLA(
                 self.next_skip_topk = False
             else:
                 self.index_topk_freq = getattr(config, "index_topk_freq", 1)
-                self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
+                # GlmMoeDsa: HF config 自带 per-layer `indexer_types` 列表,
+                # 优先查表; DSV3.2 模数公式只作为回退 (公式在本模型上会错位一层).
+                hf_indexer_types = getattr(config, "indexer_types", None)
+                if hf_indexer_types is not None:
+                    self.index_topk_pattern = [
+                        "F" if t == "full" else "S" for t in hf_indexer_types
+                    ]
+                else:
+                    self.index_topk_pattern = getattr(
+                        config, "index_topk_pattern", None
+                    )
                 if self.index_topk_pattern is None:
                     self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
                     self.next_skip_topk = layer_id % self.index_topk_freq != 0
@@ -1390,7 +1416,7 @@ class DeepseekV2AttentionMLA(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=quant_config,
+            quant_config=None if _glm5_920f else quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -2149,6 +2175,20 @@ class DeepseekV2Model(nn.Module):
                 ),
             ),
         )
+        # GLM-5 DSA: "shared" indexer 层 (skip_topk=True) 直接复用上一个 full
+        # 层的 topk 索引, 且导出只在 full 层存 indexer 权重 -> 把 shared 层的
+        # Indexer 对象替换为上一个 full 层的对象 (参数去重, 加载不缺 key).
+        # full 层在其他 PP rank 时无法共享, 该层回退为独立 indexer.
+        if is_deepseek_nsa(config):
+            _last_full_indexer = None
+            for _layer in self.layers:
+                _attn = _layer.self_attn
+                if getattr(_attn, "indexer", None) is None:
+                    continue
+                if not _attn.skip_topk:
+                    _last_full_indexer = _attn.indexer
+                elif _last_full_indexer is not None:
+                    _attn.indexer = _last_full_indexer
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
