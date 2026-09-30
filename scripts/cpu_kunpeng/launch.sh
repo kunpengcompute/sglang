@@ -18,7 +18,8 @@
 #   prefill/decode/native -> runtime/launch_cluster.sh
 #   router                -> runtime/launch_router.sh
 #   mooncake              -> runtime/launch_mooncake.sh (HiCache L3 store master)
-#   all                   -> inline: [mooncake] + prefill + decode + health-check
+#   store                 -> runtime/launch_store.sh (HiCache L3 store service)
+#   all                   -> inline: [mooncake + store] + prefill + decode + health-check
 #                            + router
 #   update                -> inline: update_time + update_numa_dup
 
@@ -44,8 +45,10 @@ Roles:
              default 30001/30002; instance selects
              runtime/.user_env_<side>_<instance>.sh)
   mooncake   Launch the mooncake store master (HiCache L3 backend mooncake)
+  store      Launch the mooncake store service on MOONCAKE_STORE_NODE (L3 pool)
   all        Launch prefill, decode, tokenizer, and router sequentially
-             (the mooncake master first, when a prefill entry selects it)
+             (the mooncake master + store service first, when a prefill entry
+             selects the mooncake backend)
   update     Regenerate .time_env.sh + update NUMA binary replicas
 
 Options:
@@ -55,6 +58,7 @@ Examples:
   $0 prefill
   $0 all
   $0 mooncake
+  $0 store
   $0 update
 EOF
 }
@@ -73,7 +77,7 @@ case "$CMD" in
         show_usage
         exit 0
         ;;
-    prefill|decode|native|router|tokenizer|mooncake|all|update)
+    prefill|decode|native|router|tokenizer|mooncake|store|all|update)
         ROLE="$CMD"
         ;;
     *)
@@ -85,7 +89,7 @@ esac
 
 
 bash "$SCRIPT_DIR/runtime/update_time.sh"
-if [[ "$ROLE" == "router" || "$ROLE" == "tokenizer" || "$ROLE" == "mooncake" ]]; then
+if [[ "$ROLE" == "router" || "$ROLE" == "tokenizer" || "$ROLE" == "mooncake" || "$ROLE" == "store" ]]; then
     echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update for role '$ROLE'.\033[0m"
 elif [[ "${SGLANG_ENABLE_NUMA_DUPLICATION:-1}" != "1" ]]; then
     echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update (SGLANG_ENABLE_NUMA_DUPLICATION='${SGLANG_ENABLE_NUMA_DUPLICATION:-unset}').\033[0m"
@@ -117,16 +121,22 @@ elif [[ "$ROLE" == "all" ]]; then
         _entry="${_entry//[[:space:]]/}"
         [[ -z "$_entry" ]] && continue
         _role="${_entry%%_*}"
-        [[ "$_role" == "prefill" ]] || continue
+        [[ "$_role" == "prefill" || "$_role" == "native" ]] || continue
         _inst=""
         [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
+        _hicache="$(SKIP_CONDA=1 bash -c "
+            source '$SCRIPT_DIR/env.sh' '$_role' '$_inst' >/dev/null 2>&1
+            echo \"\${ENABLE_KUNPENG_HICACHE:-0}\"")"
+        [[ "$_hicache" != "1" ]] && continue
         _backend="$(SKIP_CONDA=1 bash -c "
-            source '$SCRIPT_DIR/env.sh' prefill '$_inst' >/dev/null 2>&1
+            source '$SCRIPT_DIR/env.sh' '$_role' '$_inst' >/dev/null 2>&1
             echo \"\${KUNPENG_HICACHE_BACKEND:-file}\"")"
         [[ "$_backend" == "mooncake" ]] && _start_mooncake=1
     done
     if [[ "$_start_mooncake" == "1" ]]; then
+        SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/stop_store.sh"
         SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_mooncake.sh"
+        SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_store.sh"
     fi
 
     for _entry in "${_INST_LIST[@]}"; do
@@ -158,6 +168,9 @@ elif [[ "$ROLE" == "tokenizer" ]]; then
 
 elif [[ "$ROLE" == "mooncake" ]]; then
     bash "$SCRIPT_DIR/runtime/launch_mooncake.sh" "$@"
+
+elif [[ "$ROLE" == "store" ]]; then
+    bash "$SCRIPT_DIR/runtime/launch_store.sh" "$@"
 
 else
     # prefill/decode/native

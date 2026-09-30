@@ -118,7 +118,7 @@ case "$ROLE" in
         SPECIFIC_ARGS=(
             --disaggregation-mode prefill
             --max-prefill-tokens $((SGLANG_KUNPENG_MAX_SEQ_NUM * SGLANG_KUNPENG_MAX_CUR_LEN))
-            --max-total-tokens 180000
+            --max-total-tokens 65536
             --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
             --max-running-requests $((8 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
             --load-balance-method round_robin
@@ -168,13 +168,13 @@ case "$ROLE" in
 esac
 
 # Kunpeng multi-level KV cache (L1 DDR -> L2 DDR -> L3 storage).
-# Only the prefill role participates. KUNPENG_HICACHE_BACKEND picks the L3 store:
+# Only the prefill and native roles participate. KUNPENG_HICACHE_BACKEND picks the L3 store:
 #   file     per-page files under KUNPENG_HICACHE_L3_DIR (a directory shared by
 #            all prefill nodes); leave it empty to run L1<->L2 only. layer_first.
 #   mooncake mooncake store master (launch.sh mooncake / launch.sh all); the
 #            store is page_first-only, so the host pool switches layout.
 # Disabled unless ENABLE_KUNPENG_HICACHE=1.
-if [[ "$ROLE" == "prefill" && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
+if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
     HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
     if [[ "$HICACHE_BACKEND" == "mooncake" ]]; then
         HICACHE_MEM_LAYOUT="page_first"

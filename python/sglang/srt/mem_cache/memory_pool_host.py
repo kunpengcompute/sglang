@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import abc
+import json
 import logging
+import os
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -79,6 +86,79 @@ logger = logging.getLogger(__name__)
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+
+NODE_HOST_MEMORY_BUDGET_FILE = "/tmp/sglang_hicache_node_memory.json"
+NODE_HOST_MEMORY_LOCK_FILE = "/tmp/sglang_hicache_node_memory.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _reserve_node_host_memory(requested_bytes: int):
+    """Reserve *requested_bytes* of host RAM for this rank, node-wide.
+
+    Ranks on one node start together and each only sees its own ``psutil``
+    reading, so N ranks can each claim the pool size and get the node
+    OOM-killed. Keeping the running total in one per-node file bounds the sum;
+    dead pids are dropped and the file is keyed by boot id, so a stale file
+    cannot block a later start.
+
+    Returns ``(fits, available_bytes, reserved_by_peers_bytes)``, or ``None``
+    when the bookkeeping is unavailable (caller then falls back to the plain
+    per-rank check).
+    """
+    if fcntl is None:
+        return None
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot_id = f.read().strip()
+        lock_fd = os.open(NODE_HOST_MEMORY_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with open(NODE_HOST_MEMORY_BUDGET_FILE) as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            state = {}
+        if not isinstance(state, dict) or state.get("boot_id") != boot_id:
+            state = {"boot_id": boot_id, "entries": {}}
+        raw_entries = state.get("entries")
+        if not isinstance(raw_entries, dict):
+            raw_entries = {}
+        entries = {}
+        for pid_str, size in raw_entries.items():
+            try:
+                pid, size = int(pid_str), int(size)
+            except (TypeError, ValueError):
+                continue
+            if pid == os.getpid() or _pid_alive(pid):
+                entries[pid_str] = size
+        reserved = sum(entries.values())
+        available = psutil.virtual_memory().available - reserved
+        fits = requested_bytes <= available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if fits:
+            entries[str(os.getpid())] = requested_bytes
+            tmp_path = f"{NODE_HOST_MEMORY_BUDGET_FILE}.{os.getpid()}"
+            with open(tmp_path, "w") as f:
+                json.dump({"boot_id": boot_id, "entries": entries}, f)
+            os.replace(tmp_path, NODE_HOST_MEMORY_BUDGET_FILE)
+        return fits, available, reserved
+    except (OSError, TypeError, ValueError):
+        return None
+    finally:
+        os.close(lock_fd)
 
 
 def synchronized(func):
@@ -230,7 +310,30 @@ class HostKVCache(abc.ABC):
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        reservation = _reserve_node_host_memory(requested_bytes)
+        if reservation is None:
+            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+            reserved_by_peers = 0
+        else:
+            fits, available_bytes, reserved_by_peers = reservation
+            if not fits:
+                raise ValueError(
+                    f"Not enough host memory available. Requesting "
+                    f"{requested_bytes / 1e9:.2f} GB for this rank but only "
+                    f"have {available_bytes / 1e9:.2f} GB free on the node "
+                    f"({host_mem.available / 1e9:.2f} GB available, "
+                    f"{reserved_by_peers / 1e9:.2f} GB already claimed by other "
+                    f"local ranks, and "
+                    f"{HICACHE_HOST_MEMORY_RESERVE_BYTES / 1e9:.2f} GB kept for "
+                    f"the OS). Please reduce the size of the hierarchical cache."
+                )
+            if reserved_by_peers:
+                logger.info(
+                    "[hicache] node memory budget: %.2f GB left for this rank "
+                    "after %.2f GB claimed by other local ranks.",
+                    available_bytes / 1e9,
+                    reserved_by_peers / 1e9,
+                )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
