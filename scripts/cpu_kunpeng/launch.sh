@@ -87,6 +87,20 @@ case "$CMD" in
         ;;
 esac
 
+role_uses_mooncake() {
+    local _role="${1:-}" _inst="${2:-}" _sel
+    [[ "$_role" == "prefill" || "$_role" == "native" ]] || return 1
+    _sel="$(SKIP_CONDA=1 bash -c '
+        source "$1/env.sh" "$2" "$3" >/dev/null 2>&1
+        echo "${ENABLE_KUNPENG_HICACHE:-0}/${KUNPENG_HICACHE_BACKEND:-file}"' _ "$SCRIPT_DIR" "$_role" "$_inst")"
+    [[ "$_sel" == "1/mooncake" ]]
+}
+
+start_mooncake_store() {
+    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/stop_store.sh"
+    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_mooncake.sh"
+    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_store.sh"
+}
 
 bash "$SCRIPT_DIR/runtime/update_time.sh"
 if [[ "$ROLE" == "router" || "$ROLE" == "tokenizer" || "$ROLE" == "mooncake" || "$ROLE" == "store" ]]; then
@@ -121,23 +135,11 @@ elif [[ "$ROLE" == "all" ]]; then
         _entry="${_entry//[[:space:]]/}"
         [[ -z "$_entry" ]] && continue
         _role="${_entry%%_*}"
-        [[ "$_role" == "prefill" || "$_role" == "native" ]] || continue
         _inst=""
         [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
-        _hicache="$(SKIP_CONDA=1 bash -c "
-            source '$SCRIPT_DIR/env.sh' '$_role' '$_inst' >/dev/null 2>&1
-            echo \"\${ENABLE_KUNPENG_HICACHE:-0}\"")"
-        [[ "$_hicache" != "1" ]] && continue
-        _backend="$(SKIP_CONDA=1 bash -c "
-            source '$SCRIPT_DIR/env.sh' '$_role' '$_inst' >/dev/null 2>&1
-            echo \"\${KUNPENG_HICACHE_BACKEND:-file}\"")"
-        [[ "$_backend" == "mooncake" ]] && _start_mooncake=1
+        role_uses_mooncake "$_role" "$_inst" && _start_mooncake=1
     done
-    if [[ "$_start_mooncake" == "1" ]]; then
-        SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/stop_store.sh"
-        SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_mooncake.sh"
-        SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_store.sh"
-    fi
+    [[ "$_start_mooncake" == "1" ]] && start_mooncake_store
 
     for _entry in "${_INST_LIST[@]}"; do
         _entry="${_entry//[[:space:]]/}"
@@ -174,5 +176,6 @@ elif [[ "$ROLE" == "store" ]]; then
 
 else
     # prefill/decode/native
+    role_uses_mooncake "$ROLE" "$@" && start_mooncake_store
     bash "$SCRIPT_DIR/runtime/launch_cluster.sh" "$ROLE" "$@"
 fi
