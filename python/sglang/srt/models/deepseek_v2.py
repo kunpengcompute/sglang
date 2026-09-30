@@ -1345,20 +1345,19 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = None
         self.next_skip_topk = None
-        # GLM-5 (GlmMoeDsa) on kunpeng 920F: kv_b_proj / indexer.wk 为 bf16,
-        # kv_b 走 bgemm 吸收路径 (见 deepseek_weight_loader)
-        _glm5_920f = (
-            _is_cpu_920f
-            and bool(getattr(config, "architectures", None))
-            and config.architectures[0] == "GlmMoeDsaForCausalLM"
+        # GLM-5 (GlmMoeDsa): kv_b_proj / indexer.wk 为 bf16 (920F 上 kv_b 走
+        # bgemm 吸收路径, 见 deepseek_weight_loader); indexer 用 interleaved
+        # RoPE (DSV3.2 是 half-split) 且 HF config 无 indexer_rope_interleave
+        # 字段, 故默认 interleave. The MTP draft rewrites architectures[0] to
+        # DeepseekV3ForCausalLMNextN (ModelConfig._config_draft_model), so
+        # pre_nextn_architecture is checked to keep detecting the family.
+        _glm_moe_dsa = bool(getattr(config, "architectures", None)) and (
+            config.architectures[0] == "GlmMoeDsaForCausalLM"
+            or getattr(config, "pre_nextn_architecture", None)
+            == "GlmMoeDsaForCausalLM"
         )
+        _glm5_920f = _is_cpu_920f and _glm_moe_dsa
         if self.use_nsa:
-            # GlmMoeDsa: indexer 用 interleaved RoPE (DSV3.2 是 half-split),
-            # 且 HF config 无 indexer_rope_interleave 字段, 故默认 interleave.
-            _glm_moe_dsa = (
-                bool(getattr(config, "architectures", None))
-                and config.architectures[0] == "GlmMoeDsaForCausalLM"
-            )
             is_neox_style = not getattr(
                 config, "indexer_rope_interleave", _glm_moe_dsa
             )
