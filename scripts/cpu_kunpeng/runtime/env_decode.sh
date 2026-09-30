@@ -80,16 +80,6 @@ export DECODE_SWAP_KV_BLOCKWISE="${DECODE_SWAP_KV_BLOCKWISE:-0}"
 # ------------------------------------------------------------
 # Equivalent to MAX_SEQ_NUM / PP_SIZE in DeepSeek-V3-Sample (max_seq_num_per_mb):
 export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-64}"
-# Decode MTP: a verify micro-batch holds (root + speculative_num_steps
-# draft) tokens per sequence, so the per-sequence in-flight width is
-# speculative_num_steps + 1.
-if [[ -z "${SGLANG_KUNPENG_MAX_CUR_LEN:-}" ]]; then
-    if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
-        export SGLANG_KUNPENG_MAX_CUR_LEN=$(( ${SGLANG_SPECULATIVE_NUM_STEPS:-2} + 1 ))
-    else
-        export SGLANG_KUNPENG_MAX_CUR_LEN=1
-    fi
-fi
 
 # Per-server overrides (sourced after role defaults so they take priority).
 # With an instance (env.sh decode 128p -> INSTANCE=128p), ONLY the instance
@@ -107,3 +97,22 @@ elif [[ -f "$SCRIPT_DIR/runtime/.user_env_decode.sh" ]]; then
 else
     echo "WARNING: runtime/.user_env_decode.sh not found, using role defaults only" >&2
 fi
+
+# Decode MTP: a verify micro-batch holds (root + speculative_num_steps
+# draft) tokens per sequence, so the per-sequence in-flight width is
+# speculative_num_steps + 1.  Derived AFTER the instance file so an
+# instance-level SGLANG_SPECULATIVE_NUM_STEPS override is respected; an
+# explicit SGLANG_KUNPENG_MAX_CUR_LEN (here or in the instance file) wins.
+if [[ -z "${SGLANG_KUNPENG_MAX_CUR_LEN:-}" ]]; then
+    if [[ "$SGLANG_ENABLE_MTP" == "1" ]]; then
+        export SGLANG_KUNPENG_MAX_CUR_LEN=$(( ${SGLANG_SPECULATIVE_NUM_STEPS:-2} + 1 ))
+    else
+        export SGLANG_KUNPENG_MAX_CUR_LEN=1
+    fi
+fi
+
+# Kutacc fusedmoe multi-expert parallelism (worker pool split into G groups of
+# T threads running experts concurrently; T derived from the tiling entry).
+# Default off: bit-exact with the serial per-expert path.  Set AFTER the
+# instance file so an instance may enable it explicitly.
+export KUTACC_FUSEDMOE_MULTIEXPT="${KUTACC_FUSEDMOE_MULTIEXPT:-0}"
