@@ -95,9 +95,14 @@ def import_model_classes(package_name: str, strict: bool = False):
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
-            if (
-                envs.SGLANG_USE_CPU_920F.get()
-                and not "sglang.srt.models.deepseek" in name
+            if envs.SGLANG_USE_CPU_920F.get() and not any(
+                allowed in name
+                for allowed in (
+                    # DeepSeek family (incl. V3.2 DSA) plus the DSA GLM MoE
+                    # (GlmMoeDsaForCausalLM reuses the DeepseekV2 stack).
+                    "sglang.srt.models.deepseek",
+                    "sglang.srt.models.glm4_moe",
+                )
             ):
                 continue
             if name.split(".")[-1] in envs.SGLANG_DISABLED_MODEL_ARCHS.get():

@@ -20,6 +20,7 @@
 
 #include <arm_sve.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
@@ -43,6 +44,13 @@ void s8_s8_packed_gemm_bf16_dq_kunpeng(
     int64_t tile_m, int64_t tile_n, int64_t tile_k);
 std::tuple<int64_t, int64_t, int64_t> igemm_find_optimal_tiling_plan(
     int64_t M, int64_t N, int64_t K);
+
+// bf16 GEMM pipeline helpers for the unquantized-kv_b chain.
+void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r,
+                            int64_t split_c);
+void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight,
+                              at::Tensor output, at::Tensor workspace,
+                              int64_t num_threads);
 
 at::Tensor flash_mla_meta_create_kunpeng()
 {
@@ -116,14 +124,21 @@ int64_t flash_mla_dense_decode_sched_kunpeng(const at::Tensor &seqlens_kv, int64
 }
 
 int64_t flash_mla_sparse_decode_sched_kunpeng(const at::Tensor &topk_length, int64_t seqlen_q, int64_t num_heads_q,
-                                              int64_t head_dim, int64_t head_dim_v, c10::optional<at::Tensor> meta)
+                                              int64_t head_dim, int64_t head_dim_v, c10::optional<at::Tensor> meta,
+                                              int64_t topk, int64_t extra_topk, c10::optional<at::Tensor> extra_topk_length)
 {
     kutacc::Tensor<int, 1> kt_topk_length = to_kutacc<int, 1>(topk_length);
     kutacc::FlashMLAMetaHandle meta_handle = reinterpret_cast<kutacc::FlashMLAMetaHandle>(meta.value().item<int64_t>());
     int64_t extra_bytes_sizes = 0;
 
-    kutacc::flash_mla_sparse_decode_sched(kt_topk_length.size(0), seqlen_q, num_heads_q, head_dim, head_dim_v, 1, 0,
-                                          kt_topk_length, std::nullopt, extra_bytes_sizes, meta_handle);
+    std::optional<kutacc::Tensor<int, 1>> kt_extra_topk_length = std::nullopt;
+    if (extra_topk_length.has_value()) {
+        kt_extra_topk_length = to_kutacc<int, 1>(extra_topk_length.value());
+    }
+
+    kutacc::flash_mla_sparse_decode_sched(kt_topk_length.size(0), seqlen_q, num_heads_q, head_dim, head_dim_v, topk,
+                                          extra_topk, kt_topk_length, kt_extra_topk_length, extra_bytes_sizes,
+                                          meta_handle);
     return extra_bytes_sizes;
 }
 
@@ -192,7 +207,28 @@ at::Tensor build_block_table_kunpeng(const at::Tensor &req_to_token,
     return block_table;
 }
 
+// Sparse (DSA/NSA) MLA decode, full kutacc contract:
+//   q            [bs, s_q, h, d]           bf16 (s_q == 1 for decode steps)
+//   kvcache      [pages, page_size, d]     bf16 (paged latent cache; indices
+//                                           are FLAT slot rows)
+//   indices      [bs, s_q, topk]           int32 (selected slot ids)
+//   topk_length  [bs]                      int32 (valid prefix count per seq)
+//   extra_kvcache [rows/page, page, d]     bf16? (window/extra KV cache --
+//                                           e.g. the always-attended local
+//                                           window rows, flat-row indexed)
+//   extra_indices [bs, s_q, extra_topk]    int32? (rows into extra_kvcache)
+//   extra_topk_length [bs]                 int32? (valid prefix count)
+//   attn_sink    [h]                       fp32? (per-head attention sink
+//                                           logit, matching the sparse
+//                                           prefill op's semantics; absent
+//                                           = no sink term)
+//   o            [bs, s_q, h, d_v]         bf16 (direct-write output)
+//   softmax_lse  [bs, s_q, h]              fp32 (direct-write)
+// The main (indices) and extra (extra_indices) sets are attended as the
+// union with a shared online softmax.
 void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache, at::Tensor indices, at::Tensor topk_length,
+                                     c10::optional<at::Tensor> extra_kvcache, c10::optional<at::Tensor> extra_indices,
+                                     c10::optional<at::Tensor> extra_topk_length, c10::optional<at::Tensor> attn_sink,
                                      at::Tensor o, at::Tensor softmax_lse, double softmax_scale,
                                      at::Tensor extra_buffer, c10::optional<at::Tensor> meta)
 {
@@ -203,11 +239,28 @@ void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache, at::Tensor
     auto kt_o = to_kutacc<bfloat16_t, 4>(o);
     auto kt_softmax_lse = to_kutacc<float, 3>(softmax_lse);
 
+    std::optional<kutacc::Tensor<bfloat16_t, 3>> kt_extra_kvcache = std::nullopt;
+    std::optional<kutacc::Tensor<int, 3>> kt_extra_indices = std::nullopt;
+    std::optional<kutacc::Tensor<int, 1>> kt_extra_topk_length = std::nullopt;
+    std::optional<kutacc::Tensor<float, 1>> kt_attn_sink = std::nullopt;
+    if (extra_kvcache.has_value()) {
+        kt_extra_kvcache = to_kutacc<bfloat16_t, 3>(extra_kvcache.value());
+    }
+    if (extra_indices.has_value()) {
+        kt_extra_indices = to_kutacc<int, 3>(extra_indices.value());
+    }
+    if (extra_topk_length.has_value()) {
+        kt_extra_topk_length = to_kutacc<int, 1>(extra_topk_length.value());
+    }
+    if (attn_sink.has_value()) {
+        kt_attn_sink = to_kutacc<float, 1>(attn_sink.value());
+    }
+
     void *extra_ptr = extra_buffer.data_ptr();
     kutacc::FlashMLAMetaHandle meta_handle = reinterpret_cast<kutacc::FlashMLAMetaHandle>(meta.value().item<int64_t>());
 
-    kutacc::flash_mla_sparse_decode(kt_q, kt_kcache, kt_indices, kt_topk_length, std::nullopt, std::nullopt,
-                                    std::nullopt, std::nullopt, kt_o, kt_softmax_lse,
+    kutacc::flash_mla_sparse_decode(kt_q, kt_kcache, kt_indices, kt_topk_length, kt_extra_kvcache, kt_extra_indices,
+                                    kt_extra_topk_length, kt_attn_sink, kt_o, kt_softmax_lse,
                                     static_cast<float>(softmax_scale), extra_ptr, meta_handle);
 }
 
@@ -219,6 +272,219 @@ std::tuple<int64_t, int64_t> get_flash_attention_block_kunpeng()
 int64_t get_flash_attention_thread_num()
 {
     return kutacc::get_thread_num();
+}
+
+// ---------------------------------------------------------------------------
+// DSA (NSA) decode index transform: indexer top-k token positions -> flat
+// KV-cache slot ids for the sparse flash MLA kernel.
+//
+// The sparse kernel attends flat slot rows of the paged KV cache; the indexer
+// emits per-sequence token positions (< seq_len, -1 = invalid padding). The
+// mapping goes through the page-granular block_table:
+//   slot = block_table[b, pos / page_size] * page_size + pos % page_size
+// Valid entries are COMPACTED to the row prefix (the kernel only reads the
+// first topk_length entries of each row); the tail is filled with -1, so the
+// indexer's padding convention (leading prefix vs. interleaved) is
+// irrelevant.
+//
+// block_table  [bs, max_blocks] int32/int64 (page indices; this rank's batch
+//              slice -- after the decode all2all the backend owns Btp rows)
+// topk_indices [B_full, (1,) topk] int32/int64 (token positions; the FULL
+//              batch -- row_start selects this rank's rows)
+// seq_lens     [bs] int32/int64 (this rank's batch slice)
+// Returns (slots [bs, 1, topk] int32 (-1 tail for invalid entries),
+//          topk_length [bs] int32 = valid count per row).
+// ---------------------------------------------------------------------------
+// Direct-write form: slots/topk_length are caller-allocated outputs (the
+// graph engine passes registered output tensors as trailing tensor args and
+// discards return values, so output-returning ops cannot be replayed).
+// NOTE: tensor args are passed BY VALUE (const-ref also works) -- the graph
+// dispatch extracts tensors as temporaries, which cannot bind to non-const
+// lvalue references.
+void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &topk_indices,
+                            const at::Tensor &seq_lens, int64_t page_size, int64_t row_start,
+                            at::Tensor slots, at::Tensor topk_length)
+{
+    TORCH_CHECK(block_table.dim() == 2 && block_table.scalar_type() == at::kInt &&
+                    block_table.is_contiguous(),
+                "block_table must be contiguous [bs, max_blocks] int32");
+    TORCH_CHECK(topk_indices.scalar_type() == at::kInt || topk_indices.scalar_type() == at::kLong,
+                "topk_indices must be int32 or int64, got ", topk_indices.scalar_type());
+    TORCH_CHECK(topk_indices.dim() == 2 || topk_indices.dim() == 3,
+                "topk_indices must be [B, topk] or [B, 1, topk], got ", topk_indices.sizes());
+    TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous(),
+                "seq_lens must be contiguous [bs]");
+    TORCH_CHECK(page_size > 0, "page_size must be positive");
+
+    const int64_t bs = block_table.size(0);
+    const int64_t max_blocks = block_table.size(1);
+    int64_t b_full, topk;
+    if (topk_indices.dim() == 3) {
+        TORCH_CHECK(topk_indices.size(1) == 1, "topk_indices dim1 must be 1, got ",
+                    topk_indices.sizes());
+        b_full = topk_indices.size(0);
+        topk = topk_indices.size(2);
+    } else {
+        b_full = topk_indices.size(0);
+        topk = topk_indices.size(1);
+    }
+    TORCH_CHECK(row_start >= 0 && row_start + bs <= b_full, "row_start ", row_start, " + bs ", bs,
+                " exceeds topk_indices rows ", b_full);
+    TORCH_CHECK(seq_lens.size(0) == bs, "seq_lens size ", seq_lens.size(0),
+                " != block_table batch ", bs);
+    TORCH_CHECK(slots.dim() == 3 && slots.scalar_type() == at::kInt &&
+                    slots.size(0) == bs && slots.size(1) == 1 && slots.size(2) == topk,
+                "slots must be [bs, 1, topk] int32, got ", slots.sizes());
+    TORCH_CHECK(topk_length.dim() == 1 && topk_length.scalar_type() == at::kInt &&
+                    topk_length.size(0) == bs,
+                "topk_length must be [bs] int32, got ", topk_length.sizes());
+
+    if (bs > 0 && topk == 0)
+        topk_length.zero_();
+
+    const bool tk_long = topk_indices.scalar_type() == at::kLong;
+    const bool sl_long = seq_lens.scalar_type() == at::kLong;
+    const int64_t tk_s0 = topk_indices.stride(0);
+    const int64_t tk_slast = topk_indices.stride(-1);
+    TORCH_CHECK(tk_slast == 1 || topk == 1, "topk_indices last dim must be contiguous");
+
+    const int32_t *bt = block_table.data_ptr<int32_t>();
+    const int32_t *sl32 = sl_long ? nullptr : seq_lens.data_ptr<int32_t>();
+    const int64_t *sl64 = sl_long ? seq_lens.data_ptr<int64_t>() : nullptr;
+    const int32_t *tk32 = tk_long ? nullptr : topk_indices.data_ptr<int32_t>();
+    const int64_t *tk64 = tk_long ? topk_indices.data_ptr<int64_t>() : nullptr;
+    int32_t *slots_p = slots.data_ptr<int32_t>();
+    int32_t *len_p = topk_length.data_ptr<int32_t>();
+
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        for (int64_t b = start; b < end; ++b) {
+            const int64_t seq_len = sl_long ? sl64[b] : (int64_t)sl32[b];
+            const int64_t row_base = (row_start + b) * tk_s0;
+            int32_t *row = slots_p + b * topk;
+            int32_t valid = 0;
+            for (int64_t i = 0; i < topk; ++i) {
+                const int64_t pos = tk_long ? tk64[row_base + i * tk_slast]
+                                            : (int64_t)tk32[row_base + i * tk_slast];
+                if (pos < 0 || pos >= seq_len)
+                    continue;
+                const int64_t page = pos / page_size;
+                if (page >= max_blocks)
+                    continue;
+                row[valid++] = bt[b * max_blocks + page] * (int32_t)page_size +
+                               (int32_t)(pos % page_size);
+            }
+            for (int64_t i = valid; i < topk; ++i)
+                row[i] = -1;
+            len_p[b] = valid;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Fake indexer for 920F DSA bring-up. With total context <= index_topk every
+// token is selected, so the indexer's top-k degenerates to emitting ALL token
+// positions: row b = [0, 1, ..., seq_len_b-1, -1, -1, ...] (padded to topk).
+// Under that regime the sparse decode path is exactly equivalent to dense
+// attention. The Python-side Indexer.forward_cpu guard enforces
+// seq_len <= topk (the fake would silently select the wrong tokens beyond).
+//
+// seq_lens [B] int32/int64 (this step's full batch; persistent graph input)
+// indices [B, topk] int32 (direct-write output) -- the same contract as the
+// real indexer's decode output ([q_rows, topk], valid prefix, -1 padding),
+// consumed by dsa_topk_slots_kunpeng.
+// ---------------------------------------------------------------------------
+void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices)
+{
+    TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous(),
+                "seq_lens must be contiguous [B]");
+    TORCH_CHECK(seq_lens.scalar_type() == at::kInt || seq_lens.scalar_type() == at::kLong,
+                "seq_lens must be int32 or int64");
+    TORCH_CHECK(topk > 0, "topk must be positive");
+    TORCH_CHECK(indices.dim() == 2 && indices.scalar_type() == at::kInt &&
+                    indices.size(0) == seq_lens.size(0) && indices.size(1) == topk,
+                "indices must be [B, topk] int32, got ", indices.sizes());
+
+    const int64_t bs = seq_lens.size(0);
+    if (bs == 0)
+        return;
+
+    const bool sl_long = seq_lens.scalar_type() == at::kLong;
+    const int32_t *sl32 = sl_long ? nullptr : seq_lens.data_ptr<int32_t>();
+    const int64_t *sl64 = sl_long ? seq_lens.data_ptr<int64_t>() : nullptr;
+    int32_t *out = indices.data_ptr<int32_t>();
+
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        for (int64_t b = start; b < end; ++b) {
+            const int64_t seq_len = sl_long ? sl64[b] : (int64_t)sl32[b];
+            int32_t *row = out + b * topk;
+            int64_t i = 0;
+            for (; i < topk && i < seq_len; ++i)
+                row[i] = (int32_t)i;
+            for (; i < topk; ++i)
+                row[i] = -1;
+        }
+    });
+}
+
+// Extend (prefill) variant of the fake indexer above: per-QUERY-ROW causal
+// prefix [0, min(prefix+t+1, topk)) (-1 padded; query row t of seq b sits at
+// in-sequence position prefix_b + t). Consumed by
+// flash_attention_sparse_prefill_kunpeng (in-sequence positions); exact
+// while seq_len <= topk (guarded on the Python side).
+//
+// extend_seq_lens/prefix_lens [bs] int32; indices [max_rows, topk] int32
+// direct-write (only the leading sum(extend) rows are written).
+void fake_indexer_topk_rows_kunpeng(const at::Tensor &extend_seq_lens, const at::Tensor &prefix_lens,
+                                    int64_t topk, at::Tensor indices)
+{
+    TORCH_CHECK(extend_seq_lens.dim() == 1 && extend_seq_lens.is_contiguous() &&
+                    extend_seq_lens.scalar_type() == at::kInt,
+                "extend_seq_lens must be contiguous [bs] int32");
+    TORCH_CHECK(prefix_lens.dim() == 1 && prefix_lens.is_contiguous() &&
+                    prefix_lens.scalar_type() == at::kInt &&
+                    prefix_lens.size(0) == extend_seq_lens.size(0),
+                "prefix_lens must be contiguous [bs] int32 matching extend_seq_lens");
+    TORCH_CHECK(topk > 0, "topk must be positive");
+    TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous() && indices.scalar_type() == at::kInt,
+                "indices must be contiguous [max_rows, topk] int32, got ", indices.sizes());
+    TORCH_CHECK(indices.size(1) >= topk, "indices width (", indices.size(1),
+                ") must be >= topk (", topk, ")");
+
+    const int64_t bs = extend_seq_lens.size(0);
+    if (bs == 0)
+        return;
+
+    const int32_t *ext = extend_seq_lens.data_ptr<int32_t>();
+    const int32_t *pfx = prefix_lens.data_ptr<int32_t>();
+    int32_t *out = indices.data_ptr<int32_t>();
+    const int64_t width = indices.size(1);
+
+    int64_t live = 0;
+    for (int64_t b = 0; b < bs; ++b)
+        live += ext[b];
+    TORCH_CHECK(live <= indices.size(0), "live query rows (", live,
+                ") exceed the indices buffer (", indices.size(0), " rows)");
+
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        // Each worker covers a contiguous sequence range; recompute the row
+        // offset of its first sequence (bs is small, the prefix sum is
+        // negligible).
+        int64_t row = 0;
+        for (int64_t i = 0; i < start; ++i)
+            row += ext[i];
+        for (int64_t b = start; b < end; ++b) {
+            const int64_t pos_base = pfx[b];
+            for (int64_t t = 0; t < ext[b]; ++t, ++row) {
+                const int64_t valid = std::min(pos_base + t + 1, topk);
+                int32_t *r = out + row * width;
+                int64_t i = 0;
+                for (; i < valid; ++i)
+                    r[i] = (int32_t)i;
+                for (; i < width; ++i)
+                    r[i] = -1;
+            }
+        }
+    });
 }
 
 void flash_attention_k_block_pack_kunpeng(int64_t kv_len, int64_t num_heads, int64_t qk_head_dim, int64_t output_len,
@@ -293,6 +559,59 @@ void varlen_attention_kunpeng(at::Tensor q,    // [total_q_tokens, num_heads, qk
     auto kt_key_start_loc = to_kutacc<int, 1>(key_start_loc);
 
     kutacc::varlen_attention(kt_q, kt_k, kt_v, kt_out, causal, softmax_scale, kt_query_start_loc, kt_key_start_loc);
+}
+
+// DSA (NSA) sparse prefill attention: kutacc::flash_attention_sparse_prefill
+// thin wrapper. MHA formulation over pre-packed per-head K/V rows; each query
+// row attends only its indexed in-sequence positions (indexer output), with
+// kernel-side causal masking and an optional per-head attention sink.
+// out/lse direct-write.
+//
+//   q [total_q, H, d] / k [total_kv, H, d] / v [total_kv, H, d_v] bf16
+//   indices [total_q, topk] int32 (in-sequence positions, -1 pad)
+//   topk_length? [total_q] int32; out [total_q, H, d_v] bf16; lse? [total_q, H] fp32
+//   workspace uint8 >= ..._workspace_size_kunpeng(d_v)
+//   query_start_loc [bs+1] (cum extend) / key_start_loc [bs+1] (cum prefix+extend)
+//   attn_sink? [H] fp32
+int64_t flash_attention_sparse_prefill_workspace_size_kunpeng(int64_t vo_head_dim)
+{
+    return kutacc::get_flash_attention_sparse_prefill_workspace_size(vo_head_dim);
+}
+
+void flash_attention_sparse_prefill_kunpeng(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor indices,
+                                            c10::optional<at::Tensor> topk_length, at::Tensor out,
+                                            c10::optional<at::Tensor> lse, at::Tensor workspace, bool causal,
+                                            double softmax_scale, at::Tensor query_start_loc,
+                                            at::Tensor key_start_loc, c10::optional<at::Tensor> attn_sink)
+{
+    auto kt_q = to_kutacc<bfloat16_t, 3>(q);
+    auto kt_k = to_kutacc<bfloat16_t, 3>(k);
+    auto kt_v = to_kutacc<bfloat16_t, 3>(v);
+    auto kt_indices = to_kutacc<int, 2>(indices);
+    auto kt_out = to_kutacc<bfloat16_t, 3>(out);
+    auto kt_workspace = to_kutacc<uint8_t, 1>(workspace);
+
+    auto kt_query_start_loc = to_kutacc<int, 1>(query_start_loc);
+    auto kt_key_start_loc = to_kutacc<int, 1>(key_start_loc);
+
+    std::optional<kutacc::Tensor<int, 1>> kt_topk_length = std::nullopt;
+    std::optional<kutacc::Tensor<float, 2>> kt_lse = std::nullopt;
+    std::optional<kutacc::Tensor<float, 1>> kt_attn_sink = std::nullopt;
+    if (topk_length.has_value()) {
+        kt_topk_length = to_kutacc<int, 1>(topk_length.value());
+    }
+    if (lse.has_value()) {
+        kt_lse = to_kutacc<float, 2>(lse.value());
+    }
+    if (attn_sink.has_value()) {
+        kt_attn_sink = to_kutacc<float, 1>(attn_sink.value());
+    }
+
+    // Default schedule (token-balanced); output_coord is ignored here.
+    kutacc::attention_schedule schedule;
+    kutacc::flash_attention_sparse_prefill(kt_q, kt_k, kt_v, kt_indices, kt_topk_length, kt_out, kt_lse,
+                                            kt_workspace, causal, softmax_scale, kt_query_start_loc,
+                                            kt_key_start_loc, kt_attn_sink, schedule);
 }
 
 // Gather the paged MLA latent cache via block_table and split each row into
@@ -645,6 +964,45 @@ void contiguous_rows_kunpeng(
     if (live == 0)
         return;
     out.narrow(0, 0, live).copy_(x.narrow(0, 0, live));
+}
+
+// bf16 (bgemm) counterparts of the pack/gemm rows pair above, for the
+// GLM-5 unquantized-kv_b chunked-prefill chain. Same live-bounded contract;
+// the row extent is 64-aligned (the bgemm kernels want M % 64 == 0) and
+// clamped to the max-sized buffer. Pack and GEMM derive the same extent from
+// the same lens, and the {N,K}-keyed bgemm tiling plan ignores M, so the
+// capture-time split_c matches the plan re-derived inside the GEMM.
+static inline int64_t bf16_rows_m(int64_t live, int64_t cap)
+{
+    TORCH_CHECK(cap % 64 == 0, "bf16 rows ops require 64-aligned max-sized "
+                "buffers (check SGLANG_KUNPENG_MAX_SEQ_LEN)");
+    return std::min((live + 63) / 64 * 64, cap);
+}
+
+void bf16_gemm_pack_rows_kunpeng(
+    at::Tensor input, at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor out, int64_t split_c)
+{
+    int64_t live = rows_live_total(extend_seq_lens, prefix_lens, input.size(0));
+    if (live == 0)
+        return;
+    int64_t m = bf16_rows_m(live, input.size(0));
+    bf16_gemm_pack_kunpeng(input.narrow(0, 0, m), out.narrow(0, 0, m),
+                           m, split_c);
+}
+
+void bf16_packed_gemm_rows_kunpeng(
+    at::Tensor input, at::Tensor weight, at::Tensor workspace,
+    at::Tensor extend_seq_lens, at::Tensor prefix_lens,
+    at::Tensor output)
+{
+    int64_t live = rows_live_total(extend_seq_lens, prefix_lens, input.size(0));
+    if (live == 0)
+        return;
+    int64_t m = bf16_rows_m(live, input.size(0));
+    bf16_packed_gemm_kunpeng(input.narrow(0, 0, m), weight,
+                             output.narrow(0, 0, m), workspace,
+                             kutacc::get_thread_num());
 }
 
 

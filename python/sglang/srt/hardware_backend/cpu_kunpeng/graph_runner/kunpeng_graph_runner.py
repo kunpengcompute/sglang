@@ -557,6 +557,15 @@ class KunpengGraphRunner:
             inputs.extend(
                 [forward_batch.out_cache_loc, attn_backend._decode_meta]
             )
+            if getattr(attn_backend, "_nsa_enabled", False):
+                # DSA: full-batch seq lens consumed by the (fake) CPU indexer
+                # graph op. Register the SAME view the op consumes (the
+                # leading [:B] rows, B = FULL batch incl. graph padding --
+                # NOT the all2all-sliced meta.seq_lens row count; bs is
+                # fixed per capture).
+                inputs.append(
+                    meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
+                )
             if getattr(attn_backend, "_lc_enabled", False):
                 # Long-context decode CP: per-step sparse-attention metadata
                 # (local KV indices + per-sequence counts) consumed by the

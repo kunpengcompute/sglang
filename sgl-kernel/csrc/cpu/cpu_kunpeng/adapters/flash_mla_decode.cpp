@@ -49,29 +49,41 @@ static KernelRegistrar _r_flash_mla_dense_decode(
                     &flash_mla_dense_decode_graph>);
 
 // Long-context decode CP: sparse paged MLA over the rank's local KV shard.
-// The kernel's c10::optional<at::Tensor> meta is exposed as a plain tensor
-// in the graph dispatch signature (the graph engine does not handle
-// optional-tensor argument types).
+// The kernel's c10::optional<at::Tensor> arguments (extra_kvcache,
+// extra_indices, extra_topk_length, attn_sink, meta) are exposed as plain
+// at::Tensor in the graph dispatch signature (the graph engine does not
+// handle optional-tensor argument types): the Python side passes None for
+// unused optional positions, capture registers them as undefined views, and
+// replay hands them to this function as undefined tensors, which we convert
+// back to c10::nullopt.
 //
 // The dispatch signature MUST match the Python call order exactly (graph
 // dispatch extracts tensors/scalars by type, in positional order): o and
 // softmax_lse are the persistent SHM region views passed IN as outputs, so
 // there is exactly ONE scalar (softmax_scale) and no head_dim_v argument.
-void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache,
-                                     at::Tensor indices, at::Tensor topk_length,
-                                     at::Tensor o, at::Tensor softmax_lse,
-                                     double softmax_scale, at::Tensor extra_buffer,
-                                     c10::optional<at::Tensor> meta);
+void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache, at::Tensor indices, at::Tensor topk_length,
+                                     c10::optional<at::Tensor> extra_kvcache, c10::optional<at::Tensor> extra_indices,
+                                     c10::optional<at::Tensor> extra_topk_length, c10::optional<at::Tensor> attn_sink,
+                                     at::Tensor o, at::Tensor softmax_lse, double softmax_scale,
+                                     at::Tensor extra_buffer, c10::optional<at::Tensor> meta);
 
 void flash_mla_sparse_decode_graph(at::Tensor q, at::Tensor kcache,
                                    at::Tensor indices, at::Tensor topk_length,
+                                   at::Tensor extra_kvcache, at::Tensor extra_indices,
+                                   at::Tensor extra_topk_length, at::Tensor attn_sink,
                                    at::Tensor o, at::Tensor softmax_lse,
                                    double softmax_scale,
                                    at::Tensor extra_buffer, at::Tensor meta)
 {
+    auto opt = [](const at::Tensor &t) -> c10::optional<at::Tensor> {
+        return t.defined() ? c10::optional<at::Tensor>(t) : c10::nullopt;
+    };
     flash_mla_sparse_decode_kunpeng(
-        q, kcache, indices, topk_length, o, softmax_lse,
-        softmax_scale, extra_buffer, meta);
+        q, kcache, indices, topk_length,
+        opt(extra_kvcache), opt(extra_indices), opt(extra_topk_length), opt(attn_sink),
+        o, softmax_lse,
+        softmax_scale,
+        extra_buffer, opt(meta));
 }
 
 static KernelRegistrar _r_flash_mla_sparse_decode(

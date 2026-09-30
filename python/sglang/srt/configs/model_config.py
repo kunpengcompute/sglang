@@ -341,6 +341,12 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
+        # Keep the pre-remap architecture reachable: model code keyed on the
+        # base family (e.g. GLM-5 DSA's bf16 kv_b_proj / interleaved indexer
+        # RoPE) must still detect it after the NextN rewrite below.
+        if is_draft_model:
+            self.hf_config.pre_nextn_architecture = self.hf_config.architectures[0]
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
             "GlmMoeDsaForCausalLM",

@@ -42,7 +42,8 @@ for i in "${!NODES[@]}"; do
     node="${NODES[i]}"
 
     ssh "$node" '
-        MAIN_PIDS=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
+        PAT="sglang[.]launch_server|sglang[_]server|sglang[:]:"
+        MAIN_PIDS=$(ps aux | grep -E "$PAT" | grep -v grep | awk "{print \$2}")
 
         if [ -n "$MAIN_PIDS" ]; then
             echo "Found SGLang processes on '"$node"'"
@@ -53,7 +54,7 @@ for i in "${!NODES[@]}"; do
 
             sleep 15
 
-            REMAINING=$(ps aux | grep sglang | grep -v grep | awk "{print \$2}")
+            REMAINING=$(ps aux | grep -E "$PAT" | grep -v grep | awk "{print \$2}")
             if [ -n "$REMAINING" ]; then
                 echo "Processes still running on '"$node"'. Sending SIGKILL..."
                 for pid in $REMAINING; do
