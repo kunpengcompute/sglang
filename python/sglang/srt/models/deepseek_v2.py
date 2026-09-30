@@ -1632,7 +1632,8 @@ class DeepseekV2AttentionMLA(
             )
         elif attn_forward_method == AttnForwardMethod.MHA_KUNPENG:
             inner_state = self.forward_normal_prepare_kunpeng(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, hidden_states, forward_batch, zero_allocator,
+                prev_topk_indices,
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(

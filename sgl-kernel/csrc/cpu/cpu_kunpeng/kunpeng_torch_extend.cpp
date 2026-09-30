@@ -117,6 +117,15 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
                             at::Tensor slots, at::Tensor topk_length);
 
 void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices);
+void fake_indexer_topk_rows_kunpeng(const at::Tensor &extend_seq_lens, const at::Tensor &prefix_lens,
+                                    int64_t topk, at::Tensor indices);
+
+int64_t flash_attention_sparse_prefill_workspace_size_kunpeng(int64_t vo_head_dim);
+void flash_attention_sparse_prefill_kunpeng(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor indices,
+                                            c10::optional<at::Tensor> topk_length, at::Tensor out,
+                                            c10::optional<at::Tensor> lse, at::Tensor workspace, bool causal,
+                                            double softmax_scale, at::Tensor query_start_loc,
+                                            at::Tensor key_start_loc, c10::optional<at::Tensor> attn_sink);
 void bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output);
 
 at::Tensor bgemm_prepack_kunpeng(const at::Tensor &weight, int64_t batch_size);
@@ -661,6 +670,27 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "fake_indexer_topk_kunpeng(Tensor seq_lens, int topk, "
         "Tensor(a!) indices) -> ()");
     m.impl("fake_indexer_topk_kunpeng", fake_indexer_topk_kunpeng);
+
+    // Fake indexer, extend (prefill) variant: per-query-row causal-prefix
+    // in-sequence positions. Direct-write output.
+    m.def(
+        "fake_indexer_topk_rows_kunpeng(Tensor extend_seq_lens, Tensor prefix_lens, "
+        "int topk, Tensor(a!) indices) -> ()");
+    m.impl("fake_indexer_topk_rows_kunpeng", fake_indexer_topk_rows_kunpeng);
+
+    // DSA (NSA) sparse prefill attention (see kunpeng_attention.cpp for the
+    // contract). Direct-write out/lse.
+    m.def(
+        "flash_attention_sparse_prefill_workspace_size_kunpeng(int vo_head_dim) -> int");
+    m.impl("flash_attention_sparse_prefill_workspace_size_kunpeng",
+           flash_attention_sparse_prefill_workspace_size_kunpeng);
+
+    m.def(
+        "flash_attention_sparse_prefill_kunpeng(Tensor q, Tensor k, Tensor v, "
+        "Tensor indices, Tensor? topk_length, Tensor(a!) out, Tensor? lse, "
+        "Tensor workspace, bool causal, float softmax_scale, "
+        "Tensor query_start_loc, Tensor key_start_loc, Tensor? attn_sink) -> ()");
+    m.impl("flash_attention_sparse_prefill_kunpeng", flash_attention_sparse_prefill_kunpeng);
 
     // Simple bf16 batched GEMM (naive fp32 accumulation, no SME packed
     // kernels) for the bf16 kv_b_proj MLA absorb path (e.g. GLM-5).

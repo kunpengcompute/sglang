@@ -19,9 +19,24 @@
 #include <cstdint>
 
 void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices);
+void fake_indexer_topk_rows_kunpeng(const at::Tensor &extend_seq_lens, const at::Tensor &prefix_lens,
+                                    int64_t topk, at::Tensor indices);
 
 // 直写式: 张量序 = [seq_lens (输入), indices (输出)], 标量 = [topk],
 // 与 Python GraphOp 调用序一致, 直接注册原函数.
 static KernelRegistrar _r_fake_indexer(
     "fake_indexer_topk_kunpeng",
     make_dispatch_v<decltype(&fake_indexer_topk_kunpeng), &fake_indexer_topk_kunpeng>);
+
+// Extend (prefill) 变体: 标量序 = [topk, max_rows] -- max_rows 只用于
+// shape_infer 的持久输出高度, 内核不使用.
+void fake_indexer_topk_rows_graph(const at::Tensor &extend_seq_lens, const at::Tensor &prefix_lens,
+                                  int64_t topk, int64_t max_rows, at::Tensor indices)
+{
+    (void)max_rows;
+    fake_indexer_topk_rows_kunpeng(extend_seq_lens, prefix_lens, topk, indices);
+}
+
+static KernelRegistrar _r_fake_indexer_rows(
+    "fake_indexer_topk_rows_kunpeng",
+    make_dispatch_v<decltype(&fake_indexer_topk_rows_graph), &fake_indexer_topk_rows_graph>);

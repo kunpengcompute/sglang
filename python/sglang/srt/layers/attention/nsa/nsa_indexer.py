@@ -1077,16 +1077,17 @@ class Indexer(MultiPlatformOp):
         indexer implementation (the bring-up fake) for now.
 
         The fake: with the bring-up regime (total context <= index_topk)
-        every token is selected, so the top-k selection degenerates to
-        emitting ALL token positions [0, seq_len) per sequence (-1 padded to
-        topk) -- under that regime the sparse decode path is exactly
-        equivalent to dense attention.
+        every token is selected, so the sparse decode and sparse prefill
+        paths are exactly equivalent to dense attention.
+
+        Decode: ALL positions [0, seq_len) per sequence (-1 padded to topk).
+        Plain EXTEND: per-query-row causal prefix [0, prefix+t] (-1 padded).
 
         Raises when any sequence exceeds index_topk (beyond it the fake
         would select the wrong tokens; needs the real indexer) or on a
         non-920F CPU (no indexer implementation).
 
-        Output contract matches the CUDA decode path: [q_rows, topk] int32,
+        Output contract matches the CUDA paths: [q_rows, topk] int32,
         valid entries form the leading prefix, -1 padding.
         """
         if not is_cpu_920f():
@@ -1107,7 +1108,21 @@ class Indexer(MultiPlatformOp):
         from sglang.srt.graph import ops as kunpeng
 
         backend = forward_batch.attn_backend
-        # Full-batch persistent seq lens (graph input; see
+
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            # Plain EXTEND (the MHA_KUNPENG dispatch): per-query-row causal
+            # prefix, consumed by flash_attention_sparse_prefill_kunpeng.
+            prefix_lens = forward_batch.extend_prefix_lens
+            if prefix_lens is None:
+                prefix_lens = torch.zeros_like(forward_batch.extend_seq_lens)
+            return kunpeng.fake_indexer_topk_rows_kunpeng(
+                forward_batch.extend_seq_lens,
+                prefix_lens,
+                self.index_topk,
+                envs.SGLANG_KUNPENG_MAX_SEQ_LEN.get(),
+            )
+
+        # Decode: full-batch persistent seq lens (graph input; see
         # KunpengCpuBackend._init_decode_metadata). q_lora rows == batch
         # rows for decode steps.
         seq_lens = backend.forward_metadata.full_seq_lens[: q_lora.shape[0]]

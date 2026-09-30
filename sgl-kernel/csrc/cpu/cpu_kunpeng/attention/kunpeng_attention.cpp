@@ -20,6 +20,7 @@
 
 #include <arm_sve.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
@@ -425,6 +426,67 @@ void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Ten
     });
 }
 
+// Extend (prefill) variant of the fake indexer above: per-QUERY-ROW causal
+// prefix [0, min(prefix+t+1, topk)) (-1 padded; query row t of seq b sits at
+// in-sequence position prefix_b + t). Consumed by
+// flash_attention_sparse_prefill_kunpeng (in-sequence positions); exact
+// while seq_len <= topk (guarded on the Python side).
+//
+// extend_seq_lens/prefix_lens [bs] int32; indices [max_rows, topk] int32
+// direct-write (only the leading sum(extend) rows are written).
+void fake_indexer_topk_rows_kunpeng(const at::Tensor &extend_seq_lens, const at::Tensor &prefix_lens,
+                                    int64_t topk, at::Tensor indices)
+{
+    TORCH_CHECK(extend_seq_lens.dim() == 1 && extend_seq_lens.is_contiguous() &&
+                    extend_seq_lens.scalar_type() == at::kInt,
+                "extend_seq_lens must be contiguous [bs] int32");
+    TORCH_CHECK(prefix_lens.dim() == 1 && prefix_lens.is_contiguous() &&
+                    prefix_lens.scalar_type() == at::kInt &&
+                    prefix_lens.size(0) == extend_seq_lens.size(0),
+                "prefix_lens must be contiguous [bs] int32 matching extend_seq_lens");
+    TORCH_CHECK(topk > 0, "topk must be positive");
+    TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous() && indices.scalar_type() == at::kInt,
+                "indices must be contiguous [max_rows, topk] int32, got ", indices.sizes());
+    TORCH_CHECK(indices.size(1) >= topk, "indices width (", indices.size(1),
+                ") must be >= topk (", topk, ")");
+
+    const int64_t bs = extend_seq_lens.size(0);
+    if (bs == 0)
+        return;
+
+    const int32_t *ext = extend_seq_lens.data_ptr<int32_t>();
+    const int32_t *pfx = prefix_lens.data_ptr<int32_t>();
+    int32_t *out = indices.data_ptr<int32_t>();
+    const int64_t width = indices.size(1);
+
+    int64_t live = 0;
+    for (int64_t b = 0; b < bs; ++b)
+        live += ext[b];
+    TORCH_CHECK(live <= indices.size(0), "live query rows (", live,
+                ") exceed the indices buffer (", indices.size(0), " rows)");
+
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        // Each worker covers a contiguous sequence range; recompute the row
+        // offset of its first sequence (bs is small, the prefix sum is
+        // negligible).
+        int64_t row = 0;
+        for (int64_t i = 0; i < start; ++i)
+            row += ext[i];
+        for (int64_t b = start; b < end; ++b) {
+            const int64_t pos_base = pfx[b];
+            for (int64_t t = 0; t < ext[b]; ++t, ++row) {
+                const int64_t valid = std::min(pos_base + t + 1, topk);
+                int32_t *r = out + row * width;
+                int64_t i = 0;
+                for (; i < valid; ++i)
+                    r[i] = (int32_t)i;
+                for (; i < width; ++i)
+                    r[i] = -1;
+            }
+        }
+    });
+}
+
 void flash_attention_k_block_pack_kunpeng(int64_t kv_len, int64_t num_heads, int64_t qk_head_dim, int64_t output_len,
                                           int64_t input_stride0, int64_t input_stride1, at::Tensor input,
                                           at::Tensor output)
@@ -497,6 +559,59 @@ void varlen_attention_kunpeng(at::Tensor q,    // [total_q_tokens, num_heads, qk
     auto kt_key_start_loc = to_kutacc<int, 1>(key_start_loc);
 
     kutacc::varlen_attention(kt_q, kt_k, kt_v, kt_out, causal, softmax_scale, kt_query_start_loc, kt_key_start_loc);
+}
+
+// DSA (NSA) sparse prefill attention: kutacc::flash_attention_sparse_prefill
+// thin wrapper. MHA formulation over pre-packed per-head K/V rows; each query
+// row attends only its indexed in-sequence positions (indexer output), with
+// kernel-side causal masking and an optional per-head attention sink.
+// out/lse direct-write.
+//
+//   q [total_q, H, d] / k [total_kv, H, d] / v [total_kv, H, d_v] bf16
+//   indices [total_q, topk] int32 (in-sequence positions, -1 pad)
+//   topk_length? [total_q] int32; out [total_q, H, d_v] bf16; lse? [total_q, H] fp32
+//   workspace uint8 >= ..._workspace_size_kunpeng(d_v)
+//   query_start_loc [bs+1] (cum extend) / key_start_loc [bs+1] (cum prefix+extend)
+//   attn_sink? [H] fp32
+int64_t flash_attention_sparse_prefill_workspace_size_kunpeng(int64_t vo_head_dim)
+{
+    return kutacc::get_flash_attention_sparse_prefill_workspace_size(vo_head_dim);
+}
+
+void flash_attention_sparse_prefill_kunpeng(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor indices,
+                                            c10::optional<at::Tensor> topk_length, at::Tensor out,
+                                            c10::optional<at::Tensor> lse, at::Tensor workspace, bool causal,
+                                            double softmax_scale, at::Tensor query_start_loc,
+                                            at::Tensor key_start_loc, c10::optional<at::Tensor> attn_sink)
+{
+    auto kt_q = to_kutacc<bfloat16_t, 3>(q);
+    auto kt_k = to_kutacc<bfloat16_t, 3>(k);
+    auto kt_v = to_kutacc<bfloat16_t, 3>(v);
+    auto kt_indices = to_kutacc<int, 2>(indices);
+    auto kt_out = to_kutacc<bfloat16_t, 3>(out);
+    auto kt_workspace = to_kutacc<uint8_t, 1>(workspace);
+
+    auto kt_query_start_loc = to_kutacc<int, 1>(query_start_loc);
+    auto kt_key_start_loc = to_kutacc<int, 1>(key_start_loc);
+
+    std::optional<kutacc::Tensor<int, 1>> kt_topk_length = std::nullopt;
+    std::optional<kutacc::Tensor<float, 2>> kt_lse = std::nullopt;
+    std::optional<kutacc::Tensor<float, 1>> kt_attn_sink = std::nullopt;
+    if (topk_length.has_value()) {
+        kt_topk_length = to_kutacc<int, 1>(topk_length.value());
+    }
+    if (lse.has_value()) {
+        kt_lse = to_kutacc<float, 2>(lse.value());
+    }
+    if (attn_sink.has_value()) {
+        kt_attn_sink = to_kutacc<float, 1>(attn_sink.value());
+    }
+
+    // Default schedule (token-balanced); output_coord is ignored here.
+    kutacc::attention_schedule schedule;
+    kutacc::flash_attention_sparse_prefill(kt_q, kt_k, kt_v, kt_indices, kt_topk_length, kt_out, kt_lse,
+                                            kt_workspace, causal, softmax_scale, kt_query_start_loc,
+                                            kt_key_start_loc, kt_attn_sink, schedule);
 }
 
 // Gather the paged MLA latent cache via block_table and split each row into

@@ -1703,9 +1703,17 @@ class KunpengCpuBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=False,
+        topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
 
         self.swap_mgr.get_kv_cache()
+
+        if topk_indices is not None:
+            # DSA sparse prefill (non-chunked extend).
+            return self._forward_extend_sparse_kunpeng(
+                q, k, v, layer, forward_batch, topk_indices, sinks
+            )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
         is_cross_attn = layer.is_cross_attention
@@ -1722,6 +1730,59 @@ class KunpengCpuBackend(AttentionBackend):
             return self._forward_extend_kutacc(q, k, v, layer, forward_batch)
         else:
             return self.forward_extend_native(q, k, v, layer, forward_batch)
+
+    def _forward_extend_sparse_kunpeng(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        topk_indices: torch.Tensor,
+        sinks: Optional[torch.Tensor] = None,
+    ):
+        """DSA sparse prefill over the model-assembled per-head K/V
+        (non-chunked extend: no prefix here, plumbed for parity anyway).
+        """
+        q_3d = kunpeng.contiguous_kunpeng(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        )
+        k_3d = kunpeng.contiguous_kunpeng(
+            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        )
+        v_3d = kunpeng.contiguous_kunpeng(
+            v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        )
+
+        prefix_lens = forward_batch.extend_prefix_lens
+        if prefix_lens is None:
+            prefix_lens = torch.zeros_like(forward_batch.extend_seq_lens)
+
+        softmax_scale = (
+            layer.scaling
+            if layer.scaling is not None
+            else 1.0 / math.sqrt(layer.qk_head_dim)
+        )
+
+        n = q_3d.shape[0]
+        out = kunpeng.alloc_buffer(
+            n * layer.tp_q_head_num * layer.v_head_dim, dtype=torch.bfloat16
+        ).view(n, layer.tp_q_head_num, layer.v_head_dim)
+        ws_bytes = (
+            torch.ops.sgl_kernel
+            .flash_attention_sparse_prefill_workspace_size_kunpeng(
+                layer.v_head_dim)
+        )
+        workspace = kunpeng.alloc_buffer(ws_bytes, dtype=torch.uint8)
+
+        kunpeng.flash_attention_sparse_prefill_kunpeng(
+            q_3d, k_3d, v_3d, topk_indices, None, out, None, workspace,
+            True,  # causal
+            softmax_scale,
+            forward_batch.extend_seq_lens, prefix_lens,
+            sinks,
+        )
+        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
