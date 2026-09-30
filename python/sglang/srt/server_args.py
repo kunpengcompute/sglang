@@ -3147,9 +3147,71 @@ class ServerArgs:
                 ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
         if self.moe_a2a_backend == "kunpeng_cpu":
-            self.ep_size = self.tp_size
-            logger.warning(
-                f"Kunpeng MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            if self.ep_size < self.tp_size:
+                # ETP (expert tensor parallel): each EP group of moe_tp ranks
+                # holds the full local expert set with weights split 1/moe_tp
+                # along the intermediate dim.  Keep ep_size as configured and
+                # validate the ETP constraint set.
+                self._validate_kunpeng_etp()
+                logger.info(
+                    f"Kunpeng MoE A2A ETP is enabled: ep_size={self.ep_size}, "
+                    f"moe_tp_size={self.tp_size // self.ep_size}, tp_size={self.tp_size}."
+                )
+            else:
+                self.ep_size = self.tp_size
+                logger.warning(
+                    f"Kunpeng MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                )
+
+    def _validate_kunpeng_etp(self):
+        """Validate the ETP constraint set for the Kunpeng MoE A2A backend.
+
+        ETP maps to sglang's moe_tp mechanism: moe_tp_size = tp_size // ep_size
+        (with moe_dp_size == 1).  Each MOE_TP group is a set of consecutive
+        ranks that must fit within a single node for the SHM-based token
+        broadcast / partial-sum reduction to work.
+        """
+        assert (
+            self.tp_size % self.ep_size == 0
+        ), f"Kunpeng ETP requires tp_size ({self.tp_size}) divisible by ep_size ({self.ep_size})"
+        moe_tp_size = self.tp_size // self.ep_size
+        assert moe_tp_size > 1, (
+            "Kunpeng ETP requires ep_size < tp_size so that moe_tp_size > 1; "
+            "use ep_size == tp_size for the non-ETP deployment"
+        )
+        assert (
+            self.moe_dp_size == 1
+        ), "Kunpeng ETP v1 only supports moe_dp_size == 1"
+        assert (
+            not self.enable_eplb
+        ), "Kunpeng ETP v1 does not support EPLB (expert location must be trivial)"
+        assert (
+            self.init_expert_location == "trivial"
+        ), "Kunpeng ETP v1 requires init_expert_location == 'trivial'"
+        assert (
+            self.ep_num_redundant_experts == 0
+        ), "Kunpeng ETP v1 does not support redundant experts"
+        # The fused shared-expert slot has no valid ETP route (expert id space
+        # must stay exactly [0, num_experts) and divisible by ep_size); disable
+        # the fusion instead of requiring the flag on every launch script.
+        if not self.disable_shared_experts_fusion:
+            self.disable_shared_experts_fusion = True
+            logger.info(
+                "Kunpeng ETP: shared-experts fusion disabled automatically "
+                "(the fused shared-expert slot has no valid ETP route)."
+            )
+        assert (
+            os.environ.get("ENABLE_STATIC_ROUTING", "0") != "1"
+        ), "Kunpeng ETP v1 does not support static routing (ENABLE_STATIC_ROUTING must be 0)"
+        assert (
+            os.environ.get("SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE", "false").lower()
+            not in ("1", "true")
+        ), "Kunpeng ETP v1 does not support SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE"
+        local_size = int(os.environ.get("MV2_COMM_WORLD_LOCAL_SIZE", "0") or 0)
+        if local_size > 0:
+            assert moe_tp_size <= local_size and local_size % moe_tp_size == 0, (
+                f"Kunpeng ETP requires moe_tp_size ({moe_tp_size}) to divide the "
+                f"ranks per node (MV2_COMM_WORLD_LOCAL_SIZE={local_size})"
             )
 
     def _handle_eplb_and_dispatch(self):
