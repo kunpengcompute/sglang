@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
     get_attn_tp_group,
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.environ import envs
@@ -137,6 +138,29 @@ class _KunpengDispatcherState:
         self.use_static_route: bool = False
         self.parallel_policy: Optional[torch.Tensor] = None
 
+        # ETP (expert tensor parallel, moe_tp_size > 1) state.  Each MOE_TP
+        # group (moe_tp_size consecutive ranks, node-local) holds the full
+        # local expert set with weights split 1/moe_tp_size along the
+        # intermediate dim.  The group leader (moe_tp_rank == 0) receives the
+        # RDMA dispatch, compacts the received slot rows into a dense buffer
+        # and broadcasts it to its peers over node SHM; after the down-proj
+        # GEMM the peers' partial outputs are reduced onto the leader, whose
+        # combine_send is the only one putting data back to the token sources.
+        self.comm_size: int = 0
+        self.moe_tp_size: int = 1
+        self.moe_tp_rank: int = 0
+        self.etp_enabled: bool = False
+        self.etp_dense_max: int = 0
+        self.etp_dense_buf: Optional[torch.Tensor] = None
+        self.etp_token_ids_buf: Optional[torch.Tensor] = None
+        self.etp_experts_offset: Optional[torch.Tensor] = None
+        self.etp_total: Optional[torch.Tensor] = None
+        self.etp_seq: Optional[torch.Tensor] = None
+        # Expert count that parameterizes the C++ slot space (each rank
+        # covers num_local_experts experts x comm_size source ranks);
+        # C++ derives num_local_experts = num_experts / comm_size from it.
+        self.slot_space_num_experts: int = 0
+
     @classmethod
     def get(cls) -> "_KunpengDispatcherState":
         """Return the singleton instance, creating it if necessary."""
@@ -211,6 +235,54 @@ def _ensure_rdma_initialized(
             get_tensor_model_parallel_world_size() // state.ep_size
         )  # moe_tp
 
+        # ETP (expert tensor parallel) capture.  The MoE RDMA communication
+        # domain spans the full TP group, so the C++ slot-space sizing must be
+        # derived from comm_size (== tp_size), not ep_size.
+        state.comm_size = get_tensor_model_parallel_world_size()
+        state.moe_tp_size = state.comm_size // state.ep_size
+        state.moe_tp_rank = get_moe_tensor_parallel_rank()
+        state.etp_enabled = state.moe_tp_size > 1
+        if state.etp_enabled:
+            if state.is_prefill:
+                raise ValueError(
+                    "Kunpeng ETP v1 only supports the decode (non-prefill) role; "
+                    "run prefill instances with ep_size == tp_size"
+                )
+            if state.use_static_route:
+                raise ValueError(
+                    "Kunpeng ETP v1 does not support static routing "
+                    "(ENABLE_STATIC_ROUTING must be 0)"
+                )
+            if os.environ.get(
+                "SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE", "false"
+            ).lower() in (
+                "1",
+                "true",
+            ):
+                raise ValueError(
+                    "Kunpeng ETP v1 does not support "
+                    "SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE"
+                )
+            # Worst-case dense rows received by one MOE_TP group leader.  The
+            # global microbatch is dp_size * max_tokens_per_mb tokens (each
+            # node's DP group contributes up to max_tokens_per_mb), and each
+            # token activates at most min(topk, num_local_experts) experts of
+            # one group.  This equals the group's slot-space bound
+            # (num_local_experts * comm_size * max_dispatch) whenever
+            # topk >= num_local_experts, and is tighter otherwise.
+            dp_size = state.comm_size // state.attn_tp_size
+            dense_default = (
+                dp_size * max_tokens_per_mb * min(router_topk, state.num_local_experts)
+            )
+            state.etp_dense_max = int(
+                os.environ.get("SGLANG_KUNPENG_ETP_DENSE_MAX", str(dense_default))
+            )
+        state.slot_space_num_experts = (
+            state.num_local_experts * state.comm_size
+            if state.etp_enabled
+            else state.num_experts
+        )
+
         # Step 1: RDMA communication domain.  Only needed when MoE dispatch/
         # combine actually runs over RDMA (i.e. not local SHM dispatch).  When
         # it is created we set rdma_comm_created so the DP-attention sync can
@@ -243,7 +315,7 @@ def _ensure_rdma_initialized(
                 state.dispatch_send_buf,
                 state.recv_src_info,
                 state.recv_src_info_bak,
-                state.num_experts,
+                state.slot_space_num_experts,
                 state.num_max_dispatch_tokens_per_rank,
                 state.dispatch_send_buf.size(1),
                 state.dispatch_send_buf.size(0),
@@ -254,11 +326,18 @@ def _ensure_rdma_initialized(
             )
             state.dispatch_initialized = True
 
+            # For ETP the combine buffer holds only the dense received rows
+            # (etp_dense_max), which can differ from the slot-count-derived MR
+            # size the C++ side would register by default; pass the explicit
+            # override.
+            combine_reg_size = (
+                state.etp_dense_max * state.hidden_size * 2 if state.etp_enabled else 0
+            )
             torch.ops.sgl_kernel.moe_combine_init_kunpeng(
                 state.combine_send_buf,
                 state.combined_x,
                 state.dispatch_send_buf.size(0),
-                state.num_experts,
+                state.slot_space_num_experts,
                 state.num_max_dispatch_tokens_per_rank,
                 state.router_topk,
                 state.hidden_size,
@@ -266,6 +345,7 @@ def _ensure_rdma_initialized(
                 state.attn_tp_size,
                 state.combine_recv_buf,
                 state.use_static_route,
+                combine_reg_size,
             )
             state.combine_initialized = True
 
@@ -361,7 +441,10 @@ def _hbw_pool_or_none():
 
 
 def _init_buffers(state: _KunpengDispatcherState):
-    num_ranks = state.ep_size
+    # The MoE RDMA communication domain covers the full TP group, so the
+    # source-rank dimension of the recv slot layout is comm_size (== tp_size).
+    # For the non-ETP deployment ep_size == tp_size, so this is unchanged.
+    num_ranks = state.comm_size
     max_dispatch_tokens = state.num_max_dispatch_tokens_per_rank
 
     # Communication buffers live on the HBW (on-package) pool when available,
@@ -439,9 +522,13 @@ def _init_buffers(state: _KunpengDispatcherState):
             "combine_send_buf",
         )
     else:
+        # RDMA (prefill + decode) worst-case per-(expert, rank) slot layout.
+        # With ETP the slot space is num_local_experts * comm_size
+        # (= slot_space_num_experts): each of the comm_size ranks allocates slot
+        # regions for all num_local_experts experts it (partially) hosts.
         state.dispatch_recv_size = (
-            state.num_experts * max_dispatch_tokens * (state.hidden_size + 4)
-            + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
+            state.slot_space_num_experts * max_dispatch_tokens * (state.hidden_size + 4)
+            + state.slot_space_num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
         )
         state.dispatch_recv_buf = _zeros(
             (state.dispatch_recv_size,),
@@ -449,12 +536,22 @@ def _init_buffers(state: _KunpengDispatcherState):
             "dispatch_recv_buf",
             force_ddr=state.is_prefill,
         )
-        state.combine_send_buf = _zeros(
-            (state.num_experts * max_dispatch_tokens, state.hidden_size),
-            torch.bfloat16,
-            "combine_send_buf",
-            force_ddr=state.is_prefill,
-        )
+        if state.etp_enabled:
+            # ETP combine buffer: dense rows actually received by the group
+            # (worst case etp_dense_max), node-shared SHM so the leader can
+            # reduce peers' partial down-proj outputs into it before
+            # combine_send.  Must be SHM-symmetric across the MOE_TP group for
+            # get_peer_shm_baseptr-based peer access.
+            state.combine_send_buf = kernel.create_shm_tensor_kunpeng(
+                torch.bfloat16, [state.etp_dense_max, state.hidden_size]
+            )
+        else:
+            state.combine_send_buf = _zeros(
+                (state.num_experts * max_dispatch_tokens, state.hidden_size),
+                torch.bfloat16,
+                "combine_send_buf",
+                force_ddr=state.is_prefill,
+            )
 
     if state.use_static_route:
         state.combine_recv_size = (
@@ -527,8 +624,10 @@ def _init_buffers(state: _KunpengDispatcherState):
             dtype=torch.int32,
         )
     else:
+        # Slot indices go up to num_local_experts * num_ranks * max_dispatch
+        # (= slot_space_num_experts * max_dispatch).
         state.recv_token_ids_buf = torch.zeros(
-            state.num_experts * max_dispatch_tokens, dtype=torch.int32
+            state.slot_space_num_experts * max_dispatch_tokens, dtype=torch.int32
         )
     state.recv_experts_offset = torch.zeros(
         state.num_local_experts + 1, dtype=torch.int32
@@ -548,6 +647,32 @@ def _init_buffers(state: _KunpengDispatcherState):
         torch.int16, [state.max_tokens_per_mb, state.router_topk * 2]
     )
     state.topk_ids_index_buf.zero_()
+
+    if state.etp_enabled:
+        # ETP node-shared buffers (SHM-symmetric across the MOE_TP group so
+        # peers reach them via get_peer_shm_baseptr).  Allocated after all
+        # non-ETP SHM buffers to keep the allocation sequence identical on
+        # every rank of the deployment.
+        # - etp_dense_buf: compacted received rows (int8 act + fp32 scale),
+        #   written only by the group leader; peers read the leader's copy
+        #   directly (pull-A redirect in igemm_fusedmoe_gateup_kunpeng).
+        # - etp_experts_offset / etp_total: broadcast segment metadata.
+        # - etp_seq: [bcast_seq, reduce_seq] monotonically increasing
+        #   counters used for leader<->peer synchronization.
+        state.etp_dense_buf = kernel.create_shm_tensor_kunpeng(
+            torch.uint8, [state.etp_dense_max, state.hidden_size + 4]
+        )
+        state.etp_experts_offset = kernel.create_shm_tensor_kunpeng(
+            torch.int32, [state.num_local_experts + 1]
+        )
+        state.etp_total = kernel.create_shm_tensor_kunpeng(torch.int32, [1])
+        # [0] = broadcast sequence (leader writes), [1] = down-GEMM-done
+        # sequence (each rank writes its own), [2] = row-segment reduce-done
+        # sequence (each rank writes its own); monotonic int64 counters.
+        state.etp_seq = kernel.create_shm_tensor_kunpeng(torch.int64, [3])
+        # Identity gather index: after the leader's compaction, dense row i is
+        # consumed directly as IGEMM input row i.
+        state.etp_token_ids_buf = torch.arange(state.etp_dense_max, dtype=torch.int32)
 
     logger.info(
         f"[KunpengMoE rank={state.ep_rank}] _init_buffers: "
@@ -641,13 +766,19 @@ class KunpengDispatcher(BaseDispatcher):
         self.use_static_route = env_static or use_static_route
 
         if num_max_dispatch_tokens_per_rank is None:
-            # Matches DeepSeek-V3-Sample (context.cpp init_context):
-            #   (max_tokens_per_mb / dtp) * min(moe_comm_size / moe_ep, n_activated)
-            # where moe_comm_size / moe_ep == moe_tp == tp_size / ep_size (= 1
-            # in all supported scenarios).
+            # Per-(expert, source-rank) slot capacity.  Each rank sends
+            # max_tokens_per_mb / attn_tp_size tokens (its dtp duty slice) and
+            # all of them may target one expert, so the slot bound is the
+            # per-rank send share.  DeepSeek-V3-Sample also multiplies by
+            # min(moe_comm_size / moe_ep, n_activated); that factor is dropped
+            # here because ETP dispatch is single-destination (the expert
+            # group leader) followed by a node-local SHM broadcast, which does
+            # not enlarge any per-(expert, src) slot.  For the non-ETP
+            # deployment (tp // ep == 1) the result is identical to the
+            # reference formula.
             self.num_max_dispatch_tokens_per_rank = (
                 self.max_tokens_per_mb // self.attn_tp_size
-            ) * min(self.tp_size // self.ep_size, self.router_topk)
+            )
         else:
             self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
 
@@ -739,7 +870,7 @@ class KunpengDispatcher(BaseDispatcher):
             kunpeng.moe_dispatch_send_kunpeng(
                 norm_int8_and_scale,
                 state.topk_ids_index_buf,
-                state.num_experts,
+                state.slot_space_num_experts,
                 state.num_max_dispatch_tokens_per_rank,
                 state.parallel_policy,
                 batch_size,
@@ -795,7 +926,7 @@ class KunpengDispatcher(BaseDispatcher):
                 state.recv_src_info_bak,
                 state.recv_token_ids_buf,
                 state.recv_experts_offset,
-                state.ep_size,
+                state.comm_size,
                 state.num_local_experts,
                 state.num_max_dispatch_tokens_per_rank,
                 state.max_tokens_per_mb,
@@ -803,6 +934,31 @@ class KunpengDispatcher(BaseDispatcher):
                 state.is_prefill,
             )
         t_convert_end = time.perf_counter()
+
+        if state.etp_enabled:
+            # ETP (pull-A): the group leader compacts the received slot rows
+            # into its node-shared dense buffer and pushes only the segment
+            # metadata to its MOE_TP peers; peers spin on the broadcast
+            # sequence counter and then read the leader's rows directly
+            # inside gateup (C++ redirect, no per-peer data copy).
+            t_share_start = time.perf_counter()
+            kunpeng.moe_etp_dispatch_share_kunpeng(
+                state.packed_recv_x,
+                state.recv_token_ids_buf,
+                state.recv_experts_offset,
+                state.etp_dense_buf,
+                state.etp_experts_offset,
+                state.etp_total,
+                state.etp_seq,
+                state.hidden_size + 4,
+                state.moe_tp_size,
+            )
+            t_share_end = time.perf_counter()
+            if envs.SGLANG_KUNPENG_PROFILE.get():
+                logger.info(
+                    f"|   |---etp_dispatch_share timing (ms): "
+                    f"{1000*(t_share_end - t_share_start):.2f}"
+                )
 
         t_total_end = time.perf_counter()
         if envs.SGLANG_KUNPENG_PROFILE.get():
@@ -815,6 +971,16 @@ class KunpengDispatcher(BaseDispatcher):
             )
 
         self._dispatch_pending = None
+
+        if state.etp_enabled:
+            return KunpengDispatchOutput(
+                num_tokens=num_tokens,
+                packed_recv_x=state.etp_dense_buf,
+                combine_send_buf=state.combine_send_buf,
+                recv_token_ids_buf=state.etp_token_ids_buf,
+                recv_experts_offset=state.etp_experts_offset,
+                max_dispatch_tokens_per_rank=state.num_max_dispatch_tokens_per_rank,
+            )
 
         return KunpengDispatchOutput(
             num_tokens=num_tokens,
@@ -870,7 +1036,7 @@ class KunpengDispatcher(BaseDispatcher):
                 state.recv_src_info,
                 state.recv_src_info_bak,
                 state.num_max_dispatch_tokens_per_rank,
-                state.num_experts,
+                state.slot_space_num_experts,
                 state.hidden_size,
                 state.parallel_policy,
                 batch_id,

@@ -677,6 +677,82 @@ def _setup_moe_local_combine_recv_kunpeng():
     register_op('moe_local_combine_recv_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_moe_etp_dispatch_share_kunpeng():
+    def shape_infer(
+        packed_recv_x,
+        token_ids,
+        experts_offset,
+        dense_buf,
+        etp_experts_offset,
+        etp_total,
+        etp_seq,
+        row_bytes,
+        moe_tp_size,
+    ):
+        return []
+
+    def eager_fn(
+        packed_recv_x,
+        token_ids,
+        experts_offset,
+        dense_buf,
+        etp_experts_offset,
+        etp_total,
+        etp_seq,
+        row_bytes,
+        moe_tp_size,
+    ):
+        torch.ops.sgl_kernel.moe_etp_dispatch_share_kunpeng(
+            packed_recv_x,
+            token_ids,
+            experts_offset,
+            dense_buf,
+            etp_experts_offset,
+            etp_total,
+            etp_seq,
+            row_bytes,
+            moe_tp_size,
+        )
+        return None
+
+    register_op("moe_etp_dispatch_share_kunpeng", shape_infer, eager_fn)
+
+
+def _setup_moe_etp_reduce_kunpeng():
+    def shape_infer(moe_down, etp_total, etp_seq, hidden, moe_tp_size):
+        return []
+
+    def eager_fn(moe_down, etp_total, etp_seq, hidden, moe_tp_size):
+        torch.ops.sgl_kernel.moe_etp_reduce_kunpeng(
+            moe_down, etp_total, etp_seq, hidden, moe_tp_size
+        )
+        return None
+
+    register_op("moe_etp_reduce_kunpeng", shape_infer, eager_fn)
+
+
+def _setup_etp_remap_topk_ids_kunpeng():
+    def shape_infer(
+        topk_ids, topk_ids_index_buf, num_tokens, topk, num_local_experts, moe_tp_size
+    ):
+        return []
+
+    def eager_fn(
+        topk_ids, topk_ids_index_buf, num_tokens, topk, num_local_experts, moe_tp_size
+    ):
+        torch.ops.sgl_kernel.etp_remap_topk_ids_kunpeng(
+            topk_ids,
+            topk_ids_index_buf,
+            num_tokens,
+            topk,
+            num_local_experts,
+            moe_tp_size,
+        )
+        return None
+
+    register_op("etp_remap_topk_ids_kunpeng", shape_infer, eager_fn)
+
+
 def _setup_kupl_sdma_memcpy_chunked():
     def shape_infer(
         dst,
@@ -1406,5 +1482,8 @@ def setup():
     _setup_igemm_fusedmoe_gateup_kunpeng()
     _setup_igemm_fusedmoe_down_kunpeng()
     _setup_record_expert_activation_kunpeng()
+    _setup_moe_etp_dispatch_share_kunpeng()
+    _setup_moe_etp_reduce_kunpeng()
+    _setup_etp_remap_topk_ids_kunpeng()
 
 setup()

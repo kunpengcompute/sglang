@@ -746,7 +746,13 @@ class KunpengMoE(FusedMoE):
         num_local_experts = self.num_local_experts
         max_dispatch_tokens = dispatch_output.max_dispatch_tokens_per_rank
         inter_dim = w13_weight.shape[1] // 2
-        if self.is_prefill and _KunpengDispatcherState.get().use_local_dis_com:
+        if _KunpengDispatcherState.get().etp_enabled:
+            # ETP: the group's dense received rows are bounded by the global
+            # (token, topk) pairs targeting one expert group, compacted by
+            # the group leader and read directly by peers (pull-A; must
+            # match etp_dense_buf sizing in token_dispatcher/kunpeng.py).
+            recv_dense_size = _KunpengDispatcherState.get().etp_dense_max
+        elif self.is_prefill and _KunpengDispatcherState.get().use_local_dis_com:
             # pp16 single-node local SHM mode keeps the legacy tight-packing
             # prefill layout (must match packed_recv_x/token_ids sizing in
             # token_dispatcher/kunpeng.py)
@@ -873,6 +879,27 @@ class KunpengMoE(FusedMoE):
             tmp_scales_down,
         )
         t_down_end = time.perf_counter()
+
+        # ETP: each rank's down output is a partial sum over its 1/moe_tp_size
+        # of the intermediate dim.  Reduce the moe_tp_size partials onto the
+        # group leader's moe_down (node-local SHM), which is the buffer
+        # combine_send reads; peers return immediately after publishing.
+        etp_state = _KunpengDispatcherState.get()
+        if etp_state.etp_enabled:
+            t_etp_reduce_start = time.perf_counter()
+            kunpeng.moe_etp_reduce_kunpeng(
+                moe_down,
+                etp_state.etp_total,
+                etp_state.etp_seq,
+                hidden,
+                etp_state.moe_tp_size,
+            )
+            t_etp_reduce_end = time.perf_counter()
+            if envs.SGLANG_KUNPENG_PROFILE.get():
+                logger.info(
+                    f"|   |---etp_reduce timing (ms): "
+                    f"{1000*(t_etp_reduce_end - t_etp_reduce_start):.2f}"
+                )
 
         t_total_end = time.perf_counter()
         if envs.SGLANG_KUNPENG_PROFILE.get():
