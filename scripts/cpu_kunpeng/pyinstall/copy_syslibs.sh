@@ -71,8 +71,8 @@ for i in $(seq 0 15); do
                 echo "[copy_syslibs] WARNING: HPCKIT source directory $SOURCE_HPCKIT_DIR does not exist, skipping KUCCL copy for tp$i"
             fi
             # libsdma_dk.so: direct dep of libuct_sdma.so plugin -> _internal/
-            if [ -f "$HUCX_DIR/lib/libsdma_dk.so" ]; then
-                cp -f "$HUCX_DIR/lib/libsdma_dk.so" "$TARGET/"
+            if [ -f "/usr/lib64/libsdma_dk.so" ]; then
+                cp -f "/usr/lib64/libsdma_dk.so" "$TARGET/"
             fi
         fi
 

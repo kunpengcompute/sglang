@@ -28,10 +28,8 @@ SGLANG_SRC=$SGLANG_PATH/python
 SGL_KERNEL_SRC=$SGLANG_PATH/sgl-kernel
 BISHENG_LIB=$HPCKIT_PATH/latest/compiler/bisheng/lib
 KUPL_LIB=$HPCKIT_PATH/latest/kupl/bisheng/release/lib
-KUTACC_LIB=${KUTACC_PATH}/install/lib
+KUTACC_LIB=${KUTACC_PATH}/lib
 SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_path('purelib'))")
-
-rm -rf $PYINSTALL_PATH/dist
 
 # ===================== kuccl binary dependencies =====================
 # kuccl_pg.py fallback: _kuccl_dir/install/{hucx,xucg}/
@@ -42,7 +40,7 @@ if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
     KUCCL_FLAGS=(
       --add-binary "/usr/lib64/libnuma.so:."
       --add-binary "/usr/lib64/librdmacm.so.1:."
-      --add-binary "$HUCX_DIR/lib/libsdma_dk.so:."
+      --add-binary "/usr/lib64/libsdma_dk.so:."
       # UCX direct deps -> kuccl/install/hucx/lib/
       --add-binary "$HUCX_DIR/lib/libucs.so:kuccl/install/hucx/lib"
       --add-binary "$HUCX_DIR/lib/libucm.so.0:kuccl/install/hucx/lib"
@@ -62,67 +60,139 @@ if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
     )
 fi
 
-# ===================== PyInstaller packaging =====================
-if [ ! -f sglang_server.spec ]; then
-    echo "[pyinstall] generate spec file..."
-    pyi-makespec \
-      --name sglang_server \
-      --onedir \
-      --noconsole \
-      --add-binary "$CONDA_ENV_PATH/lib/libpython$PYTHON_VERSION.so.1.0:." \
-      --add-binary "$KUPL_LIB/libkupl.so.1:." \
-      --add-binary "$KUTACC_LIB/libkutacc.so.25.1.RC1:." \
-      --add-binary "$SITE_PACKAGES/kuccl_backend_pg*.so:kuccl/" \
-      --add-data "$KUCCL_PATH/kuccl_pg.py:kuccl/" \
-      --add-binary "$SITE_PACKAGES/torch/lib/*.so:torch/lib" \
-      --add-binary "$BISHENG_LIB/libomp.so:." \
-      --add-binary "$CONDA_ENV_PATH/lib/libstdc++.so.6:." \
-      --add-binary "$CONDA_ENV_PATH/lib/libgcc_s.so.1:." \
-      --add-binary "/usr/lib64/libdl.so.2:." \
-      --add-binary "/usr/lib64/libpthread.so.0:." \
-      --add-binary "/usr/lib64/libc.so.6:." \
-      --add-binary "/usr/lib64/libutil.so.1:." \
-      --add-binary "/usr/lib64/libm.so.6:." \
-      --add-binary "/usr/lib64/librt.so.1:." \
-      --add-binary "/usr/lib64/libmemkind.so:." \
-      --add-binary "/usr/lib64/libhwloc.so.15:." \
-      --add-binary "/usr/lib64/libfribidi.so.0:." \
-      --add-binary "/usr/lib64/libresolv.so.2:." \
-      --add-binary "/usr/lib64/libcrypt.so.1:." \
-      --add-data "$SGLANG_SRC/sglang:sglang" \
-      --add-data "$SITE_PACKAGES/sgl_kernel:sgl_kernel" \
-      --hidden-import torch \
-      --hidden-import torchvision \
-      --hidden-import triton \
-      --hidden-import sglang \
-      --hidden-import sgl_kernel \
-      --hidden-import kuccl_pg \
-      --hidden-import kuccl_backend_pg \
-      --hidden-import pybase64 \
-      --hidden-import zmq \
-      --hidden-import zmq.asyncio \
-      --hidden-import fastapi \
-      --hidden-import fastapi.middleware.cors \
-      --hidden-import starlette \
-      --hidden-import starlette.middleware.cors \
-      --hidden-import uvicorn \
-      --hidden-import setproctitle \
-      --hidden-import openai \
-      --hidden-import vllm \
-      --hidden-import vllm.logging_utils \
-      --hidden-import atomics \
-      --hidden-import distro \
-      --hidden-import partial_json_parser \
-      --hidden-import transformers \
-      --hidden-import transformers.models.ernie4_5 \
-      --hidden-import transformers.models.ernie4_5_moe \
-      --hidden-import msgspec \
-      --collect-all vllm \
-      --collect-all torch \
-      --collect-binaries torch \
-      "${KUCCL_FLAGS[@]}" \
-      $SGLANG_SRC/sglang/launch_server.py
+# ===================== PyInstaller flags =====================
+PYI_FLAGS=(
+  --name sglang_server
+  --onedir
+  --noconsole
+  --add-binary "$CONDA_ENV_PATH/lib/libpython$PYTHON_VERSION.so.1.0:."
+  --add-binary "$KUPL_LIB/libkupl.so.1:."
+  --add-binary "$KUTACC_LIB/libkutacc.so.25.1.RC1:."
+  --add-binary "$KUCCL_PATH/kuccl_backend_pg*.so:kuccl/"
+  --add-data "$KUCCL_PATH/kuccl_pg.py:kuccl/"
+  --add-binary "$SITE_PACKAGES/torch/lib/*.so:torch/lib"
+  --add-binary "$BISHENG_LIB/libomp.so:."
+  --add-binary "$CONDA_ENV_PATH/lib/libstdc++.so.6:."
+  --add-binary "$CONDA_ENV_PATH/lib/libgcc_s.so.1:."
+  --add-binary "/usr/lib64/libdl.so.2:."
+  --add-binary "/usr/lib64/libpthread.so.0:."
+  --add-binary "/usr/lib64/libc.so.6:."
+  --add-binary "/usr/lib64/libutil.so.1:."
+  --add-binary "/usr/lib64/libm.so.6:."
+  --add-binary "/usr/lib64/librt.so.1:."
+  --add-binary "/usr/lib64/libmemkind.so:."
+  --add-binary "/usr/lib64/libhwloc.so.15:."
+  --add-binary "/usr/lib64/libfribidi.so.0:."
+  --add-binary "/usr/lib64/libresolv.so.2:."
+  --add-binary "/usr/lib64/libcrypt.so.1:."
+  "${KUCCL_FLAGS[@]}"
+  --add-data "$SGLANG_SRC/sglang:sglang"
+  --add-data "$SITE_PACKAGES/sgl_kernel:sgl_kernel"
+  --hidden-import torch
+  --hidden-import torchvision
+  --hidden-import triton
+  --hidden-import sglang
+  --hidden-import sgl_kernel
+  --hidden-import kuccl_pg
+  --hidden-import kuccl_backend_pg
+  --hidden-import pybase64
+  --hidden-import zmq
+  --hidden-import zmq.asyncio
+  --hidden-import fastapi
+  --hidden-import fastapi.middleware.cors
+  --hidden-import starlette
+  --hidden-import starlette.middleware.cors
+  --hidden-import uvicorn
+  --hidden-import setproctitle
+  --hidden-import openai
+  --hidden-import vllm
+  --hidden-import vllm.logging_utils
+  --hidden-import atomics
+  --hidden-import distro
+  --hidden-import partial_json_parser
+  --hidden-import transformers
+  --hidden-import transformers.models.ernie4_5
+  --hidden-import transformers.models.ernie4_5_moe
+  --hidden-import msgspec
+  --collect-all vllm
+  --collect-all torch
+  --collect-binaries torch
+  $SGLANG_SRC/sglang/launch_server.py
+)
+
+# ===================== Pre-check all add-binary/add-data sources =====================
+# Report every missing source path up front instead of letting pyinstaller fail
+# on the first one. Run with "check" (or CHECK_ONLY=1) to only validate.
+precheck_sources() {
+    echo "[precheck] resolved paths:"
+    local v
+    for v in SGLANG_PATH SGLANG_SRC SITE_PACKAGES CONDA_ENV_PATH HPCKIT_PATH \
+             BISHENG_LIB KUPL_LIB KUTACC_LIB KUCCL_PATH HUCX_DIR XUCG_DIR; do
+        printf '  %-16s = %s\n' "$v" "${!v}"
+    done
+    echo
+
+    local expect=0 arg src dest m total=0 missing=0
+    for arg in "$@"; do
+        if [[ "$expect" == "1" ]]; then
+            expect=0
+            src="${arg%%:*}"
+            dest="${arg#*:}"
+            total=$((total + 1))
+            for m in $src; do
+                if [[ -e "$m" ]]; then
+                    printf '  [OK]      %s  ->  %s\n' "$m" "$dest"
+                else
+                    printf '  [MISSING] %s  ->  %s\n' "$m" "$dest"
+                    missing=$((missing + 1))
+                fi
+            done
+            continue
+        fi
+        case "$arg" in
+            --add-binary|--add-data) expect=1 ;;
+        esac
+    done
+
+    if [[ ! -e "$SGLANG_SRC/sglang/launch_server.py" ]]; then
+        printf '  [MISSING] %s\n' "$SGLANG_SRC/sglang/launch_server.py"
+        missing=$((missing + 1))
+    fi
+
+    if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
+        echo
+        echo "[precheck] kuccl/sdma location probes:"
+        for p in "$KUCCL_PATH/install" "$KUCCL_PATH/install/hucx/lib" \
+                 "$KUCCL_PATH/hucx/lib" "$HUCX_DIR/lib" "$HUCX_DIR/lib/ucx" \
+                 "$XUCG_DIR/lib" "$XUCG_DIR/lib/planc"; do
+            if [[ -e "$p" ]]; then printf '  [DIR ] %s\n' "$p"; else printf '  [----] %s\n' "$p"; fi
+        done
+        echo "[precheck] find libsdma_dk.so / libuct_sdma.so under KUCCL_PATH + HPCKIT_PATH + /usr/lib64:"
+        find "$KUCCL_PATH" "$HPCKIT_PATH" /usr/lib64 \
+             \( -name 'libsdma_dk.so' -o -name 'libuct_sdma.so' \) 2>/dev/null | head -20
+    fi
+
+    echo
+    printf '[precheck] entries checked: %d, missing: %d\n' "$total" "$missing"
+    return "$missing"
+}
+
+_MISSING=0
+precheck_sources "${PYI_FLAGS[@]}" || _MISSING=$?
+
+if [[ "${1:-}" == "check" || "${CHECK_ONLY:-0}" == "1" ]]; then
+    echo "[precheck] check-only mode, exit before spec/build."
+    exit 0
 fi
+if [[ "$_MISSING" -ne 0 ]]; then
+    echo "[precheck] ERROR: $_MISSING source path(s) missing, abort before pyinstaller." >&2
+    exit 1
+fi
+
+# ===================== PyInstaller spec =====================
+echo "[pyinstall] generate spec file..."
+rm -f sglang_server.spec
+pyi-makespec "${PYI_FLAGS[@]}"
 
 # ===================== Auto-modify spec file =====================
 echo "[pyinstall] modify spec file, move sglang/sgl_kernel/kuccl_pg out of PYZ..."
@@ -150,6 +220,7 @@ else:
 EOF
 
 # ===================== Build with modified spec =====================
+rm -rf $PYINSTALL_PATH/dist
 echo "[pyinstall] start build..."
 pyinstaller sglang_server.spec --distpath ./dist --workpath ./build --noconfirm
 
