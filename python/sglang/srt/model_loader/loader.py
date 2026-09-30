@@ -1671,6 +1671,54 @@ class KunpengStateLoader(BaseModelLoader):
             sorted(moe_modules.keys()),
         )
 
+        # Fast path: ETP pre-sharded expert directory (generated offline by
+        # split_weights_dsv3.py --etp_shard).  Each rank reads exactly its own
+        # (layer, ep_group, tp_rank) file per layer instead of reading whole
+        # experts and discarding (moe_tp_size-1)/moe_tp_size of every read,
+        # restoring the non-ETP I/O picture (2.5GB/rank).  Falls back to the
+        # whole-expert path below when the directory is absent.
+        if moe_modules:
+            first_moe = next(iter(moe_modules.values()))
+            moe_tp_size = getattr(first_moe, "moe_tp_size", 1)
+            if moe_tp_size > 1:
+                etp_preshard_dir = os.path.join(
+                    model_config.model_path, f"experts_etp{moe_tp_size}"
+                )
+                if os.path.isdir(etp_preshard_dir):
+                    loaded = 0
+                    for layer_id, moe in moe_modules.items():
+                        ep_rank = moe.moe_ep_rank
+                        tp_rank = getattr(moe, "moe_tp_rank", 0)
+                        filepath = os.path.join(
+                            etp_preshard_dir,
+                            f"layer_{layer_id}",
+                            f"ep{ep_rank}_tp{tp_rank}.safetensors",
+                        )
+                        if not os.path.isfile(filepath):
+                            raise RuntimeError(
+                                f"Cannot find ETP pre-sharded expert file `{filepath}`"
+                            )
+                        data = load_file(filepath)
+                        for local_i in range(moe._num_local_routed):
+                            # Keys are "{local_i}.{param}"; partition (not
+                            # startswith) so local_i=1 never matches "12.".
+                            sub = {}
+                            for k, v in data.items():
+                                idx_str, _, rest = k.partition(".")
+                                if idx_str == str(local_i) and rest:
+                                    sub[rest] = v
+                            self._copy_expert_weights(
+                                sub, moe, local_i, presharded=True
+                            )
+                            loaded += 1
+                    logger.info(
+                        "KunpengStateLoader: loaded %d pre-sharded ETP expert "
+                        "files from %s.",
+                        loaded,
+                        etp_preshard_dir,
+                    )
+                    return loaded > 0
+
         loaded = 0
         for layer_id, moe in moe_modules.items():
             layer_dir = os.path.join(experts_base, f"layer_{layer_id}")
@@ -1712,17 +1760,52 @@ class KunpengStateLoader(BaseModelLoader):
         data: Dict[str, torch.Tensor],
         moe: nn.Module,
         local_i: int,
+        presharded: bool = False,
     ) -> None:
         """Copy one expert's weights into *moe* module at slot *local_i*.
 
         The tensors in *data* are preprocessed: gate+up already concatenated
         into ``w13_*``, with a leading batch-1 dim added by split_moe_experts.
-        No TP sharding is done (moe_tp_size == 1 in MOE A2A).
+        For the non-ETP deployment (moe_tp_size == 1) no TP sharding is done
+        and the tensors are copied whole.  Under ETP (moe_tp_size > 1) each
+        rank holds 1/moe_tp_size of each expert along the intermediate dim:
+        w13 is split per gate/up half and re-concatenated (preserving SwiGLU
+        gate[i]/up[i] pairing), w2 is narrowed along its input dim, and
+        w2_weight_scale (per hidden output row) is not sharded.  When
+        *presharded* is True the tensors come from an experts_etp{N} file and
+        are already narrowed to this rank's shard, so the runtime sharding is
+        skipped.
         """
         # Map file keys (e.g. "model.layers.0.mlp.experts.w13_weight")
         # to local param names (e.g. "w13_weight")
         moe_params = dict(moe.named_parameters())
         param_name_to_key = {k.split(".")[-1]: k for k in moe_params}
+
+        moe_tp_rank = getattr(moe, "moe_tp_rank", 0)
+        moe_tp_size = getattr(moe, "moe_tp_size", 1)
+
+        def _etp_shard(short: str, flat: torch.Tensor) -> torch.Tensor:
+            """Narrow a full-expert file tensor to this rank's ETP shard."""
+            if moe_tp_size <= 1:
+                return flat
+            if short in ("w13_weight", "w13_weight_scale"):
+                # flat: [2*inter, ...]; gate occupies rows [0, inter),
+                # up occupies [inter, 2*inter).  Take the moe_tp_rank-th
+                # slice of each half and re-concat so silu_mul sees matched
+                # gate/up pairs.
+                half = flat.shape[0] // 2
+                ipp = half // moe_tp_size
+                start = moe_tp_rank * ipp
+                gate = flat[start : start + ipp]
+                up = flat[half + start : half + start + ipp]
+                return torch.cat([gate, up], dim=0)
+            if short == "w2_weight":
+                # flat: [hidden, inter]; narrow the intermediate (input) dim.
+                ipp = flat.shape[1] // moe_tp_size
+                start = moe_tp_rank * ipp
+                return flat.narrow(1, start, ipp)
+            # w2_weight_scale is per hidden output row: not sharded.
+            return flat
 
         for file_key, full_tensor in data.items():
             short = file_key.split(".")[-1]  # "w13_weight", "w13_weight_scale", ...
@@ -1737,6 +1820,12 @@ class KunpengStateLoader(BaseModelLoader):
 
             # Remove the leading batch-1 dim added by split_moe_experts
             flat = full_tensor[0] if full_tensor.dim() == 3 else full_tensor
+
+            # ETP: narrow the full-expert file tensor to this rank's shard
+            # when the parameter is moe_tp_size smaller along the shard dim.
+            # Pre-sharded (experts_etp{N}) files arrive already narrowed.
+            if moe_tp_size > 1 and not presharded:
+                flat = _etp_shard(short, flat)
 
             dst = param.data[local_i]
             for dim, size in enumerate(flat.shape):
