@@ -254,7 +254,7 @@ void moe_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor recv_src
 void moe_combine_init_kunpeng(at::Tensor combine_send_buf, at::Tensor combined_x, int64_t num_tokens,
                               int64_t num_experts, int64_t num_max_dispatch_tokens_per_rank, int64_t num_topk,
                               int64_t hidden, int64_t local_rank, int64_t local_size, at::Tensor combine_recv_buf,
-                              bool use_static_route);
+                              bool use_static_route, int64_t combine_reg_size);
 
 void moe_dispatch_send_kunpeng(at::Tensor x, at::Tensor topk_idx, int64_t num_experts,
                                int64_t num_max_dispatch_tokens_per_rank, at::Tensor parallel_policy, int64_t num_tokens,
@@ -290,6 +290,18 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info, at::Tensor s
 
 void record_expert_activation_kunpeng(at::Tensor experts_offset, at::Tensor counter,
                                       int64_t layer_id, int64_t num_local_experts);
+
+void moe_etp_dispatch_share_kunpeng(at::Tensor packed_recv_x, at::Tensor token_ids,
+                                    at::Tensor experts_offset, at::Tensor dense_buf,
+                                    at::Tensor etp_experts_offset, at::Tensor etp_total,
+                                    at::Tensor etp_seq, int64_t row_bytes, int64_t moe_tp_size);
+
+void moe_etp_reduce_kunpeng(at::Tensor moe_down, at::Tensor etp_total, at::Tensor etp_seq,
+                            int64_t hidden, int64_t moe_tp_size);
+
+void etp_remap_topk_ids_kunpeng(at::Tensor topk_ids, at::Tensor topk_ids_index_buf,
+                                int64_t num_tokens, int64_t topk, int64_t num_local_experts,
+                                int64_t moe_tp_size);
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
                                         int64_t num_experts, int64_t topk, bool force_balance,
@@ -848,7 +860,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def(
         "moe_combine_init_kunpeng(Tensor combine_send_buf, Tensor combined_x, "
         "int num_tokens, int num_experts, int num_max_dispatch_tokens_per_rank, int num_topk, int hidden, "
-        "int local_rank, int local_size, Tensor combine_recv_buf, bool use_static_route) -> ()");
+        "int local_rank, int local_size, Tensor combine_recv_buf, bool use_static_route, "
+        "int combine_reg_size) -> ()");
     m.impl("moe_combine_init_kunpeng", moe_combine_init_kunpeng);
 
     m.def(
@@ -906,6 +919,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "record_expert_activation_kunpeng("
         "Tensor experts_offset, Tensor(a!) counter, int layer_id, int num_local_experts) -> ()");
     m.impl("record_expert_activation_kunpeng", record_expert_activation_kunpeng);
+
+    m.def(
+        "moe_etp_dispatch_share_kunpeng("
+        "Tensor packed_recv_x, Tensor token_ids, Tensor experts_offset, "
+        "Tensor(a!) dense_buf, Tensor(b!) etp_experts_offset, Tensor(c!) etp_total, "
+        "Tensor(d!) etp_seq, int row_bytes, int moe_tp_size) -> ()");
+    m.impl("moe_etp_dispatch_share_kunpeng", moe_etp_dispatch_share_kunpeng);
+
+    m.def(
+        "moe_etp_reduce_kunpeng("
+        "Tensor(a!) moe_down, Tensor etp_total, Tensor(b!) etp_seq, "
+        "int hidden, int moe_tp_size) -> ()");
+    m.impl("moe_etp_reduce_kunpeng", moe_etp_reduce_kunpeng);
+
+    m.def(
+        "etp_remap_topk_ids_kunpeng("
+        "Tensor topk_ids, Tensor(a!) topk_ids_index_buf, "
+        "int num_tokens, int topk, int num_local_experts, int moe_tp_size) -> ()");
+    m.impl("etp_remap_topk_ids_kunpeng", etp_remap_topk_ids_kunpeng);
 
     // multinomial sampling
     m.def("multinomial_kunpeng(Tensor probs, Tensor(a!) out, int num_samples, bool replacement) -> ()");

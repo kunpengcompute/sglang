@@ -28,6 +28,7 @@
 #include <sgl_kernel_ops.h>
 #include <arm_bf16.h>
 #include <arm_fp16.h>
+#include <arm_sve.h>
 
 #include "../matmul/tiling.h"
 #include "../utils/math.h"
@@ -249,7 +250,7 @@ void moe_dispatch_finalize_kunpeng()
 void moe_combine_init_kunpeng(at::Tensor combine_send_buf, at::Tensor combined_x, int64_t num_tokens,
                               int64_t num_experts, int64_t num_max_dispatch_tokens_per_rank, int64_t num_topk,
                               int64_t hidden, int64_t local_rank, int64_t local_size, at::Tensor combine_recv_buf,
-                              bool use_static_route)
+                              bool use_static_route, int64_t combine_reg_size)
 {
     bfloat16_t *combine_send_buf_data = reinterpret_cast<bfloat16_t *>(combine_send_buf.data_ptr());
     bfloat16_t *combined_x_data = reinterpret_cast<bfloat16_t *>(combined_x.data_ptr());
@@ -280,7 +281,7 @@ void moe_combine_init_kunpeng(at::Tensor combine_send_buf, at::Tensor combined_x
 
     kutacc::moe_combine_init(combine_send_buf_data, num_tokens, num_experts, num_max_dispatch_tokens_per_rank, num_topk,
                              hidden, std::move(group_ptr), static_cast<int>(local_rank), std::move(recv_group),
-                             g_moe_comm_h->local_ds_conn_info);
+                             g_moe_comm_h->local_ds_conn_info, combine_reg_size);
 }
 
 void moe_combine_send_kunpeng(at::Tensor x, at::Tensor count, at::Tensor src_info, at::Tensor src_info_bak,
@@ -599,6 +600,28 @@ static std::optional<int64_t> fusedmoe_lookup_nslice(const int *experts_offset_d
 }
 
 // ---------------------------------------------------------------------------
+// ETP pull-A dense redirect: peers consume the group leader's compacted
+// dense rows directly (inside igemm_fusedmoe_gateup_kunpeng) instead of
+// receiving a broadcast copy.  moe_etp_dispatch_share_kunpeng refreshes this
+// mapping on every call, always ahead of the gateup that consumes the rows.
+// ---------------------------------------------------------------------------
+static uint8_t *g_etp_own_dense_base = nullptr;     // this rank's etp_dense_buf
+static uint8_t *g_etp_leader_dense_base = nullptr;  // leader's equivalent address
+static int64_t g_etp_dense_capacity = 0;            // bytes
+
+// Map a pointer inside this rank's etp_dense_buf to the same offset in the
+// leader's buffer.  Returns false when ETP is off or the pointer is outside
+// the dense buffer (non-ETP callers keep their own pointer).
+static inline bool etp_redirect_dense(const void *ptr, void **out)
+{
+    if (g_etp_own_dense_base == nullptr) return false;
+    const uint8_t *p = static_cast<const uint8_t *>(ptr);
+    if (p < g_etp_own_dense_base || p >= g_etp_own_dense_base + g_etp_dense_capacity) return false;
+    *out = g_etp_leader_dense_base + (p - g_etp_own_dense_base);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // igemm_fusedmoe_gateup_kunpeng
 //
 // Calls kutacc::fusedmoe_gateup to compute the gate/up projection for all
@@ -652,6 +675,20 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
 
     int64_t acts_stride = act.stride(0);
     int64_t acts_scale_stride = scale.stride(0);
+
+    // ETP pull-A: on non-leader ranks the dense rows live in the group
+    // leader's buffer; the Python-side act/scale views still point at this
+    // rank's (never-written) copy.  Redirect by offset — strides are layout
+    // properties and stay valid.
+    {
+        void *red_act = nullptr;
+        void *red_scale = nullptr;
+        if (etp_redirect_dense(acts_data, &red_act) &&
+            etp_redirect_dense(acts_scale_data, &red_scale)) {
+            acts_data = static_cast<int8_t *>(red_act);
+            acts_scale_data = static_cast<float *>(red_scale);
+        }
+    }
 
 #ifdef SGLANG_KUNPENG_DEBUG_EXPERT_LOAD
     // Record the per-expert activation distribution of this call.  Also
@@ -1095,4 +1132,253 @@ void moe_local_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, 
 
     // SHM barrier — ensure allgather is complete
     kupl_shm_fence(kupl_win_intra_node);
+}
+
+// ---------------------------------------------------------------------------
+// ETP (expert tensor parallel) node-local broadcast / reduction.
+//
+// Under ETP the MOE_TP group is a set of moe_tp_size consecutive ranks that
+// fits inside one node.  Only the group leader (intra-node rank %
+// moe_tp_size == 0) is the RDMA dispatch destination; these two ops move data
+// between the leader and its peers over the node SHM window:
+//
+//   moe_etp_dispatch_share_kunpeng: after the leader's dispatch_recv +
+//   topk_convert, compact the received slot rows into the leader's dense
+//   buffer (the single data copy) and push only the segment metadata to
+//   every peer.  Peers spin on the leader's broadcast sequence counter and
+//   then read the leader's rows directly inside gateup (pull-A: no
+//   per-peer data copy; see the redirect block above igemm_fusedmoe_gateup).
+//
+//   moe_etp_reduce_kunpeng: after every rank's down-proj GEMM wrote its
+//   partial output into its own shared moe_down rows, every rank publishes
+//   a completion counter, waits for the whole group, then sums one disjoint
+//   row segment over all moe_tp_size partials (fp32 accumulate, bf16
+//   write-back) into the leader's buffer, which is the only one consumed by
+//   combine_send.  Row ownership spreads the reduction's read bandwidth
+//   across the group instead of saturating the leader's node.
+// ---------------------------------------------------------------------------
+
+// Monotonic per-op call counters (lockstep across ranks; graph-replay safe
+// because every replay re-executes the op body).
+static int64_t g_etp_bcast_calls = 0;
+static int64_t g_etp_reduce_calls = 0;
+
+static inline void etp_spin_until(volatile int64_t *addr, int64_t expected)
+{
+    while (__atomic_load_n(addr, __ATOMIC_ACQUIRE) < expected) {
+        // spin; the acquire load orders the subsequent data reads
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ETP routing-table remap: logical expert id -> (group leader rank, local
+// slot), written into the interleaved columns of topk_ids_index_buf that the
+// kutacc dispatch kernel consumes.  Implemented as ONE graph op because the
+// Python-side equivalent ((ids // n_local) * etp etc.) creates unregistered
+// intermediate tensors that graph capture rejects.
+// ---------------------------------------------------------------------------
+void etp_remap_topk_ids_kunpeng(at::Tensor topk_ids, at::Tensor topk_ids_index_buf,
+                                int64_t num_tokens, int64_t topk, int64_t num_local_experts,
+                                int64_t moe_tp_size)
+{
+    TORCH_CHECK(topk_ids.scalar_type() == at::kShort, "topk_ids must be int16");
+    TORCH_CHECK(topk_ids_index_buf.scalar_type() == at::kShort, "topk_ids_index_buf must be int16");
+    TORCH_CHECK(topk_ids_index_buf.size(1) == topk * 2,
+                "topk_ids_index_buf second dim must be 2*topk");
+
+    const int16_t *ids = topk_ids.data_ptr<int16_t>();
+    int16_t *idx = topk_ids_index_buf.data_ptr<int16_t>();
+    const int64_t total = num_tokens * topk;
+    // num_local_experts is a power of two in every real ETP topology (8/16);
+    // the 64-bit div/mod pair dominates this loop, so use shift/mask there.
+    // Not kutacc::parallel_for: total is only mb*topk (<=768) elements, the
+    // fork-join dispatch costs more than the ~1us serial loop.
+    if ((num_local_experts & (num_local_experts - 1)) == 0) {
+        const int shift = __builtin_ctzll(num_local_experts);
+        const int16_t mask = static_cast<int16_t>(num_local_experts - 1);
+        for (int64_t i = 0; i < total; ++i) {
+            const int16_t e = ids[i];
+            idx[2 * i] = static_cast<int16_t>((e >> shift) * moe_tp_size);
+            idx[2 * i + 1] = static_cast<int16_t>(e & mask);
+        }
+    } else {
+        for (int64_t i = 0; i < total; ++i) {
+            const int16_t e = ids[i];
+            idx[2 * i] = static_cast<int16_t>((e / num_local_experts) * moe_tp_size);
+            idx[2 * i + 1] = static_cast<int16_t>(e % num_local_experts);
+        }
+    }
+}
+
+void moe_etp_dispatch_share_kunpeng(at::Tensor packed_recv_x, at::Tensor token_ids,
+                                    at::Tensor experts_offset, at::Tensor dense_buf,
+                                    at::Tensor etp_experts_offset, at::Tensor etp_total,
+                                    at::Tensor etp_seq, int64_t row_bytes, int64_t moe_tp_size)
+{
+    TORCH_CHECK(moe_tp_size > 1, "moe_etp_dispatch_share_kunpeng requires moe_tp_size > 1");
+    TORCH_CHECK(dense_buf.is_contiguous() && etp_seq.is_contiguous(),
+                "ETP shared buffers must be contiguous");
+
+    const int intra_rank = get_intra_node_rank();
+    const int group_base = intra_rank - (intra_rank % moe_tp_size);
+    const bool is_leader = (intra_rank % moe_tp_size) == 0;
+    const int64_t seq = ++g_etp_bcast_calls;
+
+    // Refresh the pull-A redirect mapping (pure address translation, no data
+    // dependency — safe before the seq spin).
+    uint8_t *dense = reinterpret_cast<uint8_t *>(dense_buf.data_ptr());
+    g_etp_own_dense_base = dense;
+    g_etp_dense_capacity = dense_buf.numel();
+    if (is_leader) {
+        g_etp_leader_dense_base = dense;
+    } else {
+        get_peer_shm_baseptr(group_base, dense, (void **)&g_etp_leader_dense_base);
+    }
+
+    if (is_leader) {
+        const int32_t *offsets = experts_offset.data_ptr<int32_t>();
+        const int num_local = static_cast<int>(experts_offset.size(0)) - 1;
+        const int64_t total = offsets[num_local];
+        TORCH_CHECK(total <= dense_buf.size(0),
+                    "ETP dense buffer overflow: total=", total,
+                    " capacity=", dense_buf.size(0),
+                    " (increase SGLANG_KUNPENG_ETP_DENSE_MAX or the decode SHM pool)");
+        const uint8_t *slots = reinterpret_cast<const uint8_t *>(packed_recv_x.data_ptr());
+        const int32_t *ids = token_ids.data_ptr<int32_t>();
+        int32_t *dst_offsets = etp_experts_offset.data_ptr<int32_t>();
+        int32_t *dst_total = etp_total.data_ptr<int32_t>();
+
+        // Compact the used slot rows into the leader's dense buffer — the
+        // single data copy of pull-A (peers gather from it inside gateup).
+        // Pool-parallel over rows like the etp reduce (see there).
+        kutacc::parallel_for(0, total, 1, [&](int64_t row_begin, int64_t row_end) {
+            for (int64_t i = row_begin; i < row_end; ++i) {
+                memcpy(dense + i * row_bytes, slots + static_cast<int64_t>(ids[i]) * row_bytes,
+                       row_bytes);
+            }
+        });
+        memcpy(dst_offsets, offsets, (num_local + 1) * sizeof(int32_t));
+        *dst_total = static_cast<int32_t>(total);
+
+        // Push only the segment metadata (tens of bytes) to every peer.
+        for (int g = 1; g < moe_tp_size; ++g) {
+            int32_t *peer_offsets = nullptr;
+            int32_t *peer_total = nullptr;
+            get_peer_shm_baseptr(group_base + g, dst_offsets, (void **)&peer_offsets);
+            get_peer_shm_baseptr(group_base + g, dst_total, (void **)&peer_total);
+            memcpy(peer_offsets, dst_offsets, (num_local + 1) * sizeof(int32_t));
+            *peer_total = static_cast<int32_t>(total);
+        }
+
+        // Publish with release ordering.  IMPORTANT: no kupl_shm_fence here —
+        // it is a collective node-wide barrier, while the peers spin on this
+        // counter without fencing first, so a leader-side fence would
+        // deadlock (leader waits inside the barrier for peers that are
+        // waiting for the leader's counter).
+        __atomic_store_n(etp_seq.data_ptr<int64_t>(), seq, __ATOMIC_RELEASE);
+    } else {
+        int64_t *leader_seq = nullptr;
+        get_peer_shm_baseptr(group_base, etp_seq.data_ptr<int64_t>(), (void **)&leader_seq);
+        etp_spin_until(reinterpret_cast<volatile int64_t *>(leader_seq), seq);
+    }
+}
+
+void moe_etp_reduce_kunpeng(at::Tensor moe_down, at::Tensor etp_total, at::Tensor etp_seq,
+                            int64_t hidden, int64_t moe_tp_size)
+{
+    TORCH_CHECK(moe_tp_size > 1, "moe_etp_reduce_kunpeng requires moe_tp_size > 1");
+    TORCH_CHECK(moe_down.is_contiguous() && etp_seq.is_contiguous(),
+                "ETP shared buffers must be contiguous");
+    TORCH_CHECK(moe_down.scalar_type() == at::kBFloat16, "moe_down must be bfloat16");
+    TORCH_CHECK(etp_seq.numel() >= 3,
+                "etp_seq needs 3 counters (bcast / gemm-done / segment-done); "
+                "update the token_dispatcher allocation");
+
+    const int intra_rank = get_intra_node_rank();
+    const int group_base = intra_rank - (intra_rank % moe_tp_size);
+    const int gid = intra_rank % moe_tp_size;  // rank inside the group (0 = leader)
+    const bool is_leader = (gid == 0);
+    const int64_t seq = ++g_etp_reduce_calls;
+    const int64_t total = etp_total.data_ptr<int32_t>()[0];
+
+    // Publish my down-proj partial FIRST, then wait for the whole group: with
+    // row ownership every rank sums a segment and needs all partials.  No
+    // kupl_shm_fence: it is a collective node-wide barrier and ranks that
+    // already published would block forever inside it.
+    __atomic_store_n(etp_seq.data_ptr<int64_t>() + 1, seq, __ATOMIC_RELEASE);
+
+    // srcs[p] = group rank p's partial; dst = the leader's moe_down, the only
+    // buffer combine_send reads.
+    bfloat16_t *mine = reinterpret_cast<bfloat16_t *>(moe_down.data_ptr());
+    bfloat16_t *dst = nullptr;
+    if (is_leader) {
+        dst = mine;
+    } else {
+        get_peer_shm_baseptr(group_base, mine, (void **)&dst);
+    }
+    std::vector<bfloat16_t *> srcs(moe_tp_size, nullptr);
+    srcs[0] = dst;
+    for (int p = 1; p < moe_tp_size; ++p) {
+        if (group_base + p == intra_rank) {
+            srcs[p] = mine;  // self
+        } else {
+            get_peer_shm_baseptr(group_base + p, mine, (void **)&srcs[p]);
+        }
+    }
+
+    // Wait until every rank's partial is published.
+    for (int p = 1; p < moe_tp_size; ++p) {
+        int64_t *peer_seq = nullptr;
+        get_peer_shm_baseptr(group_base + p, etp_seq.data_ptr<int64_t>(), (void **)&peer_seq);
+        etp_spin_until(reinterpret_cast<volatile int64_t *>(peer_seq + 1), seq);
+    }
+
+    // Row-ownership reduce: rank gid sums the disjoint row segment
+    // [gid*chunk, (gid+1)*chunk) over all partials into the leader's moe_down
+    // (in-place for the leader).  Every partial row is read exactly once, by
+    // its segment owner, before that owner overwrites the leader's copy;
+    // peers' own partials are only re-touched by the next layer's down GEMM,
+    // which is ordered behind the leader's next bcast, i.e. behind this
+    // reduce completing on all ranks.  SVE pattern mirrors kutacc's combine
+    // reduction; pool-parallel over rows, summation order (p ascending) is
+    // bit-identical to the previous leader-only implementation.
+    const int64_t chunk = (total + moe_tp_size - 1) / moe_tp_size;
+    int64_t seg_begin = gid * chunk;
+    int64_t seg_end = seg_begin + chunk;
+    if (seg_begin > total) seg_begin = total;
+    if (seg_end > total) seg_end = total;
+
+    kutacc::parallel_for(seg_begin, seg_end, 1, [&](int64_t row_begin, int64_t row_end) {
+        const int64_t vec_bf16 = svcntb();
+        const svbool_t ptrue32 = svptrue_b16();
+        const svbfloat16_t sve_zero = svdup_bf16(0.0f);
+        for (int64_t i = row_begin; i < row_end; ++i) {
+            bfloat16_t *row = dst + i * hidden;
+            for (int64_t d = 0; d < hidden; d += vec_bf16) {
+                const svbool_t pred = svwhilelt_b16((uint64_t)d, (uint64_t)hidden);
+                svfloat32_t acc0 = svdup_f32(0.0f);
+                svfloat32_t acc1 = svdup_f32(0.0f);
+                for (int p = 0; p < moe_tp_size; ++p) {
+                    const bfloat16_t *src = srcs[p] + i * hidden + d;
+                    const svbfloat16_t v = svldnt1(pred, src);
+                    acc0 = svadd_m(pred, acc0, svreinterpret_f32(svzip1(sve_zero, v)));
+                    acc1 = svadd_m(pred, acc1, svreinterpret_f32(svzip2(sve_zero, v)));
+                }
+                const svbfloat16_t out = svuzp1(svcvt_bf16_x(ptrue32, acc0),
+                                                svcvt_bf16_x(ptrue32, acc1));
+                svstnt1(pred, row + d, out);
+            }
+        }
+    });
+
+    // Segment done.  Only the leader must observe every segment before
+    // returning (combine_send reads its full moe_down); peers may proceed.
+    __atomic_store_n(etp_seq.data_ptr<int64_t>() + 2, seq, __ATOMIC_RELEASE);
+    if (is_leader) {
+        for (int p = 1; p < moe_tp_size; ++p) {
+            int64_t *peer_seq = nullptr;
+            get_peer_shm_baseptr(group_base + p, etp_seq.data_ptr<int64_t>(), (void **)&peer_seq);
+            etp_spin_until(reinterpret_cast<volatile int64_t *>(peer_seq + 2), seq);
+        }
+    }
 }
