@@ -37,18 +37,20 @@ echo "[$(date +%T)] Launching mooncake master on $MOONCAKE_MASTER_NODE ($MOONCAK
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
     "root@$MOONCAKE_MASTER_NODE" \
     "cd \"$PWD\" && mkdir -p \"$LOG_DIR\" && \
-     nohup \"$MOONCAKE_MASTER_BIN\" \
+     setsid nohup \"$MOONCAKE_MASTER_BIN\" \
+       --port=$MOONCAKE_MASTER_PORT \
        --enable_http_metadata_server=true \
        --http_metadata_server_port=$MOONCAKE_METADATA_PORT \
        --eviction_high_watermark_ratio=$MOONCAKE_EVICTION_WATERMARK \
        </dev/null >\"$LOG_DIR/mooncake_master.log\" 2>&1 &" \
     >"$LOG_DIR/ssh_mooncake.log" 2>&1 &
 
-# Wait for the master to listen (up to 60s). A slow master only warns: the
-# prefill servers retry their own registration.
-echo "[$(date +%T)] Waiting for $MOONCAKE_MASTER ..."
+# Wait for the master to listen. A slow master only warns: the prefill servers
+# retry their own registration. Overridable via MOONCAKE_MASTER_READY_TIMEOUT.
+echo "[$(date +%T)] Waiting for $MOONCAKE_MASTER_NODE:$MOONCAKE_MASTER_PORT ..."
+_master_ready_timeout="${MOONCAKE_MASTER_READY_TIMEOUT:-300}"
 _ready=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 "$_master_ready_timeout"); do
     if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
         "root@$MOONCAKE_MASTER_NODE" \
         "ss -lnt | grep -q ':$MOONCAKE_MASTER_PORT '"; then
@@ -58,8 +60,8 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 if [[ "$_ready" == "1" ]]; then
-    echo "[$(date +%T)] Mooncake master ready on $MOONCAKE_MASTER"
+    echo "[$(date +%T)] Mooncake master ready on $MOONCAKE_MASTER_NODE:$MOONCAKE_MASTER_PORT"
 else
-    echo "WARNING: mooncake master did not listen on $MOONCAKE_MASTER within 60s;" >&2
+    echo "WARNING: mooncake master did not listen on $MOONCAKE_MASTER_NODE:$MOONCAKE_MASTER_PORT within ${_master_ready_timeout}s;" >&2
     echo "         check $LOG_DIR/mooncake_master.log on $MOONCAKE_MASTER_NODE" >&2
 fi

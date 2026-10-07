@@ -34,13 +34,16 @@ echo "[$(date +%T)] Launching mooncake store service on $MOONCAKE_STORE_NODE:$MO
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
     "root@$MOONCAKE_STORE_NODE" \
     "cd \"$PWD\" && mkdir -p \"$LOG_DIR\" && \
-     nohup sh ./runtime/server_store.sh \"$LOG_DIR\" \
+     setsid nohup sh ./runtime/server_store.sh \"$LOG_DIR\" \
        </dev/null >\"$LOG_DIR/store_service.log\" 2>&1 &" \
     >"$LOG_DIR/ssh_store.log" 2>&1 &
 
 echo "[$(date +%T)] Waiting for store service on port $MOONCAKE_STORE_PORT ..."
+# Startup cost is dominated by allocating/pinning the L3 segment (MOONCAKE_STORE_SEGMENT_SIZE)
+# and registering it with RDMA, so the wait is generous by default and overridable.
+_store_ready_timeout="${MOONCAKE_STORE_READY_TIMEOUT:-300}"
 _ready=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 "$_store_ready_timeout"); do
     if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
         "root@$MOONCAKE_STORE_NODE" \
         "ss -lnt | grep -q ':$MOONCAKE_STORE_PORT '"; then
@@ -52,6 +55,6 @@ done
 if [[ "$_ready" == "1" ]]; then
     echo "[$(date +%T)] Mooncake store service ready on $MOONCAKE_STORE_NODE:$MOONCAKE_STORE_PORT"
 else
-    echo "WARNING: mooncake store service did not listen on port $MOONCAKE_STORE_PORT within 60s;" >&2
+    echo "WARNING: mooncake store service did not listen on port $MOONCAKE_STORE_PORT within ${_store_ready_timeout}s;" >&2
     echo "         check $LOG_DIR/store_service.log on $MOONCAKE_STORE_NODE" >&2
 fi
