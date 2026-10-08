@@ -119,6 +119,8 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
 void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices);
 void fake_indexer_topk_rows_kunpeng(const at::Tensor &extend_seq_lens, const at::Tensor &prefix_lens,
                                     int64_t topk, at::Tensor indices);
+void fake_indexer_topk_mtp_kunpeng(const at::Tensor &seq_lens, const c10::optional<at::Tensor> &extend_seq_lens,
+                                   int64_t num_rows, int64_t topk, at::Tensor indices);
 
 int64_t flash_attention_sparse_prefill_workspace_size_kunpeng(int64_t vo_head_dim);
 void flash_attention_sparse_prefill_kunpeng(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor indices,
@@ -677,6 +679,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "fake_indexer_topk_rows_kunpeng(Tensor extend_seq_lens, Tensor prefix_lens, "
         "int topk, Tensor(a!) indices) -> ()");
     m.impl("fake_indexer_topk_rows_kunpeng", fake_indexer_topk_rows_kunpeng);
+
+    // Fake indexer, MTP (TARGET_VERIFY / DRAFT_EXTEND) variant: fixed n
+    // query rows per sequence in the [B, n, topk] layout. extend_seq_lens
+    // is optional (verify: undefined = all rows live). Direct-write output.
+    m.def(
+        "fake_indexer_topk_mtp_kunpeng(Tensor seq_lens, Tensor? extend_seq_lens, "
+        "int num_rows, int topk, Tensor(a!) indices) -> ()");
+    m.impl("fake_indexer_topk_mtp_kunpeng", fake_indexer_topk_mtp_kunpeng);
 
     // DSA (NSA) sparse prefill attention (see kunpeng_attention.cpp for the
     // contract). Direct-write out/lse.

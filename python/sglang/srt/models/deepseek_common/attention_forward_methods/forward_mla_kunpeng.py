@@ -93,17 +93,28 @@ class DeepseekMLAKunpengForwardMixin:
             # q_norm + quantize fusion: emit (int8, scale) so q_b_proj skips
             # the separate quant pass inside W8A8Int8LinearMethod.apply.
             q_normed = self.q_a_layernorm(q, quantize=True)
-            # DSA (NSA): indexer 选 top-k token 位置 ([bs, topk], -1 padding),
-            # decode 时由 backend 映射为 KV slot (dsa_topk_slots_kunpeng +
-            # flash_mla_sparse_decode_kunpeng). 仅 DECODE/IDLE: extend/MTP
-            # 走稠密 paged MLA (seq_len <= topk 时等价). CPU 上 Indexer
-            # 分派到 920F fake (全 id).
+            # DSA (NSA): indexer 选 top-k token 位置 (decode: [bs, topk];
+            # MTP verify/draft-extend: [bs, n, topk]; -1 padding), 由 backend
+            # 映射为 KV slot (dsa_topk_slots_kunpeng +
+            # flash_mla_sparse_decode_kunpeng). 覆盖 DECODE/IDLE 和 MTP 的
+            # TARGET_VERIFY/DRAFT_EXTEND (后者仅在非 LC 模式 -- LC 走 CP 稀疏
+            # 路径, 不消费 topk_indices); plain extend 在 MHA_KUNPENG 路径
+            # 调用. CPU 上 Indexer 分派到 920F fake (全 id).
             # TODO(kunpeng): 复用 fused quant pass 的 bf16 normed q,
             # 免第二次 layernorm.
             if (
                 getattr(self, "use_nsa", False)
                 and self.indexer is not None
-                and forward_batch.forward_mode.is_decode_or_idle()
+                and (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or (
+                        not self._lc_enabled
+                        and (
+                            forward_batch.forward_mode.is_target_verify()
+                            or forward_batch.forward_mode.is_draft_extend()
+                        )
+                    )
+                )
             ):
                 if not getattr(self, "skip_topk", False) or prev_topk_indices is None:
                     topk_indices = self.indexer(
@@ -190,7 +201,19 @@ class DeepseekMLAKunpengForwardMixin:
             out_cache_loc. The kunpeng write kernels skip ``loc < 0`` rows, so
             the non-local rows no longer need to be dropped eagerly here
             (boolean-mask filtering allocates new tensors and is not
-            graph-capture safe)."""
+            graph-capture safe).
+
+            Batch padding rows (dp-attention / all2all padding) carry all-zero
+            out_cache_loc rows: their garbage K/V must not be scattered into
+            slot 0 -- the paged allocator hands out page 0 first, so slot 0
+            is a LIVE page. Route those rows to -1 as well; the mask derives
+            from loc itself (a real row never has all-zero slots) and
+            masked_fill keeps the shape, so this stays graph-capture safe."""
+            bs = forward_batch.input_ids.shape[0]
+            if loc is not None and bs > 0 and loc.shape[0] % bs == 0:
+                tpr = loc.shape[0] // bs
+                pad = loc.view(bs, tpr).eq(0).all(dim=1).repeat_interleave(tpr)
+                loc = loc.masked_fill(pad, -1)
             return loc, kk, pp
 
         if self.swap_mgr.enable_swap_kv_in:

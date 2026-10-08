@@ -291,9 +291,10 @@ class KunpengCpuBackend(AttentionBackend):
         # _init_long_context_metadata); 0 until the first LC decode step.
         self._lc_max_topk: int = 0
 
-        # DSA (NSA): decode runs sparse flash MLA over the indexer-selected
-        # top-k tokens (topk_indices -> slots via dsa_topk_slots_kunpeng);
-        # MTP modes still run the dense paged MLA path.
+        # DSA (NSA): decode, MTP verify and draft-extend run the sparse
+        # flash MLA over the indexer-selected top-k tokens
+        # (topk_indices -> slots via dsa_topk_slots_kunpeng); plain extend
+        # runs the sparse prefill kernel.
         self._nsa_enabled = is_deepseek_nsa(model_config.hf_text_config)
         self._nsa_topk = (
             get_nsa_index_topk(model_config.hf_config) if self._nsa_enabled else 0
@@ -301,7 +302,8 @@ class KunpengCpuBackend(AttentionBackend):
         self._nsa_dense_fallback_warned = False
         if self._nsa_enabled:
             logger.info(
-                "DSA (NSA) sparse decode enabled: topk=%d (MTP verify still dense)",
+                "DSA (NSA) sparse attention enabled: topk=%d "
+                "(decode + MTP verify/draft-extend + prefill)",
                 self._nsa_topk,
             )
         if self._lc_enabled:
@@ -348,6 +350,26 @@ class KunpengCpuBackend(AttentionBackend):
         # across steps so the fixed (B, speculative_num_draft_tokens,
         # MAX_TOPK) shape can be reused as a graph input. They are not reset
         # here (idle/extend forwards never read them).
+
+        if (
+            self._nsa_enabled
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.seq_lens is not None
+            and forward_batch.seq_lens.numel() > 0
+        ):
+            # Bring-up guard for the fake indexer's prefill selection
+            # (moved out of Indexer.forward_cpu so it also holds for graph
+            # replays, not just the capture round): the per-query-row
+            # causal-prefix selection is exact only while the full window
+            # (prefix + chunk) fits in topk.
+            max_window = int(forward_batch.seq_lens.max())
+            if max_window > self._nsa_topk:
+                raise NotImplementedError(
+                    f"fake CPU indexer requires the attention window "
+                    f"({max_window}) <= index_topk ({self._nsa_topk}) "
+                    f"in {forward_batch.forward_mode} mode; the real CPU "
+                    f"indexer is not implemented yet"
+                )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_decode_metadata(
@@ -567,17 +589,55 @@ class KunpengCpuBackend(AttentionBackend):
             )
 
         with pp_span("decode_sched"):
-            if (
+            mode = forward_batch.forward_mode
+            sparse_mla = (
                 self._nsa_enabled
-                and forward_batch.forward_mode.is_decode()
-                and seqlen_q == 1
                 and seq_lens.shape[0] > 0
-            ):
-                # Per-seq selected count = min(topk, seq_len); clamp >= 1
-                # because the sched rejects 0-length rows.
+                and (
+                    (mode.is_decode() and seqlen_q == 1)
+                    or (
+                        (mode.is_target_verify() or mode.is_draft_extend())
+                        and seqlen_q == self.speculative_num_draft_tokens
+                    )
+                )
+            )
+            if sparse_mla:
+                # Bring-up regime guard for the fake indexer: the sparse
+                # selection is exact only while the FULL attention window
+                # fits in topk. verify/draft-extend seq_lens already
+                # include the n draft rows (init_forward_metadata), and
+                # each draft chain step's backend inits with seq_lens +
+                # i + 1, so this check covers every mode that reaches the
+                # sparse path. It runs OUTSIDE the graph capture region,
+                # so every replay round is guarded (not just capture).
+                max_window = int(seq_lens.max())
+                if max_window > self._nsa_topk:
+                    raise NotImplementedError(
+                        f"fake CPU indexer requires the attention window "
+                        f"({max_window}) <= index_topk ({self._nsa_topk}) "
+                        f"in {mode} mode; the real CPU indexer is not "
+                        f"implemented yet"
+                    )
+                # Per-seq scan bound = min(topk, window of the LAST query
+                # row) == min(topk, seq_len); clamp >= 1 because the sched
+                # rejects 0-length rows. Per-row lengths are trimmed by the
+                # trailing -1 padding inside each indices row (verify /
+                # draft-extend have n query rows per sequence).
                 topk_len = torch.minimum(
                     seq_lens, torch.full_like(seq_lens, self._nsa_topk)
                 ).clamp_(min=1)
+                ext = forward_batch.extend_seq_lens
+                if ext is not None:
+                    # Padding rows (extend_seq_lens == 0) carry the 1-entry
+                    # LC dummy index pattern: their kernel-side topk_length
+                    # is 1, not min(seq_lens, topk).
+                    ext_slice = ext[
+                        metadata.token_slice_start : metadata.token_slice_start
+                        + metadata.batchsize_per_tp
+                    ]
+                    topk_len = torch.where(
+                        ext_slice == 0, torch.ones_like(topk_len), topk_len
+                    )
                 metadata.extra_bytes = (
                     torch.ops.sgl_kernel.flash_mla_sparse_decode_sched_kunpeng(
                         topk_len,
@@ -1646,12 +1706,17 @@ class KunpengCpuBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = False,
+        topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        """MTP target-verify forward via the paged MLA path.
+        """MTP target-verify forward via the sparse (DSA) or paged MLA path.
 
         q has a fixed shape (sum_seq_len == bs * speculative_num_draft_tokens);
         it is reshaped here to (bs, speculative_num_draft_tokens, H, D).
+        With DSA topk_indices (full-batch [B, n, topk] from the indexer) the
+        sparse flash MLA kernel runs over the selected tokens; without it the
+        dense paged MLA path (one-time warning).
         """
         self.swap_mgr.get_kv_cache()
 
@@ -1669,6 +1734,19 @@ class KunpengCpuBackend(AttentionBackend):
             # into the persistent SHM regions + pure-read of the peers').
             # The model runs the online-softmax reduce over the cp dimension.
             return self._forward_mla_paged_cp(q_4d, k, v, layer, forward_batch)
+        if topk_indices is not None:
+            # DSA (NSA): sparse flash MLA over the indexer-selected tokens
+            # (n query rows per sequence, causal windows encoded in the
+            # per-row indices).
+            return self._forward_mla_sparse_paged(
+                q_4d, k, v, layer, forward_batch, topk_indices, attn_sink=sinks
+            )
+        if self._nsa_enabled and not self._nsa_dense_fallback_warned:
+            logger.warning(
+                "DSA model TARGET_VERIFY WITHOUT topk_indices (indexer not "
+                "available?); falling back to dense paged MLA"
+            )
+            self._nsa_dense_fallback_warned = True
         return self._forward_mla_paged(q_4d, k, v, layer, forward_batch)
 
     def forward_draft_extend(
@@ -1679,13 +1757,16 @@ class KunpengCpuBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = False,
+        topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        """MTP draft-extend forward via the paged MLA path.
+        """MTP draft-extend forward via the sparse (DSA) or paged MLA path.
 
         q is already left-padded by the model (forward_absorb_core_kunpeng) to
         (bs, speculative_num_draft_tokens, H, D); the unpad happens there too,
-        so this only runs the paged MLA kernel.
+        so this only runs the attention kernel. Padding rows carry the LC
+        dummy index pattern; their outputs are discarded by the unpad.
         """
         self.swap_mgr.get_kv_cache()
 
@@ -1693,6 +1774,18 @@ class KunpengCpuBackend(AttentionBackend):
             # Long-context decode CP: sparse paged MLA + zero-copy exchange;
             # the model runs the online-softmax reduce over the cp dimension.
             return self._forward_mla_paged_cp(q, k, v, layer, forward_batch)
+        if topk_indices is not None:
+            # DSA (NSA): sparse flash MLA over the indexer-selected tokens
+            # (live rows right-aligned over the left padding).
+            return self._forward_mla_sparse_paged(
+                q, k, v, layer, forward_batch, topk_indices, attn_sink=sinks
+            )
+        if self._nsa_enabled and not self._nsa_dense_fallback_warned:
+            logger.warning(
+                "DSA model DRAFT_EXTEND WITHOUT topk_indices (indexer not "
+                "available?); falling back to dense paged MLA"
+            )
+            self._nsa_dense_fallback_warned = True
         return self._forward_mla_paged(q, k, v, layer, forward_batch)
 
     def forward_extend(
@@ -1837,16 +1930,19 @@ class KunpengCpuBackend(AttentionBackend):
         topk_indices: torch.Tensor,
         attn_sink: Optional[torch.Tensor] = None,
     ):
-        """DSA (NSA) sparse decode: top-k selected tokens via the sparse
-        flash MLA kernel.
+        """DSA (NSA) sparse attention via the sparse flash MLA kernel.
 
-        q is 4D (Btp, 1, H, D) -- after the decode all2all H covers all
-        heads of the socket group and Btp is this rank's batch slice.
-        topk_indices is the FULL-batch indexer output ([B, 1, topk] token
-        positions, -1 padding); metadata.token_slice_start selects this
-        rank's rows (0 without the all2all). attn_sink ([H] fp32, optional)
-        is the per-head attention sink, matching the sparse prefill op's
-        semantics. Returns o as 4D (Btp, 1, H, v_head_dim).
+        q is 4D (Btp, seqlen_q, H, D): decode passes (Btp, 1, H, D) -- after
+        the decode all2all H covers all heads of the socket group and Btp is
+        this rank's batch slice; TARGET_VERIFY / DRAFT_EXTEND pass (Btp,
+        speculative_num_draft_tokens, H, D) (draft-extend rows include the
+        model's left padding).
+        topk_indices is the FULL-batch indexer output ([B, topk] token
+        positions for decode, [B, seqlen_q, topk] for the MTP modes; -1
+        padding); metadata.token_slice_start selects this rank's sequence
+        rows (0 without the all2all). attn_sink ([H] fp32, optional) is the
+        per-head attention sink, matching the sparse prefill op's semantics.
+        Returns o as 4D (Btp, seqlen_q, H, v_head_dim).
         """
         meta = self.forward_metadata
         kv_buf = self._get_kv_buffer(
@@ -1867,7 +1963,22 @@ class KunpengCpuBackend(AttentionBackend):
             meta.token_slice_start,
         )
 
-        b, _, nh, _ = q.shape
+        b, sq, nh, _ = q.shape
+        # All-padding slice (every row's req_pool_indices == 0, produced by
+        # the mlp-sync/all2all batch padding): no real work, the outputs are
+        # dropped by the gather-side unpad. Skip the kernel -- the kutacc
+        # sparse kernel segfaults on the degenerate all-padding shape.
+        rpi = forward_batch.req_pool_indices
+        if rpi is not None:
+            start = meta.token_slice_start or 0
+            btp = meta.batchsize_per_tp or rpi.shape[0]
+            rpi_slice = rpi[start : start + btp]
+            if rpi_slice.numel() > 0 and bool((rpi_slice == 0).all()):
+                o = kunpeng.alloc_buffer(
+                    b * sq * nh * layer.v_head_dim, dtype=torch.bfloat16
+                ).view(b, sq, nh, layer.v_head_dim)
+                o.zero_()
+                return o
         softmax_scale = (
             layer.scaling
             if layer.scaling is not None
@@ -1879,9 +1990,9 @@ class KunpengCpuBackend(AttentionBackend):
             else torch.empty(0, dtype=torch.uint8, device=q.device)
         )
         o = kunpeng.alloc_buffer(
-            b * nh * layer.v_head_dim, dtype=torch.bfloat16
-        ).view(b, 1, nh, layer.v_head_dim)
-        lse = kunpeng.alloc_buffer(b * nh, dtype=torch.float32).view(b, 1, nh)
+            b * sq * nh * layer.v_head_dim, dtype=torch.bfloat16
+        ).view(b, sq, nh, layer.v_head_dim)
+        lse = kunpeng.alloc_buffer(b * sq * nh, dtype=torch.float32).view(b, sq, nh)
         kunpeng.flash_mla_sparse_decode_kunpeng(
             q,
             kvcache_paged,

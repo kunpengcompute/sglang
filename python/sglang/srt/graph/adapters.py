@@ -1250,24 +1250,30 @@ def _setup_flash_mla_sparse_decode_kunpeng():
 
 
 def _setup_dsa_topk_slots_kunpeng():
-    # DSA (NSA) decode index transform: indexer top-k token positions ->
-    # flat KV-cache slot ids (+ per-sequence valid counts) for the sparse
-    # flash MLA kernel. Direct-write outputs (bmm-style: eager allocates,
+    # DSA (NSA) index transform: indexer top-k token positions -> flat
+    # KV-cache slot ids (+ per-sequence valid counts) for the sparse flash
+    # MLA kernel. topk_indices [B, topk] (decode) or [B, n, topk] (MTP
+    # verify / draft-extend: n query rows per sequence) -> slots
+    # [bs, n, topk]. Direct-write outputs (bmm-style: eager allocates,
     # capture registers via shape_infer; the C++ graph registrar lists
     # [inputs..., outputs...] in the same order).
     def _out_shapes(block_table, topk_indices):
         bs = block_table.shape[0]
-        topk = (topk_indices.shape[2] if topk_indices.dim() == 3
-                else topk_indices.shape[1])
-        return bs, topk
+        if topk_indices.dim() == 3:
+            n = topk_indices.shape[1]
+            topk = topk_indices.shape[2]
+        else:
+            n = 1
+            topk = topk_indices.shape[1]
+        return bs, n, topk
 
     def shape_infer(block_table, topk_indices, seq_lens, page_size, row_start):
-        bs, topk = _out_shapes(block_table, topk_indices)
-        return [((bs, 1, topk), torch.int32), ((bs,), torch.int32)]
+        bs, n, topk = _out_shapes(block_table, topk_indices)
+        return [((bs, n, topk), torch.int32), ((bs,), torch.int32)]
 
     def eager_fn(block_table, topk_indices, seq_lens, page_size, row_start):
-        bs, topk = _out_shapes(block_table, topk_indices)
-        slots = torch.empty((bs, 1, topk), dtype=torch.int32)
+        bs, n, topk = _out_shapes(block_table, topk_indices)
+        slots = torch.empty((bs, n, topk), dtype=torch.int32)
         topk_length = torch.empty((bs,), dtype=torch.int32)
         torch.ops.sgl_kernel.dsa_topk_slots_kunpeng(
             block_table, topk_indices, seq_lens, page_size, row_start,
@@ -1309,6 +1315,26 @@ def _setup_fake_indexer_topk_rows_kunpeng():
         return indices
 
     register_op('fake_indexer_topk_rows_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_fake_indexer_topk_mtp_kunpeng():
+    # Fake indexer, MTP (TARGET_VERIFY / DRAFT_EXTEND) variant: fixed n
+    # query rows per sequence in the [B, n, topk] layout consumed by
+    # dsa_topk_slots_kunpeng. seq_lens carries the FULL window of the last
+    # query row (verify: context + n; draft-extend: full context);
+    # extend_seq_lens carries the live rows per sequence and is None for
+    # TARGET_VERIFY (all rows live). Direct-write output.
+    def shape_infer(seq_lens, extend_seq_lens, num_rows, topk):
+        return [((seq_lens.shape[0], int(num_rows), int(topk)), torch.int32)]
+
+    def eager_fn(seq_lens, extend_seq_lens, num_rows, topk):
+        indices = torch.empty(
+            (seq_lens.shape[0], int(num_rows), int(topk)), dtype=torch.int32)
+        torch.ops.sgl_kernel.fake_indexer_topk_mtp_kunpeng(
+            seq_lens, extend_seq_lens, int(num_rows), int(topk), indices)
+        return indices
+
+    register_op('fake_indexer_topk_mtp_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_bgemm_kunpeng():
@@ -1563,6 +1589,7 @@ def setup():
     _setup_dsa_topk_slots_kunpeng()
     _setup_fake_indexer_topk_kunpeng()
     _setup_fake_indexer_topk_rows_kunpeng()
+    _setup_fake_indexer_topk_mtp_kunpeng()
     _setup_bgemm_kunpeng()
     _setup_shm_mla_o_alltoall_long_context_kunpeng()
     _setup_lc_mark_empty_lse_kunpeng()

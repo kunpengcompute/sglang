@@ -311,30 +311,39 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
     TORCH_CHECK(topk_indices.scalar_type() == at::kInt || topk_indices.scalar_type() == at::kLong,
                 "topk_indices must be int32 or int64, got ", topk_indices.scalar_type());
     TORCH_CHECK(topk_indices.dim() == 2 || topk_indices.dim() == 3,
-                "topk_indices must be [B, topk] or [B, 1, topk], got ", topk_indices.sizes());
+                "topk_indices must be [B, topk], [B, 1, topk] or [B, n, topk], got ",
+                topk_indices.sizes());
     TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous(),
                 "seq_lens must be contiguous [bs]");
     TORCH_CHECK(page_size > 0, "page_size must be positive");
 
     const int64_t bs = block_table.size(0);
     const int64_t max_blocks = block_table.size(1);
-    int64_t b_full, topk;
+    // topk_indices rows: [B, topk] (decode) or [B, n, topk] (MTP verify /
+    // draft-extend: n query rows per sequence). n == 1 unifies both.
+    int64_t b_full, n_rows, topk, tk_s0, tk_s1;
     if (topk_indices.dim() == 3) {
-        TORCH_CHECK(topk_indices.size(1) == 1, "topk_indices dim1 must be 1, got ",
-                    topk_indices.sizes());
         b_full = topk_indices.size(0);
+        n_rows = topk_indices.size(1);
         topk = topk_indices.size(2);
+        tk_s0 = topk_indices.stride(0);
+        tk_s1 = topk_indices.stride(1);
     } else {
         b_full = topk_indices.size(0);
+        n_rows = 1;
         topk = topk_indices.size(1);
+        tk_s0 = topk_indices.stride(0);
+        tk_s1 = 0;
     }
+    TORCH_CHECK(n_rows >= 1, "topk_indices dim1 must be >= 1, got ", topk_indices.sizes());
     TORCH_CHECK(row_start >= 0 && row_start + bs <= b_full, "row_start ", row_start, " + bs ", bs,
                 " exceeds topk_indices rows ", b_full);
     TORCH_CHECK(seq_lens.size(0) == bs, "seq_lens size ", seq_lens.size(0),
                 " != block_table batch ", bs);
     TORCH_CHECK(slots.dim() == 3 && slots.scalar_type() == at::kInt &&
-                    slots.size(0) == bs && slots.size(1) == 1 && slots.size(2) == topk,
-                "slots must be [bs, 1, topk] int32, got ", slots.sizes());
+                    slots.is_contiguous() && slots.size(0) == bs && slots.size(1) == n_rows &&
+                    slots.size(2) == topk,
+                "slots must be [bs, n, topk] int32, got ", slots.sizes());
     TORCH_CHECK(topk_length.dim() == 1 && topk_length.scalar_type() == at::kInt &&
                     topk_length.size(0) == bs,
                 "topk_length must be [bs] int32, got ", topk_length.sizes());
@@ -344,7 +353,6 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
 
     const bool tk_long = topk_indices.scalar_type() == at::kLong;
     const bool sl_long = seq_lens.scalar_type() == at::kLong;
-    const int64_t tk_s0 = topk_indices.stride(0);
     const int64_t tk_slast = topk_indices.stride(-1);
     TORCH_CHECK(tk_slast == 1 || topk == 1, "topk_indices last dim must be contiguous");
 
@@ -359,23 +367,34 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
     kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
         for (int64_t b = start; b < end; ++b) {
             const int64_t seq_len = sl_long ? sl64[b] : (int64_t)sl32[b];
-            const int64_t row_base = (row_start + b) * tk_s0;
-            int32_t *row = slots_p + b * topk;
-            int32_t valid = 0;
-            for (int64_t i = 0; i < topk; ++i) {
-                const int64_t pos = tk_long ? tk64[row_base + i * tk_slast]
-                                            : (int64_t)tk32[row_base + i * tk_slast];
-                if (pos < 0 || pos >= seq_len)
-                    continue;
-                const int64_t page = pos / page_size;
-                if (page >= max_blocks)
-                    continue;
-                row[valid++] = bt[b * max_blocks + page] * (int32_t)page_size +
-                               (int32_t)(pos % page_size);
+            const int64_t g = row_start + b;
+            int32_t *seq_slots = slots_p + b * n_rows * topk;
+            int32_t valid_max = 0;
+            for (int64_t j = 0; j < n_rows; ++j) {
+                const int64_t row_base = g * tk_s0 + j * tk_s1;
+                int32_t *row = seq_slots + j * topk;
+                int32_t valid = 0;
+                for (int64_t i = 0; i < topk; ++i) {
+                    const int64_t pos = tk_long ? tk64[row_base + i * tk_slast]
+                                                : (int64_t)tk32[row_base + i * tk_slast];
+                    if (pos < 0 || pos >= seq_len)
+                        continue;
+                    const int64_t page = pos / page_size;
+                    if (page >= max_blocks)
+                        continue;
+                    row[valid++] = bt[b * max_blocks + page] * (int32_t)page_size +
+                                   (int32_t)(pos % page_size);
+                }
+                for (int64_t i = valid; i < topk; ++i)
+                    row[i] = -1;
+                if (valid > valid_max)
+                    valid_max = valid;
             }
-            for (int64_t i = valid; i < topk; ++i)
-                row[i] = -1;
-            len_p[b] = valid;
+            // Per-sequence scan bound for the sparse kernel = the largest
+            // row fill (causal-prefix rows are nested, so the last live
+            // row; take the max defensively). Each row is trimmed to its
+            // own length by its trailing -1 padding.
+            len_p[b] = valid_max;
         }
     });
 }
@@ -385,8 +404,9 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
 // token is selected, so the indexer's top-k degenerates to emitting ALL token
 // positions: row b = [0, 1, ..., seq_len_b-1, -1, -1, ...] (padded to topk).
 // Under that regime the sparse decode path is exactly equivalent to dense
-// attention. The Python-side Indexer.forward_cpu guard enforces
-// seq_len <= topk (the fake would silently select the wrong tokens beyond).
+// attention. The seq_len <= topk regime guard lives in
+// KunpengCpuBackend.init_forward_metadata (OUTSIDE the graph capture region,
+// so every replay round is checked).
 //
 // seq_lens [B] int32/int64 (this step's full batch; persistent graph input)
 // indices [B, topk] int32 (direct-write output) -- the same contract as the
@@ -482,6 +502,94 @@ void fake_indexer_topk_rows_kunpeng(const at::Tensor &extend_seq_lens, const at:
                     r[i] = (int32_t)i;
                 for (; i < width; ++i)
                     r[i] = -1;
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Fake indexer, MTP variant (TARGET_VERIFY / DRAFT_EXTEND): fixed n query
+// rows per sequence in the [B, n, topk] layout consumed by
+// dsa_topk_slots_kunpeng and the sparse flash MLA kernel. Exact while the
+// full attention window fits in topk (guarded OUTSIDE the graph capture in
+// KunpengCpuBackend, so every replay round is checked).
+//
+//   seq_lens         [B] int32/int64: full window of the LAST query row
+//                     (verify: pre-draft context + n; draft-extend: full
+//                     context including the extend rows).
+//   extend_seq_lens  [B] int32, optional/undefined: live query rows per
+//                     sequence. TARGET_VERIFY passes none (all n rows live);
+//                     DRAFT_EXTEND passes the per-sequence accepted counts.
+//   num_rows (n)     speculative_num_draft_tokens.
+//   indices          [B, n, topk] int32 direct-write.
+//
+// Live rows are RIGHT-aligned (left padding, matching pad_q_left_mtp): row
+// t is live iff t >= n - ext; live row t' = t - (n - ext) covers the causal
+// prefix [0, prefix + t' + 1) with prefix = seq_len - ext (-1 padded).
+// Empty rows (padding, or a degenerate window <= 0) carry the LC dummy
+// pattern (slot 0 then -1s) so the sparse kernel never scans a fully empty
+// row; their outputs are discarded by unpad_o_right_mtp / batch trim.
+// ---------------------------------------------------------------------------
+void fake_indexer_topk_mtp_kunpeng(const at::Tensor &seq_lens, const c10::optional<at::Tensor> &extend_seq_lens,
+                                   int64_t num_rows, int64_t topk, at::Tensor indices)
+{
+    TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous(),
+                "seq_lens must be contiguous [B]");
+    TORCH_CHECK(seq_lens.scalar_type() == at::kInt || seq_lens.scalar_type() == at::kLong,
+                "seq_lens must be int32 or int64");
+    TORCH_CHECK(num_rows > 0, "num_rows must be positive");
+    TORCH_CHECK(topk > 0, "topk must be positive");
+    const bool has_ext = extend_seq_lens.has_value() && extend_seq_lens->defined() &&
+                         extend_seq_lens->numel() > 0;
+    if (has_ext) {
+        TORCH_CHECK(extend_seq_lens->dim() == 1 && extend_seq_lens->is_contiguous() &&
+                        extend_seq_lens->scalar_type() == at::kInt &&
+                        extend_seq_lens->size(0) == seq_lens.size(0),
+                    "extend_seq_lens must be contiguous [B] int32 matching seq_lens");
+    }
+    TORCH_CHECK(indices.dim() == 3 && indices.is_contiguous() && indices.scalar_type() == at::kInt &&
+                    indices.size(0) == seq_lens.size(0) && indices.size(1) == num_rows &&
+                    indices.size(2) == topk,
+                "indices must be [B, n, topk] int32, got ", indices.sizes());
+
+    const int64_t bs = seq_lens.size(0);
+    if (bs == 0)
+        return;
+
+    const bool sl_long = seq_lens.scalar_type() == at::kLong;
+    const int32_t *sl32 = sl_long ? nullptr : seq_lens.data_ptr<int32_t>();
+    const int64_t *sl64 = sl_long ? seq_lens.data_ptr<int64_t>() : nullptr;
+    const int32_t *ext = has_ext ? extend_seq_lens->data_ptr<int32_t>() : nullptr;
+    int32_t *out = indices.data_ptr<int32_t>();
+
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        for (int64_t b = start; b < end; ++b) {
+            const int64_t seq_len = sl_long ? sl64[b] : (int64_t)sl32[b];
+            int64_t live = ext ? (int64_t)ext[b] : num_rows;
+            if (live < 0)
+                live = 0;
+            if (live > num_rows)
+                live = num_rows;
+            const int64_t off = num_rows - live;
+            const int64_t prefix = seq_len - live;
+            int32_t *seq = out + b * num_rows * topk;
+            for (int64_t t = 0; t < num_rows; ++t) {
+                int32_t *row = seq + t * topk;
+                int64_t valid = 0;
+                if (t >= off)
+                    valid = std::min(prefix + (t - off) + 1, topk);
+                if (valid <= 0) {
+                    // LC dummy pattern: one valid slot id, rest -1.
+                    row[0] = 0;
+                    for (int64_t i = 1; i < topk; ++i)
+                        row[i] = -1;
+                } else {
+                    int64_t i = 0;
+                    for (; i < valid; ++i)
+                        row[i] = (int32_t)i;
+                    for (; i < topk; ++i)
+                        row[i] = -1;
+                }
             }
         }
     });

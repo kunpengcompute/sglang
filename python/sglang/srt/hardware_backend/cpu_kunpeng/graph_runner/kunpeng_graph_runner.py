@@ -642,6 +642,21 @@ class KunpengGraphRunner:
                     # LC + block-wise KV swap: per-step slot-remapped index
                     # buffer consumed by the sparse flash MLA kernel.
                     inputs.append(meta.long_context_hbm_indices)
+            if (
+                getattr(attn_backend, "_nsa_enabled", False)
+                and not getattr(attn_backend, "_lc_enabled", False)
+                and (
+                    forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+                )
+            ):
+                # DSA + MTP: the fake MTP indexer op (inside the capture)
+                # reads the backend's persistent FULL-batch seq lens (verify
+                # rows already include +n). Register the SAME view the op
+                # consumes. (The full-batch extend_seq_lens it also reads
+                # for DRAFT_EXTEND is already in the base input list above.)
+                inputs.append(
+                    meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
+                )
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)
