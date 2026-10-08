@@ -642,18 +642,27 @@ class KunpengGraphRunner:
                     # LC + block-wise KV swap: per-step slot-remapped index
                     # buffer consumed by the sparse flash MLA kernel.
                     inputs.append(meta.long_context_hbm_indices)
+            absorbed_dsa_prefill = (
+                forward_mode.is_extend_without_speculative()
+                and getattr(attn_backend, "_nsa_enabled", False)
+                and not getattr(attn_backend, "_lc_enabled", False)
+            )
             if (
                 getattr(attn_backend, "_nsa_enabled", False)
                 and not getattr(attn_backend, "_lc_enabled", False)
                 and (
-                    forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+                    forward_mode.is_target_verify()
+                    or forward_mode.is_draft_extend()
+                    or absorbed_dsa_prefill
                 )
             ):
-                # DSA + MTP: the fake MTP indexer op (inside the capture)
-                # reads the backend's persistent FULL-batch seq lens (verify
-                # rows already include +n). Register the SAME view the op
-                # consumes. (The full-batch extend_seq_lens it also reads
-                # for DRAFT_EXTEND is already in the base input list above.)
+                # DSA + MTP / absorbed prefill: the fake MTP indexer op
+                # (inside the capture) reads the backend's persistent
+                # FULL-batch seq lens (verify rows already include +n).
+                # Register the SAME view the op consumes. (The full-batch
+                # extend_seq_lens it also reads for draft-extend /
+                # absorbed prefill is already in the base input list
+                # above.)
                 inputs.append(
                     meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
                 )
@@ -661,7 +670,13 @@ class KunpengGraphRunner:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_cache_loc)
-            if forward_batch.extend_prefix_lens is not None:
+            if (
+                forward_batch.extend_prefix_lens is not None
+                and not absorbed_dsa_prefill
+            ):
+                # The absorbed DSA prefill path never reads the prefix lens
+                # (its windows come from full_seq_lens + extend_seq_lens);
+                # only the MHA prefill kernels consume them.
                 inputs.append(forward_batch.extend_prefix_lens)
 
         spec_info = getattr(forward_batch, "spec_info", None)
@@ -852,6 +867,22 @@ class KunpengGraphRunner:
         attn_backend = self._resolve_attn_backend(
             self.model_runner, forward_batch
         )
+        # Absorbed DSA prefill: the padded attention shape (bs, max_ext,
+        # H, D) and the [bs, max_ext, topk] indexer buffers depend on
+        # max(extend_seq_lens), not just total_tokens/batch_size (e.g.
+        # [4,4] and [7,1] share total_tokens=8 but pad differently), so it
+        # must be part of the cache key.
+        absorbed_prefill_key = (
+            int(forward_batch.extend_seq_lens.max())
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and forward_batch.extend_seq_lens is not None
+                and forward_batch.extend_seq_lens.numel() > 0
+                and getattr(attn_backend, "_nsa_enabled", False)
+                and not getattr(attn_backend, "_lc_enabled", False)
+            )
+            else None
+        )
         graph_cache_key = (
             forward_batch.forward_mode,
             total_tokens,
@@ -860,6 +891,7 @@ class KunpengGraphRunner:
             id(attn_backend)
             if attn_backend is not self.model_runner.attn_backend
             else None,
+            absorbed_prefill_key,
         )
 
         if graph_cache_key not in self._sglang_graph_cache:

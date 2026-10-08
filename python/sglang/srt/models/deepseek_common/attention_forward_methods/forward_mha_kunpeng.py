@@ -49,7 +49,9 @@ class DeepseekMHAKunpengForwardMixin:
         zero_allocator: BumpAllocator,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        topk_indices = None
+        # DSA models run plain EXTEND through the absorbed MLA path (see
+        # handle_attention_kunpeng_cpu); this MHA prefill path serves the
+        # non-DSA / LC configurations and never produces topk_indices.
         if self.q_lora_rank is not None:
             # fused_qkv_a_proj_with_mqa (via prepare_qkv_latent)
             qkva = self.prepare_qkv_latent(hidden_states, forward_batch)
@@ -60,25 +62,6 @@ class DeepseekMHAKunpengForwardMixin:
             # q_norm + quantize fusion: emit (int8, scale) so q_b_proj skips
             # the separate quant pass inside W8A8Int8LinearMethod.apply.
             q_normed = self.q_a_layernorm(q, quantize=True)
-            # DSA (NSA): indexer 选 top-k token 位置 (plain EXTEND, CPU 上
-            # 为 920F fake), 由 flash_attention_sparse_prefill_kunpeng 消费;
-            # 无 topk 时 core 回退稠密. GLM-5 "shared" indexer 层复用上一层
-            # (skip_topk). TODO(kunpeng): 复用 fused quant 的 normed q.
-            if (
-                getattr(self, "use_nsa", False)
-                and self.indexer is not None
-                and forward_batch.forward_mode.is_extend_without_speculative()
-            ):
-                if not getattr(self, "skip_topk", False) or prev_topk_indices is None:
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=self.q_a_layernorm(q),
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
-                    )
-                else:
-                    topk_indices = prev_topk_indices
             out, _ = self.q_b_proj(q_normed)
             q = out.view(-1, self.num_local_heads, self.qk_head_dim)
         else:
@@ -113,7 +96,7 @@ class DeepseekMHAKunpengForwardMixin:
 
         cps = get_global_server_args().chunked_prefill_size
         if cps is not None and cps > 0:
-            return q, None, None, forward_batch, topk_indices
+            return q, None, None, forward_batch, None
 
         # kv_b
         out, _ = self.kv_b_proj(kv_a)
@@ -122,7 +105,7 @@ class DeepseekMHAKunpengForwardMixin:
         v = kv[..., self.qk_nope_head_dim :]
         k = self._concat_and_cast_mha_k_kunpeng(k_nope, k_pe, forward_batch)
 
-        return q, k, v, forward_batch, topk_indices
+        return q, k, v, forward_batch, None
 
     def forward_normal_core_kunpeng(
         self: DeepseekV2AttentionMLA,
@@ -135,41 +118,36 @@ class DeepseekMHAKunpengForwardMixin:
         cps = get_global_server_args().chunked_prefill_size
         if cps is not None and cps > 0:
             attn_output = self._forward_mha_chunked_prefill_kunpeng(
-                q, forward_batch, topk_indices)
+                q, forward_batch)
         else:
-            attn_output = self.attn_mha(
-                q, k, v, forward_batch, save_kv_cache=False,
-                **(dict(topk_indices=topk_indices)
-                   if topk_indices is not None else {}),
-            )
+            attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
 
         # o_proj
         output, _ = self.o_proj(attn_output)
 
-        # Return topk_indices for the next layer when enabling index cache
-        # (mirrors forward_absorb_core_kunpeng).
+        # Keep the (output, topk) tuple shape for the shared-indexer layer
+        # plumbing; this path never produces topk anymore (DSA prefill runs
+        # absorbed, see forward_normal_prepare_kunpeng).
         if self.next_skip_topk is None:
             return output
         if not self.next_skip_topk:
             return output, None
         else:
-            return output, topk_indices
+            return output, None
 
     def _forward_mha_chunked_prefill_kunpeng(
         self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
         forward_batch: ForwardBatch,
-        topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run chunked-prefill MLA attention as a chain of graph ops.
 
         Gathers the paged latent via block_table, applies kv_b_proj through
         the quantized GEMM ops, assembles MHA K/V, then runs varlen flash
-        attention (or the DSA sparse prefill kernel when the indexer
-        produced top-k indices). Requires block_table/seq_lens metadata
-        from init_forward_metadata.
+        attention. Requires block_table/seq_lens metadata from
+        init_forward_metadata.
         """
         meta = forward_batch.attn_backend.forward_metadata
 
@@ -303,27 +281,7 @@ class DeepseekMHAKunpengForwardMixin:
         if envs.SGLANG_KUNPENG_ZERO_OUT.get():
             kunpeng.zero_(out)
 
-        if topk_indices is not None:
-            # 5a. DSA sparse prefill over the SAME packed per-head K/V (the
-            # kernel applies the causal mask itself); tiny per-thread
-            # workspace. attn_sink is plumbed with the real indexer / sinks.
-            sparse_ws_bytes = (
-                torch.ops.sgl_kernel
-                .flash_attention_sparse_prefill_workspace_size_kunpeng(
-                    self.v_head_dim)
-            )
-            sparse_ws = kunpeng.alloc_buffer(
-                sparse_ws_bytes, dtype=torch.uint8)
-            kunpeng.flash_attention_sparse_prefill_kunpeng(
-                q, k, v, topk_indices, None, out, None, sparse_ws,
-                True,  # causal
-                softmax_scale,
-                forward_batch.extend_seq_lens, prefix_lens,
-                None,  # attn_sink
-            )
-            return out
-
-        # 5b. Dense varlen flash attention.
+        # Dense varlen flash attention.
         # Attention workspace (same sizing as before).
         def align64(x):
             return (x + 63) // 64 * 64

@@ -1081,10 +1081,10 @@ class Indexer(MultiPlatformOp):
         sparse prefill paths are exactly equivalent to dense attention.
 
         Decode: ALL positions [0, seq_len) per sequence (-1 padded to topk).
-        Plain EXTEND: per-query-row causal prefix [0, prefix+t] (-1 padded).
-        TARGET_VERIFY / DRAFT_EXTEND: [B, n, topk] rows -- verify windows
-        grow [0, ctx + t + 1); draft-extend live rows are right-aligned over
-        the model's left padding.
+        TARGET_VERIFY / DRAFT_EXTEND / absorbed prefill: [B, n, topk] rows
+        -- verify windows grow [0, ctx + t + 1); draft-extend live rows are
+        right-aligned over the model's left padding; absorbed prefill pads
+        to the batch-wide max extend len the same way.
 
         The seq_len <= index_topk regime guard lives in
         KunpengCpuBackend.init_forward_metadata (OUTSIDE the graph capture
@@ -1105,43 +1105,51 @@ class Indexer(MultiPlatformOp):
 
         backend = forward_batch.attn_backend
 
-        if forward_batch.forward_mode.is_extend_without_speculative():
-            # Plain EXTEND (the MHA_KUNPENG dispatch): per-query-row causal
-            # prefix, consumed by flash_attention_sparse_prefill_kunpeng.
-            prefix_lens = forward_batch.extend_prefix_lens
-            if prefix_lens is None:
-                prefix_lens = torch.zeros_like(forward_batch.extend_seq_lens)
-            return kunpeng.fake_indexer_topk_rows_kunpeng(
-                forward_batch.extend_seq_lens,
-                prefix_lens,
-                self.index_topk,
-                envs.SGLANG_KUNPENG_MAX_SEQ_LEN.get(),
-            )
-
-        if forward_batch.forward_mode.is_target_verify() or (
-            forward_batch.forward_mode.is_draft_extend()
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            # MTP (the MLA_KUNPENG dispatch): n query rows per sequence in
-            # the [B, n, topk] layout, consumed by dsa_topk_slots_kunpeng +
+            # MTP verify/draft-extend and DSA absorbed prefill (all via the
+            # MLA_KUNPENG dispatch): a fixed row count per sequence in the
+            # [B, n, topk] layout, consumed by dsa_topk_slots_kunpeng +
             # flash_mla_sparse_decode_kunpeng. full_seq_lens is the
             # backend's persistent FULL-batch buffer (graph input; verify
-            # rows already include +n, draft-extend holds the full context)
-            # -- not the per-q_lora-row slice the decode branch uses.
+            # rows already include +n, the other modes hold the full
+            # context) -- not the per-q_lora-row slice the decode branch
+            # uses.
             bs = forward_batch.seq_lens.shape[0]
             seq_lens = backend.forward_metadata.full_seq_lens[:bs]
-            n = backend.speculative_num_draft_tokens
-            if forward_batch.forward_mode.is_draft_extend():
+            if forward_batch.forward_mode.is_target_verify():
+                n = backend.speculative_num_draft_tokens
+                # All n rows live (verify batches carry no extend lens).
+                extend_seq_lens = None
+            else:
+                # Draft-extend: fixed n = speculative_num_draft_tokens;
+                # absorbed prefill: n = the per-sequence padded row count
+                # (token-granular a2all rounds it up to the socket multiple;
+                # the extra leading rows are LC dummies, matching the q
+                # left-padding), or the batch-wide max extend len without
+                # the a2all.
                 extend_seq_lens = forward_batch.extend_seq_lens
+                # Clamp >= 1: an all-padding batch (every extend_seq_lens
+                # == 0) still needs >= 1 (dummy) row per sequence -- the
+                # fake indexer kernel rejects num_rows == 0.
+                n = (
+                    backend.speculative_num_draft_tokens
+                    if forward_batch.forward_mode.is_draft_extend()
+                    else (
+                        backend.forward_metadata.absorbed_padded_rows
+                        or max(int(extend_seq_lens.max()), 1)
+                    )
+                )
                 assert (
                     extend_seq_lens is not None
                     and extend_seq_lens.shape[0] == bs
                 ), (
-                    "DRAFT_EXTEND batch must carry a [bs] extend_seq_lens "
-                    "for the fake CPU indexer"
+                    f"{forward_batch.forward_mode} batch must carry a [bs] "
+                    f"extend_seq_lens for the fake CPU indexer"
                 )
-            else:
-                # TARGET_VERIFY: all n rows live (no extend_seq_lens).
-                extend_seq_lens = None
             return kunpeng.fake_indexer_topk_mtp_kunpeng(
                 seq_lens, extend_seq_lens, n, self.index_topk
             )
