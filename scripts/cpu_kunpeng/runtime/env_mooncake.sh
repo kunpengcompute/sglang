@@ -22,10 +22,11 @@
 # ------------------------------------------------------------
 # mooncake_master owns the global segment allocation, the object metadata and
 # the eviction decisions; every prefill rank registers its L2 host pool with it.
-# It is a native binary, not a python module: the pip wheel ships the client
-# (mooncake.store) only, so MOONCAKE_MASTER_BIN must point at a locally built
-# mooncake_master.
-export MOONCAKE_MASTER_BIN="${MOONCAKE_MASTER_BIN:-}"
+# It is a native binary, not a python module: the wheel ships the client
+# (mooncake.store) plus this binary (mooncake/mooncake_master, exposed as
+# bin/mooncake_master), so master and client stay in lockstep -- they must, or
+# the store RPC rejects the client ("invalid rpc arg" during warmup).
+export MOONCAKE_MASTER_BIN="${MOONCAKE_MASTER_BIN:-$CONDA_ENV_PATH/bin/mooncake_master}"
 # Port of the master's embedded HTTP metadata server. This is NOT the port the
 # store clients use: those go through MOONCAKE_MASTER
 # (= MOONCAKE_MASTER_NODE:MOONCAKE_MASTER_PORT, the master's RPC port, see

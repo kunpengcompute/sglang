@@ -41,7 +41,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, NSATokenToKVPool
 from sglang.srt.utils import get_device_module, is_cpu_920f
 from sglang.srt.environ import envs
 
@@ -160,6 +160,10 @@ if is_cpu_920f():
     # docstring of hardware_backend/cpu_kunpeng/hicache.py).
     from sglang.srt.hardware_backend.cpu_kunpeng.hicache import (
         cpu_device_module as device_module,
+    )
+    from sglang.srt.hardware_backend.cpu_kunpeng.hicache import (
+        hicache_page_flatten_batch,
+        hicache_page_unflatten_batch,
     )
 else:
     device_module = get_device_module()
@@ -381,6 +385,7 @@ class HiCacheController:
         pp_rank: int = 0,
         pp_size: int = 1,
         enable_storage_metrics: bool = False,
+        l1l3_only: bool = False,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -394,6 +399,14 @@ class HiCacheController:
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
+        # Two-tier mode (Kunpeng L1+L3): there is no L2 host pool at all. The
+        # only extra memory is the fixed flat I/O buffer allocated at attach
+        # time -- a bounce target for the L3 backend, never allocated/freed or
+        # bound to a tree node. See the hiradix_cache 1l3 branches.
+        self.l1l3_only = l1l3_only
+        self.flat_write: Optional[torch.Tensor] = None
+        self.flat_read: Optional[torch.Tensor] = None
+        self.flat_io_batch_pages = 0
         self.write_policy = write_policy
         self.page_size = page_size
         self.io_backend = io_backend
@@ -422,7 +435,18 @@ class HiCacheController:
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
-        self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+        if not self.l1l3_only:
+            self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+        elif not isinstance(self.mem_pool_device, MLATokenToKVPool) or isinstance(
+            self.mem_pool_device, NSATokenToKVPool
+        ):
+            # The flat L3 blob is the MLA (layer, token, 1, kv_dim) layout; MHA
+            # would need a k/v split per layer and NSA keeps a separate indexer
+            # pool, so both are rejected instead of silently mis-encoding.
+            raise NotImplementedError(
+                "SGLANG_KUNPENG_HICACHE_L1L3_ONLY currently supports MLA pools "
+                f"only, got {type(self.mem_pool_device).__name__}"
+            )
 
         if write_policy not in [
             "write_through",
@@ -430,6 +454,14 @@ class HiCacheController:
             "write_back",
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
+        if self.l1l3_only and write_policy == "write_back":
+            # No L2 to hold the data until eviction, so write_back would have to
+            # block eviction on an L3 ack. Only the write-through policies are
+            # supported in the two-tier mode.
+            raise ValueError(
+                "SGLANG_KUNPENG_HICACHE_L1L3_ONLY supports write_through / "
+                "write_through_selective only, got write_back"
+            )
 
         # self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue: List[CacheOperation] = []
@@ -463,13 +495,14 @@ class HiCacheController:
         if is_cpu_920f():
             logger.info(
                 "[hicache] controller ready: io_backend=%s write_policy=%s "
-                "page_size=%d layers=%d device=%s L3=%s",
+                "page_size=%d layers=%d device=%s L3=%s tiers=%s",
                 self.io_backend,
                 self.write_policy,
                 self.page_size,
                 self.layer_num,
                 self.mem_pool_device.device,
                 self.storage_backend_type if self.enable_storage else "disabled",
+                "L1+L3 (no L2 pool)" if self.l1l3_only else "L1+L2+L3",
             )
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
@@ -632,18 +665,42 @@ class HiCacheController:
 
         try:
             self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.mem_pool_host
+                storage_backend,
+                self.storage_config,
+                None if self.l1l3_only else self.mem_pool_host,
             )
-            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            if self.l1l3_only:
+                if not self.storage_backend.supports_flat_io():
+                    raise ValueError(
+                        f"Storage backend '{storage_backend}' does not implement the "
+                        "flat I/O interface required by "
+                        "SGLANG_KUNPENG_HICACHE_L1L3_ONLY."
+                    )
+                self._alloc_flat_io_buffers()
+            else:
+                self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = max(
-                0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
-            )
-            # granularity of batch storage IO operations, in number of pages
-            self.storage_batch_size = 128
+            if self.l1l3_only:
+                # No L2: the prefetch staging area is the L1 device pool itself,
+                # so cap in-flight prefetched tokens by a share of it.
+                self.prefetch_capacity_limit = max(
+                    self.page_size,
+                    int(
+                        envs.SGLANG_KUNPENG_HICACHE_L1L3_PREFETCH_RATIO.get()
+                        * self.mem_pool_device.size
+                    ),
+                )
+                # granularity of batch storage IO operations, in number of pages
+                self.storage_batch_size = self.flat_io_batch_pages
+            else:
+                self.prefetch_capacity_limit = max(
+                    0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
+                )
+                # granularity of batch storage IO operations, in number of pages
+                self.storage_batch_size = 128
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -655,33 +712,61 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (
-                self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
-            ) or (
-                self.storage_backend_type == "dynamic"
-                and bool(self.storage_config.extra_config.get("interface_v1", 0))
+            if not self.l1l3_only and (
+                (
+                    self.storage_backend_type
+                    in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+                )
+                or (
+                    self.storage_backend_type == "dynamic"
+                    and bool(self.storage_config.extra_config.get("interface_v1", 0))
+                )
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
+            # In the two-tier mode the page functions are not used at all:
+            # _page_transfer / _page_backup go through _page_transfer_l1l3 /
+            # _page_backup_l1l3, which own the batch flatten/unflatten.
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
             if is_cpu_920f():
-                logger.info(
-                    "[hicache] L3 storage ready: backend=%s dir=%s page_size=%d "
-                    "page_bytes=%d batch_pages=%d prefetch_threshold=%d "
-                    "prefetch_capacity_limit=%d backup_skip=%s",
-                    self.storage_backend_type,
-                    getattr(self.storage_backend, "file_path", "-"),
-                    self.page_size,
-                    self.mem_pool_host.get_size_per_token() * self.page_size,
-                    self.storage_batch_size,
-                    self.prefetch_threshold,
-                    self.prefetch_capacity_limit,
-                    self.backup_skip,
-                )
+                if self.l1l3_only:
+                    blob_bytes = (
+                        self.flat_write.size(-1) * self.flat_write.element_size()
+                        if self.flat_write is not None
+                        else 0
+                    )
+                    logger.info(
+                        "[hicache] L3 storage ready (L1+L3 two-tier, no L2 pool): "
+                        "backend=%s page_size=%d page_bytes=%d batch_pages=%d "
+                        "flat_buffer=%.2f GB x2 registered=%s prefetch_threshold=%d "
+                        "prefetch_capacity_limit=%d backup_skip=%s",
+                        self.storage_backend_type,
+                        self.page_size,
+                        blob_bytes,
+                        self.storage_batch_size,
+                        blob_bytes * self.storage_batch_size / 1e9,
+                        self.storage_backend.supports_flat_io(),
+                        self.prefetch_threshold,
+                        self.prefetch_capacity_limit,
+                        self.backup_skip,
+                    )
+                else:
+                    logger.info(
+                        "[hicache] L3 storage ready: backend=%s dir=%s page_size=%d "
+                        "page_bytes=%d batch_pages=%d prefetch_threshold=%d "
+                        "prefetch_capacity_limit=%d backup_skip=%s",
+                        self.storage_backend_type,
+                        getattr(self.storage_backend, "file_path", "-"),
+                        self.page_size,
+                        self.mem_pool_host.get_size_per_token() * self.page_size,
+                        self.storage_batch_size,
+                        self.prefetch_threshold,
+                        self.prefetch_capacity_limit,
+                        self.backup_skip,
+                    )
         except Exception:
             # Best-effort cleanup for partial init.
             try:
@@ -701,9 +786,43 @@ class HiCacheController:
             self.storage_backend = None
             self.storage_backend_type = None
             self.enable_storage = False
+            self.flat_write = None
+            self.flat_read = None
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
             raise
+
+    def _alloc_flat_io_buffers(self):
+        """Allocate and register the two fixed flat I/O buffers (two-tier mode).
+
+        One buffer per storage thread -- ``flat_read`` for the prefetch I/O aux
+        thread, ``flat_write`` for the backup thread -- so neither needs a lock
+        and neither can stall the other. They are allocated once, never freed
+        and never split into slots: the transfer API completes before returning,
+        so a single buffer per direction is enough.
+        """
+        self.flat_io_batch_pages = max(
+            1, envs.SGLANG_KUNPENG_HICACHE_IO_BATCH_PAGES.get()
+        )
+        blob_elems = self.layer_num * self.page_size * self.mem_pool_device.kv_cache_dim
+        self.flat_write = torch.empty(
+            (self.flat_io_batch_pages, blob_elems),
+            dtype=self.mem_pool_device.store_dtype,
+        )
+        self.flat_read = torch.empty_like(self.flat_write)
+        for buffer in (self.flat_write, self.flat_read):
+            self.storage_backend.register_io_buffer(buffer)
+
+    def _device_page_starts(
+        self, indices: torch.Tensor, pages: int, op: str
+    ) -> torch.Tensor:
+        """First slot of each page of a page-aligned contiguous index run."""
+        if indices.numel() != pages * self.page_size:
+            raise ValueError(
+                f"{op}: index run length mismatch, got {indices.numel()} slots for "
+                f"{pages} page(s) x {self.page_size}"
+            )
+        return indices.reshape(pages, self.page_size)[:, 0].contiguous()
 
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
@@ -742,6 +861,8 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage = False
+        self.flat_write = None
+        self.flat_read = None
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
         # Now it's safe to clear the stop event for future re-attach.
@@ -776,6 +897,7 @@ class HiCacheController:
             ), "tp_lcm_size must be divisible by tp_size."
             should_split_heads = (
                 not is_mla_backend
+                and not self.l1l3_only
                 and self.mem_pool_host.layout == "page_head"
                 and tp_lcm_size > self.tp_size
             )
@@ -791,7 +913,12 @@ class HiCacheController:
             attn_cp_size=attn_cp_size,
             is_mla_model=is_mla_backend,
             enable_storage_metrics=self.enable_storage_metrics,
-            is_page_first_layout=self.mem_pool_host.layout == "page_first",
+            # No L2 pool in the two-tier mode, so there is no host layout; the
+            # flat blob keeps the page_first-equivalent (per-page contiguous)
+            # encoding the backends already expect.
+            is_page_first_layout=(
+                True if self.l1l3_only else self.mem_pool_host.layout == "page_first"
+            ),
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
@@ -1061,7 +1188,11 @@ class HiCacheController:
     def append_host_mem_release(self, host_indices: torch.Tensor):
         if host_indices.numel() == 0:
             return
-        pages = host_indices.split(self.mem_pool_host.page_size)
+        if self.l1l3_only:
+            # No L2 pool in the two-tier mode: the released runs are L1 slots.
+            pages = host_indices.split(self.page_size)
+        else:
+            pages = host_indices.split(self.mem_pool_host.page_size)
         for page in pages:
             self.host_mem_release_queue.put(page)
 
@@ -1189,6 +1320,9 @@ class HiCacheController:
             )
 
     def _page_transfer(self, operation):
+        if self.l1l3_only:
+            self._page_transfer_l1l3(operation)
+            return
         # Transfer batch by batch
         debug = _hicache_debug()
         prefix_keys = operation.prefix_keys
@@ -1243,6 +1377,92 @@ class HiCacheController:
             ):
                 operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
+
+            if prefix_keys and len(prefix_keys) > 0:
+                prefix_keys += batch_hashes
+
+    def _page_transfer_l1l3(self, operation):
+        """Two-tier L3 -> L1 read: get a batch into the flat buffer, then scatter
+        it straight into the batch's pre-allocated L1 device slots.
+
+        Runs on the prefetch I/O aux thread, which kupl does not know about, so
+        both the backend call and the scatter stay serial (the batch scatter is
+        the serial kernel, not the parallel ``hicache_page_copy`` used from the
+        scheduler thread).
+
+        Ordering contract, same as the pool path: the data must be in L1 before
+        ``completed_tokens`` moves, because the scheduler thread publishes the
+        node as soon as it observes the completed tokens.
+        """
+        debug = _hicache_debug()
+        prefix_keys = operation.prefix_keys
+        layers = self.mem_pool_device.kv_buffer
+        for i in range(0, len(operation.hash_value), self.storage_batch_size):
+            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+            pages = len(batch_hashes)
+            batch_indices = operation.host_indices[
+                i * self.page_size : (i + pages) * self.page_size
+            ]
+
+            t_batch_start = time.perf_counter() if debug else 0.0
+            if debug:
+                cpu_batch_start, rq_batch_start = _thread_stat()
+
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            hits = self.storage_backend.batch_get_flat(
+                batch_hashes, [self.flat_read[j] for j in range(pages)], extra_info
+            )
+            hit_pages = 0
+            for hit in hits:
+                if not hit:
+                    break
+                hit_pages += 1
+            if hit_pages:
+                # Only the leading run of hits is published, and only after its
+                # bytes have actually landed in L1.
+                hicache_page_unflatten_batch(
+                    layers,
+                    self.flat_read[:hit_pages],
+                    self._device_page_starts(
+                        batch_indices[: hit_pages * self.page_size],
+                        hit_pages,
+                        "L3->L1",
+                    ),
+                    self.page_size,
+                )
+            still_running = operation.increment(hit_pages * self.page_size)
+
+            if debug:
+                t_end = time.perf_counter()
+                cpu_batch_end, rq_batch_end = _thread_stat()
+                cpu_used = cpu_batch_end - cpu_batch_start
+                logger.info(
+                    "[hicache] L3->flat read + flat->L1 scatter: req=%s, %d/%d page(s), "
+                    "device%s, done=%d/%d, total=%.3fs, cpu=%.3fs offcpu=%.3fs rqwait=%ss",
+                    operation.request_id,
+                    hit_pages,
+                    pages,
+                    _idx_range(batch_indices),
+                    operation.completed_tokens,
+                    len(operation.hash_value) * self.page_size,
+                    t_end - t_batch_start,
+                    cpu_used,
+                    (t_end - t_batch_start) - cpu_used,
+                    _fmt_wait(rq_batch_end, rq_batch_start),
+                )
+
+            if not still_running:
+                # Cancelled while this batch was in flight: every slot past the
+                # completed prefix may be recycled already, so stop writing.
+                break
+            if hit_pages != pages:
+                for j in range(hit_pages, pages):
+                    logger.warning(
+                        f"Prefetch operation {operation.request_id} failed to "
+                        f"retrieve page {batch_hashes[j]}."
+                    )
+                operation.mark_terminate()
+                break
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
@@ -1355,9 +1575,11 @@ class HiCacheController:
                 else:
                     if _hicache_debug():
                         logger.info(
-                            "[hicache] L3->L2 start: req=%s, %d page(s), host%s",
+                            "[hicache] %s: req=%s, %d page(s), %s%s",
+                            "L3->flat start" if self.l1l3_only else "L3->L2 start",
                             operation.request_id,
                             storage_hit_count // self.page_size,
+                            "flat" if self.l1l3_only else "host",
                             _idx_range(operation.host_indices),
                         )
                     operation.hash_value = hash_value[
@@ -1385,19 +1607,32 @@ class HiCacheController:
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
+
+        In the two-tier mode (l1l3_only) the indices are L1 device slots instead:
+        there is no L2 to copy into first, so the backup thread gathers the pages
+        straight out of L1 into the flat buffer and writes that out.
         """
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
         self.backup_queue.put(operation)
         if _hicache_debug():
-            logger.info(
-                "[hicache] L2->L3 queued: op=%d, %d page(s), host%s, %d token(s)",
-                operation.id,
-                len(operation.hash_value),
-                _idx_range(host_indices),
-                len(token_ids),
-            )
+            if self.l1l3_only:
+                logger.info(
+                    "[hicache] L1->L3 queued: op=%d, %d page(s), device%s, %d token(s)",
+                    operation.id,
+                    len(operation.hash_value),
+                    _idx_range(host_indices),
+                    len(token_ids),
+                )
+            else:
+                logger.info(
+                    "[hicache] L2->L3 queued: op=%d, %d page(s), host%s, %d token(s)",
+                    operation.id,
+                    len(operation.hash_value),
+                    _idx_range(host_indices),
+                    len(token_ids),
+                )
         return operation.id
 
     # todo: deprecate
@@ -1474,6 +1709,9 @@ class HiCacheController:
 
     # Backup batch by batch
     def _page_backup(self, operation):
+        if self.l1l3_only:
+            self._page_backup_l1l3(operation)
+            return
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
@@ -1516,6 +1754,72 @@ class HiCacheController:
                     operation.completed_tokens,
                     len(operation.hash_value) * self.page_size,
                 )
+
+    def _page_backup_l1l3(self, operation):
+        """Two-tier L1 -> L3 write: gather each batch's L1 device pages into the
+        flat buffer, then hand the buffer to the backend.
+
+        Runs on the backup thread: the gather is the serial batch kernel (safe
+        there), the backend call is zero-copy out of the registered flat buffer.
+        ``operation.host_indices`` holds L1 device slots in this mode.
+        """
+        debug = _hicache_debug()
+        prefix_keys = operation.prefix_keys
+        layers = self.mem_pool_device.kv_buffer
+        src_indices = operation.host_indices
+        for i in range(0, len(operation.hash_value), self.storage_batch_size):
+            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+            pages = len(batch_hashes)
+            batch_indices = src_indices[
+                i * self.page_size : (i + pages) * self.page_size
+            ]
+
+            t_batch_start = time.perf_counter() if debug else 0.0
+            if debug:
+                cpu_batch_start, rq_batch_start = _thread_stat()
+
+            hicache_page_flatten_batch(
+                layers,
+                self.flat_write[:pages],
+                self._device_page_starts(batch_indices, pages, "L1->L3"),
+                self.page_size,
+            )
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            success = all(
+                self.storage_backend.batch_set_flat(
+                    batch_hashes,
+                    [self.flat_write[j] for j in range(pages)],
+                    extra_info,
+                )
+            )
+
+            if debug:
+                t_end = time.perf_counter()
+                cpu_batch_end, rq_batch_end = _thread_stat()
+                cpu_used = cpu_batch_end - cpu_batch_start
+                logger.info(
+                    "[hicache] L1->flat copy + flat->L3 write: op=%d, %d page(s), "
+                    "device%s, done=%d/%d, total=%.3fs, cpu=%.3fs offcpu=%.3fs rqwait=%ss",
+                    operation.id,
+                    pages,
+                    _idx_range(batch_indices),
+                    operation.completed_tokens,
+                    len(operation.hash_value) * self.page_size,
+                    t_end - t_batch_start,
+                    cpu_used,
+                    (t_end - t_batch_start) - cpu_used,
+                    _fmt_wait(rq_batch_end, rq_batch_start),
+                )
+
+            if not success:
+                logger.warning(
+                    f"Write page to storage: {len(batch_hashes)} pages failed."
+                )
+                break
+
+            if prefix_keys and len(prefix_keys) > 0:
+                prefix_keys += batch_hashes
+            operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def backup_thread_func(self):
         """

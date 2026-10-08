@@ -306,6 +306,23 @@ class Envs:
     # that the scheduler never places, so they are pinned here to keep them off
     # the cores owned by the kupl executor pool.
     SGLANG_KUNPENG_HICACHE_CPU_OFFSET = EnvInt(19)
+    # Kunpeng CPU: drop the L2 host pool entirely and run the two-tier
+    # L1(device DDR) + L3(storage) hierarchy. The only extra memory left is the
+    # fixed flat I/O buffer below (a DMA bounce, not a cache tier: no
+    # alloc/free, no eviction, no tree binding). Ignored off the 920F path.
+    SGLANG_KUNPENG_HICACHE_L1L3_ONLY = EnvBool(False)
+    # Pages held by one flat I/O buffer of the two-tier mode. Bounds both the
+    # per-batch L3 granularity and the buffer size (pages * page blob bytes).
+    # Smaller = less DDR, more backend round trips per token.
+    SGLANG_KUNPENG_HICACHE_IO_BATCH_PAGES = EnvInt(128)
+    # Two-tier mode only: share of the L1 device pool that in-flight prefetched
+    # tokens (they are staged straight into L1) may occupy before prefetching is
+    # rate limited.
+    SGLANG_KUNPENG_HICACHE_L1L3_PREFETCH_RATIO = EnvFloat(0.25)
+    # Two-tier mode only: upper bound on the tokens whose only remaining copy is
+    # in L3 (storage-only tree nodes, which cost no memory but do cost tree
+    # metadata), as a multiple of the L1 device pool size.
+    SGLANG_KUNPENG_HICACHE_L3_INDEX_RATIO = EnvFloat(4.0)
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)

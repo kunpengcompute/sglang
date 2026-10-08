@@ -19,7 +19,9 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-SKIP_CONDA=1 source ./env.sh none
+# store role config (not "none"): MOONCAKE_STORE_NODE/PORT live in
+# runtime/env_store.sh, which only the store role loads. Matches launch_store.sh.
+SKIP_CONDA=1 source ./env.sh store
 
 echo "Killing mooncake store service on $MOONCAKE_STORE_NODE"
 ssh "root@$MOONCAKE_STORE_NODE" '

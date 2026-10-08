@@ -58,6 +58,14 @@ std::tuple<at::Tensor, at::Tensor> hicache_page_load_coalesced_batch_kunpeng(
     c10::optional<at::Tensor> draft_kv_buffer, c10::optional<at::Tensor> draft_indices,
     int64_t draft_page_size, std::vector<std::string> paths);
 
+// Two-tier HiCache (L1 device pool + L3 storage, no L2 host pool): batch page
+// (de)serialization between the per-layer L1 tensors and the flat L3 blob.
+void hicache_page_flatten_batch_kunpeng(at::TensorList layers, at::Tensor out,
+                                        at::Tensor page_starts, int64_t page_size);
+
+void hicache_page_unflatten_batch_kunpeng(at::TensorList layers, at::Tensor flat,
+                                          at::Tensor page_starts, int64_t page_size);
+
 void kupl_sdma_set_kv_buffer_2(at::Tensor kv_buffer, at::Tensor loc, at::Tensor k_nope, at::Tensor k_pe,
                                at::Tensor event_tensor, at::Tensor event_num_tensor);
 
@@ -1292,6 +1300,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "hicache_page_unflatten_kunpeng("
         "Tensor(a!) kv_buffer, Tensor flat, int index, int page_size, bool page_first) -> ()");
     m.impl("hicache_page_unflatten_kunpeng", hicache_page_unflatten_kunpeng);
+
+    // Two-tier HiCache (SGLANG_KUNPENG_HICACHE_L1L3_ONLY): one call per batch
+    // moves a whole batch of pages between the per-layer L1 device tensors and
+    // the flat L3 blobs. Serial by design: the callers are the HiCache storage
+    // threads, where kutacc::parallel_for is unsafe.
+    m.def(
+        "hicache_page_flatten_batch_kunpeng("
+        "Tensor[] layers, Tensor(a!) out, Tensor page_starts, int page_size) -> ()");
+    m.impl("hicache_page_flatten_batch_kunpeng", hicache_page_flatten_batch_kunpeng);
+
+    m.def(
+        "hicache_page_unflatten_batch_kunpeng("
+        "Tensor[] layers, Tensor flat, Tensor page_starts, int page_size) -> ()");
+    m.impl("hicache_page_unflatten_batch_kunpeng", hicache_page_unflatten_batch_kunpeng);
 
     // Whole-batch L3 -> L2 load: one call reads a batch of coalesced page files
     // and scatters them into the L2 pools (see the kernel header comment in

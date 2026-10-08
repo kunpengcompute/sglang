@@ -17,7 +17,7 @@ set -e
 
 # ===================== Path definitions =====================
 PYTHON_VERSION=3.12
-source ../env.sh native
+source ../env.sh router
 
 echo "[pyinstall] SGLANG_PATH: $SGLANG_PATH"
 echo "[pyinstall] CONDA_ENV_PATH: $CONDA_ENV_PATH"
@@ -31,11 +31,22 @@ KUPL_LIB=$HPCKIT_PATH/latest/kupl/bisheng/release/lib
 KUTACC_LIB=${KUTACC_PATH}/lib
 SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_path('purelib'))")
 
+if [[ "$SITE_PACKAGES" != "$CONDA_ENV_PATH/"* ]]; then
+    echo "[pyinstall] ERROR: 'python' is $(command -v python) -> $SITE_PACKAGES" >&2
+    echo "[pyinstall]        expected it under $CONDA_ENV_PATH." >&2
+    echo "[pyinstall]        another conda env is active; build from a clean" >&2
+    echo "[pyinstall]        shell so env.sh can activate $CONDA_ENV_NAME." >&2
+    exit 1
+fi
+
 # ===================== kuccl binary dependencies =====================
 # kuccl_pg.py fallback: _kuccl_dir/install/{hucx,xucg}/
 # .so files must be placed under kuccl/install/{hucx,xucg}/ to match fallback path
 KUCCL_FLAGS=()
 if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
+    : "${HUCX_DIR:=${HPCKIT_PATH}/latest/hmpi/bisheng/release/hucx}"
+    : "${XUCG_DIR:=${HPCKIT_PATH}/latest/hmpi/bisheng/release/xucg}"
+    export HUCX_DIR XUCG_DIR
     echo "[pyinstall] SGLANG_ENABLE_KUCCL=1, adding kuccl binaries..."
     KUCCL_FLAGS=(
       --add-binary "/usr/lib64/libnuma.so:."
@@ -59,6 +70,27 @@ if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
       --add-binary "$XUCG_DIR/lib/planc/libucg_planm_ucx_hicoll.so:kuccl/install/xucg/lib/planc"
     )
 fi
+
+# ===================== mooncake transfer engine libs =====================
+# engine*.so needs libgflags/libglog; the bundle loader does not search the conda
+# prefix, so bundle them (glob -> survives soname bumps, warn-only if missing).
+MOONCAKE_LIB_FLAGS=()
+for _mlib in libgflags.so libglog.so; do
+    _madded=0
+    for _mdir in "$CONDA_ENV_PATH/lib" "/usr/lib64"; do
+        [[ -d "$_mdir" ]] || continue
+        _mhits=("$_mdir/$_mlib"*)
+        if [[ -e "${_mhits[0]}" ]]; then
+            echo "[pyinstall] mooncake dep: $_mdir/$_mlib*"
+            MOONCAKE_LIB_FLAGS+=(--add-binary "$_mdir/$_mlib*:.")
+            _madded=1
+            break
+        fi
+    done
+    if [[ "$_madded" == "0" ]]; then
+        echo "[pyinstall] WARNING: $_mlib* not found (mooncake will fail to load at runtime)" >&2
+    fi
+done
 
 # ===================== PyInstaller flags =====================
 PYI_FLAGS=(
@@ -86,6 +118,7 @@ PYI_FLAGS=(
   --add-binary "/usr/lib64/libresolv.so.2:."
   --add-binary "/usr/lib64/libcrypt.so.1:."
   "${KUCCL_FLAGS[@]}"
+  "${MOONCAKE_LIB_FLAGS[@]}"
   --add-data "$SGLANG_SRC/sglang:sglang"
   --add-data "$SITE_PACKAGES/sgl_kernel:sgl_kernel"
   --hidden-import torch
@@ -114,6 +147,11 @@ PYI_FLAGS=(
   --hidden-import transformers.models.ernie4_5
   --hidden-import transformers.models.ernie4_5_moe
   --hidden-import msgspec
+  # mooncake is imported lazily inside functions: import it explicitly; its
+  # libgflags/libglog deps are added by MOONCAKE_LIB_FLAGS below.
+  --hidden-import mooncake
+  --hidden-import mooncake.engine
+  --collect-all mooncake
   --collect-all vllm
   --collect-all torch
   --collect-binaries torch

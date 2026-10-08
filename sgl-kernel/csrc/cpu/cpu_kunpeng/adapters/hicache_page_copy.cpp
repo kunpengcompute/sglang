@@ -14,6 +14,7 @@
  * ==============================================================================
  */
 
+#include <ATen/ATen.h>
 #include <ATen/Tensor.h>
 #include <ATen/ops/empty.h>
 #include <c10/util/Optional.h>
@@ -267,6 +268,163 @@ void hicache_page_unflatten_kunpeng(at::Tensor kv_buffer, at::Tensor flat,
         std::memcpy(dst + layer * layer_stride_bytes + index * kv_dim * elem_sz,
                     src + layer * page_bytes,
                     page_bytes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two-tier (L1 device pool + L3 storage) page (de)serialization.
+//
+// In that mode there is no L2 host pool: a page of the L1 device pool is the
+// source/destination, and the flat blob that the L3 backend stores is assembled
+// in a fixed pre-registered bounce buffer. The L1 device pool keeps one tensor
+// per layer (MTLATokenToKVPool::kv_buffer), so a page spans layer_num separate
+// allocations and neither `hicache_page_flatten_kunpeng` (single 4-D buffer) nor
+// `hicache_page_copy_kunpeng` (parallel, scheduler-thread only) applies.
+//
+// Both ops below are deliberately SERIAL and batched: the caller is a HiCache
+// storage thread (a plain Python thread unknown to kupl), where parallel_for
+// segfaults (see the note above), and one call per batch avoids one GIL round
+// trip per page.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// L1 device pool page geometry. Every layer tensor is (slots, 1, kv_dim) dense,
+// which is what both ops below walk.
+struct DevicePageLayout {
+    std::vector<uint8_t *> layer_ptrs;
+    int64_t layers = 0;
+    int64_t slots = 0;
+    int64_t row_bytes = 0;      // one token of one layer
+    int64_t page_bytes = 0;     // one layer's slice of a page
+};
+
+DevicePageLayout make_device_page_layout(const at::TensorList &layers,
+                                         int64_t page_size, const char *op)
+{
+    TORCH_CHECK(layers.size() > 0, op, ": layers must not be empty");
+    DevicePageLayout layout;
+    layout.layers = static_cast<int64_t>(layers.size());
+    layout.layer_ptrs.reserve(layout.layers);
+    for (int64_t l = 0; l < layout.layers; l++) {
+        const at::Tensor &layer = layers[l];
+        TORCH_CHECK(layer.dim() == 3 && layer.size(1) == 1, op, ": layer ", l,
+                    " must be (slots, 1, kv_dim), got dim=", layer.dim(),
+                    " size(1)=", layer.dim() == 3 ? layer.size(1) : -1);
+        TORCH_CHECK(layer.is_cpu() && layer.is_contiguous(), op, ": layer ", l,
+                    " must be a contiguous CPU tensor");
+        if (l == 0) {
+            layout.slots = layer.size(0);
+            layout.row_bytes = layer.size(2) * layer.element_size();
+        } else {
+            TORCH_CHECK(layer.size(0) == layout.slots && layer.size(2) == layers[0].size(2),
+                        op, ": layer ", l, " geometry mismatch (slots=", layer.size(0),
+                        ", kv_dim=", layer.size(2), ") vs layer 0 (slots=", layout.slots,
+                        ", kv_dim=", layers[0].size(2), ")");
+            TORCH_CHECK(layer.scalar_type() == layers[0].scalar_type(), op,
+                        ": layer ", l, " dtype mismatch");
+        }
+        layout.layer_ptrs.push_back(static_cast<uint8_t *>(layer.data_ptr()));
+    }
+    TORCH_CHECK(page_size > 0, op, ": page_size must be positive, got ", page_size);
+    layout.page_bytes = page_size * layout.row_bytes;
+    return layout;
+}
+
+// Page start slots: 1-D int32/int64, one entry per page.
+std::vector<int64_t> read_page_starts(const at::Tensor &page_starts,
+                                      const DevicePageLayout &layout,
+                                      int64_t page_size, const char *op)
+{
+    TORCH_CHECK(page_starts.dim() == 1, op, ": page_starts must be 1D, got dim=",
+                page_starts.dim());
+    TORCH_CHECK(page_starts.is_cpu() && page_starts.is_contiguous(), op,
+                ": page_starts must be a contiguous CPU tensor");
+    const bool is_i32 = page_starts.scalar_type() == at::kInt;
+    TORCH_CHECK(is_i32 || page_starts.scalar_type() == at::kLong, op,
+                ": page_starts must be int32 or int64, got ", page_starts.scalar_type());
+
+    std::vector<int64_t> starts(static_cast<size_t>(page_starts.numel()));
+    const int32_t *p32 = is_i32 ? page_starts.data_ptr<int32_t>() : nullptr;
+    const int64_t *p64 = is_i32 ? nullptr : page_starts.data_ptr<int64_t>();
+    for (int64_t i = 0; i < page_starts.numel(); i++) {
+        const int64_t start = is_i32 ? static_cast<int64_t>(p32[i]) : p64[i];
+        TORCH_CHECK(start >= 0 && start + page_size <= layout.slots, op,
+                    ": page ", i, " out of range (start=", start, ", page_size=", page_size,
+                    ", slots=", layout.slots, ")");
+        starts[static_cast<size_t>(i)] = start;
+    }
+    return starts;
+}
+
+}  // namespace
+
+// Gather a batch of L1 device pages into flat blobs (one blob per page).
+//   out[p, l * page_size + t] = layers[l][page_starts[p] + t]   for all l, t
+void hicache_page_flatten_batch_kunpeng(at::TensorList layers,
+                                        at::Tensor out,
+                                        at::Tensor page_starts,
+                                        int64_t page_size)
+{
+    constexpr const char *op = "hicache_page_flatten_batch_kunpeng";
+    const DevicePageLayout layout = make_device_page_layout(layers, page_size, op);
+
+    TORCH_CHECK(out.dim() == 2, op, ": out must be (pages, blob_elems), got dim=", out.dim());
+    TORCH_CHECK(out.is_cpu() && out.is_contiguous(), op, ": out must be a contiguous CPU tensor");
+    TORCH_CHECK(out.scalar_type() == layers[0].scalar_type(), op,
+                ": dtype mismatch (out=", out.scalar_type(), ", layers=",
+                layers[0].scalar_type(), ")");
+    const int64_t pages = out.size(0);
+    TORCH_CHECK(page_starts.numel() == pages, op, ": page_starts numel mismatch (",
+                page_starts.numel(), " != ", pages, ")");
+    const int64_t blob_elems = layout.layers * layout.page_bytes / out.element_size();
+    TORCH_CHECK(out.size(1) == blob_elems, op, ": out width mismatch (out=", out.size(1),
+                ", expected=", blob_elems, ")");
+
+    const std::vector<int64_t> starts = read_page_starts(page_starts, layout, page_size, op);
+    uint8_t *dst = static_cast<uint8_t *>(out.data_ptr());
+    const int64_t blob_bytes = blob_elems * out.element_size();
+
+    for (int64_t p = 0; p < pages; p++) {
+        for (int64_t l = 0; l < layout.layers; l++) {
+            std::memcpy(dst + p * blob_bytes + l * layout.page_bytes,
+                        layout.layer_ptrs[l] + starts[p] * layout.row_bytes,
+                        layout.page_bytes);
+        }
+    }
+}
+
+// Inverse of the above: scatter flat blobs back into L1 device pages.
+void hicache_page_unflatten_batch_kunpeng(at::TensorList layers,
+                                          at::Tensor flat,
+                                          at::Tensor page_starts,
+                                          int64_t page_size)
+{
+    constexpr const char *op = "hicache_page_unflatten_batch_kunpeng";
+    const DevicePageLayout layout = make_device_page_layout(layers, page_size, op);
+
+    TORCH_CHECK(flat.dim() == 2, op, ": flat must be (pages, blob_elems), got dim=", flat.dim());
+    TORCH_CHECK(flat.is_cpu() && flat.is_contiguous(), op, ": flat must be a contiguous CPU tensor");
+    TORCH_CHECK(flat.scalar_type() == layers[0].scalar_type(), op,
+                ": dtype mismatch (flat=", flat.scalar_type(), ", layers=",
+                layers[0].scalar_type(), ")");
+    const int64_t pages = flat.size(0);
+    TORCH_CHECK(page_starts.numel() == pages, op, ": page_starts numel mismatch (",
+                page_starts.numel(), " != ", pages, ")");
+    const int64_t blob_elems = layout.layers * layout.page_bytes / flat.element_size();
+    TORCH_CHECK(flat.size(1) == blob_elems, op, ": flat width mismatch (flat=", flat.size(1),
+                ", expected=", blob_elems, ")");
+
+    const std::vector<int64_t> starts = read_page_starts(page_starts, layout, page_size, op);
+    const uint8_t *src = static_cast<const uint8_t *>(flat.data_ptr());
+    const int64_t blob_bytes = blob_elems * flat.element_size();
+
+    for (int64_t p = 0; p < pages; p++) {
+        for (int64_t l = 0; l < layout.layers; l++) {
+            std::memcpy(layout.layer_ptrs[l] + starts[p] * layout.row_bytes,
+                        src + p * blob_bytes + l * layout.page_bytes,
+                        layout.page_bytes);
+        }
     }
 }
 

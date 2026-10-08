@@ -38,6 +38,11 @@ Two pieces live here:
    flat blob layout used by the L3 storage backend. See
    ``sgl-kernel/csrc/cpu/cpu_kunpeng/adapters/hicache_page_copy.cpp``.
    ``hicache_page_load_coalesced_batch`` is the batched L3 -> L2 counterpart.
+
+   ``hicache_page_flatten_batch`` / ``hicache_page_unflatten_batch`` are the
+   two-tier counterparts (``SGLANG_KUNPENG_HICACHE_L1L3_ONLY``): they move a
+   whole batch of pages between the per-layer L1 device tensors and the flat L3
+   blobs in one serial call, because that mode has no L2 pool to address.
 """
 
 import numpy as np
@@ -49,8 +54,10 @@ __all__ = [
     "cpu_device_module",
     "hicache_page_copy",
     "hicache_page_flatten",
+    "hicache_page_flatten_batch",
     "hicache_page_load_coalesced_batch",
     "hicache_page_unflatten",
+    "hicache_page_unflatten_batch",
     "hicache_zeros",
 ]
 
@@ -227,6 +234,58 @@ def hicache_page_unflatten(
         )
     torch.ops.sgl_kernel.hicache_page_unflatten_kunpeng(
         kv_buffer, flat, int(index), int(page_size), bool(page_first)
+    )
+
+
+def hicache_page_flatten_batch(
+    device_layers: list,
+    out: torch.Tensor,
+    page_starts: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Gather a batch of L1 device pages into flat L3 blobs (two-tier mode).
+
+    Two-tier HiCache (``SGLANG_KUNPENG_HICACHE_L1L3_ONLY``) has no L2 host pool,
+    so a page is written straight out of the L1 device pool. That pool keeps one
+    tensor per layer (``MLATokenToKVPool.kv_buffer``), i.e. a page spans
+    ``layer_num`` separate allocations, which the 4-D ``hicache_page_flatten``
+    cannot address and the parallel ``hicache_page_copy`` must not run here (the
+    caller is a storage thread). One serial call handles the whole batch.
+
+    Args:
+        device_layers: the L1 pool's per-layer tensors, each ``(slots, 1, kv_dim)``.
+        out: ``(pages, layer_num * page_size * kv_dim)`` flat blobs, one row per page.
+        page_starts: 1-D int32/int64 slot of each page's first token, len ``pages``.
+        page_size: tokens per page.
+    """
+    if not is_cpu_920f():
+        raise RuntimeError(
+            "hicache_page_flatten_batch is only supported on the Kunpeng CPU "
+            "path (SGLANG_USE_CPU_920F=1)."
+        )
+    torch.ops.sgl_kernel.hicache_page_flatten_batch_kunpeng(
+        list(device_layers), out, page_starts, int(page_size)
+    )
+
+
+def hicache_page_unflatten_batch(
+    device_layers: list,
+    flat: torch.Tensor,
+    page_starts: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Scatter flat L3 blobs back into L1 device pages (two-tier mode).
+
+    Inverse of :func:`hicache_page_flatten_batch`; arguments mirror it with
+    ``flat`` as the source.
+    """
+    if not is_cpu_920f():
+        raise RuntimeError(
+            "hicache_page_unflatten_batch is only supported on the Kunpeng CPU "
+            "path (SGLANG_USE_CPU_920F=1)."
+        )
+    torch.ops.sgl_kernel.hicache_page_unflatten_batch_kunpeng(
+        list(device_layers), flat, page_starts, int(page_size)
     )
 
 

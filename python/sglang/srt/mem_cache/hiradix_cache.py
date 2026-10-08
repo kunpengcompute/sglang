@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchOperation,
+    _hicache_debug,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -46,6 +50,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
@@ -54,6 +59,7 @@ from sglang.srt.mem_cache.radix_cache import (
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.utils import is_cpu_920f
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -70,7 +76,17 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
+        # Two-tier mode (Kunpeng L1+L3): no L2 host pool is created at all, so
+        # the tree only ever holds device-resident nodes plus "storage-only"
+        # nodes (evicted from L1 but still present in L3). Off the Kunpeng path
+        # the flag is forced False and every branch below is dead code.
+        self.l1l3_only = is_cpu_920f() and (
+            envs.SGLANG_KUNPENG_HICACHE_L1L3_ONLY.get()
+        )
+
+        if self.l1l3_only:
+            self.token_to_kv_pool_host = None
+        elif isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -150,6 +166,7 @@ class HiRadixCache(RadixCache):
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
+                l1l3_only=self.l1l3_only,
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -183,7 +200,37 @@ class HiRadixCache(RadixCache):
 
         self.evictable_host_leaves = set()
 
+        # Two-tier mode bookkeeping: nodes whose only remaining copy is in L3.
+        # They cost no memory, so without a counter of their own the tree would
+        # grow forever (keys + page hashes per node).
+        self.evictable_storage_leaves = set()
+        self.storage_only_tokens = 0
+        self.storage_index_limit = (
+            int(
+                envs.SGLANG_KUNPENG_HICACHE_L3_INDEX_RATIO.get()
+                * self.kv_cache.size
+            )
+            if self.l1l3_only
+            else 0
+        )
+
         super().__init__(params=params)
+
+        if self.l1l3_only:
+            logger.info(
+                "[hicache] two-tier mode (L1+L3, no L2 pool): device_pool=%d token(s), "
+                "page_size=%d, storage_index_limit=%d token(s)",
+                self.kv_cache.size,
+                self.page_size,
+                self.storage_index_limit,
+            )
+            if not self.enable_storage:
+                logger.warning(
+                    "[hicache] two-tier mode is enabled but no L3 backend was "
+                    "configured; the cache degenerates to L1 only. Set "
+                    "--hicache-storage-backend (and its config) or drop "
+                    "SGLANG_KUNPENG_HICACHE_L1L3_ONLY."
+                )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -437,7 +484,12 @@ class HiRadixCache(RadixCache):
 
                 try:
                     if host_indices is not None:
-                        cc.mem_pool_host.free(host_indices)
+                        if self.l1l3_only:
+                            self.cache_controller.mem_pool_device_allocator.free(
+                                host_indices
+                            )
+                        else:
+                            cc.mem_pool_host.free(host_indices)
                 except Exception:
                     logger.exception(
                         "Failed to free host indices for prefetch %s", req_id
@@ -465,7 +517,11 @@ class HiRadixCache(RadixCache):
         try:
             for ack_id, node in list(self.ongoing_backup.items()):
                 try:
-                    node.release_host()
+                    if self.l1l3_only:
+                        # Two-tier: release the L1 slot pin instead.
+                        self.dec_lock_ref(node)
+                    else:
+                        node.release_host()
                 except Exception:
                     logger.exception(
                         "Failed to release host protection for backup op %s", ack_id
@@ -521,7 +577,18 @@ class HiRadixCache(RadixCache):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
-                    entry.release_host()
+                    if self.l1l3_only:
+                        # Two-tier: the L1 slots were pinned with a lock ref
+                        # (there is no host_value protection to release).
+                        self.dec_lock_ref(entry)
+                        if _hicache_debug():
+                            logger.info(
+                                "[hicache] L3 write ack: op=%d, %d token(s) unpinned",
+                                ack_id,
+                                len(entry.value) if entry.value is not None else 0,
+                            )
+                    else:
+                        entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -533,7 +600,11 @@ class HiRadixCache(RadixCache):
                 host_indices_list.append(host_indices)
             if host_indices_list:
                 host_indices = torch.cat(host_indices_list, dim=0)
-                cc.mem_pool_host.free(host_indices)
+                if self.l1l3_only:
+                    # The released runs are L1 device slots in this mode.
+                    cc.mem_pool_device_allocator.free(host_indices)
+                else:
+                    cc.mem_pool_host.free(host_indices)
 
         _drain_revoke()
         _drain_backup()
@@ -619,11 +690,17 @@ class HiRadixCache(RadixCache):
     def reset(self):
         TreeNode.counter = 0
         self.cache_controller.reset()
-        self.token_to_kv_pool_host.clear()
+        if not self.l1l3_only:
+            self.token_to_kv_pool_host.clear()
+        self.evictable_storage_leaves.clear()
+        self.storage_only_tokens = 0
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
+        if self.l1l3_only:
+            # The empty prefix always "exists" in L3 (see TreeNode.storage_backed).
+            self.root_node.storage_backed = True
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -673,6 +750,8 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
+        if self.l1l3_only:
+            return self._write_backup_l1l3(node, write_back)
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed
         # up yet;
@@ -707,6 +786,46 @@ class HiRadixCache(RadixCache):
 
         return len(host_indices)
 
+    def _write_backup_l1l3(self, node: TreeNode, write_back: bool = False) -> int:
+        """Queue an L1 -> L3 write for *node* (two-tier mode).
+
+        Nothing is allocated and no data moves here: the backup thread gathers
+        the node's L1 pages straight into the flat buffer and hands it to the
+        backend. The node is pinned with a lock ref until the L3 ack, so its
+        device slots cannot be freed and reused while the gather is in flight.
+        """
+        # Same prefix invariant as the pool path: only write a node once its
+        # parent is in L3, since the backend resolves a prefix by chaining page
+        # hashes. ``storage_backed`` is set when the parent's write is *queued*,
+        # which keeps insertion order sufficient (a later hit re-tries anyway).
+        if not write_back and (
+            node.parent != self.root_node and not node.parent.storage_backed
+        ):
+            return 0
+        if node.value is None or len(node.value) == 0:
+            return 0
+        if not self.enable_storage:
+            # Without an L3 backend the two-tier mode degenerates to a plain L1
+            # radix cache: nothing to write, nothing to index.
+            return 0
+
+        prefix_keys = (
+            node.get_prefix_hash_values(node.parent)
+            if self.hicache_storage_pass_prefix_keys
+            else None
+        )
+        operation_id = self.cache_controller.write_storage(
+            node.value,
+            node.key,
+            node.hash_value,
+            prefix_keys,
+            **self._get_extra_pools(),
+        )
+        self.ongoing_backup[operation_id] = node
+        node.storage_backed = True
+        self.inc_lock_ref(node)
+        return len(node.value)
+
     def write_backup_storage(self, node: TreeNode):
         prefix_keys = (
             node.get_prefix_hash_values(node.parent)
@@ -730,12 +849,21 @@ class HiRadixCache(RadixCache):
             return
         node.hit_count += 1
 
-        if not node.backuped:
+        # Two-tier mode has no host_value to test, so "already backed up" is the
+        # L3 flag (set when the write is queued).
+        already_backed = node.storage_backed if self.l1l3_only else node.backuped
+        if not already_backed:
             if node.hit_count >= self.write_through_threshold:
                 # write to host if the node is not backuped
                 self.write_backup(node)
 
     def writing_check(self, write_back=False):
+        if self.l1l3_only:
+            # Nothing to acknowledge: in the two-tier mode there is no L1 -> L2
+            # copy and the write-through bookkeeping is the L3 ack queue, which
+            # drain_storage_control_queues() handles with the usual MIN
+            # agreement across ranks.
+            return
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
@@ -780,6 +908,10 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def loading_check(self):
+        if self.l1l3_only:
+            # No L2 -> L1 load-back exists in the two-tier mode: prefetched data
+            # is scattered into L1 by the storage thread before it is published.
+            return
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
@@ -840,6 +972,9 @@ class HiRadixCache(RadixCache):
         return DecLockRefResult(delta=delta)
 
     def _update_host_leaf_status(self, node: TreeNode):
+        if self.l1l3_only:
+            self._update_storage_leaf_status(node)
+            return
         if not node.evicted or node.lock_ref > 0:
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
@@ -853,6 +988,27 @@ class HiRadixCache(RadixCache):
 
         if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
+
+    def _update_storage_leaf_status(self, node: TreeNode):
+        """Two-tier mode: track the storage-only leaves that may be dropped.
+
+        A node is droppable when it has no device value left (its KV is only in
+        L3), is not locked, is not pinned by an in-flight prefetch, and has no
+        children at all -- deleting a node that still has descendants would
+        orphan them (they would stay unreachable from the root forever).
+        """
+        droppable = (
+            node is not self.root_node
+            and node.value is None
+            and node.storage_backed
+            and node.lock_ref == 0
+            and node.host_ref_counter == 0
+            and len(node.children) == 0
+        )
+        if droppable:
+            self.evictable_storage_leaves.add(node)
+        else:
+            self.evictable_storage_leaves.discard(node)
 
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
@@ -871,7 +1027,16 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
 
-            if not x.backuped:
+            if self.l1l3_only:
+                if x.value is None:
+                    # Already dropped from L1: it is bounded by the storage-index
+                    # budget (see _trim_storage_index), not by L1 eviction.
+                    continue
+                if x.storage_backed:
+                    num_evicted += self._evict_storage_backed(x)
+                else:
+                    num_evicted += self._evict_regular(x)
+            elif not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
                     written = self.write_backup(x, write_back=True)
@@ -917,6 +1082,26 @@ class HiRadixCache(RadixCache):
         self._update_leaf_status(node.parent)
         return num_evicted
 
+    def _evict_storage_backed(self, node: TreeNode) -> int:
+        """Two-tier mode L1 eviction of a node that is already in L3.
+
+        Only the device slots are released: the node stays in the tree as a
+        storage-only node (key + page hashes) so a later request can prefetch it
+        back from L3.
+        """
+        # The block stops being L1-local; it is still in L3.
+        self._record_remove_event(node, medium=StorageMedium.GPU)
+        num_evicted = self.cache_controller.evict_device(node.value)
+        assert num_evicted > 0
+        self.evictable_size_ -= num_evicted
+        self.storage_only_tokens += num_evicted
+        node.value = None
+        self._update_leaf_status(node)
+        self._update_host_leaf_status(node)
+        # update leaf status for the parent because the node is evicted
+        self._update_leaf_status(node.parent)
+        return num_evicted
+
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
@@ -928,6 +1113,9 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def evict_host(self, num_tokens: int):
+        if self.l1l3_only:
+            self._evict_storage_only(num_tokens)
+            return
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -962,9 +1150,86 @@ class HiRadixCache(RadixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
+    def _delete_storage_leaf(self, node: TreeNode):
+        """Unlink a storage-only leaf from the tree.
+
+        Unlike ``RadixCache._delete_leaf`` there is no memory to release and
+        ``evictable_size_`` was already decremented when the node lost its
+        device value, so only the parent link and the leaf sets change.
+        """
+        key = node.key.child_key(self.page_size)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+        self.evictable_storage_leaves.discard(node)
+        self._update_storage_leaf_status(node.parent)
+
+    def _evict_storage_only(self, num_tokens: int) -> int:
+        """Drop storage-only leaves until *num_tokens* tokens are unlinked.
+
+        Only the in-process index entry goes away -- the L3 objects stay until
+        the store evicts them -- which is what bounds the tree metadata of
+        prefixes whose KV lives in L3 only.
+        """
+        leaves = list(self.evictable_storage_leaves)
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node) for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
+
+        num_evicted = 0
+        while num_evicted < num_tokens and len(eviction_heap):
+            _priority, x = heapq.heappop(eviction_heap)
+            if x is self.root_node:
+                break
+            # Guard against state that changed while the node sat in the heap.
+            if (
+                x.value is not None
+                or x.lock_ref > 0
+                or x.host_ref_counter > 0
+                or len(x.children) > 0
+            ):
+                continue
+
+            self._record_remove_event(x, medium=StorageMedium.CPU)
+            num_evicted += len(x.key)
+            self.storage_only_tokens -= len(x.key)
+            self._delete_storage_leaf(x)
+
+            if len(x.parent.children) == 0 and x.parent.value is None:
+                new_priority = self.eviction_strategy.get_priority(x.parent)
+                heapq.heappush(eviction_heap, (new_priority, x.parent))
+        return num_evicted
+
+    def _trim_storage_index(self):
+        """Bound the storage-only part of the tree (two-tier mode).
+
+        Those nodes hold no KV memory but do hold the token key and the per-page
+        hashes, so without a budget a long-running server would grow the tree
+        without bound.
+        """
+        if not self.l1l3_only:
+            return
+        excess = self.storage_only_tokens - self.storage_index_limit
+        if excess <= 0:
+            return
+        evicted = self._evict_storage_only(excess)
+        if evicted > 0:
+            logger.info(
+                "[hicache] storage-only index trim: dropped %d token(s), "
+                "now %d/%d token(s)",
+                evicted,
+                self.storage_only_tokens,
+                self.storage_index_limit,
+            )
+
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
+        if self.l1l3_only:
+            # Unreachable: match_prefix() reports host_hit_length == 0, so the
+            # scheduler never asks for an L2 -> L1 promotion. Data comes back
+            # only through a prefetch that lands straight in L1.
+            raise AssertionError("load_back is not available in the two-tier mode")
 
         start_time = time.perf_counter()
         last_hit_node = node
@@ -1071,6 +1336,8 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+            if self.l1l3_only:
+                self._trim_storage_index()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1176,17 +1443,39 @@ class HiRadixCache(RadixCache):
         min_completed_tokens = completed_tokens_tensor.item()
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
-            last_host_node,
-            fetched_key,
-            written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
-        )
+        if self.l1l3_only:
+            # The prefetched pages already sit in L1 (the storage thread
+            # scattered them there), so publishing them is just a device-value
+            # insert; there is no host_value and no load_back afterwards.
+            dup_ranges = self._insert_helper_device(
+                last_host_node,
+                fetched_key,
+                written_indices,
+                hash_value[: min_completed_tokens // self.page_size],
+            )
+            # Tokens that hit an already device-resident node keep their own
+            # slots, so the copies fetched for them are released right away.
+            matched_length = 0
+            for start, end in dup_ranges:
+                self.cache_controller.mem_pool_device_allocator.free(
+                    host_indices[start:end]
+                )
+                matched_length += end - start
+            self.cache_controller.append_host_mem_release(
+                host_indices[min_completed_tokens:completed_tokens]
+            )
+        else:
+            matched_length = self._insert_helper_host(
+                last_host_node,
+                fetched_key,
+                written_indices,
+                hash_value[: min_completed_tokens // self.page_size],
+            )
 
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
+            self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+            self.cache_controller.append_host_mem_release(
+                host_indices[min_completed_tokens:completed_tokens]
+            )
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
@@ -1217,6 +1506,15 @@ class HiRadixCache(RadixCache):
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def is_storage_indexed(self, node: TreeNode) -> bool:
+        """True when *node*'s pages can be resolved from L3 (two-tier mode).
+
+        Used by the scheduler as the prefetch trigger in place of ``backuped``:
+        with no L2 pool there is no host copy to rely on, only the L3 write that
+        was queued for the node.
+        """
+        return node.storage_backed
+
     def match_prefix(self, params: MatchPrefixParams):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
 
@@ -1245,6 +1543,20 @@ class HiRadixCache(RadixCache):
 
         host_hit_length = 0
         last_host_node = last_node
+        if self.l1l3_only:
+            # Two-tier: nothing to count as "host hit" (that tier is gone) and
+            # the prefetch anchor is the deepest node whose pages are in L3.
+            while last_node.evicted:
+                last_node = last_node.parent
+            while not last_host_node.storage_backed:
+                last_host_node = last_host_node.parent
+            return MatchResult(
+                device_indices=value,
+                last_device_node=last_node,
+                last_host_node=last_host_node,
+                host_hit_length=0,
+            )
+
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
@@ -1282,6 +1594,51 @@ class HiRadixCache(RadixCache):
             return
 
         last_host_node.protect_host()
+        if self.l1l3_only:
+            # No L2: allocate the target pages in the L1 device pool so the
+            # prefetch scatters straight into them. Evict from L1 first if the
+            # pool is short; if even that is not enough, drop the prefetch.
+            host_indices = self.cache_controller.mem_pool_device_allocator.alloc(
+                prefetch_length
+            )
+            if host_indices is None:
+                self.evict(EvictParams(num_tokens=prefetch_length))
+                host_indices = self.cache_controller.mem_pool_device_allocator.alloc(
+                    prefetch_length
+                )
+            if host_indices is None:
+                last_host_node.release_host()
+                logger.warning(
+                    "[hicache] prefetch skipped: not enough L1 slots for %d tokens",
+                    prefetch_length,
+                )
+                return
+            if _hicache_debug():
+                logger.info(
+                    "[hicache] prefetch L1 alloc: req=%s, need=%d, got=%d, occupied=%d/%d",
+                    req_id,
+                    prefetch_length,
+                    len(host_indices),
+                    self.cache_controller.prefetch_tokens_occupied,
+                    self.cache_controller.prefetch_capacity_limit,
+                )
+            operation = self.cache_controller.prefetch(
+                req_id,
+                host_indices,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                **self._get_extra_pools(),
+            )
+            self.ongoing_prefetch[req_id] = (
+                last_host_node,
+                prefetch_key,
+                host_indices,
+                operation,
+            )
+            self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+            return
+
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             self.evict_host(prefetch_length)
@@ -1313,6 +1670,88 @@ class HiRadixCache(RadixCache):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+
+    def _insert_helper_device(
+        self, node: TreeNode, key: RadixKey, value, hash_value
+    ):
+        """Publish prefetched L3 pages as L1-resident nodes (two-tier mode).
+
+        Modeled on :meth:`insert`, but the payload arrives from L3 instead of
+        from a finished request:
+
+        * an existing storage-only node covered by the run is *promoted* (it
+          takes ownership of those L1 slots) instead of being duplicated;
+        * a node that is already device-resident keeps its own slots, so the
+          run's duplicates are returned in ``dup_ranges`` for the caller to free;
+        * the tail that is new to the tree becomes new nodes.
+
+        Returns ``dup_ranges``: ``(start, end)`` token offsets into *value* whose
+        slots were not taken over and must be released by the caller.
+        """
+        node.last_access_time = time.monotonic()
+        dup_ranges = []
+        if len(key) == 0:
+            return dup_ranges
+
+        child_key = key.child_key(self.page_size)
+        offset = 0
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.monotonic()
+            prefix_len = node.key.match(key, page_size=self.page_size)
+
+            if prefix_len < len(node.key):
+                new_node = self._split_node(node.key, node, prefix_len)
+                new_node.priority = node.priority
+                if new_node.value is None:
+                    self._promote_storage_node(
+                        new_node, value[:prefix_len]
+                    )
+                else:
+                    dup_ranges.append((offset, offset + prefix_len))
+                node = new_node
+            else:
+                if node.value is None:
+                    self._promote_storage_node(node, value[:prefix_len])
+                else:
+                    dup_ranges.append((offset, offset + prefix_len))
+
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
+            offset += prefix_len
+
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        if len(key):
+            new_node = TreeNode(priority=node.priority)
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = value.clone()
+            new_node.storage_backed = True
+            new_node.hash_value = hash_value
+            node.children[child_key] = new_node
+            self.evictable_size_ += len(value)
+            self._update_leaf_status(node)
+            self._update_leaf_status(new_node)
+            self._update_host_leaf_status(new_node)
+            self._update_host_leaf_status(node)
+            # Device-resident again: emit store(L1) for the router index.
+            self._record_store_event(new_node)
+
+        return dup_ranges
+
+    def _promote_storage_node(self, node: TreeNode, value: torch.Tensor):
+        """Give a storage-only node a device value again (prefetch landed)."""
+        prefix_len = len(value)
+        node.value = value.clone()
+        self.evictable_size_ += prefix_len
+        self.storage_only_tokens -= prefix_len
+        self._update_leaf_status(node)
+        self._update_host_leaf_status(node)
+        self._update_leaf_status(node.parent)
+        self._record_store_event(node)
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
@@ -1401,6 +1840,8 @@ class HiRadixCache(RadixCache):
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
+        # Both halves stay in L3 if the parent page range was written.
+        new_node.storage_backed = child.storage_backed
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
@@ -1444,6 +1885,9 @@ class HiRadixCache(RadixCache):
                     # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(node.value)
+                    if self.l1l3_only:
+                        # Recompute brought the KV back into L1 (it stays in L3).
+                        self.storage_only_tokens -= prefix_len
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
@@ -1459,6 +1903,8 @@ class HiRadixCache(RadixCache):
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
+                    if self.l1l3_only:
+                        self.storage_only_tokens -= prefix_len
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device

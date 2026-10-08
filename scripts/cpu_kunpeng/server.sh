@@ -167,30 +167,45 @@ case "$ROLE" in
         ;;
 esac
 
-# Kunpeng multi-level KV cache (L1 DDR -> L2 DDR -> L3 storage).
+# Kunpeng multi-level KV cache. Two layouts are supported:
+#   (a) three tiers L1 DDR -> L2 DDR -> L3 storage (default)
+#   (b) two tiers L1 DDR -> L3 storage, no L2 pool at all
+#       (KUNPENG_HICACHE_L1L3=1): the L2 pool and all of its machinery are gone,
+#       only a fixed flat I/O buffer is kept as the L3 bounce target.
 # Only the prefill and native roles participate. KUNPENG_HICACHE_BACKEND picks the L3 store:
 #   file     per-page files under KUNPENG_HICACHE_L3_DIR (a directory shared by
 #            all prefill nodes); leave it empty to run L1<->L2 only. layer_first.
-#   mooncake mooncake store master (launch.sh mooncake / launch.sh all); the
-#            store is page_first-only, so the host pool switches layout.
+#   mooncake mooncake store master (launch.sh mooncake / launch.sh all); in the
+#            three-tier layout the store is page_first-only, so the host pool
+#            switches layout; the two-tier layout has no host pool to lay out.
 # Disabled unless ENABLE_KUNPENG_HICACHE=1.
 if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
     HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
-    if [[ "$HICACHE_BACKEND" == "mooncake" ]]; then
-        HICACHE_MEM_LAYOUT="page_first"
-    else
-        HICACHE_MEM_LAYOUT="layer_first"
-    fi
     BASE_ARGS+=(
         --enable-hierarchical-cache
         --hicache-io-backend kunpeng
-        --hicache-mem-layout "$HICACHE_MEM_LAYOUT"
         --hicache-write-policy "${KUNPENG_HICACHE_WRITE_POLICY:-write_through}"
     )
-    if [[ -n "${KUNPENG_HICACHE_SIZE:-}" ]]; then
-        BASE_ARGS+=(--hicache-size "$KUNPENG_HICACHE_SIZE")
+    if [[ "${KUNPENG_HICACHE_L1L3:-0}" == "1" ]]; then
+        # L2 pool removed: no --hicache-size / --hicache-ratio / --hicache-mem-layout
+        # (there is no host pool to size or lay out), and no host DRAM beyond the
+        # fixed flat I/O buffer.
+        export SGLANG_KUNPENG_HICACHE_L1L3_ONLY=1
+        if [[ -n "${KUNPENG_HICACHE_IO_BATCH_PAGES:-}" ]]; then
+            export SGLANG_KUNPENG_HICACHE_IO_BATCH_PAGES="${KUNPENG_HICACHE_IO_BATCH_PAGES}"
+        fi
     else
-        BASE_ARGS+=(--hicache-ratio "${KUNPENG_HICACHE_RATIO:-2.0}")
+        if [[ "$HICACHE_BACKEND" == "mooncake" ]]; then
+            HICACHE_MEM_LAYOUT="page_first"
+        else
+            HICACHE_MEM_LAYOUT="layer_first"
+        fi
+        BASE_ARGS+=(--hicache-mem-layout "$HICACHE_MEM_LAYOUT")
+        if [[ -n "${KUNPENG_HICACHE_SIZE:-}" ]]; then
+            BASE_ARGS+=(--hicache-size "$KUNPENG_HICACHE_SIZE")
+        else
+            BASE_ARGS+=(--hicache-ratio "${KUNPENG_HICACHE_RATIO:-2.0}")
+        fi
     fi
     case "$HICACHE_BACKEND" in
         mooncake)
@@ -317,6 +332,7 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
         fi
 
         _rank_log="${LOG_PATH}/pp${PP_RANK}_dp${DP_RANK_ACTUAL}_tp${TP_RANK_ACTUAL}_$IP.log"
+        export SGLANG_KUNPENG_HICACHE_CPU_OFFSET=$((RANK_IN_NODE * 38 + 17))
         echo "[$(date +%T)] command: taskset -c $((RANK_IN_NODE * 38 + 20)) $SERVER_BIN ${BASE_ARGS[*]} ${SPECIFIC_ARGS[*]} ${IB_ARGS[*]} --tp-rank-in-node ${RANK_IN_NODE} --port $((30000 + RANK_IN_NODE))" > "$_rank_log"
         taskset -c $((RANK_IN_NODE * 38 + 20)) \
         $SERVER_BIN "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \

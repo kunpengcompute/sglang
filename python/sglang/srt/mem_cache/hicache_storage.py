@@ -228,6 +228,53 @@ class HiCacheStorage(ABC):
         """
         raise NotImplementedError()
 
+    def supports_flat_io(self) -> bool:
+        """True when the two-tier (L1+L3) flat-blob interface is implemented.
+
+        That mode has no L2 host pool, so ``batch_get_v1``/``batch_set_v1`` (which
+        resolve their buffers through ``mem_pool_host.get_page_buffer_meta``)
+        cannot be used. Backends implementing this return True from
+        :meth:`supports_flat_io` and take caller-provided 1-D tensors instead;
+        everything else keeps the pool-based interface (default: unsupported).
+        """
+        return False
+
+    def register_io_buffer(self, buffer: torch.Tensor) -> None:
+        """Register a fixed I/O buffer so zero-copy transfers may target it.
+
+        Called once per flat I/O buffer at attach time. Backends that copy
+        through the CPU (e.g. the file backend) need no registration, so the
+        default is a no-op.
+        """
+        pass
+
+    def batch_get_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """Read one page blob per key into the matching 1-D buffer.
+
+        ``buffers[i]`` is a view of the caller's flat I/O buffer and is exactly
+        one page blob wide; the caller guarantees it stays alive until this
+        returns. Returns per-key success, same contract as :meth:`batch_get_v1`.
+        Only called when :meth:`supports_flat_io` is True.
+        """
+        raise NotImplementedError()
+
+    def batch_set_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """Write one page blob per key out of the matching 1-D buffer.
+
+        Mirror of :meth:`batch_get_flat`; returns per-key success.
+        """
+        raise NotImplementedError()
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -560,6 +607,54 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
+
+    def supports_flat_io(self) -> bool:
+        # Only the kunpeng two-tier HiCache path uses the flat interface; same
+        # capability-flag shape as supports_batched_page_load above.
+        return is_cpu_920f()
+
+    def batch_get_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        results = []
+        for key, buffer in zip(keys, buffers):
+            tensor_path = os.path.join(
+                self.file_path, f"{self._get_suffixed_key(key)}.bin"
+            )
+            expected = buffer.numel() * buffer.element_size()
+            try:
+                with open(tensor_path, "rb", buffering=0) as f:
+                    buf = memoryview(buffer.view(torch.uint8).contiguous().numpy())
+                    results.append(f.readinto(buf) == expected)
+            except FileNotFoundError:
+                logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+                results.append(False)
+        return results
+
+    def batch_set_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        results = []
+        for key, buffer in zip(keys, buffers):
+            if self.exists(key):
+                results.append(True)
+                continue
+            tensor_path = os.path.join(
+                self.file_path, f"{self._get_suffixed_key(key)}.bin"
+            )
+            try:
+                buffer.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
+                results.append(True)
+            except Exception as e:
+                logger.error(f"Failed to save tensor {key}: {e}")
+                results.append(False)
+        return results
 
     def _collect_existing_component_keys(
         self,

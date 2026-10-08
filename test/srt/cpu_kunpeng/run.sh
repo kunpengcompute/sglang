@@ -40,6 +40,7 @@
 #   pp_bundle        -- PP consensus bundle (forward/ring-back) demux correctness
 #   broadcast        -- kunpeng broadcast (functional + perf vs gloo)
 #   hicache          -- HiCache L1<->L2 page copy + L2 host pool correctness
+#   hicache_l1_l3    -- HiCache two-tier L1+L3 (no L2 pool) correctness
 #
 # Options (environment variables):
 #   PYTHON        -- python interpreter       (default: python3)
@@ -144,9 +145,18 @@ case "${TEST_NAME}" in
         MASTER_PORT=5015
         TEST_LABEL="HiCache L1<->L2 page copy + L2 host pool + L2->L3->L2 (file)"
         ;;
+    hicache_l1_l3)
+        TEST_FILE="${SCRIPT_DIR}/test_hicache_l1_l3.py"
+        # Two-tier mode (SGLANG_KUNPENG_HICACHE_L1L3_ONLY): no L2 pool at all,
+        # only the fixed flat I/O buffer between L1 and L3. Single process, the
+        # storage threads are the only concurrency involved.
+        WORLD_SIZE=1
+        MASTER_PORT=5016
+        TEST_LABEL="HiCache two-tier L1+L3 (no L2 pool): flat blob ops, write-through, prefetch, index budget"
+        ;;
     *)
         echo "ERROR: unknown test '${TEST_NAME}'" >&2
-        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8, mla_alltoall, rdma_allgather, pp_comm, pp_bundle, broadcast, hicache" >&2
+        echo "Available tests: moe, shm, reduce_scatter, dual_allgather, batch_allgather, allreduce, min_int8, mla_alltoall, rdma_allgather, pp_comm, pp_bundle, broadcast, hicache, hicache_l1_l3" >&2
         exit 1
         ;;
 esac
