@@ -111,8 +111,9 @@ if [[ -z "${SGLANG_KUNPENG_MAX_CUR_LEN:-}" ]]; then
     fi
 fi
 
-# Kutacc fusedmoe multi-expert parallelism (worker pool split into G groups of
-# T threads running experts concurrently; T derived from the tiling entry).
-# Default off: bit-exact with the serial per-expert path.  Set AFTER the
-# instance file so an instance may enable it explicitly.
+# Kutacc fusedmoe multi-expert parallelism: value = group count G (worker
+# pool split into G groups of 32/G threads, each group owning a share of the
+# local experts; per-group tile derived in-kernel, CSV plan untouched).
+# Default 0 = serial per-expert path, bit-exact. Set AFTER the instance file
+# so an instance may enable it explicitly.
 export KUTACC_FUSEDMOE_MULTIEXPT="${KUTACC_FUSEDMOE_MULTIEXPT:-0}"

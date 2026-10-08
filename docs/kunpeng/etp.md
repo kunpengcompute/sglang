@@ -94,7 +94,7 @@ export DECODE_WEIGTHS_HBW_POOL_SIZE_MB=3850
 
 ```bash
 python scripts/cpu_kunpeng/model_processing/split_weights_dsv3.py \
-    --input <model_path> --etp_shard --etp_size 8
+    --model_dir <model_path> --etp_shard --etp_size 8
 # 产出 <model_path>/experts_etp8/layer_{l}/ep{g}_tp{r}.safetensors
 # 每文件=组g的本地专家各1/8分片，16进程按(层,组)并行，无读写放大
 # MTP draft模型（experts/下仅layer_0）对<mtp_model_path>再跑一次，脚本按目录自动适配
@@ -137,19 +137,24 @@ python scripts/cpu_kunpeng/model_processing/split_weights_dsv3.py \
 
 剩余回退主要在gateup的GEMM形状（8专家串行8波×每波barrier）。
 
-### multiexpt专家分组（kutacc侧）
+### multiexpt专家分组（kutacc侧，实验特性）
 
-fusedmoe_*_multiexpt_parallel把工作池分成G组×T线程并发处理多个专家：T由tiling条目推导（T=(N/tile_n)×(K/tile_k)），G=32/T，组以stride-G认领专家。波数与barrier数按G成比例下降。ne==2保留dualexst路径（128p冗余专家场景）。
+fusedmoe_*_multiexpt_parallel把工作池分成G组×T线程（T=池/G），组以stride-G认领专家并发处理，波数与barrier数按每组专家数成比例下降。ne==2保留dualexst路径（128p冗余专家场景）。
 
-档位由GEMM_TILING_PLAN_FILE的CSV控制（map按(N,K)精确匹配，同一形状只一条生效，原地改值切换，无需重编）。以etp8 gateup（N=512,K=7168）为例：
+开关KUTACC_FUSEDMOE_MULTIEXPT=\<组数\>（默认0=串行路径，bit-exact回退）：
 
-| CSV条目(N=512,K=7168) | T | G | 波数 |
+| 组数G（etp8, gateup N=512/K=7168, down N=7168/K=256） | gateup | down | gateup波数 |
 |---|---|---|---|
-| (128,896) | 32 | 1 | 8（即现状，天然回退位） |
-| (256,896) | 16 | 2 | 4 |
-| (512,896) | 8 | 4 | 2 |
+| 0（默认） | 串行 | 串行 | 8 |
+| 2 | T=16, tile (256,896)* | T=16, tile (448,256)* | 4 |
+| 4 | T=8, tile (512,896)* | T=8, tile (896,256)* | 2 |
+| 8 | 不满足（T=4不被bk=8整除），回落串行 | T=4, tile (1792,256)* | — |
 
-tile_k敏感性警告：tile_k变化会改变k-partial的bf16舍入边界，数值末位漂移会显著拉低MTP接受率（实测(256,1792)使接受率1.87→1.46，TPOT反而变差）。切换档位时保持tile_k不变（gateup用896、down用256），并把MTP接受率作为回归守卫。tile_n变化是结果中性的（每个输出元素的k链只依赖tile_k）。
+*组内tile由kutacc内核自行推导（multiexpt_group_tile：保持CSV条目的tile_k、重算tile_n使组内blocks恰等于T），**不依赖也不修改CSV**——串行路径要求同形状CSV条目blocks==池大小（32），同一(N,K)键无法同时服务两条路径（曾因在CSV里加multiexpt档位覆盖串行条目，导致串行路径4×冗余计算、gateup 137.6→785μs/层，2026-10-08实测踩坑后改为内核内推导）。tile_k保持不变确保k-partial舍入与串行路径bit一致；tile_n变化是结果中性的。
+
+串行路径防呆：kutacc在fusedmoe分派处校验CSV条目blocks==池大小——blocks>池直接abort（会静默漏算、结果错误），blocks<池打警告（冗余计算、结果正确但成倍变慢）。
+
+tile_k敏感性警告：任何tile_k变化会改变k-partial的bf16舍入边界，数值末位漂移会显著拉低MTP接受率（实测(256,1792)使接受率1.87→1.46）。调tiling时保持tile_k不变，并把MTP接受率作为回归守卫。
 
 ## 验证要点
 
