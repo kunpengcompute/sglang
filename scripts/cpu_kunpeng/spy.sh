@@ -28,7 +28,7 @@ fi
 
 ROLE="${1:-decode}"
 case "$ROLE" in
-    decode|prefill|all) ;;
+    native|decode|prefill|all) ;;
     *)
         echo "ERROR: unknown role '$ROLE'. Usage: spy.sh [decode|prefill|all] [instance] (default decode)" >&2
         ROLE=decode
@@ -52,6 +52,9 @@ fi
 DECODE_IPS=()
 PREFILL_IPS=()
 case "$ROLE" in
+    native)
+        SKIP_CONDA=1 source "$ENV_SH" native
+        ;;
     decode|all)
         SKIP_CONDA=1 source "$ENV_SH" decode "$INSTANCE"
         DECODE_IPS=("${NODE_IPS[@]}")
@@ -74,7 +77,7 @@ if [[ "$ROLE" == "all" ]]; then
     done
 elif [[ "$ROLE" == "decode" ]]; then
     NODE_IPS=("${DECODE_IPS[@]}")
-else
+elif [[ "$ROLE" != "native" ]]; then
     NODE_IPS=("${PREFILL_IPS[@]}")
 fi
 

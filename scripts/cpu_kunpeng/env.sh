@@ -36,14 +36,22 @@ if [[ "$ACTION" == "none" ]]; then
 fi
 
 # Role-dependent config + defaults.
-# prefill/native/build -> prefill config; decode -> decode config.
+# prefill -> prefill config; native -> native config; decode -> decode config.
+# build needs only the base env + toolchain (see below): no role config, no
+# PREFILL_*/DECODE_* exports leak into the build shell.
 # router/tokenizer resolve each instance's role env themselves (per-entry
 # subshells in launch_router.sh / server_router.sh / launch_tokenizer.sh),
 # so they only load the base env here — no prefill/decode exports leak
 # into the control shell.
 case "$ACTION" in
-    prefill|native|build)
+    native)
+        source "$SCRIPT_DIR/runtime/env_native.sh" || return 1
+        ;;
+    prefill)
         source "$SCRIPT_DIR/runtime/env_prefill.sh" || return 1
+        ;;
+    decode)
+        source "$SCRIPT_DIR/runtime/env_decode.sh" || return 1
         ;;
     mooncake)
         source "$SCRIPT_DIR/runtime/env_mooncake.sh" || return 1
@@ -67,8 +75,12 @@ case "$ACTION" in
             source "$SCRIPT_DIR/runtime/env_decode.sh" || return 1
         fi
         ;;
+    build)
+        : # base env only; toolchain/conda setup below is all build needs
+        ;;
     *)
-        source "$SCRIPT_DIR/runtime/env_decode.sh" || return 1
+        echo "Usage: source env.sh [native|prefill|decode|router|tokenizer|build] [instance]" >&2
+        return 1 2>/dev/null || exit 1
         ;;
 esac
 

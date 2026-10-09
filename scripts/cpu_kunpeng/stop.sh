@@ -17,6 +17,7 @@
 # Pure dispatcher: delegates to the matching sub-script under runtime/.
 # Usage: ./stop.sh <target> [args]
 #   server    [prefill|decode|native] [instance] -> runtime/stop_server.sh
+#   <role>    native|prefill|decode (shorthand for "server <role>")
 #   router                                       -> runtime/stop_router.sh
 #   tokenizer [prefill|decode|all]               -> runtime/stop_tokenizer.sh
 #   mooncake                                     -> runtime/stop_mooncake.sh
@@ -38,6 +39,7 @@ Usage: $0 <target> [side]
 
 Targets:
   server    Kill sglang on the role's cluster nodes (side: prefill|decode|native, optional instance)
+  <role>    native|prefill|decode: shorthand for "server <role>"
   router    Kill the gateway on the router node
   tokenizer Kill tokenizer HTTP server(s) (side: prefill|decode|all, default all)
   mooncake  Kill the mooncake store master on MOONCAKE_MASTER_NODE
@@ -48,6 +50,7 @@ Options:
   -h, --help    show this help and exit
 
 Examples:
+  $0 native
   $0 server decode
   $0 server decode 128p
   $0 tokenizer prefill
@@ -72,6 +75,11 @@ case "$TARGET" in
         ;;
     server|router)
         bash "$SCRIPT_DIR/runtime/stop_${TARGET}.sh" "$@"
+        exit $?
+        ;;
+    # Shorthand: "stop.sh <role>" == "stop.sh server <role>"
+    native|prefill|decode)
+        bash "$SCRIPT_DIR/runtime/stop_server.sh" "$TARGET" "$@"
         exit $?
         ;;
     tokenizer)

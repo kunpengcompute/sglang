@@ -65,9 +65,9 @@ BASE_ARGS=(
     --enable-dp-attention-local-control-broadcast
     --quantization w8a8_int8
     ${LOAD_FORMAT:+--load-format "$LOAD_FORMAT"}
-    --chat-template  "$SGLANG_PATH/examples/chat_template/tool_chat_template_deepseekr1.jinja"
-    --tool-call-parser deepseekv3
-    --reasoning-parser deepseek-r1
+    ${CHAT_TEMPLATE:+--chat-template "$CHAT_TEMPLATE"}
+    ${TOOL_CALL_PARSER:+--tool-call-parser "$TOOL_CALL_PARSER"}
+    ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"}
     --stream-interval "$STREAM_INTERVAL"
 )
 

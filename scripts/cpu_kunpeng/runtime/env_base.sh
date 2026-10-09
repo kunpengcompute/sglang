@@ -184,6 +184,15 @@ export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1 # Kunpeng prefill graph padding t
 export SGLANG_GRAPH_DEBUG_PRINT=0  # 1 = per-op debug print in eager/capture (ops.py) and graph replay (C++)
 # Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
+# Chat template / parsers: model-specific, opt-in. server.sh only passes
+# the flag when the variable is non-empty — set them in .user_env*.sh for
+# models that need them (e.g. DeepSeek-R1:
+#   CHAT_TEMPLATE="$SGLANG_PATH/examples/chat_template/tool_chat_template_deepseekr1.jinja"
+#   TOOL_CALL_PARSER=deepseekv3
+#   REASONING_PARSER=deepseek-r1).
+export CHAT_TEMPLATE=""
+export TOOL_CALL_PARSER=""
+export REASONING_PARSER=""
 # Drop OS page cache (echo 3 > /proc/sys/vm/drop_caches) during stop.sh node
 export DROP_CACHES=0
 # Tokenizer-side cross-process batch timeline logging
