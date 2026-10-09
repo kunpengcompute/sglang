@@ -35,6 +35,19 @@ if TYPE_CHECKING:
 _DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
 
 
+def _kv_write_loc(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+    """Slot-filtered out_cache_loc for the per-layer K/V scatter writes.
+
+    Computed once per step by the backend, outside the capture region
+    (registered as a graph input): all-zero padding rows are routed to -1
+    so the write kernels (which skip ``loc < 0``) never scatter padding
+    K/V into the live page 0. Falls back to the raw out_cache_loc when
+    the backend produced no filter.
+    """
+    filtered = forward_batch.attn_backend.forward_metadata.kv_write_loc
+    return filtered if filtered is not None else forward_batch.out_cache_loc
+
+
 def _lc_reduce_partial_o(o_rows, lse_rows, b, num_local_heads):
     """Merge per-shard partial attention outputs (online-softmax reduction).
 
@@ -198,26 +211,7 @@ class DeepseekMLAKunpengForwardMixin:
 
             q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
 
-        def _lc_filter(loc, kk, pp):
-            """Long-context decode CP (step 2): foreign pages carry slot -1 in
-            out_cache_loc. The kunpeng write kernels skip ``loc < 0`` rows, so
-            the non-local rows no longer need to be dropped eagerly here
-            (boolean-mask filtering allocates new tensors and is not
-            graph-capture safe).
-
-            Batch padding rows (dp-attention / all2all padding) carry all-zero
-            out_cache_loc rows: their garbage K/V must not be scattered into
-            slot 0 -- the paged allocator hands out page 0 first, so slot 0
-            is a LIVE page. Route those rows to -1 as well; the mask derives
-            from loc itself (a real row never has all-zero slots) and
-            masked_fill keeps the shape, so this stays graph-capture safe."""
-            bs = forward_batch.input_ids.shape[0]
-            if loc is not None and bs > 0 and loc.shape[0] % bs == 0:
-                tpr = loc.shape[0] // bs
-                pad = loc.view(bs, tpr).eq(0).all(dim=1).repeat_interleave(tpr)
-                loc = loc.masked_fill(pad, -1)
-            return loc, kk, pp
-
+        loc_w = _kv_write_loc(forward_batch)
         if self.swap_mgr.enable_swap_kv_in:
             # The layer's swap-in is an async DMA over the whole pool and may
             # still be in flight; drain it before writing this step's new K/V
@@ -242,32 +236,20 @@ class DeepseekMLAKunpengForwardMixin:
                     k_nope[start:end], k_pe[start:end],
                 )
             else:
-                loc_w, k_w, p_w = _lc_filter(
-                    forward_batch.out_cache_loc, k_nope, k_pe
-                )
                 self.swap_mgr.set_kv_buffer_2(
-                    self.swap_mgr._cur_kv_hbm, loc_w, k_w, p_w
+                    self.swap_mgr._cur_kv_hbm, loc_w, k_nope, k_pe
                 )
 
             # DDR write keeps the original (un-remapped) out_cache_loc.
             if self.swap_mgr.enable_swap_kv_out:
-                loc_w, k_w, p_w = _lc_filter(
-                    forward_batch.out_cache_loc, k_nope, k_pe
-                )
-                self.swap_mgr.set_kv_buffer_2_sdma(loc_w, k_w, p_w)
+                self.swap_mgr.set_kv_buffer_2_sdma(loc_w, k_nope, k_pe)
             else:
-                loc_w, k_w, p_w = _lc_filter(
-                    forward_batch.out_cache_loc, k_nope, k_pe
-                )
                 self.swap_mgr.set_kv_buffer_2(
-                    self.swap_mgr._cur_kv_ddr, loc_w, k_w, p_w
+                    self.swap_mgr._cur_kv_ddr, loc_w, k_nope, k_pe
                 )
         else:
-            loc_w, k_w, p_w = _lc_filter(
-                forward_batch.out_cache_loc, k_nope, k_pe
-            )
             self.swap_mgr.set_kv_buffer_2(
-                self.swap_mgr._cur_kv_ddr, loc_w, k_w, p_w
+                self.swap_mgr._cur_kv_ddr, loc_w, k_nope, k_pe
             )
 
         return (
@@ -464,16 +446,17 @@ class DeepseekMLAKunpengForwardMixin:
                     # return: shared-indexer layers (skip_topk) reuse it
                     # verbatim and re-slice their own block, and a re-bound
                     # rank-local slice re-slices to 0 rows.
+                    # contiguous_kunpeng materializes the permuted view (a
+                    # raw reshape would abort the graph capture).
                     blk = max_ext_len // all2all_size
                     r = socket_group.rank_in_group
                     kernel_topk_indices = topk_indices[
                         :, r * blk : (r + 1) * blk, :
                     ]
-                    q = (
+                    q = kunpeng.contiguous_kunpeng(
                         q.view(bs, all2all_size, blk, numhead_local_q, D_qk)
                         .permute(1, 0, 2, 3, 4)
-                        .reshape(-1, numhead_local_q, D_qk)
-                    )
+                    ).reshape(-1, numhead_local_q, D_qk)
                 else:
                     kernel_topk_indices = topk_indices
                     q = q.view(-1, numhead_local_q, D_qk)
@@ -529,17 +512,16 @@ class DeepseekMLAKunpengForwardMixin:
                 )
             elif is_absorbed_prefill:
                 # de-interleave back to (bs, max_ext_len, H, D_kv) and unpad
-                attn_output = (
+                # (contiguous_kunpeng for capture safety, as on the q side).
+                attn_output = kunpeng.contiguous_kunpeng(
                     attn_output.view(
                         all2all_size,
                         bs,
                         blk,
                         numhead_local_q,
                         self.kv_lora_rank,
-                    )
-                    .permute(1, 0, 2, 3, 4)
-                    .reshape(bs, max_ext_len, numhead_local_q, self.kv_lora_rank)
-                )
+                    ).permute(1, 0, 2, 3, 4)
+                ).reshape(bs, max_ext_len, numhead_local_q, self.kv_lora_rank)
                 attn_output = kunpeng.unpad_o_right_mtp_kunpeng(
                     attn_output, forward_batch.extend_seq_lens, orig_rows
                 )

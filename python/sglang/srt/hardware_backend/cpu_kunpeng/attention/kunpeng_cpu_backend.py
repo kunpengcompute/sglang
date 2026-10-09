@@ -28,6 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.common import is_lc_cp_enabled
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.graph import ops as kunpeng
+from sglang.srt.graph._capture import is_capturing
 from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import pp_span
 from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import *
 from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
@@ -229,6 +230,20 @@ class KunpengCpuMetadata:
         # the release kernel dereferences. This rank's slice.
         self.sparse_sched_topk_len: Optional[torch.Tensor] = None
 
+        # K/V write locations: out_cache_loc with all-zero padding rows
+        # routed to -1, so the write kernels (which skip ``loc < 0``)
+        # never scatter padding K/V into the live page 0. Computed once
+        # per step outside the capture region (see _init_kv_write_loc)
+        # and registered as a graph input; None = raw passthrough.
+        self.kv_write_loc: Optional[torch.Tensor] = None
+
+        # True when every req_pool_indices row of this rank's slice is 0
+        # (batch padding mirror of another rank's prefill): the sparse
+        # kernel segfaults on the degenerate shape, so the forward skips
+        # it and returns zeros. Frozen Python branch inside the capture,
+        # so it is part of the graph cache key.
+        self.sparse_all_padding: bool = False
+
         # Long-context decode CP metadata (sparse flash MLA over the local
         # 1/cp KV shard). Built once per decode step, reused across layers.
         # ``long_context_indices`` is a PERSISTENT fixed-shape
@@ -354,6 +369,8 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata.token_slice_start = 0
         self.forward_metadata.absorbed_padded_rows = None
         self.forward_metadata.sparse_sched_topk_len = None
+        self.forward_metadata.kv_write_loc = None
+        self.forward_metadata.sparse_all_padding = False
         self.forward_metadata.long_context_topk_length = None
         self.forward_metadata.long_context_real_topk_length = None
         # long_context_indices / fill_len / last_req_idx / last_seq_len are
@@ -448,7 +465,35 @@ class KunpengCpuBackend(AttentionBackend):
             # prefix pages (in cache) + current chunk pages. The paged MHA
             # kernel (MHA_KUNPENG) reads latent via this block_table.
             self._init_extend_mha_metadata(forward_batch)
+
+        self._init_kv_write_loc(forward_batch)
         return
+
+    def _init_kv_write_loc(self, forward_batch: ForwardBatch) -> None:
+        """Per-step K/V write locations and all-padding flag.
+
+        Both derive from tensor content but are consumed inside the
+        captured region, so they are computed here instead:
+        kv_write_loc is registered as a graph input, sparse_all_padding
+        joins the graph cache key.
+        """
+        metadata = self.forward_metadata
+        loc = forward_batch.out_cache_loc
+        bs = forward_batch.input_ids.shape[0]
+        if loc is not None and bs > 0 and loc.shape[0] % bs == 0:
+            tpr = loc.shape[0] // bs
+            pad = loc.view(bs, tpr).eq(0).all(dim=1).repeat_interleave(tpr)
+            metadata.kv_write_loc = loc.masked_fill(pad, -1)
+
+        rpi = forward_batch.req_pool_indices
+        if rpi is None:
+            return
+        start = metadata.token_slice_start or 0
+        btp = metadata.batchsize_per_tp or rpi.shape[0]
+        rpi_slice = rpi[start : start + btp]
+        metadata.sparse_all_padding = (
+            rpi_slice.numel() > 0 and bool((rpi_slice == 0).all())
+        )
 
     def _init_extend_mha_metadata(self, forward_batch: ForwardBatch):
         """Build block_table for the paged MHA extend (chunked prefill).
@@ -1997,24 +2042,24 @@ class KunpengCpuBackend(AttentionBackend):
         )
 
         b, sq, nh, _ = q.shape
-        # All-padding slice (every row's req_pool_indices == 0, produced by
-        # the mlp-sync/all2all batch padding): no real work, the outputs are
-        # dropped by the gather-side unpad. Skip the kernel -- the kutacc
-        # sparse kernel segfaults on the degenerate all-padding shape.
-        rpi = forward_batch.req_pool_indices
-        if rpi is not None:
-            start = meta.token_slice_start or 0
-            btp = meta.batchsize_per_tp or rpi.shape[0]
-            rpi_slice = rpi[start : start + btp]
-            if rpi_slice.numel() > 0 and bool((rpi_slice == 0).all()):
-                o = kunpeng.alloc_buffer(
-                    b * sq * nh * layer.v_head_dim, dtype=torch.bfloat16
-                ).view(b, sq, nh, layer.v_head_dim)
-                o.zero_()
-                return o
+        # All-padding slice (batch padding mirror): no real work -- the
+        # outputs are dropped by the gather-side unpad -- and the kernel
+        # segfaults on the degenerate shape. The flag is part of the graph
+        # cache key; zero_ is a registered op, so replays re-zero.
+        if meta.sparse_all_padding:
+            o = kunpeng.alloc_buffer(
+                b * sq * nh * layer.v_head_dim, dtype=torch.bfloat16
+            ).view(b, sq, nh, layer.v_head_dim)
+            kunpeng.zero_(o)
+            return o
         sched_topk = meta.sparse_sched_topk_len
-        if sched_topk is not None and not torch.equal(
-            sched_topk, topk_length.to(sched_topk.dtype)
+        # Not checked while capturing: registered ops do not execute at
+        # capture time, so topk_length is dsa_topk_slots' shape-only
+        # uninitialized output buffer and the comparison reads garbage.
+        if (
+            sched_topk is not None
+            and not is_capturing()
+            and not torch.equal(sched_topk, topk_length.to(sched_topk.dtype))
         ):
             # The sched planned tile ranges from its metadata-time topk_len
             # while the kernel reads the forward-time topk_length; a
@@ -2037,13 +2082,19 @@ class KunpengCpuBackend(AttentionBackend):
             # compiled out in release. Zero-pad to 64; the dummy heads'
             # outputs are sliced away. The sched sizes the workspace for
             # the padded count (sched_heads in _init_decode_metadata).
-            q = torch.cat(
-                [q, q.new_zeros(b, sq, 64 - nh, q.shape[-1])], dim=2
-            )
+            # Registered ops only: a raw torch.cat / new_zeros would
+            # allocate an unregistered storage and abort the capture.
+            q_padded = kunpeng.alloc_buffer(
+                b * sq * 64 * q.shape[-1], dtype=q.dtype
+            ).view(b, sq, 64, q.shape[-1])
+            kunpeng.copy_kunpeng(q_padded[:, :, :nh], q)
+            kunpeng.zero_(q_padded[:, :, nh:])
+            q = q_padded
             if attn_sink is not None:
-                attn_sink = torch.cat(
-                    [attn_sink, attn_sink.new_zeros(64 - nh)], dim=0
-                )
+                sink_padded = kunpeng.alloc_buffer(64, dtype=attn_sink.dtype)
+                kunpeng.copy_kunpeng(sink_padded[:nh], attn_sink)
+                kunpeng.zero_(sink_padded[nh:])
+                attn_sink = sink_padded
             nh = 64
         softmax_scale = (
             layer.scaling
@@ -2075,7 +2126,8 @@ class KunpengCpuBackend(AttentionBackend):
             self._decode_meta,
         )
         if nh != nh_orig:
-            o = o[:, :, :nh_orig].contiguous()
+            # Registered op: a raw .contiguous() would abort the capture.
+            o = kunpeng.contiguous_kunpeng(o[:, :, :nh_orig])
         return o
 
     def support_triton(self):

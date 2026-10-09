@@ -557,6 +557,9 @@ class KunpengGraphRunner:
             inputs.extend(
                 [forward_batch.out_cache_loc, attn_backend._decode_meta]
             )
+            if meta is not None and meta.kv_write_loc is not None:
+                # Slot-filtered write locations for set_kv_buffer_2.
+                inputs.append(meta.kv_write_loc)
             if getattr(attn_backend, "_nsa_enabled", False):
                 # DSA: full-batch seq lens consumed by the (fake) CPU indexer
                 # graph op. Register the SAME view the op consumes (the
@@ -611,6 +614,8 @@ class KunpengGraphRunner:
                 attn_backend._decode_meta,
             ]
             if meta is not None:
+                if meta.kv_write_loc is not None:
+                    inputs.append(meta.kv_write_loc)
                 inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
                 if self.swap_mgr._blockwise_ddr_block_ids is not None:
                     # Only replace when a block_table entry exists (non-LC
@@ -883,6 +888,12 @@ class KunpengGraphRunner:
             )
             else None
         )
+        # All-padding batches take the zero-output skip branch inside
+        # _forward_mla_sparse_paged -- a Python branch frozen at capture,
+        # so the flag must split the graph cache key.
+        all_padding_key = bool(
+            getattr(attn_backend.forward_metadata, "sparse_all_padding", False)
+        )
         graph_cache_key = (
             forward_batch.forward_mode,
             total_tokens,
@@ -892,6 +903,7 @@ class KunpengGraphRunner:
             if attn_backend is not self.model_runner.attn_backend
             else None,
             absorbed_prefill_key,
+            all_padding_key,
         )
 
         if graph_cache_key not in self._sglang_graph_cache:
