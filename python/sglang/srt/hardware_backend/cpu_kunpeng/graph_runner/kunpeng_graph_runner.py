@@ -723,6 +723,15 @@ class KunpengGraphRunner:
                 "topk_ids_flat_buf",
                 "topk_ids_index_buf",
                 "dynamic_remap_counter",
+                # ETP node-shared buffers: consumed by
+                # moe_etp_dispatch_share_kunpeng / moe_etp_reduce_kunpeng
+                # and (dense_buf/token_ids/offset) by the downstream IGEMM
+                # ops via KunpengDispatchOutput.  None on non-ETP ranks.
+                "etp_dense_buf",
+                "etp_token_ids_buf",
+                "etp_experts_offset",
+                "etp_total",
+                "etp_seq",
             ):
                 t = getattr(state, attr, None)
                 if t is not None:

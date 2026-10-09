@@ -14,10 +14,11 @@
 
 #!/bin/bash
 
-# Usage: spy.sh [decode|prefill|all]   (default: decode)
+# Usage: spy.sh [decode|prefill|all] [instance]   (default: decode; empty instance = default)
+#   e.g. "spy.sh decode 32p-etp8" targets only that instance's nodes.
 #
-# Sources env.sh with <role> and SKIP_CONDA=1 to obtain the correct
-# SGLANG_PATH / CONDA_ENV_PATH / NODE_IPS from the cluster config.
+# Sources env.sh with <role> [<instance>] and SKIP_CONDA=1 to obtain the
+# correct SGLANG_PATH / CONDA_ENV_PATH / NODE_IPS from the cluster config.
 # Requires bash (env.sh uses bash syntax); re-exec under bash if it
 # was invoked as "sh spy.sh".
 
@@ -29,10 +30,11 @@ ROLE="${1:-decode}"
 case "$ROLE" in
     decode|prefill|all) ;;
     *)
-        echo "ERROR: unknown role '$ROLE'. Usage: spy.sh [decode|prefill|all] (default decode)" >&2
+        echo "ERROR: unknown role '$ROLE'. Usage: spy.sh [decode|prefill|all] [instance] (default decode)" >&2
         ROLE=decode
         ;;
 esac
+INSTANCE="${2:-}"
 
 # Locate env.sh from this script's own directory (same cpu_kunpeng dir).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,13 +53,13 @@ DECODE_IPS=()
 PREFILL_IPS=()
 case "$ROLE" in
     decode|all)
-        SKIP_CONDA=1 source "$ENV_SH" decode
+        SKIP_CONDA=1 source "$ENV_SH" decode "$INSTANCE"
         DECODE_IPS=("${NODE_IPS[@]}")
         ;;
 esac
 case "$ROLE" in
     prefill|all)
-        SKIP_CONDA=1 source "$ENV_SH" prefill
+        SKIP_CONDA=1 source "$ENV_SH" prefill "$INSTANCE"
         PREFILL_IPS=("${NODE_IPS[@]}")
         ;;
 esac
@@ -77,6 +79,7 @@ else
 fi
 
 echo "ROLE          = $ROLE"
+echo "INSTANCE      = ${INSTANCE:-<default>}"
 echo "SGLANG_PATH   = $SGLANG_PATH"
 echo "CONDA_ENV_PATH= $CONDA_ENV_PATH"
 echo "NODE_IPS (${#NODE_IPS[@]}) = ${NODE_IPS[*]}"

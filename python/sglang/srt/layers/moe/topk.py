@@ -737,6 +737,34 @@ def _kunpeng_allgather_interleaved_slots(full_buf: torch.Tensor, num_tokens: int
     kunpeng.shm_dual_allgather_kunpeng(src, full_buf, src1, flat)
 
 
+def _kunpeng_etp_remap_topk_ids(topk_ids: torch.Tensor):
+    """Map logical expert ids to (dest rank, local slot) for ETP dispatch.
+
+    With ETP (ep_size < tp_size), expert e is held by the MOE_TP group of
+    moe_tp_size consecutive ranks starting at (e // num_local_experts) *
+    moe_tp_size; the group leader is the single RDMA dispatch destination and
+    the local slot index on every rank of the group is e % num_local_experts.
+
+    Implemented as a single C++ graph op writing the interleaved
+    (leader rank, slot) pairs directly into ``topk_ids_index_buf``: the
+    Python-side equivalent (``(ids // n_local) * etp`` etc.) would create
+    unregistered intermediate tensors that graph capture rejects.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+        _KunpengDispatcherState,
+    )
+
+    state = _KunpengDispatcherState.get()
+    kunpeng.etp_remap_topk_ids_kunpeng(
+        topk_ids,
+        state.topk_ids_index_buf[: topk_ids.shape[0]],
+        topk_ids.shape[0],
+        topk_ids.shape[1],
+        state.num_local_experts,
+        state.moe_tp_size,
+    )
+
+
 def _kunpeng_publish_and_sync_topk_ids(topk_ids: torch.Tensor) -> None:
     """Publish the logical ids into the dispatch buffer and sync across ranks.
 
@@ -744,7 +772,9 @@ def _kunpeng_publish_and_sync_topk_ids(topk_ids: torch.Tensor) -> None:
     the interleaved dispatch buffer's even columns hold the logical ids, which
     may differ across ranks after the rank-local load-balance fill.  This
     re-publishes ``topk_ids`` and runs the same single allgather used by the
-    remap path, so every rank agrees on the routing table.
+    remap path, so every rank agrees on the routing table.  Under ETP the
+    even/odd columns hold the expert group leader rank and the local expert
+    slot instead of the raw logical id.
     """
     from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
         _KunpengDispatcherState,
@@ -753,7 +783,10 @@ def _kunpeng_publish_and_sync_topk_ids(topk_ids: torch.Tensor) -> None:
     state = _KunpengDispatcherState.get()
     num_tokens, topk = topk_ids.shape
     full_buf = state.topk_ids_index_buf[:num_tokens]
-    kunpeng.copy_kunpeng(full_buf[:, 0::2], topk_ids)
+    if state.etp_enabled:
+        _kunpeng_etp_remap_topk_ids(topk_ids)
+    else:
+        kunpeng.copy_kunpeng(full_buf[:, 0::2], topk_ids)
     _kunpeng_allgather_interleaved_slots(full_buf, num_tokens, topk)
 
 
@@ -815,14 +848,20 @@ def grouped_topk_kunpeng(
     if topk_ids_out is not None:
         # Publish the consistent full ids table into the interleaved
         # dispatch buffer (even columns); every rank writes identical data.
+        # Under ETP the even/odd columns hold the expert group leader rank
+        # and the local expert slot instead of the raw logical id.
         from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
             _KunpengDispatcherState,
         )
+        from sglang.srt.layers.moe.topk import _kunpeng_etp_remap_topk_ids
 
         state = _KunpengDispatcherState.get()
-        kunpeng.copy_kunpeng(
-            state.topk_ids_index_buf[: topk_ids.shape[0], 0::2], topk_ids
-        )
+        if state.etp_enabled:
+            _kunpeng_etp_remap_topk_ids(topk_ids)
+        else:
+            kunpeng.copy_kunpeng(
+                state.topk_ids_index_buf[: topk_ids.shape[0], 0::2], topk_ids
+            )
 
     return topk_weights, topk_ids
 
@@ -1408,14 +1447,20 @@ def biased_grouped_topk_kunpeng(
     if topk_ids_out is not None:
         # Publish the consistent full ids table into the interleaved
         # dispatch buffer (even columns); every rank writes identical data.
+        # Under ETP the even/odd columns hold the expert group leader rank
+        # and the local expert slot instead of the raw logical id.
         from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
             _KunpengDispatcherState,
         )
+        from sglang.srt.layers.moe.topk import _kunpeng_etp_remap_topk_ids
 
         state = _KunpengDispatcherState.get()
-        kunpeng.copy_kunpeng(
-            state.topk_ids_index_buf[: topk_ids.shape[0], 0::2], topk_ids
-        )
+        if state.etp_enabled:
+            _kunpeng_etp_remap_topk_ids(topk_ids)
+        else:
+            kunpeng.copy_kunpeng(
+                state.topk_ids_index_buf[: topk_ids.shape[0], 0::2], topk_ids
+            )
 
     return topk_weights, topk_ids
 

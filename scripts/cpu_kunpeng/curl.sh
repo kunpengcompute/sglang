@@ -39,7 +39,8 @@ usage() {
   echo "              rows + response bodies to <run-id>_detail.txt"
   echo "  -F          Fake-transfer mode: inject bootstrap_host=2.2.2.2 + a unique"
   echo "              bootstrap_room per request; decode skips KV transfer without"
-  echo "              --disaggregation-transfer-backend. Port defaults to 30002."
+  echo "              --disaggregation-transfer-backend. Port auto-derived from"
+  echo "              the decode entry in INSTANCES; CURL_PORT overrides."
   echo "  -p          Enable profiling (start/stop profile via separate curl calls)"
   echo "  -c CONC     Max concurrent requests (default: unbounded)"
   echo "  -i          Interactive chat mode — multi-turn streaming conversation"
@@ -158,15 +159,47 @@ parse_ranks() {
 # Override to hit a standalone decode master directly, e.g. fake-transfer
 # decode-throughput tests:
 #   CURL_HOST=<decode master IP> ./curl.sh -d 0-15 -n 512 -m 384
-# With -F (fake transfer), the port defaults to 30002 — the decode tokenizer
-# HTTP server on the route node — so the IP needs no adjustment.
+# With -F (fake transfer), the port auto-derives from the runtime layout
+# (same rule as runtime/env_decode.sh): 30001 + the decode entry's position
+# in INSTANCES (.user_env.sh) — the decode tokenizer HTTP server on the
+# route node, so the IP needs no adjustment. CURL_DECODE_INSTANCE=<suffix>
+# selects among multiple decode entries (e.g. "64p-etp8" for entry
+# "decode_64p-etp8"); CURL_PORT still overrides everything.
 IP=${CURL_HOST:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}
 if [ "$FAKE" = true ]; then
-  PORT=${CURL_PORT:-30002}
+  _want="decode${CURL_DECODE_INSTANCE:+_$CURL_DECODE_INSTANCE}"
+  _insts=$(grep -E '^[[:space:]]*export[[:space:]]+INSTANCES=' \
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.user_env.sh" 2>/dev/null \
+    | head -n1 | cut -d'"' -f2 | tr ',' '\n')
+  # Entry not listed / no .user_env.sh -> classic "prefill,decode" (30002).
+  _g=1
+  if [ -n "$_insts" ]; then
+    _g=-1; _i=0
+    while IFS= read -r _e; do
+      _e="${_e//[[:space:]]/}"
+      [ -z "$_e" ] && continue
+      # Exact match when CURL_DECODE_INSTANCE is set; otherwise take the
+      # FIRST entry with the decode role prefix ("decode" or "decode_*",
+      # same semantics as _instance_indexes' role check).
+      if [ "$_e" = "$_want" ] || { [ -z "${CURL_DECODE_INSTANCE:-}" ] && [ "${_e%%_*}" = "decode" ]; }; then
+        _g=$_i; break
+      fi
+      _i=$((_i + 1))
+    done <<< "$_insts"
+    [ "$_g" -lt 0 ] && _g=1
+  fi
+  PORT=${CURL_PORT:-$((30001 + _g))}
+  unset _want _insts _g _i _e
 else
   PORT=${CURL_PORT:-30000}
 fi
 URL="http://${IP}:${PORT}/v1/completions"
+# Print the resolved target for non-interactive runs: a stale/wrong port
+# silently redirects requests to the wrong instance (e.g. -F hitting a
+# prefill tokenizer), which is hard to notice from the response alone.
+if [ "$INTERACTIVE" = false ]; then
+  echo "Target: $URL" >&2
+fi
 
 # Fake-transfer injection: per-request unique bootstrap_room (ns timestamp
 # base) + the magic fake host recognized by decode._is_fake_transfer.

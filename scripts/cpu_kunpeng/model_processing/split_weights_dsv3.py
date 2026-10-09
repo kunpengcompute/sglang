@@ -206,6 +206,115 @@ def split_moe_experts(
 
 
 # ============================================================================
+# MoE 专家权重 ETP 预切分
+# ============================================================================
+
+
+def _etp_shard_tensor(
+    short: str, flat: torch.Tensor, moe_tp_size: int, moe_tp_rank: int
+) -> torch.Tensor:
+    """Narrow one expert's full tensor to the moe_tp_rank-th ETP shard.
+
+    Mirrors KunpengStateLoader._etp_shard (sglang loader.py) exactly:
+    w13/w13_weight_scale are split per gate/up half and re-concatenated
+    (preserving SwiGLU gate[i]/up[i] pairing), w2_weight is narrowed along
+    the intermediate dim, w2_weight_scale is not sharded.
+    """
+    if short in ("w13_weight", "w13_weight_scale"):
+        half = flat.shape[0] // 2
+        ipp = half // moe_tp_size
+        start = moe_tp_rank * ipp
+        return torch.cat(
+            [flat[start : start + ipp], flat[half + start : half + start + ipp]],
+            dim=0,
+        )
+    if short == "w2_weight":
+        ipp = flat.shape[1] // moe_tp_size
+        return flat[:, moe_tp_rank * ipp : (moe_tp_rank + 1) * ipp].contiguous()
+    return flat.clone()
+
+
+def _process_etp_layer_group(task, experts_dir, out_dir, n_local, etp_size):
+    """Read one (layer, ep_group) of whole experts, write etp_size shard files."""
+    layer, group = task
+    shard = [dict() for _ in range(etp_size)]
+    for local_i in range(n_local):
+        expert_id = group * n_local + local_i
+        data = load_file(
+            os.path.join(
+                experts_dir, f"layer_{layer}", f"expert_{expert_id}.safetensors"
+            )
+        )
+        for file_key, full_tensor in data.items():
+            short = file_key.split(".")[-1]
+            flat = full_tensor[0] if full_tensor.dim() == 3 else full_tensor
+            for tp in range(etp_size):
+                shard[tp][f"{local_i}.{short}"] = _etp_shard_tensor(
+                    short, flat, etp_size, tp
+                )
+
+    layer_out = os.path.join(out_dir, f"layer_{layer}")
+    os.makedirs(layer_out, exist_ok=True)
+    for tp in range(etp_size):
+        save_file(shard[tp], os.path.join(layer_out, f"ep{group}_tp{tp}.safetensors"))
+    return n_local
+
+
+def split_moe_experts_etp(experts_dir, out_dir, etp_size, ep_size, workers=16):
+    """Pre-shard a preprocessed experts/ directory for ETP deployment.
+
+    Layout produced (one file per (layer, ep_group, tp_rank), each holding the
+    group's n_local experts narrowed to 1/etp_size along the intermediate dim):
+
+        out_dir/layer_{l}/ep{g}_tp{r}.safetensors   keys: "{local_i}.w13_weight" ...
+
+    With this, every rank reads exactly its own file per layer (2.5GB/rank
+    total, same I/O picture as the non-ETP ep256 deployment) instead of
+    reading whole experts and discarding (etp_size-1)/etp_size of every read.
+    The loader auto-detects the directory by name (experts_etp{etp_size}).
+    """
+    layers = sorted(
+        int(d.split("_")[1]) for d in os.listdir(experts_dir) if d.startswith("layer_")
+    )
+    if not layers:
+        raise FileNotFoundError(f"在 {experts_dir} 下未找到 layer_* 目录")
+
+    first_layer = os.path.join(experts_dir, f"layer_{layers[0]}")
+    expert_ids = [
+        int(f[len("expert_") : -len(".safetensors")])
+        for f in os.listdir(first_layer)
+        if f.startswith("expert_") and f.endswith(".safetensors")
+    ]
+    num_experts = max(expert_ids) + 1
+    if num_experts % ep_size != 0:
+        raise ValueError(f"专家数 {num_experts} 不能被 ep_size {ep_size} 整除")
+    n_local = num_experts // ep_size
+
+    os.makedirs(out_dir, exist_ok=True)
+    tasks = [(layer, group) for layer in layers for group in range(ep_size)]
+    print(
+        f"ETP 预切分: {len(layers)} 层 x {ep_size} 组, n_local={n_local}, "
+        f"etp_size={etp_size}, 输出 {len(tasks)} 个文件到 {out_dir}"
+    )
+
+    from functools import partial
+    from multiprocessing import Pool
+
+    fn = partial(
+        _process_etp_layer_group,
+        experts_dir=experts_dir,
+        out_dir=out_dir,
+        n_local=n_local,
+        etp_size=etp_size,
+    )
+    with Pool(workers) as pool:
+        for _ in tqdm(
+            pool.imap_unordered(fn, tasks), total=len(tasks), desc="ETP 预切分"
+        ):
+            pass
+
+
+# ============================================================================
 # Non-MoE 权重切分
 # ============================================================================
 
@@ -482,7 +591,53 @@ if __name__ == "__main__":
         help="隐藏层数量，用于区分 MTP 层与普通层的边界；不传时表示无 MTP 层，所有权重保存到同一目录",
     )
 
+    # ETP 预切分 (对已预处理的 experts/ 目录二次切分, 不触碰其他权重)
+    parser.add_argument(
+        "--etp_shard",
+        action="store_true",
+        default=False,
+        help="对 model_dir/experts 下已预处理的专家文件做 ETP 预切分, "
+        "输出到 model_dir/experts_etp{etp_size} (loader 自动探测)",
+    )
+    parser.add_argument(
+        "--etp_size",
+        type=int,
+        default=16,
+        help="ETP 分片数 (moe_tp_size), 如 etp16 填 16, etp8 填 8",
+    )
+    parser.add_argument(
+        "--ep_size",
+        type=int,
+        default=None,
+        help="EP 组数 (experts_etp 目录内文件名 ep{g} 的 g 上限); "
+        "不传时按 num_experts/etp_size 推导",
+    )
+    parser.add_argument("--workers", type=int, default=16, help="ETP 预切分并行进程数")
+
     args = parser.parse_args()
+
+    if args.etp_shard:
+        experts_dir = os.path.join(args.model_dir, "experts")
+        if not os.path.isdir(experts_dir):
+            raise FileNotFoundError(
+                f"未找到已预处理的专家目录: {experts_dir} "
+                f"(请先运行 --moe 生成, 再运行 --etp_shard)"
+            )
+        # tp=256 集群上 ep_size * etp_size == tp_size, 默认按此推导
+        ep_size = args.ep_size or (256 // args.etp_size)
+        out_dir = os.path.join(args.model_dir, f"experts_etp{args.etp_size}")
+        print("=================== ETP 预切分配置 ===================")
+        print(f"专家目录 (experts_dir)    : {experts_dir}")
+        print(f"输出目录 (out_dir)        : {out_dir}")
+        print(f"etp_size                  : {args.etp_size}")
+        print(f"ep_size                   : {ep_size}")
+        print(f"并行进程数                : {args.workers}")
+        print("========================================================\n")
+        split_moe_experts_etp(
+            experts_dir, out_dir, args.etp_size, ep_size, args.workers
+        )
+        # 模块级不能 return; ETP 预切分到此结束, 跳过后面的常规切分与文件复制
+        raise SystemExit(0)
 
     if not args.moe:
         print("=================== 非 MoE 切分配置 ===================")

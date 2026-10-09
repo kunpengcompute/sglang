@@ -102,7 +102,7 @@ git apply pytorch-v2.9.0-sglang-0830.patch
 
 模型路径、conda环境名、native节点信息（`NATIVE_IP_SPEC`/`NATIVE_IP_FILE`、`NATIVE_MASTER_ADDR`）在`runtime/env_base.sh`中配置（或通过`.user_env.sh`覆盖）；prefill/decode节点集与并行度在对应角色文件中配置。完整配置加载顺序见3.3节。
 
-由于V3量化版本权重加载较慢，可在配置文件中设置`LOAD_FORMAT`启用分片加载加速启动，支持`sharded_state`与`kunpeng_state`两种格式。首次使用前，需要用`scripts/cpu_kunpeng/model_processing/split_weights.py`脚本对原始权重进行预处理。
+由于V3量化版本权重加载较慢，可在配置文件中设置`LOAD_FORMAT`启用分片加载加速启动，支持`sharded_state`与`kunpeng_state`两种格式。首次使用前，需要用`scripts/cpu_kunpeng/model_processing/split_weights_dsv3.py`脚本对原始权重进行预处理。
 
 native模式启动和终止命令：
 

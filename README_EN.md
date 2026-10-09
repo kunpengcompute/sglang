@@ -103,7 +103,7 @@ Taking the DeepSeek V3 int8 quantized version as an example, the recommended nat
 
 Configure the model path, conda environment name, and native node information (`NATIVE_IP_SPEC`/`NATIVE_IP_FILE`, `NATIVE_MASTER_ADDR`) in `runtime/env_base.sh` (or override via `.user_env.sh`); configure prefill/decode node sets and parallel sizes in the corresponding role files. See Section 3.3 for the full configuration loading order.
 
-Since loading the V3 quantized weights is relatively slow, set `LOAD_FORMAT` in the configuration files to enable sharded loading for faster startup. Two formats are supported: `sharded_state` and `kunpeng_state`. Before the first use, preprocess the original weights using the `scripts/cpu_kunpeng/model_processing/split_weights.py` script.
+Since loading the V3 quantized weights is relatively slow, set `LOAD_FORMAT` in the configuration files to enable sharded loading for faster startup. Two formats are supported: `sharded_state` and `kunpeng_state`. Before the first use, preprocess the original weights using the `scripts/cpu_kunpeng/model_processing/split_weights_dsv3.py` script.
 
 Native mode startup and shutdown commands:
 
