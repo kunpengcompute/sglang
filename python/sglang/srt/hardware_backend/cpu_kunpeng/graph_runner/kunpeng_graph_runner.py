@@ -37,7 +37,11 @@ from sglang.srt.utils import (
     is_kunpeng_graph_capture,
     is_kunpeng_graph_profile,
     is_kunpeng_hbw_pool,
+    is_kunpeng_hbw_resident_expert_weights,
+    is_kunpeng_hbw_resident_graph,
+    is_kunpeng_hbw_resident_non_expert_weights,
     is_kunpeng_swap_expert,
+    validate_kunpeng_hbw_residency,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_kunpeng_hbw_pool = is_kunpeng_hbw_pool()
+# Residency switches: raise on conflicting config at import time so the
+# process fails at the earliest possible point.
+_hbw_resident_non_expert = is_kunpeng_hbw_resident_non_expert_weights()
+_hbw_resident_expert = is_kunpeng_hbw_resident_expert_weights()
+_hbw_resident_graph = is_kunpeng_hbw_resident_graph()
 _is_kunpeng_swap_expert = is_kunpeng_swap_expert()
 _is_kunpeng_graph_capture = is_kunpeng_graph_capture()
 _is_kunpeng_graph_profile = is_kunpeng_graph_profile()
@@ -101,6 +110,13 @@ class KunpengGraphRunner:
         """
         if not is_cpu_920f():
             return None
+        residency = validate_kunpeng_hbw_residency()
+        logger.info(
+            "[HBW residency] non_expert_weights=%s expert_weights=%s graph=%s",
+            residency["non_expert_weights"],
+            residency["expert_weights"],
+            residency["graph"],
+        )
         runner = cls(model_runner)
         if _is_kunpeng_hbw_pool:
             runner.init_hbw_pool()
@@ -178,29 +194,63 @@ class KunpengGraphRunner:
             )
 
     def move_weights_to_hbw(self):
-        """Move model parameters to HBW memory pool."""
+        """Move model parameters to HBW memory pool.
+
+        Per-category residency switches (see utils/common.py):
+        - SGLANG_KUNPENG_HBW_RESIDENT_NON_EXPERT_WEIGHTS=0 keeps non-expert
+          weights in DDR.
+        - SGLANG_KUNPENG_HBW_RESIDENT_EXPERT_WEIGHTS=0 keeps expert weights
+          in DDR (layer-wise swap path when SGLANG_KUNPENG_SWAP_EXPERT=1).
+        """
         if self.model_runner.is_draft_worker:
             if (
                 self.model_runner.server_args.disaggregation_mode == "decode"
                 and int(os.environ.get("DECODE_PP_SIZE", "1")) > 1
             ):
                 logger.info(
-                    "[weight load] decode (DECODE_PP_SIZE=%s): draft weights placed on HBW",
+                    "[weight load] decode (DECODE_PP_SIZE=%s): draft weights "
+                    "moved to HBW per residency switches "
+                    "(non_expert=%s expert=%s)",
                     os.environ.get("DECODE_PP_SIZE", "1"),
+                    _hbw_resident_non_expert,
+                    _hbw_resident_expert,
                 )
             else:
                 return
+
+        pool = self.weight_hbw_pool
+        non_expert_bytes = 0
+        expert_bytes = 0
 
         for name, param in self.model_runner.model.named_parameters():
             if "embed_tokens" in name:
                 continue
             if "mlp.experts" in name:
-                if _is_kunpeng_swap_expert:
+                if _is_kunpeng_swap_expert or not _hbw_resident_expert:
                     continue
+                used_before = pool.used_bytes
                 tensor_hbw = self._move_expert_weights_to_hbw(name, param)
+                expert_bytes += pool.used_bytes - used_before
             else:
-                tensor_hbw = self.weight_hbw_pool.move_to_hbw(param)
+                if not _hbw_resident_non_expert:
+                    continue
+                used_before = pool.used_bytes
+                tensor_hbw = pool.move_to_hbw(param, label="non_expert_weights")
+                non_expert_bytes += pool.used_bytes - used_before
             param.data = tensor_hbw
+
+        mb = 1024 * 1024
+        logger.info(
+            "[HBW weights] moved non_expert=%.1f MB (%s), expert=%.1f MB (%s); "
+            "pool used=%.1f MB free=%.1f MB largest_free=%.1f MB",
+            non_expert_bytes / mb,
+            "resident" if _hbw_resident_non_expert else "DDR",
+            expert_bytes / mb,
+            "resident" if _hbw_resident_expert else "DDR",
+            pool.used_bytes / mb,
+            (pool.pool_size - pool.used_bytes) / mb,
+            pool.largest_free_bytes / mb,
+        )
 
     def _move_expert_weights_to_hbw(
         self, name: str, param: torch.nn.Parameter
@@ -230,7 +280,7 @@ class KunpengGraphRunner:
 
         metadata = get_global_expert_location_metadata()
         if metadata is None:
-            return self.weight_hbw_pool.move_to_hbw(param)
+            return self.weight_hbw_pool.move_to_hbw(param, label="expert_weights")
 
         # Target model: model.layers.<N>.mlp.experts.*
         # MTP draft model: decoder.mlp.experts.* (no layer id; use the last
@@ -238,7 +288,7 @@ class KunpengGraphRunner:
         m = re.match(r"^(?:model\.layers\.(\d+)|decoder)\.mlp\.experts\.\S+$", name)
         if m is None:
             logger.info("non-moe weight %s", name)
-            return self.weight_hbw_pool.move_to_hbw(param)
+            return self.weight_hbw_pool.move_to_hbw(param, label="expert_weights")
 
         layer_id = int(m.group(1)) if m.group(1) is not None else metadata.num_layers - 1
         ep_rank = get_moe_expert_parallel_rank()
@@ -263,7 +313,7 @@ class KunpengGraphRunner:
         logger.debug("[KunpengHBW] %s valid_local=%s", name, valid_local)
         if len(valid_local) == len(slots):
             # No invalid slot on this layer/rank: plain move.
-            return self.weight_hbw_pool.move_to_hbw(param)
+            return self.weight_hbw_pool.move_to_hbw(param, label="expert_weights")
 
         if valid_local != list(range(len(valid_local))):
             raise ValueError(
@@ -280,7 +330,9 @@ class KunpengGraphRunner:
             math.prod(compressed_shape),
             math.prod(compressed_shape) * param.dtype.itemsize,
         )
-        hbw_tensor = self.weight_hbw_pool.alloc(compressed_shape, param.dtype)
+        hbw_tensor = self.weight_hbw_pool.alloc(
+            compressed_shape, param.dtype, label="expert_weights"
+        )
         hbw_tensor.copy_(param[: len(valid_local)])
         logger.debug(
             "Kunpeng HBW: compressed %s %s -> %s",
@@ -956,16 +1008,34 @@ class KunpengGraphRunner:
                         )
                     )
 
-            if use_hbw and _is_kunpeng_hbw_pool:
+            if use_hbw and _is_kunpeng_hbw_pool and _hbw_resident_graph:
                 if KunpengGraphRunner._graph_hbw_tensor is None:
                     remaining = self.weight_hbw_pool.largest_free_bytes
-                    raw = self.weight_hbw_pool.alloc((remaining,), torch.uint8)
+                    if remaining < 4 * 1024 * 1024:
+                        pool = self.weight_hbw_pool
+                        raise RuntimeError(
+                            f"HBW pool has only {remaining / 1024 / 1024:.1f} MB "
+                            f"largest free block left for graph capture "
+                            f"(min 4 MB). pool used={pool.used_bytes / 1024 / 1024:.1f} MB "
+                            f"free={(pool.pool_size - pool.used_bytes) / 1024 / 1024:.1f} MB. "
+                            f"Enlarge SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB, or free "
+                            f"HBW via SGLANG_KUNPENG_HBW_RESIDENT_NON_EXPERT_WEIGHTS=0 / "
+                            f"SGLANG_KUNPENG_HBW_RESIDENT_EXPERT_WEIGHTS=0, or disable graph "
+                            f"HBW with SGLANG_KUNPENG_HBW_RESIDENT_GRAPH=0."
+                        )
+                    raw = self.weight_hbw_pool.alloc(
+                        (remaining,), torch.uint8, label="graph_capture"
+                    )
                     # Round the pool base up to 2M so that per-storage offset
                     # alignment in pack_intervals (2M/512K/1K workspace bufs)
                     # equals absolute-address alignment.
                     _align = 2 * 1024 * 1024
                     off = (_align - (raw.data_ptr() % _align)) % _align
                     KunpengGraphRunner._graph_hbw_tensor = raw[off:]
+                    logger.info(
+                        "[HBW graph] claimed %d MB for graph capture buffers",
+                        remaining // (1024 * 1024),
+                    )
                 graph = finalize(
                     graph_outputs,
                     external_pool=KunpengGraphRunner._graph_hbw_tensor,
