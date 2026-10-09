@@ -1,6 +1,6 @@
 # Kunpeng ETP（Expert Tensor Parallel，专家张量并行）
 
-## 概述
+## 1. 概述
 
 ETP在EP（专家并行）之上把每个专家的权重沿intermediate维切分到一组rank上，让热点专家的计算由整组分摊。面向920F decode场景：标准EP下热点expert单rank峰值计算远超稳态负载，TPOT由最慢rank决定；ETP把热点分摊并行度从1提升到moe_tp_size，同时每rank专家权重持有量不变（42MiB）。
 
@@ -14,7 +14,7 @@ DSV3 INT8、16节点decode的三档拓扑：
 
 attn部分始终按attn_tp=tp/dp切分，与MoE切分独立，可组合出"attn按16切+MoE按8切"。etp8组内SHM访问全为socket本地；etp16组内必有跨socket访问。
 
-## 工作原理
+## 2. 工作原理
 
 ### 并行度与分组
 
@@ -69,7 +69,7 @@ reduce-scatter式全组参与：rank gid认领互不相交的行段[gid*chunk,(g
 
 leader为下层覆写dense前，必经本层reduce等齐全组[2]（peer的down晚于gateup），故peer的gateup读不会被下层压缩写撕裂；peer的partial被他人读后，其下次覆写（下层down GEMM）排在leader下层bcast之后，而那又排在leader本层reduce返回之后。
 
-## 开启与配置
+## 3. 开启与配置
 
 ### 部署实例
 
@@ -80,10 +80,6 @@ export DECODE_TP_SIZE=256
 export DECODE_EP_SIZE=32              # < TP_SIZE 即启用ETP；moe_tp = 256/32 = 8
 export DECODE_DP_SIZE=16              # attn_tp = 256/16 = 16，与MoE切分独立
 export DECODE_PP_SIZE=1
-export SGLANG_SPECULATIVE_NUM_STEPS=2 # MTP
-export SGLANG_KUNPENG_MAX_SEQ_NUM=16
-export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=256
-export DECODE_WEIGTHS_HBW_POOL_SIZE_MB=3850
 ```
 
 启动：`INSTANCES="prefill,decode_32p-etp8"` + `./launch.sh all`（或`./launch.sh decode 32p-etp8`）。
@@ -111,6 +107,15 @@ python scripts/cpu_kunpeng/model_processing/split_weights_dsv3.py \
 | SGLANG_KUNPENG_DECODE_SHM_SIZE_MB | decode SHM池，ETP扩容主要项（etp8+MTP2约256；etp16+MTP2需320且SHM走DDR，即unset KUPL_SHM_ON_PACKAGE） |
 | DECODE_WEIGTHS_HBW_POOL_SIZE_MB | 权重HBW池（etp8/etp16配3850/3830） |
 
+推荐配置（MTP=1，即SGLANG_ENABLE_MTP=1 + SGLANG_SPECULATIVE_NUM_STEPS=1，取自runtime实例文件实测值）：
+
+| 实例 | SGLANG_KUNPENG_DECODE_SHM_SIZE_MB | DECODE_WEIGTHS_HBW_POOL_SIZE_MB |
+|---|---|---|
+| decode_32p-etp8（ep32/dp16，16节点） | 160 | 3850 |
+| decode_64p-etp8（ep32/dp32×pp2，32节点） | 200 | 3800 |
+
+MTP steps每+1，dense相关SHM按steps+1线性放大（见SGLANG_KUNPENG_ETP_DENSE_MAX），池大小需相应上调（如32p-etp8在MTP=2时配256）。
+
 主要SHM项（组内对称分配，get_peer_shm_baseptr按相同偏移互访）：
 
 - dispatch_recv_buf（槽位空间）=n_local×comm×max_dispatch×(hidden+4)，decode侧在HBW池
@@ -125,7 +130,7 @@ python scripts/cpu_kunpeng/model_processing/split_weights_dsv3.py \
 - moe_tp整除每节点rank数（组不出节点）
 - 无EPLB、冗余专家、静态路由、FORCE_LOAD_BALANCE、fused shared experts（后者自动关闭并打日志）
 
-## 性能与调优（32p-etp8实测，DSV3，单请求1kin/128out/MTP1）
+## 4. 性能与调优（32p-etp8实测，DSV3，单请求1kin/128out/MTP1）
 
 | 阶段 | etp_share(μs) | etp_reduce(μs) | MoE总时间 | vs非ETP基线 |
 |---|---|---|---|---|
@@ -156,15 +161,7 @@ fusedmoe_*_multiexpt_parallel把工作池分成G组×T线程（T=池/G），组�
 
 tile_k敏感性警告：任何tile_k变化会改变k-partial的bf16舍入边界，数值末位漂移会显著拉低MTP接受率（实测(256,1792)使接受率1.87→1.46）。调tiling时保持tile_k不变，并把MTP接受率作为回归守卫。
 
-## 验证要点
-
-1. 编译sgl-kernel与kutacc并同步全部decode节点（版本混布会导致RDMA remote access error；etp_seq为int64[3]，旧Python分配+新.so会被TORCH_CHECK拦截，反向混布无害）
-2. 单节点小规模：2 rank（etp=2,ep=1,tp=2）对比单专家FFW的fp32参考输出，验证w13 gate/up配对切分与多路归约数值正确性
-3. 全量起服务冒烟（curl.sh -s -f prompts/5.txt），与非ETP基线同prompts对比greedy token匹配率（int8量化噪声带内）
-4. 性能：SGLANG_KUNPENG_PROFILE=1（MoE层分项）或SGLANG_ENABLE_GRAPH_PROFILE=1（逐算子JSONL，配合analysis/下的stats_to_csv.py等脚本）
-5. 稳定性：soak压测验证etp_seq序号同步无死锁（层间复用同一计数器、图重放场景）；大batch下关注etp_reduce的max/avg分布（TPOT由max决定）
-
-## 关键代码位置
+## 5. 关键代码位置
 
 - 约束校验：`python/sglang/srt/server_args.py`（_validate_kunpeng_etp）
 - 状态捕获、buffer布局、pull-A集成：`python/sglang/srt/layers/moe/token_dispatcher/kunpeng.py`
