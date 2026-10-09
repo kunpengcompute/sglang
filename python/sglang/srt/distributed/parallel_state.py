@@ -665,7 +665,9 @@ class GroupCoordinator:
             ):
                 if _enable_shm_fence:
                     kunpeng.shm_fence_kunpeng(self.world_size)
-                kunpeng.shm_allreduce_kunpeng(input_)
+                kunpeng.shm_allreduce_kunpeng(
+                    input_, profile_name=f"shm_allreduce_kunpeng@{self.unique_name}"
+                )
             else:
                 torch.distributed.all_reduce(
                     input_,
