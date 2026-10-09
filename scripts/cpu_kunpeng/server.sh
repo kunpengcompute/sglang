@@ -180,13 +180,13 @@ esac
 #            switches layout; the two-tier layout has no host pool to lay out.
 # Disabled unless ENABLE_KUNPENG_HICACHE=1.
 if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
-    HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
+    HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-mooncake}"
     BASE_ARGS+=(
         --enable-hierarchical-cache
         --hicache-io-backend kunpeng
         --hicache-write-policy "${KUNPENG_HICACHE_WRITE_POLICY:-write_through}"
     )
-    if [[ "${KUNPENG_HICACHE_L1L3:-0}" == "1" ]]; then
+    if [[ "${KUNPENG_HICACHE_L1L3:-1}" == "1" ]]; then
         # L2 pool removed: no --hicache-size / --hicache-ratio / --hicache-mem-layout
         # (there is no host pool to size or lay out), and no host DRAM beyond the
         # fixed flat I/O buffer.
@@ -204,7 +204,7 @@ if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICAC
         if [[ -n "${KUNPENG_HICACHE_SIZE:-}" ]]; then
             BASE_ARGS+=(--hicache-size "$KUNPENG_HICACHE_SIZE")
         else
-            BASE_ARGS+=(--hicache-ratio "${KUNPENG_HICACHE_RATIO:-2.0}")
+            BASE_ARGS+=(--hicache-ratio "${KUNPENG_HICACHE_RATIO:-1.0}")
         fi
     fi
     case "$HICACHE_BACKEND" in

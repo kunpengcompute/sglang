@@ -104,7 +104,8 @@ export PREFILL_SWAP_KV_BLOCKWISE="${PREFILL_SWAP_KV_BLOCKWISE:-0}"
 # per-transfer "[hicache]" logs. Off by default; server.sh wires it for prefill.
 # ------------------------------------------------------------
 export ENABLE_KUNPENG_HICACHE="${ENABLE_KUNPENG_HICACHE:-0}"
-export KUNPENG_HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
+export KUNPENG_HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-mooncake}"
+export KUNPENG_HICACHE_L1L3="${KUNPENG_HICACHE_L1L3:-1}"
 export KUNPENG_HICACHE_L3_DIR="${KUNPENG_HICACHE_L3_DIR:-}"
 export KUNPENG_HICACHE_RATIO="${KUNPENG_HICACHE_RATIO:-1.0}"
 export KUNPENG_HICACHE_SIZE="${KUNPENG_HICACHE_SIZE:-}"
