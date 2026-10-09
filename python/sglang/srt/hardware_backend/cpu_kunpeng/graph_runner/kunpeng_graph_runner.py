@@ -616,6 +616,10 @@ class KunpengGraphRunner:
             if meta is not None:
                 if meta.kv_write_loc is not None:
                     inputs.append(meta.kv_write_loc)
+                if getattr(meta, "absorbed_slots", None) is not None:
+                    # Flat absorbed prefill: per-row slots + valid counts.
+                    inputs.append(meta.absorbed_slots)
+                    inputs.append(meta.absorbed_topk_length)
                 inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
                 if self.swap_mgr._blockwise_ddr_block_ids is not None:
                     # Only replace when a block_table entry exists (non-LC
@@ -658,16 +662,12 @@ class KunpengGraphRunner:
                 and (
                     forward_mode.is_target_verify()
                     or forward_mode.is_draft_extend()
-                    or absorbed_dsa_prefill
                 )
             ):
-                # DSA + MTP / absorbed prefill: the fake MTP indexer op
-                # (inside the capture) reads the backend's persistent
-                # FULL-batch seq lens (verify rows already include +n).
-                # Register the SAME view the op consumes. (The full-batch
-                # extend_seq_lens it also reads for draft-extend /
-                # absorbed prefill is already in the base input list
-                # above.)
+                # DSA + MTP verify/draft-extend: the fake MTP indexer op
+                # (inside the capture) reads the persistent FULL-batch seq
+                # lens; register the SAME view it consumes. (The absorbed
+                # prefill no longer consumes it.)
                 inputs.append(
                     meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
                 )
@@ -872,17 +872,18 @@ class KunpengGraphRunner:
         attn_backend = self._resolve_attn_backend(
             self.model_runner, forward_batch
         )
-        # Absorbed DSA prefill: the padded attention shape (bs, max_ext,
-        # H, D) and the [bs, max_ext, topk] indexer buffers depend on
-        # max(extend_seq_lens), not just total_tokens/batch_size (e.g.
-        # [4,4] and [7,1] share total_tokens=8 but pad differently), so it
-        # must be part of the cache key.
+        # Absorbed DSA prefill: the flat row count fixes the kernel/slots
+        # shapes and is not a function of total_tokens/batch_size, so it
+        # joins the cache key (shapes never depend on
+        # sum(extend_seq_lens); the per-row data varies via the inputs).
         absorbed_prefill_key = (
-            int(forward_batch.extend_seq_lens.max())
+            getattr(
+                attn_backend.forward_metadata,
+                "absorbed_flat_rows",
+                None,
+            )
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and forward_batch.extend_seq_lens is not None
-                and forward_batch.extend_seq_lens.numel() > 0
                 and getattr(attn_backend, "_nsa_enabled", False)
                 and not getattr(attn_backend, "_lc_enabled", False)
             )

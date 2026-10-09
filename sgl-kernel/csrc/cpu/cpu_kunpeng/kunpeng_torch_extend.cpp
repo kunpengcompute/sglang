@@ -116,6 +116,11 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
                             const at::Tensor &seq_lens, int64_t page_size, int64_t row_start,
                             at::Tensor slots, at::Tensor topk_length);
 
+void dsa_prefill_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &seq_lens,
+                               const at::Tensor &extend_seq_lens, int64_t num_rows,
+                               int64_t page_size, int64_t topk,
+                               at::Tensor slots, at::Tensor topk_length);
+
 void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices);
 void fake_indexer_topk_mtp_kunpeng(const at::Tensor &seq_lens, const c10::optional<at::Tensor> &extend_seq_lens,
                                    int64_t num_rows, int64_t topk, at::Tensor indices);
@@ -657,6 +662,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor seq_lens, int page_size, int row_start, "
         "Tensor(a!) slots, Tensor(b!) topk_length) -> ()");
     m.impl("dsa_topk_slots_kunpeng", dsa_topk_slots_kunpeng);
+
+    // Flat absorbed prefill: merged fake-indexer + position->slot mapping
+    // (per-row KV slots for the decode-shaped (rows, 1, H, D) sparse call).
+    // Runs at metadata time, outside the graph capture; direct-write outputs.
+    m.def(
+        "dsa_prefill_slots_kunpeng(Tensor block_table, Tensor seq_lens, "
+        "Tensor extend_seq_lens, int num_rows, int page_size, int topk, "
+        "Tensor(a!) slots, Tensor(b!) topk_length) -> ()");
+    m.impl("dsa_prefill_slots_kunpeng", dsa_prefill_slots_kunpeng);
 
     // Fake indexer (920F DSA bring-up): all-ids selection, exact when
     // seq_len <= index_topk (guarded on the Python side).

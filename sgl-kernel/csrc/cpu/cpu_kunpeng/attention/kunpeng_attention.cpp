@@ -400,6 +400,127 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
 }
 
 // ---------------------------------------------------------------------------
+// Flat absorbed prefill: merged fake-indexer + position->slot mapping --
+// the per-row KV slots for the decode-shaped (rows, 1, H, D) sparse call,
+// emitted once per step at metadata time (outside the graph capture).
+//
+//   block_table     [bs, max_blocks] int32 (page indices)
+//   seq_lens        [bs] int32/int64 (FULL seq lens: prefix + extend)
+//   extend_seq_lens [bs] int32/int64 (live flat rows per sequence)
+//   num_rows        total flat rows (>= sum(extend_seq_lens); the tail
+//                   [sum, num_rows) carries the dummy pattern)
+//   slots           [num_rows, topk] int32 direct-write: row i (seq b,
+//                   position p in its extend) = the KV slots of the
+//                   causal prefix [0, min(prefix_b + p + 1, topk)), -1
+//                   tail.
+//   topk_length     [num_rows] int32 direct-write: valid count (>= 1).
+// ---------------------------------------------------------------------------
+void dsa_prefill_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &seq_lens,
+                               const at::Tensor &extend_seq_lens, int64_t num_rows,
+                               int64_t page_size, int64_t topk,
+                               at::Tensor slots, at::Tensor topk_length)
+{
+    TORCH_CHECK(block_table.dim() == 2 && block_table.scalar_type() == at::kInt &&
+                    block_table.is_contiguous(),
+                "block_table must be contiguous [bs, max_blocks] int32");
+    TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous() &&
+                    (seq_lens.scalar_type() == at::kInt || seq_lens.scalar_type() == at::kLong),
+                "seq_lens must be contiguous [bs] int32/int64");
+    TORCH_CHECK(extend_seq_lens.dim() == 1 && extend_seq_lens.is_contiguous() &&
+                    extend_seq_lens.size(0) == seq_lens.size(0) &&
+                    (extend_seq_lens.scalar_type() == at::kInt ||
+                     extend_seq_lens.scalar_type() == at::kLong),
+                "extend_seq_lens must be contiguous [bs] int32/int64 matching seq_lens");
+    TORCH_CHECK(page_size > 0, "page_size must be positive");
+    TORCH_CHECK(topk > 0, "topk must be positive");
+    TORCH_CHECK(slots.dim() == 2 && slots.scalar_type() == at::kInt && slots.is_contiguous() &&
+                    slots.size(0) == num_rows && slots.size(1) == topk,
+                "slots must be [num_rows, topk] int32, got ", slots.sizes());
+    TORCH_CHECK(topk_length.dim() == 1 && topk_length.scalar_type() == at::kInt &&
+                    topk_length.is_contiguous() && topk_length.size(0) == num_rows,
+                "topk_length must be [num_rows] int32, got ", topk_length.sizes());
+
+    const int64_t bs = block_table.size(0);
+    const int64_t max_blocks = block_table.size(1);
+    if (num_rows == 0)
+        return;
+
+    const bool sl_long = seq_lens.scalar_type() == at::kLong;
+    const bool ext_long = extend_seq_lens.scalar_type() == at::kLong;
+    const int32_t *sl32 = sl_long ? nullptr : seq_lens.data_ptr<int32_t>();
+    const int64_t *sl64 = sl_long ? seq_lens.data_ptr<int64_t>() : nullptr;
+    const int32_t *ext32 = ext_long ? nullptr : extend_seq_lens.data_ptr<int32_t>();
+    const int64_t *ext64 = ext_long ? extend_seq_lens.data_ptr<int64_t>() : nullptr;
+    const int32_t *bt = block_table.data_ptr<int32_t>();
+    int32_t *slots_p = slots.data_ptr<int32_t>();
+    int32_t *len_p = topk_length.data_ptr<int32_t>();
+
+    // Flat rows are seq-major packed: seq b owns rows [cum_b, cum_b +
+    // ext_b). Parallel over sequences; each worker re-walks the prefix
+    // sums (bs is small).
+    int64_t sum_ext = 0;
+    for (int64_t b = 0; b < bs; ++b) {
+        int64_t e = ext_long ? ext64[b] : (int64_t)ext32[b];
+        if (e < 0)
+            e = 0;
+        sum_ext += e;
+    }
+    TORCH_CHECK(sum_ext <= num_rows, "sum(extend_seq_lens) ", sum_ext,
+                " exceeds num_rows ", num_rows);
+
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        int64_t cum = 0;
+        for (int64_t b = 0; b < start; ++b) {
+            int64_t e = ext_long ? ext64[b] : (int64_t)ext32[b];
+            if (e < 0)
+                e = 0;
+            cum += e;
+        }
+        for (int64_t b = start; b < end; ++b) {
+            const int64_t seq_len = sl_long ? sl64[b] : (int64_t)sl32[b];
+            int64_t e = ext_long ? ext64[b] : (int64_t)ext32[b];
+            if (e < 0)
+                e = 0;
+            const int64_t prefix = seq_len - e;
+            for (int64_t p = 0; p < e; ++p) {
+                int32_t *row = slots_p + (cum + p) * topk;
+                const int64_t valid = std::min(prefix + p + 1, topk);
+                if (valid < 1) {
+                    // Degenerate window: LC dummy pattern.
+                    row[0] = 0;
+                    for (int64_t i = 1; i < topk; ++i)
+                        row[i] = -1;
+                    len_p[cum + p] = 1;
+                    continue;
+                }
+                int64_t v = 0;
+                for (int64_t pos = 0; pos < valid; ++pos) {
+                    const int64_t page = pos / page_size;
+                    if (page >= max_blocks)
+                        break;
+                    row[v++] = bt[b * max_blocks + page] * (int32_t)page_size +
+                               (int32_t)(pos % page_size);
+                }
+                for (int64_t i = v; i < topk; ++i)
+                    row[i] = -1;
+                len_p[cum + p] = (int32_t)std::max(v, (int64_t)1);
+            }
+            cum += e;
+        }
+    });
+
+    // Trailing dummy rows [sum_ext, num_rows): one valid slot, rest -1;
+    // their outputs are dropped by the model's row trim.
+    for (int64_t i = sum_ext; i < num_rows; ++i) {
+        int32_t *row = slots_p + i * topk;
+        row[0] = 0;
+        for (int64_t j = 1; j < topk; ++j)
+            row[j] = -1;
+        len_p[i] = 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fake indexer for 920F DSA bring-up. With total context <= index_topk every
 // token is selected, so the indexer's top-k degenerates to emitting ALL token
 // positions: row b = [0, 1, ..., seq_len_b-1, -1, -1, ...] (padded to topk).

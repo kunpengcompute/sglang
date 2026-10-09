@@ -1108,16 +1108,14 @@ class Indexer(MultiPlatformOp):
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
-            or forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            # MTP verify/draft-extend and DSA absorbed prefill (all via the
-            # MLA_KUNPENG dispatch): a fixed row count per sequence in the
-            # [B, n, topk] layout, consumed by dsa_topk_slots_kunpeng +
+            # MTP verify/draft-extend: fixed rows per sequence in the
+            # [B, n, topk] layout for dsa_topk_slots_kunpeng +
             # flash_mla_sparse_decode_kunpeng. full_seq_lens is the
-            # backend's persistent FULL-batch buffer (graph input; verify
-            # rows already include +n, the other modes hold the full
-            # context) -- not the per-q_lora-row slice the decode branch
-            # uses.
+            # persistent FULL-batch buffer, not the per-q_lora-row slice
+            # the decode branch uses. (The absorbed prefill no longer runs
+            # the indexer -- dsa_prefill_slots_kunpeng emits its slots at
+            # metadata time.)
             bs = forward_batch.seq_lens.shape[0]
             seq_lens = backend.forward_metadata.full_seq_lens[:bs]
             if forward_batch.forward_mode.is_target_verify():
@@ -1125,24 +1123,9 @@ class Indexer(MultiPlatformOp):
                 # All n rows live (verify batches carry no extend lens).
                 extend_seq_lens = None
             else:
-                # Draft-extend: fixed n = speculative_num_draft_tokens;
-                # absorbed prefill: n = the per-sequence padded row count
-                # (token-granular a2all rounds it up to the socket multiple;
-                # the extra leading rows are LC dummies, matching the q
-                # left-padding), or the batch-wide max extend len without
-                # the a2all.
+                # Draft-extend: fixed n = speculative_num_draft_tokens.
                 extend_seq_lens = forward_batch.extend_seq_lens
-                # Clamp >= 1: an all-padding batch (every extend_seq_lens
-                # == 0) still needs >= 1 (dummy) row per sequence -- the
-                # fake indexer kernel rejects num_rows == 0.
-                n = (
-                    backend.speculative_num_draft_tokens
-                    if forward_batch.forward_mode.is_draft_extend()
-                    else (
-                        backend.forward_metadata.absorbed_padded_rows
-                        or max(int(extend_seq_lens.max()), 1)
-                    )
-                )
+                n = backend.speculative_num_draft_tokens
                 assert (
                     extend_seq_lens is not None
                     and extend_seq_lens.shape[0] == bs
