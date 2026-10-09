@@ -208,7 +208,7 @@ export SGLANG_KUNPENG_SAVE_AT_TRACE=0 # set 1 to open record experts activation 
 USER_ENV_ROLE="${1:-native}"
 
 case "$USER_ENV_ROLE" in
-    decode|router|tokenizer) IS_PREFILL=0 ;;
+    decode|router|tokenizer|mooncake|store) IS_PREFILL=0 ;;
     *) IS_PREFILL=1 ;;
 esac
 export IS_PREFILL
@@ -220,3 +220,22 @@ fi
 if [[ -f "$SCRIPT_DIR/runtime/.user_env_base.sh" ]]; then
     source "$SCRIPT_DIR/runtime/.user_env_base.sh" "$USER_ENV_ROLE"
 fi
+
+# ------------------------------------------------------------
+# Mooncake master address (KUNPENG_HICACHE_BACKEND=mooncake). Resolved after
+# .user_env.sh so an override there wins. Defaults to the router node, which is
+# outside the prefill/decode node sets. This address is read by BOTH the master
+# process and the prefill/native *clients* (mooncake_store.py), so it has to be
+# visible to every role -- hence env_base.sh. The store-only knobs
+# (STORE_NODE/PORT/SEGMENT_SIZE) live in runtime/env_store.sh.
+# ------------------------------------------------------------
+export MOONCAKE_MASTER_NODE="${MOONCAKE_MASTER_NODE:-$ROUTER_IP}"
+export MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-50061}"
+export MOONCAKE_MASTER="${MOONCAKE_MASTER:-$MOONCAKE_MASTER_NODE:$MOONCAKE_MASTER_PORT}"
+
+# RDMA device(s) for the transfer engine clients and the store service, plus the
+# client's own hostname so the master can address it. Both are per-node, so they
+# belong here (every role picks them up) rather than in a role file; env_store.sh
+# still overrides the hostname for the store role.
+export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-roceroh0,roceroh3,roceroh4,roceroh7}"
+export MOONCAKE_LOCAL_HOSTNAME="${MOONCAKE_LOCAL_HOSTNAME:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}"

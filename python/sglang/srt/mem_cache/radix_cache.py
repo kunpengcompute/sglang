@@ -229,6 +229,10 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # Two-tier HiCache (Kunpeng L1+L3, no L2 pool): set when this node's
+        # pages have been handed to the L3 backend, i.e. it can be restored from
+        # storage alone once its device value is dropped. Unused elsewhere.
+        self.storage_backed: bool = False
         # priority for priority-aware eviction
         self.priority = priority
 

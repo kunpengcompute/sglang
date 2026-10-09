@@ -174,6 +174,14 @@ router_config() {
     export NODE_IPS_LIST="$ROUTER_IP"
 }
 
+mooncake_config() {
+    export NODE_IPS_LIST="$MOONCAKE_MASTER_NODE"
+}
+
+store_config() {
+    export NODE_IPS_LIST="$MOONCAKE_STORE_NODE"
+}
+
 build_config() {
     :
 }

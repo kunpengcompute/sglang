@@ -17,7 +17,10 @@
 # Usage: ./launch.sh <role> [args...]
 #   prefill/decode/native -> runtime/launch_cluster.sh
 #   router                -> runtime/launch_router.sh
-#   all                   -> inline: prefill + decode + health-check + router
+#   mooncake              -> runtime/launch_mooncake.sh (HiCache L3 store master)
+#   store                 -> runtime/launch_store.sh (HiCache L3 store service)
+#   all                   -> inline: [mooncake + store] + prefill + decode + health-check
+#                            + router
 #   update                -> inline: update_time + update_numa_dup
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,7 +44,11 @@ Roles:
              (port auto-derived from the entry's position in INSTANCES,
              default 30001/30002; instance selects
              runtime/.user_env_<side>_<instance>.sh)
+  mooncake   Launch the mooncake store master (HiCache L3 backend mooncake)
+  store      Launch the mooncake store service on MOONCAKE_STORE_NODE (L3 pool)
   all        Launch prefill, decode, tokenizer, and router sequentially
+             (the mooncake master + store service first, when a prefill entry
+             selects the mooncake backend)
   update     Regenerate .time_env.sh + update NUMA binary replicas
 
 Options:
@@ -50,6 +57,8 @@ Options:
 Examples:
   $0 prefill
   $0 all
+  $0 mooncake
+  $0 store
   $0 update
 EOF
 }
@@ -68,7 +77,7 @@ case "$CMD" in
         show_usage
         exit 0
         ;;
-    prefill|decode|native|router|tokenizer|all|update)
+    prefill|decode|native|router|tokenizer|mooncake|store|all|update)
         ROLE="$CMD"
         ;;
     *)
@@ -78,9 +87,23 @@ case "$CMD" in
         ;;
 esac
 
+role_uses_mooncake() {
+    local _role="${1:-}" _inst="${2:-}" _sel
+    [[ "$_role" == "prefill" || "$_role" == "native" ]] || return 1
+    _sel="$(SKIP_CONDA=1 bash -c '
+        source "$1/env.sh" "$2" "$3" >/dev/null 2>&1
+        echo "${ENABLE_KUNPENG_HICACHE:-0}/${KUNPENG_HICACHE_BACKEND:-file}"' _ "$SCRIPT_DIR" "$_role" "$_inst")"
+    [[ "$_sel" == "1/mooncake" ]]
+}
+
+start_mooncake_store() {
+    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/stop_store.sh"
+    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_mooncake.sh"
+    SKIP_LOG=1 bash "$SCRIPT_DIR/runtime/launch_store.sh"
+}
 
 bash "$SCRIPT_DIR/runtime/update_time.sh"
-if [[ "$ROLE" == "router" || "$ROLE" == "tokenizer" ]]; then
+if [[ "$ROLE" == "router" || "$ROLE" == "tokenizer" || "$ROLE" == "mooncake" || "$ROLE" == "store" ]]; then
     echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update for role '$ROLE'.\033[0m"
 elif [[ "${SGLANG_ENABLE_NUMA_DUPLICATION:-1}" != "1" ]]; then
     echo -e "\033[33m[$(date +%T)] Skipping NUMA binary update (SGLANG_ENABLE_NUMA_DUPLICATION='${SGLANG_ENABLE_NUMA_DUPLICATION:-unset}').\033[0m"
@@ -102,6 +125,22 @@ elif [[ "$ROLE" == "all" ]]; then
     echo "[$(date +%T)] ===== Launching all roles ($INSTANCES + tokenizer + router) ====="
 
     IFS=',' read -ra _INST_LIST <<< "$INSTANCES"
+
+    # HiCache L3 = mooncake: the store master has to be up before the prefill
+    # servers register their L2 host pools with it. The backend is chosen in the
+    # prefill entry's own role env, so resolve it there (a subshell, like
+    # launch_router.sh does for the master addresses).
+    _start_mooncake=0
+    for _entry in "${_INST_LIST[@]}"; do
+        _entry="${_entry//[[:space:]]/}"
+        [[ -z "$_entry" ]] && continue
+        _role="${_entry%%_*}"
+        _inst=""
+        [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
+        role_uses_mooncake "$_role" "$_inst" && _start_mooncake=1
+    done
+    [[ "$_start_mooncake" == "1" ]] && start_mooncake_store
+
     for _entry in "${_INST_LIST[@]}"; do
         _entry="${_entry//[[:space:]]/}"
         [[ -z "$_entry" ]] && continue
@@ -129,7 +168,14 @@ elif [[ "$ROLE" == "router" ]]; then
 elif [[ "$ROLE" == "tokenizer" ]]; then
     bash "$SCRIPT_DIR/runtime/launch_tokenizer.sh" "$@"
 
+elif [[ "$ROLE" == "mooncake" ]]; then
+    bash "$SCRIPT_DIR/runtime/launch_mooncake.sh" "$@"
+
+elif [[ "$ROLE" == "store" ]]; then
+    bash "$SCRIPT_DIR/runtime/launch_store.sh" "$@"
+
 else
     # prefill/decode/native
+    role_uses_mooncake "$ROLE" "$@" && start_mooncake_store
     bash "$SCRIPT_DIR/runtime/launch_cluster.sh" "$ROLE" "$@"
 fi

@@ -3295,6 +3295,11 @@ class ServerArgs:
         ):
             return
 
+        # Kunpeng CPU: exactly one viable configuration, so it is pinned here and
+        # the CUDA/HIP-oriented steps below are skipped.
+        if self._handle_hicache_kunpeng():
+            return
+
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()
 
@@ -3307,6 +3312,56 @@ class ServerArgs:
         # Step 4: Re-normalize layout after io backend changes.
         if io_changed:
             self._resolve_layout_io_compatibility()
+
+    def _handle_hicache_kunpeng(self) -> bool:
+        """Pin the HiCache layout / IO backend for the Kunpeng CPU path.
+
+        Kunpeng has no accelerator: the L1 device pool and the L2 host pool both
+        live in host DDR, so the row copy is done by the `kunpeng` IO backend and
+        the host pool uses the `layer_first` layout -- except with the mooncake
+        L3 backend, whose store is page_first-only (see
+        `_resolve_storage_layout_compatibility`). The generic knobs only
+        describe CUDA/HIP transfers and carry no meaning here, so instead of
+        rejecting a mismatching request we override it with a warning -- the
+        alternative would be a silent bad-configuration run.
+
+        Returns True when the Kunpeng configuration applies, so the caller skips
+        the CUDA-oriented normalization steps.
+        """
+        if not is_cpu_920f():
+            return False
+
+        if self.hicache_io_backend != "kunpeng":
+            logger.warning(
+                "[hicache] Kunpeng CPU only supports --hicache-io-backend kunpeng "
+                "for the hierarchical cache; overriding the requested %r.",
+                self.hicache_io_backend,
+            )
+            self.hicache_io_backend = "kunpeng"
+
+        mooncake_page_first = (
+            self.hicache_storage_backend == "mooncake"
+            and self.hicache_mem_layout == "page_first"
+        )
+        if self.hicache_mem_layout != "layer_first" and not mooncake_page_first:
+            logger.warning(
+                "[hicache] Kunpeng CPU only supports --hicache-mem-layout "
+                "layer_first (or page_first with the mooncake storage backend) "
+                "for the hierarchical cache; overriding the requested %r.",
+                self.hicache_mem_layout,
+            )
+            self.hicache_mem_layout = "layer_first"
+
+        if (
+            self.enable_hierarchical_cache
+            and self.disaggregation_mode == "decode"
+        ):
+            logger.warning(
+                "[hicache] Kunpeng hierarchical cache is currently wired for the "
+                "prefill role only; running it on decode has not been validated."
+            )
+
+        return True
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -5936,7 +5991,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend"],
+            choices=["direct", "kernel", "kernel_ascend", "kunpeng"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )

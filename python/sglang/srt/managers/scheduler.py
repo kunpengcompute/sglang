@@ -1152,6 +1152,12 @@ class Scheduler(
         if not self.enable_hierarchical_cache:
             return
 
+        if getattr(self.tree_cache, "l1l3_only", False):
+            # Two-tier mode: the draft pool is not part of L3 (the L3 blob
+            # encoding is target-KV only) and there is no L2 to piggyback on, so
+            # it simply stays L1-only.
+            return
+
         draft_kv_pool, _ = self._get_draft_kv_pool()
         if draft_kv_pool is None:
             return
@@ -2346,7 +2352,14 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+            # In the two-tier mode (no L2 pool) the anchor is "this prefix is in
+            # L3" rather than "this prefix is backed up in host memory".
+            anchor_ready = (
+                self.tree_cache.is_storage_indexed(last_host_node)
+                if getattr(self.tree_cache, "l1l3_only", False)
+                else last_host_node.backuped
+            )
+            if anchor_ready or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]

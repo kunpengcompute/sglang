@@ -13,7 +13,7 @@
 # ==============================================================================
 
 #!/bin/bash
-# Usage: source env.sh [prefill|decode|native|router|tokenizer|build|none] [instance]
+# Usage: source env.sh [prefill|decode|native|router|tokenizer|mooncake|store|build|none] [instance]
 #   instance (e.g. "128p") selects per-instance user env overrides
 #   (runtime/.user_env_<role>_<instance>.sh); empty = default instance.
 #   For tokenizer, the instance arg is "<side>[_<instance>]" (e.g.
@@ -45,6 +45,12 @@ case "$ACTION" in
     prefill|native|build)
         source "$SCRIPT_DIR/runtime/env_prefill.sh" || return 1
         ;;
+    mooncake)
+        source "$SCRIPT_DIR/runtime/env_mooncake.sh" || return 1
+        ;;
+    store)
+        source "$SCRIPT_DIR/runtime/env_store.sh" || return 1
+        ;;
     router)
         : # base env only; backends are resolved per INSTANCES entry
         ;;
@@ -70,11 +76,11 @@ esac
 SKIP_CONDA="${SKIP_CONDA:-0}"
 
 case "$ACTION" in
-    prefill|decode|native|router|tokenizer|build)
+    prefill|decode|native|router|tokenizer|mooncake|store|build)
         "${ACTION}_config"
         ;;
     *)
-        echo "Usage: source env.sh [prefill|decode|native|router|tokenizer|build]" >&2
+        echo "Usage: source env.sh [prefill|decode|native|router|tokenizer|mooncake|store|build]" >&2
         return 1
         ;;
 esac
@@ -113,7 +119,7 @@ fi
 export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/${LOG_SUBDIR}/${LOG_TIME}"
 export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 
-if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]] || [[ "$ACTION" == "tokenizer" ]] || [[ "$ACTION" == "build" ]]; then
+if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]] || [[ "$ACTION" == "tokenizer" ]] || [[ "$ACTION" == "mooncake" ]] || [[ "$ACTION" == "store" ]] || [[ "$ACTION" == "build" ]]; then
     source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 
     export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}

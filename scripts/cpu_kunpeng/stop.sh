@@ -19,7 +19,10 @@
 #   server    [prefill|decode|native] [instance] -> runtime/stop_server.sh
 #   router                                       -> runtime/stop_router.sh
 #   tokenizer [prefill|decode|all]               -> runtime/stop_tokenizer.sh
+#   mooncake                                     -> runtime/stop_mooncake.sh
+#   store                                        -> runtime/stop_store.sh
 #   all    -> router + tokenizer(both) + server(per INSTANCES in env_base.sh)
+#             + store + mooncake
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -37,7 +40,9 @@ Targets:
   server    Kill sglang on the role's cluster nodes (side: prefill|decode|native, optional instance)
   router    Kill the gateway on the router node
   tokenizer Kill tokenizer HTTP server(s) (side: prefill|decode|all, default all)
-  all       Stop router + both tokenizer sides + servers per INSTANCES
+  mooncake  Kill the mooncake store master on MOONCAKE_MASTER_NODE
+  store     Kill the mooncake store service on MOONCAKE_STORE_NODE
+  all       Stop router + both tokenizer sides + servers per INSTANCES + store + mooncake
 
 Options:
   -h, --help    show this help and exit
@@ -46,6 +51,8 @@ Examples:
   $0 server decode
   $0 server decode 128p
   $0 tokenizer prefill
+  $0 mooncake
+  $0 store
   $0 all
 EOF
 }
@@ -71,12 +78,21 @@ case "$TARGET" in
         bash "$SCRIPT_DIR/runtime/stop_tokenizer.sh" "${1:-all}"
         exit $?
         ;;
+    mooncake)
+        bash "$SCRIPT_DIR/runtime/stop_mooncake.sh"
+        exit $?
+        ;;
+    store)
+        bash "$SCRIPT_DIR/runtime/stop_store.sh"
+        exit $?
+        ;;
     all)
         bash "$SCRIPT_DIR/runtime/stop_router.sh"
         bash "$SCRIPT_DIR/runtime/stop_tokenizer.sh" all
         # Stop servers per the deployment's instance list (same parsing
         # as launch.sh all): entries "<role>" or "<role>_<instance>".
         IFS=',' read -ra _INST_LIST <<< "$INSTANCES"
+        _stop_mooncake=0
         for _entry in "${_INST_LIST[@]}"; do
             _entry="${_entry//[[:space:]]/}"
             [[ -z "$_entry" ]] && continue
@@ -84,7 +100,21 @@ case "$TARGET" in
             _inst=""
             [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
             bash "$SCRIPT_DIR/runtime/stop_server.sh" "$_role" "$_inst"
+            [[ "$_role" == "prefill" || "$_role" == "native" ]] || continue
+            _hicache="$(SKIP_CONDA=1 bash -c "
+                source '$SCRIPT_DIR/env.sh' '$_role' '$_inst' >/dev/null 2>&1
+                echo \"\${ENABLE_KUNPENG_HICACHE:-0}\"")"
+            [[ "$_hicache" != "1" ]] && continue
+            _backend="$(SKIP_CONDA=1 bash -c "
+                source '$SCRIPT_DIR/env.sh' '$_role' '$_inst' >/dev/null 2>&1
+                echo \"\${KUNPENG_HICACHE_BACKEND:-file}\"")"
+            [[ "$_backend" == "mooncake" ]] && _stop_mooncake=1
         done
+        # Last: the prefill servers deregister from the store on the way down.
+        if [[ "$_stop_mooncake" == "1" ]]; then
+            bash "$SCRIPT_DIR/runtime/stop_store.sh"
+            bash "$SCRIPT_DIR/runtime/stop_mooncake.sh"
+        fi
         exit $?
         ;;
     *)

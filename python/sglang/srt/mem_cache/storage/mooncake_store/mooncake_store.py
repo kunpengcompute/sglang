@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.utils import is_cpu_920f
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -329,6 +330,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     device_name = ""
             if self.config.standalone_storage:
+                if mem_pool is None:
+                    raise RuntimeError(
+                        "MooncakeStore with standalone_storage=True needs a host "
+                        "pool to size the dummy store; the two-tier (L1+L3) HiCache "
+                        "mode has none. Set standalone_storage=False."
+                    )
                 if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
                     raise RuntimeError(
                         "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
@@ -545,6 +552,102 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.extra_backend_tag is None:
             return keys
         return [f"{ self.extra_backend_tag}_{key}" for key in keys]
+
+    def supports_flat_io(self) -> bool:
+        # Only the kunpeng two-tier HiCache path uses one page blob per key out of
+        # a fixed registered bounce buffer instead of an L2 pool page.
+        return is_cpu_920f()
+
+    def register_io_buffer(self, buffer: torch.Tensor) -> None:
+        super().register_buffer(buffer)
+        # register_mem_pool_host() sets this for the pool path; the two-tier mode
+        # has no pool, so derive it from the blob width (see _batch_preprocess).
+        self.gb_per_page = buffer.size(-1) * buffer.element_size() / (1 << 30)
+        logger.info(
+            "Mooncake registered HiCache I/O buffer: %d page(s) x %.2f MB",
+            buffer.size(0),
+            self.gb_per_page * (1 << 30) / 1e6,
+        )
+
+    def _flat_keys(self, keys: List[str]) -> List[str]:
+        """Storage keys of the flat-blob interface.
+
+        Must stay byte-identical to the keys used by ``batch_exists`` and the
+        ``*_v1`` path, otherwise a page written through one interface is a miss
+        on the other.
+        """
+        if not self.is_mla_backend:
+            raise NotImplementedError(
+                "Flat L3 I/O currently supports MLA pools only; the two-tier "
+                "HiCache mode is not implemented for MHA."
+            )
+        return [f"{key}_{self.mla_suffix}_k" for key in self._tag_keys(keys)]
+
+    def batch_get_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        key_strs = self._flat_keys(keys)
+        assert len(key_strs) == len(buffers)
+        buffer_ptrs = [int(buf.data_ptr()) for buf in buffers]
+        buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
+
+        start_time = time.perf_counter()
+        get_results = self._get_batch_zero_copy_impl(
+            key_strs, buffer_ptrs, buffer_sizes
+        )
+        end_time = time.perf_counter()
+
+        if self.enable_storage_metrics:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (end_time - start_time) * self.gb_per_page
+            )
+
+        return self._batch_postprocess(get_results, is_set_operate=False)
+
+    def batch_set_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        key_strs = self._flat_keys(keys)
+        assert len(key_strs) == len(buffers)
+        buffer_ptrs = [int(buf.data_ptr()) for buf in buffers]
+        buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
+
+        exist_result = self._batch_exist(key_strs)
+        set_keys, set_ptrs, set_sizes, set_indices = [], [], [], []
+        set_results = [-1] * len(key_strs)
+        for i in range(len(key_strs)):
+            if exist_result[i] != 1:
+                set_keys.append(key_strs[i])
+                set_ptrs.append(buffer_ptrs[i])
+                set_sizes.append(buffer_sizes[i])
+                set_indices.append(i)
+            else:
+                set_results[i] = 0
+
+        if len(set_keys) > 0:
+            start_time = time.perf_counter()
+            put_results = self._put_batch_zero_copy_impl(
+                set_keys, set_ptrs, set_sizes
+            )
+            end_time = time.perf_counter()
+
+            if self.enable_storage_metrics:
+                self.backup_pgs.append(len(set_keys))
+                self.backup_bandwidth.append(
+                    len(set_keys) / (end_time - start_time) * self.gb_per_page
+                )
+
+            for i in range(len(set_indices)):
+                set_results[set_indices[i]] = put_results[i]
+
+        return self._batch_postprocess(set_results, is_set_operate=True)
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
@@ -892,16 +995,30 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # TODO: return the number of consecutive successful operations from the start.
         return success_count == len(keys)
 
+    @staticmethod
+    def _buffer_args(target_location, target_size: Optional[Any] = None) -> tuple:
+        """Normalize one I/O target into a ``(pointer, byte size)`` pair.
+
+        Callers hand over either a registered tensor (whose address and byte
+        size are derived here) or an explicit raw pointer plus its size.
+        """
+        if isinstance(target_location, torch.Tensor):
+            return (
+                target_location.data_ptr(),
+                target_location.numel() * target_location.element_size(),
+            )
+        return target_location, target_size
+
     def get(
         self,
         key,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        assert target_location is not None and target_sizes is not None
-        get_result = self._get_batch_zero_copy_impl(
-            [key], [target_location], [target_sizes]
-        )
+        assert target_location is not None
+        location, size = self._buffer_args(target_location, target_sizes)
+        assert size is not None
+        get_result = self._get_batch_zero_copy_impl([key], [location], [size])
         return get_result[0] >= 0
 
     def batch_get(
@@ -910,14 +1027,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> int:
-        assert len(keys) == len(target_locations) == len(target_sizes)
+        assert target_locations is not None and len(keys) == len(target_locations)
+        if target_sizes is None:
+            target_sizes = [None] * len(keys)
+        assert len(keys) == len(target_sizes)
         if len(keys) == 0:
             return 0
 
+        locations, sizes = [], []
+        for location, size in zip(target_locations, target_sizes):
+            location, size = self._buffer_args(location, size)
+            assert size is not None
+            locations.append(location)
+            sizes.append(size)
+
         start_time = time.perf_counter()
-        get_result = self._get_batch_zero_copy_impl(
-            keys, target_locations, target_sizes
-        )
+        get_result = self._get_batch_zero_copy_impl(keys, locations, sizes)
         end_time = time.perf_counter()
 
         if self.is_mla_backend:

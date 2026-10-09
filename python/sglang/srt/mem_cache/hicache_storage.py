@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.utils import is_cpu_920f
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,115 @@ class HiCacheStorage(ABC):
         """Write data from host memory to storage for each PoolTransfer.
 
         Returns a dict mapping pool name to a per-entry success list.
+        """
+        raise NotImplementedError()
+
+    def supports_coalesced_pages(self) -> bool:
+        """True when the backend keeps a page's draft KV inside the page object.
+
+        Page-oriented backends that pay a high per-object cost (shared
+        filesystems charge an open/close round trip per page) can store the
+        draft blob in the same object as the target blob, halving the object
+        count per prefetched page. Callers then use
+        :meth:`batch_set_coalesced_pages` / :meth:`batch_get_coalesced_pages`
+        instead of the separate ``"d:"``-prefixed draft keys.
+        """
+        return False
+
+    def batch_set_coalesced_pages(
+        self,
+        keys: List[str],
+        values: List[Any],
+        draft_values: List[Any],
+    ) -> bool:
+        """Store each page with its target and draft blobs coalesced."""
+        raise NotImplementedError()
+
+    def batch_get_coalesced_pages(
+        self,
+        keys: List[str],
+        target_locations: List[torch.Tensor],
+        draft_locations: List[torch.Tensor],
+    ) -> tuple:
+        """Read each coalesced object once, filling the target and draft buffers.
+
+        Returns ``(targets, draft_hits)``: ``targets[i]`` is the filled target
+        buffer, or None when the object is missing; ``draft_hits[i]`` reports
+        whether the trailing draft section was present and fully read. Objects
+        written before coalescing existed carry no draft section, which is not
+        an error -- the draft pool simply keeps its current contents.
+        """
+        raise NotImplementedError()
+
+    def supports_batched_page_load(self) -> bool:
+        """True when ``batch_get_pages_into_pools`` can be used.
+
+        That call reads a whole batch of pages straight into the L2 pools in one
+        Python -> C++ call, which matters for backends whose caller is a plain
+        Python thread (HiCache's storage threads): each round trip costs it a GIL
+        re-acquisition, i.e. tens of ms under load.
+        """
+        return False
+
+    def batch_get_pages_into_pools(
+        self,
+        keys: List[str],
+        target_pool,
+        target_indices: torch.Tensor,
+        draft_pool=None,
+        draft_indices: Optional[torch.Tensor] = None,
+    ) -> tuple:
+        """Read a batch of pages straight into the L2 pools; see the backends.
+
+        Returns ``(target_hits, draft_hits)``, 0/1 per page. Only called when
+        :meth:`supports_batched_page_load` is True.
+        """
+        raise NotImplementedError()
+
+    def supports_flat_io(self) -> bool:
+        """True when the two-tier (L1+L3) flat-blob interface is implemented.
+
+        That mode has no L2 host pool, so ``batch_get_v1``/``batch_set_v1`` (which
+        resolve their buffers through ``mem_pool_host.get_page_buffer_meta``)
+        cannot be used. Backends implementing this return True from
+        :meth:`supports_flat_io` and take caller-provided 1-D tensors instead;
+        everything else keeps the pool-based interface (default: unsupported).
+        """
+        return False
+
+    def register_io_buffer(self, buffer: torch.Tensor) -> None:
+        """Register a fixed I/O buffer so zero-copy transfers may target it.
+
+        Called once per flat I/O buffer at attach time. Backends that copy
+        through the CPU (e.g. the file backend) need no registration, so the
+        default is a no-op.
+        """
+        pass
+
+    def batch_get_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """Read one page blob per key into the matching 1-D buffer.
+
+        ``buffers[i]`` is a view of the caller's flat I/O buffer and is exactly
+        one page blob wide; the caller guarantees it stays alive until this
+        returns. Returns per-key success, same contract as :meth:`batch_get_v1`.
+        Only called when :meth:`supports_flat_io` is True.
+        """
+        raise NotImplementedError()
+
+    def batch_set_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """Write one page blob per key out of the matching 1-D buffer.
+
+        Mirror of :meth:`batch_get_flat`; returns per-key success.
         """
         raise NotImplementedError()
 
@@ -379,10 +489,172 @@ class HiCacheFile(HiCacheStorage):
                 return False
         return True
 
+    def supports_coalesced_pages(self) -> bool:
+        return True
+
+    def batch_set_coalesced_pages(
+        self,
+        keys: List[str],
+        values: List[Any],
+        draft_values: List[Any],
+    ) -> bool:
+        """Store each page as one ``.bin`` holding ``[target blob][draft blob]``.
+
+        The target blob comes first, so the plain read path is unaffected:
+        :meth:`get` reads exactly target-sized bytes from offset 0 and never sees
+        the draft section, which keeps ``exists`` / ``batch_exists`` and the
+        per-page prefix match identical to the non-coalesced layout.
+        """
+        for key, value, draft_value in zip(keys, values, draft_values):
+            if self.exists(key):
+                logger.debug(f"Key {key} already exists. Skipped.")
+                continue
+
+            key = self._get_suffixed_key(key)
+            tensor_path = os.path.join(self.file_path, f"{key}.bin")
+            try:
+                with open(tensor_path, "wb") as f:
+                    value.contiguous().view(dtype=torch.uint8).numpy().tofile(f)
+                    draft_value.contiguous().view(dtype=torch.uint8).numpy().tofile(f)
+            except Exception as e:
+                logger.error(f"Failed to save tensor {key}: {e}")
+                return False
+        return True
+
+    def batch_get_coalesced_pages(
+        self,
+        keys: List[str],
+        target_locations: List[torch.Tensor],
+        draft_locations: List[torch.Tensor],
+    ) -> tuple:
+        """Read each coalesced page object once, into both buffers.
+
+        The single open/read pair per page is the point of the coalesced layout:
+        the draft section is read from the same handle right after the target
+        blob instead of from its own ``"d:"`` object.
+        """
+        targets = []
+        draft_hits = []
+        for key, target, draft in zip(keys, target_locations, draft_locations):
+            tensor_path = os.path.join(
+                self.file_path, f"{self._get_suffixed_key(key)}.bin"
+            )
+            expected = target.numel() * target.element_size()
+            draft_expected = draft.numel() * draft.element_size()
+            try:
+                with open(tensor_path, "rb", buffering=0) as f:
+                    buf = memoryview(target.view(torch.uint8).contiguous().numpy())
+                    if f.readinto(buf) != expected:
+                        raise IOError(f"Short read for {key}")
+                    # A page stored before coalescing has no trailing section;
+                    # that is not an error, the draft pool keeps its contents.
+                    draft_buf = memoryview(
+                        draft.view(torch.uint8).contiguous().numpy()
+                    )
+                    draft_hits.append(f.readinto(draft_buf) == draft_expected)
+                    targets.append(target)
+            except FileNotFoundError:
+                logger.warning(
+                    f"Failed to fetch {key} from HiCacheFile storage."
+                )
+                targets.append(None)
+                draft_hits.append(False)
+            except Exception as e:
+                logger.error(f"Failed to fetch {key}: {e}")
+                targets.append(None)
+                draft_hits.append(False)
+        return targets, draft_hits
+
+    def supports_batched_page_load(self) -> bool:
+        # The batched load kernel is Kunpeng-only; other platforms keep the
+        # per-page interface above.
+        return is_cpu_920f()
+
+    def batch_get_pages_into_pools(
+        self,
+        keys: List[str],
+        target_pool,
+        target_indices: torch.Tensor,
+        draft_pool=None,
+        draft_indices: Optional[torch.Tensor] = None,
+    ) -> tuple:
+        """Read a batch of pages and scatter them into the L2 pools in one call.
+
+        Same data as :meth:`batch_get_coalesced_pages` plus one
+        ``set_from_flat_data_page`` per page, without the per-page
+        Python -> C++ round trips. ``target_indices`` follows the per-page loop's
+        convention (page ``i`` owns slots ``[i * page_size, (i + 1) * page_size)``);
+        ``draft_pool`` is given only for coalescing backends, where the draft blob
+        sits inside the target object. Returns ``(target_hits, draft_hits)``, 0/1
+        per page (0 = not in storage, or no draft section).
+        """
+        from sglang.srt.hardware_backend.cpu_kunpeng.hicache import (
+            hicache_page_load_coalesced_batch,
+        )
+
+        paths = [self._get_component_path(key) for key in keys]
+        return hicache_page_load_coalesced_batch(
+            target_pool.kv_buffer,
+            target_indices,
+            target_pool.page_size,
+            paths,
+            draft_pool.kv_buffer if draft_pool is not None else None,
+            draft_indices if draft_pool is not None else None,
+            draft_pool.page_size if draft_pool is not None else 0,
+        )
+
     def exists(self, key: str) -> bool:
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
+
+    def supports_flat_io(self) -> bool:
+        # Only the kunpeng two-tier HiCache path uses the flat interface; same
+        # capability-flag shape as supports_batched_page_load above.
+        return is_cpu_920f()
+
+    def batch_get_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        results = []
+        for key, buffer in zip(keys, buffers):
+            tensor_path = os.path.join(
+                self.file_path, f"{self._get_suffixed_key(key)}.bin"
+            )
+            expected = buffer.numel() * buffer.element_size()
+            try:
+                with open(tensor_path, "rb", buffering=0) as f:
+                    buf = memoryview(buffer.view(torch.uint8).contiguous().numpy())
+                    results.append(f.readinto(buf) == expected)
+            except FileNotFoundError:
+                logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+                results.append(False)
+        return results
+
+    def batch_set_flat(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        results = []
+        for key, buffer in zip(keys, buffers):
+            if self.exists(key):
+                results.append(True)
+                continue
+            tensor_path = os.path.join(
+                self.file_path, f"{self._get_suffixed_key(key)}.bin"
+            )
+            try:
+                buffer.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
+                results.append(True)
+            except Exception as e:
+                logger.error(f"Failed to save tensor {key}: {e}")
+                results.append(False)
+        return results
 
     def _collect_existing_component_keys(
         self,

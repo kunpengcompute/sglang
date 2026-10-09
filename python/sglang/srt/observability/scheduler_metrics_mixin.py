@@ -706,6 +706,17 @@ class SchedulerMetricsMixin:
         if not self.enable_hierarchical_cache:
             return
 
+        if getattr(self.tree_cache, "l1l3_only", False):
+            # Two-tier mode has no host pool; report the storage-only index
+            # (tokens whose only local copy is in L3) instead.
+            self.stats.hicache_host_used_tokens = getattr(
+                self.tree_cache, "storage_only_tokens", 0
+            )
+            self.stats.hicache_host_total_tokens = getattr(
+                self.tree_cache, "storage_index_limit", 0
+            )
+            return
+
         host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
             self.tree_cache, "full_kv_pool_host", None
         )
