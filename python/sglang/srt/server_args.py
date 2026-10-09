@@ -3203,10 +3203,20 @@ class ServerArgs:
         assert (
             os.environ.get("ENABLE_STATIC_ROUTING", "0") != "1"
         ), "Kunpeng ETP v1 does not support static routing (ENABLE_STATIC_ROUTING must be 0)"
-        assert (
-            os.environ.get("SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE", "false").lower()
-            not in ("1", "true")
-        ), "Kunpeng ETP v1 does not support SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE"
+        if os.environ.get(
+            "SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE", "false"
+        ).lower() in (
+            "1",
+            "true",
+        ):
+            # Perf-test only: force balance rewrites logical topk ids before
+            # the ETP group-slot mapping, so it runs through the shared topk
+            # postprocess. Routing correctness is not preserved (same caveat
+            # as the non-ETP path); validate numerics separately.
+            logger.warning(
+                "Kunpeng ETP with SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE is "
+                "perf-test only (routing correctness not preserved)."
+            )
         local_size = int(os.environ.get("MV2_COMM_WORLD_LOCAL_SIZE", "0") or 0)
         if local_size > 0:
             assert moe_tp_size <= local_size and local_size % moe_tp_size == 0, (

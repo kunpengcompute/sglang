@@ -259,9 +259,12 @@ def _ensure_rdma_initialized(
                 "1",
                 "true",
             ):
-                raise ValueError(
-                    "Kunpeng ETP v1 does not support "
-                    "SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE"
+                # Perf-test only (see server_args._validate_kunpeng_etp): the
+                # balance rewrite targets logical expert ids in the shared
+                # topk postprocess, before ETP group-slot mapping.
+                logger.warning(
+                    "Kunpeng ETP with SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE "
+                    "is perf-test only (routing correctness not preserved)."
                 )
             # Worst-case dense rows received by one MOE_TP group leader.  The
             # global microbatch is dp_size * max_tokens_per_mb tokens (each

@@ -128,7 +128,8 @@ MTP steps每+1，dense相关SHM按steps+1线性放大（见SGLANG_KUNPENG_ETP_DE
 
 - tp%ep==0且moe_tp>1；moe_dp==1；仅decode角色
 - moe_tp整除每节点rank数（组不出节点）
-- 无EPLB、冗余专家、静态路由、FORCE_LOAD_BALANCE、fused shared experts（后者自动关闭并打日志）
+- 无EPLB、冗余专家、静态路由、fused shared experts（后者自动关闭并打日志）
+- FORCE_LOAD_BALANCE放行但仅限压测（改写路由、不保正确性；每个expert均匀即每个moe_tp组dense行数均匀）
 
 ## 4. 性能与调优（32p-etp8实测，DSV3，单请求1kin/128out/MTP1）
 
