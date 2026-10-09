@@ -28,21 +28,12 @@ PREFILL_IP_FILE="${PREFILL_IP_FILE:-}"
 PREFILL_MASTER_ADDR="${PREFILL_MASTER_ADDR:-xxx.xxx.xxx.1}"
 # PREFILL_MASTER_PORT is derived per instance below (5000 + 100 * index).
 
-# Prefill model paths (default to the shared MODEL_PATH)
-MODEL_PATH_PREFILL="${MODEL_PATH_PREFILL:-$MODEL_PATH}"
-SPECULATIVE_DRAFT_MODEL_PATH_PREFILL="${SPECULATIVE_DRAFT_MODEL_PATH_PREFILL:-$SPECULATIVE_DRAFT_MODEL_PATH}"
-
-# ------------------------------------------------------------
-# Prefill TP/EP/PP sizes (default to the global values from env_base)
-# ------------------------------------------------------------
-export PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-${TP_SIZE}}"
-export PREFILL_DP_SIZE="${PREFILL_DP_SIZE:-${DP_SIZE}}"
-export PREFILL_EP_SIZE="${PREFILL_EP_SIZE:-${PREFILL_TP_SIZE}}"
-export PREFILL_PP_SIZE="${PREFILL_PP_SIZE:-${PP_SIZE}}"
-export PREFILL_REDUNDANT_EXPERTS="${PREFILL_REDUNDANT_EXPERTS:-0}"
-export PREFILL_INIT_EXPERT_LOCATION="${PREFILL_INIT_EXPERT_LOCATION:-}"
-export PREFILL_EP_DISPATCH_ALGORITHM="${PREFILL_EP_DISPATCH_ALGORITHM:-}"
-export PREFILL_SGLANG_KUNPENG_MOE_SHUFFLE_MODE="${PREFILL_SGLANG_KUNPENG_MOE_SHUFFLE_MODE:-0}"
+# NOTE: the prefixed PREFILL_* overrides (model paths, parallel sizes,
+# HBW pool, swap flags) are resolved AFTER the user env file at the
+# bottom of this file, for the same reason as in env_decode.sh: resolving
+# them before .user_env_prefill.sh is sourced lets _export_pd_vars
+# (prefill_config in env_helper.sh) silently revert user globals like
+# PP_SIZE=2 to the stale env_base defaults.
 
 
 # Per-DP-rank chunked prefill size; server.sh multiplies it by DP_SIZE
@@ -84,10 +75,6 @@ unset _pf_g _pf_s
 # Prefill SHM / HBW pool
 # ------------------------------------------------------------
 export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB="${SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB:-476}"
-export PREFILL_WEIGTHS_HBW_POOL_SIZE_MB="${PREFILL_WEIGTHS_HBW_POOL_SIZE_MB:-3400}"
-export PREFILL_SWAP_KV_IN="${PREFILL_SWAP_KV_IN:-0}"
-export PREFILL_SWAP_KV_OUT="${PREFILL_SWAP_KV_OUT:-0}"
-export PREFILL_SWAP_KV_BLOCKWISE="${PREFILL_SWAP_KV_BLOCKWISE:-0}"
 
 # ------------------------------------------------------------
 # Prefill hierarchical cache. L1 = main DDR KV pool; L2 = extra DDR pool sized by
@@ -140,3 +127,25 @@ elif [[ -f "$SCRIPT_DIR/runtime/.user_env_prefill.sh" ]]; then
 else
     echo "WARNING: runtime/.user_env_prefill.sh not found, using role defaults only" >&2
 fi
+
+# ------------------------------------------------------------
+# Resolve the prefixed PREFILL_* overrides against the globals — AFTER
+# the user env file above (see the NOTE at the top of this file). Both
+# config styles take effect: globals set in the user env file become
+# the PREFILL_* defaults; explicit PREFILL_* entries (e.g. the
+# LONG_PROMPT_PREFILL_INSTANCE block or instance files) still win.
+# ------------------------------------------------------------
+export MODEL_PATH_PREFILL="${MODEL_PATH_PREFILL:-$MODEL_PATH}"
+export SPECULATIVE_DRAFT_MODEL_PATH_PREFILL="${SPECULATIVE_DRAFT_MODEL_PATH_PREFILL:-$SPECULATIVE_DRAFT_MODEL_PATH}"
+export PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-${TP_SIZE}}"
+export PREFILL_DP_SIZE="${PREFILL_DP_SIZE:-${DP_SIZE}}"
+export PREFILL_EP_SIZE="${PREFILL_EP_SIZE:-${PREFILL_TP_SIZE}}"
+export PREFILL_PP_SIZE="${PREFILL_PP_SIZE:-${PP_SIZE}}"
+export PREFILL_REDUNDANT_EXPERTS="${PREFILL_REDUNDANT_EXPERTS:-${REDUNDANT_EXPERTS:-0}}"
+export PREFILL_INIT_EXPERT_LOCATION="${PREFILL_INIT_EXPERT_LOCATION:-${INIT_EXPERT_LOCATION:-}}"
+export PREFILL_EP_DISPATCH_ALGORITHM="${PREFILL_EP_DISPATCH_ALGORITHM:-${EP_DISPATCH_ALGORITHM:-}}"
+export PREFILL_SGLANG_KUNPENG_MOE_SHUFFLE_MODE="${PREFILL_SGLANG_KUNPENG_MOE_SHUFFLE_MODE:-${SGLANG_KUNPENG_MOE_SHUFFLE_MODE:-0}}"
+export PREFILL_WEIGTHS_HBW_POOL_SIZE_MB="${PREFILL_WEIGTHS_HBW_POOL_SIZE_MB:-${SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB:-3400}}"
+export PREFILL_SWAP_KV_IN="${PREFILL_SWAP_KV_IN:-${SGLANG_KUNPENG_SWAP_KV_IN:-0}}"
+export PREFILL_SWAP_KV_OUT="${PREFILL_SWAP_KV_OUT:-${SGLANG_KUNPENG_SWAP_KV_OUT:-0}}"
+export PREFILL_SWAP_KV_BLOCKWISE="${PREFILL_SWAP_KV_BLOCKWISE:-${SGLANG_KUNPENG_SWAP_KV_BLOCKWISE:-0}}"
