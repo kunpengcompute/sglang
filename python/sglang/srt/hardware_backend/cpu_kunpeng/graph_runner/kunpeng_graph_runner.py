@@ -557,6 +557,9 @@ class KunpengGraphRunner:
             inputs.extend(
                 [forward_batch.out_cache_loc, attn_backend._decode_meta]
             )
+            if meta is not None and meta.kv_write_loc is not None:
+                # Slot-filtered write locations for set_kv_buffer_2.
+                inputs.append(meta.kv_write_loc)
             if getattr(attn_backend, "_nsa_enabled", False):
                 # DSA: full-batch seq lens consumed by the (fake) CPU indexer
                 # graph op. Register the SAME view the op consumes (the
@@ -611,6 +614,12 @@ class KunpengGraphRunner:
                 attn_backend._decode_meta,
             ]
             if meta is not None:
+                if meta.kv_write_loc is not None:
+                    inputs.append(meta.kv_write_loc)
+                if getattr(meta, "absorbed_slots", None) is not None:
+                    # Flat absorbed prefill: per-row slots + valid counts.
+                    inputs.append(meta.absorbed_slots)
+                    inputs.append(meta.absorbed_topk_length)
                 inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
                 if self.swap_mgr._blockwise_ddr_block_ids is not None:
                     # Only replace when a block_table entry exists (non-LC
@@ -642,11 +651,37 @@ class KunpengGraphRunner:
                     # LC + block-wise KV swap: per-step slot-remapped index
                     # buffer consumed by the sparse flash MLA kernel.
                     inputs.append(meta.long_context_hbm_indices)
+            absorbed_dsa_prefill = (
+                forward_mode.is_extend_without_speculative()
+                and getattr(attn_backend, "_nsa_enabled", False)
+                and not getattr(attn_backend, "_lc_enabled", False)
+            )
+            if (
+                getattr(attn_backend, "_nsa_enabled", False)
+                and not getattr(attn_backend, "_lc_enabled", False)
+                and (
+                    forward_mode.is_target_verify()
+                    or forward_mode.is_draft_extend()
+                )
+            ):
+                # DSA + MTP verify/draft-extend: the fake MTP indexer op
+                # (inside the capture) reads the persistent FULL-batch seq
+                # lens; register the SAME view it consumes. (The absorbed
+                # prefill no longer consumes it.)
+                inputs.append(
+                    meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
+                )
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_cache_loc)
-            if forward_batch.extend_prefix_lens is not None:
+            if (
+                forward_batch.extend_prefix_lens is not None
+                and not absorbed_dsa_prefill
+            ):
+                # The absorbed DSA prefill path never reads the prefix lens
+                # (its windows come from full_seq_lens + extend_seq_lens);
+                # only the MHA prefill kernels consume them.
                 inputs.append(forward_batch.extend_prefix_lens)
 
         spec_info = getattr(forward_batch, "spec_info", None)
@@ -846,6 +881,29 @@ class KunpengGraphRunner:
         attn_backend = self._resolve_attn_backend(
             self.model_runner, forward_batch
         )
+        # Absorbed DSA prefill: the flat row count fixes the kernel/slots
+        # shapes and is not a function of total_tokens/batch_size, so it
+        # joins the cache key (shapes never depend on
+        # sum(extend_seq_lens); the per-row data varies via the inputs).
+        absorbed_prefill_key = (
+            getattr(
+                attn_backend.forward_metadata,
+                "absorbed_flat_rows",
+                None,
+            )
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and getattr(attn_backend, "_nsa_enabled", False)
+                and not getattr(attn_backend, "_lc_enabled", False)
+            )
+            else None
+        )
+        # All-padding batches take the zero-output skip branch inside
+        # _forward_mla_sparse_paged -- a Python branch frozen at capture,
+        # so the flag must split the graph cache key.
+        all_padding_key = bool(
+            getattr(attn_backend.forward_metadata, "sparse_all_padding", False)
+        )
         graph_cache_key = (
             forward_batch.forward_mode,
             total_tokens,
@@ -854,6 +912,8 @@ class KunpengGraphRunner:
             id(attn_backend)
             if attn_backend is not self.model_runner.attn_backend
             else None,
+            absorbed_prefill_key,
+            all_padding_key,
         )
 
         if graph_cache_key not in self._sglang_graph_cache:

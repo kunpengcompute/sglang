@@ -35,6 +35,19 @@ if TYPE_CHECKING:
 _DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
 
 
+def _kv_write_loc(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+    """Slot-filtered out_cache_loc for the per-layer K/V scatter writes.
+
+    Computed once per step by the backend, outside the capture region
+    (registered as a graph input): all-zero padding rows are routed to -1
+    so the write kernels (which skip ``loc < 0``) never scatter padding
+    K/V into the live page 0. Falls back to the raw out_cache_loc when
+    the backend produced no filter.
+    """
+    filtered = forward_batch.attn_backend.forward_metadata.kv_write_loc
+    return filtered if filtered is not None else forward_batch.out_cache_loc
+
+
 def _lc_reduce_partial_o(o_rows, lse_rows, b, num_local_heads):
     """Merge per-shard partial attention outputs (online-softmax reduction).
 
@@ -93,17 +106,27 @@ class DeepseekMLAKunpengForwardMixin:
             # q_norm + quantize fusion: emit (int8, scale) so q_b_proj skips
             # the separate quant pass inside W8A8Int8LinearMethod.apply.
             q_normed = self.q_a_layernorm(q, quantize=True)
-            # DSA (NSA): indexer 选 top-k token 位置 ([bs, topk], -1 padding),
-            # decode 时由 backend 映射为 KV slot (dsa_topk_slots_kunpeng +
-            # flash_mla_sparse_decode_kunpeng). 仅 DECODE/IDLE: extend/MTP
-            # 走稠密 paged MLA (seq_len <= topk 时等价). CPU 上 Indexer
-            # 分派到 920F fake (全 id).
+            # DSA (NSA): indexer 选 top-k token 位置 (decode [bs, topk];
+            # verify/draft-extend [bs, n, topk]; -1 padding), 由 backend
+            # 映射为 KV slot. 覆盖 DECODE/IDLE 和非 LC 的 MTP (LC 走 CP
+            # 稀疏路径; absorbed prefill 的 per-row slot 在 backend
+            # metadata 期直接生成, 不走 indexer). CPU 上分派到 920F fake
+            # (全 id).
             # TODO(kunpeng): 复用 fused quant pass 的 bf16 normed q,
             # 免第二次 layernorm.
             if (
                 getattr(self, "use_nsa", False)
                 and self.indexer is not None
-                and forward_batch.forward_mode.is_decode_or_idle()
+                and (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or (
+                        not self._lc_enabled
+                        and (
+                            forward_batch.forward_mode.is_target_verify()
+                            or forward_batch.forward_mode.is_draft_extend()
+                        )
+                    )
+                )
             ):
                 if not getattr(self, "skip_topk", False) or prev_topk_indices is None:
                     topk_indices = self.indexer(
@@ -185,14 +208,7 @@ class DeepseekMLAKunpengForwardMixin:
 
             q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
 
-        def _lc_filter(loc, kk, pp):
-            """Long-context decode CP (step 2): foreign pages carry slot -1 in
-            out_cache_loc. The kunpeng write kernels skip ``loc < 0`` rows, so
-            the non-local rows no longer need to be dropped eagerly here
-            (boolean-mask filtering allocates new tensors and is not
-            graph-capture safe)."""
-            return loc, kk, pp
-
+        loc_w = _kv_write_loc(forward_batch)
         if self.swap_mgr.enable_swap_kv_in:
             # The layer's swap-in is an async DMA over the whole pool and may
             # still be in flight; drain it before writing this step's new K/V
@@ -217,32 +233,20 @@ class DeepseekMLAKunpengForwardMixin:
                     k_nope[start:end], k_pe[start:end],
                 )
             else:
-                loc_w, k_w, p_w = _lc_filter(
-                    forward_batch.out_cache_loc, k_nope, k_pe
-                )
                 self.swap_mgr.set_kv_buffer_2(
-                    self.swap_mgr._cur_kv_hbm, loc_w, k_w, p_w
+                    self.swap_mgr._cur_kv_hbm, loc_w, k_nope, k_pe
                 )
 
             # DDR write keeps the original (un-remapped) out_cache_loc.
             if self.swap_mgr.enable_swap_kv_out:
-                loc_w, k_w, p_w = _lc_filter(
-                    forward_batch.out_cache_loc, k_nope, k_pe
-                )
-                self.swap_mgr.set_kv_buffer_2_sdma(loc_w, k_w, p_w)
+                self.swap_mgr.set_kv_buffer_2_sdma(loc_w, k_nope, k_pe)
             else:
-                loc_w, k_w, p_w = _lc_filter(
-                    forward_batch.out_cache_loc, k_nope, k_pe
-                )
                 self.swap_mgr.set_kv_buffer_2(
-                    self.swap_mgr._cur_kv_ddr, loc_w, k_w, p_w
+                    self.swap_mgr._cur_kv_ddr, loc_w, k_nope, k_pe
                 )
         else:
-            loc_w, k_w, p_w = _lc_filter(
-                forward_batch.out_cache_loc, k_nope, k_pe
-            )
             self.swap_mgr.set_kv_buffer_2(
-                self.swap_mgr._cur_kv_ddr, loc_w, k_w, p_w
+                self.swap_mgr._cur_kv_ddr, loc_w, k_nope, k_pe
             )
 
         return (
@@ -271,17 +275,20 @@ class DeepseekMLAKunpengForwardMixin:
         if llama_4_scaling is not None:
             q = q * llama_4_scaling
 
-        # MTP draft-extend: left-pad q to a fixed (bs, max_ext_len, H, D) shape
-        # BEFORE any all2all, so the all2all row-splitting lands on sequence
-        # boundaries. Uses the global (unsliced) extend_seq_lens.
+        # MTP draft-extend: left-pad q to (bs, n, H, D) before the all2all,
+        # so the split lands on sequence boundaries (n uniform per
+        # sequence). The absorbed prefill keeps the packed flat rows.
         is_draft_extend = forward_batch.forward_mode.is_draft_extend()
+        is_absorbed_prefill = (
+            forward_batch.forward_mode.is_extend_without_speculative()
+        )
         orig_rows = q.shape[0]
         if is_draft_extend:
             q = kunpeng.pad_q_left_mtp_kunpeng(
                 q,
                 forward_batch.extend_seq_lens,
                 forward_batch.attn_backend.speculative_num_draft_tokens,
-            )  # (bs, max_ext_len, H, D)
+            )  # (bs, n, H, D)
 
         tp_size = get_attention_tp_size()
         if self._lc_enabled:
@@ -383,7 +390,77 @@ class DeepseekMLAKunpengForwardMixin:
                     attn_output = kunpeng.unpad_o_right_mtp_kunpeng(
                         attn_output, forward_batch.extend_seq_lens, orig_rows
                     )
+        elif is_absorbed_prefill:
+            # Flat absorbed prefill: all extend rows form one packed
+            # stream. Rows are independent (per-row topk), so the a2all
+            # splits the stream into equal per-rank chunks -- the flat
+            # layout IS the chunk layout, no interleave. The kernel runs
+            # decode-shaped on this rank's slice with metadata-time slots.
+            flat_rows = (
+                forward_batch.attn_backend.forward_metadata.absorbed_flat_rows
+            )
+            numhead_local_q = q.shape[-2]
+            D_qk = q.shape[-1]
+            use_a2a = tp_size > 1 and not _DISABLE_MLA_ALL2ALL
+            if use_a2a:
+                all2all_size = get_socket_tp_group().world_size
+                rows = flat_rows // all2all_size
+            else:
+                all2all_size = 1
+                rows = flat_rows
+            # Rows [0, flat_rows) of the packed q ([0, sum_ext) real; the
+            # rest are DP-pad activations / zero rows as dummy q). Shapes
+            # depend only on (orig_rows, flat_rows) -- never on
+            # sum(extend_seq_lens) -- so one graph serves every split.
+            if flat_rows > orig_rows:
+                q_flat = kunpeng.alloc_buffer(
+                    flat_rows * numhead_local_q * D_qk, dtype=q.dtype
+                ).view(flat_rows, numhead_local_q, D_qk)
+                kunpeng.copy_kunpeng(q_flat[:orig_rows], q)
+                kunpeng.zero_(q_flat[orig_rows:])
+            else:
+                q_flat = q[:flat_rows]
+            if use_a2a:
+                q_flat = kunpeng.shm_mla_q_alltoall_kunpeng(q_flat, all2all_size)
+                # (rows, H*a2a, D_qk) with the socket group's full heads
+                saved_tp_q_head_num = self.attn_mqa.tp_q_head_num
+                self.attn_mqa.tp_q_head_num = self.num_local_heads * all2all_size
+                try:
+                    attn_output = self._call_attn_mqa(
+                        q_flat.unsqueeze(1), k, k_nope, forward_batch, None
+                    )
+                finally:
+                    self.attn_mqa.tp_q_head_num = saved_tp_q_head_num
+                attn_output = attn_output.view(
+                    rows, numhead_local_q * all2all_size, self.kv_lora_rank
+                )
+                attn_output = kunpeng.shm_mla_o_alltoall_kunpeng(
+                    attn_output, all2all_size
+                )  # (flat_rows, H_local, D_kv), original row order
+            else:
+                attn_output = self._call_attn_mqa(
+                    q_flat.unsqueeze(1), k, k_nope, forward_batch, None
+                )
+                attn_output = attn_output.view(
+                    flat_rows, numhead_local_q, self.kv_lora_rank
+                )
+            # Trim back to the packed batch; dummy-row outputs and the
+            # zeroed tail are dropped by the gather-side DP unpad.
+            if flat_rows < orig_rows:
+                buf = kunpeng.alloc_buffer(
+                    orig_rows * numhead_local_q * self.kv_lora_rank,
+                    dtype=attn_output.dtype,
+                ).view(orig_rows, numhead_local_q, self.kv_lora_rank)
+                kunpeng.copy_kunpeng(buf[:flat_rows], attn_output)
+                kunpeng.zero_(buf[flat_rows:])
+                attn_output = buf
+            else:
+                attn_output = attn_output[:orig_rows]
+            # reshape back to flattened for w_vc
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         elif tp_size > 1 and not _DISABLE_MLA_ALL2ALL:
+            # MLA all2all over the per-socket sub-group (MTP draft-extend:
+            # sequence-boundary split over the seq-padded batch).
             socket_group = get_socket_tp_group()
             all2all_size = socket_group.world_size
 
@@ -394,9 +471,11 @@ class DeepseekMLAKunpengForwardMixin:
                 max_ext_len = q.shape[1]
                 numhead_local_q = q.shape[2]
                 D_qk = q.shape[3]
+                kernel_topk_indices = topk_indices
                 q = q.view(-1, numhead_local_q, D_qk)
             else:
                 B_q, numhead_local_q, D_qk = q.shape
+                kernel_topk_indices = topk_indices
             batchsize_per_tp = q.shape[0] // all2all_size
             q = kunpeng.shm_mla_q_alltoall_kunpeng(q, all2all_size)
 
@@ -415,7 +494,7 @@ class DeepseekMLAKunpengForwardMixin:
             self.attn_mqa.tp_q_head_num = self.num_local_heads * all2all_size
             try:
                 attn_output = self._call_attn_mqa(
-                    q, k, k_nope, forward_batch, topk_indices
+                    q, k, k_nope, forward_batch, kernel_topk_indices
                 )
             finally:
                 self.attn_mqa.tp_q_head_num = saved_tp_q_head_num

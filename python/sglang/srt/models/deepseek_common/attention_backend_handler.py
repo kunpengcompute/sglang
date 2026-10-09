@@ -16,6 +16,7 @@
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.mem_cache.common import is_lc_cp_enabled
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
@@ -192,12 +193,22 @@ def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 def handle_attention_kunpeng_cpu(attn, forward_batch):
-    # Use MHA_KUNPENG for all prefill so chunked and non-chunked match;
-    # MLA_KUNPENG's absorbed-q path diverges numerically.
     if forward_batch.forward_mode.is_extend_without_speculative():
+        if (
+            not is_lc_cp_enabled()
+            and getattr(attn, "use_nsa", False)
+            and getattr(attn, "indexer", None) is not None
+        ):
+            # DSA absorbed prefill: MLA_KUNPENG runs the absorbed-q path and
+            # the sparse flash MLA over the paged LATENT cache (the same
+            # kernel as decode / MTP verify), dropping the MHA form's
+            # per-layer kv_b up-projection of the full context.
+            return AttnForwardMethod.MLA_KUNPENG
+        # Otherwise use MHA_KUNPENG for all prefill so chunked and
+        # non-chunked match; MLA_KUNPENG's absorbed-q path diverges
+        # numerically.
         return AttnForwardMethod.MHA_KUNPENG
-    else:
-        return AttnForwardMethod.MLA_KUNPENG
+    return AttnForwardMethod.MLA_KUNPENG
 
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)

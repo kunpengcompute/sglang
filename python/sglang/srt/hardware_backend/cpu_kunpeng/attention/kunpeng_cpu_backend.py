@@ -28,6 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.common import is_lc_cp_enabled
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.graph import ops as kunpeng
+from sglang.srt.graph._capture import is_capturing
 from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import pp_span
 from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import *
 from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import KunpengSwapManager
@@ -50,7 +51,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
-_enable_debug = False
 
 
 def run_sdpa_forward_mha(
@@ -218,6 +218,37 @@ class KunpengCpuMetadata:
         self.batchsize_per_tp: int = 0
         self.token_slice_start: int = 0
 
+        # DSA absorbed prefill: the flat row-stream length (all extend
+        # rows concatenated, rounded up to the a2a multiple; >= a2a so an
+        # all-padding batch still presents dummy rows).
+        self.absorbed_flat_rows: Optional[int] = None
+        # This rank's row window: per-row KV slots [rows, 1, topk] +
+        # valid counts [rows], emitted once per step outside the capture
+        # region. Stored as the EXACT views the kernel consumes (graph
+        # inputs must match the consumed views).
+        self.absorbed_slots: Optional[torch.Tensor] = None
+        self.absorbed_topk_length: Optional[torch.Tensor] = None
+
+        # The topk_len the sparse sched planned with (metadata time), checked
+        # against the kernel-time topk_length before every sparse kernel call:
+        # a divergence leaves a phantom kv1 range on null extra_indices that
+        # the release kernel dereferences. This rank's slice.
+        self.sparse_sched_topk_len: Optional[torch.Tensor] = None
+
+        # K/V write locations: out_cache_loc with all-zero padding rows
+        # routed to -1, so the write kernels (which skip ``loc < 0``)
+        # never scatter padding K/V into the live page 0. Computed once
+        # per step outside the capture region (see _init_kv_write_loc)
+        # and registered as a graph input; None = raw passthrough.
+        self.kv_write_loc: Optional[torch.Tensor] = None
+
+        # True when every req_pool_indices row of this rank's slice is 0
+        # (batch padding mirror of another rank's prefill): the sparse
+        # kernel segfaults on the degenerate shape, so the forward skips
+        # it and returns zeros. Frozen Python branch inside the capture,
+        # so it is part of the graph cache key.
+        self.sparse_all_padding: bool = False
+
         # Long-context decode CP metadata (sparse flash MLA over the local
         # 1/cp KV shard). Built once per decode step, reused across layers.
         # ``long_context_indices`` is a PERSISTENT fixed-shape
@@ -291,9 +322,9 @@ class KunpengCpuBackend(AttentionBackend):
         # _init_long_context_metadata); 0 until the first LC decode step.
         self._lc_max_topk: int = 0
 
-        # DSA (NSA): decode runs sparse flash MLA over the indexer-selected
-        # top-k tokens (topk_indices -> slots via dsa_topk_slots_kunpeng);
-        # MTP modes still run the dense paged MLA path.
+        # DSA (NSA): decode, MTP verify/draft-extend and absorbed prefill
+        # all run the sparse flash MLA over the indexer-selected top-k
+        # tokens (topk_indices -> slots via dsa_topk_slots_kunpeng).
         self._nsa_enabled = is_deepseek_nsa(model_config.hf_text_config)
         self._nsa_topk = (
             get_nsa_index_topk(model_config.hf_config) if self._nsa_enabled else 0
@@ -301,7 +332,8 @@ class KunpengCpuBackend(AttentionBackend):
         self._nsa_dense_fallback_warned = False
         if self._nsa_enabled:
             logger.info(
-                "DSA (NSA) sparse decode enabled: topk=%d (MTP verify still dense)",
+                "DSA (NSA) sparse attention enabled: topk=%d "
+                "(decode + MTP verify/draft-extend + absorbed prefill)",
                 self._nsa_topk,
             )
         if self._lc_enabled:
@@ -340,6 +372,12 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata.all2all_size = 1
         self.forward_metadata.batchsize_per_tp = 0
         self.forward_metadata.token_slice_start = 0
+        self.forward_metadata.absorbed_flat_rows = None
+        self.forward_metadata.absorbed_slots = None
+        self.forward_metadata.absorbed_topk_length = None
+        self.forward_metadata.sparse_sched_topk_len = None
+        self.forward_metadata.kv_write_loc = None
+        self.forward_metadata.sparse_all_padding = False
         self.forward_metadata.long_context_topk_length = None
         self.forward_metadata.long_context_real_topk_length = None
         # long_context_indices / fill_len / last_req_idx / last_seq_len are
@@ -369,6 +407,15 @@ class KunpengCpuBackend(AttentionBackend):
                 enable_blockwise=self.swap_mgr.enable_swap_kv_blockwise,
             )
             forward_batch.seq_lens = save_seq_lens
+        elif (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and self._nsa_enabled
+            and not self._lc_enabled
+        ):
+            # DSA absorbed prefill (the MLA_KUNPENG dispatch): flat row
+            # stream -- all extend rows concatenated, decode-shaped sparse
+            # call with per-row slots from metadata.
+            self._init_absorbed_prefill_metadata(forward_batch)
         elif self.swap_mgr.enable_swap_kv_blockwise:
             # Extend (prefill) with block-wise swap: compute block_table
             # covering ALL tokens (history + new). No all2all slicing.
@@ -392,7 +439,35 @@ class KunpengCpuBackend(AttentionBackend):
             # prefix pages (in cache) + current chunk pages. The paged MHA
             # kernel (MHA_KUNPENG) reads latent via this block_table.
             self._init_extend_mha_metadata(forward_batch)
+
+        self._init_kv_write_loc(forward_batch)
         return
+
+    def _init_kv_write_loc(self, forward_batch: ForwardBatch) -> None:
+        """Per-step K/V write locations and all-padding flag.
+
+        Both derive from tensor content but are consumed inside the
+        captured region, so they are computed here instead:
+        kv_write_loc is registered as a graph input, sparse_all_padding
+        joins the graph cache key.
+        """
+        metadata = self.forward_metadata
+        loc = forward_batch.out_cache_loc
+        bs = forward_batch.input_ids.shape[0]
+        if loc is not None and bs > 0 and loc.shape[0] % bs == 0:
+            tpr = loc.shape[0] // bs
+            pad = loc.view(bs, tpr).eq(0).all(dim=1).repeat_interleave(tpr)
+            metadata.kv_write_loc = loc.masked_fill(pad, -1)
+
+        rpi = forward_batch.req_pool_indices
+        if rpi is None:
+            return
+        start = metadata.token_slice_start or 0
+        btp = metadata.batchsize_per_tp or rpi.shape[0]
+        rpi_slice = rpi[start : start + btp]
+        metadata.sparse_all_padding = (
+            rpi_slice.numel() > 0 and bool((rpi_slice == 0).all())
+        )
 
     def _init_extend_mha_metadata(self, forward_batch: ForwardBatch):
         """Build block_table for the paged MHA extend (chunked prefill).
@@ -417,6 +492,115 @@ class KunpengCpuBackend(AttentionBackend):
             seq_lens,
             enable_blockwise=False,
         )
+
+    def _init_absorbed_prefill_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Flat absorbed prefill: all extend rows form one stream (packed
+        order, real rows first), rounded up to the a2a multiple; each rank
+        presents its flat slice after the model's a2all. Per-row slots are
+        emitted here (outside the capture region) and the kernel runs
+        decode-shaped (rows, 1, H, D) -- no per-seq row padding, no
+        64-head padding."""
+        metadata = self.forward_metadata
+        metadata.page_size = forward_batch.token_to_kv_pool.page_size
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        ext = forward_batch.extend_seq_lens
+        assert ext is not None and ext.shape[0] == seq_lens.shape[0], (
+            "absorbed prefill requires a [bs] extend_seq_lens"
+        )
+        bs = seq_lens.shape[0]
+
+        # Fake-indexer regime guard: exact only while the full attention
+        # window fits in topk (checked outside the capture, so every
+        # replay round is guarded).
+        if bs > 0:
+            max_window = int(seq_lens.max())
+            if max_window > self._nsa_topk:
+                raise NotImplementedError(
+                    f"fake CPU indexer requires the attention window "
+                    f"({max_window}) <= index_topk ({self._nsa_topk}) "
+                    f"in absorbed prefill; the real CPU indexer is not "
+                    f"implemented yet"
+                )
+
+        # Round up to the a2a multiple (the a2all splits the stream into
+        # equal per-rank chunks); >= a2a so an all-padding batch still
+        # presents dummy rows.
+        real_rows = int(ext.sum())
+        a2a = 1
+        if get_attention_tp_size() > 1 and not _DISABLE_MLA_ALL2ALL:
+            a2a = get_socket_tp_group().world_size
+            flat_rows = max(((real_rows + a2a - 1) // a2a) * a2a, a2a)
+        else:
+            flat_rows = max(real_rows, 1)
+        metadata.absorbed_flat_rows = flat_rows
+
+        # The a2all is model-side, so the kv-write / rpi bookkeeping
+        # stays unsliced.
+        metadata.seq_lens = seq_lens
+        metadata.extend_seq_lens = ext
+        metadata.all2all_size = 1
+        metadata.batchsize_per_tp = bs
+        metadata.token_slice_start = 0
+
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+        enable_blockwise = self.swap_mgr.enable_swap_kv_blockwise
+        with pp_span("block_table_build"):
+            self._init_block_table(
+                metadata,
+                forward_batch,
+                req_pool_indices,
+                seq_lens,
+                enable_blockwise=enable_blockwise,
+            )
+        if enable_blockwise:
+            with pp_span("blockwise_swap"):
+                self._init_blockwise_swap_metadata(metadata, forward_batch)
+
+        # Per-row slots, once per step (the old path re-ran the mapping
+        # every layer); block_table remap rule matches the dense path.
+        block_table = self.swap_mgr.get_remapped_block_table()
+        if block_table is None:
+            block_table = metadata.block_table
+        slots = torch.empty(flat_rows, self._nsa_topk, dtype=torch.int32)
+        topk_length = torch.empty(flat_rows, dtype=torch.int32)
+        torch.ops.sgl_kernel.dsa_prefill_slots_kunpeng(
+            block_table,
+            seq_lens,
+            ext,
+            flat_rows,
+            metadata.page_size,
+            self._nsa_topk,
+            slots,
+            topk_length,
+        )
+
+        # Rank row window; seqlen_q == 1 makes topk_length per row (= per
+        # kernel request). The window slices are the EXACT views the
+        # kernel consumes (graph inputs must match consumed views).
+        if a2a > 1:
+            socket_group = get_socket_tp_group()
+            row_start = socket_group.rank_in_group * (flat_rows // a2a)
+            rows = flat_rows // a2a
+            num_heads_q = self.num_q_heads * a2a
+        else:
+            row_start = 0
+            rows = flat_rows
+            num_heads_q = self.num_q_heads
+        with pp_span("decode_sched"):
+            metadata.extra_bytes = (
+                torch.ops.sgl_kernel.flash_mla_sparse_decode_sched_kunpeng(
+                    topk_length[row_start : row_start + rows],
+                    seqlen_q=1,
+                    num_heads_q=num_heads_q,
+                    head_dim=self.decode_head_dim,
+                    head_dim_v=self.decode_head_dim_v,
+                    meta=self._decode_meta,
+                )
+            )
+        metadata.absorbed_slots = slots[row_start : row_start + rows].view(
+            rows, 1, self._nsa_topk
+        )
+        metadata.absorbed_topk_length = topk_length[row_start : row_start + rows]
 
     def _init_decode_metadata(
         self,
@@ -567,17 +751,51 @@ class KunpengCpuBackend(AttentionBackend):
             )
 
         with pp_span("decode_sched"):
-            if (
+            mode = forward_batch.forward_mode
+            sparse_mla = (
                 self._nsa_enabled
-                and forward_batch.forward_mode.is_decode()
-                and seqlen_q == 1
                 and seq_lens.shape[0] > 0
-            ):
-                # Per-seq selected count = min(topk, seq_len); clamp >= 1
-                # because the sched rejects 0-length rows.
+                and (
+                    (mode.is_decode() and seqlen_q == 1)
+                    or (
+                        (mode.is_target_verify() or mode.is_draft_extend())
+                        and seqlen_q == self.speculative_num_draft_tokens
+                    )
+                )
+            )
+            if sparse_mla:
+                # Bring-up regime guard for the fake indexer: the sparse
+                # selection is exact only while the full attention window
+                # fits in topk. This runs OUTSIDE the graph capture region,
+                # so every replay round is guarded (not just capture).
+                max_window = int(seq_lens.max())
+                if max_window > self._nsa_topk:
+                    raise NotImplementedError(
+                        f"fake CPU indexer requires the attention window "
+                        f"({max_window}) <= index_topk ({self._nsa_topk}) "
+                        f"in {mode} mode; the real CPU indexer is not "
+                        f"implemented yet"
+                    )
+                # Per-seq scan bound = min(topk, window of the LAST query
+                # row) == min(topk, seq_len); clamp >= 1 because the sched
+                # rejects 0-length rows. Per-row lengths are trimmed by the
+                # trailing -1 padding inside each indices row.
                 topk_len = torch.minimum(
                     seq_lens, torch.full_like(seq_lens, self._nsa_topk)
                 ).clamp_(min=1)
+                ext = forward_batch.extend_seq_lens
+                if ext is not None:
+                    # Padding rows (extend_seq_lens == 0) carry the 1-entry
+                    # LC dummy index pattern: their kernel-side topk_length
+                    # is 1, not min(seq_lens, topk).
+                    ext_slice = ext[
+                        metadata.token_slice_start : metadata.token_slice_start
+                        + metadata.batchsize_per_tp
+                    ]
+                    topk_len = torch.where(
+                        ext_slice == 0, torch.ones_like(topk_len), topk_len
+                    )
+                metadata.sparse_sched_topk_len = topk_len
                 metadata.extra_bytes = (
                     torch.ops.sgl_kernel.flash_mla_sparse_decode_sched_kunpeng(
                         topk_len,
@@ -1646,12 +1864,17 @@ class KunpengCpuBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = False,
+        topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        """MTP target-verify forward via the paged MLA path.
+        """MTP target-verify forward via the sparse (DSA) or paged MLA path.
 
         q has a fixed shape (sum_seq_len == bs * speculative_num_draft_tokens);
         it is reshaped here to (bs, speculative_num_draft_tokens, H, D).
+        With DSA topk_indices (full-batch [B, n, topk] from the indexer) the
+        sparse flash MLA kernel runs over the selected tokens; without it the
+        dense paged MLA path (one-time warning).
         """
         self.swap_mgr.get_kv_cache()
 
@@ -1669,6 +1892,19 @@ class KunpengCpuBackend(AttentionBackend):
             # into the persistent SHM regions + pure-read of the peers').
             # The model runs the online-softmax reduce over the cp dimension.
             return self._forward_mla_paged_cp(q_4d, k, v, layer, forward_batch)
+        if topk_indices is not None:
+            # DSA (NSA): sparse flash MLA over the indexer-selected tokens
+            # (n query rows per sequence, causal windows encoded in the
+            # per-row indices).
+            return self._forward_mla_sparse_paged(
+                q_4d, k, v, layer, forward_batch, topk_indices, attn_sink=sinks
+            )
+        if self._nsa_enabled and not self._nsa_dense_fallback_warned:
+            logger.warning(
+                "DSA model TARGET_VERIFY WITHOUT topk_indices (indexer not "
+                "available?); falling back to dense paged MLA"
+            )
+            self._nsa_dense_fallback_warned = True
         return self._forward_mla_paged(q_4d, k, v, layer, forward_batch)
 
     def forward_draft_extend(
@@ -1679,13 +1915,16 @@ class KunpengCpuBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = False,
+        topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        """MTP draft-extend forward via the paged MLA path.
+        """MTP draft-extend forward via the sparse (DSA) or paged MLA path.
 
         q is already left-padded by the model (forward_absorb_core_kunpeng) to
         (bs, speculative_num_draft_tokens, H, D); the unpad happens there too,
-        so this only runs the paged MLA kernel.
+        so this only runs the attention kernel. Padding rows carry the LC
+        dummy index pattern; their outputs are discarded by the unpad.
         """
         self.swap_mgr.get_kv_cache()
 
@@ -1693,6 +1932,18 @@ class KunpengCpuBackend(AttentionBackend):
             # Long-context decode CP: sparse paged MLA + zero-copy exchange;
             # the model runs the online-softmax reduce over the cp dimension.
             return self._forward_mla_paged_cp(q, k, v, layer, forward_batch)
+        if topk_indices is not None:
+            # DSA (NSA): sparse flash MLA over the indexer-selected tokens
+            # (live rows right-aligned over the left padding).
+            return self._forward_mla_sparse_paged(
+                q, k, v, layer, forward_batch, topk_indices, attn_sink=sinks
+            )
+        if self._nsa_enabled and not self._nsa_dense_fallback_warned:
+            logger.warning(
+                "DSA model DRAFT_EXTEND WITHOUT topk_indices (indexer not "
+                "available?); falling back to dense paged MLA"
+            )
+            self._nsa_dense_fallback_warned = True
         return self._forward_mla_paged(q, k, v, layer, forward_batch)
 
     def forward_extend(
@@ -1709,11 +1960,28 @@ class KunpengCpuBackend(AttentionBackend):
 
         self.swap_mgr.get_kv_cache()
 
-        if topk_indices is not None:
-            # DSA sparse prefill (non-chunked extend).
-            return self._forward_extend_sparse_kunpeng(
-                q, k, v, layer, forward_batch, topk_indices, sinks
-            )
+        if q.dim() == 4:
+            # DSA absorbed prefill: q is the flat (rows, 1, H, D) form;
+            # the per-row slots come from metadata (no topk_indices).
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and self._nsa_enabled
+                and not self._lc_enabled
+            ):
+                return self._forward_mla_sparse_flat(
+                    q, k, v, layer, forward_batch, attn_sink=sinks
+                )
+            if topk_indices is not None:
+                return self._forward_mla_sparse_paged(
+                    q, k, v, layer, forward_batch, topk_indices, attn_sink=sinks
+                )
+            if self._nsa_enabled and not self._nsa_dense_fallback_warned:
+                logger.warning(
+                    "DSA model EXTEND WITHOUT topk_indices (indexer not "
+                    "available?); falling back to dense paged MLA"
+                )
+                self._nsa_dense_fallback_warned = True
+            return self._forward_mla_paged(q, k, v, layer, forward_batch)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
         is_cross_attn = layer.is_cross_attention
@@ -1730,59 +1998,6 @@ class KunpengCpuBackend(AttentionBackend):
             return self._forward_extend_kutacc(q, k, v, layer, forward_batch)
         else:
             return self.forward_extend_native(q, k, v, layer, forward_batch)
-
-    def _forward_extend_sparse_kunpeng(
-        self,
-        q,
-        k,
-        v,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        topk_indices: torch.Tensor,
-        sinks: Optional[torch.Tensor] = None,
-    ):
-        """DSA sparse prefill over the model-assembled per-head K/V
-        (non-chunked extend: no prefix here, plumbed for parity anyway).
-        """
-        q_3d = kunpeng.contiguous_kunpeng(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
-        k_3d = kunpeng.contiguous_kunpeng(
-            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-        )
-        v_3d = kunpeng.contiguous_kunpeng(
-            v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
-        )
-
-        prefix_lens = forward_batch.extend_prefix_lens
-        if prefix_lens is None:
-            prefix_lens = torch.zeros_like(forward_batch.extend_seq_lens)
-
-        softmax_scale = (
-            layer.scaling
-            if layer.scaling is not None
-            else 1.0 / math.sqrt(layer.qk_head_dim)
-        )
-
-        n = q_3d.shape[0]
-        out = kunpeng.alloc_buffer(
-            n * layer.tp_q_head_num * layer.v_head_dim, dtype=torch.bfloat16
-        ).view(n, layer.tp_q_head_num, layer.v_head_dim)
-        ws_bytes = (
-            torch.ops.sgl_kernel
-            .flash_attention_sparse_prefill_workspace_size_kunpeng(
-                layer.v_head_dim)
-        )
-        workspace = kunpeng.alloc_buffer(ws_bytes, dtype=torch.uint8)
-
-        kunpeng.flash_attention_sparse_prefill_kunpeng(
-            q_3d, k_3d, v_3d, topk_indices, None, out, None, workspace,
-            True,  # causal
-            softmax_scale,
-            forward_batch.extend_seq_lens, prefix_lens,
-            sinks,
-        )
-        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -1827,6 +2042,66 @@ class KunpengCpuBackend(AttentionBackend):
 
         return o_4d.view(q_.shape[0], -1)
 
+    def _forward_mla_sparse_flat(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        attn_sink: Optional[torch.Tensor] = None,
+    ):
+        """Flat absorbed prefill: decode-shaped (rows, 1, H, D) sparse
+        call on this rank's slice of the flat row stream; slots /
+        topk_length come from metadata. Returns o as (rows, 1, H,
+        v_head_dim)."""
+        meta = self.forward_metadata
+        kv_buf = self._get_kv_buffer(
+            layer, forward_batch, k, v, forward_batch.out_cache_loc
+        )
+        kvcache_paged = kv_buf[:, 0, :].reshape(-1, meta.page_size, kv_buf.shape[-1])
+
+        b, sq, nh, _ = q.shape
+        # All-padding slice: skip the kernel (segfaults on the degenerate
+        # shape); the flag is part of the graph cache key.
+        if meta.sparse_all_padding:
+            o = kunpeng.alloc_buffer(
+                b * sq * nh * layer.v_head_dim, dtype=torch.bfloat16
+            ).view(b, sq, nh, layer.v_head_dim)
+            kunpeng.zero_(o)
+            return o
+
+        softmax_scale = (
+            layer.scaling
+            if layer.scaling is not None
+            else 1.0 / math.sqrt(layer.qk_head_dim)
+        )
+        extra_buffer = (
+            kunpeng.alloc_buffer(meta.extra_bytes)
+            if meta.extra_bytes > 0
+            else torch.empty(0, dtype=torch.uint8, device=q.device)
+        )
+        o = kunpeng.alloc_buffer(
+            b * sq * nh * layer.v_head_dim, dtype=torch.bfloat16
+        ).view(b, sq, nh, layer.v_head_dim)
+        lse = kunpeng.alloc_buffer(b * sq * nh, dtype=torch.float32).view(b, sq, nh)
+        kunpeng.flash_mla_sparse_decode_kunpeng(
+            q,
+            kvcache_paged,
+            meta.absorbed_slots,
+            meta.absorbed_topk_length,
+            None,  # extra_kvcache (window set; indexer covers the window)
+            None,  # extra_indices
+            None,  # extra_topk_length
+            attn_sink,
+            o,
+            lse,
+            softmax_scale,
+            extra_buffer,
+            self._decode_meta,
+        )
+        return o
+
     def _forward_mla_sparse_paged(
         self,
         q,
@@ -1837,16 +2112,19 @@ class KunpengCpuBackend(AttentionBackend):
         topk_indices: torch.Tensor,
         attn_sink: Optional[torch.Tensor] = None,
     ):
-        """DSA (NSA) sparse decode: top-k selected tokens via the sparse
-        flash MLA kernel.
+        """DSA (NSA) sparse attention via the sparse flash MLA kernel.
 
-        q is 4D (Btp, 1, H, D) -- after the decode all2all H covers all
-        heads of the socket group and Btp is this rank's batch slice.
-        topk_indices is the FULL-batch indexer output ([B, 1, topk] token
-        positions, -1 padding); metadata.token_slice_start selects this
-        rank's rows (0 without the all2all). attn_sink ([H] fp32, optional)
-        is the per-head attention sink, matching the sparse prefill op's
-        semantics. Returns o as 4D (Btp, 1, H, v_head_dim).
+        q is 4D (Btp, seqlen_q, H, D): decode passes (Btp, 1, H, D) -- after
+        the decode all2all H covers all heads of the socket group and Btp is
+        this rank's batch slice; TARGET_VERIFY / DRAFT_EXTEND pass (Btp,
+        speculative_num_draft_tokens, H, D) (draft-extend rows include the
+        model's left padding).
+        topk_indices is the FULL-batch indexer output ([B, topk] token
+        positions for decode, [B, seqlen_q, topk] for the MTP modes; -1
+        padding); metadata.token_slice_start selects this rank's sequence
+        rows (0 without the all2all). attn_sink ([H] fp32, optional) is the
+        per-head attention sink, matching the sparse prefill op's semantics.
+        Returns o as 4D (Btp, seqlen_q, H, v_head_dim).
         """
         meta = self.forward_metadata
         kv_buf = self._get_kv_buffer(
@@ -1867,7 +2145,36 @@ class KunpengCpuBackend(AttentionBackend):
             meta.token_slice_start,
         )
 
-        b, _, nh, _ = q.shape
+        b, sq, nh, _ = q.shape
+        # All-padding slice (batch padding mirror): no real work -- the
+        # outputs are dropped by the gather-side unpad -- and the kernel
+        # segfaults on the degenerate shape. The flag is part of the graph
+        # cache key; zero_ is a registered op, so replays re-zero.
+        if meta.sparse_all_padding:
+            o = kunpeng.alloc_buffer(
+                b * sq * nh * layer.v_head_dim, dtype=torch.bfloat16
+            ).view(b, sq, nh, layer.v_head_dim)
+            kunpeng.zero_(o)
+            return o
+        sched_topk = meta.sparse_sched_topk_len
+        # Not checked while capturing: registered ops do not execute at
+        # capture time, so topk_length is dsa_topk_slots' shape-only
+        # uninitialized output buffer and the comparison reads garbage.
+        if (
+            sched_topk is not None
+            and not is_capturing()
+            and not torch.equal(sched_topk, topk_length.to(sched_topk.dtype))
+        ):
+            # The sched planned tile ranges from its metadata-time topk_len
+            # while the kernel reads the forward-time topk_length; a
+            # mismatch leaves a phantom kv1 range on null extra_indices that
+            # the release kernel dereferences. Fail loudly instead.
+            raise RuntimeError(
+                f"sparse sched/kernel topk mismatch rank="
+                f"{get_socket_tp_group().rank_in_group} "
+                f"mode={forward_batch.forward_mode.name} "
+                f"sched={sched_topk.tolist()} kernel={topk_length.tolist()}"
+            )
         softmax_scale = (
             layer.scaling
             if layer.scaling is not None
@@ -1879,9 +2186,9 @@ class KunpengCpuBackend(AttentionBackend):
             else torch.empty(0, dtype=torch.uint8, device=q.device)
         )
         o = kunpeng.alloc_buffer(
-            b * nh * layer.v_head_dim, dtype=torch.bfloat16
-        ).view(b, 1, nh, layer.v_head_dim)
-        lse = kunpeng.alloc_buffer(b * nh, dtype=torch.float32).view(b, 1, nh)
+            b * sq * nh * layer.v_head_dim, dtype=torch.bfloat16
+        ).view(b, sq, nh, layer.v_head_dim)
+        lse = kunpeng.alloc_buffer(b * sq * nh, dtype=torch.float32).view(b, sq, nh)
         kunpeng.flash_mla_sparse_decode_kunpeng(
             q,
             kvcache_paged,

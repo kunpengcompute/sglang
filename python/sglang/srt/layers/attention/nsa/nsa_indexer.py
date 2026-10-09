@@ -1077,49 +1077,64 @@ class Indexer(MultiPlatformOp):
         indexer implementation (the bring-up fake) for now.
 
         The fake: with the bring-up regime (total context <= index_topk)
-        every token is selected, so the sparse decode and sparse prefill
-        paths are exactly equivalent to dense attention.
+        every token is selected, so the sparse decode, sparse MTP and
+        sparse prefill paths are exactly equivalent to dense attention.
 
         Decode: ALL positions [0, seq_len) per sequence (-1 padded to topk).
-        Plain EXTEND: per-query-row causal prefix [0, prefix+t] (-1 padded).
+        TARGET_VERIFY / DRAFT_EXTEND / absorbed prefill: [B, n, topk] rows
+        -- verify windows grow [0, ctx + t + 1); draft-extend live rows are
+        right-aligned over the model's left padding; absorbed prefill pads
+        to the batch-wide max extend len the same way.
 
-        Raises when any sequence exceeds index_topk (beyond it the fake
-        would select the wrong tokens; needs the real indexer) or on a
+        The seq_len <= index_topk regime guard lives in
+        KunpengCpuBackend.init_forward_metadata (OUTSIDE the graph capture
+        region, so every replay round is checked; beyond topk the fake would
+        select the wrong tokens and needs the real indexer). Raises on a
         non-920F CPU (no indexer implementation).
 
-        Output contract matches the CUDA paths: [q_rows, topk] int32,
-        valid entries form the leading prefix, -1 padding.
+        Output contract matches the CUDA paths: [q_rows, topk] int32
+        (MTP: [B, n, topk]), valid entries form the leading prefix, -1
+        padding.
         """
         if not is_cpu_920f():
             raise NotImplementedError(
                 "CPU indexer forward is only implemented for Kunpeng 920F"
             )
 
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
-            max_len = int(max(seq_lens_cpu))
-            if max_len > self.index_topk:
-                raise NotImplementedError(
-                    f"fake CPU indexer requires seq_len ({max_len}) <= "
-                    f"index_topk ({self.index_topk}); the real CPU indexer "
-                    f"is not implemented yet"
-                )
-
         from sglang.srt.graph import ops as kunpeng
 
         backend = forward_batch.attn_backend
 
-        if forward_batch.forward_mode.is_extend_without_speculative():
-            # Plain EXTEND (the MHA_KUNPENG dispatch): per-query-row causal
-            # prefix, consumed by flash_attention_sparse_prefill_kunpeng.
-            prefix_lens = forward_batch.extend_prefix_lens
-            if prefix_lens is None:
-                prefix_lens = torch.zeros_like(forward_batch.extend_seq_lens)
-            return kunpeng.fake_indexer_topk_rows_kunpeng(
-                forward_batch.extend_seq_lens,
-                prefix_lens,
-                self.index_topk,
-                envs.SGLANG_KUNPENG_MAX_SEQ_LEN.get(),
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            # MTP verify/draft-extend: fixed rows per sequence in the
+            # [B, n, topk] layout for dsa_topk_slots_kunpeng +
+            # flash_mla_sparse_decode_kunpeng. full_seq_lens is the
+            # persistent FULL-batch buffer, not the per-q_lora-row slice
+            # the decode branch uses. (The absorbed prefill no longer runs
+            # the indexer -- dsa_prefill_slots_kunpeng emits its slots at
+            # metadata time.)
+            bs = forward_batch.seq_lens.shape[0]
+            seq_lens = backend.forward_metadata.full_seq_lens[:bs]
+            if forward_batch.forward_mode.is_target_verify():
+                n = backend.speculative_num_draft_tokens
+                # All n rows live (verify batches carry no extend lens).
+                extend_seq_lens = None
+            else:
+                # Draft-extend: fixed n = speculative_num_draft_tokens.
+                extend_seq_lens = forward_batch.extend_seq_lens
+                n = backend.speculative_num_draft_tokens
+                assert (
+                    extend_seq_lens is not None
+                    and extend_seq_lens.shape[0] == bs
+                ), (
+                    f"{forward_batch.forward_mode} batch must carry a [bs] "
+                    f"extend_seq_lens for the fake CPU indexer"
+                )
+            return kunpeng.fake_indexer_topk_mtp_kunpeng(
+                seq_lens, extend_seq_lens, n, self.index_topk
             )
 
         # Decode: full-batch persistent seq lens (graph input; see
