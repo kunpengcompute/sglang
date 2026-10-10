@@ -41,7 +41,11 @@ usage() {
   echo "              bootstrap_room per request; decode skips KV transfer without"
   echo "              --disaggregation-transfer-backend. Port auto-derived from"
   echo "              the decode entry in INSTANCES; CURL_PORT overrides."
-  echo "  -p          Enable profiling (start/stop profile via separate curl calls)"
+  echo "  -p          Enable profiling (start/stop_profile via separate curl calls;"
+  echo "              PD layout: sent to the decode side's tokenizer HTTP port,"
+  echo "              auto-derived as 30001 + the decode entry's position in"
+  echo "              INSTANCES; native layout: sent to the target."
+  echo "              CURL_DECODE_INSTANCE / CURL_DECODE_PORT select/override)"
   echo "  -c CONC     Max concurrent requests (default: unbounded)"
   echo "  -i          Interactive chat mode — multi-turn streaming conversation"
   exit 0
@@ -161,35 +165,62 @@ parse_ranks() {
 #   CURL_HOST=<decode master IP> ./curl.sh -d 0-15 -n 512 -m 384
 # With -F (fake transfer), the port auto-derives from the runtime layout
 # (same rule as runtime/env_decode.sh): 30001 + the decode entry's position
-# in INSTANCES (.user_env.sh) — the decode tokenizer HTTP server on the
-# route node, so the IP needs no adjustment. CURL_DECODE_INSTANCE=<suffix>
-# selects among multiple decode entries (e.g. "64p-etp8" for entry
-# "decode_64p-etp8"); CURL_PORT still overrides everything.
-IP=${CURL_HOST:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}
-if [ "$FAKE" = true ]; then
-  _want="decode${CURL_DECODE_INSTANCE:+_$CURL_DECODE_INSTANCE}"
-  _insts=$(grep -E '^[[:space:]]*export[[:space:]]+INSTANCES=' \
-    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.user_env.sh" 2>/dev/null \
-    | head -n1 | cut -d'"' -f2 | tr ',' '\n')
-  # Entry not listed / no .user_env.sh -> classic "prefill,decode" (30002).
-  _g=1
-  if [ -n "$_insts" ]; then
-    _g=-1; _i=0
-    while IFS= read -r _e; do
-      _e="${_e//[[:space:]]/}"
-      [ -z "$_e" ] && continue
+# in INSTANCES — the decode tokenizer HTTP server on the route node, so the
+# IP needs no adjustment. CURL_DECODE_INSTANCE=<suffix> selects among
+# multiple decode entries (e.g. "64p-etp8" for entry "decode_64p-etp8");
+# CURL_PORT overrides everything.
+
+# Decode tokenizer HTTP port on the router node: 30001 + the decode entry's
+# position in INSTANCES. INSTANCES resolution mirrors env_base.sh's load
+# order: an exported shell variable first (e.g. the user sourced env.sh),
+# then .user_env.sh, then runtime/.user_env_base.sh, then the built-in
+# default layout in runtime/env_base.sh. Echoes nothing when the layout has
+# no decode entry (native) and strict=1 (default); -F passes strict=0 to
+# keep the classic "prefill,decode" fallback (30002). CURL_DECODE_PORT
+# overrides everything.
+resolve_decode_tok_port() {
+  if [ -n "${CURL_DECODE_PORT:-}" ]; then
+    echo "$CURL_DECODE_PORT"
+    return
+  fi
+  local base want insts="" g="" i=0 e f
+  base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  want="decode${CURL_DECODE_INSTANCE:+_$CURL_DECODE_INSTANCE}"
+  if [ -n "${INSTANCES:-}" ]; then
+    insts="${INSTANCES//,/$'\n'}"
+  else
+    for f in "$base/.user_env.sh" "$base/runtime/.user_env_base.sh" \
+             "$base/runtime/env_base.sh"; do
+      [ -f "$f" ] || continue
+      insts=$(grep -E '^[[:space:]]*(export[[:space:]]+)?INSTANCES=' "$f" \
+        | head -n1 | cut -d'"' -f2 | tr ',' '\n')
+      [ -n "$insts" ] && break
+    done
+  fi
+  if [ -n "$insts" ]; then
+    while IFS= read -r e; do
+      e="${e//[[:space:]]/}"
+      [ -z "$e" ] && continue
       # Exact match when CURL_DECODE_INSTANCE is set; otherwise take the
       # FIRST entry with the decode role prefix ("decode" or "decode_*",
       # same semantics as _instance_indexes' role check).
-      if [ "$_e" = "$_want" ] || { [ -z "${CURL_DECODE_INSTANCE:-}" ] && [ "${_e%%_*}" = "decode" ]; }; then
-        _g=$_i; break
+      if [ "$e" = "$want" ] || { [ -z "${CURL_DECODE_INSTANCE:-}" ] && [ "${e%%_*}" = "decode" ]; }; then
+        g=$i
+        break
       fi
-      _i=$((_i + 1))
-    done <<< "$_insts"
-    [ "$_g" -lt 0 ] && _g=1
+      i=$((i + 1))
+    done <<< "$insts"
   fi
-  PORT=${CURL_PORT:-$((30001 + _g))}
-  unset _want _insts _g _i _e
+  if [ -n "$g" ]; then
+    echo $((30001 + g))
+  elif [ "${1:-1}" = "0" ]; then
+    echo 30002
+  fi
+}
+
+IP=${CURL_HOST:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}
+if [ "$FAKE" = true ]; then
+  PORT=${CURL_PORT:-$(resolve_decode_tok_port 0)}
 else
   PORT=${CURL_PORT:-30000}
 fi
@@ -200,6 +231,31 @@ URL="http://${IP}:${PORT}/v1/completions"
 if [ "$INTERACTIVE" = false ]; then
   echo "Target: $URL" >&2
 fi
+
+# start/stop_profile control (used by -p). Addressing rules:
+#   - PD layout (a decode entry exists in the runtime layout): the decode
+#     side's own tokenizer HTTP server is addressed. Under the default
+#     primary target (router gateway :30000) the gateway is skipped — it
+#     does not proxy control endpoints; an explicit CURL_PORT (or -F, which
+#     derives PORT the same way and dedupes) is addressed as well.
+#   - Native layout (no decode entry): the primary target only, as before.
+profile_req() {
+  local action=$1 u urls
+  local decode_tok_port
+  decode_tok_port=$(resolve_decode_tok_port)
+  if [ -z "$decode_tok_port" ]; then
+    urls="http://${IP}:${PORT}"
+  elif [ -n "${CURL_PORT:-}" ] || [ "$FAKE" = true ]; then
+    urls="http://${IP}:${PORT}"
+    [ "$decode_tok_port" != "$PORT" ] && urls="$urls http://${IP}:${decode_tok_port}"
+  else
+    urls="http://${IP}:${decode_tok_port}"
+  fi
+  for u in $urls; do
+    echo "profile: ${action} -> $u" >&2
+    curl --noproxy "*" "$u/$action"
+  done
+}
 
 # Fake-transfer injection: per-request unique bootstrap_room (ns timestamp
 # base) + the magic fake host recognized by decode._is_fake_transfer.
@@ -230,7 +286,7 @@ if [ "$INTERACTIVE" = false ]; then
   fi
 
   if [ "$PROFILE" = true ]; then
-    curl --noproxy "*" http://${IP}:${PORT}/start_profile
+    profile_req start_profile
   fi
 fi
 
@@ -512,7 +568,7 @@ if [ "$INTERACTIVE" = false ]; then
   exec 3>&-
 
   if [ "$PROFILE" = true ]; then
-    curl --noproxy "*" http://${IP}:${PORT}/stop_profile
+    profile_req stop_profile
   fi
 
   # --- Compute and print results ---

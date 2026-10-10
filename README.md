@@ -238,7 +238,7 @@ export SGLANG_SPECULATIVE_NUM_STEPS=2   # 投机步数，默认2
 export SGLANG_ENABLE_GRAPH_CAPTURE=1  # 默认开
 ```
 
-- **作用**：对forward计算做图捕获与重放，消除Python调度开销。相关设置：`SGLANG_KUNPENG_GRAPH_CACHE_SIZE`（捕获图缓存数量，默认10）、`SGLANG_KUNPENG_EXTEND_POWER_2_PADDING`（prefill图按2的幂对齐padding，默认开）、`SGLANG_ENABLE_GRAPH_PROFILE`（图性能统计）、`SGLANG_GRAPH_DEBUG_PRINT`（逐算子调试打印）。
+- **作用**：对forward计算做图捕获与重放，消除Python调度开销。相关设置：`SGLANG_KUNPENG_GRAPH_CACHE_SIZE`（捕获图缓存数量，默认10）、`SGLANG_KUNPENG_EXTEND_POWER_2_PADDING`（prefill图按2的幂对齐padding，默认开）、`SGLANG_GRAPH_DEBUG_PRINT`（逐算子调试打印）。逐op计时记录由`/start_profile`/`/stop_profile`请求驱动。
 
 **6. SGLANG\_ENABLE\_KUCCL — kuccl通信后端**
 

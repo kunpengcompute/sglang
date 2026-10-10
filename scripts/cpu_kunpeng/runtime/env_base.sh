@@ -186,7 +186,6 @@ export SGLANG_KUNPENG_SDMA_MAX_EVENTS=10
 export SGLANG_KUNPENG_SDMA_THRESHOLD=5
 # Kunpeng graph capture
 export SGLANG_ENABLE_GRAPH_CAPTURE=1
-export SGLANG_ENABLE_GRAPH_PROFILE=0
 export SGLANG_KUNPENG_GRAPH_CACHE_SIZE=10
 export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1 # Kunpeng prefill graph padding to power 2 size
 export SGLANG_GRAPH_DEBUG_PRINT=0  # 1 = per-op debug print in eager/capture (ops.py) and graph replay (C++)

@@ -240,7 +240,7 @@ export SGLANG_SPECULATIVE_NUM_STEPS=2   # speculative steps, default 2
 export SGLANG_ENABLE_GRAPH_CAPTURE=1  # default on
 ```
 
-- **Effect**: Captures and replays forward computation graphs to eliminate Python scheduling overhead. Related settings: `SGLANG_KUNPENG_GRAPH_CACHE_SIZE` (captured graph cache count, default 10), `SGLANG_KUNPENG_EXTEND_POWER_2_PADDING` (prefill graph padding to power-of-2 sizes, default on), `SGLANG_ENABLE_GRAPH_PROFILE` (graph performance statistics), `SGLANG_GRAPH_DEBUG_PRINT` (per-op debug print).
+- **Effect**: Captures and replays forward computation graphs to eliminate Python scheduling overhead. Related settings: `SGLANG_KUNPENG_GRAPH_CACHE_SIZE` (captured graph cache count, default 10), `SGLANG_KUNPENG_EXTEND_POWER_2_PADDING` (prefill graph padding to power-of-2 sizes, default on), `SGLANG_GRAPH_DEBUG_PRINT` (per-op debug print). Per-op timing recording is request-driven via `/start_profile`/`/stop_profile`.
 
 **6. SGLANG\_ENABLE\_KUCCL — kuccl Communication Backend**
 

@@ -35,7 +35,6 @@ Kunpeng 计算图面向 920F 平台：对模型一次 forward 进行捕获（cap
 其他环境变量：
 
 - `SGLANG_ENABLE_HBW_POOL`（默认 0）：HBW 池开关，decode/idle 中间张量放入 HBW
-- `SGLANG_ENABLE_GRAPH_PROFILE`（默认 0）：逐 op 计时输出 JSONL
 - `SGLANG_KUNPENG_GRAPH_CACHE_SIZE`（默认 4）：图 LRU 容量
 - `SGLANG_KUNPENG_ENABLE_SHM_FENCE`（默认 0）：是否在 allreduce/allgather 前插入显式 fence 图算子
 
@@ -176,7 +175,7 @@ SHM 池：`model_runner` 首次捕获后把 SHM bump 分配器剩余全部字节
 
 ## 调试
 
-`SGLANG_ENABLE_GRAPH_PROFILE=1` 会把每次回放的逐算子耗时追加写入 `sglang_graph_rank{RANK}.jsonl`（目录由 `SGLANG_TORCH_PROFILER_DIR` 指定）。`scripts/cpu_kunpeng/analysis/` 下提供三个分析脚本：
+图逐 op 计时与 torch profiler 一样是请求驱动的：向服务发 `/start_profile` 后开始收集每次回放的逐算子耗时（缓存在内存，不落盘），`/stop_profile` 停止收集并把这段时间的记录一次性追加写入 `sglang_graph_pp{PP}_dp{DP}_tp{TP}.jsonl`（目录由 `/start_profile` 的 `output_dir` 参数或 `SGLANG_TORCH_PROFILER_DIR` 指定）。另可用 `num_steps`/`profile_by_stage` 等参数自动开始/停止。920F 图捕获开启时 `/start_profile`/`/stop_profile` 只驱动图计时，不会启动 torch profiler。图捕获开启时每 forward 的 EP barrier（压出更干净的 in-graph 通信算子耗时）随图常开。`scripts/cpu_kunpeng/analysis/` 下提供三个分析脚本：
 
 **转 Chrome tracing（时间线视图）**：
 
