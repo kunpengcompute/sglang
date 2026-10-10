@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
+    get_nsa_index_head_dim,
+    is_deepseek_nsa,
+)
 from sglang.srt.distributed.parallel_state import get_pp_group, get_tp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -30,6 +34,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
+    is_cpu_920f,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
@@ -50,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_cpu_920f = is_cpu_920f()
 
 
 class ModelRunnerKVCacheMixin:
@@ -453,6 +459,26 @@ class ModelRunnerKVCacheMixin:
                     hisparse_cfg.host_to_device_ratio
                 )
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
+            elif _is_cpu_920f:
+                # Kunpeng 920F: flat bf16 index-K pool; shared (skip-topk)
+                # layers get no index-K buffer.
+                from sglang.srt.hardware_backend.cpu_kunpeng.memory_pool_kunpeng import (
+                    KunpengNSATokenToKVPool,
+                )
+
+                kunpeng_kwargs = {
+                    k: v
+                    for k, v in nsa_pool_kwargs.items()
+                    if k != "kv_cache_dim"
+                }
+                kunpeng_kwargs["skip_topk_layers"] = [
+                    dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                    for layer_id in range(
+                        self.start_layer,
+                        self.start_layer + self.num_effective_layers,
+                    )
+                ]
+                self.token_to_kv_pool = KunpengNSATokenToKVPool(**kunpeng_kwargs)
             else:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:

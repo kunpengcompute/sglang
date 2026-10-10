@@ -1346,6 +1346,28 @@ def _setup_fake_indexer_topk_mtp_kunpeng():
     register_op('fake_indexer_topk_mtp_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_paged_mqa_logits_topk_kunpeng():
+    # Real DSA indexer scoring kernel (kutacc, bf16): per-head ReLU-gated
+    # MQA logits over the paged index-K cache -> deterministic top-k ids
+    # (score descending, ties -> smaller id, -1 padding). Direct-write
+    # output (flash_mla_sparse_decode style: caller allocates, shape_infer
+    # returns no extra outputs). output_coord: 0 = absolute paged slot
+    # (decode), 1 = in-sequence position (sparse prefill consumer with
+    # key_start_loc; also feeds dsa_topk_slots_kunpeng).
+    def shape_infer(q, cur_kv_cache, weight, block_tables, seq_lens,
+                    cur_lens, output, workspace, topk, output_coord):
+        return []
+
+    def eager_fn(q, cur_kv_cache, weight, block_tables, seq_lens,
+                 cur_lens, output, workspace, topk, output_coord):
+        torch.ops.sgl_kernel.paged_mqa_logits_topk_kunpeng(
+            q, cur_kv_cache, weight, block_tables, seq_lens, cur_lens,
+            output, workspace, topk, output_coord)
+        return None
+
+    register_op('paged_mqa_logits_topk_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_batched_bgemm_kunpeng():
     # SME bf16 batched GEMM for the bf16 kv_b_proj MLA absorb path (e.g.
     # GLM-5): out = input @ weight^T per batch item. weight is the
@@ -1408,19 +1430,29 @@ def _setup_flash_mla_reduce_kunpeng():
 
 
 def _setup_pad_q_left_mtp_kunpeng():
-    def shape_infer(q, seq_lens, max_seq_len):
+    # DTYPE-AGNOSTIC left-pad with an explicit fill value (byte memcpy of
+    # the real rows; the WHOLE dst is filled first, so the pad region and
+    # empty-sequence rows carry an explicit value). Two consumers:
+    #   - MTP draft-extend q (bf16 [T, H, D]): fill_value=0 (the pad rows
+    #     are computed then discarded by unpad_o_right; 0 is just more
+    #     deterministic than the previous uninitialized buffer);
+    #   - DSA indexer draft-extend / absorbed-prefill top-k indices
+    #     ([T, topk] int32): fill_value=-1 (the sparse kernel trims the
+    #     all -1 pad rows).
+    # fill_value carries a Python-side default so the existing 3-arg q call
+    # sites stay unchanged.
+    def shape_infer(src, seq_lens, max_seq_len, fill_value=0):
         bsz = seq_lens.shape[0]
-        n_heads = q.shape[1]
-        head_dim = q.shape[2]
-        return [((bsz, max_seq_len, n_heads, head_dim), q.dtype)]
+        tail = list(src.shape[1:])
+        return [((bsz, max_seq_len, *tail), src.dtype)]
 
-    def eager_fn(q, seq_lens, max_seq_len):
+    def eager_fn(src, seq_lens, max_seq_len, fill_value=0):
         bsz = seq_lens.shape[0]
-        n_heads = q.shape[1]
-        head_dim = q.shape[2]
-        q_padded = torch.empty((bsz, max_seq_len, n_heads, head_dim), dtype=q.dtype)
-        torch.ops.sgl_kernel.pad_q_left_mtp_kunpeng(q, seq_lens, q_padded)
-        return q_padded
+        tail = list(src.shape[1:])
+        dst = torch.empty((bsz, max_seq_len, *tail), dtype=src.dtype)
+        torch.ops.sgl_kernel.pad_q_left_mtp_kunpeng(
+            src, seq_lens, dst, int(fill_value))
+        return dst
 
     register_op('pad_q_left_mtp_kunpeng', shape_infer, eager_fn)
 
@@ -1598,6 +1630,7 @@ def setup():
     _setup_dsa_topk_slots_kunpeng()
     _setup_fake_indexer_topk_kunpeng()
     _setup_fake_indexer_topk_mtp_kunpeng()
+    _setup_paged_mqa_logits_topk_kunpeng()
     _setup_batched_bgemm_kunpeng()
     _setup_shm_mla_o_alltoall_long_context_kunpeng()
     _setup_lc_mark_empty_lse_kunpeng()

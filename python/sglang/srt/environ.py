@@ -635,6 +635,16 @@ class Envs:
     # recorded into the graph and replayed every step. Enable when running
     # print_hash diagnosis; disable (default) for production perf.
     SGLANG_KUNPENG_ZERO_OUT = EnvBool(False)
+    # Bring-up fake CPU indexer for the DSA (NSA) sparse-MLA path: under the
+    # bring-up regime (attention window <= index_topk) the fake selects every
+    # token, making sparse decode / MTP / absorbed prefill equivalent to dense
+    # attention; the backend also enforces window <= index_topk while on. Used
+    # to cross-check the real 920F indexer. Default off.
+    SGLANG_KUNPENG_FAKE_INDEXER = EnvBool(False)
+    # DSA (NSA) MTP escape hatch: TARGET_VERIFY / DRAFT_EXTEND fall back to the
+    # dense paged path (the indexer still fills the draft pool's index-K but
+    # skips scoring). Orthogonal to the fake indexer. Default off.
+    SGLANG_KUNPENG_DISABLE_DSA_SPARSE_MTP = EnvBool(False)
 
 envs = Envs()
 EnvField._allow_set_name = False
