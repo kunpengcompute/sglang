@@ -87,7 +87,13 @@ def convert(files, output_path):
                 ev_id += 1
 
     with open(output_path, "w") as f:
-        json.dump({"traceEvents": events, "displayTimeUnit": "us"}, f)
+        # One event per line; ts/dur stay in us per Chrome trace spec,
+        # displayTimeUnit controls the unit shown by the viewer.
+        f.write('{"traceEvents": [\n')
+        for i, ev in enumerate(events):
+            f.write(json.dumps(ev, separators=(",", ":")))
+            f.write(",\n" if i + 1 < len(events) else "\n")
+        f.write('], "displayTimeUnit": "ns"}\n')
 
     print(f"Wrote {len(events)} events from {len(files)} file(s) to {output_path}")
 

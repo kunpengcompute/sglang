@@ -28,21 +28,12 @@ DECODE_IP_FILE="${DECODE_IP_FILE:-}"
 DECODE_MASTER_ADDR="${DECODE_MASTER_ADDR:-xxx.xxx.xxx.17}"
 # DECODE_MASTER_PORT is derived per instance below (5010 + 100 * index).
 
-# Decode model paths (default to the shared MODEL_PATH)
-MODEL_PATH_DECODE="${MODEL_PATH_DECODE:-$MODEL_PATH}"
-SPECULATIVE_DRAFT_MODEL_PATH_DECODE="${SPECULATIVE_DRAFT_MODEL_PATH_DECODE:-$SPECULATIVE_DRAFT_MODEL_PATH}"
-
-# ------------------------------------------------------------
-# Decode TP/EP/PP sizes (default to the global values from env_base)
-# ------------------------------------------------------------
-export DECODE_TP_SIZE="${DECODE_TP_SIZE:-${TP_SIZE}}"
-export DECODE_DP_SIZE="${DECODE_DP_SIZE:-${DP_SIZE}}"
-export DECODE_EP_SIZE="${DECODE_EP_SIZE:-${DECODE_TP_SIZE}}"
-export DECODE_PP_SIZE="${DECODE_PP_SIZE:-${PP_SIZE}}"
-export DECODE_REDUNDANT_EXPERTS="${DECODE_REDUNDANT_EXPERTS:-0}"
-export DECODE_INIT_EXPERT_LOCATION="${DECODE_INIT_EXPERT_LOCATION:-}"
-export DECODE_EP_DISPATCH_ALGORITHM="${DECODE_EP_DISPATCH_ALGORITHM:-}"
-export DECODE_SGLANG_KUNPENG_MOE_SHUFFLE_MODE="${DECODE_SGLANG_KUNPENG_MOE_SHUFFLE_MODE:-0}"
+# NOTE: the prefixed DECODE_* overrides (model paths, parallel sizes,
+# HBW pool, swap flags) are resolved AFTER the user env file at the
+# bottom of this file. They must NOT be resolved here: this file is
+# sourced before .user_env_decode.sh, so a global override like
+# PP_SIZE=2 there would be silently reverted by _export_pd_vars
+# (decode_config in env_helper.sh) reading the stale prefixed value.
 
 # ------------------------------------------------------------
 # Decode tokenizer-separate endpoints (router node), auto-derived from
@@ -70,10 +61,6 @@ unset _de_g _de_s
 # Decode SHM / HBW pool
 # ------------------------------------------------------------
 export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB="${SGLANG_KUNPENG_DECODE_SHM_SIZE_MB:-100}"
-export DECODE_WEIGTHS_HBW_POOL_SIZE_MB="${DECODE_WEIGTHS_HBW_POOL_SIZE_MB:-3900}"
-export DECODE_SWAP_KV_IN="${DECODE_SWAP_KV_IN:-0}"
-export DECODE_SWAP_KV_OUT="${DECODE_SWAP_KV_OUT:-0}"
-export DECODE_SWAP_KV_BLOCKWISE="${DECODE_SWAP_KV_BLOCKWISE:-0}"
 
 # ------------------------------------------------------------
 # Decode role defaults
@@ -117,3 +104,27 @@ fi
 # Default 0 = serial per-expert path, bit-exact. Set AFTER the instance file
 # so an instance may enable it explicitly.
 export KUTACC_FUSEDMOE_MULTIEXPT="${KUTACC_FUSEDMOE_MULTIEXPT:-0}"
+# ------------------------------------------------------------
+# Resolve the prefixed DECODE_* overrides against the globals. This MUST
+# run after the user env file above so both config styles take effect:
+#   - globals set there (e.g. PP_SIZE=2) become the DECODE_* defaults;
+#   - explicit DECODE_* entries (e.g. DECODE_PP_SIZE=2 in instance
+#     files) still win over the globals.
+# _export_pd_vars (decode_config) and the direct consumers (python code
+# reading DECODE_PP_SIZE, server_tokenizer.sh reading DECODE_DP_SIZE)
+# all read the values resolved here.
+# ------------------------------------------------------------
+export MODEL_PATH_DECODE="${MODEL_PATH_DECODE:-$MODEL_PATH}"
+export SPECULATIVE_DRAFT_MODEL_PATH_DECODE="${SPECULATIVE_DRAFT_MODEL_PATH_DECODE:-$SPECULATIVE_DRAFT_MODEL_PATH}"
+export DECODE_TP_SIZE="${DECODE_TP_SIZE:-${TP_SIZE}}"
+export DECODE_DP_SIZE="${DECODE_DP_SIZE:-${DP_SIZE}}"
+export DECODE_EP_SIZE="${DECODE_EP_SIZE:-${DECODE_TP_SIZE}}"
+export DECODE_PP_SIZE="${DECODE_PP_SIZE:-${PP_SIZE}}"
+export DECODE_REDUNDANT_EXPERTS="${DECODE_REDUNDANT_EXPERTS:-${REDUNDANT_EXPERTS:-0}}"
+export DECODE_INIT_EXPERT_LOCATION="${DECODE_INIT_EXPERT_LOCATION:-${INIT_EXPERT_LOCATION:-}}"
+export DECODE_EP_DISPATCH_ALGORITHM="${DECODE_EP_DISPATCH_ALGORITHM:-${EP_DISPATCH_ALGORITHM:-}}"
+export DECODE_SGLANG_KUNPENG_MOE_SHUFFLE_MODE="${DECODE_SGLANG_KUNPENG_MOE_SHUFFLE_MODE:-${SGLANG_KUNPENG_MOE_SHUFFLE_MODE:-0}}"
+export DECODE_WEIGTHS_HBW_POOL_SIZE_MB="${DECODE_WEIGTHS_HBW_POOL_SIZE_MB:-${SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB:-3900}}"
+export DECODE_SWAP_KV_IN="${DECODE_SWAP_KV_IN:-${SGLANG_KUNPENG_SWAP_KV_IN:-0}}"
+export DECODE_SWAP_KV_OUT="${DECODE_SWAP_KV_OUT:-${SGLANG_KUNPENG_SWAP_KV_OUT:-0}}"
+export DECODE_SWAP_KV_BLOCKWISE="${DECODE_SWAP_KV_BLOCKWISE:-${SGLANG_KUNPENG_SWAP_KV_BLOCKWISE:-0}}"

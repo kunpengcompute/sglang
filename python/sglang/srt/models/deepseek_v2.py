@@ -2182,6 +2182,8 @@ class DeepseekV2Model(nn.Module):
         if is_deepseek_nsa(config):
             _last_full_indexer = None
             for _layer in self.layers:
+                if isinstance(_layer, PPMissingLayer):
+                    continue
                 _attn = _layer.self_attn
                 if getattr(_attn, "indexer", None) is None:
                     continue

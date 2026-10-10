@@ -205,6 +205,65 @@ def is_kunpeng_swap_expert() -> bool:
     return is_kunpeng_hbw_pool() and os.environ.get("SGLANG_KUNPENG_SWAP_EXPERT") == "1"
 
 
+def is_kunpeng_hbw_resident_non_expert_weights() -> bool:
+    if not is_kunpeng_hbw_pool():
+        return False
+    value = os.environ.get("SGLANG_KUNPENG_HBW_RESIDENT_NON_EXPERT_WEIGHTS", "1")
+    if value not in ("0", "1"):
+        raise ValueError(
+            f"Invalid value {value!r} for "
+            "SGLANG_KUNPENG_HBW_RESIDENT_NON_EXPERT_WEIGHTS: must be '0' or '1'"
+        )
+    return value == "1"
+
+
+def is_kunpeng_hbw_resident_expert_weights() -> bool:
+    if not is_kunpeng_hbw_pool():
+        return False
+    swap_expert = is_kunpeng_swap_expert()
+    value = os.environ.get("SGLANG_KUNPENG_HBW_RESIDENT_EXPERT_WEIGHTS", "auto")
+    if value == "auto":
+        # Derive from the swap switch: experts stay in DDR for layer-wise
+        # swap, otherwise reside in HBW.
+        return not swap_expert
+    if value not in ("0", "1"):
+        raise ValueError(
+            "Invalid value "
+            f"{value!r} for SGLANG_KUNPENG_HBW_RESIDENT_EXPERT_WEIGHTS: "
+            "must be '0', '1' or 'auto'"
+        )
+    resident = value == "1"
+    if resident and swap_expert:
+        raise RuntimeError(
+            "Conflicting config: SGLANG_KUNPENG_HBW_RESIDENT_EXPERT_WEIGHTS=1 "
+            "(experts resident in HBW) cannot be combined with "
+            "SGLANG_KUNPENG_SWAP_EXPERT=1 (experts swapped layer-wise from DDR). "
+            "Disable one of the two."
+        )
+    return resident
+
+
+def is_kunpeng_hbw_resident_graph() -> bool:
+    if not is_kunpeng_hbw_pool():
+        return False
+    value = os.environ.get("SGLANG_KUNPENG_HBW_RESIDENT_GRAPH", "1")
+    if value not in ("0", "1"):
+        raise ValueError(
+            f"Invalid value {value!r} for "
+            "SGLANG_KUNPENG_HBW_RESIDENT_GRAPH: must be '0' or '1'"
+        )
+    return value == "1"
+
+
+def validate_kunpeng_hbw_residency() -> dict:
+    """Resolve all HBW residency switches; raises on conflicting config."""
+    return {
+        "non_expert_weights": is_kunpeng_hbw_resident_non_expert_weights(),
+        "expert_weights": is_kunpeng_hbw_resident_expert_weights(),
+        "graph": is_kunpeng_hbw_resident_graph(),
+    }
+
+
 def is_kunpeng_swap_kv_in() -> bool:
     return is_kunpeng_hbw_pool() and os.environ.get("SGLANG_KUNPENG_SWAP_KV_IN") == "1"
 

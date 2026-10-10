@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -63,6 +64,11 @@ _disable_hip_linear_quant = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_DISABLE_LINEARQUANT"
 )
 _enable_shm_fence = envs.SGLANG_KUNPENG_ENABLE_SHM_FENCE.get()
+
+# Strips the layer index from weight-loading prefixes for profile tags:
+# "model.layers.5.self_attn.o_proj" -> "model.self_attn.o_proj" (the
+# "model." head is removed separately in _kunpeng_allreduce_role).
+_ALLREDUCE_LAYER_RE = re.compile(r"layers\.\d+\.")
 
 logger = logging.getLogger(__name__)
 
@@ -1343,6 +1349,15 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
+def _kunpeng_allreduce_role(module: LinearBase) -> str:
+    """Role name for profiling tags: the module's weight-loading prefix with
+    the layer index stripped, so all layers of the same module type share one
+    profile row (e.g. "model.layers.5.self_attn.o_proj" -> "self_attn.o_proj").
+    """
+    prefix = getattr(module, "prefix", "") or ""
+    return _ALLREDUCE_LAYER_RE.sub("", prefix).removeprefix("model.")
+
+
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
 
@@ -1552,7 +1567,16 @@ class RowParallelLinear(LinearBase):
                     kunpeng.shm_fence_kunpeng(
                         get_attn_tensor_model_parallel_world_size()
                     )
-                kunpeng.shm_allreduce_kunpeng(output_parallel)
+                kunpeng.shm_allreduce_kunpeng(
+                    output_parallel,
+                    # Role-level tag for profiling, derived from the weight
+                    # loading prefix with the layer index stripped, e.g.
+                    # "model.layers.5.self_attn.o_proj" -> "self_attn.o_proj".
+                    profile_name=(
+                        f"shm_allreduce_kunpeng@"
+                        f"{_kunpeng_allreduce_role(self) or 'row_parallel_linear'}"
+                    ),
+                )
                 output = output_parallel
             elif self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)

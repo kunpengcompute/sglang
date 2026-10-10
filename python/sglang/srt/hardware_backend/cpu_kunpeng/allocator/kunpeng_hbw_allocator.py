@@ -138,7 +138,13 @@ class KunpengHBWPool:
 
         weakref.finalize(tensor, _auto_free)
 
-    def alloc(self, shape: Tuple[int, ...], dtype: torch.dtype, auto_free: bool = False) -> torch.Tensor:
+    def alloc(
+        self,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        auto_free: bool = False,
+        label: Optional[str] = None,
+    ) -> torch.Tensor:
         """Allocate a contiguous tensor from the pool.
 
         Args:
@@ -146,6 +152,8 @@ class KunpengHBWPool:
                        memory to the pool when the tensor is garbage-collected.
                        Set to False for long-lived tensors (e.g. model weights)
                        to prevent accidental recycling.
+            label: Optional category label (e.g. "non_expert_weights") added
+                   to the exhaustion error message for fine-grained control.
         """
         num_bytes = math.prod(shape) * dtype.itemsize
 
@@ -163,7 +171,8 @@ class KunpengHBWPool:
 
         if tensor is None:
             raise RuntimeError(
-                f"HBW pool exhausted: requested {num_bytes} bytes "
+                f"HBW pool exhausted{f' (category: {label})' if label else ''}: "
+                f"requested {num_bytes} bytes "
                 f"(alignment={self.alignment}), "
                 f"utilization={self.utilization * 100:.1f}%, "
                 f"free blocks={len(self._free_blocks)}, "
@@ -232,9 +241,10 @@ class KunpengHBWPool:
     def move_to_hbw(
         self,
         ddr_tensor: torch.Tensor,
+        label: Optional[str] = None,
     ) -> torch.Tensor:
         """Copy a DDR tensor to HBW memory via the pool."""
-        hbw_tensor = self.alloc(ddr_tensor.shape, ddr_tensor.dtype)
+        hbw_tensor = self.alloc(ddr_tensor.shape, ddr_tensor.dtype, label=label)
         hbw_tensor.copy_(ddr_tensor)
         return hbw_tensor
 
