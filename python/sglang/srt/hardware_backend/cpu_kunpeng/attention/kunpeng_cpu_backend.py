@@ -239,13 +239,6 @@ class KunpengCpuMetadata:
         # the release kernel dereferences. This rank's slice.
         self.sparse_sched_topk_len: Optional[torch.Tensor] = None
 
-        # K/V write locations: out_cache_loc with all-zero padding rows
-        # routed to -1, so the write kernels (which skip ``loc < 0``)
-        # never scatter padding K/V into the live page 0. Computed once
-        # per step outside the capture region (see _init_kv_write_loc)
-        # and registered as a graph input; None = raw passthrough.
-        self.kv_write_loc: Optional[torch.Tensor] = None
-
         # True when every req_pool_indices row of this rank's slice is 0
         # (batch padding mirror of another rank's prefill): the sparse
         # kernel segfaults on the degenerate shape, so the forward skips
@@ -381,7 +374,6 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata.absorbed_topk_length = None
         self.forward_metadata.req_pool_indices = None
         self.forward_metadata.sparse_sched_topk_len = None
-        self.forward_metadata.kv_write_loc = None
         self.forward_metadata.sparse_all_padding = False
         self.forward_metadata.long_context_topk_length = None
         self.forward_metadata.long_context_real_topk_length = None
@@ -445,25 +437,16 @@ class KunpengCpuBackend(AttentionBackend):
             # kernel (MHA_KUNPENG) reads latent via this block_table.
             self._init_extend_mha_metadata(forward_batch)
 
-        self._init_kv_write_loc(forward_batch)
+        self._init_all_padding_flag(forward_batch)
         return
 
-    def _init_kv_write_loc(self, forward_batch: ForwardBatch) -> None:
-        """Per-step K/V write locations and all-padding flag.
-
-        Both derive from tensor content but are consumed inside the
-        captured region, so they are computed here instead:
-        kv_write_loc is registered as a graph input, sparse_all_padding
-        joins the graph cache key.
-        """
+    def _init_all_padding_flag(self, forward_batch: ForwardBatch) -> None:
+        """Per-step all-padding flag: True when every req_pool_indices row
+        of this rank's slice is 0 (batch padding mirror of another rank's
+        forward). Derived from tensor content but consumed inside the
+        captured region (a frozen Python branch), so it joins the graph
+        cache key."""
         metadata = self.forward_metadata
-        loc = forward_batch.out_cache_loc
-        bs = forward_batch.input_ids.shape[0]
-        if loc is not None and bs > 0 and loc.shape[0] % bs == 0:
-            tpr = loc.shape[0] // bs
-            pad = loc.view(bs, tpr).eq(0).all(dim=1).repeat_interleave(tpr)
-            metadata.kv_write_loc = loc.masked_fill(pad, -1)
-
         rpi = forward_batch.req_pool_indices
         if rpi is None:
             return

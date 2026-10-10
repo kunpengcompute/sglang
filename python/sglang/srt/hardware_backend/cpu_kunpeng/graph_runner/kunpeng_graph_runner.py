@@ -557,9 +557,6 @@ class KunpengGraphRunner:
             inputs.extend(
                 [forward_batch.out_cache_loc, attn_backend._decode_meta]
             )
-            if meta is not None and meta.kv_write_loc is not None:
-                # Slot-filtered write locations for set_kv_buffer_2.
-                inputs.append(meta.kv_write_loc)
             if getattr(attn_backend, "_nsa_enabled", False):
                 # DSA: full-batch seq lens consumed by the (fake) CPU indexer
                 # graph op. Register the SAME view the op consumes (the
@@ -622,8 +619,6 @@ class KunpengGraphRunner:
                 attn_backend._decode_meta,
             ]
             if meta is not None:
-                if meta.kv_write_loc is not None:
-                    inputs.append(meta.kv_write_loc)
                 if getattr(meta, "absorbed_slots", None) is not None:
                     # Flat absorbed prefill: per-row slots + valid counts.
                     inputs.append(meta.absorbed_slots)

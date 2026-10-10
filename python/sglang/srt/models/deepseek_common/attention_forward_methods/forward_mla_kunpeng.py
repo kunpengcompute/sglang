@@ -35,19 +35,6 @@ if TYPE_CHECKING:
 _DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
 
 
-def _kv_write_loc(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
-    """Slot-filtered out_cache_loc for the per-layer K/V scatter writes.
-
-    Computed once per step by the backend, outside the capture region
-    (registered as a graph input): all-zero padding rows are routed to -1
-    so the write kernels (which skip ``loc < 0``) never scatter padding
-    K/V into the live page 0. Falls back to the raw out_cache_loc when
-    the backend produced no filter.
-    """
-    filtered = forward_batch.attn_backend.forward_metadata.kv_write_loc
-    return filtered if filtered is not None else forward_batch.out_cache_loc
-
-
 def _lc_reduce_partial_o(o_rows, lse_rows, b, num_local_heads):
     """Merge per-shard partial attention outputs (online-softmax reduction).
 
@@ -208,7 +195,9 @@ class DeepseekMLAKunpengForwardMixin:
 
             q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
 
-        loc_w = _kv_write_loc(forward_batch)
+        # Padding rows write to loc 0, reserved by the allocator for dummy
+        # writes; LC foreign rows carry -1 (write kernels skip loc < 0).
+        loc_w = forward_batch.out_cache_loc
         if self.swap_mgr.enable_swap_kv_in:
             # The layer's swap-in is an async DMA over the whole pool and may
             # still be in flight; drain it before writing this step's new K/V
