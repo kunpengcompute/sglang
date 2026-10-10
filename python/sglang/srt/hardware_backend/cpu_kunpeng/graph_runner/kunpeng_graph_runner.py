@@ -569,6 +569,14 @@ class KunpengGraphRunner:
                 inputs.append(
                     meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
                 )
+            if (
+                getattr(attn_backend, "_nsa_enabled", False)
+                and not getattr(attn_backend, "_lc_enabled", False)
+            ):
+                # dsa_topk_slots reads req_to_token directly; register the
+                # SAME views the op consumes.
+                inputs.append(forward_batch.req_to_token_pool.req_to_token)
+                inputs.append(meta.req_pool_indices)
             if getattr(attn_backend, "_lc_enabled", False):
                 # Long-context decode CP: per-step sparse-attention metadata
                 # (local KV indices + per-sequence counts) consumed by the
@@ -671,6 +679,10 @@ class KunpengGraphRunner:
                 inputs.append(
                     meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
                 )
+                # dsa_topk_slots reads req_to_token directly; register the
+                # SAME views the op consumes.
+                inputs.append(forward_batch.req_to_token_pool.req_to_token)
+                inputs.append(meta.req_pool_indices)
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)

@@ -1276,13 +1276,13 @@ def _setup_flash_mla_sparse_decode_kunpeng():
 def _setup_dsa_topk_slots_kunpeng():
     # DSA (NSA) index transform: indexer top-k token positions -> flat
     # KV-cache slot ids (+ per-sequence valid counts) for the sparse flash
-    # MLA kernel. topk_indices [B, topk] (decode) or [B, n, topk] (MTP
-    # verify / draft-extend: n query rows per sequence) -> slots
-    # [bs, n, topk]. Direct-write outputs (bmm-style: eager allocates,
-    # capture registers via shape_infer; the C++ graph registrar lists
-    # [inputs..., outputs...] in the same order).
-    def _out_shapes(block_table, topk_indices):
-        bs = block_table.shape[0]
+    # MLA kernel, read straight from req_to_token (remapped_block_table =
+    # HBM page table under block-wise KV swap, None otherwise). Direct-
+    # write outputs (bmm-style: eager allocates, capture registers via
+    # shape_infer; the C++ graph registrar lists [inputs..., outputs...]
+    # in the same order).
+    def _out_shapes(req_pool_indices, topk_indices):
+        bs = req_pool_indices.shape[0]
         if topk_indices.dim() == 3:
             n = topk_indices.shape[1]
             topk = topk_indices.shape[2]
@@ -1291,16 +1291,19 @@ def _setup_dsa_topk_slots_kunpeng():
             topk = topk_indices.shape[1]
         return bs, n, topk
 
-    def shape_infer(block_table, topk_indices, seq_lens, page_size, row_start):
-        bs, n, topk = _out_shapes(block_table, topk_indices)
+    def shape_infer(req_to_token, req_pool_indices, remapped_block_table,
+                    topk_indices, seq_lens, page_size, row_start):
+        bs, n, topk = _out_shapes(req_pool_indices, topk_indices)
         return [((bs, n, topk), torch.int32), ((bs,), torch.int32)]
 
-    def eager_fn(block_table, topk_indices, seq_lens, page_size, row_start):
-        bs, n, topk = _out_shapes(block_table, topk_indices)
+    def eager_fn(req_to_token, req_pool_indices, remapped_block_table,
+                 topk_indices, seq_lens, page_size, row_start):
+        bs, n, topk = _out_shapes(req_pool_indices, topk_indices)
         slots = torch.empty((bs, n, topk), dtype=torch.int32)
         topk_length = torch.empty((bs,), dtype=torch.int32)
         torch.ops.sgl_kernel.dsa_topk_slots_kunpeng(
-            block_table, topk_indices, seq_lens, page_size, row_start,
+            req_to_token, req_pool_indices, remapped_block_table,
+            topk_indices, seq_lens, page_size, row_start,
             slots, topk_length)
         return slots, topk_length
 

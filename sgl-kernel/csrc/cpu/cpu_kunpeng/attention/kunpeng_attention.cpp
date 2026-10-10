@@ -280,18 +280,23 @@ int64_t get_flash_attention_thread_num()
 //
 // The sparse kernel attends flat slot rows of the paged KV cache; the indexer
 // emits per-sequence token positions (< seq_len, -1 = invalid padding). The
-// mapping goes through the page-granular block_table:
-//   slot = block_table[b, pos / page_size] * page_size + pos % page_size
+// default lookup goes straight to the persistent req_to_token pool
+// (slot = req_to_token[req, pos] -- no per-step block_table); with block-wise
+// KV swap the REMAPPED (HBM slot) page table replaces the direct lookup:
+//   slot = remapped[b, pos / page_size] * page_size + pos % page_size
 // Valid entries are COMPACTED to the row prefix (the kernel only reads the
 // first topk_length entries of each row); the tail is filled with -1, so the
 // indexer's padding convention (leading prefix vs. interleaved) is
 // irrelevant.
 //
-// block_table  [bs, max_blocks] int32/int64 (page indices; this rank's batch
-//              slice -- after the decode all2all the backend owns Btp rows)
-// topk_indices [B_full, (1,) topk] int32/int64 (token positions; the FULL
-//              batch -- row_start selects this rank's rows)
-// seq_lens     [bs] int32/int64 (this rank's batch slice)
+// req_to_token         [R, C] int32 (request row -> position -> pool slot)
+// req_pool_indices     [bs] int32 (batch row -> request row; this rank's
+//                      slice -- after the decode all2all the backend owns
+//                      Btp rows)
+// remapped_block_table optional [bs, max_blocks] int32 (block-wise swap)
+// topk_indices         [B_full, (1,) topk] int32/int64 (token positions; the
+//                      FULL batch -- row_start selects this rank's rows)
+// seq_lens             [bs] int32/int64 (this rank's batch slice)
 // Returns (slots [bs, 1, topk] int32 (-1 tail for invalid entries),
 //          topk_length [bs] int32 = valid count per row).
 // ---------------------------------------------------------------------------
@@ -301,13 +306,25 @@ int64_t get_flash_attention_thread_num()
 // NOTE: tensor args are passed BY VALUE (const-ref also works) -- the graph
 // dispatch extracts tensors as temporaries, which cannot bind to non-const
 // lvalue references.
-void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &topk_indices,
-                            const at::Tensor &seq_lens, int64_t page_size, int64_t row_start,
+void dsa_topk_slots_kunpeng(const at::Tensor &req_to_token, const at::Tensor &req_pool_indices,
+                            const c10::optional<at::Tensor> &remapped_block_table,
+                            const at::Tensor &topk_indices, const at::Tensor &seq_lens,
+                            int64_t page_size, int64_t row_start,
                             at::Tensor slots, at::Tensor topk_length)
 {
-    TORCH_CHECK(block_table.dim() == 2 && block_table.scalar_type() == at::kInt &&
-                    block_table.is_contiguous(),
-                "block_table must be contiguous [bs, max_blocks] int32");
+    const bool use_remap = remapped_block_table.has_value() && remapped_block_table->defined();
+    TORCH_CHECK(req_to_token.dim() == 2 && req_to_token.scalar_type() == at::kInt &&
+                    req_to_token.is_contiguous(),
+                "req_to_token must be contiguous [R, C] int32");
+    TORCH_CHECK(req_pool_indices.dim() == 1 && req_pool_indices.scalar_type() == at::kInt &&
+                    req_pool_indices.is_contiguous(),
+                "req_pool_indices must be contiguous [bs] int32");
+    if (use_remap) {
+        TORCH_CHECK(remapped_block_table->dim() == 2 &&
+                        remapped_block_table->scalar_type() == at::kInt &&
+                        remapped_block_table->is_contiguous(),
+                    "remapped_block_table must be contiguous [bs, max_blocks] int32");
+    }
     TORCH_CHECK(topk_indices.scalar_type() == at::kInt || topk_indices.scalar_type() == at::kLong,
                 "topk_indices must be int32 or int64, got ", topk_indices.scalar_type());
     TORCH_CHECK(topk_indices.dim() == 2 || topk_indices.dim() == 3,
@@ -317,8 +334,14 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
                 "seq_lens must be contiguous [bs]");
     TORCH_CHECK(page_size > 0, "page_size must be positive");
 
-    const int64_t bs = block_table.size(0);
-    const int64_t max_blocks = block_table.size(1);
+    const int64_t bs = req_pool_indices.size(0);
+    const int64_t R = req_to_token.size(0);
+    const int64_t C = req_to_token.size(1);
+    const int64_t max_blocks = use_remap ? remapped_block_table->size(1) : 0;
+    if (use_remap) {
+        TORCH_CHECK(remapped_block_table->size(0) == bs, "remapped_block_table batch ",
+                    remapped_block_table->size(0), " != req_pool_indices rows ", bs);
+    }
     // topk_indices rows: [B, topk] (decode) or [B, n, topk] (MTP verify /
     // draft-extend: n query rows per sequence). n == 1 unifies both.
     int64_t b_full, n_rows, topk, tk_s0, tk_s1;
@@ -339,7 +362,7 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
     TORCH_CHECK(row_start >= 0 && row_start + bs <= b_full, "row_start ", row_start, " + bs ", bs,
                 " exceeds topk_indices rows ", b_full);
     TORCH_CHECK(seq_lens.size(0) == bs, "seq_lens size ", seq_lens.size(0),
-                " != block_table batch ", bs);
+                " != req_pool_indices rows ", bs);
     TORCH_CHECK(slots.dim() == 3 && slots.scalar_type() == at::kInt &&
                     slots.is_contiguous() && slots.size(0) == bs && slots.size(1) == n_rows &&
                     slots.size(2) == topk,
@@ -356,7 +379,9 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
     const int64_t tk_slast = topk_indices.stride(-1);
     TORCH_CHECK(tk_slast == 1 || topk == 1, "topk_indices last dim must be contiguous");
 
-    const int32_t *bt = block_table.data_ptr<int32_t>();
+    const int32_t *rtt = req_to_token.data_ptr<int32_t>();
+    const int32_t *rpi = req_pool_indices.data_ptr<int32_t>();
+    const int32_t *rbt = use_remap ? remapped_block_table->data_ptr<int32_t>() : nullptr;
     const int32_t *sl32 = sl_long ? nullptr : seq_lens.data_ptr<int32_t>();
     const int64_t *sl64 = sl_long ? seq_lens.data_ptr<int64_t>() : nullptr;
     const int32_t *tk32 = tk_long ? nullptr : topk_indices.data_ptr<int32_t>();
@@ -367,6 +392,7 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
     kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
         for (int64_t b = start; b < end; ++b) {
             const int64_t seq_len = sl_long ? sl64[b] : (int64_t)sl32[b];
+            const int64_t req = rpi[b];
             const int64_t g = row_start + b;
             int32_t *seq_slots = slots_p + b * n_rows * topk;
             int32_t valid_max = 0;
@@ -379,11 +405,15 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
                                                 : (int64_t)tk32[row_base + i * tk_slast];
                     if (pos < 0 || pos >= seq_len)
                         continue;
-                    const int64_t page = pos / page_size;
-                    if (page >= max_blocks)
-                        continue;
-                    row[valid++] = bt[b * max_blocks + page] * (int32_t)page_size +
-                                   (int32_t)(pos % page_size);
+                    if (use_remap) {
+                        const int64_t page = pos / page_size;
+                        if (page >= max_blocks)
+                            continue;
+                        row[valid++] = rbt[b * max_blocks + page] * (int32_t)page_size +
+                                       (int32_t)(pos % page_size);
+                    } else if (req >= 0 && req < R && pos < C) {
+                        row[valid++] = rtt[req * C + pos];
+                    }
                 }
                 for (int64_t i = valid; i < topk; ++i)
                     row[i] = -1;
@@ -403,26 +433,41 @@ void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &top
 // Flat absorbed prefill: merged fake-indexer + position->slot mapping --
 // the per-row KV slots for the decode-shaped (rows, 1, H, D) sparse call,
 // emitted once per step at metadata time (outside the graph capture).
+// Slot lookup matches dsa_topk_slots_kunpeng: req_to_token directly, or the
+// remapped (HBM slot) page table under block-wise KV swap.
 //
-//   block_table     [bs, max_blocks] int32 (page indices)
-//   seq_lens        [bs] int32/int64 (FULL seq lens: prefix + extend)
-//   extend_seq_lens [bs] int32/int64 (live flat rows per sequence)
-//   num_rows        total flat rows (>= sum(extend_seq_lens); the tail
-//                   [sum, num_rows) carries the dummy pattern)
-//   slots           [num_rows, topk] int32 direct-write: row i (seq b,
-//                   position p in its extend) = the KV slots of the
-//                   causal prefix [0, min(prefix_b + p + 1, topk)), -1
-//                   tail.
-//   topk_length     [num_rows] int32 direct-write: valid count (>= 1).
+//   req_to_token         [R, C] int32 (request row -> position -> pool slot)
+//   req_pool_indices     [bs] int32 (batch row -> request row)
+//   remapped_block_table optional [bs, max_blocks] int32 (block-wise swap)
+//   seq_lens             [bs] int32/int64 (FULL seq lens: prefix + extend)
+//   extend_seq_lens      [bs] int32/int64 (live flat rows per sequence)
+//   num_rows             total flat rows (>= sum(extend_seq_lens); the tail
+//                        [sum, num_rows) carries the dummy pattern)
+//   slots                [num_rows, topk] int32 direct-write: row i (seq b,
+//                        position p in its extend) = the KV slots of the
+//                        causal prefix [0, min(prefix_b + p + 1, topk)), -1
+//                        tail.
+//   topk_length          [num_rows] int32 direct-write: valid count (>= 1).
 // ---------------------------------------------------------------------------
-void dsa_prefill_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &seq_lens,
-                               const at::Tensor &extend_seq_lens, int64_t num_rows,
-                               int64_t page_size, int64_t topk,
+void dsa_prefill_slots_kunpeng(const at::Tensor &req_to_token, const at::Tensor &req_pool_indices,
+                               const c10::optional<at::Tensor> &remapped_block_table,
+                               const at::Tensor &seq_lens, const at::Tensor &extend_seq_lens,
+                               int64_t num_rows, int64_t page_size, int64_t topk,
                                at::Tensor slots, at::Tensor topk_length)
 {
-    TORCH_CHECK(block_table.dim() == 2 && block_table.scalar_type() == at::kInt &&
-                    block_table.is_contiguous(),
-                "block_table must be contiguous [bs, max_blocks] int32");
+    const bool use_remap = remapped_block_table.has_value() && remapped_block_table->defined();
+    TORCH_CHECK(req_to_token.dim() == 2 && req_to_token.scalar_type() == at::kInt &&
+                    req_to_token.is_contiguous(),
+                "req_to_token must be contiguous [R, C] int32");
+    TORCH_CHECK(req_pool_indices.dim() == 1 && req_pool_indices.scalar_type() == at::kInt &&
+                    req_pool_indices.is_contiguous(),
+                "req_pool_indices must be contiguous [bs] int32");
+    if (use_remap) {
+        TORCH_CHECK(remapped_block_table->dim() == 2 &&
+                        remapped_block_table->scalar_type() == at::kInt &&
+                        remapped_block_table->is_contiguous(),
+                    "remapped_block_table must be contiguous [bs, max_blocks] int32");
+    }
     TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous() &&
                     (seq_lens.scalar_type() == at::kInt || seq_lens.scalar_type() == at::kLong),
                 "seq_lens must be contiguous [bs] int32/int64");
@@ -440,18 +485,28 @@ void dsa_prefill_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &
                     topk_length.is_contiguous() && topk_length.size(0) == num_rows,
                 "topk_length must be [num_rows] int32, got ", topk_length.sizes());
 
-    const int64_t bs = block_table.size(0);
-    const int64_t max_blocks = block_table.size(1);
+    const int64_t bs = req_pool_indices.size(0);
+    const int64_t R = req_to_token.size(0);
+    const int64_t C = req_to_token.size(1);
+    const int64_t max_blocks = use_remap ? remapped_block_table->size(1) : 0;
+    if (use_remap) {
+        TORCH_CHECK(remapped_block_table->size(0) == bs, "remapped_block_table batch ",
+                    remapped_block_table->size(0), " != req_pool_indices rows ", bs);
+    }
+    TORCH_CHECK(seq_lens.size(0) == bs, "seq_lens size ", seq_lens.size(0),
+                " != req_pool_indices rows ", bs);
     if (num_rows == 0)
         return;
 
     const bool sl_long = seq_lens.scalar_type() == at::kLong;
     const bool ext_long = extend_seq_lens.scalar_type() == at::kLong;
+    const int32_t *rtt = req_to_token.data_ptr<int32_t>();
+    const int32_t *rpi = req_pool_indices.data_ptr<int32_t>();
+    const int32_t *rbt = use_remap ? remapped_block_table->data_ptr<int32_t>() : nullptr;
     const int32_t *sl32 = sl_long ? nullptr : seq_lens.data_ptr<int32_t>();
     const int64_t *sl64 = sl_long ? seq_lens.data_ptr<int64_t>() : nullptr;
     const int32_t *ext32 = ext_long ? nullptr : extend_seq_lens.data_ptr<int32_t>();
     const int64_t *ext64 = ext_long ? extend_seq_lens.data_ptr<int64_t>() : nullptr;
-    const int32_t *bt = block_table.data_ptr<int32_t>();
     int32_t *slots_p = slots.data_ptr<int32_t>();
     int32_t *len_p = topk_length.data_ptr<int32_t>();
 
@@ -482,6 +537,8 @@ void dsa_prefill_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &
             if (e < 0)
                 e = 0;
             const int64_t prefix = seq_len - e;
+            const int64_t req = rpi[b];
+            const bool req_ok = req >= 0 && req < R;
             for (int64_t p = 0; p < e; ++p) {
                 int32_t *row = slots_p + (cum + p) * topk;
                 const int64_t valid = std::min(prefix + p + 1, topk);
@@ -494,12 +551,18 @@ void dsa_prefill_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &
                     continue;
                 }
                 int64_t v = 0;
-                for (int64_t pos = 0; pos < valid; ++pos) {
-                    const int64_t page = pos / page_size;
-                    if (page >= max_blocks)
-                        break;
-                    row[v++] = bt[b * max_blocks + page] * (int32_t)page_size +
-                               (int32_t)(pos % page_size);
+                if (use_remap) {
+                    for (int64_t pos = 0; pos < valid; ++pos) {
+                        const int64_t page = pos / page_size;
+                        if (page >= max_blocks)
+                            break;
+                        row[v++] = rbt[b * max_blocks + page] * (int32_t)page_size +
+                                   (int32_t)(pos % page_size);
+                    }
+                } else if (req_ok) {
+                    const int64_t n = std::min(valid, C);
+                    for (int64_t pos = 0; pos < n; ++pos)
+                        row[v++] = rtt[req * C + pos];
                 }
                 for (int64_t i = v; i < topk; ++i)
                     row[i] = -1;

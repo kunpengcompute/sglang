@@ -229,6 +229,10 @@ class KunpengCpuMetadata:
         self.absorbed_slots: Optional[torch.Tensor] = None
         self.absorbed_topk_length: Optional[torch.Tensor] = None
 
+        # DSA sparse slot mapping: batch rows consumed by dsa_topk_slots
+        # (a2a-sliced for decode/MTP); exact-view graph input.
+        self.req_pool_indices: Optional[torch.Tensor] = None
+
         # The topk_len the sparse sched planned with (metadata time), checked
         # against the kernel-time topk_length before every sparse kernel call:
         # a divergence leaves a phantom kv1 range on null extra_indices that
@@ -375,6 +379,7 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata.absorbed_flat_rows = None
         self.forward_metadata.absorbed_slots = None
         self.forward_metadata.absorbed_topk_length = None
+        self.forward_metadata.req_pool_indices = None
         self.forward_metadata.sparse_sched_topk_len = None
         self.forward_metadata.kv_write_loc = None
         self.forward_metadata.sparse_all_padding = False
@@ -543,28 +548,31 @@ class KunpengCpuBackend(AttentionBackend):
         metadata.token_slice_start = 0
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+        metadata.req_pool_indices = req_pool_indices
         enable_blockwise = self.swap_mgr.enable_swap_kv_blockwise
-        with pp_span("block_table_build"):
-            self._init_block_table(
-                metadata,
-                forward_batch,
-                req_pool_indices,
-                seq_lens,
-                enable_blockwise=enable_blockwise,
-            )
         if enable_blockwise:
+            # Block-wise swap: the remapped page table drives the swap-in
+            # set and the slot mapping below.
+            with pp_span("block_table_build"):
+                self._init_block_table(
+                    metadata,
+                    forward_batch,
+                    req_pool_indices,
+                    seq_lens,
+                    enable_blockwise=True,
+                )
             with pp_span("blockwise_swap"):
                 self._init_blockwise_swap_metadata(metadata, forward_batch)
 
-        # Per-row slots, once per step (the old path re-ran the mapping
-        # every layer); block_table remap rule matches the dense path.
-        block_table = self.swap_mgr.get_remapped_block_table()
-        if block_table is None:
-            block_table = metadata.block_table
+        # Per-row slots, once per step: straight from req_to_token
+        # (remapped HBM page table under block-wise swap).
+        remapped = self.swap_mgr.get_remapped_block_table()
         slots = torch.empty(flat_rows, self._nsa_topk, dtype=torch.int32)
         topk_length = torch.empty(flat_rows, dtype=torch.int32)
         torch.ops.sgl_kernel.dsa_prefill_slots_kunpeng(
-            block_table,
+            forward_batch.req_to_token_pool.req_to_token,
+            req_pool_indices,
+            remapped,
             seq_lens,
             ext,
             flat_rows,
@@ -613,7 +621,6 @@ class KunpengCpuBackend(AttentionBackend):
         metadata.page_size = forward_batch.token_to_kv_pool.page_size
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         metadata.extend_seq_lens = forward_batch.extend_seq_lens
-        req_to_token = forward_batch.req_to_token_pool.req_to_token.to(torch.int32)
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
 
         if self._nsa_enabled:
@@ -740,15 +747,19 @@ class KunpengCpuBackend(AttentionBackend):
             metadata.token_slice_start = 0
 
         metadata.seq_lens = seq_lens
+        metadata.req_pool_indices = req_pool_indices
 
-        with pp_span("block_table_build"):
-            self._init_block_table(
-                metadata,
-                forward_batch,
-                req_pool_indices,
-                seq_lens,
-                enable_blockwise=enable_blockwise,
-            )
+        # Block table: only the dense paged MLA / block-wise swap paths
+        # consume it; DSA sparse reads req_to_token directly.
+        if enable_blockwise or not self._nsa_enabled:
+            with pp_span("block_table_build"):
+                self._init_block_table(
+                    metadata,
+                    forward_batch,
+                    req_pool_indices,
+                    seq_lens,
+                    enable_blockwise=enable_blockwise,
+                )
 
         with pp_span("decode_sched"):
             mode = forward_batch.forward_mode
@@ -2132,13 +2143,12 @@ class KunpengCpuBackend(AttentionBackend):
         )
         kvcache_paged = kv_buf[:, 0, :].reshape(-1, meta.page_size, kv_buf.shape[-1])
 
-        # topk positions -> flat KV slots (valid entries compacted to the
-        # row prefix); block_table remap rule matches the dense path.
-        block_table = self.swap_mgr.get_remapped_block_table()
-        if block_table is None:
-            block_table = meta.block_table
+        # topk positions -> flat KV slots, straight from req_to_token
+        # (remapped HBM page table under block-wise swap).
         slots, topk_length = kunpeng.dsa_topk_slots_kunpeng(
-            block_table,
+            forward_batch.req_to_token_pool.req_to_token,
+            meta.req_pool_indices,
+            self.swap_mgr.get_remapped_block_table(),
             topk_indices,
             meta.seq_lens,
             meta.page_size,
