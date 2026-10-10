@@ -415,6 +415,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
+    # Gate for reusing the first MTP draft step's indexer topk across steps;
+    # the carried topk lives on spec_info (see IndexTopKShareState).
+    reuse_dsa_topk_indices: bool = False
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded

@@ -149,6 +149,9 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # DSA indexer topk carried across MTP draft steps (see IndexTopKShareState).
+    dsa_topk_indices = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
