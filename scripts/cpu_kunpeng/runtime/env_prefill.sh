@@ -55,6 +55,7 @@ if [[ $LONG_PROMPT_PREFILL_INSTANCE == "1" ]]; then
     export PREFILL_DP_SIZE=1
     export PREFILL_EP_SIZE="${PREFILL_TP_SIZE}"
     export PREFILL_PP_SIZE=16
+    export SGLANG_KUNPENG_MOE_PREFILL_FORCE_DDR=1
 fi
 
 # ------------------------------------------------------------

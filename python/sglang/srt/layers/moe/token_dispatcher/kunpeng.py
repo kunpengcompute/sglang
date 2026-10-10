@@ -455,9 +455,13 @@ def _init_buffers(state: _KunpengDispatcherState):
     # dispatch/combine buffers from on_package_memory.  Falls back to normal
     # DDR tensors when the pool is disabled or not yet initialized.
     # Prefill's worst-case buffers (~1.4GB/rank at 32p: tp=256, attn_tp=16,
-    # EP=256, 4K tokens: dispatch_recv 449MiB + combine_send 896MiB) would
-    # crowd the HBW weights pool (~3.4GB/rank), hence force_ddr=True.
+    # EP=256, 4K tokens: dispatch_recv 449MiB + combine_send 896MiB) can
+    # crowd the HBW weights pool (~3.4GB/rank). They stay on HBW by default
+    # and move to DDR only when SGLANG_KUNPENG_MOE_PREFILL_FORCE_DDR=1.
     hbw = _hbw_pool_or_none()
+    prefill_force_ddr = (
+        os.environ.get("SGLANG_KUNPENG_MOE_PREFILL_FORCE_DDR", "0") == "1"
+    )
 
     def _zeros(shape, dtype, name, force_ddr=False):
         if hbw is not None and not force_ddr:
@@ -514,7 +518,10 @@ def _init_buffers(state: _KunpengDispatcherState):
             + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
         )
         state.dispatch_recv_buf = _zeros(
-            (state.dispatch_recv_size,), torch.uint8, "dispatch_recv_buf"
+            (state.dispatch_recv_size,),
+            torch.uint8,
+            "dispatch_recv_buf",
+            force_ddr=prefill_force_ddr,
         )
         state.combine_send_buf = _zeros(
             (
@@ -523,6 +530,7 @@ def _init_buffers(state: _KunpengDispatcherState):
             ),
             torch.bfloat16,
             "combine_send_buf",
+            force_ddr=prefill_force_ddr,
         )
     else:
         # RDMA (prefill + decode) worst-case per-(expert, rank) slot layout.
@@ -572,7 +580,7 @@ def _init_buffers(state: _KunpengDispatcherState):
             (state.combine_recv_size,),
             torch.uint8,
             "combine_recv_buf",
-            force_ddr=state.is_prefill and not local_layout,
+            force_ddr=prefill_force_ddr,
         )
 
     if local_layout:
