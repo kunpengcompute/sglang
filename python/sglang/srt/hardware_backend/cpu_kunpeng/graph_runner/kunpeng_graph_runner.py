@@ -642,10 +642,9 @@ class KunpengGraphRunner:
             )
             if getattr(attn_backend, "_nsa_enabled", False):
                 # DSA: full-batch seq lens consumed by the (fake) CPU indexer
-                # graph op. Register the SAME view the op consumes (the
-                # leading [:B] rows, B = FULL batch incl. graph padding --
-                # NOT the all2all-sliced meta.seq_lens row count; bs is
-                # fixed per capture).
+                # graph op; the real indexer reads the per-step full-batch
+                # view (metadata.indexer_*, built outside the capture).
+                # Register the SAME views the ops consume.
                 inputs.append(
                     meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
                 )
@@ -657,6 +656,14 @@ class KunpengGraphRunner:
                 # SAME views the op consumes.
                 inputs.append(forward_batch.req_to_token_pool.req_to_token)
                 inputs.append(meta.req_pool_indices)
+                if meta.indexer_block_table is not None:
+                    inputs.extend(
+                        [
+                            meta.indexer_seq_lens,
+                            meta.indexer_cur_lens,
+                            meta.indexer_block_table,
+                        ]
+                    )
             if getattr(attn_backend, "_lc_enabled", False):
                 # Long-context decode CP: per-step sparse-attention metadata
                 # (local KV indices + per-sequence counts) consumed by the
@@ -750,10 +757,12 @@ class KunpengGraphRunner:
                     or forward_mode.is_draft_extend()
                 )
             ):
-                # DSA + MTP verify/draft-extend: the fake MTP indexer op
+                # DSA + MTP verify/draft-extend: the (fake) MTP indexer op
                 # (inside the capture) reads the persistent FULL-batch seq
-                # lens; register the SAME view it consumes. (The absorbed
-                # prefill no longer consumes it.)
+                # lens; the real indexer reads the per-step full-batch view
+                # (metadata.indexer_*, built outside the capture). Register
+                # the SAME views the ops consume. (The absorbed prefill no
+                # longer consumes them.)
                 inputs.append(
                     meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
                 )
@@ -761,6 +770,14 @@ class KunpengGraphRunner:
                 # SAME views the op consumes.
                 inputs.append(forward_batch.req_to_token_pool.req_to_token)
                 inputs.append(meta.req_pool_indices)
+                if meta.indexer_block_table is not None:
+                    inputs.extend(
+                        [
+                            meta.indexer_seq_lens,
+                            meta.indexer_cur_lens,
+                            meta.indexer_block_table,
+                        ]
+                    )
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)

@@ -1093,16 +1093,18 @@ class Indexer(MultiPlatformOp):
         kunpeng) and skips the indexer entirely. Used to cross-check the
         real indexer.
 
-        Output contract (matches the CUDA paths and the glm5 consumers):
-          - DECODE: [B, topk] full-batch in-sequence positions (this rank's
-            rows written at [token_slice_start : +token_rows); consumers
-            read their slice).
+        Output contract (matches the CUDA paths, the glm5 consumers and the
+        fake indexer -- FULL batch, every rank repeats the computation):
+          - DECODE: [B, topk] full-batch in-sequence positions.
           - TARGET_VERIFY / DRAFT_EXTEND: [B, n, topk] with -1 padding;
             n = speculative_num_draft_tokens. Valid entries form the
             leading prefix.
-          - absorbed prefill: the flat [flat_rows, topk] SLOT-coordinate
-            stream (real rows first, -1 padding rows to the a2a multiple),
-            sliced per rank by the backend's absorbed_row_start window.
+          - absorbed prefill: the flat [T, topk] SLOT-coordinate stream;
+            T == absorbed_flat_rows by the upstream a2a token alignment
+            (asserted at metadata time), sliced per rank by the backend's
+            absorbed_row_start window.
+        Consumers select their own windows (token_slice_start /
+        absorbed_row_start); the indexer itself never slices.
 
         return_indices=False: only fill the index-K cache (prefill producer
         layers; shared layers never call this -- should_run_indexer).
@@ -1120,6 +1122,7 @@ class Indexer(MultiPlatformOp):
             )
 
         pool = forward_batch.token_to_kv_pool
+        meta = forward_batch.attn_backend.forward_metadata
         out_loc = forward_batch.out_cache_loc
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
@@ -1165,38 +1168,30 @@ class Indexer(MultiPlatformOp):
             return None
 
         # ---- top-k scoring over the paged index-K cache ----
-        # Score ONLY through the attention metadata's slice-aligned indexer
-        # view (KunpengCpuMetadata.indexer_*): prefill q rows are
-        # power-of-2/TP padded beyond sum(extend_seq_lens), and the decode /
-        # MTP all2all slices the batch (metadata.block_table holds this
-        # rank's Btp rows while forward_batch keeps the full padded batch).
-        # Reading forward_batch globals directly violates the kernel
-        # contract (sum(cur_lens) == q rows, block_table rows == seq_lens).
+        # FULL-BATCH scoring, mirroring the fake indexer: q / weights /
+        # output cover ALL rows the model handed in (T = q.shape[0], a
+        # static per-graph shape; every rank repeats the full computation).
+        # The view tensors are the backend's per-step indexer view
+        # (metadata.indexer_*, built OUTSIDE the capture region from the
+        # GLOBAL batch; sum(cur_lens) == T is guaranteed by the upstream
+        # token alignment -- see KunpengCpuBackend). The indexer only
+        # READS them: no slicing, no tensor creation, no dynamic shapes.
+        # Consumers pick their own windows afterwards (token_slice_start
+        # for decode / MTP, absorbed_row_start for the flat prefill).
         T = q.shape[0]
         topk = self.index_topk
         output = torch.full((T, topk), -1, dtype=torch.int32)
         if T == 0:
             return output
 
-        meta = forward_batch.attn_backend.forward_metadata
         seq_lens = meta.indexer_seq_lens
         cur_lens = meta.indexer_cur_lens
         block_tables = meta.indexer_block_table
         if seq_lens is None or cur_lens is None or block_tables is None:
-            # No indexer view for this forward (LC CP): skip scoring; the
-            # consumer falls back to dense attention. The index-K cache
-            # filled above stays valid for later steps.
+            # No indexer view for this forward (LC CP / empty batch):
+            # skip scoring; the consumer falls back to dense attention.
+            # The index-K cache filled above stays valid for later steps.
             return None
-
-        start = meta.indexer_token_slice_start
-        rows = meta.indexer_token_rows
-        assert rows == int(cur_lens.sum().item()), (
-            f"indexer view token_rows {rows} != sum(cur_lens) "
-            f"{int(cur_lens.sum().item())}"
-        )
-        assert start + rows <= T, (
-            f"indexer view slice [{start}, {start + rows}) exceeds q rows {T}"
-        )
 
         page_size = pool.page_size
         kv_paged = pool.get_index_k_buffer(layer_id).view(
@@ -1216,13 +1211,13 @@ class Indexer(MultiPlatformOp):
             0 if forward_batch.forward_mode.is_extend_without_speculative() else 1
         )
         kunpeng.paged_mqa_logits_topk_kunpeng(
-            q[start : start + rows],
+            q,
             kv_paged,
-            weights[start : start + rows],
+            weights,
             block_tables,
             seq_lens,
             cur_lens,
-            output[start : start + rows],
+            output,
             workspace,
             topk,
             output_coord,
@@ -1236,14 +1231,17 @@ class Indexer(MultiPlatformOp):
         topk: int,
     ) -> torch.Tensor:
         """Reshape the flat [T, topk] scorer output to the consumer
-        contract: [B, topk] for decode, [B, n, topk] (right-aligned, -1
-        padding) for TARGET_VERIFY / DRAFT_EXTEND, and the flat
-        [flat_rows, topk] slot stream for the absorbed prefill.
+        contract: [B, n, topk] (right-aligned, -1 padding) for
+        TARGET_VERIFY / DRAFT_EXTEND; everything else (decode, absorbed
+        prefill) consumes the flat [T, topk] rows as-is -- the absorbed
+        prefill's T == absorbed_flat_rows holds by the upstream a2a token
+        alignment (asserted at metadata time, never compensated here) and
+        the consumer slices its absorbed_row_start window directly.
 
-        The scorer fills only THIS rank's rows; the remaining rows of the
-        full-batch buffer stay -1 and are never read (the consumers select
-        their rows via metadata.token_slice_start / the backend's flat
-        row window).
+        The scorer fills the FULL batch (every rank repeats the full
+        computation); the consumers select their own rows afterwards via
+        metadata.token_slice_start / the backend's absorbed_row_start
+        window.
         """
         from sglang.srt.graph import ops as kunpeng
 
@@ -1259,19 +1257,6 @@ class Indexer(MultiPlatformOp):
                 forward_batch.extend_seq_lens,
                 nv,
                 fill_value=-1,
-            )
-        if mode.is_extend_without_speculative():
-            # Flat row stream: the first sum(extend) rows are real (already
-            # slot coords); rows past that are the power-of-2 padding rows
-            # (all -1 via the virtual padding sequence) and, when the a2a
-            # rounding exceeds them, extra -1 rows to reach flat_rows.
-            meta = forward_batch.attn_backend.forward_metadata
-            flat_rows = meta.absorbed_flat_rows or output.shape[0]
-            if flat_rows <= output.shape[0]:
-                return output[:flat_rows]
-            pad = flat_rows - output.shape[0]
-            return torch.cat(
-                [output, torch.full((pad, topk), -1, dtype=output.dtype)]
             )
         return output
 
