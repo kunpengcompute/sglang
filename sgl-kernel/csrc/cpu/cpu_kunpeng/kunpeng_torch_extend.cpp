@@ -714,8 +714,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor(a!) indices) -> ()");
     m.impl("fake_indexer_topk_kunpeng", fake_indexer_topk_kunpeng);
 
-    // Fake indexer, MTP (TARGET_VERIFY / DRAFT_EXTEND / absorbed prefill)
-    // variant: fixed n query rows per sequence in the [B, n, topk] layout.
+    // Fake indexer, MTP (TARGET_VERIFY / DRAFT_EXTEND) variant: fixed n
+    // query rows per sequence in the [B, n, topk] layout.
     // extend_seq_lens is optional (verify: undefined = all rows live).
     // Direct-write output.
     m.def(
