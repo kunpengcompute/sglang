@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cpu_920f, is_kunpeng_graph_capture, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
 
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 _is_npu = is_npu()
+_is_cpu_920f = is_cpu_920f()
 if _is_npu:
     import torch_npu
 
@@ -138,6 +139,30 @@ class SchedulerProfilerMixin:
     def start_profile(
         self: Scheduler, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        if _is_cpu_920f and is_kunpeng_graph_capture():
+            # Kunpeng graph profile replaces the torch profiler entirely:
+            # start only the graph session (per-replay rows buffered in
+            # memory, flushed on stop) and skip torch.profiler below.
+            from sglang.srt.hardware_backend.cpu_kunpeng.graph_runner.kunpeng_graph_runner import (
+                kunpeng_graph_profile_start,
+            )
+
+            # getattr: with SGLANG_PROFILE_V2, init_profiler never assigns
+            # torch_profiler_output_dir; kunpeng_graph_profile_start then
+            # falls back to SGLANG_TORCH_PROFILER_DIR.
+            output_dir = getattr(self, "torch_profiler_output_dir", None)
+            if kunpeng_graph_profile_start(
+                str(output_dir) if output_dir is not None else None
+            ):
+                return ProfileReqOutput(
+                    success=True,
+                    message="Succeeded (kunpeng graph profile session; torch profiler skipped).",
+                )
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is already in progress. Call /stop_profile first.",
+            )
+
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.manual_start()
 
@@ -251,6 +276,24 @@ class SchedulerProfilerMixin:
     def stop_profile(
         self: Scheduler, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        if _is_cpu_920f and is_kunpeng_graph_capture():
+            # Kunpeng graph profile replaces the torch profiler entirely:
+            # stop the graph session (flush buffered rows to the jsonl
+            # files) and skip the torch-profiler export below.
+            from sglang.srt.hardware_backend.cpu_kunpeng.graph_runner.kunpeng_graph_runner import (
+                kunpeng_graph_profile_stop,
+            )
+
+            if kunpeng_graph_profile_stop():
+                return ProfileReqOutput(
+                    success=True,
+                    message="Succeeded (kunpeng graph profile records flushed).",
+                )
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is not in progress. Call /start_profile first.",
+            )
+
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.manual_stop()
 

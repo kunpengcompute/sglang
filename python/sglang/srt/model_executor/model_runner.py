@@ -189,7 +189,6 @@ from sglang.srt.utils import (
     is_cpu_920f,
     is_hip,
     is_host_cpu_arm64,
-    is_kunpeng_graph_profile,
     is_npu,
     kunpeng_forward_count_inc,
     log_info_on_rank0,
@@ -3262,15 +3261,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        # With graph profiling on, sync the EP domain before each forward:
-        # pre-forward variance (e.g. profile writes) then lands here instead
-        # of inflating in-graph comm ops. Every rank must run the same number
-        # of forwards per iteration, or these per-forward barriers mispair
-        # with other ranks' a2a ops and deadlock the domain (guarded by the
-        # scheduler's forward-count check). No-ops before MoE comm init.
+        # With graph capture on (920F), sync the EP domain before each
+        # forward: pre-forward variance (e.g. scheduler work between
+        # replays) then lands here instead of inflating in-graph comm ops.
+        # Every rank must run the same number of forwards per iteration, or
+        # these per-forward barriers mispair with other ranks' a2a ops and
+        # deadlock the domain (guarded by the scheduler's forward-count
+        # check). No-ops before MoE comm init.
         if _is_cpu_920f:
             kunpeng_forward_count_inc()
-            if is_kunpeng_graph_profile():
+            if self.kunpeng_runner.is_graph_active():
                 with pp_span("moe_comm_barrier"):
                     torch.ops.sgl_kernel.moe_comm_barrier_kunpeng()
 

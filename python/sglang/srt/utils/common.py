@@ -283,10 +283,6 @@ def is_kunpeng_graph_capture() -> bool:
     return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_GRAPH_CAPTURE") == "1"
 
 
-def is_kunpeng_graph_profile() -> bool:
-    return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_GRAPH_PROFILE") == "1"
-
-
 _kunpeng_forward_count = 0
 
 

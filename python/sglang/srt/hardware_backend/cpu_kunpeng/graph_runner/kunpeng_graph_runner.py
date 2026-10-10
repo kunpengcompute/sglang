@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
+import weakref
 from collections import OrderedDict
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -35,7 +37,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.utils import (
     is_cpu_920f,
     is_kunpeng_graph_capture,
-    is_kunpeng_graph_profile,
     is_kunpeng_hbw_pool,
     is_kunpeng_hbw_resident_expert_weights,
     is_kunpeng_hbw_resident_graph,
@@ -57,11 +58,21 @@ _hbw_resident_expert = is_kunpeng_hbw_resident_expert_weights()
 _hbw_resident_graph = is_kunpeng_hbw_resident_graph()
 _is_kunpeng_swap_expert = is_kunpeng_swap_expert()
 _is_kunpeng_graph_capture = is_kunpeng_graph_capture()
-_is_kunpeng_graph_profile = is_kunpeng_graph_profile()
 _is_scheduler_skip_all_gather = (
     os.environ.get("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "0") == "1"
 )
 last_call_timestamp = 0
+
+# ── Request-driven graph profile session (mirrors the torch profiler) ──────
+# /start_profile (SchedulerProfilerMixin.start_profile) starts collecting a
+# profile row per graph replay into an in-memory buffer; /stop_profile
+# flushes the buffer into the per-rank jsonl files. Steady-state serving
+# pays only a bool check per replay — no per-replay file I/O.
+_graph_profile_lock = threading.Lock()
+_graph_profile_active = False
+_graph_profile_dir: Optional[str] = None
+_graph_profile_records: list = []
+_graph_profile_runners = weakref.WeakSet()
 
 
 class KunpengGraphRunner:
@@ -87,6 +98,10 @@ class KunpengGraphRunner:
 
     def __init__(self, model_runner: ModelRunner):
         self.model_runner = model_runner
+        # Register for the request-driven profile session so start/stop can
+        # toggle enable_profile on all cached graphs of every runner
+        # (target + MTP draft runners live in the same process).
+        _graph_profile_runners.add(self)
 
         # Graph capture state
         self.graph_fixed_weights: Optional[List[torch.Tensor]] = None
@@ -372,6 +387,22 @@ class KunpengGraphRunner:
         When graph is disabled it falls through to plain model.forward().
         """
         return True
+
+    def _graph_profile_path(self) -> str:
+        # With PP>1, stages sharing a tp_rank would concurrently append
+        # to the same file; split per pp_rank. The MTP draft runner is
+        # constructed with pp_size=1/pp_rank=0 but only ever runs on the
+        # last PP rank, so merge its records into that stage's file.
+        if self.model_runner.is_draft_worker:
+            pp_rank = self.model_runner.server_args.pp_size - 1
+        else:
+            pp_rank = self.model_runner.pp_rank
+        rank_part = (
+            f"pp{pp_rank}"
+            f"_dp{self.model_runner.dp_rank}"
+            f"_tp{self.model_runner.tp_rank}"
+        )
+        return os.path.join(_graph_profile_dir, f"sglang_graph_{rank_part}.jsonl")
 
     def replay(
         self,
@@ -1048,7 +1079,7 @@ class KunpengGraphRunner:
                 )
             graph.has_hidden_states = (not is_pp_output) and hidden_states is not None
 
-            if _is_kunpeng_graph_profile:
+            if _graph_profile_active:
                 graph.enable_profile(True)
             self._sglang_graph_cache[graph_cache_key] = (
                 graph,
@@ -1083,32 +1114,12 @@ class KunpengGraphRunner:
         ):
             logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms, others {1000 * (t0 - last_call_timestamp):.3f} ms.")
 
-        # Idle replays would grow the profile jsonl unboundedly.
-        if _is_kunpeng_graph_profile and not skip_idle_log:
-            from sglang.srt.graph.profile import write_profile
-
-            profile_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
-            # With PP>1, stages sharing a tp_rank would concurrently append
-            # to the same file; split per pp_rank. The MTP draft runner is
-            # constructed with pp_size=1/pp_rank=0 but only ever runs on the
-            # last PP rank, so merge its records into that stage's file.
-            if self.model_runner.is_draft_worker:
-                pp_rank = self.model_runner.server_args.pp_size - 1
-            else:
-                pp_rank = self.model_runner.pp_rank
-            rank_part = (
-                f"pp{pp_rank}"
-                f"_dp{self.model_runner.dp_rank}"
-                f"_tp{self.model_runner.tp_rank}"
-            )
-            path = os.path.join(
-                profile_dir,
-                f"sglang_graph_{rank_part}.jsonl",
-            )
+        # Idle replays would grow the profile records unboundedly.
+        if _graph_profile_active and not skip_idle_log:
             row = graph.get_profile_row()
             op_names = graph.profile_op_names()
-            write_profile(
-                path,
+            record = (
+                self._graph_profile_path(),
                 row,
                 op_names,
                 {
@@ -1118,6 +1129,10 @@ class KunpengGraphRunner:
                     "batch_size": forward_batch.batch_size,
                 },
             )
+            with _graph_profile_lock:
+                # Re-check: the session may have been stopped meanwhile.
+                if _graph_profile_active:
+                    _graph_profile_records.append(record)
         last_call_timestamp = time.time()
 
         if is_pp_output:
@@ -1130,3 +1145,81 @@ class KunpengGraphRunner:
             return logits, hidden_states
         (logits,) = outputs
         return logits, None
+
+    def _graph_profile_path(self) -> str:
+        # With PP>1, stages sharing a tp_rank would concurrently append
+        # to the same file; split per pp_rank. The MTP draft runner is
+        # constructed with pp_size=1/pp_rank=0 but only ever runs on the
+        # last PP rank, so merge its records into that stage's file.
+        if self.model_runner.is_draft_worker:
+            pp_rank = self.model_runner.server_args.pp_size - 1
+        else:
+            pp_rank = self.model_runner.pp_rank
+        rank_part = (
+            f"pp{pp_rank}"
+            f"_dp{self.model_runner.dp_rank}"
+            f"_tp{self.model_runner.tp_rank}"
+        )
+        return os.path.join(_graph_profile_dir, f"sglang_graph_{rank_part}.jsonl")
+
+
+def kunpeng_graph_profile_active() -> bool:
+    return _graph_profile_active
+
+
+def kunpeng_graph_profile_start(output_dir: Optional[str] = None) -> bool:
+    """Start collecting one profile row per graph replay (like the torch
+    profiler's /start_profile). Records are buffered in memory and flushed
+    by kunpeng_graph_profile_stop(). Returns False if a session is already
+    active.
+    """
+    global _graph_profile_active, _graph_profile_dir, _graph_profile_records
+    with _graph_profile_lock:
+        if _graph_profile_active:
+            return False
+        _graph_profile_records = []
+        _graph_profile_dir = output_dir or os.environ.get(
+            "SGLANG_TORCH_PROFILER_DIR", "/tmp"
+        )
+        _graph_profile_active = True
+    # Graphs captured before this session need in-graph timestamps enabled;
+    # graphs captured during the session are handled at capture time.
+    for runner in list(_graph_profile_runners):
+        for entry in runner._sglang_graph_cache.values():
+            entry[0].enable_profile(True)
+    logger.info(
+        "[graph] profile session started, records will be flushed to %s "
+        "on stop_profile",
+        _graph_profile_dir,
+    )
+    return True
+
+
+def kunpeng_graph_profile_stop() -> bool:
+    """Stop collecting and flush the buffered records into the per-rank
+    jsonl files. Returns False if no session is active.
+    """
+    global _graph_profile_active, _graph_profile_records
+    with _graph_profile_lock:
+        if not _graph_profile_active:
+            return False
+        _graph_profile_active = False
+        records = _graph_profile_records
+        _graph_profile_records = []
+    for runner in list(_graph_profile_runners):
+        for entry in runner._sglang_graph_cache.values():
+            entry[0].enable_profile(False)
+    by_path: dict = {}
+    for path, row, op_names, meta in records:
+        by_path.setdefault(path, []).append((row, op_names, meta))
+    if by_path:
+        from sglang.srt.graph.profile import write_profiles
+
+        for path, rows in by_path.items():
+            write_profiles(path, rows)
+    logger.info(
+        "[graph] profile session stopped, flushed %d record(s) into %d file(s)",
+        len(records),
+        len(by_path),
+    )
+    return True

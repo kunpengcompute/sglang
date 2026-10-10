@@ -16,7 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.utils.common import (
     is_cpu_920f,
-    is_kunpeng_graph_profile,
+    is_kunpeng_graph_capture,
     kunpeng_forward_count,
     require_mlp_tp_gather,
 )
@@ -53,11 +53,14 @@ def _rdma_allgather_available() -> bool:
     return state is not None and state.rdma_comm_created
 
 
-# Forward-count parity check (kunpeng 920F): auto-on when graph profile is
-# on (per-forward RDMA barriers then make count divergence a deadlock), or
-# force-on with SGLANG_KUNPENG_CHECK_FWD_COUNT=1.
+# Forward-count parity check (kunpeng 920F): auto-on when graph capture is
+# on (the per-forward RDMA barrier in ModelRunner._forward_raw then makes
+# count divergence a deadlock), or force-on with
+# SGLANG_KUNPENG_CHECK_FWD_COUNT=1. Graph profile *recording* is
+# request-driven (/start_profile//stop_profile) and adds no collectives,
+# so it does not need this check.
 _is_kunpeng_fwd_count_check = _is_cpu_920f and (
-    is_kunpeng_graph_profile()
+    is_kunpeng_graph_capture()
     or os.environ.get("SGLANG_KUNPENG_CHECK_FWD_COUNT", "0") == "1"
 )
 _fwd_count_check_last = 0
@@ -262,7 +265,7 @@ def _check_forward_count_consistency(tp_group: "GroupCoordinator") -> None:
             f"[fwd-count-check] per-rank forward counts diverged since the "
             f"last scheduler sync: deltas={deltas} (local delta={delta}). "
             f"Per-forward RDMA-domain collectives (moe_comm_barrier under "
-            f"SGLANG_ENABLE_GRAPH_PROFILE, NextN MoE dispatch) mispair across "
+            f"graph capture, NextN MoE dispatch) mispair across "
             f"ranks and will deadlock the cluster."
         )
 
