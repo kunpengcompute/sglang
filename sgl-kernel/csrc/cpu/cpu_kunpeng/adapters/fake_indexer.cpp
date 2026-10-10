@@ -29,7 +29,7 @@ static KernelRegistrar _r_fake_indexer(
     "fake_indexer_topk_kunpeng",
     make_dispatch_v<decltype(&fake_indexer_topk_kunpeng), &fake_indexer_topk_kunpeng>);
 
-// MTP (TARGET_VERIFY / DRAFT_EXTEND / absorbed prefill) 变体: 张量序 =
+// MTP (TARGET_VERIFY / DRAFT_EXTEND) 变体: 张量序 =
 // [seq_lens, extend_seq_lens (输入, verify 传 None -> undefined),
 // indices (输出)], 标量 = [num_rows, topk]. 内核侧自行处理 undefined 的
 // extend_seq_lens. 图分发不接受 optional 张量类型 (make_dispatch_v 只认

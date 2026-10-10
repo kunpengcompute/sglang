@@ -194,15 +194,11 @@ def handle_attention_intel_xpu(attn, forward_batch):
 
 def handle_attention_kunpeng_cpu(attn, forward_batch):
     if forward_batch.forward_mode.is_extend_without_speculative():
-        if (
-            not is_lc_cp_enabled()
-            and getattr(attn, "use_nsa", False)
-            and getattr(attn, "indexer", None) is not None
-        ):
-            # DSA absorbed prefill: MLA_KUNPENG runs the absorbed-q path and
-            # the sparse flash MLA over the paged LATENT cache (the same
-            # kernel as decode / MTP verify), dropping the MHA form's
-            # per-layer kv_b up-projection of the full context.
+        if not is_lc_cp_enabled() and getattr(attn, "use_nsa", False):
+            # DSA absorbed prefill: flat sparse flash MLA over the paged
+            # LATENT cache; per-row slots come from backend metadata (no
+            # model-side indexer). Gate must match the backend's absorbed
+            # dispatch.
             return AttnForwardMethod.MLA_KUNPENG
         # Otherwise use MHA_KUNPENG for all prefill so chunked and
         # non-chunked match; MLA_KUNPENG's absorbed-q path diverges

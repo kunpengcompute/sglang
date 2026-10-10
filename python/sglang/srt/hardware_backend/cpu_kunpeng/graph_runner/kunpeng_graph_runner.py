@@ -609,9 +609,6 @@ class KunpengGraphRunner:
             inputs.extend(
                 [forward_batch.out_cache_loc, attn_backend._decode_meta]
             )
-            if meta is not None and meta.kv_write_loc is not None:
-                # Slot-filtered write locations for set_kv_buffer_2.
-                inputs.append(meta.kv_write_loc)
             if getattr(attn_backend, "_nsa_enabled", False):
                 # DSA: full-batch seq lens consumed by the (fake) CPU indexer
                 # graph op. Register the SAME view the op consumes (the
@@ -621,6 +618,14 @@ class KunpengGraphRunner:
                 inputs.append(
                     meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
                 )
+            if (
+                getattr(attn_backend, "_nsa_enabled", False)
+                and not getattr(attn_backend, "_lc_enabled", False)
+            ):
+                # dsa_topk_slots reads req_to_token directly; register the
+                # SAME views the op consumes.
+                inputs.append(forward_batch.req_to_token_pool.req_to_token)
+                inputs.append(meta.req_pool_indices)
             if getattr(attn_backend, "_lc_enabled", False):
                 # Long-context decode CP: per-step sparse-attention metadata
                 # (local KV indices + per-sequence counts) consumed by the
@@ -666,8 +671,6 @@ class KunpengGraphRunner:
                 attn_backend._decode_meta,
             ]
             if meta is not None:
-                if meta.kv_write_loc is not None:
-                    inputs.append(meta.kv_write_loc)
                 if getattr(meta, "absorbed_slots", None) is not None:
                     # Flat absorbed prefill: per-row slots + valid counts.
                     inputs.append(meta.absorbed_slots)
@@ -723,6 +726,10 @@ class KunpengGraphRunner:
                 inputs.append(
                     meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
                 )
+                # dsa_topk_slots reads req_to_token directly; register the
+                # SAME views the op consumes.
+                inputs.append(forward_batch.req_to_token_pool.req_to_token)
+                inputs.append(meta.req_pool_indices)
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)

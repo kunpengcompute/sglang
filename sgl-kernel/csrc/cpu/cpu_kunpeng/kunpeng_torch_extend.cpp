@@ -135,13 +135,16 @@ void flash_mla_sparse_decode_kunpeng(at::Tensor q, at::Tensor kcache, at::Tensor
                                      at::Tensor o, at::Tensor softmax_lse, double softmax_scale,
                                      at::Tensor extra_buffer, c10::optional<at::Tensor> meta);
 
-void dsa_topk_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &topk_indices,
-                            const at::Tensor &seq_lens, int64_t page_size, int64_t row_start,
+void dsa_topk_slots_kunpeng(const at::Tensor &req_to_token, const at::Tensor &req_pool_indices,
+                            const c10::optional<at::Tensor> &remapped_block_table,
+                            const at::Tensor &topk_indices, const at::Tensor &seq_lens,
+                            int64_t page_size, int64_t row_start,
                             at::Tensor slots, at::Tensor topk_length);
 
-void dsa_prefill_slots_kunpeng(const at::Tensor &block_table, const at::Tensor &seq_lens,
-                               const at::Tensor &extend_seq_lens, int64_t num_rows,
-                               int64_t page_size, int64_t topk,
+void dsa_prefill_slots_kunpeng(const at::Tensor &req_to_token, const at::Tensor &req_pool_indices,
+                               const c10::optional<at::Tensor> &remapped_block_table,
+                               const at::Tensor &seq_lens, const at::Tensor &extend_seq_lens,
+                               int64_t num_rows, int64_t page_size, int64_t topk,
                                at::Tensor slots, at::Tensor topk_length);
 
 void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices);
@@ -690,11 +693,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("flash_mla_sparse_decode_kunpeng", flash_mla_sparse_decode_kunpeng);
 
     // DSA (NSA) decode: indexer top-k token positions -> flat KV-cache slots
-    // (+ per-sequence valid counts) for the sparse flash MLA kernel.
-    // Direct-write outputs (graph replay discards return values).
+    // (+ per-sequence valid counts) for the sparse flash MLA kernel. Slots
+    // are read straight from the req_to_token pool; remapped_block_table
+    // carries the HBM page table under block-wise KV swap (undefined
+    // otherwise). Direct-write outputs (graph replay discards return
+    // values).
     m.def(
-        "dsa_topk_slots_kunpeng(Tensor block_table, Tensor topk_indices, "
-        "Tensor seq_lens, int page_size, int row_start, "
+        "dsa_topk_slots_kunpeng(Tensor req_to_token, Tensor req_pool_indices, "
+        "Tensor? remapped_block_table, Tensor topk_indices, Tensor seq_lens, "
+        "int page_size, int row_start, "
         "Tensor(a!) slots, Tensor(b!) topk_length) -> ()");
     m.impl("dsa_topk_slots_kunpeng", dsa_topk_slots_kunpeng);
 
@@ -702,8 +709,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     // (per-row KV slots for the decode-shaped (rows, 1, H, D) sparse call).
     // Runs at metadata time, outside the graph capture; direct-write outputs.
     m.def(
-        "dsa_prefill_slots_kunpeng(Tensor block_table, Tensor seq_lens, "
-        "Tensor extend_seq_lens, int num_rows, int page_size, int topk, "
+        "dsa_prefill_slots_kunpeng(Tensor req_to_token, Tensor req_pool_indices, "
+        "Tensor? remapped_block_table, Tensor seq_lens, Tensor extend_seq_lens, "
+        "int num_rows, int page_size, int topk, "
         "Tensor(a!) slots, Tensor(b!) topk_length) -> ()");
     m.impl("dsa_prefill_slots_kunpeng", dsa_prefill_slots_kunpeng);
 
@@ -714,8 +722,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor(a!) indices) -> ()");
     m.impl("fake_indexer_topk_kunpeng", fake_indexer_topk_kunpeng);
 
-    // Fake indexer, MTP (TARGET_VERIFY / DRAFT_EXTEND / absorbed prefill)
-    // variant: fixed n query rows per sequence in the [B, n, topk] layout.
+    // Fake indexer, MTP (TARGET_VERIFY / DRAFT_EXTEND) variant: fixed n
+    // query rows per sequence in the [B, n, topk] layout.
     // extend_seq_lens is optional (verify: undefined = all rows live).
     // Direct-write output.
     m.def(
