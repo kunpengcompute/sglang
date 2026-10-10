@@ -784,19 +784,35 @@ class KunpengGraphRunner:
                     break
         if forward_batch.next_token_logits_buffer is not None:
             fixed.append(forward_batch.next_token_logits_buffer)
-        # Expert HBM swap buffers (reused across layers, allocated once)
+        # Expert HBM swap buffers (reused across layers, allocated once).
+        # Buffers may legitimately be None when the flag is on but this rank
+        # has no expert/KV layers (e.g. disagg prefill PP0 with only dense
+        # layers sets _first_moe_layer_idx=None), so skip None entries instead
+        # of passing them to begin_capture (which rejects non-Tensor items).
         if self.swap_mgr.enable_swap_expert:
-            fixed.append(self.swap_mgr._expert_buffer_w13)
-            fixed.append(self.swap_mgr._expert_buffer_w2)
-            fixed.append(self.swap_mgr._expert_event_tensor)
-            fixed.append(self.swap_mgr._expert_event_num_tensor)
+            for buf in (
+                self.swap_mgr._expert_buffer_w13,
+                self.swap_mgr._expert_buffer_w2,
+                self.swap_mgr._expert_event_tensor,
+                self.swap_mgr._expert_event_num_tensor,
+            ):
+                if buf is not None:
+                    fixed.append(buf)
         if self.swap_mgr.enable_swap_kv_in:
-            fixed.append(self.swap_mgr._cur_kv_hbm)
-            fixed.append(self.swap_mgr._kv_swap_in_event_tensor)
-            fixed.append(self.swap_mgr._kv_swap_in_event_num_tensor)
+            for buf in (
+                self.swap_mgr._cur_kv_hbm,
+                self.swap_mgr._kv_swap_in_event_tensor,
+                self.swap_mgr._kv_swap_in_event_num_tensor,
+            ):
+                if buf is not None:
+                    fixed.append(buf)
         if self.swap_mgr.enable_swap_kv_out:
-            fixed.append(self.swap_mgr._kv_ddr_event_tensor)
-            fixed.append(self.swap_mgr._kv_ddr_event_num_tensor)
+            for buf in (
+                self.swap_mgr._kv_ddr_event_tensor,
+                self.swap_mgr._kv_ddr_event_num_tensor,
+            ):
+                if buf is not None:
+                    fixed.append(buf)
         try:
             from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
                 _KunpengDispatcherState,
