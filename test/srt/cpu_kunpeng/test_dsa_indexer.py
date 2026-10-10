@@ -1,0 +1,1256 @@
+"""DSA indexer module tests for Kunpeng 920F (pure torch / pure python).
+
+Run (group A/C/D need only torch; group B needs the compiled sgl_kernel +
+KUPL/KUTACC runtime, auto-skipped otherwise):
+
+    python test/srt/cpu_kunpeng/test_dsa_indexer.py     # expect final PASS
+
+Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
+  A. numeric semantics of the pure-torch golden (per-head ReLU, causal
+     visibility, tie -> smaller id, -1 padding) vs an independent float64
+     naive reference;
+  B. strict-order comparison against the fused kutacc op
+     (paged_mqa_logits_topk_kunpeng);
+  C. KunpengNSATokenToKVPool index-K buffers (slot alignment, -1 skip,
+     shared-layer skip, size accounting);
+  D. dsa_layer_skips_topk scheduling rules + count_indexer_layers +
+     the skip_topk propagation chain mirror.
+  E. IndexTopKShareState MTP cross-iteration carry semantics (enter/publish/
+     exit lifecycle, idempotent publish, disabled no-op).
+  F. DSA sparse prefill attention vs an fp32 reference + workspace-size
+     contracts. NOTE: the glm5 absorbed-prefill branch dropped the MHA-form
+     flash_attention_sparse_prefill_kunpeng operator, so the sparse-prefill
+     cases auto-skip when it is absent (the workspace helper still checks
+     the paged_mqa_logits_topk contract).
+  G. indexer scoring view: power-of-2/TP prefill padding handled by a
+     virtual seq_len-0 sequence (real rows keep their exact causal window)
+     and the decode all2all Btp slice scores identically to the full batch
+     (KunpengCpuMetadata.indexer_* fields consumed by Indexer.forward_cpu).
+  H. MTP indexer views (verify uniform nv rows with a ts*nv offset,
+     draft-extend ragged rows with a cumsum offset; view slices score
+     identically to the full batch) + the fused MTP primitives
+     (dsa_topk_slots [B, nv, topk] mapping, pad_q_left fill semantics).
+"""
+
+import random
+import traceback
+
+import torch
+
+from sglang.srt.layers.attention.nsa.indexer_cpu import (
+    OUTPUT_COORD_POSITION,
+    OUTPUT_COORD_SLOT,
+    indexer_topk_from_slot_lists,
+    paged_mqa_logits_topk_cpu,
+    topk_length_from_seq_lens,
+)
+
+try:
+    from sglang.srt.configs.model_config import (
+        count_indexer_layers,
+        dsa_layer_skips_topk,
+    )
+    from sglang.srt.configs.model_config import is_deepseek_nsa as _is_nsa
+
+    _HAVE_MODEL_CONFIG = True
+except Exception:
+    _HAVE_MODEL_CONFIG = False
+
+try:
+    from sglang.srt.hardware_backend.cpu_kunpeng.memory_pool_kunpeng import (
+        KunpengNSATokenToKVPool,
+    )
+
+    _HAVE_POOL = True
+except Exception:
+    _HAVE_POOL = False
+
+_sgl_kernel = None
+try:
+    import sgl_kernel  # noqa: F401
+
+    _sgl_kernel = torch.ops.sgl_kernel
+    _ = _sgl_kernel.paged_mqa_logits_topk_kunpeng  # attribute check
+    _ = _sgl_kernel.get_paged_mqa_logits_topk_workspace_size
+except Exception:
+    _sgl_kernel = None
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _make_case(rng, n_heads, head_dim, block_size, topk, n_seq, cur_list, delta):
+    """Random paged inputs: q/weight bf16, a paged kv cache, block tables."""
+    T = sum(cur_list)
+    seq_lens = [c + d for c, d in zip(cur_list, delta)]
+    num_slots = 64
+    q = torch.randn(T, n_heads, head_dim, dtype=torch.bfloat16) * 0.5
+    weight = torch.randn(T, n_heads, dtype=torch.bfloat16) * 0.5
+    kv = torch.randn(num_slots, block_size, head_dim, dtype=torch.bfloat16) * 0.5
+
+    # Random (but valid) block tables: distinct pages per sequence.
+    max_blocks = max((s + block_size - 1) // block_size for s in seq_lens)
+    pages = list(range(0, (num_slots // block_size)))
+    rng.shuffle(pages)
+    block_tables = torch.zeros(n_seq, max_blocks, dtype=torch.int32)
+    for b in range(n_seq):
+        need = (seq_lens[b] + block_size - 1) // block_size
+        block_tables[b, :need] = torch.tensor(pages[b * need : (b + 1) * need])
+    return (
+        q,
+        kv,
+        weight,
+        block_tables,
+        torch.tensor(seq_lens, dtype=torch.int32),
+        torch.tensor(cur_list, dtype=torch.int32),
+        topk,
+        seq_lens,
+        cur_list,
+    )
+
+
+def _naive_paged_topk(q, kv, weight, block_tables, seq_lens, cur_lens, topk):
+    """Independent float64 triple-loop reference (slot coordinate)."""
+    T, H, D = q.shape
+    block_size = kv.shape[1]
+    out = torch.full((T, topk), -1, dtype=torch.int32)
+    offsets = [sum(cur_lens[:b]) for b in range(len(cur_lens))]
+    for ti in range(T):
+        b = next(i for i in range(len(cur_lens)) if offsets[i] <= ti < offsets[i] + cur_lens[i])
+        pos = ti - offsets[b]
+        k_end = seq_lens[b] - cur_lens[b] + pos + 1
+        cands = []
+        for si in range(k_end):
+            slot = (
+                int(block_tables[b][si // block_size]) * block_size + si % block_size
+            )
+            k = kv[slot // block_size, slot % block_size].double()
+            score = 0.0
+            for h in range(H):
+                dot = float(q[ti, h].double() @ k)
+                score += max(dot, 0.0) * float(weight[ti, h])
+            cands.append((score, slot))
+        # score descending, ties -> smaller slot
+        cands.sort(key=lambda x: (-x[0], x[1]))
+        for j in range(min(topk, len(cands))):
+            out[ti, j] = cands[j][1]
+    return out
+
+
+def _valid_prefix(row):
+    out = []
+    for v in row:
+        if v < 0:
+            break
+        out.append(int(v))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# A. numeric semantics (pure torch)
+# ---------------------------------------------------------------------------
+
+def test_matches_naive():
+    rng = random.Random(0)
+    configs = []
+    for n_head in (1, 2):
+        for head_dim in (2, 4):
+            for block_size in (1, 2, 4):
+                for topk in (1, 3, 8):
+                    for n_seq in (1, 2, 3):
+                        for cur in (1, 2, 3):
+                            for delta in (0, 1, 5, 7):
+                                configs.append((n_head, head_dim, block_size, topk, n_seq, cur, delta))
+    rng.shuffle(configs)
+    for cfg in configs[:20]:
+        n_head, head_dim, block_size, topk, n_seq, cur, delta = cfg
+        cur_list = [cur] * n_seq
+        (q, kv, weight, bt, sl, cl, tk, seq_lens, cur_list2) = _make_case(
+            rng, n_head, head_dim, block_size, topk, n_seq, cur_list, [delta] * n_seq
+        )
+        got = paged_mqa_logits_topk_cpu(q, kv, weight, bt, sl, cl, tk, output_coord=OUTPUT_COORD_SLOT)
+        ref = _naive_paged_topk(q, kv, weight, bt, [int(x) for x in sl], [int(x) for x in cl], tk)
+        for r in range(got.shape[0]):
+            assert _valid_prefix(got[r].tolist()) == _valid_prefix(ref[r].tolist()), (
+                f"row {r} mismatch cfg={cfg}: {_valid_prefix(got[r].tolist())} "
+                f"vs {_valid_prefix(ref[r].tolist())}"
+            )
+
+
+def test_relu_is_applied():
+    # H=2, D=2. Per head, dot with slot0 / slot1:
+    #   head0: [0, 1]   head1: [0, -5]
+    # With per-head ReLU: slot1 = relu(1) + relu(-5) = 1 > slot0 = 0.
+    # Without per-head ReLU (sum-then-relu): slot1 = relu(1 - 5) = 0, i.e. a
+    # tie with slot0 -> would pick slot0. So top1 == slot1 proves per-head
+    # ReLU (not relu-after-sum).
+    q = torch.zeros(1, 2, 2, dtype=torch.bfloat16)
+    q[0, 0] = torch.tensor([0.0, 1.0], dtype=torch.bfloat16)   # head0
+    q[0, 1] = torch.tensor([0.0, -5.0], dtype=torch.bfloat16)  # head1
+    kv = torch.zeros(1, 2, 2, dtype=torch.bfloat16)
+    kv[0, 0] = torch.tensor([1.0, 0.0], dtype=torch.bfloat16)  # slot0: dots = 0, 0
+    kv[0, 1] = torch.tensor([0.0, 1.0], dtype=torch.bfloat16)  # slot1: dots = 1, -5
+    weight = torch.ones(1, 2, dtype=torch.bfloat16)
+    bt = torch.tensor([[0]], dtype=torch.int32)
+    sl = torch.tensor([2], dtype=torch.int32)
+    cl = torch.tensor([1], dtype=torch.int32)
+    out = paged_mqa_logits_topk_cpu(q, kv, weight, bt, sl, cl, 1, output_coord=OUTPUT_COORD_SLOT)
+    # slot0: relu(0)+relu(0)=0 ; slot1: relu(1)+relu(-5)=1 -> top1 = slot1
+    assert out[0, 0].item() == 1, f"per-head ReLU not applied: {out}"
+
+
+def test_tie_break_smaller_slot():
+    # Two slots with equal scores; the block table reverses the logical
+    # order (si0 -> slot1, si1 -> slot0). Ties must pick the smaller slot.
+    # block_size == 1 so si -> block is identity and bt inverts slots.
+    q = torch.ones(1, 1, 2, dtype=torch.bfloat16)
+    kv = torch.zeros(2, 1, 2, dtype=torch.bfloat16)  # 2 blocks x block_size 1
+    kv[0, 0] = torch.tensor([1.0, 0.0], dtype=torch.bfloat16)  # slot0
+    kv[1, 0] = torch.tensor([1.0, 0.0], dtype=torch.bfloat16)  # slot1
+    weight = torch.ones(1, 1, dtype=torch.bfloat16)
+    bt = torch.tensor([[1, 0]], dtype=torch.int32)  # si0 -> slot1, si1 -> slot0
+    sl = torch.tensor([2], dtype=torch.int32)
+    cl = torch.tensor([1], dtype=torch.int32)
+    out = paged_mqa_logits_topk_cpu(q, kv, weight, bt, sl, cl, 2, output_coord=OUTPUT_COORD_SLOT)
+    assert out[0].tolist() == [0, 1], f"tie must break to smaller slot: {out}"
+
+
+def test_causal_visibility():
+    # Single sequence, cur == seq == 4 (chunked-prefill mid-chunk): query
+    # row ti only sees si <= ti.
+    q = torch.randn(4, 1, 2, dtype=torch.bfloat16)
+    kv = torch.randn(1, 4, 2, dtype=torch.bfloat16)
+    weight = torch.ones(4, 1, dtype=torch.bfloat16)
+    bt = torch.tensor([[0]], dtype=torch.int32)
+    sl = torch.tensor([4], dtype=torch.int32)
+    cl = torch.tensor([4], dtype=torch.int32)
+    out = paged_mqa_logits_topk_cpu(q, kv, weight, bt, sl, cl, 8, output_coord=OUTPUT_COORD_POSITION)
+    for ti in range(4):
+        row = [int(v) for v in out[ti] if v >= 0]
+        assert sorted(row) == list(range(ti + 1)), (
+            f"row {ti} must see positions [0..{ti}]: {out[ti].tolist()}"
+        )
+
+
+def test_slot_list_variant_equivalence():
+    rng = random.Random(1)
+    q, kv, weight, bt, sl, cl, topk, seq_lens, cur_list = _make_case(
+        rng, n_heads=2, head_dim=4, block_size=2, topk=3, n_seq=1,
+        cur_list=[1], delta=[7],
+    )
+    paged = paged_mqa_logits_topk_cpu(q, kv, weight, bt, sl, cl, topk, output_coord=OUTPUT_COORD_SLOT)
+    # Expand the block table into an absolute-slot list (si ascending).
+    block_size = kv.shape[1]
+    s0 = int(sl[0])
+    si = torch.arange(s0)
+    slot_list = (bt[0].to(torch.int64)[si // block_size] * block_size + si % block_size)
+    slot_lists = slot_list.unsqueeze(0)
+    variant = indexer_topk_from_slot_lists(
+        q, kv.reshape(-1, kv.shape[2]), weight, slot_lists,
+        sl, cl, topk,
+    )
+    assert paged.tolist() == variant.tolist(), (
+        f"slot-list variant != paged variant: {paged} vs {variant}"
+    )
+
+
+def _naive_slot_list_topk(q, index_k, weight, slot_lists, seq_lens, extend_lens, topk):
+    """Independent float64 reference for the ragged (varlen) variant."""
+    T, H, D = q.shape
+    out = torch.full((T, topk), -1, dtype=torch.int32)
+    offsets = [sum(extend_lens[:b]) for b in range(len(extend_lens))]
+    for b in range(len(seq_lens)):
+        s_b = seq_lens[b]
+        r_cnt = extend_lens[b]
+        slots = [int(slot_lists[b][j]) for j in range(s_b)]
+        for r in range(r_cnt):
+            ti = offsets[b] + r
+            k_end = s_b - r_cnt + r + 1
+            cands = []
+            for si in range(k_end):
+                k = index_k[slots[si]].double()
+                score = 0.0
+                for h in range(H):
+                    score += max(float(q[ti, h].double() @ k), 0.0) * float(weight[ti, h])
+                cands.append((score, slots[si]))
+            cands.sort(key=lambda x: (-x[0], x[1]))
+            for j in range(min(topk, len(cands))):
+                out[ti, j] = cands[j][1]
+    return out
+
+
+def test_slot_list_variant_varlen():
+    # MTP draft-extend style ragged rows: extend = [2, 2, 1].
+    rng = random.Random(2)
+    extend = [2, 2, 1]
+    seq_lens = [5, 4, 3]
+    T = sum(extend)
+    q = torch.randn(T, 2, 4, dtype=torch.bfloat16) * 0.5
+    weight = torch.randn(T, 2, dtype=torch.bfloat16) * 0.5
+    index_k = torch.randn(32, 4, dtype=torch.bfloat16) * 0.5
+    slot_lists = torch.zeros(3, 8, dtype=torch.int32)
+    for b, s in enumerate(seq_lens):
+        slot_lists[b, :s] = torch.randperm(32, dtype=torch.int32)[:s]
+    got = indexer_topk_from_slot_lists(
+        q, index_k, weight, slot_lists,
+        torch.tensor(seq_lens, dtype=torch.int32),
+        torch.tensor(extend, dtype=torch.int32),
+        3,
+    )
+    ref = _naive_slot_list_topk(q, index_k, weight, slot_lists, seq_lens, extend, 3)
+    for r in range(T):
+        assert _valid_prefix(got[r].tolist()) == _valid_prefix(ref[r].tolist()), (
+            f"varlen row {r}: {got[r].tolist()} vs {ref[r].tolist()}"
+        )
+
+
+def test_topk_length():
+    got = topk_length_from_seq_lens([1, 2048, 4096, 100], 2048)
+    assert got.tolist() == [1, 2048, 2048, 100], got.tolist()
+
+
+# ---------------------------------------------------------------------------
+# B. fused kutacc comparison (needs compiled sgl_kernel)
+# ---------------------------------------------------------------------------
+
+def _iter_random_kutacc_cases(seed=0, limit=20):
+    """Yield (cfg, q, kv, weight, bt, sl, cl, tk) random paged cases.
+
+    Deterministic seed/order so the kSlot and kPosition comparison tests
+    run on identical inputs.
+    """
+    rng = random.Random(seed)
+    configs = []
+    for n_head in (1, 2):
+        for head_dim in (2, 4):
+            for block_size in (1, 2, 4):
+                for topk in (1, 3, 8):
+                    for n_seq in (1, 2, 3):
+                        for cur in (1, 2, 3):
+                            for delta in (0, 1, 5, 7):
+                                configs.append((n_head, head_dim, block_size, topk, n_seq, cur, delta))
+    rng.shuffle(configs)
+    for cfg in configs[:limit]:
+        n_head, head_dim, block_size, topk, n_seq, cur, delta = cfg
+        cur_list = [cur] * n_seq
+        q, kv, weight, bt, sl, cl, tk, _, _ = _make_case(
+            rng, n_head, head_dim, block_size, topk, n_seq, cur_list, [delta] * n_seq
+        )
+        yield cfg, q, kv, weight, bt, sl, cl, tk
+
+
+def _run_kutacc_topk(q, kv, weight, bt, sl, cl, tk, output_coord):
+    out = torch.full((q.shape[0], tk), -1, dtype=torch.int32)
+    max_k_end = int(sl.max())
+    ws_bytes = int(_sgl_kernel.get_paged_mqa_logits_topk_workspace_size(max_k_end))
+    workspace = torch.empty(ws_bytes, dtype=torch.uint8)
+    _sgl_kernel.paged_mqa_logits_topk_kunpeng(
+        q, kv, weight, bt, sl, cl, out, workspace, tk, output_coord
+    )
+    return out
+
+
+def test_kutacc_matches_cpu():
+    """kSlot coordinate (historical default): strict elementwise equality."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    for cfg, q, kv, weight, bt, sl, cl, tk in _iter_random_kutacc_cases():
+        cpu = paged_mqa_logits_topk_cpu(
+            q, kv, weight, bt, sl, cl, tk, output_coord=OUTPUT_COORD_SLOT
+        )
+        out = _run_kutacc_topk(q, kv, weight, bt, sl, cl, tk, OUTPUT_COORD_SLOT)
+        assert out.tolist() == cpu.tolist(), (
+            f"kutacc(slot) != cpu (strict order) cfg={cfg}: {out} vs {cpu}"
+        )
+
+
+def test_kutacc_matches_cpu_position():
+    """kPosition coordinate -- the forward_cpu production path (decode feeds
+    dsa_topk_slots_kunpeng, prefill feeds the sparse prefill kernel):
+    strict elementwise equality against the CPU golden in-sequence positions.
+    """
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    for cfg, q, kv, weight, bt, sl, cl, tk in _iter_random_kutacc_cases():
+        cpu = paged_mqa_logits_topk_cpu(
+            q, kv, weight, bt, sl, cl, tk, output_coord=OUTPUT_COORD_POSITION
+        )
+        out = _run_kutacc_topk(q, kv, weight, bt, sl, cl, tk, OUTPUT_COORD_POSITION)
+        assert out.tolist() == cpu.tolist(), (
+            f"kutacc(position) != cpu (strict order) cfg={cfg}: {out} vs {cpu}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# C. KunpengNSATokenToKVPool index-K buffers
+# ---------------------------------------------------------------------------
+
+def _bare_pool(buffers):
+    """Bypass __init__ (no main-pool allocation); hand-write the buffers."""
+    pool = object.__new__(KunpengNSATokenToKVPool)
+    pool.index_k_buffer = buffers
+    pool.layer_transfer_counter = None
+    pool.start_layer = 0
+    return pool
+
+
+def test_kunpeng_index_k_pool():
+    if not _HAVE_POOL:
+        print("  [skip] memory_pool_kunpeng not importable")
+        return
+    buf = torch.zeros(8, 4, dtype=torch.bfloat16)
+    pool = _bare_pool([buf])
+    k = torch.randn(3, 4, dtype=torch.bfloat16)
+    pool.set_index_k_buffer(0, torch.tensor([7, 0, 3]), k)
+    assert torch.equal(buf[7], k[0]) and torch.equal(buf[0], k[1]) and torch.equal(buf[3], k[2])
+    assert torch.equal(pool.get_index_k_buffer(0), buf)
+    # loc = -1 rows are skipped entirely (no wraparound write to buf[-1]).
+    zero = torch.zeros(4, dtype=torch.bfloat16)
+    buf2 = torch.zeros(4, 4, dtype=torch.bfloat16)
+    pool2 = _bare_pool([buf2])
+    k2 = torch.randn(2, 4, dtype=torch.bfloat16)
+    pool2.set_index_k_buffer(0, torch.tensor([-1, 2]), k2)
+    assert torch.equal(buf2[2], k2[1]), "valid loc row must be written"
+    assert torch.equal(buf2[3], zero), "loc=-1 must not wraparound-write buf[-1]"
+    assert torch.equal(buf2[0], zero) and torch.equal(buf2[1], zero), (
+        "loc=-1 must not pollute other rows"
+    )
+
+
+def test_kunpeng_index_k_pool_skip():
+    if not _HAVE_POOL:
+        print("  [skip] memory_pool_kunpeng not importable")
+        return
+    full = torch.zeros(4, 4, dtype=torch.bfloat16)
+    pool = _bare_pool([full, None, full.clone()])
+    pool.skip_topk_layers = [False, True, False]
+    k = torch.randn(1, 4, dtype=torch.bfloat16)
+    pool.set_index_k_buffer(0, torch.tensor([1]), k)
+    assert torch.equal(pool.get_index_k_buffer(0)[1], k[0])
+    for fn in (
+        lambda: pool.set_index_k_buffer(1, torch.tensor([0]), k),
+        lambda: pool.get_index_k_buffer(1),
+    ):
+        try:
+            fn()
+            raise AssertionError("shared layer must raise RuntimeError")
+        except RuntimeError:
+            pass
+    assert pool.get_index_k_size_bytes() == 2 * full.numel() * full.element_size()
+
+
+def test_kunpeng_index_k_pool_default_allocates_all():
+    if not _HAVE_POOL:
+        print("  [skip] memory_pool_kunpeng not importable")
+        return
+    try:
+        pool = KunpengNSATokenToKVPool(
+            size=4, page_size=1, dtype=torch.bfloat16,
+            kv_lora_rank=8, qk_rope_head_dim=4, layer_num=3, device="cpu",
+            enable_memory_saver=False, index_head_dim=4,
+        )
+    except Exception:
+        print("  [skip] pool allocation unsupported in this environment")
+        return
+    assert len(pool.index_k_buffer) == 3
+    assert all(b is not None for b in pool.index_k_buffer)
+
+
+def test_kunpeng_index_k_pool_length_mismatch():
+    if not _HAVE_POOL:
+        print("  [skip] memory_pool_kunpeng not importable")
+        return
+    try:
+        KunpengNSATokenToKVPool(
+            size=4, page_size=1, dtype=torch.bfloat16,
+            kv_lora_rank=8, qk_rope_head_dim=4, layer_num=3, device="cpu",
+            enable_memory_saver=False, index_head_dim=4,
+            skip_topk_layers=[True, False],
+        )
+    except AssertionError as e:
+        assert "skip_topk_layers" in str(e), str(e)
+        return
+    except Exception:
+        print("  [skip] pool allocation unsupported in this environment")
+        return
+    raise AssertionError("length mismatch must raise AssertionError")
+
+
+# ---------------------------------------------------------------------------
+# D. dsa_layer_skips_topk scheduling (pure python)
+# ---------------------------------------------------------------------------
+
+_GL53_LAYERS = 78
+# GLM-5.3: full layers {0,1,2,6,10,...,74} (21), the rest shared.
+_GL53_FULL = sorted({0, 1, 2} | {l for l in range(6, 75, 4)})
+
+
+def _glm53_config(**extra):
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLM"],
+        index_topk=2048,
+        num_hidden_layers=_GL53_LAYERS,
+        indexer_types=["full" if l in _GL53_FULL else "shared" for l in range(_GL53_LAYERS)],
+    )
+    for k, v in extra.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _skips_by_types(cfg):
+    return [cfg.indexer_types[l] == "shared" for l in range(cfg.num_hidden_layers)]
+
+
+def test_dsa_layer_skips_topk():
+    assert _HAVE_MODEL_CONFIG
+    cfg = _glm53_config()
+    assert _is_nsa(cfg)
+    skips = [dsa_layer_skips_topk(cfg, l) for l in range(_GL53_LAYERS)]
+    # (a) matches the GLM-5.3 schedule; (b) 57 shared / 21 full.
+    assert skips == _skips_by_types(cfg)
+    assert sum(skips) == 57 and sum(1 for s in skips if not s) == 21
+    # (c) pattern form agrees with indexer_types.
+    cfg2 = _glm53_config()
+    del cfg2.indexer_types
+    cfg2.index_topk_pattern = "".join("S" if s else "F" for s in skips)
+    assert [dsa_layer_skips_topk(cfg2, l) for l in range(_GL53_LAYERS)] == skips
+    # (d) freq=4 + offset=3 derivation agrees layer by layer.
+    cfg3 = _glm53_config()
+    del cfg3.indexer_types
+    cfg3.index_topk_freq = 4
+    cfg3.index_skip_topk_offset = 3
+    assert [dsa_layer_skips_topk(cfg3, l) for l in range(_GL53_LAYERS)] == skips
+    # (e) no offset degrades to max(l-1,0) % freq.
+    cfg3.index_skip_topk_offset = None
+    assert [dsa_layer_skips_topk(cfg3, l) for l in range(_GL53_LAYERS)] == [
+        max(l - 1, 0) % 4 != 0 for l in range(_GL53_LAYERS)
+    ]
+    # (f) freq=1 -> all full.
+    cfg3.index_topk_freq = 1
+    assert not any(dsa_layer_skips_topk(cfg3, l) for l in range(_GL53_LAYERS))
+    # (g) count_indexer_layers agrees.
+    assert count_indexer_layers(cfg) == 21
+
+
+def test_dsa_layer_skips_topk_priority():
+    assert _HAVE_MODEL_CONFIG
+    # indexer_types wins over pattern / freq.
+    cfg = _glm53_config()
+    cfg.index_topk_pattern = "S" * _GL53_LAYERS
+    cfg.index_topk_freq = 1
+    assert [dsa_layer_skips_topk(cfg, l) for l in range(_GL53_LAYERS)] == _skips_by_types(cfg)
+
+
+def test_dsa_layer_skips_topk_pattern():
+    assert _HAVE_MODEL_CONFIG
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLM"], index_topk=2048,
+        num_hidden_layers=8, index_topk_pattern="SFSF",
+    )
+    assert [dsa_layer_skips_topk(cfg, l) for l in range(4)] == [True, False, True, False]
+    # Out-of-range layer ids are full (no skip).
+    assert dsa_layer_skips_topk(cfg, 4) is False
+    assert dsa_layer_skips_topk(cfg, 99) is False
+
+
+def test_dsa_layer_skips_topk_cli_factor():
+    assert _HAVE_MODEL_CONFIG
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLM"], index_topk=2048,
+        num_hidden_layers=8, cli_factor=3,
+    )
+    assert [dsa_layer_skips_topk(cfg, l) for l in range(6)] == [
+        l % 3 != 0 for l in range(6)
+    ]
+
+
+def test_dsa_layer_skips_topk_edges():
+    assert _HAVE_MODEL_CONFIG
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLM"], index_topk=2048,
+        num_hidden_layers=4, indexer_types=[],
+    )
+    assert dsa_layer_skips_topk(cfg, 0) is False  # empty types -> full
+    assert dsa_layer_skips_topk(cfg, -1) is False  # negative -> full
+    cfg_all = SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLM"], index_topk=2048,
+        num_hidden_layers=4, indexer_types=["full"] * 4,
+    )
+    assert not any(dsa_layer_skips_topk(cfg_all, l) for l in range(4))
+
+
+def test_dsa_layer_skips_topk_asserts():
+    assert _HAVE_MODEL_CONFIG
+    from types import SimpleNamespace
+
+    for bad in ({"index_topk_freq": 0}, {"cli_factor": 0}):
+        cfg = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048,
+            num_hidden_layers=4, **bad,
+        )
+        try:
+            dsa_layer_skips_topk(cfg, 1)
+            raise AssertionError(f"{bad} must raise AssertionError")
+        except AssertionError as e:
+            if "must be positive" not in str(e):
+                raise
+
+
+def test_count_indexer_layers_ranges():
+    assert _HAVE_MODEL_CONFIG
+    cfg = _glm53_config()
+    assert count_indexer_layers(cfg) == 21
+    assert count_indexer_layers(cfg, 0, 6) == 3
+    assert count_indexer_layers(cfg, 3, 6) == 0
+    assert count_indexer_layers(cfg, 6, 10) == 1
+    assert count_indexer_layers(cfg, 0, None) == 21
+
+
+def test_skip_topk_chain():
+    """Mirror the layer-to-layer skip_topk propagation."""
+    assert _HAVE_MODEL_CONFIG
+    cfg = _glm53_config()
+    carried = None
+    last_full = None
+    full_count = 0
+    for l in range(_GL53_LAYERS):
+        skip = dsa_layer_skips_topk(cfg, l)
+        if not skip:
+            carried = f"topk_L{l}"  # a fresh object
+            last_full = carried
+            full_count += 1
+        else:
+            assert carried is last_full, f"layer {l}: shared must reuse carried topk"
+        next_skip = dsa_layer_skips_topk(cfg, l + 1)
+        if not next_skip:
+            carried = None
+    assert full_count == 21
+    # The MTP layer id (== num_hidden_layers) is out of range -> full.
+    assert dsa_layer_skips_topk(cfg, _GL53_LAYERS) is False
+
+
+# ---------------------------------------------------------------------------
+# E. MTP cross-iteration top-k share (IndexTopKShareState)
+# ---------------------------------------------------------------------------
+
+try:
+    from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+
+    _HAVE_TOPK_SHARE = True
+except Exception:
+    _HAVE_TOPK_SHARE = False
+
+
+def test_index_topk_share():
+    """Carry semantics: enter sets the reuse gate and clears the seed; step 0
+    sees None (recompute), update+publish writes the carry back, step>=1
+    reads the same object; publish is idempotent; exit clears both; the
+    disabled path is a no-op."""
+    if not _HAVE_TOPK_SHARE:
+        print("  [skip] index_topk_share not importable")
+        return
+    from types import SimpleNamespace
+
+    spec_info = SimpleNamespace(dsa_topk_indices=None)
+    forward_batch = SimpleNamespace(
+        spec_info=spec_info, reuse_dsa_topk_indices=False
+    )
+
+    with IndexTopKShareState.mtp_iteration(forward_batch, enabled=True) as share:
+        assert forward_batch.reuse_dsa_topk_indices is True
+        assert share.topk_indices is None  # step 0 has no seed -> recompute
+        step0 = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+        share.update(step0)
+        share.publish()
+        assert spec_info.dsa_topk_indices is step0
+        # step 1 reads the carried top-k back; republishing is idempotent.
+        share1 = IndexTopKShareState.from_mtp_carry(forward_batch)
+        assert share1.topk_indices is step0
+        share1.update(step0)
+        share1.publish()
+        assert spec_info.dsa_topk_indices is step0
+
+    assert forward_batch.reuse_dsa_topk_indices is False
+    assert spec_info.dsa_topk_indices is None
+
+    # Disabled path is a no-op and does not touch the carry.
+    with IndexTopKShareState.mtp_iteration(forward_batch, enabled=False) as share:
+        assert share is None
+        assert forward_batch.reuse_dsa_topk_indices is False
+        assert spec_info.dsa_topk_indices is None
+
+
+# ---------------------------------------------------------------------------
+# F. DSA sparse prefill attention (M6) + workspace-size contracts
+# ---------------------------------------------------------------------------
+
+def _ref_sparse_prefill(q, k, v, indices, query_start_loc, key_start_loc, softmax_scale):
+    """fp32 reference: per-query softmax over the listed KV positions.
+
+    indices hold in-sequence positions (-1 padded); the owning sequence's KV
+    row is key_start_loc[b] + pos. Attention is per head over the selected
+    positions (MHA: v has its own feature dim).
+    """
+    Tq, H, _ = q.shape
+    out = torch.zeros(Tq, H, v.shape[2], dtype=torch.float32)
+    for b in range(query_start_loc.numel() - 1):
+        q0, q1 = int(query_start_loc[b]), int(query_start_loc[b + 1])
+        ks = int(key_start_loc[b])
+        for ti in range(q0, q1):
+            pos = [int(x) for x in indices[ti] if int(x) >= 0]
+            if not pos:
+                continue
+            rows = torch.tensor(pos, dtype=torch.long)
+            krows = k[ks + rows].float()  # [P, H, Dqk]
+            logits = torch.einsum("hd,phd->ph", q[ti].float(), krows) * softmax_scale
+            probs = torch.softmax(logits, dim=0)  # over positions, per head
+            vrows = v[ks + rows].float()  # [P, H, Dv]
+            out[ti] = torch.einsum("ph,phd->hd", probs, vrows)
+    return out
+
+
+def test_sparse_prefill_matches_reference():
+    """flash_attention_sparse_prefill_kunpeng vs an fp32 reference.
+
+    Two ragged sequences (pure extend + chunked with prefix) and two index
+    sets: full selection (== dense causal) and a partial (true sparse)
+    subset -- the latter catches "selected the wrong positions" bugs that a
+    full selection would hide.
+
+    NOTE: the glm5 absorbed-prefill branch dropped this MHA-form op (prefill
+    runs the absorbed MLA sparse path instead), so the case skips when the
+    op is absent.
+    """
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (sparse prefill)")
+        return
+    if not hasattr(_sgl_kernel, "flash_attention_sparse_prefill_kunpeng"):
+        print("  [skip] flash_attention_sparse_prefill_kunpeng not available")
+        return
+    rng = random.Random(3)
+    H, Dqk, Dv = 2, 8, 4  # Dv != Dqk exercises the MHA v-dim path
+    q_lens = [3, 2]
+    prefix_lens = [0, 2]
+    kv_lens = [p + q for p, q in zip(prefix_lens, q_lens)]
+    Tq, Tk = sum(q_lens), sum(kv_lens)
+    q = torch.randn(Tq, H, Dqk, dtype=torch.bfloat16) * 0.5
+    k = torch.randn(Tk, H, Dqk, dtype=torch.bfloat16) * 0.5
+    v = torch.randn(Tk, H, Dv, dtype=torch.bfloat16) * 0.5
+    query_start_loc = torch.tensor([0, q_lens[0], Tq], dtype=torch.int32)
+    key_start_loc = torch.tensor([0, kv_lens[0], Tk], dtype=torch.int32)
+    softmax_scale = 1.0 / (Dqk**0.5)
+    topk = max(kv_lens)
+
+    for mode in ("full", "partial"):
+        # Compact valid prefix, -1 padding (the indexer output contract).
+        indices = torch.full((Tq, topk), -1, dtype=torch.int32)
+        for b in range(len(q_lens)):
+            for r in range(q_lens[b]):
+                ti = int(query_start_loc[b]) + r
+                k_end = prefix_lens[b] + r + 1  # visible positions [0, k_end)
+                if mode == "full":
+                    sel = list(range(k_end))
+                else:
+                    n = min(k_end, max(1, topk // 2))
+                    sel = sorted(rng.sample(range(k_end), n))
+                indices[ti, : len(sel)] = torch.tensor(sel, dtype=torch.int32)
+
+        out = torch.empty(Tq, H, Dv, dtype=torch.bfloat16)
+        ws_bytes = int(_sgl_kernel.flash_attention_sparse_prefill_workspace_size_kunpeng(Dv))
+        workspace = torch.empty(ws_bytes, dtype=torch.uint8)
+        _sgl_kernel.flash_attention_sparse_prefill_kunpeng(
+            q, k, v, indices, None, out, None, workspace, True, softmax_scale,
+            query_start_loc, key_start_loc, None,
+        )
+        ref = _ref_sparse_prefill(
+            q, k, v, indices, query_start_loc, key_start_loc, softmax_scale
+        )
+        diff = (out.float() - ref).abs().max().item()
+        assert torch.allclose(out.float(), ref, atol=2e-2, rtol=2e-2), (
+            f"sparse prefill mismatch ({mode}): max|diff|={diff}"
+        )
+
+
+def test_workspace_helpers():
+    """Workspace-size helpers must match their documented byte contracts.
+
+    The paged_mqa_logits_topk contract is always checked; the MHA sparse
+    prefill helper is only checked when its operator exists (absent on the
+    glm5 absorbed-prefill branch).
+    """
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (workspace helpers)")
+        return
+    n = int(torch.ops.sgl_kernel.get_flash_attention_thread_num())
+    assert n > 0
+    for max_k_end in (1, 1234):
+        # n_threads * max_k_end * sizeof(pair<float,int>) (8 bytes)
+        assert int(_sgl_kernel.get_paged_mqa_logits_topk_workspace_size(max_k_end)) == n * max_k_end * 8
+    if not hasattr(_sgl_kernel, "flash_attention_sparse_prefill_workspace_size_kunpeng"):
+        print("  [skip] sparse-prefill workspace helper not available")
+        return
+    for dv in (1, 4, 128):
+        # one fp32 accumulator row per worker thread, 64-byte aligned
+        row = (dv * 4 + 63) // 64 * 64
+        assert int(_sgl_kernel.flash_attention_sparse_prefill_workspace_size_kunpeng(dv)) == row * n
+
+
+# ---------------------------------------------------------------------------
+# G. indexer scoring view (power-of-2 padding / all2all slice alignment)
+# ---------------------------------------------------------------------------
+
+try:
+    from types import SimpleNamespace
+
+    from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_cpu_backend import (
+        KunpengCpuBackend,
+        KunpengCpuMetadata,
+    )
+
+    _HAVE_BACKEND = True
+except Exception:
+    _HAVE_BACKEND = False
+
+
+def _bare_backend():
+    """Bypass __init__ (no model runner / swap manager); hand-set fields."""
+    backend = object.__new__(KunpengCpuBackend)
+    backend._nsa_enabled = True
+    backend.forward_metadata = KunpengCpuMetadata()
+    return backend
+
+
+def _prefill_meta(seq_lens, extend_lens):
+    meta = KunpengCpuMetadata()
+    bs = len(seq_lens)
+    meta.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    meta.extend_seq_lens = torch.tensor(extend_lens, dtype=torch.int32)
+    meta.block_table = torch.zeros(bs, 4, dtype=torch.int32)
+    return meta
+
+
+def test_indexer_prefill_view_padding():
+    """Power-of-2/TP padding rows go to a VIRTUAL sequence (seq_len 0),
+    never into a real sequence's cur_lens (which would shrink its causal
+    window); sum(cur_lens) == padded q rows."""
+    if not _HAVE_BACKEND:
+        print("  [skip] kunpeng_cpu_backend not importable")
+        return
+    backend = _bare_backend()
+    meta = _prefill_meta([5, 12, 7], [3, 5, 0])
+    backend._set_indexer_prefill_view(
+        meta, SimpleNamespace(input_ids=torch.zeros(16, dtype=torch.int64))
+    )
+    # virtual padding sequence appended: [3, 5, 0, 8], sum == 16 rows
+    assert meta.indexer_cur_lens.tolist() == [3, 5, 0, 8]
+    assert meta.indexer_seq_lens.tolist() == [5, 12, 7, 0]
+    assert meta.indexer_batch_size == 4
+    assert meta.indexer_token_slice_start == 0
+    assert meta.indexer_token_rows == 16
+    assert meta.indexer_block_table.shape == (4, 4)
+    assert int(meta.indexer_cur_lens.sum()) == 16
+    # real sequences' cur_lens unchanged (causal windows intact)
+    assert meta.indexer_cur_lens[:3].tolist() == [3, 5, 0]
+    # base metadata fields are NOT mutated
+    assert meta.extend_seq_lens.tolist() == [3, 5, 0]
+    assert meta.seq_lens.shape[0] == 3
+
+    # no padding -> view aliases the base tensors, no virtual sequence
+    meta2 = _prefill_meta([9], [9])
+    backend._set_indexer_prefill_view(
+        meta2, SimpleNamespace(input_ids=torch.zeros(9, dtype=torch.int64))
+    )
+    assert meta2.indexer_cur_lens.tolist() == [9]
+    assert meta2.indexer_seq_lens is meta2.seq_lens
+    assert meta2.indexer_block_table is meta2.block_table
+    assert meta2.indexer_token_rows == 9
+
+    # nsa disabled -> no view at all
+    backend._nsa_enabled = False
+    meta3 = _prefill_meta([9], [9])
+    backend._set_indexer_prefill_view(
+        meta3, SimpleNamespace(input_ids=torch.zeros(9, dtype=torch.int64))
+    )
+    assert meta3.indexer_seq_lens is None
+
+
+def test_indexer_prefill_view_scoring():
+    """With the virtual-sequence view, real query rows score IDENTICALLY to
+    the unpadded run and the padding rows emit all -1 (golden kernel)."""
+    rng = random.Random(11)
+    (
+        q,
+        kv,
+        weight,
+        block_tables,
+        seq_lens_t,
+        cur_lens_t,
+        topk,
+        _seq,
+        _cur,
+    ) = _make_case(rng, 2, 4, 2, 3, 2, [2, 3], [4, 2])
+    live = q.shape[0]
+    pad = 3
+    q_padded = torch.cat(
+        [q, torch.randn(pad, *q.shape[1:], dtype=q.dtype) * 0.5]
+    )
+    w_padded = torch.cat(
+        [weight, torch.randn(pad, weight.shape[1], dtype=weight.dtype) * 0.5]
+    )
+
+    view_cur = torch.cat([cur_lens_t, torch.tensor([pad], dtype=torch.int32)])
+    view_seq = torch.cat([seq_lens_t, torch.tensor([0], dtype=torch.int32)])
+    view_bt = torch.cat(
+        [block_tables, torch.zeros(1, block_tables.shape[1], dtype=torch.int32)]
+    )
+
+    out = paged_mqa_logits_topk_cpu(
+        q_padded,
+        kv,
+        w_padded,
+        view_bt,
+        view_seq,
+        view_cur,
+        topk,
+        output_coord=OUTPUT_COORD_POSITION,
+    )
+    ref = paged_mqa_logits_topk_cpu(
+        q,
+        kv,
+        weight,
+        block_tables,
+        seq_lens_t,
+        cur_lens_t,
+        topk,
+        output_coord=OUTPUT_COORD_POSITION,
+    )
+    assert torch.equal(out[:live], ref)
+    assert torch.equal(out[live:], torch.full((pad, topk), -1, dtype=torch.int32))
+
+
+def test_indexer_decode_view_scoring():
+    """Decode all2all view (this rank's Btp sequence slice; q/weight rows
+    sliced by token_slice_start into the full output buffer) scores
+    identically to the full-batch run restricted to the same rows; the
+    non-owned rows keep -1 in the full buffer."""
+    rng = random.Random(7)
+    (
+        q,
+        kv,
+        weight,
+        block_tables,
+        seq_lens_t,
+        cur_lens_t,
+        topk,
+        _seq,
+        _cur,
+    ) = _make_case(rng, 2, 4, 2, 3, 4, [1, 1, 1, 1], [3, 1, 5, 2])
+    full = paged_mqa_logits_topk_cpu(
+        q,
+        kv,
+        weight,
+        block_tables,
+        seq_lens_t,
+        cur_lens_t,
+        topk,
+        output_coord=OUTPUT_COORD_POSITION,
+    )
+    # rank 1 of a 2-way all2all over 4 decode sequences: rows [2:4]
+    start, rows = 2, 2
+    out = torch.full((4, topk), -1, dtype=torch.int32)
+    paged_mqa_logits_topk_cpu(
+        q[start : start + rows],
+        kv,
+        weight[start : start + rows],
+        block_tables[start:],
+        seq_lens_t[start:],
+        cur_lens_t[start:],
+        topk,
+        out=out[start : start + rows],
+        output_coord=OUTPUT_COORD_POSITION,
+    )
+    assert torch.equal(out[start:], full[start:])
+    assert torch.equal(
+        out[:start], torch.full((start, topk), -1, dtype=torch.int32)
+    )
+
+
+# ---------------------------------------------------------------------------
+# H. MTP indexer views (verify / draft-extend) + fused MTP primitives
+# ---------------------------------------------------------------------------
+
+try:
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    _HAVE_FORWARD_MODE = True
+except Exception:
+    _HAVE_FORWARD_MODE = False
+
+
+def test_indexer_verify_view():
+    """TARGET_VERIFY view: uniform nv rows per sequence; the flat query-row
+    offset is ts * nv and the view covers exactly Btp * nv rows."""
+    if not (_HAVE_BACKEND and _HAVE_FORWARD_MODE):
+        print("  [skip] kunpeng_cpu_backend / ForwardMode not importable")
+        return
+    backend = _bare_backend()
+    backend.speculative_num_draft_tokens = 3
+    meta = backend.forward_metadata
+    meta.all2all_size = 2
+    meta.batchsize_per_tp = 4
+    meta.token_slice_start = 4  # rank 1 of 2 over a padded batch of 8
+    meta.seq_lens = torch.tensor(
+        [10, 12, 9, 11, 8, 13, 7, 10], dtype=torch.int32
+    )
+    meta.block_table = torch.zeros(8, 4, dtype=torch.int32)
+    fb = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY, extend_seq_lens=None)
+    backend._set_indexer_decode_view(meta, fb, meta.seq_lens[4:], 3)
+    assert meta.indexer_seq_lens.tolist() == [8, 13, 7, 10]
+    assert meta.indexer_cur_lens.tolist() == [3, 3, 3, 3]
+    assert meta.indexer_token_slice_start == 12  # ts * nv
+    assert meta.indexer_token_rows == 12  # Btp * nv
+    assert meta.indexer_batch_size == 4
+    assert meta.indexer_block_table is meta.block_table
+
+
+def test_indexer_draft_extend_view():
+    """DRAFT_EXTEND view: ragged rows; the flat row offset is the cumsum
+    prefix of the FULL extend_seq_lens (the metadata copy is already
+    all2all-sliced); token-level padding rows are simply not fed."""
+    if not (_HAVE_BACKEND and _HAVE_FORWARD_MODE):
+        print("  [skip] kunpeng_cpu_backend / ForwardMode not importable")
+        return
+    backend = _bare_backend()
+    backend.speculative_num_draft_tokens = 3
+    meta = backend.forward_metadata
+    meta.all2all_size = 2
+    meta.batchsize_per_tp = 2
+    meta.token_slice_start = 2  # rank 1 of 2 over 4 sequences
+    meta.seq_lens = torch.tensor([9, 10], dtype=torch.int32)
+    meta.block_table = torch.zeros(2, 4, dtype=torch.int32)
+    meta.extend_seq_lens = torch.tensor([2, 1], dtype=torch.int32)  # sliced
+    fb = SimpleNamespace(
+        forward_mode=ForwardMode.DRAFT_EXTEND,
+        extend_seq_lens=torch.tensor([1, 3, 2, 1], dtype=torch.int32),  # full
+    )
+    backend._set_indexer_decode_view(meta, fb, meta.seq_lens, 3)
+    assert meta.indexer_cur_lens.tolist() == [2, 1]
+    assert meta.indexer_token_slice_start == 4  # cumsum(full[:2]) == 1+3
+    assert meta.indexer_token_rows == 3  # sum(sliced) == 2+1
+    assert meta.indexer_batch_size == 2
+
+    # decode / verify modes never touch the view for a draft-extend batch
+    # and vice versa; seqlen_q mismatch leaves the view unset. A FRESH
+    # metadata object mirrors init_forward_metadata's per-forward reset
+    # (the view fields start as None), so the mismatch return is observable.
+    meta2 = KunpengCpuMetadata()
+    meta2.all2all_size = 1
+    meta2.batchsize_per_tp = 4
+    meta2.token_slice_start = 0
+    meta2.seq_lens = torch.ones(4, dtype=torch.int32)
+    meta2.block_table = torch.zeros(4, 4, dtype=torch.int32)
+    fb2 = SimpleNamespace(forward_mode=ForwardMode.DECODE, extend_seq_lens=None)
+    backend._set_indexer_decode_view(meta2, fb2, meta2.seq_lens, 3)
+    assert meta2.indexer_seq_lens is None
+
+
+def test_indexer_draft_extend_view_scoring():
+    """The draft-extend view slice (ragged rows, cumsum offset) scores
+    identically to the full-batch run restricted to the same rows."""
+    rng = random.Random(5)
+    (
+        q,
+        kv,
+        weight,
+        block_tables,
+        seq_lens_t,
+        cur_lens_t,
+        topk,
+        _seq,
+        _cur,
+    ) = _make_case(rng, 2, 4, 2, 3, 4, [1, 3, 2, 1], [4, 2, 5, 3])
+    full = paged_mqa_logits_topk_cpu(
+        q,
+        kv,
+        weight,
+        block_tables,
+        seq_lens_t,
+        cur_lens_t,
+        topk,
+        output_coord=OUTPUT_COORD_POSITION,
+    )
+    # rank 1 of a 2-way all2all over 4 sequences: start = cumsum([1, 3]) = 4,
+    # rows = 2 + 1 = 3; the view's block_table/seq_lens are the [2:] slice.
+    start, rows = 4, 3
+    out = torch.full((q.shape[0], topk), -1, dtype=torch.int32)
+    paged_mqa_logits_topk_cpu(
+        q[start : start + rows],
+        kv,
+        weight[start : start + rows],
+        block_tables[2:],
+        seq_lens_t[2:],
+        cur_lens_t[2:],
+        topk,
+        out=out[start : start + rows],
+        output_coord=OUTPUT_COORD_POSITION,
+    )
+    assert torch.equal(out[start:], full[start:])
+    assert torch.equal(
+        out[:start], torch.full((start, topk), -1, dtype=torch.int32)
+    )
+
+
+def test_dsa_topk_slots_mtp():
+    """dsa_topk_slots_kunpeng with [B_full, nv, topk] indices (MTP): per-row
+    slot mapping with -1 tail compaction and per-sequence MAX valid
+    topk_length; row_start selects this rank's sequence blocks."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (dsa_topk_slots MTP)")
+        return
+    rng = random.Random(9)
+    bs_full, nv, topk, page, max_blocks = 4, 3, 5, 2, 4
+    seq_lens = [7, 4, 6, 5]
+    block_table = torch.zeros(bs_full, max_blocks, dtype=torch.int32)
+    pages = list(range(bs_full * max_blocks))
+    rng.shuffle(pages)
+    for b in range(bs_full):
+        block_table[b] = torch.tensor(
+            pages[b * max_blocks : (b + 1) * max_blocks], dtype=torch.int32
+        )
+    # Per-row causal windows: row j sees positions [0, seq - nv + j].
+    topk_indices = torch.full((bs_full, nv, topk), -1, dtype=torch.int32)
+    for b in range(bs_full):
+        for j in range(nv):
+            k_end = seq_lens[b] - nv + j + 1
+            n = min(topk, k_end)
+            sel = sorted(rng.sample(range(k_end), n))
+            topk_indices[b, j, :n] = torch.tensor(sel, dtype=torch.int32)
+
+    # rank 1 of a 2-way split: its block_table/seq_lens cover sequences [2:],
+    # row_start = 2 selects those blocks in the full [B_full, nv, topk] input.
+    slots = torch.empty((2, nv, topk), dtype=torch.int32)
+    topk_length = torch.empty((2,), dtype=torch.int32)
+    _sgl_kernel.dsa_topk_slots_kunpeng(
+        block_table[2:],
+        topk_indices,
+        torch.tensor(seq_lens[2:], dtype=torch.int32),
+        page,
+        2,  # row_start
+        slots,
+        topk_length,
+    )
+    for b in range(2):
+        best = 0
+        for j in range(nv):
+            row = []
+            for i in range(topk):
+                pos = int(topk_indices[2 + b, j, i])
+                if pos < 0 or pos >= seq_lens[2 + b]:
+                    continue
+                row.append(
+                    int(block_table[2 + b, pos // page]) * page + pos % page
+                )
+            assert torch.equal(
+                slots[b, j, : len(row)],
+                torch.tensor(row, dtype=torch.int32),
+            )
+            assert torch.equal(
+                slots[b, j, len(row) :],
+                torch.full((topk - len(row),), -1, dtype=torch.int32),
+            )
+            best = max(best, len(row))
+        assert int(topk_length[b]) == best
+
+
+def test_pad_q_left_fill_indices():
+    """pad_q_left_mtp_kunpeng fill semantics: the WHOLE dst is filled, then
+    the real rows land right-aligned per sequence (int32 indices pad -1;
+    bf16 q pads 0)."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (pad_q_left fill)")
+        return
+    ext = torch.tensor([2, 0, 3], dtype=torch.int32)  # bs=3, T=5
+    topk = 2
+    src = (torch.arange(5 * topk, dtype=torch.int32) - 100).view(5, topk)
+    dst = torch.empty(3, 3, topk, dtype=torch.int32)
+    _sgl_kernel.pad_q_left_mtp_kunpeng(src, ext, dst, -1)
+    ref = torch.full((3, 3, topk), -1, dtype=torch.int32)
+    ref[0, 1:] = src[0:2]
+    ref[2] = src[2:5]
+    assert torch.equal(dst, ref)
+
+    # bf16 3D path with fill 0 (the q pad default).
+    q = torch.randn(5, 2, 3, dtype=torch.bfloat16)
+    q_dst = torch.empty(3, 3, 2, 3, dtype=torch.bfloat16)
+    _sgl_kernel.pad_q_left_mtp_kunpeng(q, ext, q_dst, 0)
+    assert torch.equal(q_dst[0, 1:], q[0:2])
+    assert torch.equal(q_dst[2], q[2:5])
+    assert torch.equal(q_dst[0, 0], torch.zeros(2, 3, dtype=torch.bfloat16))
+    assert torch.equal(q_dst[1], torch.zeros(3, 2, 3, dtype=torch.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main():
+    tests = [
+        ("A. test_matches_naive", test_matches_naive),
+        ("A. test_relu_is_applied", test_relu_is_applied),
+        ("A. test_tie_break_smaller_slot", test_tie_break_smaller_slot),
+        ("A. test_causal_visibility", test_causal_visibility),
+        ("A. test_slot_list_variant_equivalence", test_slot_list_variant_equivalence),
+        ("A. test_slot_list_variant_varlen", test_slot_list_variant_varlen),
+        ("A. test_topk_length", test_topk_length),
+        ("B. test_kutacc_matches_cpu", test_kutacc_matches_cpu),
+        ("B. test_kutacc_matches_cpu_position", test_kutacc_matches_cpu_position),
+        ("C. test_kunpeng_index_k_pool", test_kunpeng_index_k_pool),
+        ("C. test_kunpeng_index_k_pool_skip", test_kunpeng_index_k_pool_skip),
+        ("C. test_kunpeng_index_k_pool_default_allocates_all", test_kunpeng_index_k_pool_default_allocates_all),
+        ("C. test_kunpeng_index_k_pool_length_mismatch", test_kunpeng_index_k_pool_length_mismatch),
+        ("D. test_dsa_layer_skips_topk", test_dsa_layer_skips_topk),
+        ("D. test_dsa_layer_skips_topk_priority", test_dsa_layer_skips_topk_priority),
+        ("D. test_dsa_layer_skips_topk_pattern", test_dsa_layer_skips_topk_pattern),
+        ("D. test_dsa_layer_skips_topk_cli_factor", test_dsa_layer_skips_topk_cli_factor),
+        ("D. test_dsa_layer_skips_topk_edges", test_dsa_layer_skips_topk_edges),
+        ("D. test_dsa_layer_skips_topk_asserts", test_dsa_layer_skips_topk_asserts),
+        ("D. test_count_indexer_layers_ranges", test_count_indexer_layers_ranges),
+        ("D. test_skip_topk_chain", test_skip_topk_chain),
+        ("E. test_index_topk_share", test_index_topk_share),
+        ("F. test_sparse_prefill_matches_reference", test_sparse_prefill_matches_reference),
+        ("F. test_workspace_helpers", test_workspace_helpers),
+        ("G. test_indexer_prefill_view_padding", test_indexer_prefill_view_padding),
+        ("G. test_indexer_prefill_view_scoring", test_indexer_prefill_view_scoring),
+        ("G. test_indexer_decode_view_scoring", test_indexer_decode_view_scoring),
+        ("H. test_indexer_verify_view", test_indexer_verify_view),
+        ("H. test_indexer_draft_extend_view", test_indexer_draft_extend_view),
+        ("H. test_indexer_draft_extend_view_scoring", test_indexer_draft_extend_view_scoring),
+        ("H. test_dsa_topk_slots_mtp", test_dsa_topk_slots_mtp),
+        ("H. test_pad_q_left_fill_indices", test_pad_q_left_fill_indices),
+    ]
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"[PASS] {name}")
+        except Exception:
+            failed += 1
+            print(f"[FAIL] {name}")
+            traceback.print_exc()
+    print("PASS" if failed == 0 else f"FAILED ({failed})")
+    return failed
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

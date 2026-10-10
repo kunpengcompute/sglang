@@ -33,6 +33,11 @@ if TYPE_CHECKING:
 
 
 _DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
+# DSA (NSA) MTP escape hatch: TARGET_VERIFY / DRAFT_EXTEND fall back to the
+# dense paged path. The indexer still runs on draft-extend (it fills the
+# draft pool's index-K, closing the stale gap) but skips scoring; the
+# decode / prefill sparsity is unaffected.
+_DISABLE_DSA_SPARSE_MTP = envs.SGLANG_KUNPENG_DISABLE_DSA_SPARSE_MTP.get()
 
 
 def _lc_reduce_partial_o(o_rows, lse_rows, b, num_local_heads):
@@ -73,6 +78,24 @@ class DeepseekMLAKunpengForwardMixin:
         )
         self._lc_enabled = is_lc_cp_enabled()
 
+    def should_run_indexer(
+        self: DeepseekV2AttentionMLA,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Whether this layer runs its own indexer vs reusing carried topk.
+
+        Official strict semantics (forward_mla.py). skip_topk (shared) layers
+        carry no indexer weights, so they must reuse the carried topk and
+        never run the indexer. Do NOT widen this to
+        ``or prev_topk_indices is None``: that recomputes whenever
+        cross-layer propagation is unavailable, reintroducing the
+        >index_topk garbling. The is_nextn clause is the sole intentional
+        fallback (the NextN layer has its own weights).
+        """
+        return not getattr(self, "skip_topk", False) or (
+            self.is_nextn and prev_topk_indices is None
+        )
+
     def forward_absorb_prepare_kunpeng(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -94,11 +117,13 @@ class DeepseekMLAKunpengForwardMixin:
             # the separate quant pass inside W8A8Int8LinearMethod.apply.
             q_normed = self.q_a_layernorm(q, quantize=True)
             # DSA (NSA): indexer 选 top-k token 位置 (decode [bs, topk];
-            # verify/draft-extend [bs, n, topk]; -1 padding), 由 backend
-            # 映射为 KV slot. 覆盖 DECODE/IDLE 和非 LC 的 MTP (LC 走 CP
-            # 稀疏路径; absorbed prefill 的 per-row slot 在 backend
-            # metadata 期直接生成, 不走 indexer). CPU 上分派到 920F fake
-            # (全 id).
+            # verify/draft-extend [bs, n, topk]; absorbed prefill 平铺
+            # [flat_rows, topk] slot 坐标流; -1 padding), 由 backend 映射为
+            # KV slot. 覆盖 DECODE/IDLE 和非 LC 的 MTP/absorbed prefill (LC
+            # 走 CP 稀疏路径). CPU 走 920F 真 indexer
+            # (SGLANG_KUNPENG_FAKE_INDEXER 可切回 bring-up fake 做对拍; fake
+            # 下 absorbed prefill 的 per-row slot 在 backend metadata 期由
+            # dsa_prefill_slots_kunpeng 直接生成, 不走 indexer).
             # TODO(kunpeng): 复用 fused quant pass 的 bf16 normed q,
             # 免第二次 layernorm.
             if (
@@ -111,17 +136,31 @@ class DeepseekMLAKunpengForwardMixin:
                         and (
                             forward_batch.forward_mode.is_target_verify()
                             or forward_batch.forward_mode.is_draft_extend()
+                            or (
+                                forward_batch.forward_mode
+                                .is_extend_without_speculative()
+                            )
                         )
                     )
                 )
             ):
-                if not getattr(self, "skip_topk", False) or prev_topk_indices is None:
+                if self.should_run_indexer(prev_topk_indices):
+                    mtp_sparse = (
+                        forward_batch.forward_mode.is_target_verify()
+                        or forward_batch.forward_mode.is_draft_extend()
+                    )
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=self.q_a_layernorm(q),
                         positions=positions,
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
+                        # MTP escape hatch: still fill the index-K cache on
+                        # draft-extend (closing the stale draft index-K gap)
+                        # but skip scoring; consumers fall back to dense.
+                        return_indices=not (
+                            mtp_sparse and _DISABLE_DSA_SPARSE_MTP
+                        ),
                     )
                 else:
                     topk_indices = prev_topk_indices
@@ -384,7 +423,9 @@ class DeepseekMLAKunpengForwardMixin:
             # stream. Rows are independent (per-row topk), so the a2all
             # splits the stream into equal per-rank chunks -- the flat
             # layout IS the chunk layout, no interleave. The kernel runs
-            # decode-shaped on this rank's slice with metadata-time slots.
+            # decode-shaped on this rank's slice with the real-indexer flat
+            # top-k (slot coords; the backend slices this rank's window) or,
+            # on the fake path, the metadata-time slots.
             flat_rows = (
                 forward_batch.attn_backend.forward_metadata.absorbed_flat_rows
             )
@@ -416,7 +457,8 @@ class DeepseekMLAKunpengForwardMixin:
                 self.attn_mqa.tp_q_head_num = self.num_local_heads * all2all_size
                 try:
                     attn_output = self._call_attn_mqa(
-                        q_flat.unsqueeze(1), k, k_nope, forward_batch, None
+                        q_flat.unsqueeze(1), k, k_nope, forward_batch,
+                        topk_indices,
                     )
                 finally:
                     self.attn_mqa.tp_q_head_num = saved_tp_q_head_num
@@ -428,7 +470,7 @@ class DeepseekMLAKunpengForwardMixin:
                 )  # (flat_rows, H_local, D_kv), original row order
             else:
                 attn_output = self._call_attn_mqa(
-                    q_flat.unsqueeze(1), k, k_nope, forward_batch, None
+                    q_flat.unsqueeze(1), k, k_nope, forward_batch, topk_indices
                 )
                 attn_output = attn_output.view(
                     flat_rows, numhead_local_q, self.kv_lora_rank

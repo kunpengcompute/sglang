@@ -1264,6 +1264,7 @@ class DeepseekV2AttentionMLA(
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
