@@ -709,10 +709,14 @@ class KunpengGraphRunner:
                 attn_backend._decode_meta,
             ]
             if meta is not None:
-                if getattr(meta, "absorbed_slots", None) is not None:
-                    # Flat absorbed prefill: per-row slots + valid counts.
-                    inputs.append(meta.absorbed_slots)
+                # Flat absorbed prefill: the per-row valid counts (fake:
+                # exact values; real: the metadata-time upper bound) are
+                # consumed by the sparse sched/kernel on BOTH paths, so
+                # they register independently of the fake-only slots.
+                if getattr(meta, "absorbed_topk_length", None) is not None:
                     inputs.append(meta.absorbed_topk_length)
+                if getattr(meta, "absorbed_slots", None) is not None:
+                    inputs.append(meta.absorbed_slots)
                 inputs.extend([meta.block_table, meta.seq_lens, meta.extend_seq_lens])
                 if self.swap_mgr._blockwise_ddr_block_ids is not None:
                     # Only replace when a block_table entry exists (non-LC
@@ -778,6 +782,22 @@ class KunpengGraphRunner:
                             meta.indexer_block_table,
                         ]
                     )
+            if (
+                absorbed_dsa_prefill
+                and meta is not None
+                and meta.indexer_block_table is not None
+            ):
+                # Real absorbed prefill: the indexer scoring view (built
+                # outside the capture) is consumed by the scoring op
+                # inside; register the SAME views (mirrors the decode /
+                # MTP registration above).
+                inputs.extend(
+                    [
+                        meta.indexer_seq_lens,
+                        meta.indexer_cur_lens,
+                        meta.indexer_block_table,
+                    ]
+                )
             if self.swap_mgr._blockwise_ddr_block_ids is not None:
                 inputs.append(self.swap_mgr._blockwise_ddr_block_ids)
                 inputs.append(self.swap_mgr._blockwise_hbw_block_ids)
@@ -814,6 +834,26 @@ class KunpengGraphRunner:
         fixed = self.graph_fixed_weights[:]
         for kv in self.model_runner.token_to_kv_pool.kv_buffer:
             fixed.append(kv)
+        # DSA real indexer: the index-K pool buffers (allocated separately
+        # from the main kv_buffer by KunpengNSATokenToKVPool) and the
+        # shared max-sized scoring workspace (stable tensor identity, see
+        # KunpengCpuBackend._get_shared_indexer_workspace). The per-layer
+        # indexer weights (wq_b / wk / weights_proj / k_norm) and the
+        # rotary cos_sin caches are already covered by
+        # collect_model_weights.
+        attn_backend = self._resolve_attn_backend(
+            self.model_runner, forward_batch
+        )
+        index_k_buffers = getattr(
+            self.model_runner.token_to_kv_pool, "index_k_buffer", None
+        )
+        if index_k_buffers:
+            for buf in index_k_buffers:
+                if buf is not None:
+                    fixed.append(buf)
+        indexer_ws = getattr(attn_backend, "indexer_workspace", None)
+        if indexer_ws is not None:
+            fixed.append(indexer_ws)
         if self.model_runner.is_draft_worker:
             fixed.extend(
                 [

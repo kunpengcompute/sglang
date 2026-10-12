@@ -908,6 +908,20 @@ def _setup_contiguous_kunpeng():
     register_op('contiguous_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_layernorm_kunpeng():
+    # Standard LayerNorm (weight + bias) over the last dim, wrapping the
+    # existing sgl_kernel layernorm_cpu kernel (bf16 in -> bf16 out, fp32
+    # accumulation inside) so it becomes graph-trackable. weight/bias must
+    # share the input dtype (the caller constructs bf16 params on 920F).
+    def shape_infer(x, weight, bias, eps):
+        return [(x.shape, x.dtype)]
+
+    def eager_fn(x, weight, bias, eps):
+        return torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
+
+    register_op('layernorm_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_repeat_interleave_kunpeng():
     def shape_infer(x, repeats):
         # torch.repeat_interleave(x, repeats) with dim=None flattens then
@@ -1619,6 +1633,7 @@ def setup():
     _setup_kupl_sdma_set_kv_buffer()
     _setup_cat_kunpeng()
     _setup_contiguous_kunpeng()
+    _setup_layernorm_kunpeng()
     _setup_repeat_interleave_kunpeng()
     _setup_set_kv_buffer_kunpeng()
     _setup_set_kv_buffer_2_kunpeng()

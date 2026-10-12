@@ -199,6 +199,22 @@ def kutacc_mha(
     return attn_out[:n_token]
 
 
+# Shared max-sized scratch for the real indexer scoring kernel
+# (paged_mqa_logits_topk_kunpeng): n_threads * max_k_end * 8 bytes with
+# max_k_end bounded by context_len + speculative_num_draft_tokens. One
+# buffer per process -- every backend instance (including the multi-step
+# draft backends) shares it, and the tensor identity must stay stable so
+# the graph capture can register it as a fixed input.
+_INDEXER_WORKSPACE: Optional[torch.Tensor] = None
+
+
+def _get_shared_indexer_workspace(num_bytes: int) -> torch.Tensor:
+    global _INDEXER_WORKSPACE
+    if _INDEXER_WORKSPACE is None or _INDEXER_WORKSPACE.numel() < num_bytes:
+        _INDEXER_WORKSPACE = torch.empty(num_bytes, dtype=torch.uint8)
+    return _INDEXER_WORKSPACE
+
+
 class KunpengCpuMetadata:
     """Metadata for a single forward pass, holding pre-computed tensors reused across layers."""
 
@@ -347,6 +363,17 @@ class KunpengCpuBackend(AttentionBackend):
             get_nsa_index_topk(model_config.hf_config) if self._nsa_enabled else 0
         )
         self._nsa_dense_fallback_warned = False
+        self.indexer_workspace: Optional[torch.Tensor] = None
+        if self._nsa_enabled and not _USE_FAKE_INDEXER:
+            # Max-sized scoring scratch for the real indexer: k_end <=
+            # seq_lens <= context_len (+ speculative_num_draft_tokens on
+            # verify, where seq_lens carry +nv). Larger than the per-step
+            # exact bound is always safe (the kernel checks a lower bound).
+            # Registered as a graph fixed tensor by the graph runner.
+            ws_bytes = torch.ops.sgl_kernel.get_paged_mqa_logits_topk_workspace_size(
+                model_config.context_len + self.speculative_num_draft_tokens
+            )
+            self.indexer_workspace = _get_shared_indexer_workspace(ws_bytes)
         if self._nsa_enabled:
             logger.info(
                 "DSA (NSA) sparse attention enabled: topk=%d "
@@ -566,17 +593,17 @@ class KunpengCpuBackend(AttentionBackend):
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
         enable_blockwise = self.swap_mgr.enable_swap_kv_blockwise
+        with pp_span("block_table_build"):
+            self._init_block_table(
+                metadata,
+                forward_batch,
+                req_pool_indices,
+                seq_lens,
+                enable_blockwise=enable_blockwise,
+            )
         if enable_blockwise:
             # Block-wise swap: the remapped page table drives the swap-in
             # set and the slot mapping below.
-            with pp_span("block_table_build"):
-                self._init_block_table(
-                    metadata,
-                    forward_batch,
-                    req_pool_indices,
-                    seq_lens,
-                    enable_blockwise=True,
-                )
             with pp_span("blockwise_swap"):
                 self._init_blockwise_swap_metadata(metadata, forward_batch)
 
@@ -662,7 +689,6 @@ class KunpengCpuBackend(AttentionBackend):
         # sparse_all_padding path skips the kernel. Built OUTSIDE the
         # capture region; Indexer.forward_cpu only reads these.
         if self._nsa_enabled and real_rows > 0:
-            t_rows = forward_batch.input_ids.shape[0]
             metadata.indexer_seq_lens = seq_lens
             metadata.indexer_cur_lens = ext.to(torch.int32)
             metadata.indexer_block_table = metadata.block_table
@@ -802,7 +828,7 @@ class KunpengCpuBackend(AttentionBackend):
                     )
                 metadata.indexer_block_table = (
                     torch.ops.sgl_kernel.build_block_table_kunpeng(
-                        req_to_token,
+                        forward_batch.req_to_token_pool.req_to_token,
                         req_pool_indices,
                         seq_lens,
                         metadata.page_size,

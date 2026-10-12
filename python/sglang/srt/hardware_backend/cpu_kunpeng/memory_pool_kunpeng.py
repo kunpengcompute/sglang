@@ -99,7 +99,10 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         """Write per-token index-K rows at flat pool slots ``loc``.
 
         loc [T] int32/int64 (forward_batch.out_cache_loc; -1 = padding /
-        foreign slot -> row skipped, no wraparound write); index_k [T, D] bf16.
+        foreign slot -> row skipped by the kernel, no wraparound write);
+        index_k [T, D] bf16. Routes through the graph-compatible
+        set_kv_buffer_kunpeng op (the C++ kernel skips loc < 0), so the
+        write is replayed inside a captured graph.
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -108,9 +111,9 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
             raise ValueError(
                 f"loc numel {loc.numel()} != index_k rows {index_k.shape[0]}"
             )
-        valid = loc >= 0
-        if valid.any():
-            buf[loc[valid]] = index_k[valid]
+        from sglang.srt.graph import ops as kunpeng
+
+        kunpeng.set_kv_buffer_kunpeng(buf, loc, index_k)
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         """[num_slots, index_head_dim] bf16 flat index-K buffer."""

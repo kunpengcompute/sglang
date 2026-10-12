@@ -74,6 +74,35 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _bf16_linear_kunpeng(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """bf16 linear (out = x @ W^T) via the registered kunpeng gemm ops.
+
+    Mirrors the router / lm_head / MTP-head call sites so the eager and
+    the graph-captured paths execute the identical kernel; ``weight`` is
+    the raw [N, K] Linear parameter (bf16).
+    """
+    from sglang.srt.graph import ops as kunpeng
+
+    M, K = x.shape
+    N = weight.shape[0]
+    tile_m, tile_n, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(
+        M, N, K
+    )
+    blocks_in_k = K // tile_k
+    ws_numel = blocks_in_k * N * M + 1024 if blocks_in_k > 1 else 0
+    packed = kunpeng.bf16_gemm_pack_kunpeng(x, tile_m, tile_k)
+    return kunpeng.bf16_packed_gemm_kunpeng(
+        packed,
+        weight,
+        kunpeng.alloc_buffer(
+            ws_numel,
+            dtype=torch.bfloat16,
+            alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get(),
+        ),
+        32,
+    )
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -227,8 +256,14 @@ class Indexer(MultiPlatformOp):
             params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
+        # On 920F the CPU path runs k_norm through the bf16 layernorm_cpu
+        # kernel (graph-capture path), matching the NPU bf16 semantics;
+        # elsewhere keep the original dtype selection.
         self.k_norm = LayerNorm(
-            self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+            self.head_dim,
+            dtype=torch.bfloat16
+            if (_use_aiter or is_cpu_920f())
+            else torch.float32,
         )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
@@ -239,6 +274,17 @@ class Indexer(MultiPlatformOp):
             is_neox_style=is_neox_style,
             device=get_global_server_args().device,
         )
+        if (
+            is_cpu_920f()
+            and self.rotary_emb is not None
+            and self.rotary_emb.cos_sin_cache.dtype != torch.bfloat16
+        ):
+            # The kunpeng rope kernel (rope_kunpeng) consumes a bf16
+            # cos_sin cache; align once at construction so the tensor
+            # identity stays stable for the graph capture (fixed weights).
+            self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(
+                torch.bfloat16
+            )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
@@ -1134,11 +1180,16 @@ class Indexer(MultiPlatformOp):
         x = x.to(torch.bfloat16)
         q_lora = q_lora.to(torch.bfloat16)
 
+        # Every projection / norm / RoPE below runs through the registered
+        # kunpeng graph ops, so the eager and the captured paths execute
+        # the identical kernels (bf16, NPU semantics).
+
         # Head gates: bf16 output of weights_proj, unscaled (global positive
         # constants do not change the top-k ranking; NPU bf16 semantics).
-        weights = self.weights_proj(x)[0].to(torch.bfloat16)  # [T, H]
+        weights = _bf16_linear_kunpeng(x, self.weights_proj.weight)  # [T, H]
 
-        # q: [T, H, D] with interleaved rope/nope split
+        # q: [T, H, D] with interleaved rope/nope split (int8 W8A8 gemm,
+        # already op-routed by W8A8Int8LinearMethod on 920F).
         q = self.wq_b(q_lora)[0]
         if isinstance(q, tuple):
             q = q[0]
@@ -1148,18 +1199,25 @@ class Indexer(MultiPlatformOp):
         )
 
         # k: [T, D]
-        k_proj = self.wk(x)[0]
-        if isinstance(k_proj, tuple):
-            k_proj = k_proj[0]
-        k = self.k_norm(k_proj.to(torch.bfloat16)).to(torch.bfloat16)
+        k_proj = _bf16_linear_kunpeng(x, self.wk.weight)
+        k = kunpeng.layernorm_kunpeng(
+            k_proj,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.variance_epsilon,
+        )
         k_pe, k_nope = torch.split(
             k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        # interleaved RoPE; the CPU path is the plain RotaryEmbedding
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q = torch.cat([q_pe, q_nope], dim=-1)  # [T, H, D]
-        k = torch.cat([k_pe, k_nope], dim=-1)  # [T, D]
+        # Interleaved RoPE via the registered op (odd_even_grouping matches
+        # the interleaved split above); the kernel is 3D-only, so k_pe goes
+        # through a [T, 1, rope_head_dim] view and back.
+        q_pe, k_pe = kunpeng.rope_kunpeng(
+            positions, q_pe, k_pe.unsqueeze(1), self.rotary_emb.cos_sin_cache
+        )
+        q = kunpeng.cat_kunpeng(q_pe, q_nope, -1)  # [T, H, D]
+        k = kunpeng.cat_kunpeng(k_pe.squeeze(1), k_nope, -1)  # [T, D]
 
         # Fill the index-K cache first: the scoring below reads the full
         # window including the current tokens' keys.
@@ -1180,7 +1238,10 @@ class Indexer(MultiPlatformOp):
         # for decode / MTP, absorbed_row_start for the flat prefill).
         T = q.shape[0]
         topk = self.index_topk
-        output = torch.full((T, topk), -1, dtype=torch.int32)
+        # Graph-managed buffer: the kutacc kernel writes every entry (the
+        # -1 padding included), so no pre-fill is needed and the eager and
+        # captured paths share the same allocation scheme.
+        output = kunpeng.alloc_buffer(T * topk, dtype=torch.int32).view(T, topk)
         if T == 0:
             return output
 
@@ -1198,11 +1259,18 @@ class Indexer(MultiPlatformOp):
             -1, page_size, self.head_dim
         )
 
-        max_k_end = int(seq_lens.max().item()) if seq_lens.shape[0] > 0 else 1
-        ws_bytes = torch.ops.sgl_kernel.get_paged_mqa_logits_topk_workspace_size(
-            max_k_end
+        # Persistent max-sized scratch shared by every backend instance
+        # and layer (context_len + draft tokens bound; see
+        # KunpengCpuBackend). The stable tensor identity lets the capture
+        # register it as a fixed input; per-step exact sizing (the old
+        # seq_lens.max().item() path) would freeze a stale bound inside
+        # the graph.
+        workspace = forward_batch.attn_backend.indexer_workspace
+        assert workspace is not None, (
+            "real indexer scoring requires the backend workspace "
+            "(KunpengCpuBackend.__init__ allocates it when NSA is enabled "
+            "and SGLANG_KUNPENG_FAKE_INDEXER is unset)"
         )
-        workspace = torch.empty(ws_bytes, dtype=torch.uint8)
 
         # Absorbed prefill feeds the flat (rows, 1, H, D) sparse call whose
         # slots are ABSOLUTE pool slots (kSlot); the decode / MTP consumers
