@@ -27,6 +27,10 @@ Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
      region; the kernel semantics are covered by groups A/B.
   H. fused MTP primitives (dsa_topk_slots [B, nv, topk] mapping,
      pad_q_left fill semantics).
+  I. indexer input normalization: quantized (int8, scale) tuples from the
+     920F fused add+rmsnorm+quant path are rejected (fail-loudly -- casting
+     the raw int8 codes to bf16 silently produced garbage); bf16/fp32
+     tensors pass through.
 """
 
 import random
@@ -61,6 +65,15 @@ try:
     _HAVE_POOL = True
 except Exception:
     _HAVE_POOL = False
+
+try:
+    from sglang.srt.layers.attention.nsa.nsa_indexer import (
+        _validate_cpu_indexer_input,
+    )
+
+    _HAVE_INDEXER_INPUT = True
+except Exception:
+    _HAVE_INDEXER_INPUT = False
 
 _sgl_kernel = None
 try:
@@ -898,6 +911,68 @@ def test_pad_q_left_fill_indices():
     assert torch.equal(q_dst[1], torch.zeros(3, 2, 3, dtype=torch.bfloat16))
 
 
+def test_indexer_input_validation():
+    """Indexer.forward_cpu input contracts (bug fix: the 920F fused
+    add+rmsnorm+int8-quant path used to hand (int8, scale) tuples to the
+    indexer, whose raw int8 codes were silently cast to bf16 -- garbage,
+    since the per-row scale carries the magnitude). Contracts:
+    - x must be an unquantized bf16 tensor (bf16 bgemm projections
+      weights_proj / wk); quantized tuples raise, non-bf16 raises.
+    - q_lora must be the quantized (int8, scale) tuple from
+      q_a_layernorm(quantize=True) -- wq_b is an int8 IGEMM; a plain
+      tensor (the old re-layernorm bf16 form) raises."""
+    if not _HAVE_INDEXER_INPUT:
+        print("  [skip] nsa_indexer not importable (input validation)")
+        return
+    x = torch.randn(4, 8, dtype=torch.bfloat16)
+    q_int8 = torch.zeros(4, 16, dtype=torch.int8)
+    q_scale = torch.ones(4, dtype=torch.float32)
+    q_lora = (q_int8, q_scale)
+
+    # Valid inputs pass through unchanged (no cast, no dequant).
+    x2, q2 = _validate_cpu_indexer_input(x, q_lora)
+    assert x2 is x and q2[0] is q_int8 and q2[1] is q_scale
+
+    # x: non-bf16 raises (no silent .to(bf16)).
+    try:
+        _validate_cpu_indexer_input(torch.randn(4, 8), q_lora)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("non-bf16 x must raise")
+
+    # x: quantized tuples (2-tuple from the 920F fused path; 3-tuple like
+    # the aiter (fp8, scale, bf16) form) raise with a clear message.
+    xq = torch.zeros(4, 8, dtype=torch.int8)
+    xs = torch.ones(4, dtype=torch.float32)
+    for bad_x in ((xq, xs), (xq, xs, x)):
+        try:
+            _validate_cpu_indexer_input(bad_x, q_lora)
+        except TypeError as e:
+            assert "unquantized" in str(e)
+        else:
+            raise AssertionError("quantized x tuple must raise TypeError")
+
+    # q_lora: a plain tensor (the old second-layernorm bf16 form) raises.
+    try:
+        _validate_cpu_indexer_input(
+            x, torch.randn(4, 16, dtype=torch.bfloat16)
+        )
+    except AssertionError as e:
+        assert "q_lora" in str(e)
+    else:
+        raise AssertionError("non-tuple q_lora must raise")
+
+    # q_lora: malformed tuples (missing scale; wrong dtype) raise.
+    for bad_q in ((q_int8,), (x, q_scale)):
+        try:
+            _validate_cpu_indexer_input(x, bad_q)
+        except AssertionError as e:
+            assert "q_lora" in str(e)
+        else:
+            raise AssertionError("malformed q_lora tuple must raise")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -930,6 +1005,7 @@ def main():
         ("F. test_workspace_helpers", test_workspace_helpers),
         ("H. test_dsa_topk_slots_mtp", test_dsa_topk_slots_mtp),
         ("H. test_pad_q_left_fill_indices", test_pad_q_left_fill_indices),
+        ("I. test_indexer_input_validation", test_indexer_input_validation),
     ]
     failed = 0
     for name, fn in tests:

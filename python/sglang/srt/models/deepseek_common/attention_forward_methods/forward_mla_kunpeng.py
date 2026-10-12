@@ -124,8 +124,6 @@ class DeepseekMLAKunpengForwardMixin:
             # (SGLANG_KUNPENG_FAKE_INDEXER 可切回 bring-up fake 做对拍; fake
             # 下 absorbed prefill 的 per-row slot 在 backend metadata 期由
             # dsa_prefill_slots_kunpeng 直接生成, 不走 indexer).
-            # TODO(kunpeng): 复用 fused quant pass 的 bf16 normed q,
-            # 免第二次 layernorm.
             if (
                 getattr(self, "use_nsa", False)
                 and self.indexer is not None
@@ -149,9 +147,15 @@ class DeepseekMLAKunpengForwardMixin:
                         forward_batch.forward_mode.is_target_verify()
                         or forward_batch.forward_mode.is_draft_extend()
                     )
+                    # q_lora reuses the fused-quant (int8, scale) tuple:
+                    # the indexer's wq_b is the same int8 W8A8 IGEMM as
+                    # q_b_proj, so the pre-quantized activation is consumed
+                    # directly (no second layernorm / quant pass). Only x
+                    # (hidden_states) must stay bf16 for the indexer's bf16
+                    # projections (weights_proj / wk).
                     topk_indices = self.indexer(
                         x=hidden_states,
-                        q_lora=self.q_a_layernorm(q),
+                        q_lora=q_normed,
                         positions=positions,
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,

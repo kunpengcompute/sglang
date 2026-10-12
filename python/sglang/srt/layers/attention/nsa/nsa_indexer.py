@@ -189,6 +189,44 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def _validate_cpu_indexer_input(
+    x: torch.Tensor,
+    q_lora: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Assert the 920F indexer input contracts (fail loudly, never cast):
+
+    - x: the UNQUANTIZED bf16 hidden_states. The indexer's weights_proj /
+      wk are bf16 bgemm projections; a (int8, scale) tuple here means the
+      NSA branch of LayerCommunicator.prepare_attn regressed -- casting
+      the raw int8 codes to bf16 would silently produce garbage (the
+      per-row scale carries the magnitude).
+    - q_lora: the QUANTIZED (int8, scale) tuple from
+      q_a_layernorm(quantize=True) -- the indexer's wq_b is an int8 W8A8
+      IGEMM (same as q_b_proj) whose apply consumes the pre-quantized
+      activation directly, skipping a separate quant pass.
+    """
+    if isinstance(x, tuple):
+        raise TypeError(
+            "Indexer.forward_cpu expects an unquantized bf16 hidden_states "
+            "tensor; got a quantized tuple (likely (int8, scale) from the "
+            "920F fused add+rmsnorm+quant path). The NSA branch in "
+            "LayerCommunicator.prepare_attn must keep hidden_states bf16."
+        )
+    assert x.dtype == torch.bfloat16, (
+        f"Indexer.forward_cpu expects bf16 hidden_states, got {x.dtype}"
+    )
+    assert (
+        isinstance(q_lora, tuple)
+        and len(q_lora) == 2
+        and q_lora[0].dtype == torch.int8
+    ), (
+        "Indexer.forward_cpu expects the quantized (int8, scale) tuple from "
+        "q_a_layernorm(quantize=True) as q_lora (wq_b is an int8 IGEMM); "
+        f"got {type(q_lora)}"
+    )
+    return x, q_lora
+
+
 class Indexer(MultiPlatformOp):
     def __init__(
         self,
@@ -1113,7 +1151,7 @@ class Indexer(MultiPlatformOp):
     def forward_cpu(
         self,
         x: torch.Tensor,
-        q_lora: torch.Tensor,
+        q_lora: Tuple[torch.Tensor, torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
@@ -1121,10 +1159,14 @@ class Indexer(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         """CPU dispatch hook (MultiPlatformOp): Kunpeng 920F real indexer.
 
-        Real path (NPU bf16 semantics, see forward_npu), pure bf16, no
-        pre-scaling:
+        Real path (NPU bf16 semantics, see forward_npu), no pre-scaling.
+        Input contracts (asserted in _validate_cpu_indexer_input, never
+        silently cast): x is the UNQUANTIZED bf16 hidden_states; q_lora is
+        the QUANTIZED (int8, scale) tuple from q_a_layernorm(quantize=True)
+        -- wq_b is the same int8 W8A8 IGEMM as q_b_proj and consumes it
+        directly:
           w = weights_proj(x)                [T, H] bf16 (unscaled gates)
-          q = wq_b(q_lora) -> [T, H, D]; split rope/nope
+          q = wq_b(q_lora) -> [T, H, D] bf16; split rope/nope
           k = k_norm(wk(x)) -> [T, D];      split rope/nope
           rotary_emb(positions, q_pe, k_pe); concat back
           pool.set_index_k_buffer(layer_id, out_cache_loc, k)
@@ -1173,12 +1215,14 @@ class Indexer(MultiPlatformOp):
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
 
-        # Quantized pipelines may pass (act, scale[, ...]) tuples; take the
-        # activation and cast to bf16 (no requant path on CPU yet).
-        if isinstance(x, tuple):
-            x = x[0]
-        x = x.to(torch.bfloat16)
-        q_lora = q_lora.to(torch.bfloat16)
+        # Input contracts (fail loudly, never silently cast):
+        #   x       unquantized bf16 hidden_states (feeds the bf16 bgemm
+        #           projections weights_proj / wk);
+        #   q_lora  quantized (int8, scale) from q_a_layernorm(quantize=True)
+        #           (feeds the wq_b int8 IGEMM directly).
+        # See _validate_cpu_indexer_input and the NSA branch of
+        # LayerCommunicator.prepare_attn.
+        x, q_lora = _validate_cpu_indexer_input(x, q_lora)
 
         # Every projection / norm / RoPE below runs through the registered
         # kunpeng graph ops, so the eager and the captured paths execute
@@ -1188,12 +1232,15 @@ class Indexer(MultiPlatformOp):
         # constants do not change the top-k ranking; NPU bf16 semantics).
         weights = _bf16_linear_kunpeng(x, self.weights_proj.weight)  # [T, H]
 
-        # q: [T, H, D] with interleaved rope/nope split (int8 W8A8 gemm,
-        # already op-routed by W8A8Int8LinearMethod on 920F).
+        # q: [T, H, D] with interleaved rope/nope split. wq_b is an int8
+        # W8A8 IGEMM: q_lora is already the quantized (int8, scale) tuple
+        # (validated above) and is consumed directly -- no separate quant
+        # pass. The IGEMM's output is bf16 (dq inside the kernel).
         q = self.wq_b(q_lora)[0]
-        if isinstance(q, tuple):
-            q = q[0]
-        q = q.to(torch.bfloat16).view(-1, self.n_heads, self.head_dim)
+        assert q.dtype == torch.bfloat16, (
+            f"wq_b IGEMM output must be bf16, got {q.dtype}"
+        )
+        q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
@@ -1331,7 +1378,7 @@ class Indexer(MultiPlatformOp):
     def _forward_cpu_fake(
         self,
         x: torch.Tensor,
-        q_lora: torch.Tensor,
+        q_lora: Tuple[torch.Tensor, torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
@@ -1393,8 +1440,9 @@ class Indexer(MultiPlatformOp):
 
         # Decode: full-batch persistent seq lens (graph input; see
         # KunpengCpuBackend._init_decode_metadata). q_lora rows == batch
-        # rows for decode steps.
-        seq_lens = backend.forward_metadata.full_seq_lens[: q_lora.shape[0]]
+        # rows for decode steps; the fake only consumes the row count
+        # (the int8 part of the (int8, scale) tuple).
+        seq_lens = backend.forward_metadata.full_seq_lens[: q_lora[0].shape[0]]
         return kunpeng.fake_indexer_topk_kunpeng(seq_lens, self.index_topk)
 
     def forward_cuda(
