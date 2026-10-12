@@ -151,9 +151,9 @@ void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Ten
 void fake_indexer_topk_mtp_kunpeng(const at::Tensor &seq_lens, const c10::optional<at::Tensor> &extend_seq_lens,
                                    int64_t num_rows, int64_t topk, at::Tensor indices);
 
-void bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output);
+void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output);
 
-at::Tensor bgemm_prepack_kunpeng(const at::Tensor &weight, int64_t batch_size);
+at::Tensor batched_bgemm_prepack_kunpeng(const at::Tensor &weight);
 
 std::tuple<int64_t, int64_t> get_flash_attention_block_kunpeng();
 int64_t get_flash_attention_thread_num();
@@ -731,13 +731,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int num_rows, int topk, Tensor(a!) indices) -> ()");
     m.impl("fake_indexer_topk_mtp_kunpeng", fake_indexer_topk_mtp_kunpeng);
 
-    // Simple bf16 batched GEMM (naive fp32 accumulation, no SME packed
-    // kernels) for the bf16 kv_b_proj MLA absorb path (e.g. GLM-5).
-    m.def("bgemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output) -> ()");
-    m.impl("bgemm_kunpeng", bgemm_kunpeng);
+    // SME bf16 batched GEMM for the bf16 kv_b_proj MLA absorb path
+    // (e.g. GLM-5): weight prepacked by batched_bgemm_prepack_kunpeng, act packed
+    // per call, compute via batch_bf16_bf16_packed_gemm_bf16.
+    m.def("batched_bgemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output) -> ()");
+    m.impl("batched_bgemm_kunpeng", batched_bgemm_kunpeng);
 
-    m.def("bgemm_prepack_kunpeng(Tensor weight, int batch_size) -> Tensor");
-    m.impl("bgemm_prepack_kunpeng", bgemm_prepack_kunpeng);
+    m.def("batched_bgemm_prepack_kunpeng(Tensor weight) -> Tensor");
+    m.impl("batched_bgemm_prepack_kunpeng", batched_bgemm_prepack_kunpeng);
 
     // Flash attn (prefill attention kernel)
     m.def("get_flash_attention_block_kunpeng() -> (int, int)");

@@ -696,15 +696,14 @@ class DeepseekV2WeightLoaderMixin:
                     and self_attn.q_lora_rank is not None
                     and getattr(self_attn, "w_kc_int8_packed", None) is None
                 ):
-                    # GLM-5: bf16 kv_b + q_lora -> 吸收后的 w_kc/w_vc 走 bgemm
-                    # 路径 (纯转置预打包), 与 int8 igemm / bmm 路径互不影响.
-                    batch_size = get_global_server_args().max_prefill_tokens
+                    # GLM-5: bf16 kv_b + q_lora -> 吸收后的 w_kc/w_vc 走 SME
+                    # bgemm 路径 (SME 预打包), 与 int8 igemm / bmm 路径互不影响.
                     self_attn.w_kc_bf16_packed = \
-                        torch.ops.sgl_kernel.bgemm_prepack_kunpeng(
-                            self_attn.w_kc, batch_size)
+                        torch.ops.sgl_kernel.batched_bgemm_prepack_kunpeng(
+                            self_attn.w_kc)
                     self_attn.w_vc_bf16_packed = \
-                        torch.ops.sgl_kernel.bgemm_prepack_kunpeng(
-                            self_attn.w_vc, batch_size)
+                        torch.ops.sgl_kernel.batched_bgemm_prepack_kunpeng(
+                            self_attn.w_vc)
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
