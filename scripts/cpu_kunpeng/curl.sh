@@ -36,7 +36,9 @@ usage() {
   echo "  -r RATE     Send rate in req/s (default: 32, must be > 0)"
   echo "  -v          Verbose stats (only active when NUM > 1): decode throughput"
   echo "              table; with -s also accept rate. Writes per-request latency"
-  echo "              rows + response bodies to <run-id>_detail.txt"
+  echo "              rows + response bodies to <run-id>_detail.txt. With a single"
+  echo "              streaming request, echoes the raw SSE lines instead of the"
+  echo "              decoded text."
   echo "  -F          Fake-transfer mode: inject bootstrap_host=2.2.2.2 + a unique"
   echo "              bootstrap_room per request; decode skips KV transfer without"
   echo "              --disaggregation-transfer-backend. Port auto-derived from"
@@ -398,8 +400,24 @@ if [ "$INTERACTIVE" = false ]; then
         -d @"$body_file" > "$RESULT_DIR/ttfb_${idx}" 2>/dev/null &
       local curl_pid=$!
       while IFS= read -r line; do
-        printf '%s\n' "$line"
+        # Raw body always captured for parsing (usage tokens, chunk count).
         printf '%s\n' "$line" >> "$resp_file"
+        if [ "$VERBOSE" = true ]; then
+          # -v: original raw SSE echo (full data: lines, inspection mode).
+          printf '%s\n' "$line"
+        else
+          # Live echo: decoded "text" only (printf %b expands \n etc.).
+          # Usage-only chunks carry no "text" and print nothing; error
+          # payloads and the [DONE] marker stay raw.
+          case "$line" in
+            'data: [DONE]'*) printf '\n%s\n' "$line" ;;
+            *'"text":"'*)
+              text=${line#*\"text\":\"}
+              printf '%b' "${text%%\"*}"
+              ;;
+            *'"error"'*) printf '%s\n' "$line" ;;
+          esac
+        fi
       done < "$fifo"
       wait "$curl_pid" 2>/dev/null
       rm -f "$fifo"
@@ -575,7 +593,7 @@ if [ "$INTERACTIVE" = false ]; then
   WALL_TIME=$(awk -v s="$WALL_START" -v e="$WALL_END" 'BEGIN { printf "%.3f", e - s }')
 
   # Single request: echo the response + a TTFT/TPOT summary (the old
-  # single-request output format). -v is a no-op here by design.
+  # single-request output format). -v switches the streaming echo to raw SSE.
   if [ "$NUM_REQUESTS" -eq 1 ]; then
     # Streaming already echoed the body live from the FIFO; only
     # non-streaming (buffered to the resp file) prints it here.
