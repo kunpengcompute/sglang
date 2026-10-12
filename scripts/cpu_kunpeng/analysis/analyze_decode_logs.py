@@ -548,21 +548,28 @@ def split_logs_by_tp(input_file, output_dir):
 
 def resolve_log_base_dir(script_dir):
     """Resolve LOG_BASE_DIR from the environment, falling back to the value
-    declared in scripts/cpu_kunpeng/.user_env.sh (one directory above this
-    script, which lives in cpu_kunpeng/analysis/)."""
+    declared in scripts/cpu_kunpeng/.user_env.sh or runtime/.user_env_base.sh
+    (one directory above this script, which lives in cpu_kunpeng/analysis/).
+    env_base.sh sources .user_env.sh first and runtime/.user_env_base.sh
+    second, so the base file's value wins when both define LOG_BASE_DIR."""
     log_base = os.environ.get("LOG_BASE_DIR")
     if log_base:
         return log_base
-    user_env = os.path.join(script_dir, os.pardir, ".user_env.sh")
-    try:
-        with open(user_env, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("export LOG_BASE_DIR="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return None
+    # Mirror env_base.sh sourcing order: later file wins.
+    user_envs = [
+        os.path.join(script_dir, os.pardir, ".user_env.sh"),
+        os.path.join(script_dir, os.pardir, "runtime", ".user_env_base.sh"),
+    ]
+    for user_env in user_envs:
+        try:
+            with open(user_env, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("export LOG_BASE_DIR="):
+                        log_base = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return log_base
 
 
 def find_latest_rank0_log(log_base_dir):
@@ -604,8 +611,8 @@ if __name__ == "__main__":
         log_base = resolve_log_base_dir(script_dir)
         if not log_base:
             print(
-                "Error: LOG_BASE_DIR not set and not found in .user_env.sh; "
-                "pass a log file explicitly."
+                "Error: LOG_BASE_DIR not set and not found in .user_env.sh "
+                "or runtime/.user_env_base.sh; pass a log file explicitly."
             )
             print("Usage: python analyze_decode_logs.py [log_file] [output_dir]")
             sys.exit(1)
