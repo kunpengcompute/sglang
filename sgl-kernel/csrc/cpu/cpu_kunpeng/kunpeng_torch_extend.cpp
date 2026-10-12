@@ -30,6 +30,8 @@ void quant_kunpeng(at::Tensor input, at::Tensor out, at::Tensor scale);
 
 void rmsnorm_kunpeng(at::Tensor acts, at::Tensor weights, double eps, at::Tensor outs);
 
+void layernorm_kunpeng(at::Tensor acts, at::Tensor weights, at::Tensor bias, double eps, at::Tensor outs);
+
 void fused_add_rmsnorm_kunpeng(at::Tensor acts, at::Tensor residual, at::Tensor weights, double eps, at::Tensor outs);
 
 void rmsnorm_quant_kunpeng(at::Tensor acts, at::Tensor weights, double eps, at::Tensor outs, at::Tensor scales);
@@ -566,6 +568,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "rmsnorm_kunpeng(Tensor acts, Tensor weights, float eps, "
         "Tensor outs) -> ()");
     m.impl("rmsnorm_kunpeng", rmsnorm_kunpeng);
+
+    // layernorm (SVE; DSA indexer k_norm -- LayerNorm WITH bias, unlike
+    // the RMSNorm family above)
+    m.def(
+        "layernorm_kunpeng(Tensor acts, Tensor weights, Tensor bias, float eps, "
+        "Tensor(a!) outs) -> ()");
+    m.impl("layernorm_kunpeng", layernorm_kunpeng);
 
     m.def(
         "fused_add_rmsnorm_kunpeng(Tensor acts, Tensor residual, Tensor weights, float eps, "

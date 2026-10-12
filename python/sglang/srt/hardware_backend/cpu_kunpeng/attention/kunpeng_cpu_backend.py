@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 
 _DISABLE_MLA_ALL2ALL = get_bool_env_var("SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL")
 _USE_FAKE_INDEXER = envs.SGLANG_KUNPENG_FAKE_INDEXER.get()
+# MTP sparse escape hatch (mirrors forward_mla_kunpeng.py): skips the
+# indexer scoring on TARGET_VERIFY / DRAFT_EXTEND and forces the dense
+# sched so the dense fallback path is fully usable (block_table built +
+# dense sched extra_bytes).
+_DISABLE_DSA_SPARSE_MTP = envs.SGLANG_KUNPENG_DISABLE_DSA_SPARSE_MTP.get()
 
 
 def run_sdpa_forward_mha(
@@ -806,21 +811,22 @@ class KunpengCpuBackend(AttentionBackend):
             #                is normalized to num_tokens, so bs == q rows);
             #   VERIFY       uniform seqlen_q rows per sequence
             #                (bs * nv == q rows, lcm-aligned upstream);
-            #   DRAFT_EXTEND ragged live rows (sum(extend_seq_lens) ==
-            #                q rows, token-aligned upstream).
+            #   DRAFT_EXTEND ragged live rows. The scorer natively handles
+            #                sum(cur_lens) <= T (it scores only the first
+            #                sum(cur_lens) rows; the trailing mlp-pad rows
+            #                stay unwritten and are never read --
+            #                pad_q_left_mtp_kunpeng copies only the leading
+            #                sum(ext) rows), so no equality contract with
+            #                the padded q rows is needed.
             with pp_span("indexer_view_build"):
                 metadata.indexer_seq_lens = seq_lens
                 if forward_batch.forward_mode.is_draft_extend():
                     # Ragged live rows; the FULL extend_seq_lens
-                    # (metadata's is all2all-sliced). Contract:
-                    # sum(extend_seq_lens) == the padded q rows; leave
-                    # cur_lens unset (-> dense fallback) when it does not
-                    # hold (DP padding mirror: extend_seq_lens all zero).
+                    # (metadata's is all2all-sliced). Leave cur_lens unset
+                    # (-> dense fallback) only for the DP padding mirror
+                    # (extend_seq_lens all zero -- nothing to score).
                     ext = forward_batch.extend_seq_lens
-                    if (
-                        ext is not None
-                        and int(ext.sum()) == forward_batch.input_ids.shape[0]
-                    ):
+                    if ext is not None and int(ext.sum()) > 0:
                         metadata.indexer_cur_lens = ext.to(torch.int32)
                 else:
                     metadata.indexer_cur_lens = torch.full(
@@ -873,9 +879,34 @@ class KunpengCpuBackend(AttentionBackend):
         metadata.seq_lens = seq_lens
         metadata.req_pool_indices = req_pool_indices
 
-        # Block table: only the dense paged MLA / block-wise swap paths
-        # consume it; DSA sparse reads req_to_token directly.
-        if enable_blockwise or not self._nsa_enabled:
+        # Sparse-vs-dense sched decision, hoisted above the block-table
+        # build so the dense path can build it too (the dense paged MLA
+        # kernel's block_table arg is NOT optional). The indexer view
+        # availability (indexer_cur_lens, filled above from the UNSLICED
+        # batch) gates the sparse path: without it (DP padding mirror /
+        # missing extend lens) the consumers fall back to dense. The MTP
+        # escape hatch (SGLANG_KUNPENG_DISABLE_DSA_SPARSE_MTP) forces the
+        # dense sched as well -- this keeps the sched, the block_table
+        # and the actually-taken forward path consistent.
+        mode = forward_batch.forward_mode
+        sparse_mla = (
+            self._nsa_enabled
+            and seq_lens.shape[0] > 0
+            and metadata.indexer_cur_lens is not None
+            and not _DISABLE_DSA_SPARSE_MTP
+            and (
+                (mode.is_decode() and seqlen_q == 1)
+                or (
+                    (mode.is_target_verify() or mode.is_draft_extend())
+                    and seqlen_q == self.speculative_num_draft_tokens
+                )
+            )
+        )
+
+        # Block table: the dense paged MLA / block-wise swap paths consume
+        # it (DSA sparse reads req_to_token directly); build it whenever
+        # this forward will NOT take the sparse path.
+        if enable_blockwise or not self._nsa_enabled or not sparse_mla:
             with pp_span("block_table_build"):
                 self._init_block_table(
                     metadata,
@@ -886,18 +917,6 @@ class KunpengCpuBackend(AttentionBackend):
                 )
 
         with pp_span("decode_sched"):
-            mode = forward_batch.forward_mode
-            sparse_mla = (
-                self._nsa_enabled
-                and seq_lens.shape[0] > 0
-                and (
-                    (mode.is_decode() and seqlen_q == 1)
-                    or (
-                        (mode.is_target_verify() or mode.is_draft_extend())
-                        and seqlen_q == self.speculative_num_draft_tokens
-                    )
-                )
-            )
             if sparse_mla:
                 # Bring-up regime guard for the FAKE indexer: the fake
                 # selection is exact only while the full attention window

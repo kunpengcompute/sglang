@@ -81,6 +81,7 @@ class DeepseekMLAKunpengForwardMixin:
     def should_run_indexer(
         self: DeepseekV2AttentionMLA,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        reuse_dsa_topk_indices: bool = False,
     ) -> bool:
         """Whether this layer runs its own indexer vs reusing carried topk.
 
@@ -91,7 +92,19 @@ class DeepseekMLAKunpengForwardMixin:
         cross-layer propagation is unavailable, reintroducing the
         >index_topk garbling. The is_nextn clause is the sole intentional
         fallback (the NextN layer has its own weights).
+
+        M9 (index_share_for_mtp_iteration, topk == 1): during a draft
+        round with the carry enabled, the NextN layer reuses the step-0
+        top-k instead of re-scoring every step (the step-0 window misses
+        only the last i draft tokens; verify recovers any loss). Outside
+        the carry (or with sharing disabled) the NextN layer re-scores.
         """
+        if (
+            self.is_nextn
+            and prev_topk_indices is not None
+            and reuse_dsa_topk_indices
+        ):
+            return False
         return not getattr(self, "skip_topk", False) or (
             self.is_nextn and prev_topk_indices is None
         )
@@ -142,7 +155,12 @@ class DeepseekMLAKunpengForwardMixin:
                     )
                 )
             ):
-                if self.should_run_indexer(prev_topk_indices):
+                if self.should_run_indexer(
+                    prev_topk_indices,
+                    reuse_dsa_topk_indices=getattr(
+                        forward_batch, "reuse_dsa_topk_indices", False
+                    ),
+                ):
                     mtp_sparse = (
                         forward_batch.forward_mode.is_target_verify()
                         or forward_batch.forward_mode.is_draft_extend()

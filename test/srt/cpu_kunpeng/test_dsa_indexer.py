@@ -26,11 +26,14 @@ Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
      full-batch scoring over the global view, built outside the capture
      region; the kernel semantics are covered by groups A/B.
   H. fused MTP primitives (dsa_topk_slots [B, nv, topk] mapping,
-     pad_q_left fill semantics).
+     pad_q_left fill semantics; extra-src-rows tolerance and the LC dummy
+     pattern for all-(-1) padding sequences).
   I. indexer input normalization: quantized (int8, scale) tuples from the
      920F fused add+rmsnorm+quant path are rejected (fail-loudly -- casting
      the raw int8 codes to bf16 silently produced garbage); bf16/fp32
      tensors pass through.
+  J. should_run_indexer M9 reuse matrix (index_share_for_mtp_iteration:
+     NextN + carry + prev -> reuse; otherwise rescore).
 """
 
 import random
@@ -74,6 +77,17 @@ try:
     _HAVE_INDEXER_INPUT = True
 except Exception:
     _HAVE_INDEXER_INPUT = False
+
+try:
+    from types import SimpleNamespace
+
+    from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_kunpeng import (
+        DeepseekMLAKunpengForwardMixin,
+    )
+
+    _HAVE_MLA_KUNPENG = True
+except Exception:
+    _HAVE_MLA_KUNPENG = False
 
 _sgl_kernel = None
 try:
@@ -825,20 +839,17 @@ def test_workspace_helpers():
 def test_dsa_topk_slots_mtp():
     """dsa_topk_slots_kunpeng with [B_full, nv, topk] indices (MTP): per-row
     slot mapping with -1 tail compaction and per-sequence MAX valid
-    topk_length; row_start selects this rank's sequence blocks."""
+    topk_length; row_start selects this rank's sequence blocks. Slots come
+    straight from req_to_token (no remap)."""
     if _sgl_kernel is None:
         print("  [skip] sgl_kernel not available (dsa_topk_slots MTP)")
         return
     rng = random.Random(9)
-    bs_full, nv, topk, page, max_blocks = 4, 3, 5, 2, 4
+    bs_full, nv, topk, C = 4, 3, 5, 8
     seq_lens = [7, 4, 6, 5]
-    block_table = torch.zeros(bs_full, max_blocks, dtype=torch.int32)
-    pages = list(range(bs_full * max_blocks))
-    rng.shuffle(pages)
-    for b in range(bs_full):
-        block_table[b] = torch.tensor(
-            pages[b * max_blocks : (b + 1) * max_blocks], dtype=torch.int32
-        )
+    # req_to_token [R, C]: random distinct slots per request row.
+    rtt = torch.randint(1, 1000, (bs_full, C), dtype=torch.int32)
+    rpi = torch.arange(bs_full, dtype=torch.int32)
     # Per-row causal windows: row j sees positions [0, seq - nv + j].
     topk_indices = torch.full((bs_full, nv, topk), -1, dtype=torch.int32)
     for b in range(bs_full):
@@ -848,15 +859,17 @@ def test_dsa_topk_slots_mtp():
             sel = sorted(rng.sample(range(k_end), n))
             topk_indices[b, j, :n] = torch.tensor(sel, dtype=torch.int32)
 
-    # rank 1 of a 2-way split: its block_table/seq_lens cover sequences [2:],
-    # row_start = 2 selects those blocks in the full [B_full, nv, topk] input.
+    # rank 1 of a 2-way split: its req_pool_indices/seq_lens cover sequences
+    # [2:], row_start = 2 selects those blocks in the full [B_full, nv, topk].
     slots = torch.empty((2, nv, topk), dtype=torch.int32)
     topk_length = torch.empty((2,), dtype=torch.int32)
     _sgl_kernel.dsa_topk_slots_kunpeng(
-        block_table[2:],
+        rtt,
+        rpi[2:],
+        None,  # no remapped block table
         topk_indices,
         torch.tensor(seq_lens[2:], dtype=torch.int32),
-        page,
+        1,  # page_size (unused without remap)
         2,  # row_start
         slots,
         topk_length,
@@ -869,9 +882,7 @@ def test_dsa_topk_slots_mtp():
                 pos = int(topk_indices[2 + b, j, i])
                 if pos < 0 or pos >= seq_lens[2 + b]:
                     continue
-                row.append(
-                    int(block_table[2 + b, pos // page]) * page + pos % page
-                )
+                row.append(int(rtt[2 + b, pos]))
             assert torch.equal(
                 slots[b, j, : len(row)],
                 torch.tensor(row, dtype=torch.int32),
@@ -882,6 +893,47 @@ def test_dsa_topk_slots_mtp():
             )
             best = max(best, len(row))
         assert int(topk_length[b]) == best
+
+
+def test_dsa_topk_slots_dummy_rows():
+    """All-(-1) padding sequences (MTP draft-extend ext==0 blocks) get the
+    LC dummy pattern: topk_length clamped to 1 with one valid slot per row,
+    rest -1 -- aligned with the sched-side >= 1 clamp (the sched/kernel
+    topk_length mismatch is checked and raised on the Python side)."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (dsa_topk_slots dummy)")
+        return
+    bs, nv, topk, C = 3, 2, 4, 8
+    seq_lens = [5, 3, 4]
+    rtt = torch.randint(1, 1000, (bs, C), dtype=torch.int32)
+    rpi = torch.arange(bs, dtype=torch.int32)
+    topk_indices = torch.full((bs, nv, topk), -1, dtype=torch.int32)
+    # sequence 1 is live; 0/2 are all-(-1) padding blocks.
+    topk_indices[1, 0, :2] = torch.tensor([0, 2], dtype=torch.int32)
+    topk_indices[1, 1, :3] = torch.tensor([0, 1, 2], dtype=torch.int32)
+    slots = torch.empty((bs, nv, topk), dtype=torch.int32)
+    topk_length = torch.empty((bs,), dtype=torch.int32)
+    _sgl_kernel.dsa_topk_slots_kunpeng(
+        rtt,
+        rpi,
+        None,
+        topk_indices,
+        torch.tensor(seq_lens, dtype=torch.int32),
+        1,  # page_size
+        0,  # row_start
+        slots,
+        topk_length,
+    )
+    # live sequence: unchanged mapping.
+    assert int(topk_length[1]) == 3
+    assert int(slots[1, 0, 0]) == int(rtt[1, 0])
+    assert int(slots[1, 0, 1]) == int(rtt[1, 2])
+    # padding sequences: LC dummy (1 valid slot, rest -1).
+    for b in (0, 2):
+        assert int(topk_length[b]) == 1
+        for j in range(nv):
+            assert int(slots[b, j, 0]) == int(rtt[b, 0])
+            assert bool((slots[b, j, 1:] == -1).all())
 
 
 def test_pad_q_left_fill_indices():
@@ -909,6 +961,109 @@ def test_pad_q_left_fill_indices():
     assert torch.equal(q_dst[2], q[2:5])
     assert torch.equal(q_dst[0, 0], torch.zeros(2, 3, dtype=torch.bfloat16))
     assert torch.equal(q_dst[1], torch.zeros(3, 2, 3, dtype=torch.bfloat16))
+
+
+def test_pad_q_left_extra_src_rows():
+    """pad_q_left_mtp_kunpeng tolerates src rows > sum(ext): only the
+    leading sum(ext) rows are copied, the trailing rows are ignored
+    (mtp_kernels_kunpeng.cpp contract -- "T >= sum(ext_lens) ... only the
+    leading sum(ext_lens) rows are copied"). The indexer's draft-extend
+    reshape relies on this: it feeds the FULL padded [T, topk] output
+    (whose tail rows the scorer left unwritten) without any slicing."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (pad_q_left extra rows)")
+        return
+    ext = torch.tensor([2, 0, 3], dtype=torch.int32)  # sum = 5 live rows
+    topk = 2
+    live = (torch.arange(5 * topk, dtype=torch.int32) - 100).view(5, topk)
+    # 2 garbage tail rows (sentinel -999 would poison the output if read).
+    src = torch.cat(
+        [live, torch.full((2, topk), -999, dtype=torch.int32)], dim=0
+    )
+    dst = torch.empty(3, 3, topk, dtype=torch.int32)
+    _sgl_kernel.pad_q_left_mtp_kunpeng(src, ext, dst, -1)
+    ref = torch.full((3, 3, topk), -1, dtype=torch.int32)
+    ref[0, 1:] = live[0:2]
+    ref[2] = live[2:5]
+    assert torch.equal(dst, ref)
+
+    # bf16 path with fill 0 (the q left-pad form: full padded rows in).
+    q_live = torch.randn(5, 2, 3, dtype=torch.bfloat16)
+    q_src = torch.cat([q_live, torch.randn(2, 2, 3, dtype=torch.bfloat16)], dim=0)
+    q_dst = torch.empty(3, 3, 2, 3, dtype=torch.bfloat16)
+    _sgl_kernel.pad_q_left_mtp_kunpeng(q_src, ext, q_dst, 0)
+    assert torch.equal(q_dst[0, 1:], q_live[0:2])
+    assert torch.equal(q_dst[2], q_live[2:5])
+    assert torch.equal(q_dst[0, 0], torch.zeros(2, 3, dtype=torch.bfloat16))
+
+
+def test_scorer_partial_rows():
+    """The scorer natively handles sum(cur_lens) < T: it scores only the
+    first sum(cur_lens) rows -- the draft-extend contract (the live rows
+    sit at the front of the flat stream; the trailing mlp-pad rows stay
+    unwritten and are never read). The leading live rows must match an
+    equivalent compact call (T' == sum(cur_lens)) element-wise; the tail
+    rows keep the -1 prefill (nobody reads them)."""
+    rng = random.Random(3)
+    for _ in range(8):
+        n_seq = rng.randint(1, 3)
+        cur_list = [rng.randint(1, 3) for _ in range(n_seq)]
+        live = sum(cur_list)
+        pad_rows = rng.randint(0, 5)
+        delta = [rng.randint(0, 3) for _ in range(n_seq)]
+        n_heads = rng.choice([1, 2])
+        head_dim = rng.choice([2, 4])
+        block_size = rng.choice([1, 2, 4])
+        topk = rng.choice([1, 3, 8])
+        (q, kv, weight, bt, sl, cl, _, _, _) = _make_case(
+            rng, n_heads, head_dim, block_size, topk, n_seq, cur_list, delta
+        )
+        assert q.shape[0] == live
+        # Full call: append pad rows to q/weight (garbage the scorer must
+        # not score -- the values differ from any live row's result).
+        q_full = torch.cat(
+            [q, torch.randn(pad_rows, n_heads, head_dim, dtype=torch.bfloat16) * 0.5],
+            dim=0,
+        )
+        w_full = torch.cat(
+            [weight, torch.randn(pad_rows, n_heads, dtype=torch.bfloat16) * 0.5],
+            dim=0,
+        )
+        out_full = paged_mqa_logits_topk_cpu(q_full, kv, w_full, bt, sl, cl, topk)
+        out_live = paged_mqa_logits_topk_cpu(q, kv, weight, bt, sl, cl, topk)
+        assert out_full.shape[0] == live + pad_rows
+        assert torch.equal(out_full[:live], out_live)
+        assert bool((out_full[live:] == -1).all())
+
+
+def test_should_run_indexer_m9():
+    """should_run_indexer M9 reuse matrix (index_share_for_mtp_iteration,
+    topk == 1): during a draft round with the carry enabled, the NextN
+    layer reuses the step-0 top-k instead of re-scoring; with sharing off
+    (or no carry / no prev) it rescores. Shared layers always reuse."""
+    if not _HAVE_MLA_KUNPENG:
+        print("  [skip] forward_mla_kunpeng not importable (M9 matrix)")
+        return
+    prev = torch.zeros(2, 3, dtype=torch.int32)  # any non-None tensor
+
+    def call(is_nextn, skip_topk, prev_topk, reuse):
+        self = SimpleNamespace(is_nextn=is_nextn, skip_topk=skip_topk)
+        return DeepseekMLAKunpengForwardMixin.should_run_indexer(
+            self, prev_topk, reuse_dsa_topk_indices=reuse
+        )
+
+    # NextN layer (skip_topk=False, own weights):
+    assert call(True, False, prev, True) is False   # M9: reuse step-0 top-k
+    assert call(True, False, prev, False) is True   # sharing off: rescore
+    assert call(True, False, None, True) is True    # step 0 (no prev): rescore
+    assert call(True, False, None, False) is True
+    # Shared layer (skip_topk=True, no indexer weights): always reuse.
+    assert call(False, True, prev, True) is False
+    assert call(False, True, prev, False) is False
+    assert call(False, True, None, False) is False
+    # Normal full layer (skip_topk=False): always runs.
+    assert call(False, False, None, False) is True
+    assert call(False, False, prev, False) is True
 
 
 def test_indexer_input_validation():
@@ -986,6 +1141,7 @@ def main():
         ("A. test_slot_list_variant_equivalence", test_slot_list_variant_equivalence),
         ("A. test_slot_list_variant_varlen", test_slot_list_variant_varlen),
         ("A. test_topk_length", test_topk_length),
+        ("A. test_scorer_partial_rows", test_scorer_partial_rows),
         ("B. test_kutacc_matches_cpu", test_kutacc_matches_cpu),
         ("B. test_kutacc_matches_cpu_position", test_kutacc_matches_cpu_position),
         ("C. test_kunpeng_index_k_pool", test_kunpeng_index_k_pool),
@@ -1004,8 +1160,11 @@ def main():
         ("F. test_sparse_prefill_matches_reference", test_sparse_prefill_matches_reference),
         ("F. test_workspace_helpers", test_workspace_helpers),
         ("H. test_dsa_topk_slots_mtp", test_dsa_topk_slots_mtp),
+        ("H. test_dsa_topk_slots_dummy_rows", test_dsa_topk_slots_dummy_rows),
         ("H. test_pad_q_left_fill_indices", test_pad_q_left_fill_indices),
+        ("H. test_pad_q_left_extra_src_rows", test_pad_q_left_extra_src_rows),
         ("I. test_indexer_input_validation", test_indexer_input_validation),
+        ("J. test_should_run_indexer_m9", test_should_run_indexer_m9),
     ]
     failed = 0
     for name, fn in tests:

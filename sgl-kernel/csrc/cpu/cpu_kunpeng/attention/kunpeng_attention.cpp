@@ -420,6 +420,28 @@ void dsa_topk_slots_kunpeng(const at::Tensor &req_to_token, const at::Tensor &re
                 if (valid > valid_max)
                     valid_max = valid;
             }
+            if (valid_max == 0) {
+                // All-(-1) rows (e.g. MTP draft-extend padding sequences,
+                // ext_lens == 0, whose whole [n, topk] block is -1): the
+                // sparse sched plans a dummy 1-entry row for them
+                // (topk_len clamped to >= 1 -- the sparse kernel rejects
+                // 0-length rows) and the Python side checks sched ==
+                // kernel topk_length. Write the LC dummy pattern -- one
+                // valid slot per row, rest -1 -- mirroring
+                // dsa_prefill_slots_kunpeng. The dummy rows' outputs are
+                // discarded by the gather-side unpad.
+                const int32_t dummy_slot =
+                    (use_remap && max_blocks > 0)
+                        ? rbt[b * max_blocks] * (int32_t)page_size
+                        : ((req >= 0 && req < R && C > 0) ? rtt[req * C] : 0);
+                for (int64_t j = 0; j < n_rows; ++j) {
+                    int32_t *row = seq_slots + j * topk;
+                    row[0] = dummy_slot;
+                    for (int64_t i = 1; i < topk; ++i)
+                        row[i] = -1;
+                }
+                valid_max = 1;
+            }
             // Per-sequence scan bound for the sparse kernel = the largest
             // row fill (causal-prefix rows are nested, so the last live
             // row; take the max defensively). Each row is trimmed to its

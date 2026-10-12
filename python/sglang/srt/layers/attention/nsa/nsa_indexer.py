@@ -1278,11 +1278,14 @@ class Indexer(MultiPlatformOp):
         # static per-graph shape; every rank repeats the full computation).
         # The view tensors are the backend's per-step indexer view
         # (metadata.indexer_*, built OUTSIDE the capture region from the
-        # GLOBAL batch; sum(cur_lens) == T is guaranteed by the upstream
-        # token alignment -- see KunpengCpuBackend). The indexer only
-        # READS them: no slicing, no tensor creation, no dynamic shapes.
-        # Consumers pick their own windows afterwards (token_slice_start
-        # for decode / MTP, absorbed_row_start for the flat prefill).
+        # GLOBAL batch). The scorer natively handles sum(cur_lens) <= T:
+        # it scores only the first sum(cur_lens) rows, so the draft-extend
+        # ragged rows (and the trailing mlp-pad rows, which stay unwritten
+        # and are never read) need no equality contract. The indexer only
+        # READS the views: no slicing, no tensor creation, no dynamic
+        # shapes. Consumers pick their own windows afterwards
+        # (token_slice_start for decode / MTP, absorbed_row_start for the
+        # flat prefill).
         T = q.shape[0]
         topk = self.index_topk
         # Graph-managed buffer: the kutacc kernel writes every entry (the
@@ -1366,9 +1369,17 @@ class Indexer(MultiPlatformOp):
             return output.view(-1, nv, topk)
         if mode.is_draft_extend():
             nv = forward_batch.attn_backend.speculative_num_draft_tokens
-            sum_ext = int(forward_batch.extend_seq_lens.sum().item())
+            # Feed the FULL [T, topk] output: the kernel copies only the
+            # leading sum(extend_seq_lens) rows (the live rows sit at the
+            # front of the flat stream; the trailing mlp-pad rows stay
+            # unwritten by the scorer and are never read) -- see
+            # mtp_kernels_kunpeng.cpp ("T >= sum(ext_lens) ... only the
+            # leading sum(ext_lens) rows are copied"). A [:sum_ext] slice
+            # would need a .item() host sync and freeze a dynamic bound at
+            # capture time; the model's own q left-pad already feeds the
+            # full padded rows the same way.
             return kunpeng.pad_q_left_mtp_kunpeng(
-                output[:sum_ext],
+                output,
                 forward_batch.extend_seq_lens,
                 nv,
                 fill_value=-1,

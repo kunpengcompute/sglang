@@ -909,15 +909,19 @@ def _setup_contiguous_kunpeng():
 
 
 def _setup_layernorm_kunpeng():
-    # Standard LayerNorm (weight + bias) over the last dim, wrapping the
-    # existing sgl_kernel layernorm_cpu kernel (bf16 in -> bf16 out, fp32
-    # accumulation inside) so it becomes graph-trackable. weight/bias must
-    # share the input dtype (the caller constructs bf16 params on 920F).
+    # Standard LayerNorm (weight + bias) over the last dim, SVE kernel
+    # (norm/layernorm.cpp: bf16 in -> bf16 out, fp32 accumulation), so it
+    # becomes graph-trackable. weight/bias must share the input dtype (the
+    # caller constructs bf16 params on 920F). NOTE: a LayerNorm with bias,
+    # NOT an RMSNorm (the DSA indexer's k_norm; do not rename into the
+    # rmsnorm_kunpeng family).
     def shape_infer(x, weight, bias, eps):
         return [(x.shape, x.dtype)]
 
     def eager_fn(x, weight, bias, eps):
-        return torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
+        out = torch.empty(x.shape, dtype=x.dtype)
+        torch.ops.sgl_kernel.layernorm_kunpeng(x, weight, bias, eps, out)
+        return out
 
     register_op('layernorm_kunpeng', shape_infer, eager_fn)
 
