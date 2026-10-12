@@ -61,8 +61,8 @@ class DeepseekMLAKunpengForwardMixin:
 
         DSV3.2: kv_b_proj 量化 int8 -> loader 打包 w_kc/w_vc_int8_packed +
         scale, 前向用 packed igemm. GLM-5 (GlmMoeDsa): kv_b_proj 是 bf16 ->
-        loader 做纯转置预打包 (w_kc/w_vc_bf16_packed), 前向用简单 bgemm
-        (bgemm_kunpeng). (w_kc_int8_packed 由 deepseek_weight_loader 在
+        loader 做 SME 预打包 (w_kc/w_vc_bf16_packed), 前向用 SME bgemm
+        (batched_bgemm_kunpeng). (w_kc_int8_packed 由 deepseek_weight_loader 在
         int8 加载时设置.)
         """
         return getattr(self, "w_kc_int8_packed", None) is not None
@@ -139,7 +139,7 @@ class DeepseekMLAKunpengForwardMixin:
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         # w_kc (kv_b_proj 吸收) 按量化与否分派: int8 (DSV3.2) -> packed
-        # igemm; bf16 + q_lora (GLM-5) -> 简单 bgemm; bf16 + 无 q_lora ->
+        # igemm; bf16 + q_lora (GLM-5) -> SME bgemm; bf16 + 无 q_lora ->
         # 原有 bmm_kunpeng 路径
         if self.q_lora_rank is not None and self._kv_b_is_int8():
             # int8 packed igemm path
@@ -173,9 +173,9 @@ class DeepseekMLAKunpengForwardMixin:
                 k_pe = k_pe_out
 
         elif self.q_lora_rank is not None:
-            # bf16 kv_b + q_lora (GLM-5): 简单 bgemm
+            # bf16 kv_b + q_lora (GLM-5): SME bgemm
             q_nope_input = q_nope.transpose(0, 1)
-            q_nope_out = kunpeng.bgemm_kunpeng(q_nope_input, self.w_kc_bf16_packed)
+            q_nope_out = kunpeng.batched_bgemm_kunpeng(q_nope_input, self.w_kc_bf16_packed)
             q_nope_out = q_nope_out.transpose(0, 1)
 
             if self.rotary_emb is not None:
@@ -514,7 +514,7 @@ class DeepseekMLAKunpengForwardMixin:
             attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         # w_vc (kv_b_proj 吸收) 与 w_kc 同一分派: int8 (DSV3.2) ->
-        # packed igemm; bf16 + q_lora (GLM-5) -> 简单 bgemm;
+        # packed igemm; bf16 + q_lora (GLM-5) -> SME bgemm;
         # bf16 + 无 q_lora -> 原有 bmm_kunpeng (不动)
         if self.q_lora_rank is not None and self._kv_b_is_int8():
             bs = attn_output.size(1)
@@ -538,9 +538,9 @@ class DeepseekMLAKunpengForwardMixin:
                 -1, self.num_local_heads * self.v_head_dim
             )
         elif self.q_lora_rank is not None:
-            # bf16 kv_b + q_lora (GLM-5): 简单 bgemm
+            # bf16 kv_b + q_lora (GLM-5): SME bgemm
             attn_bmm_input = attn_output.transpose(0, 1)
-            c_tensor_3d = kunpeng.bgemm_kunpeng(attn_bmm_input, self.w_vc_bf16_packed)
+            c_tensor_3d = kunpeng.batched_bgemm_kunpeng(attn_bmm_input, self.w_vc_bf16_packed)
             attn_bmm_output = kunpeng.contiguous_kunpeng(
                 c_tensor_3d.transpose(0, 1)).reshape(
                 -1, self.num_local_heads * self.v_head_dim

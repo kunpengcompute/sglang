@@ -110,6 +110,69 @@ void batched_gemm_pack_allthreads_kunpeng(at::Tensor input, at::Tensor out)
     kutacc::batch_bf16_gemm_pack(bs, m, n, stride_bs, stride_m, input.data_ptr(), out.data_ptr(), dtype);
 }
 
+at::Tensor batched_bgemm_prepack_kunpeng(const at::Tensor &weight)
+{
+    // [B, K, N] -> [B, N, K] 转置 + SME 打包 (dtype=2 B 矩阵微块布局),
+    // 供 batched_bgemm_kunpeng 的 batch_bf16_bf16_packed_gemm_bf16 消费.
+    // loader 侧: w_kc [H, qk_nope, kv_lora] / w_vc [H, kv_lora, v_head]
+    // (BMM 语义 [B, K, N]).
+    TORCH_CHECK(weight.dim() == 3, "weight must be 3D [B, K, N]");
+    TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
+    const int64_t K = weight.size(1);
+    const int64_t N = weight.size(2);
+    TORCH_CHECK(K % 32 == 0 && N % 32 == 0,
+                "batched_bgemm_prepack_kunpeng: requires k % 32 == 0 and n % 32 == 0"
+                " (SME bgemm constraint), got k=",
+                K, ", n=", N);
+    auto w_t = weight.transpose(1, 2).contiguous();  // [B, N, K]
+    auto packed = at::empty_like(w_t);
+    kutacc::batch_bf16_gemm_pack(w_t.size(0), N, K, w_t.stride(0), w_t.stride(1),
+                                 w_t.data_ptr(), packed.data_ptr(), 2);
+    return packed;
+}
+
+void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output)
+{
+    //   input  [B, M, K] bf16 (外维可 strided, 如 transpose 视图; 末维连续)
+    //   weight [B, N, K] bf16 (batched_bgemm_prepack_kunpeng 的 SME 打包输出)
+    //   output [B, M, N] bf16 (直接写入; 外维可 strided)
+    // act 逐次 SME 打包后走 batch_bf16_bf16_packed_gemm_bf16 (MOPA 外积,
+    // m 任意, k/n 需 %32==0), 布局契约见 kutacc.h.
+    TORCH_CHECK(input.dim() == 3, "input must be 3D [B, M, K]");
+    TORCH_CHECK(weight.dim() == 3, "weight must be 3D [B, N, K]");
+    TORCH_CHECK(output.dim() == 3, "output must be 3D [B, M, N]");
+    TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be BF16");
+    TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
+    TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output must be BF16");
+    TORCH_CHECK(input.stride(2) == 1, "input last dim must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous (prepacked)");
+    TORCH_CHECK(output.stride(2) == 1, "output last dim must be contiguous");
+
+    const int64_t B = input.size(0);
+    const int64_t M = input.size(1);
+    const int64_t K = input.size(2);
+    const int64_t N = weight.size(1);
+
+    TORCH_CHECK(weight.size(0) == B && weight.size(2) == K, "weight shape mismatch");
+    TORCH_CHECK(output.size(0) == B && output.size(1) == M && output.size(2) == N,
+                "output shape mismatch");
+    TORCH_CHECK(K % 32 == 0 && N % 32 == 0,
+                "batched_bgemm_kunpeng: requires k % 32 == 0 and n % 32 == 0"
+                " (SME bgemm constraint), got k=",
+                K, ", n=", N);
+    if (B == 0 || M == 0 || N == 0 || K == 0)
+        return;
+
+    auto act_packed = at::empty({B, M, K}, input.options());
+    kutacc::batch_bf16_gemm_pack(B, M, K, input.stride(0), input.stride(1),
+                                 input.data_ptr(), act_packed.data_ptr(), 2);
+    kutacc::batch_bf16_bf16_packed_gemm_bf16(
+        B, M, N, K, output.stride(0), output.stride(1),
+        reinterpret_cast<bfloat16_t *>(act_packed.data_ptr()),
+        reinterpret_cast<bfloat16_t *>(weight.data_ptr()),
+        reinterpret_cast<bfloat16_t *>(output.data_ptr()));
+}
+
 void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
                               int64_t num_threads)
 {

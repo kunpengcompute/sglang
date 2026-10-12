@@ -1346,11 +1346,11 @@ def _setup_fake_indexer_topk_mtp_kunpeng():
     register_op('fake_indexer_topk_mtp_kunpeng', shape_infer, eager_fn)
 
 
-def _setup_bgemm_kunpeng():
-    # Simple bf16 batched GEMM (naive fp32 accumulation) for the bf16
-    # kv_b_proj MLA absorb path (e.g. GLM-5): out = input @ weight^T per
-    # batch item. weight is the bgemm_prepack_kunpeng transpose output
-    # ([B, N, K]); input [B, M, K] (outer dims may be strided views).
+def _setup_batched_bgemm_kunpeng():
+    # SME bf16 batched GEMM for the bf16 kv_b_proj MLA absorb path (e.g.
+    # GLM-5): out = input @ weight^T per batch item. weight is the
+    # batched_bgemm_prepack_kunpeng SME-packed output ([B, N, K]); input [B, M, K]
+    # (outer dims may be strided views).
     def shape_infer(input, weight):
         B, M, K = input.shape
         N = weight.shape[1]
@@ -1360,10 +1360,10 @@ def _setup_bgemm_kunpeng():
         B, M, K = input.shape
         N = weight.shape[1]
         out = torch.empty((B, M, N), dtype=input.dtype, device=input.device)
-        torch.ops.sgl_kernel.bgemm_kunpeng(input, weight, out)
+        torch.ops.sgl_kernel.batched_bgemm_kunpeng(input, weight, out)
         return out
 
-    register_op('bgemm_kunpeng', shape_infer, eager_fn)
+    register_op('batched_bgemm_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_shm_mla_o_alltoall_long_context_kunpeng():
@@ -1598,7 +1598,7 @@ def setup():
     _setup_dsa_topk_slots_kunpeng()
     _setup_fake_indexer_topk_kunpeng()
     _setup_fake_indexer_topk_mtp_kunpeng()
-    _setup_bgemm_kunpeng()
+    _setup_batched_bgemm_kunpeng()
     _setup_shm_mla_o_alltoall_long_context_kunpeng()
     _setup_lc_mark_empty_lse_kunpeng()
     _setup_flash_mla_reduce_kunpeng()

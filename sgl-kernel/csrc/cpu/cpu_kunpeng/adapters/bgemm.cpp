@@ -17,10 +17,10 @@
 #include "register_graph_kernels.h"
 #include <ATen/Tensor.h>
 
-void bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output);
+void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output);
 
 // 直写式 (output 为注册的图输出张量), 张量序 = [input, weight, output],
 // 无标量参数, 直接注册原函数.
 static KernelRegistrar _r_bgemm(
-    "bgemm_kunpeng",
-    make_dispatch_v<decltype(&bgemm_kunpeng), &bgemm_kunpeng>);
+    "batched_bgemm_kunpeng",
+    make_dispatch_v<decltype(&batched_bgemm_kunpeng), &batched_bgemm_kunpeng>);
