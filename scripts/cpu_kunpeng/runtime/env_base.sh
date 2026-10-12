@@ -89,11 +89,8 @@ export KUPL_PATH="/path-to-KUPL"
 export KUTACC_PATH="/path-to-KUTACC"
 export SGLANG_PATH="/path-to-SGLang"
 export DATASET_PATH="/path-to-dataset"
-export CONDA_ENV_PATH="$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME"
-export PYINSTALL_PATH="$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall"
 # Required when SGLANG_ENABLE_TOKENIZER_SEPERATE=1 (used by tokenizer-side HTTP servers)
 export LIBPTHREAD_HOOK_PATH="/path/to/libpthread_hook.so"
-export GEMM_TILING_PLAN_FILE="$SGLANG_PATH/scripts/cpu_kunpeng/configs/gemm_32_tiling.csv"
 # Kunpeng SDMA driver
 export SDMA_KO_PATH="/path-to-sdma-ko"
 # Required when SGLANG_ENABLE_KUCCL=1
@@ -149,8 +146,8 @@ export SGLANG_KUNPENG_ALLTOALL_FENCE=0  # 1 = explicit kupl_shm_fence after MLA 
 export SGLANG_KUNPENG_ALLREDUCE_NAIVE=0  # 1 = non-kutacc naive shm allreduce
 export SGLANG_KUNPENG_LC_DP_RANKS=""  # comma-separated DP ranks running long-context decode CP (e.g. "14,15"); empty = all regular; must be identical between prefill and decode instances
 export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096  # requests with input_len + max_new_tokens >= this go to LC DP ranks; must exceed every regular rank's max_req_input_len
-export SGLANG_KUNPENG_RDMA_ALLGATHER=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
-export SGLANG_KUNPENG_RDMA_BCAST=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang
+export SGLANG_KUNPENG_RDMA_ALLGATHER=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/sglang_930
+export SGLANG_KUNPENG_RDMA_BCAST=1  # requires kutacc built from https://gitcode.com/zhengzhong722/kutacc/tree/sglang_930
 export SGLANG_KUNPENG_RDMA_PP_COMM=1  # 1 = enable RDMA communication between PP ranks for rids
 export SGLANG_KUNPENG_PP_LAYOUT=0  # PP layout: 0 = node_block (a node maps to one PP stage, legacy); 1 = interleave (every node hosts all PP stages: rin 0..7 -> PP0, 8..15 -> PP1).
 export SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE=0  # 1 = forced MoE load balancing (perf-test only, correctness not preserved)
@@ -236,6 +233,15 @@ fi
 if [[ -f "$SCRIPT_DIR/runtime/.user_env_base.sh" ]]; then
     source "$SCRIPT_DIR/runtime/.user_env_base.sh" "$USER_ENV_ROLE"
 fi
+
+# ------------------------------------------------------------
+# Derived paths, resolved after the user env files above so that both the
+# inputs (CONDA_BASE_PATH / CONDA_ENV_NAME / SGLANG_PATH) and the derived
+# values themselves can be overridden there: unset -> default, user-set wins.
+# ------------------------------------------------------------
+export CONDA_ENV_PATH="${CONDA_ENV_PATH:-$CONDA_BASE_PATH/envs/$CONDA_ENV_NAME}"
+export PYINSTALL_PATH="${PYINSTALL_PATH:-$SGLANG_PATH/scripts/cpu_kunpeng/pyinstall}"
+export GEMM_TILING_PLAN_FILE="${GEMM_TILING_PLAN_FILE:-$SGLANG_PATH/scripts/cpu_kunpeng/configs/gemm_32_tiling.csv}"
 
 # ------------------------------------------------------------
 # Mooncake master address (KUNPENG_HICACHE_BACKEND=mooncake). Resolved after

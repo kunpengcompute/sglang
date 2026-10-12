@@ -34,12 +34,14 @@ _is_cpu_920f = is_cpu_920f()
 def _rdma_allgather_available() -> bool:
     """Whether the DP-attention sync may use the RDMA allgather.
 
-    The RDMA allgather requires the MoE RDMA communication domain
-    (``g_ds_conn_info``) to have been created via ``moe_comm_create_kunpeng``.
-    That only happens when MoE dispatch runs over RDMA (not local SHM
-    dispatch) AND the current rank actually has MoE layers.  For local
-    dispatch (e.g. single-node pp=16) or MoE-less ranks (e.g. PP0 in a
-    MoE-on-PP1-only split), fall back to ``torch.all_gather_into_tensor``.
+    The RDMA allgather requires the MoE RDMA communication domain state
+    (``g_process_group`` etc., saved by ``moe_comm_create_kunpeng``; the ctrl
+    domain itself is created lazily on first use).  That only happens when
+    MoE dispatch runs over RDMA (not local SHM dispatch) AND the current rank
+    actually has MoE layers.  For local dispatch (e.g. single-node pp=16) or
+    MoE-less ranks (e.g. PP0 in a MoE-on-PP1-only split), or when
+    SGLANG_KUNPENG_RDMA_ALLGATHER=0, fall back to
+    ``torch.all_gather_into_tensor``.
     """
     if not (_is_cpu_920f and envs.SGLANG_KUNPENG_RDMA_ALLGATHER.get()):
         return False
@@ -53,16 +55,32 @@ def _rdma_allgather_available() -> bool:
     return state is not None and state.rdma_comm_created
 
 
-# Forward-count parity check (kunpeng 920F): auto-on when graph capture is
-# on (the per-forward RDMA barrier in ModelRunner._forward_raw then makes
-# count divergence a deadlock), or force-on with
-# SGLANG_KUNPENG_CHECK_FWD_COUNT=1. Graph profile *recording* is
-# request-driven (/start_profile//stop_profile) and adds no collectives,
-# so it does not need this check.
+# Forward-count parity check (kunpeng 920F): force-on with
+# SGLANG_KUNPENG_CHECK_FWD_COUNT=1, or auto-on while a graph profile session
+# is active (kunpeng_graph_profile_active, request-driven via
+# /start_profile//stop_profile — the old env-var gate is gone).  Captured
+# graphs replay per-forward RDMA barriers; a count divergence while recording
+# deadlocks the profile session, hence the check.
 _is_kunpeng_fwd_count_check = _is_cpu_920f and (
-    is_kunpeng_graph_capture()
-    or os.environ.get("SGLANG_KUNPENG_CHECK_FWD_COUNT", "0") == "1"
+    os.environ.get("SGLANG_KUNPENG_CHECK_FWD_COUNT", "0") == "1"
 )
+
+
+def _fwd_count_check_active() -> bool:
+    """Static flag OR an active graph profile session (checked at call time:
+    profile sessions start/stop via HTTP, not at process init)."""
+    if _is_kunpeng_fwd_count_check:
+        return True
+    try:
+        from sglang.srt.hardware_backend.cpu_kunpeng.graph_runner.kunpeng_graph_runner import (
+            kunpeng_graph_profile_active,
+        )
+
+        return kunpeng_graph_profile_active()
+    except ImportError:
+        return False
+
+
 _fwd_count_check_last = 0
 
 # ---------------------------------------------------------------------------
@@ -73,9 +91,9 @@ _fwd_count_check_last = 0
 # every forward would be expensive, so we keep a pair of persistent buffers per
 # (device, comm_size, per_rank_bytes) key and register them lazily on first use.
 #
-# The global `g_ds_conn_info` RDMA communication domain is assumed to already
-# have been created by `moe_comm_create_kunpeng` during MoE token-dispatcher
-# initialization.
+# The dedicated ctrl-plane RDMA domain `g_ctrl_ds_conn_info` (independent
+# QPs/CQs) is created lazily by the C++ side on the first init call below;
+# it isolates these control collectives from MoE data-plane traffic.
 # ---------------------------------------------------------------------------
 _RDMA_AG_LOCK = threading.Lock()
 _RDMA_AG_STATE: dict[tuple, dict] = {}
@@ -191,9 +209,14 @@ class MLPSyncBatchInfo:
         )
 
         comm_size = self.dp_size * self.tp_size * self.cp_size
-        _rdma_allgather_info_kunpeng(
-            local_info_tensor, global_info_tensor, comm_size
-        )
+        if _rdma_allgather_available():
+            _rdma_allgather_info_kunpeng(
+                local_info_tensor, global_info_tensor, comm_size
+            )
+        else:
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor, local_info_tensor, group=group
+            )
         if device == "cpu":
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
@@ -254,12 +277,22 @@ def _check_forward_count_consistency(tp_group: "GroupCoordinator") -> None:
     delta = local - _fwd_count_check_last
     _fwd_count_check_last = local
 
-    group = tp_group.cpu_group
-    gathered = torch.empty(group.size(), dtype=torch.int64)
-    torch.distributed.all_gather_into_tensor(
-        gathered, torch.tensor([delta], dtype=torch.int64), group=group
-    )
-    deltas = gathered.tolist()
+    if _rdma_allgather_available():
+        # Ctrl-plane RDMA allgather (dedicated domain, same membership: EP==TP
+        # covers the full TP group); avoids the gloo/kuccl busy-wait when some
+        # DP groups are idle.
+        comm_size = tp_group.cpu_group.size()
+        local_info = torch.tensor([delta], dtype=torch.int64)
+        gathered = torch.empty(comm_size, 1, dtype=torch.int64)
+        _rdma_allgather_info_kunpeng(local_info, gathered, comm_size)
+        deltas = gathered.view(-1).tolist()
+    else:
+        group = tp_group.cpu_group
+        gathered = torch.empty(group.size(), dtype=torch.int64)
+        torch.distributed.all_gather_into_tensor(
+            gathered, torch.tensor([delta], dtype=torch.int64), group=group
+        )
+        deltas = gathered.tolist()
     if len(set(deltas)) != 1:
         raise RuntimeError(
             f"[fwd-count-check] per-rank forward counts diverged since the "
@@ -296,7 +329,7 @@ def prepare_mlp_sync_batch_raw(
 
     # Forward-count parity check; requires overlap schedule disabled (with
     # overlap the previous iteration's forwards may still be running).
-    if _is_kunpeng_fwd_count_check and disable_overlap_schedule:
+    if _fwd_count_check_active() and disable_overlap_schedule:
         _check_forward_count_consistency(tp_group)
 
     # Check if other DP workers have running batches
@@ -343,7 +376,7 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
-    # Fallback Kunpeng 920F where device_group is not initialized in "GroupCoordinator 
+    # Fallback Kunpeng 920F where device_group is not initialized in "GroupCoordinator
     # mooncake init".  Without this, all_gather_into_tensor receives group=None and
     # silently falls back to the world group, causing size mismatch when PP>1
     if group is None:
