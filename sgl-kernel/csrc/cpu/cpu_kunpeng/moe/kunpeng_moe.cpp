@@ -44,6 +44,9 @@ moe_comm_h g_moe_comm_h = &g_moe_comm;
 
 kutacc::kurmcl_conn_info_h g_ds_conn_info = nullptr;         // = g_moe_comm.local_ds_conn_info
 kutacc::kurmcl_conn_info_h g_global_ds_conn_info = nullptr;  // = g_moe_comm.global_ds_conn_info
+// Dedicated ctrl-plane domain for the scheduler sync allgather; created
+// lazily by ensure_ctrl_domain_kunpeng() on first use.
+kutacc::kurmcl_conn_info_h g_ctrl_ds_conn_info = nullptr;
 bool g_comm_initialized = false;                             // MoE sub-domain initialized
 bool g_global_comm_initialized = false;                      // Global domain initialized
 int g_comm_size = 0;
@@ -179,6 +182,28 @@ void moe_comm_create_kunpeng(int64_t process_group_ptr)
     g_comm_initialized = true;
 }
 
+void ensure_ctrl_domain_kunpeng()
+{
+    if (g_ctrl_ds_conn_info != nullptr) return;
+
+    // Lazy ctrl-plane domain for the scheduler sync allgather: same PG as the
+    // MoE sub-domain, own QPs/CQs/PDs so its CQEs never interleave with MoE
+    // data-plane traffic.  Collective; all ranks reach it at the same
+    // scheduler sync.  Never called when the RDMA allgather path is unused.
+    TORCH_CHECK(g_comm_initialized, "MoE communication domain not initialized (call moe_comm_create first)");
+    kutacc::kurmcl_oob_cb_t oob_cbs;
+    kutacc::kurmcl_oob_cb_h oob_cbs_h = &oob_cbs;
+    oob_cbs_h->oob_allgather = kunpeng_oob::kurmcl_oob_allgather;
+    oob_cbs_h->oob_barrier = kunpeng_oob::kurmcl_oob_barrier;
+    oob_cbs_h->oob_alltoall = kunpeng_oob::kurmcl_oob_alltoall;
+
+    int ret = kutacc::kurmcl_comm_create_independent(g_comm_size, g_comm_rank, oob_cbs_h,
+                                                     (void *)g_process_group, &g_ctrl_ds_conn_info);
+    TORCH_CHECK(ret == KUTACC_OK, "kurmcl_comm_create_independent (ctrl) failed with code ", ret);
+    std::cout << "[KuTACC] Init ctrl RDMA communication domain, comm_size= " << g_comm_size
+              << ", comm_rank= " << g_comm_rank << std::endl;
+}
+
 void moe_comm_barrier_kunpeng()
 {
     if (g_moe_comm_h->local_ds_conn_info != nullptr && g_comm_initialized) {
@@ -197,6 +222,10 @@ void moe_comm_finalize_kunpeng()
         free(g_moe_comm.global_ds_conn_info);
         g_moe_comm.global_ds_conn_info = nullptr;
         g_global_ds_conn_info = nullptr;
+    }
+    if (g_ctrl_ds_conn_info != nullptr) {
+        free(g_ctrl_ds_conn_info);
+        g_ctrl_ds_conn_info = nullptr;
     }
     g_comm_initialized = false;
     g_global_comm_initialized = false;

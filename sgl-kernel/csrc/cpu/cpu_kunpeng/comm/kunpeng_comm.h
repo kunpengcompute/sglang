@@ -33,11 +33,23 @@
  */
 extern kutacc::kurmcl_conn_info_h g_ds_conn_info;
 extern bool g_comm_initialized;
+// Dedicated ctrl-plane domain for the scheduler sync allgather.  Created
+// lazily by ensure_ctrl_domain_kunpeng() (own QPs/CQs/PDs), so its
+// count-based recv waits can never consume MoE data-plane completions.
+extern kutacc::kurmcl_conn_info_h g_ctrl_ds_conn_info;
+
+/**
+ * Lazily create the ctrl-plane RDMA domain on the first
+ * rdma_allgather_full_init_kunpeng call.  Collective over the MoE sub-domain
+ * PG (all ranks reach it at the same scheduler sync).  No-op if it already
+ * exists; never invoked when the RDMA allgather path is unused.
+ */
+void ensure_ctrl_domain_kunpeng();
 
 /**
  * Initialize the persistent RDMA full-mesh allgather resources (register MR
  * and exchange remote addresses via OOB).  Must be called after
- * moe_comm_create_kunpeng().  Reuses g_ds_conn_info.
+ * moe_comm_create_kunpeng(); creates the ctrl domain on first call.
  *
  * @param send_buf  Per-rank send buffer (registered with the NIC).
  * @param send_size Per-rank send size in bytes.
