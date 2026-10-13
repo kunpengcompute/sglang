@@ -1971,6 +1971,9 @@ class HostPoolGroup:
     def get_ksize_per_token(self):
         return self.anchor_entry.host_pool.get_ksize_per_token()
 
+    def get_size_per_token(self):
+        return self.anchor_entry.host_pool.get_size_per_token()
+
     def get_pool(self, name: PoolName):
         return self.entry_map[name].host_pool
 
@@ -2087,6 +2090,8 @@ class NSAIndexerPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
+        if _is_cpu_920f:
+            pin_memory = False
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
@@ -2198,6 +2203,11 @@ class NSAIndexerPoolHost(HostKVCache):
         )
         return host_page_indices, device_page_indices
 
+    def _indexer_host_layer_view(self, layer_id: int) -> torch.Tensor:
+        if self.layout == "page_first":
+            return self.index_k_with_scale_buffer[:, layer_id].squeeze(1)
+        return self.index_k_with_scale_buffer[layer_id]
+
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
@@ -2226,6 +2236,18 @@ class NSAIndexerPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "kunpeng":
+            if self.layout not in ("layer_first", "page_first"):
+                raise ValueError(
+                    "io backend 'kunpeng' supports the layer_first and "
+                    f"page_first indexer layouts, got {self.layout!r}"
+                )
+            hicache_page_copy(
+                dst=device_pool.index_k_with_scale_buffer[layer_id],
+                src=self._indexer_host_layer_view(layer_id),
+                dst_indices=device_page_indices,
+                src_indices=host_page_indices,
+            )
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
@@ -2278,6 +2300,19 @@ class NSAIndexerPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "kunpeng":
+            if self.layout not in ("layer_first", "page_first"):
+                raise ValueError(
+                    "io backend 'kunpeng' supports the layer_first and "
+                    f"page_first indexer layouts, got {self.layout!r}"
+                )
+            for layer_id in range(self.layer_num):
+                hicache_page_copy(
+                    dst=self._indexer_host_layer_view(layer_id),
+                    src=device_pool.index_k_with_scale_buffer[layer_id],
+                    dst_indices=host_page_indices,
+                    src_indices=device_page_indices,
+                )
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(

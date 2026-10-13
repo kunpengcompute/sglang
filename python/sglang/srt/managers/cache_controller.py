@@ -41,7 +41,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, NSATokenToKVPool
 from sglang.srt.utils import get_device_module, is_cpu_920f
 from sglang.srt.environ import envs
 
@@ -407,6 +407,9 @@ class HiCacheController:
         self.flat_write: Optional[torch.Tensor] = None
         self.flat_read: Optional[torch.Tensor] = None
         self.flat_io_batch_pages = 0
+        self.flat_write_idx: Optional[torch.Tensor] = None
+        self.flat_read_idx: Optional[torch.Tensor] = None
+        self.indexer_page_elems = 0
         self.write_policy = write_policy
         self.page_size = page_size
         self.io_backend = io_backend
@@ -808,6 +811,26 @@ class HiCacheController:
             dtype=self.mem_pool_device.store_dtype,
         )
         self.flat_read = torch.empty_like(self.flat_write)
+
+        pool = self.mem_pool_device
+        indexer_elems_per_token = (
+            pool.index_head_dim
+            + pool.index_head_dim // pool.quant_block_size * 4
+            if isinstance(pool, NSATokenToKVPool)
+            else 0
+        )
+        if indexer_elems_per_token:
+            self.indexer_page_elems = (
+                self.layer_num * self.page_size * indexer_elems_per_token
+            )
+            self.flat_write_idx = torch.empty(
+                (self.flat_io_batch_pages, self.indexer_page_elems),
+                dtype=NSATokenToKVPool.index_k_with_scale_buffer_dtype,
+            )
+            self.flat_read_idx = torch.empty_like(self.flat_write_idx)
+            for buffer in (self.flat_write_idx, self.flat_read_idx):
+                self.storage_backend.register_io_buffer(buffer)
+
         for buffer in (self.flat_write, self.flat_read):
             self.storage_backend.register_io_buffer(buffer)
 
@@ -821,6 +844,27 @@ class HiCacheController:
                 f"{pages} page(s) x {self.page_size}"
             )
         return indices.reshape(pages, self.page_size)[:, 0].contiguous()
+
+    @staticmethod
+    def _indexer_keys(hashes) -> list:
+        """Flat-interface keys of the NSA indexer blobs (parallel to the KV ones).
+
+        The suffix keeps them in their own namespace: a page's indexer blob is
+        a different size than its KV blob and is written/read separately.
+        """
+        return [f"{h}@idx" for h in hashes]
+
+    def _indexer_page_layers(self) -> list:
+        """Per-layer ``(page_num, 1, page_stride)`` views of the indexer buffer.
+
+        A page occupies exactly one row of every per-layer tensor, so the batch
+        flatten/unflatten kernels are used with ``page_size=1``.
+        """
+        stride = self.indexer_page_elems // self.layer_num
+        return [
+            t.view(-1, 1, stride)
+            for t in self.mem_pool_device.index_k_with_scale_buffer
+        ]
 
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
@@ -861,6 +905,8 @@ class HiCacheController:
         self.enable_storage = False
         self.flat_write = None
         self.flat_read = None
+        self.flat_write_idx = None
+        self.flat_read_idx = None
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
         # Now it's safe to clear the stop event for future re-attach.
@@ -1415,19 +1461,39 @@ class HiCacheController:
                 if not hit:
                     break
                 hit_pages += 1
+            if hit_pages and self.indexer_page_elems:
+                idx_hits = self.storage_backend.batch_get_flat(
+                    self._indexer_keys(batch_hashes[:hit_pages]),
+                    [self.flat_read_idx[j] for j in range(hit_pages)],
+                    extra_info,
+                )
+                idx_hit_pages = 0
+                for hit in idx_hits:
+                    if not hit:
+                        break
+                    idx_hit_pages += 1
+                hit_pages = idx_hit_pages
             if hit_pages:
                 # Only the leading run of hits is published, and only after its
                 # bytes have actually landed in L1.
+                page_starts = self._device_page_starts(
+                    batch_indices[: hit_pages * self.page_size],
+                    hit_pages,
+                    "L3->L1",
+                )
                 hicache_page_unflatten_batch(
                     layers,
                     self.flat_read[:hit_pages],
-                    self._device_page_starts(
-                        batch_indices[: hit_pages * self.page_size],
-                        hit_pages,
-                        "L3->L1",
-                    ),
+                    page_starts,
                     self.page_size,
                 )
+                if self.indexer_page_elems:
+                    hicache_page_unflatten_batch(
+                        self._indexer_page_layers(),
+                        self.flat_read_idx[:hit_pages],
+                        page_starts // self.page_size,
+                        1,
+                    )
             still_running = operation.increment(hit_pages * self.page_size)
 
             if debug:
@@ -1790,6 +1856,24 @@ class HiCacheController:
                     extra_info,
                 )
             )
+            if success and self.indexer_page_elems:
+                page_ids = (
+                    self._device_page_starts(batch_indices, pages, "L1->L3")
+                    // self.page_size
+                )
+                hicache_page_flatten_batch(
+                    self._indexer_page_layers(),
+                    self.flat_write_idx[:pages],
+                    page_ids,
+                    1,
+                )
+                success = all(
+                    self.storage_backend.batch_set_flat(
+                        self._indexer_keys(batch_hashes),
+                        [self.flat_write_idx[j] for j in range(pages)],
+                        extra_info,
+                    )
+                )
 
             if debug:
                 t_end = time.perf_counter()
