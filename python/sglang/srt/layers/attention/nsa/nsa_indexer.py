@@ -1236,7 +1236,7 @@ class Indexer(MultiPlatformOp):
         # W8A8 IGEMM: q_lora is already the quantized (int8, scale) tuple
         # (validated above) and is consumed directly -- no separate quant
         # pass. The IGEMM's output is bf16 (dq inside the kernel).
-        q = self.wq_b(q_lora)[0]
+        q, _ = self.wq_b(q_lora)
         assert q.dtype == torch.bfloat16, (
             f"wq_b IGEMM output must be bf16, got {q.dtype}"
         )
@@ -1263,8 +1263,8 @@ class Indexer(MultiPlatformOp):
         q_pe, k_pe = kunpeng.rope_kunpeng(
             positions, q_pe, k_pe.unsqueeze(1), self.rotary_emb.cos_sin_cache
         )
-        q = kunpeng.cat_kunpeng(q_pe, q_nope, -1)  # [T, H, D]
-        k = kunpeng.cat_kunpeng(k_pe.squeeze(1), k_nope, -1)  # [T, D]
+        q = kunpeng.cat_kunpeng(q_nope, q_pe, -1)  # [T, H, D]
+        k = kunpeng.cat_kunpeng(k_nope, k_pe.squeeze(1), -1)  # [T, D]
 
         # Fill the index-K cache first: the scoring below reads the full
         # window including the current tokens' keys.
