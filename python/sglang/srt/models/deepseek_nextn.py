@@ -27,6 +27,7 @@ from sglang.srt.configs.model_config import is_deepseek_nsa
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
@@ -255,6 +256,11 @@ class DeepseekModelNextN(nn.Module):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
+        # DSA (NSA): read the top-k carried across MTP draft iterations
+        # (IndexTopKShareState.mtp_iteration wraps EAGLEWorker.draft_forward;
+        # step 0 sees None and recomputes via should_run_indexer's NextN
+        # fallback, later steps reuse the published step-0 top-k).
+        index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual, topk_indices = self.decoder(
                 positions,
@@ -262,7 +268,10 @@ class DeepseekModelNextN(nn.Module):
                 forward_batch,
                 residual,
                 zero_allocator,
+                prev_topk_indices=index_topk_share.topk_indices,
             )
+        index_topk_share.update(topk_indices)
+        index_topk_share.publish()
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:

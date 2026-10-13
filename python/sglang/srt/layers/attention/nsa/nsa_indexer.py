@@ -74,6 +74,35 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _bf16_linear_kunpeng(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """bf16 linear (out = x @ W^T) via the registered kunpeng gemm ops.
+
+    Mirrors the router / lm_head / MTP-head call sites so the eager and
+    the graph-captured paths execute the identical kernel; ``weight`` is
+    the raw [N, K] Linear parameter (bf16).
+    """
+    from sglang.srt.graph import ops as kunpeng
+
+    M, K = x.shape
+    N = weight.shape[0]
+    tile_m, tile_n, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(
+        M, N, K
+    )
+    blocks_in_k = K // tile_k
+    ws_numel = blocks_in_k * N * M + 1024 if blocks_in_k > 1 else 0
+    packed = kunpeng.bf16_gemm_pack_kunpeng(x, tile_m, tile_k)
+    return kunpeng.bf16_packed_gemm_kunpeng(
+        packed,
+        weight,
+        kunpeng.alloc_buffer(
+            ws_numel,
+            dtype=torch.bfloat16,
+            alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get(),
+        ),
+        32,
+    )
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -160,6 +189,44 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def _validate_cpu_indexer_input(
+    x: torch.Tensor,
+    q_lora: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Assert the 920F indexer input contracts (fail loudly, never cast):
+
+    - x: the UNQUANTIZED bf16 hidden_states. The indexer's weights_proj /
+      wk are bf16 bgemm projections; a (int8, scale) tuple here means the
+      NSA branch of LayerCommunicator.prepare_attn regressed -- casting
+      the raw int8 codes to bf16 would silently produce garbage (the
+      per-row scale carries the magnitude).
+    - q_lora: the QUANTIZED (int8, scale) tuple from
+      q_a_layernorm(quantize=True) -- the indexer's wq_b is an int8 W8A8
+      IGEMM (same as q_b_proj) whose apply consumes the pre-quantized
+      activation directly, skipping a separate quant pass.
+    """
+    if isinstance(x, tuple):
+        raise TypeError(
+            "Indexer.forward_cpu expects an unquantized bf16 hidden_states "
+            "tensor; got a quantized tuple (likely (int8, scale) from the "
+            "920F fused add+rmsnorm+quant path). The NSA branch in "
+            "LayerCommunicator.prepare_attn must keep hidden_states bf16."
+        )
+    assert x.dtype == torch.bfloat16, (
+        f"Indexer.forward_cpu expects bf16 hidden_states, got {x.dtype}"
+    )
+    assert (
+        isinstance(q_lora, tuple)
+        and len(q_lora) == 2
+        and q_lora[0].dtype == torch.int8
+    ), (
+        "Indexer.forward_cpu expects the quantized (int8, scale) tuple from "
+        "q_a_layernorm(quantize=True) as q_lora (wq_b is an int8 IGEMM); "
+        f"got {type(q_lora)}"
+    )
+    return x, q_lora
+
+
 class Indexer(MultiPlatformOp):
     def __init__(
         self,
@@ -227,8 +294,14 @@ class Indexer(MultiPlatformOp):
             params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
+        # On 920F the CPU path runs k_norm through the bf16 layernorm_cpu
+        # kernel (graph-capture path), matching the NPU bf16 semantics;
+        # elsewhere keep the original dtype selection.
         self.k_norm = LayerNorm(
-            self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+            self.head_dim,
+            dtype=torch.bfloat16
+            if (_use_aiter or is_cpu_920f())
+            else torch.float32,
         )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
@@ -239,6 +312,17 @@ class Indexer(MultiPlatformOp):
             is_neox_style=is_neox_style,
             device=get_global_server_args().device,
         )
+        if (
+            is_cpu_920f()
+            and self.rotary_emb is not None
+            and self.rotary_emb.cos_sin_cache.dtype != torch.bfloat16
+        ):
+            # The kunpeng rope kernel (rope_kunpeng) consumes a bf16
+            # cos_sin cache; align once at construction so the tensor
+            # identity stays stable for the graph capture (fixed weights).
+            self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(
+                torch.bfloat16
+            )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
@@ -1067,34 +1151,51 @@ class Indexer(MultiPlatformOp):
     def forward_cpu(
         self,
         x: torch.Tensor,
-        q_lora: torch.Tensor,
+        q_lora: Tuple[torch.Tensor, torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        """CPU dispatch hook (MultiPlatformOp): only Kunpeng 920F has an
-        indexer implementation (the bring-up fake) for now.
+        """CPU dispatch hook (MultiPlatformOp): Kunpeng 920F real indexer.
 
-        The fake: with the bring-up regime (total context <= index_topk)
-        every token is selected, so the sparse decode, sparse MTP and
-        sparse prefill paths are exactly equivalent to dense attention.
+        Real path (NPU bf16 semantics, see forward_npu), no pre-scaling.
+        Input contracts (asserted in _validate_cpu_indexer_input, never
+        silently cast): x is the UNQUANTIZED bf16 hidden_states; q_lora is
+        the QUANTIZED (int8, scale) tuple from q_a_layernorm(quantize=True)
+        -- wq_b is the same int8 W8A8 IGEMM as q_b_proj and consumes it
+        directly:
+          w = weights_proj(x)                [T, H] bf16 (unscaled gates)
+          q = wq_b(q_lora) -> [T, H, D] bf16; split rope/nope
+          k = k_norm(wk(x)) -> [T, D];      split rope/nope
+          rotary_emb(positions, q_pe, k_pe); concat back
+          pool.set_index_k_buffer(layer_id, out_cache_loc, k)
+          scoring via the kutacc paged kernel (bf16 overload): per-head
+          ReLU, fp32 accumulation, deterministic top-k (ties -> smaller id).
 
-        Decode: ALL positions [0, seq_len) per sequence (-1 padded to topk).
-        TARGET_VERIFY / DRAFT_EXTEND / absorbed prefill: [B, n, topk] rows
-        -- verify windows grow [0, ctx + t + 1); draft-extend live rows are
-        right-aligned over the model's left padding; absorbed prefill pads
-        to the batch-wide max extend len the same way.
+        SGLANG_KUNPENG_FAKE_INDEXER=1 switches to the graph bring-up fake
+        (see _forward_cpu_fake): with the bring-up regime (total context <=
+        index_topk) every token is selected, so the sparse decode / MTP
+        paths are exactly equivalent to dense attention; the absorbed
+        prefill keeps its metadata-time fake slots (dsa_prefill_slots_
+        kunpeng) and skips the indexer entirely. Used to cross-check the
+        real indexer.
 
-        The seq_len <= index_topk regime guard lives in
-        KunpengCpuBackend.init_forward_metadata (OUTSIDE the graph capture
-        region, so every replay round is checked; beyond topk the fake would
-        select the wrong tokens and needs the real indexer). Raises on a
-        non-920F CPU (no indexer implementation).
+        Output contract (matches the CUDA paths, the glm5 consumers and the
+        fake indexer -- FULL batch, every rank repeats the computation):
+          - DECODE: [B, topk] full-batch in-sequence positions.
+          - TARGET_VERIFY / DRAFT_EXTEND: [B, n, topk] with -1 padding;
+            n = speculative_num_draft_tokens. Valid entries form the
+            leading prefix.
+          - absorbed prefill: the flat [T, topk] SLOT-coordinate stream;
+            T == absorbed_flat_rows by the upstream a2a token alignment
+            (asserted at metadata time), sliced per rank by the backend's
+            absorbed_row_start window.
+        Consumers select their own windows (token_slice_start /
+        absorbed_row_start); the indexer itself never slices.
 
-        Output contract matches the CUDA paths: [q_rows, topk] int32
-        (MTP: [B, n, topk]), valid entries form the leading prefix, -1
-        padding.
+        return_indices=False: only fill the index-K cache (prefill producer
+        layers; shared layers never call this -- should_run_indexer).
         """
         if not is_cpu_920f():
             raise NotImplementedError(
@@ -1103,19 +1204,230 @@ class Indexer(MultiPlatformOp):
 
         from sglang.srt.graph import ops as kunpeng
 
+        if envs.SGLANG_KUNPENG_FAKE_INDEXER.get():
+            return self._forward_cpu_fake(
+                x, q_lora, positions, forward_batch, layer_id, return_indices
+            )
+
+        pool = forward_batch.token_to_kv_pool
+        meta = forward_batch.attn_backend.forward_metadata
+        out_loc = forward_batch.out_cache_loc
+        if not out_loc.is_contiguous():
+            out_loc = out_loc.contiguous()
+
+        # Input contracts (fail loudly, never silently cast):
+        #   x       unquantized bf16 hidden_states (feeds the bf16 bgemm
+        #           projections weights_proj / wk);
+        #   q_lora  quantized (int8, scale) from q_a_layernorm(quantize=True)
+        #           (feeds the wq_b int8 IGEMM directly).
+        # See _validate_cpu_indexer_input and the NSA branch of
+        # LayerCommunicator.prepare_attn.
+        x, q_lora = _validate_cpu_indexer_input(x, q_lora)
+
+        # Every projection / norm / RoPE below runs through the registered
+        # kunpeng graph ops, so the eager and the captured paths execute
+        # the identical kernels (bf16, NPU semantics).
+
+        # Head gates: bf16 output of weights_proj, unscaled (global positive
+        # constants do not change the top-k ranking; NPU bf16 semantics).
+        weights = _bf16_linear_kunpeng(x, self.weights_proj.weight)  # [T, H]
+
+        # q: [T, H, D] with interleaved rope/nope split. wq_b is an int8
+        # W8A8 IGEMM: q_lora is already the quantized (int8, scale) tuple
+        # (validated above) and is consumed directly -- no separate quant
+        # pass. The IGEMM's output is bf16 (dq inside the kernel).
+        q, _ = self.wq_b(q_lora)
+        assert q.dtype == torch.bfloat16, (
+            f"wq_b IGEMM output must be bf16, got {q.dtype}"
+        )
+        q = q.view(-1, self.n_heads, self.head_dim)
+        q_pe, q_nope = torch.split(
+            q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+
+        # k: [T, D]
+        k_proj = _bf16_linear_kunpeng(x, self.wk.weight)
+        k = kunpeng.layernorm_kunpeng(
+            k_proj,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.variance_epsilon,
+        )
+        k_pe, k_nope = torch.split(
+            k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+
+        # Interleaved RoPE via the registered op (odd_even_grouping matches
+        # the interleaved split above); the kernel is 3D-only, so k_pe goes
+        # through a [T, 1, rope_head_dim] view and back.
+        q_pe, k_pe = kunpeng.rope_kunpeng(
+            positions, q_pe, k_pe.unsqueeze(1), self.rotary_emb.cos_sin_cache
+        )
+        q = kunpeng.cat_kunpeng(q_nope, q_pe, -1)  # [T, H, D]
+        k = kunpeng.cat_kunpeng(k_nope, k_pe.squeeze(1), -1)  # [T, D]
+
+        # Fill the index-K cache first: the scoring below reads the full
+        # window including the current tokens' keys.
+        pool.set_index_k_buffer(layer_id=layer_id, loc=out_loc, index_k=k)
+        if not return_indices:
+            return None
+
+        # ---- top-k scoring over the paged index-K cache ----
+        # FULL-BATCH scoring, mirroring the fake indexer: q / weights /
+        # output cover ALL rows the model handed in (T = q.shape[0], a
+        # static per-graph shape; every rank repeats the full computation).
+        # The view tensors are the backend's per-step indexer view
+        # (metadata.indexer_*, built OUTSIDE the capture region from the
+        # GLOBAL batch). The scorer natively handles sum(cur_lens) <= T:
+        # it scores only the first sum(cur_lens) rows, so the draft-extend
+        # ragged rows (and the trailing mlp-pad rows, which stay unwritten
+        # and are never read) need no equality contract. The indexer only
+        # READS the views: no slicing, no tensor creation, no dynamic
+        # shapes. Consumers pick their own windows afterwards
+        # (token_slice_start for decode / MTP, absorbed_row_start for the
+        # flat prefill).
+        T = q.shape[0]
+        topk = self.index_topk
+        # Graph-managed buffer: the kutacc kernel writes every entry (the
+        # -1 padding included), so no pre-fill is needed and the eager and
+        # captured paths share the same allocation scheme.
+        output = kunpeng.alloc_buffer(T * topk, dtype=torch.int32).view(T, topk)
+        if T == 0:
+            return output
+
+        seq_lens = meta.indexer_seq_lens
+        cur_lens = meta.indexer_cur_lens
+        block_tables = meta.indexer_block_table
+        if seq_lens is None or cur_lens is None or block_tables is None:
+            # No indexer view for this forward (LC CP / empty batch):
+            # skip scoring; the consumer falls back to dense attention.
+            # The index-K cache filled above stays valid for later steps.
+            return None
+
+        page_size = pool.page_size
+        kv_paged = pool.get_index_k_buffer(layer_id).view(
+            -1, page_size, self.head_dim
+        )
+
+        # Persistent max-sized scratch shared by every backend instance
+        # and layer (context_len + draft tokens bound; see
+        # KunpengCpuBackend). The stable tensor identity lets the capture
+        # register it as a fixed input; per-step exact sizing (the old
+        # seq_lens.max().item() path) would freeze a stale bound inside
+        # the graph.
+        workspace = forward_batch.attn_backend.indexer_workspace
+        assert workspace is not None, (
+            "real indexer scoring requires the backend workspace "
+            "(KunpengCpuBackend.__init__ allocates it when NSA is enabled "
+            "and SGLANG_KUNPENG_FAKE_INDEXER is unset)"
+        )
+
+        # Absorbed prefill feeds the flat (rows, 1, H, D) sparse call whose
+        # slots are ABSOLUTE pool slots (kSlot); the decode / MTP consumers
+        # keep in-sequence positions (kPosition -> dsa_topk_slots_kunpeng).
+        output_coord = (
+            0 if forward_batch.forward_mode.is_extend_without_speculative() else 1
+        )
+        kunpeng.paged_mqa_logits_topk_kunpeng(
+            q,
+            kv_paged,
+            weights,
+            block_tables,
+            seq_lens,
+            cur_lens,
+            output,
+            workspace,
+            topk,
+            output_coord,
+        )
+        return self._reshape_cpu_indexer_output(output, forward_batch, topk)
+
+    def _reshape_cpu_indexer_output(
+        self,
+        output: torch.Tensor,
+        forward_batch: ForwardBatch,
+        topk: int,
+    ) -> torch.Tensor:
+        """Reshape the flat [T, topk] scorer output to the consumer
+        contract: [B, n, topk] (right-aligned, -1 padding) for
+        TARGET_VERIFY / DRAFT_EXTEND; everything else (decode, absorbed
+        prefill) consumes the flat [T, topk] rows as-is -- the absorbed
+        prefill's T == absorbed_flat_rows holds by the upstream a2a token
+        alignment (asserted at metadata time, never compensated here) and
+        the consumer slices its absorbed_row_start window directly.
+
+        The scorer fills the FULL batch (every rank repeats the full
+        computation); the consumers select their own rows afterwards via
+        metadata.token_slice_start / the backend's absorbed_row_start
+        window.
+        """
+        from sglang.srt.graph import ops as kunpeng
+
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify():
+            nv = forward_batch.attn_backend.speculative_num_draft_tokens
+            return output.view(-1, nv, topk)
+        if mode.is_draft_extend():
+            nv = forward_batch.attn_backend.speculative_num_draft_tokens
+            # Feed the FULL [T, topk] output: the kernel copies only the
+            # leading sum(extend_seq_lens) rows (the live rows sit at the
+            # front of the flat stream; the trailing mlp-pad rows stay
+            # unwritten by the scorer and are never read) -- see
+            # mtp_kernels_kunpeng.cpp ("T >= sum(ext_lens) ... only the
+            # leading sum(ext_lens) rows are copied"). A [:sum_ext] slice
+            # would need a .item() host sync and freeze a dynamic bound at
+            # capture time; the model's own q left-pad already feeds the
+            # full padded rows the same way.
+            return kunpeng.pad_q_left_mtp_kunpeng(
+                output,
+                forward_batch.extend_seq_lens,
+                nv,
+                fill_value=-1,
+            )
+        return output
+
+    def _forward_cpu_fake(
+        self,
+        x: torch.Tensor,
+        q_lora: Tuple[torch.Tensor, torch.Tensor],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """Graph bring-up fake (SGLANG_KUNPENG_FAKE_INDEXER=1): with the
+        bring-up regime (total context <= index_topk) every token is
+        selected, so the sparse decode / MTP paths are exactly equivalent
+        to dense attention. Used to cross-check the real indexer.
+
+        Decode: ALL positions [0, seq_len) per sequence (-1 padded to topk).
+        TARGET_VERIFY / DRAFT_EXTEND: [B, n, topk] rows -- verify windows
+        grow [0, ctx + t + 1); draft-extend live rows are right-aligned
+        over the model's left padding. The absorbed prefill does NOT run
+        the indexer here: its per-row slots come from the metadata-time
+        dsa_prefill_slots_kunpeng, so this returns None (and never fills
+        the index-K cache -- nothing reads it on the fake path).
+        """
+        if not return_indices:
+            return None
+
+        from sglang.srt.graph import ops as kunpeng
+
         backend = forward_batch.attn_backend
+
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            # Fake absorbed prefill: metadata-time slots already cover it.
+            return None
 
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
         ):
-            # MTP verify/draft-extend: fixed rows per sequence in the
-            # [B, n, topk] layout for dsa_topk_slots_kunpeng +
+            # MTP verify/draft-extend: a fixed row count per sequence in
+            # the [B, n, topk] layout for dsa_topk_slots_kunpeng +
             # flash_mla_sparse_decode_kunpeng. full_seq_lens is the
             # persistent FULL-batch buffer, not the per-q_lora-row slice
-            # the decode branch uses. (The absorbed prefill no longer runs
-            # the indexer -- dsa_prefill_slots_kunpeng emits its slots at
-            # metadata time.)
+            # the decode branch uses.
             bs = forward_batch.seq_lens.shape[0]
             seq_lens = backend.forward_metadata.full_seq_lens[:bs]
             if forward_batch.forward_mode.is_target_verify():
@@ -1139,8 +1451,9 @@ class Indexer(MultiPlatformOp):
 
         # Decode: full-batch persistent seq lens (graph input; see
         # KunpengCpuBackend._init_decode_metadata). q_lora rows == batch
-        # rows for decode steps.
-        seq_lens = backend.forward_metadata.full_seq_lens[: q_lora.shape[0]]
+        # rows for decode steps; the fake only consumes the row count
+        # (the int8 part of the (int8, scale) tuple).
+        seq_lens = backend.forward_metadata.full_seq_lens[: q_lora[0].shape[0]]
         return kunpeng.fake_indexer_topk_kunpeng(seq_lens, self.index_topk)
 
     def forward_cuda(

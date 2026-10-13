@@ -46,12 +46,18 @@ void set_kv_buffer_kunpeng(at::Tensor kv_buffer, at::Tensor loc,
     if (loc.scalar_type() == at::kInt) {
         int32_t* idx = loc.data_ptr<int32_t>();
         for (int64_t i = 0; i < tokens; i++) {
+            // Padding / foreign rows carry slot -1 and must be skipped
+            // (same rule as set_kv_buffer_2_kunpeng; the DSA indexer
+            // index-K writes rely on it -- an eager boolean-mask filter is
+            // not graph-capture safe).
+            if (idx[i] < 0) continue;
             std::memcpy(buf + idx[i] * buf_stride_bytes,
                         src + i * src_stride_bytes, row_bytes);
         }
     } else {
         int64_t* idx = loc.data_ptr<int64_t>();
         for (int64_t i = 0; i < tokens; i++) {
+            if (idx[i] < 0) continue;
             std::memcpy(buf + idx[i] * buf_stride_bytes,
                         src + i * src_stride_bytes, row_bytes);
         }

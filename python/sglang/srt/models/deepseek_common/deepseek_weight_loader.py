@@ -768,6 +768,21 @@ class DeepseekV2WeightLoaderMixin:
                         # with weight absorption it is not actually used.
                         _kunpeng_prepack_igemm_weight(_proj_w)
 
+                if hasattr(self_attn, "indexer") and not getattr(self_attn, "skip_topk", False):
+                    indexer = getattr(self_attn, "indexer")
+                    if hasattr(indexer, "wq_b"):
+                        _kunpeng_prepack_igemm_weight(indexer.wq_b.weight)
+                    if hasattr(indexer, "wk"):
+                        torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                            indexer.wk.weight,
+                            get_global_server_args().max_prefill_tokens,
+                        )
+                    if hasattr(indexer, "weights_proj"):
+                        torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                            indexer.weights_proj.weight,
+                            get_global_server_args().max_prefill_tokens,
+                        )
+
                 # mlp gate_up_proj and down_proj prepack
                 mlp = (
                     self.model.layers[layer_id].mlp

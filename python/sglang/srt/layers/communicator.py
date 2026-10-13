@@ -642,7 +642,7 @@ class LayerCommunicator:
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
                         )
-                    elif _is_cpu_920f:
+                    elif _is_cpu_920f and not get_attn_tp_context().is_nsa:
                         # Fused add + rmsnorm + int8 quantize. Returns
                         # (outs_int8, scales, residual) so the downstream
                         # int8 GEMM (fused_qkv_a_proj) consumes the quantized
@@ -656,6 +656,21 @@ class LayerCommunicator:
                             )
                         )
                         hidden_states = (outs, scales)
+                    elif _is_cpu_920f:
+                        # NSA (e.g. GLM-5.3 DSA): the indexer's bf16
+                        # projections (weights_proj / wk) consume the
+                        # UNQUANTIZED activation, so hidden_states must stay
+                        # bf16 (Indexer.forward_cpu rejects quantized tuples).
+                        # The int8 GEMM (fused_qkv_a_proj) re-quantizes inside
+                        # W8A8Int8LinearMethod.apply (quant_kunpeng) at the
+                        # cost of one quant pass. Mirrors the aiter fp8
+                        # path's NSA handling above (which preserves an
+                        # unquantized copy for the indexer).
+                        hidden_states, residual = self.input_layernorm(
+                            hidden_states,
+                            residual,
+                            post_residual_addition,
+                        )
                     else:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states,

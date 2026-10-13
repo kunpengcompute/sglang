@@ -30,6 +30,8 @@ void quant_kunpeng(at::Tensor input, at::Tensor out, at::Tensor scale);
 
 void rmsnorm_kunpeng(at::Tensor acts, at::Tensor weights, double eps, at::Tensor outs);
 
+void layernorm_kunpeng(at::Tensor acts, at::Tensor weights, at::Tensor bias, double eps, at::Tensor outs);
+
 void fused_add_rmsnorm_kunpeng(at::Tensor acts, at::Tensor residual, at::Tensor weights, double eps, at::Tensor outs);
 
 void rmsnorm_quant_kunpeng(at::Tensor acts, at::Tensor weights, double eps, at::Tensor outs, at::Tensor scales);
@@ -146,6 +148,14 @@ void dsa_prefill_slots_kunpeng(const at::Tensor &req_to_token, const at::Tensor 
                                const at::Tensor &seq_lens, const at::Tensor &extend_seq_lens,
                                int64_t num_rows, int64_t page_size, int64_t topk,
                                at::Tensor slots, at::Tensor topk_length);
+
+// DSA indexer scoring kernel (kutacc adapter, bf16): see attention/indexer.cpp.
+void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
+                                   at::Tensor weight, at::Tensor block_tables,
+                                   at::Tensor seq_lens, at::Tensor cur_lens,
+                                   at::Tensor output, at::Tensor workspace,
+                                   int64_t topk, int64_t output_coord);
+int64_t get_paged_mqa_logits_topk_workspace_size(int64_t max_k_end);
 
 void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices);
 void fake_indexer_topk_mtp_kunpeng(const at::Tensor &seq_lens, const c10::optional<at::Tensor> &extend_seq_lens,
@@ -476,7 +486,8 @@ void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at
                                 at::Tensor retrieve_next_sibling, at::Tensor target_predict);
 
 
-void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded);
+void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded,
+                            int64_t fill_value);
 
 void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Tensor o_flat);
 
@@ -557,6 +568,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "rmsnorm_kunpeng(Tensor acts, Tensor weights, float eps, "
         "Tensor outs) -> ()");
     m.impl("rmsnorm_kunpeng", rmsnorm_kunpeng);
+
+    // layernorm (SVE; DSA indexer k_norm -- LayerNorm WITH bias, unlike
+    // the RMSNorm family above)
+    m.def(
+        "layernorm_kunpeng(Tensor acts, Tensor weights, Tensor bias, float eps, "
+        "Tensor(a!) outs) -> ()");
+    m.impl("layernorm_kunpeng", layernorm_kunpeng);
 
     m.def(
         "fused_add_rmsnorm_kunpeng(Tensor acts, Tensor residual, Tensor weights, float eps, "
@@ -714,6 +732,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int num_rows, int page_size, int topk, "
         "Tensor(a!) slots, Tensor(b!) topk_length) -> ()");
     m.impl("dsa_prefill_slots_kunpeng", dsa_prefill_slots_kunpeng);
+
+    // DSA indexer scoring kernel (kutacc adapter, bf16).
+    m.def(
+        "paged_mqa_logits_topk_kunpeng(Tensor q, Tensor cur_kv_cache, "
+        "Tensor weight, Tensor block_tables, Tensor seq_lens, Tensor cur_lens, "
+        "Tensor(a!) output, Tensor workspace, int topk, int output_coord) -> ()");
+    m.impl("paged_mqa_logits_topk_kunpeng", paged_mqa_logits_topk_kunpeng);
+    m.def("get_paged_mqa_logits_topk_workspace_size(int max_k_end) -> int");
+    m.impl("get_paged_mqa_logits_topk_workspace_size", get_paged_mqa_logits_topk_workspace_size);
 
     // Fake indexer (920F DSA bring-up): all-ids selection, exact when
     // seq_len <= index_topk (guarded on the Python side).
@@ -1232,7 +1259,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor retrieve_next_sibling, Tensor target_predict) -> ()");
     m.impl("verify_tree_greedy_kunpeng", verify_tree_greedy_kunpeng);
 
-    m.def("pad_q_left_mtp_kunpeng(Tensor q_heads, Tensor ext_lens, Tensor q_padded) -> ()");
+    m.def("pad_q_left_mtp_kunpeng(Tensor q_heads, Tensor ext_lens, Tensor(a!) q_padded, "
+          "int fill_value) -> ()");
     m.impl("pad_q_left_mtp_kunpeng", pad_q_left_mtp_kunpeng);
 
     m.def("unpad_o_right_mtp_kunpeng(Tensor o_padded, Tensor ext_lens, Tensor o_flat) -> ()");

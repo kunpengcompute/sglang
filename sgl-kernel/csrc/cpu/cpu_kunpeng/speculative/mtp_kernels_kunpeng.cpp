@@ -116,29 +116,54 @@ void verify_tree_greedy_kunpeng(at::Tensor predicts, at::Tensor accept_index, at
     }
 }
 
-template <typename scalar_t>
-static void _copy_mtp_strided(scalar_t *src, scalar_t *dst, int64_t *offsets, int32_t *ext_lens, int64_t bs,
-                              int64_t max_ext_len, int64_t num_heads, int64_t head_dim, bool is_pad)
+// Dtype-agnostic strided copy (byte level): src/dst element types must
+// match; tail is the trailing element count per row (collapsed dims).
+// Equivalence with the previous bf16-typed template is byte-exact: element
+// offsets * elem_size == the old scalar_t pointer arithmetic.
+static void _copy_mtp_strided(const void *src, void *dst, int64_t *offsets, int32_t *ext_lens, int64_t bs,
+                              int64_t max_ext_len, int64_t tail, size_t elem_size, bool is_pad)
 {
-    int64_t nh = num_heads * head_dim;
-    size_t elem_size = sizeof(scalar_t);
+    const uint8_t *src_p = reinterpret_cast<const uint8_t *>(src);
+    uint8_t *dst_p = reinterpret_cast<uint8_t *>(dst);
     kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
         for (int64_t b = start; b < end; b++) {
             int64_t ext_len = ext_lens[b];
-            int64_t flat_idx = offsets[b] * nh;
-            int64_t padded_idx = (b * max_ext_len + max_ext_len - ext_len) * nh;
-            size_t bytes = ext_len * nh * elem_size;
+            int64_t flat_idx = offsets[b] * tail;
+            int64_t padded_idx = (b * max_ext_len + max_ext_len - ext_len) * tail;
+            size_t bytes = static_cast<size_t>(ext_len) * tail * elem_size;
             if (is_pad) {
-                std::memcpy(dst + padded_idx, src + flat_idx, bytes);
+                std::memcpy(dst_p + padded_idx * elem_size, src_p + flat_idx * elem_size, bytes);
             } else {
-                std::memcpy(dst + flat_idx, src + padded_idx, bytes);
+                std::memcpy(dst_p + flat_idx * elem_size, src_p + padded_idx * elem_size, bytes);
             }
         }
     });
 }
 
-void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded)
+// Left-pad a [T, ...] source to [bs, max_ext_len, ...], right-aligned per
+// sequence. The source is normally ragged (T == sum(ext_lens): the MTP draft
+// q and the indexer's top-k slices) but may also be a PADDED batch
+// (T >= sum(ext_lens): the DSA absorbed-prefill q, whose trailing rows are
+// padding) -- only the leading sum(ext_lens) rows are copied. dtype-agnostic
+// (byte memcpy); the WHOLE dst is filled with fill_value first, so the pad
+// region and empty-sequence rows carry an explicit value:
+//   - q (bf16, dense-consumed) pads with 0 (the pad rows are computed then
+//     discarded by unpad_o_right, so the value is inert -- 0 is simply more
+//     deterministic than the previous uninitialized buffer);
+//   - the DSA indexer's MTP draft-extend top-k indices ([T, topk] int32)
+//     pad with -1: the sparse kernel trims the all -1 pad rows per row.
+void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor q_padded,
+                            int64_t fill_value)
 {
+    TORCH_CHECK(ext_lens.dim() == 1 && ext_lens.scalar_type() == at::kInt && ext_lens.is_contiguous(),
+                "ext_lens must be contiguous [bs] int32");
+    TORCH_CHECK(q_heads.dim() >= 1 && q_padded.dim() == q_heads.dim() + 1,
+                "src must be [T, ...] and dst [bs, max_ext_len, ...], got src ",
+                q_heads.sizes(), " dst ", q_padded.sizes());
+    TORCH_CHECK(q_heads.scalar_type() == q_padded.scalar_type(),
+                "src/dst dtype mismatch: ", q_heads.scalar_type(), " vs ", q_padded.scalar_type());
+    TORCH_CHECK(q_heads.is_contiguous() && q_padded.is_contiguous(), "src/dst must be contiguous");
+
     int64_t bs = ext_lens.size(0);
     std::vector<int64_t> offsets(bs + 1, 0);
     auto ext_a = ext_lens.accessor<int32_t, 1>();
@@ -146,9 +171,25 @@ void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor 
         offsets[b + 1] = offsets[b] + ext_a[b];
     }
     int64_t max_ext_len = q_padded.size(1);
-    _copy_mtp_strided(reinterpret_cast<bfloat16_t *>(q_heads.data_ptr()),
-                      reinterpret_cast<bfloat16_t *>(q_padded.data_ptr()), offsets.data(), ext_a.data(), bs,
-                      max_ext_len, q_heads.size(1), q_heads.size(2), true);
+    TORCH_CHECK(q_padded.size(0) == bs, "dst batch ", q_padded.size(0), " != ext_lens batch ", bs);
+
+    int64_t tail = 1; // trailing elements per row (dst dims >= 2)
+    for (int64_t i = 2; i < q_padded.dim(); ++i) {
+        TORCH_CHECK(q_heads.size(i - 1) == q_padded.size(i), "src/dst tail shape mismatch at dim ", i);
+        tail *= q_padded.size(i);
+    }
+    // src may be a padded batch (T >= sum(ext_lens)): only the leading
+    // sum(ext_lens) rows are the real tokens; the trailing pad rows are
+    // ignored (absorbed prefill passes the full padded q here).
+    TORCH_CHECK(q_heads.size(0) >= offsets[bs], "src rows ", q_heads.size(0),
+                " < sum(ext_lens) ", offsets[bs]);
+
+    // Fill the WHOLE buffer first (left-pad region + empty-sequence rows),
+    // then overwrite the real rows right-aligned.
+    q_padded.fill_(fill_value);
+
+    _copy_mtp_strided(q_heads.data_ptr(), q_padded.data_ptr(), offsets.data(), ext_a.data(), bs,
+                      max_ext_len, tail, q_heads.element_size(), true);
 }
 
 void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Tensor o_flat)
@@ -160,7 +201,7 @@ void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Ten
         offsets[b + 1] = offsets[b] + ext_a[b];
     }
     int64_t max_ext_len = o_padded.size(1);
-    _copy_mtp_strided(reinterpret_cast<bfloat16_t *>(o_padded.data_ptr()),
-                      reinterpret_cast<bfloat16_t *>(o_flat.data_ptr()), offsets.data(), ext_a.data(), bs, max_ext_len,
-                      o_flat.size(1), o_flat.size(2), false);
+    int64_t tail = o_flat.size(1) * o_flat.size(2);
+    _copy_mtp_strided(o_padded.data_ptr(), o_flat.data_ptr(), offsets.data(), ext_a.data(), bs,
+                      max_ext_len, tail, o_flat.element_size(), false);
 }

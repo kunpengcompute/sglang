@@ -177,6 +177,16 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # DSA (NSA) MTP cross-iteration top-k share (IndexTopKShareState):
+        # only when the model opts in and the draft tree is a chain
+        # (speculative_eagle_topk == 1).
+        self.index_share_for_mtp_iteration = self.topk == 1 and bool(
+            getattr(
+                target_worker.model_runner.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+        )
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -989,6 +999,18 @@ class EAGLEWorker(TpModelWorker):
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
+        # DSA indexer top-k shared across MTP draft iterations: enable the
+        # carry for the whole step loop (step 0 recomputes via the NextN
+        # fallback, later steps read the published step-0 top-k through
+        # IndexTopKShareState in the NextN model); cleared after the loop so
+        # it never leaks past this draft round. Equivalent to
+        # IndexTopKShareState.mtp_iteration(forward_batch, enabled=...)
+        # without re-indenting the step loop.
+        _dsa_share_enabled = self.index_share_for_mtp_iteration
+        if _dsa_share_enabled:
+            forward_batch.reuse_dsa_topk_indices = True
+            if forward_batch.spec_info is not None:
+                forward_batch.spec_info.dsa_topk_indices = None
         # Forward multiple steps
         scores = None
         topk1 = _is_cpu_920f and self.topk == 1
@@ -1065,6 +1087,11 @@ class EAGLEWorker(TpModelWorker):
                 # clone so the next step's replay cannot overwrite this
                 # step's h-condition in place.
                 hidden_states = hidden_states.clone()
+
+        if _dsa_share_enabled:
+            if forward_batch.spec_info is not None:
+                forward_batch.spec_info.dsa_topk_indices = None
+            forward_batch.reuse_dsa_topk_indices = False
 
         if topk1 and self.speculative_num_steps == 1:
             # 1-step + topk==1: score_list/token_list/parents_list are

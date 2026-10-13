@@ -123,6 +123,62 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether a DSA layer reuses the previous layer's top-k indices.
+
+    Shared (skip-topk) layers carry no indexer weights in the checkpoint and
+    never run their own indexer; they reuse the top-k indices carried from
+    the previous full layer (or across PP stages via pp_proxy_tensors).
+    Mirrors the per-layer ``skip_topk`` computed in DeepseekV2AttentionMLA.
+    """
+    assert is_deepseek_nsa(config)
+
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        return (
+            0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
+        )
+
+    # LongCat computes fresh top-k indices every cli_factor layers.
+    cli_factor = getattr(config, "cli_factor", 1)
+    if cli_factor is None:
+        cli_factor = 1
+    assert cli_factor > 0, f"cli_factor must be positive, got {cli_factor}"
+    if cli_factor > 1:
+        return layer_id % cli_factor != 0
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return layer_id < len(pattern) and pattern[layer_id] == "S"
+
+    freq = getattr(config, "index_topk_freq", 1)
+    if freq is None:
+        freq = 1
+    assert freq > 0, f"index_topk_freq must be positive, got {freq}"
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is not None:
+        assert offset > 0, (
+            "index_skip_topk_offset must be positive; offset <= 0 "
+            "marks layer 0 as skip_topk with no prior topk to reuse"
+        )
+        return max(layer_id - offset + 1, 0) % freq != 0
+
+    return max(layer_id - 1, 0) % freq != 0
+
+
+def count_indexer_layers(
+    config: PretrainedConfig, start: int = 0, end: Optional[int] = None
+) -> int:
+    """Number of layers running their own indexer (non skip-topk) in [start, end)."""
+    assert is_deepseek_nsa(config)
+    if end is None:
+        end = config.num_hidden_layers
+    assert 0 <= start <= end <= config.num_hidden_layers, (
+        f"invalid layer range [{start}, {end}) for {config.num_hidden_layers} layers"
+    )
+    return sum(1 for l in range(start, end) if not dsa_layer_skips_topk(config, l))
+
+
 class ModelConfig:
     def __init__(
         self,
