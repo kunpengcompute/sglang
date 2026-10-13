@@ -41,7 +41,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.utils import get_device_module, is_cpu_920f
 from sglang.srt.environ import envs
 
@@ -437,9 +437,7 @@ class HiCacheController:
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
         if not self.l1l3_only:
             self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
-        elif not isinstance(self.mem_pool_device, MLATokenToKVPool) or isinstance(
-            self.mem_pool_device, NSATokenToKVPool
-        ):
+        elif not isinstance(self.mem_pool_device, MLATokenToKVPool):
             # The flat L3 blob is the MLA (layer, token, 1, kv_dim) layout; MHA
             # would need a k/v split per layer and NSA keeps a separate indexer
             # pool, so both are rejected instead of silently mis-encoding.

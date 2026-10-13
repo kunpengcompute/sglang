@@ -147,6 +147,7 @@ class HiRadixCache(RadixCache):
                 load_cache_event=self.load_cache_event,
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
+                l1l3_only=self.l1l3_only,
             )
         else:
             self.cache_controller = HiCacheController(
@@ -710,6 +711,8 @@ class HiRadixCache(RadixCache):
         return height
 
     def _get_extra_pools(self) -> dict:
+        if self.l1l3_only:
+            return {}
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
         if isinstance(self.kv_cache, NSATokenToKVPool):
@@ -723,6 +726,8 @@ class HiRadixCache(RadixCache):
 
     def _get_hybrid_storage_attach_kwargs(self) -> dict:
         """Extra kwargs for attach_storage_backend when controller is HybridCacheController."""
+        if self.l1l3_only:
+            return {}
         if isinstance(self.cache_controller, HybridCacheController):
             return {"host_pools": self.cache_controller.mem_pool_host.entries}
         return {}

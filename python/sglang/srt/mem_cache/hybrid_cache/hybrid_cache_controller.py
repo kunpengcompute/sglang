@@ -168,6 +168,7 @@ class HybridCacheController(BaseHiCacheController):
         attn_cp_size: int = 1,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        l1l3_only: bool = False,
     ):
         startup_storage_backend = storage_backend
         super().__init__(
@@ -187,6 +188,7 @@ class HybridCacheController(BaseHiCacheController):
             pp_rank=pp_rank,
             pp_size=pp_size,
             enable_storage_metrics=enable_storage_metrics,
+            l1l3_only=l1l3_only,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
