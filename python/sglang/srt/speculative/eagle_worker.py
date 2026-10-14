@@ -860,7 +860,15 @@ class EAGLEWorker(TpModelWorker):
             # shift ScheduleBatch.seq_lens by +1 between the draft-side and
             # verify-side allocations, which silently bypasses page pops at
             # page boundaries and leaks KV pool pages.
-            spec_info.positions = batch.seq_lens.clone()
+            #
+            # Seed with seq_lens - 1 (the COLUMN of d1): draft_forward
+            # pre-increments positions before each forward, so step i runs
+            # at seq_lens - 1 + (i + 1) = column of d_{i+1}. Seeding with
+            # seq_lens itself rotated every chain query/K one column too
+            # far (RoPE off-by-one vs the committed prefix); the PP chain
+            # derives the same seq_lens - 1 via clamp_position when
+            # positions is None.
+            spec_info.positions = batch.seq_lens.clone() - 1
         else:
             spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
