@@ -16,8 +16,8 @@
 # Native role config: role defaults for the non-disaggregated (single-server)
 # mode. Sourced by env.sh (after env_base.sh, so .user_env.sh overrides set
 # there are respected via the ${VAR:-default} fallbacks below).
-# Node topology and parallel sizes are NOT set here: native_config in
-# env_helper.sh reads the NATIVE_* vars plus the global TP_SIZE/DP_SIZE/
+# Parallel sizes are NOT set here: native_config in env_helper.sh reads
+# the NATIVE_* vars (bottom of this file) plus the global TP_SIZE/DP_SIZE/
 # EP_SIZE/PP_SIZE from env_base.sh. Native runs prefill and decode in one
 # server, so it inherits the prefill-side role defaults below.
 # Per-server overrides: runtime/.user_env_native.sh (sourced last).
@@ -56,3 +56,15 @@ elif [[ -f "$SCRIPT_DIR/runtime/.user_env_native.sh" ]]; then
 else
     echo "WARNING: runtime/.user_env_native.sh not found, using role defaults only" >&2
 fi
+
+# ------------------------------------------------------------
+# Native cluster topology (native_config in env_helper.sh reads these).
+# Resolved AFTER the user env files above so overrides there win, like the
+# PREFILL_* / DECODE_* topology in env_prefill.sh / env_decode.sh.
+# IP_FILE: file with one IP per line (e.g. "192.168.1.1" per line)
+# IP_SPEC: alternative range notation, e.g. "192.168.1. | 1-3,5" (used only when IP_FILE is empty)
+# ------------------------------------------------------------
+export NATIVE_IP_SPEC="${NATIVE_IP_SPEC:-}"
+export NATIVE_IP_FILE="${NATIVE_IP_FILE:-}"
+export NATIVE_MASTER_ADDR="${NATIVE_MASTER_ADDR:-xxx.xxx.xxx.1}"
+export NATIVE_MASTER_PORT="${NATIVE_MASTER_PORT:-5010}"

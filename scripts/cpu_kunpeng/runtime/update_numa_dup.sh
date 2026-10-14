@@ -20,7 +20,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-source "$SCRIPT_DIR/env.sh" native
+source "$SCRIPT_DIR/env.sh" build
 
 echo "Update binary sglang..."
 bash "$SCRIPT_DIR/pyinstall/update.sh" "$@"

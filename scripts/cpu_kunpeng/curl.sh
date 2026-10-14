@@ -230,7 +230,9 @@ URL="http://${IP}:${PORT}/v1/completions"
 # Print the resolved target for non-interactive runs: a stale/wrong port
 # silently redirects requests to the wrong instance (e.g. -F hitting a
 # prefill tokenizer), which is hard to notice from the response alone.
-if [ "$INTERACTIVE" = false ]; then
+# With -p the print is deferred until start_profile returns (see below), so
+# the output order is: start_profile -> its response -> Target -> requests.
+if [ "$INTERACTIVE" = false ] && [ "$PROFILE" = false ]; then
   echo "Target: $URL" >&2
 fi
 
@@ -289,6 +291,9 @@ if [ "$INTERACTIVE" = false ]; then
 
   if [ "$PROFILE" = true ]; then
     profile_req start_profile
+    # Deferred Target print: only after start_profile has returned, so the
+    # target request fires (and is logged) strictly after profiling started.
+    echo "Target: $URL" >&2
   fi
 fi
 
