@@ -1597,7 +1597,9 @@ class KunpengStateLoader(BaseModelLoader):
             model_config, model, is_expert=False
         )
 
-    def _load_sharded_non_expert(self, model: nn.Module, filepaths: List[str]) -> None:
+    def _load_sharded_non_expert(
+        self, model: nn.Module, filepaths: List[str], model_config: ModelConfig
+    ) -> None:
         """Load non-expert weights from sharded safetensors via direct copy."""
         from safetensors.torch import safe_open
 
@@ -1618,10 +1620,88 @@ class KunpengStateLoader(BaseModelLoader):
             if not self._is_expert_weight(key):
                 non_moe_state_dict[key] = tensor
 
+        skipped = [
+            key
+            for key in non_moe_state_dict
+            if self._is_shared_indexer_key(model, model_config, key)
+        ]
+        if skipped:
+            layers = sorted(
+                {key.split(".self_attn", 1)[0].rsplit(".", 1)[-1] for key in skipped}
+            )
+            logger.info(
+                "KunpengStateLoader: skipped %d indexer param(s) of shared "
+                "(skip-topk) layers %s: those layers carry no indexer weights "
+                "in the checkpoint and never run their own indexer.",
+                len(skipped),
+                layers,
+            )
+            for key in skipped:
+                non_moe_state_dict.pop(key)
+
         if non_moe_state_dict:
             raise ValueError(
                 f"Missing keys {tuple(non_moe_state_dict)} in loaded state!"
             )
+
+    @staticmethod
+    def _is_shared_indexer_key(model: nn.Module, model_config, key: str) -> bool:
+        """Whether ``key`` is an indexer param of a shared (skip-topk) DSA layer.
+
+        Shared layers reuse the previous full layer's top-k and never run their
+        own indexer, so the checkpoint carries no indexer weights for them. The
+        verdict comes from ``dsa_layer_skips_topk`` on the layer id parsed out of
+        the key -- the same id (and predicate) the index-K pool uses -- so the
+        loader and the pool cannot disagree. Only configs carrying an explicit
+        per-layer table are trusted; the frequency fallback inside that predicate
+        is known to be misaligned on this model.
+        """
+        marker = ".self_attn.indexer."
+        if marker not in key:
+            return False
+        prefix = key.split(marker, 1)[0]
+        layer_name = prefix.rsplit(".", 1)[-1]
+        if not layer_name.isdigit():
+            return False
+
+        from sglang.srt.configs.model_config import dsa_layer_skips_topk
+
+        layer_id = int(layer_name)
+        shared = None
+        for config in (
+            model_config.hf_config,
+            getattr(model_config, "hf_text_config", None),
+        ):
+            if config is None:
+                continue
+            if (
+                getattr(config, "indexer_types", None) is None
+                and getattr(config, "index_topk_pattern", None) is None
+            ):
+                continue
+            try:
+                shared = dsa_layer_skips_topk(config, layer_id)
+            except (AssertionError, AttributeError):
+                continue
+            break
+        if shared is None:
+            return False
+
+        module_flag = None
+        try:
+            module_flag = getattr(model.get_submodule(prefix), "skip_topk", None)
+        except AttributeError:
+            pass
+        if module_flag is not None and bool(module_flag) != shared:
+            logger.warning(
+                "KunpengStateLoader: layer %s indexer verdict mismatch (module "
+                "skip_topk=%s, dsa_layer_skips_topk=%s); trusting the config, "
+                "which is what the index-K pool uses.",
+                layer_name,
+                bool(module_flag),
+                shared,
+            )
+        return shared
 
     # -- preprocessed expert weight loading -------------------------------------
 
@@ -1873,7 +1953,7 @@ class KunpengStateLoader(BaseModelLoader):
             "KunpengStateLoader: loading non-expert weights from %d sharded file(s).",
             len(filepaths),
         )
-        self._load_sharded_non_expert(model, filepaths)
+        self._load_sharded_non_expert(model, filepaths, model_config)
 
         # ---------- Phase 3: post-process ----------
         for _, module in model.named_modules():
