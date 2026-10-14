@@ -223,7 +223,7 @@ export SGLANG_KUNPENG_SWAP_EXPERT=1        # layer-wise expert weight swap-in (p
 
 - **SGLANG\_ENABLE\_HBW\_POOL=1**: KV cache allocated from High Bandwidth Memory first, reducing DRAM access latency.
 - **SGLANG\_KUNPENG\_SWAP\_KV\_IN/OUT=1**: Enables asynchronous SDMA migration between HBW pages and DRAM; with `SWAP_KV_BLOCKWISE=1`, decode swaps in only the needed blocks.
-- **Related settings**: `SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB`, `SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS`, `SGLANG_KUNPENG_SDMA_MAX_EVENTS`, `SGLANG_KUNPENG_SDMA_THRESHOLD`.
+- **Related settings**: `SGLANG_KUNPENG_WEIGHTS_HBW_POOL_SIZE_MB`, `SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS`, `SGLANG_KUNPENG_SDMA_MAX_EVENTS`, `SGLANG_KUNPENG_SDMA_THRESHOLD`.
 
 **4. SGLANG\_ENABLE\_MTP — Multi-Token Prediction**
 
@@ -307,7 +307,7 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # long-sequence threshold
 
 **HBW Memory Pool**
 
-- **SGLANG\_KUNPENG\_WEIGTHS\_HBW\_POOL\_SIZE\_MB**: Weight cache pre-allocation in HBW, default 3400MB (prefill 3400, decode 3900).
+- **SGLANG\_KUNPENG\_WEIGHTS\_HBW\_POOL\_SIZE\_MB**: Weight cache pre-allocation in HBW, default 3400MB (prefill 3400, decode 3900).
 - **SGLANG\_KUNPENG\_MEMORY\_ALIGNMENT**: HBW memory alignment in bytes, default 4096.
 - **SGLANG\_KUNPENG\_SWAP\_MAX\_KV\_BLOCKS**: Max KV blocks for block-wise swap-in, default 512.
 

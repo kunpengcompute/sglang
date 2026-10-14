@@ -147,7 +147,7 @@ class KunpengGraphRunner:
         )
 
         weights_pool_size_mb = int(
-            os.environ.get("SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB")
+            os.environ.get("SGLANG_KUNPENG_WEIGHTS_HBW_POOL_SIZE_MB")
         )
         assert (
             weights_pool_size_mb > 0
@@ -1129,7 +1129,7 @@ class KunpengGraphRunner:
                             f"largest free block left for graph capture "
                             f"(min 4 MB). pool used={pool.used_bytes / 1024 / 1024:.1f} MB "
                             f"free={(pool.pool_size - pool.used_bytes) / 1024 / 1024:.1f} MB. "
-                            f"Enlarge SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB, or free "
+                            f"Enlarge SGLANG_KUNPENG_WEIGHTS_HBW_POOL_SIZE_MB, or free "
                             f"HBW via SGLANG_KUNPENG_HBW_RESIDENT_NON_EXPERT_WEIGHTS=0 / "
                             f"SGLANG_KUNPENG_HBW_RESIDENT_EXPERT_WEIGHTS=0, or disable graph "
                             f"HBW with SGLANG_KUNPENG_HBW_RESIDENT_GRAPH=0."

@@ -660,8 +660,11 @@ class KunpengCpuBackend(AttentionBackend):
             # per-row upper bound min(topk, seq_lens[seq(r)]) for the
             # sparse sched (>= the actual value is always safe: the kernel
             # trims the -1 padded tail). Padding rows (past real_rows)
-            # carry 1 (the kernel skips their all -1 slot rows).
-            topk_length = torch.ones(flat_rows, dtype=torch.int32)
+            # carry 0: the scorer only writes rows [0, sum(extend_seq_lens))
+            # (kutacc recomputes n_tokens from cur_lens), so pad-row slots
+            # hold stale pool bytes -- topk=0 makes the sparse kernel skip
+            # those rows instead of dereferencing garbage slots.
+            topk_length = torch.zeros(flat_rows, dtype=torch.int32)
             if real_rows > 0:
                 seq_of_row = torch.repeat_interleave(
                     torch.arange(bs), ext.to(torch.int64)

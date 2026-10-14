@@ -105,11 +105,11 @@ python scripts/cpu_kunpeng/model_processing/split_weights_dsv3.py \
 | DECODE_EP_SIZE | 小于TP_SIZE即启用ETP，moe_tp=tp/ep |
 | SGLANG_KUNPENG_ETP_DENSE_MAX | dense行上限；默认dp×max_tokens_per_mb×min(topk,n_local)，MTP按steps+1线性放大；偏小运行时报ETP dense buffer overflow |
 | SGLANG_KUNPENG_DECODE_SHM_SIZE_MB | decode SHM池，ETP扩容主要项（etp8+MTP2约256；etp16+MTP2需320且SHM走DDR，即unset KUPL_SHM_ON_PACKAGE） |
-| DECODE_WEIGTHS_HBW_POOL_SIZE_MB | 权重HBW池（etp8/etp16配3850/3830） |
+| DECODE_WEIGHTS_HBW_POOL_SIZE_MB | 权重HBW池（etp8/etp16配3850/3830） |
 
 推荐配置（MTP=1，即SGLANG_ENABLE_MTP=1 + SGLANG_SPECULATIVE_NUM_STEPS=1，取自runtime实例文件实测值）：
 
-| 实例 | SGLANG_KUNPENG_DECODE_SHM_SIZE_MB | DECODE_WEIGTHS_HBW_POOL_SIZE_MB |
+| 实例 | SGLANG_KUNPENG_DECODE_SHM_SIZE_MB | DECODE_WEIGHTS_HBW_POOL_SIZE_MB |
 |---|---|---|
 | decode_32p-etp8（ep32/dp16，16节点） | 160 | 3850 |
 | decode_64p-etp8（ep32/dp32×pp2，32节点） | 200 | 3800 |
