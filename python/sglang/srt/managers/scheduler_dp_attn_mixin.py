@@ -16,7 +16,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.utils.common import (
     is_cpu_920f,
-    is_kunpeng_graph_capture,
     kunpeng_forward_count,
     require_mlp_tp_gather,
 )
@@ -55,30 +54,19 @@ def _rdma_allgather_available() -> bool:
     return state is not None and state.rdma_comm_created
 
 
-# Forward-count parity check (kunpeng 920F): force-on with
-# SGLANG_KUNPENG_CHECK_FWD_COUNT=1, or auto-on while a graph profile session
-# is active (kunpeng_graph_profile_active, request-driven via
-# /start_profile//stop_profile — the old env-var gate is gone).  Captured
-# graphs replay per-forward RDMA barriers; a count divergence while recording
-# deadlocks the profile session, hence the check.
+# Forward-count parity checks add a TP-wide collective, so enable them on all
+# ranks before startup via SGLANG_KUNPENG_CHECK_FWD_COUNT=1. Local profile state
+# cannot gate this collective: DP groups can receive /start_profile or
+# /stop_profile in different iterations. Some ranks would enter this check
+# while peers enter model collectives, deadlocking even an idle server.
 _is_kunpeng_fwd_count_check = _is_cpu_920f and (
     os.environ.get("SGLANG_KUNPENG_CHECK_FWD_COUNT", "0") == "1"
 )
 
 
 def _fwd_count_check_active() -> bool:
-    """Static flag OR an active graph profile session (checked at call time:
-    profile sessions start/stop via HTTP, not at process init)."""
-    if _is_kunpeng_fwd_count_check:
-        return True
-    try:
-        from sglang.srt.hardware_backend.cpu_kunpeng.graph_runner.kunpeng_graph_runner import (
-            kunpeng_graph_profile_active,
-        )
-
-        return kunpeng_graph_profile_active()
-    except ImportError:
-        return False
+    """Keep collective participation independent of local profile start/stop."""
+    return _is_kunpeng_fwd_count_check
 
 
 _fwd_count_check_last = 0

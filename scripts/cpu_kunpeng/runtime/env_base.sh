@@ -45,14 +45,6 @@ source "$SCRIPT_DIR/runtime/env_helper.sh"
 # instance's nodes).
 INSTANCES="prefill,decode"
 
-# IP range, Master address/port for native nodes.
-# prefill/decode topology now lives in runtime/env_prefill.sh / env_decode.sh.
-# IP_FILE: file with one IP per line (e.g. "192.168.1.1" per line)
-# IP_SPEC: alternative range notation, e.g. "192.168.1. | 1-3,5" (used only when IP_FILE is empty)
-NATIVE_IP_SPEC=""
-NATIVE_IP_FILE=""
-NATIVE_MASTER_ADDR="xxx.xxx.xxx.1"
-NATIVE_MASTER_PORT="5010"
 
 # Router node IP (single IP for PD disaggregation router)
 export ROUTER_IP="xxx.xxx.xxx.1"
