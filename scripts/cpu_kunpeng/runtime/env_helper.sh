@@ -140,7 +140,7 @@ _export_pd_vars() {
     _var="${prefix}_SGLANG_KUNPENG_MOE_SHUFFLE_MODE"; export SGLANG_KUNPENG_MOE_SHUFFLE_MODE="${!_var}"
     _var="MODEL_PATH_${prefix}"; export MODEL_PATH="${!_var}"
     _var="SPECULATIVE_DRAFT_MODEL_PATH_${prefix}"; export SPECULATIVE_DRAFT_MODEL_PATH="${!_var}"
-    _var="${prefix}_WEIGTHS_HBW_POOL_SIZE_MB"; export SGLANG_KUNPENG_WEIGTHS_HBW_POOL_SIZE_MB="${!_var}"
+    _var="${prefix}_WEIGHTS_HBW_POOL_SIZE_MB"; export SGLANG_KUNPENG_WEIGHTS_HBW_POOL_SIZE_MB="${!_var}"
     _var="${prefix}_SWAP_KV_IN"; export SGLANG_KUNPENG_SWAP_KV_IN="${!_var}"
     _var="${prefix}_SWAP_KV_OUT"; export SGLANG_KUNPENG_SWAP_KV_OUT="${!_var}"
     _var="${prefix}_SWAP_KV_BLOCKWISE"; export SGLANG_KUNPENG_SWAP_KV_BLOCKWISE="${!_var}"
