@@ -645,6 +645,11 @@ class Envs:
     # dense paged path (the indexer still fills the draft pool's index-K but
     # skips scoring). Orthogonal to the fake indexer. Default off.
     SGLANG_KUNPENG_DISABLE_DSA_SPARSE_MTP = EnvBool(False)
+    # DSA (NSA) indexer TP split escape hatch: set to 1 to construct the
+    # indexer projections as ReplicatedLinear (full weights, full-size
+    # GEMMs, no collectives) instead of the attn-TP weight-sharded path.
+    # Read once at Indexer construction.
+    SGLANG_KUNPENG_DISABLE_INDEXER_TP_SPLIT = EnvBool(False)
 
 envs = Envs()
 EnvField._allow_set_name = False

@@ -34,6 +34,12 @@ Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
      tensors pass through.
   J. should_run_indexer M9 reuse matrix (index_share_for_mtp_iteration:
      NextN + carry + prev -> reuse; otherwise rescore).
+  K. indexer attn-TP weight split (see nsa_indexer.Indexer.__init__ /
+     forward_cpu): the K-split partial-sum identity behind the RowParallel
+     wk / weights_proj + SHM allreduce, the head-aligned N-split column
+     stitch behind the ColumnParallel wq_b + batched allgather, the shard
+     boundary / head-alignment invariants, and the sharded linear weight
+     shapes (auto-skip when the modules are not importable).
 """
 
 import random
@@ -77,6 +83,16 @@ try:
     _HAVE_INDEXER_INPUT = True
 except Exception:
     _HAVE_INDEXER_INPUT = False
+
+try:
+    from sglang.srt.layers.linear import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+
+    _HAVE_LINEAR = True
+except Exception:
+    _HAVE_LINEAR = False
 
 try:
     from types import SimpleNamespace
@@ -1129,6 +1145,192 @@ def test_indexer_input_validation():
 
 
 # ---------------------------------------------------------------------------
+# K. indexer attn-TP weight split (wk / weights_proj RowParallel K-split +
+#    SHM allreduce; wq_b ColumnParallel N-split + batched allgather)
+# ---------------------------------------------------------------------------
+
+
+def test_tp_split_k_shard_partial_sum():
+    """RowParallel (K-split) math for wk / weights_proj: the sum of the
+    per-rank partial GEMMs over disjoint K-shards of x equals the full GEMM
+    -- the SHM allreduce performs exactly this sum (fp32 accumulation, see
+    comm/allreduce.cpp). fp32 checks the identity tightly; bf16 checks the
+    realistic rounding budget (one bf16 partial per rank + fp32 reduce)."""
+    torch.manual_seed(2026)
+    tp, hidden, out, T = 4, 64, 16, 6
+    shard = hidden // tp
+    x32 = torch.randn(T, hidden, dtype=torch.float32)
+    w32 = torch.randn(out, hidden, dtype=torch.float32)
+
+    partials = [
+        torch.matmul(x32[:, r * shard : (r + 1) * shard], w32[:, r * shard : (r + 1) * shard].t())
+        for r in range(tp)
+    ]
+    reduced = torch.stack(partials).sum(dim=0)
+    assert torch.allclose(reduced, torch.matmul(x32, w32.t()), atol=1e-4), (
+        "fp32 K-shard partial sum must equal the full GEMM"
+    )
+
+    xb = x32.to(torch.bfloat16)
+    wb = w32.to(torch.bfloat16)
+    partials_b = [
+        torch.matmul(
+            xb[:, r * shard : (r + 1) * shard].contiguous(),
+            wb[:, r * shard : (r + 1) * shard].t().contiguous(),
+        )
+        for r in range(tp)
+    ]
+    reduced_b = torch.stack(partials_b).sum(dim=0, dtype=torch.float32).to(torch.bfloat16)
+    full_b = torch.matmul(xb, wb.t())
+    torch.testing.assert_close(
+        reduced_b.float(), full_b.float(), rtol=2e-2, atol=2e-2
+    )
+
+
+def test_tp_split_n_shard_head_stitch():
+    """ColumnParallel (N-split) math for wq_b: head-aligned column shards
+    concatenated in rank order (the batched allgather semantics, dim=-1)
+    rebuild the full [T, H*D] output with the head order preserved --
+    rank r owns heads [r*H/tp, (r+1)*H/tp), so the stitch needs no
+    permute and q.view(T, H, D) lands on the right heads."""
+    torch.manual_seed(2027)
+    tp, n_heads, head_dim, q_lora_rank, T = 4, 8, 16, 32, 6
+    out = n_heads * head_dim
+    n_shard = out // tp
+    heads_per_rank = n_heads // tp
+    assert n_shard == heads_per_rank * head_dim, "shard must be head-aligned"
+
+    xq = torch.randn(T, q_lora_rank, dtype=torch.float32)
+    wq = torch.randn(out, q_lora_rank, dtype=torch.float32)
+
+    shards = [
+        torch.matmul(xq, wq[r * n_shard : (r + 1) * n_shard].t())
+        for r in range(tp)
+    ]
+    q = torch.cat(shards, dim=-1)
+    full = torch.matmul(xq, wq.t())
+    assert torch.allclose(q, full, atol=1e-4), (
+        "N-shard column stitch must equal the full GEMM"
+    )
+
+    q3 = q.view(T, n_heads, head_dim)
+    full3 = full.view(T, n_heads, head_dim)
+    for r in range(tp):
+        h0 = r * heads_per_rank
+        local = shards[r].view(T, heads_per_rank, head_dim)
+        assert torch.allclose(local, full3[:, h0 : h0 + heads_per_rank], atol=1e-4), (
+            f"rank {r} shard must own heads [{h0}, {h0 + heads_per_rank})"
+        )
+    assert torch.allclose(q3, full3, atol=1e-4)
+
+
+def test_tp_split_shard_bounds():
+    """Shard-boundary invariants shared with Indexer.__init__ (GLM-5.3
+    dims): the K-shards tile hidden_size exactly (no gap, no overlap) and
+    the wq_b N-shard keeps whole heads (shard columns % head_dim == 0),
+    for both attn-TP deployment sizes."""
+    hidden_size, n_heads, head_dim = 6144, 32, 128
+    for tp in (1, 8, 16):
+        assert hidden_size % tp == 0
+        assert n_heads % tp == 0
+        k_shard = hidden_size // tp
+        starts = [r * k_shard for r in range(tp)]
+        ends = [s + k_shard for s in starts]
+        assert starts[0] == 0 and ends[-1] == hidden_size
+        assert all(ends[i] == starts[i + 1] for i in range(tp - 1))
+        n_shard = (n_heads * head_dim) // tp
+        assert n_shard % head_dim == 0
+        assert n_shard == (n_heads // tp) * head_dim
+
+
+def test_tp_split_linear_shapes():
+    """The sharded projections hold the expected per-rank weight shapes
+    when constructed with explicit attn-TP rank/size (o_proj / q_b_proj
+    style -- the default tensor-parallel rank lookup is bypassed, so no
+    parallel_state initialization is needed)."""
+    if not _HAVE_LINEAR:
+        print("  [skip] sglang.srt.layers.linear not importable (tp split shapes)")
+        return
+
+    hidden_size, n_heads, head_dim, q_lora_rank = 6144, 32, 128, 512
+    tp, rank = 16, 3
+    k_shard = hidden_size // tp
+    n_shard = (n_heads * head_dim) // tp
+
+    wk = RowParallelLinear(
+        hidden_size,
+        head_dim,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        prefix="test.indexer.wk",
+        tp_rank=rank,
+        tp_size=tp,
+    )
+    assert tuple(wk.weight.shape) == (head_dim, k_shard), (
+        f"RowParallel wk shard must be [{head_dim}, {k_shard}], got {tuple(wk.weight.shape)}"
+    )
+
+    wproj = RowParallelLinear(
+        hidden_size,
+        n_heads,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        prefix="test.indexer.weights_proj",
+        tp_rank=rank,
+        tp_size=tp,
+    )
+    assert tuple(wproj.weight.shape) == (n_heads, k_shard), (
+        f"RowParallel weights_proj shard must be [{n_heads}, {k_shard}], "
+        f"got {tuple(wproj.weight.shape)}"
+    )
+
+    wqb = ColumnParallelLinear(
+        q_lora_rank,
+        n_heads * head_dim,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        prefix="test.indexer.wq_b",
+        tp_rank=rank,
+        tp_size=tp,
+    )
+    assert tuple(wqb.weight.shape) == (n_shard, q_lora_rank), (
+        f"ColumnParallel wq_b shard must be [{n_shard}, {q_lora_rank}], "
+        f"got {tuple(wqb.weight.shape)}"
+    )
+
+
+def test_tp_split_bf16_gemm_shard():
+    """The _bf16_linear_kunpeng op chain accepts the K-sharded inputs
+    (x_shard [T, hidden/tp] x W_shard [out, hidden/tp]) that the tp-split
+    forward_cpu branch feeds it, and the partial output matches the fp32
+    reference. Runs only where the compiled sgl_kernel is available."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (bf16 gemm shard)")
+        return
+    try:
+        from sglang.srt.layers.attention.nsa.nsa_indexer import (
+            _bf16_linear_kunpeng,
+        )
+    except Exception:
+        print("  [skip] nsa_indexer not importable (bf16 gemm shard)")
+        return
+
+    torch.manual_seed(2028)
+    tp, hidden, out, T = 4, 128, 16, 8
+    shard = hidden // tp
+    x = torch.randn(T, hidden, dtype=torch.bfloat16)
+    w = torch.randn(out, hidden, dtype=torch.bfloat16)
+
+    partial = _bf16_linear_kunpeng(
+        x[:, :shard].contiguous(), w[:, :shard].contiguous()
+    )
+    assert partial.shape == (T, out) and partial.dtype == torch.bfloat16
+
+    ref = torch.matmul(x[:, :shard].float(), w[:, :shard].float().t())
+    torch.testing.assert_close(partial.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1165,6 +1367,11 @@ def main():
         ("H. test_pad_q_left_extra_src_rows", test_pad_q_left_extra_src_rows),
         ("I. test_indexer_input_validation", test_indexer_input_validation),
         ("J. test_should_run_indexer_m9", test_should_run_indexer_m9),
+        ("K. test_tp_split_k_shard_partial_sum", test_tp_split_k_shard_partial_sum),
+        ("K. test_tp_split_n_shard_head_stitch", test_tp_split_n_shard_head_stitch),
+        ("K. test_tp_split_shard_bounds", test_tp_split_shard_bounds),
+        ("K. test_tp_split_linear_shapes", test_tp_split_linear_shapes),
+        ("K. test_tp_split_bf16_gemm_shard", test_tp_split_bf16_gemm_shard),
     ]
     failed = 0
     for name, fn in tests:
