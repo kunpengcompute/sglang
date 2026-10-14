@@ -407,6 +407,10 @@ class HiCacheController:
         self.flat_write: Optional[torch.Tensor] = None
         self.flat_read: Optional[torch.Tensor] = None
         self.flat_io_batch_pages = 0
+        self.flat_write_idx: Optional[torch.Tensor] = None
+        self.flat_read_idx: Optional[torch.Tensor] = None
+        self.indexer_page_elems = 0
+        self.indexer_key_suffix = "@idx"
         self.write_policy = write_policy
         self.page_size = page_size
         self.io_backend = io_backend
@@ -437,9 +441,7 @@ class HiCacheController:
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
         if not self.l1l3_only:
             self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
-        elif not isinstance(self.mem_pool_device, MLATokenToKVPool) or isinstance(
-            self.mem_pool_device, NSATokenToKVPool
-        ):
+        elif not isinstance(self.mem_pool_device, MLATokenToKVPool):
             # The flat L3 blob is the MLA (layer, token, 1, kv_dim) layout; MHA
             # would need a k/v split per layer and NSA keeps a separate indexer
             # pool, so both are rejected instead of silently mis-encoding.
@@ -810,6 +812,22 @@ class HiCacheController:
             dtype=self.mem_pool_device.store_dtype,
         )
         self.flat_read = torch.empty_like(self.flat_write)
+
+        indexer_layers, indexer_elems_per_token, indexer_dtype, self.indexer_key_suffix = (
+            self._indexer_layout()
+        )
+        if indexer_layers:
+            self.indexer_page_elems = (
+                len(indexer_layers) * self.page_size * indexer_elems_per_token
+            )
+            self.flat_write_idx = torch.empty(
+                (self.flat_io_batch_pages, self.indexer_page_elems),
+                dtype=indexer_dtype,
+            )
+            self.flat_read_idx = torch.empty_like(self.flat_write_idx)
+            for buffer in (self.flat_write_idx, self.flat_read_idx):
+                self.storage_backend.register_io_buffer(buffer)
+
         for buffer in (self.flat_write, self.flat_read):
             self.storage_backend.register_io_buffer(buffer)
 
@@ -823,6 +841,54 @@ class HiCacheController:
                 f"{pages} page(s) x {self.page_size}"
             )
         return indices.reshape(pages, self.page_size)[:, 0].contiguous()
+
+    def _indexer_layout(self):
+        """``(per-layer buffers, elems per token, dtype, L3 key suffix)`` of the
+        DSA indexer pool. ``layers`` is None for a plain MLA pool (no indexer).
+
+        The Kunpeng (920F) pool keeps flat bf16 ``[slots, head_dim]`` rows with
+        no fp8 scale and no buffer for shared (skip-topk) layers, so both the
+        blob geometry and the key namespace differ from ``NSATokenToKVPool``.
+        """
+        from sglang.srt.hardware_backend.cpu_kunpeng.memory_pool_kunpeng import (
+            KunpengNSATokenToKVPool,
+        )
+
+        pool = self.mem_pool_device
+        if isinstance(pool, KunpengNSATokenToKVPool):
+            return (
+                [buf for buf in pool.index_k_buffer if buf is not None],
+                pool.index_head_dim,
+                pool.index_k_dtype,
+                "@idxk",
+            )
+        if isinstance(pool, NSATokenToKVPool):
+            return (
+                pool.index_k_with_scale_buffer,
+                pool.index_head_dim
+                + pool.index_head_dim // pool.quant_block_size * 4,
+                NSATokenToKVPool.index_k_with_scale_buffer_dtype,
+                "@idx",
+            )
+        return None, 0, None, "@idx"
+
+    def _indexer_keys(self, hashes) -> list:
+        """Flat-interface keys of the NSA indexer blobs (parallel to the KV ones).
+
+        The suffix keeps them in their own namespace: a page's indexer blob is
+        a different size than its KV blob and is written/read separately.
+        """
+        return [f"{h}{self.indexer_key_suffix}" for h in hashes]
+
+    def _indexer_page_layers(self) -> list:
+        """Per-layer ``(page_num, 1, page_stride)`` views of the indexer buffer.
+
+        A page occupies exactly one row of every per-layer tensor, so the batch
+        flatten/unflatten kernels are used with ``page_size=1``.
+        """
+        layers = self._indexer_layout()[0]
+        stride = self.indexer_page_elems // len(layers)
+        return [t.view(-1, 1, stride) for t in layers]
 
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
@@ -863,6 +929,8 @@ class HiCacheController:
         self.enable_storage = False
         self.flat_write = None
         self.flat_read = None
+        self.flat_write_idx = None
+        self.flat_read_idx = None
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
         # Now it's safe to clear the stop event for future re-attach.
@@ -1417,19 +1485,49 @@ class HiCacheController:
                 if not hit:
                     break
                 hit_pages += 1
+            if hit_pages and self.indexer_page_elems:
+                idx_hits = self.storage_backend.batch_get_flat(
+                    self._indexer_keys(batch_hashes[:hit_pages]),
+                    [self.flat_read_idx[j] for j in range(hit_pages)],
+                    extra_info,
+                )
+                idx_hit_pages = 0
+                for hit in idx_hits:
+                    if not hit:
+                        break
+                    idx_hit_pages += 1
+                hit_pages = idx_hit_pages
             if hit_pages:
                 # Only the leading run of hits is published, and only after its
                 # bytes have actually landed in L1.
+                page_starts = self._device_page_starts(
+                    batch_indices[: hit_pages * self.page_size],
+                    hit_pages,
+                    "L3->L1",
+                )
                 hicache_page_unflatten_batch(
                     layers,
                     self.flat_read[:hit_pages],
-                    self._device_page_starts(
-                        batch_indices[: hit_pages * self.page_size],
-                        hit_pages,
-                        "L3->L1",
-                    ),
+                    page_starts,
                     self.page_size,
                 )
+                if self.indexer_page_elems:
+                    hicache_page_unflatten_batch(
+                        self._indexer_page_layers(),
+                        self.flat_read_idx[:hit_pages],
+                        page_starts // self.page_size,
+                        1,
+                    )
+                    if debug:
+                        logger.info(
+                            "[hicache] L3->flat read + flat->L1 scatter (indexer): "
+                            "req=%s, %d/%d page(s), device%s, key_suffix=%s",
+                            operation.request_id,
+                            hit_pages,
+                            pages,
+                            _idx_range(page_starts),
+                            self.indexer_key_suffix,
+                        )
             still_running = operation.increment(hit_pages * self.page_size)
 
             if debug:
@@ -1792,6 +1890,34 @@ class HiCacheController:
                     extra_info,
                 )
             )
+            if success and self.indexer_page_elems:
+                page_ids = (
+                    self._device_page_starts(batch_indices, pages, "L1->L3")
+                    // self.page_size
+                )
+                hicache_page_flatten_batch(
+                    self._indexer_page_layers(),
+                    self.flat_write_idx[:pages],
+                    page_ids,
+                    1,
+                )
+                success = all(
+                    self.storage_backend.batch_set_flat(
+                        self._indexer_keys(batch_hashes),
+                        [self.flat_write_idx[j] for j in range(pages)],
+                        extra_info,
+                    )
+                )
+                if debug:
+                    logger.info(
+                        "[hicache] L1->flat copy + flat->L3 write (indexer): op=%d, "
+                        "%d page(s), device%s, key_suffix=%s, ok=%s",
+                        operation.id,
+                        pages,
+                        _idx_range(batch_indices),
+                        self.indexer_key_suffix,
+                        success,
+                    )
 
             if debug:
                 t_end = time.perf_counter()

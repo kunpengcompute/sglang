@@ -261,35 +261,39 @@ def build_shared_anchor_stack(
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
-) -> tuple[HostPoolGroup, HybridCacheController]:
+    l1l3_only: bool = False,
+) -> tuple[Optional[HostPoolGroup], HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=kv_pool,
-        page_size=page_size,
-        server_args=server_args,
-        use_mla=use_mla,
-        override_kv_cache_dim=override_kv_cache_dim,
-    )
-    shared_host_pool = shared_host_pool_factory(kv_host_pool)
-    entries = [
-        build_pool_entry(
-            name=PoolName.KV,
-            host_pool=kv_host_pool,
-            device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
-            is_anchor=True,
-        ),
-        build_pool_entry(
-            name=shared_pool_name,
-            host_pool=shared_host_pool,
-            device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
-            share_indices_with_anchor=True,
-        ),
-    ]
-    host_pool_group = HostPoolGroup(entries)
+    if l1l3_only:
+        host_pool_group = None
+    else:
+        kv_host_pool = build_kv_host_pool(
+            kv_pool=kv_pool,
+            page_size=page_size,
+            server_args=server_args,
+            use_mla=use_mla,
+            override_kv_cache_dim=override_kv_cache_dim,
+        )
+        shared_host_pool = shared_host_pool_factory(kv_host_pool)
+        entries = [
+            build_pool_entry(
+                name=PoolName.KV,
+                host_pool=kv_host_pool,
+                device_pool=kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+                is_anchor=True,
+            ),
+            build_pool_entry(
+                name=shared_pool_name,
+                host_pool=shared_host_pool,
+                device_pool=kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+                share_indices_with_anchor=True,
+            ),
+        ]
+        host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,
@@ -310,6 +314,7 @@ def build_shared_anchor_stack(
         attn_cp_size=attn_cp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        l1l3_only=l1l3_only,
     )
     return host_pool_group, cache_controller
 
@@ -433,6 +438,7 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
     load_cache_event,
     attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
     attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    l1l3_only: bool = False,
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
@@ -468,15 +474,25 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             attn_cp_rank=params.attn_cp_rank,
             attn_cp_size=params.attn_cp_size,
             enable_storage_metrics=enable_storage_metrics,
+            l1l3_only=l1l3_only,
         )
-        radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
-        radix_cache.token_to_kv_pool_host = host_pool_group
+        if host_pool_group is None:
+            radix_cache.full_kv_pool_host = None
+            radix_cache.token_to_kv_pool_host = None
+            logger.info(
+                "Attached hybrid NSA pool stack to HiRadixCache: L1+L3 two-tier "
+                "(no L2 pool), transfer_layer_num=%s",
+                len(layer_mapping),
+            )
+        else:
+            radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
+            radix_cache.token_to_kv_pool_host = host_pool_group
+            logger.info(
+                "Attached hybrid NSA pool stack to HiRadixCache: pools=KV + INDEXER, "
+                "transfer_layer_num=%s",
+                len(layer_mapping),
+            )
         radix_cache.cache_controller = cache_controller
-        logger.info(
-            "Attached hybrid NSA pool stack to HiRadixCache: pools=KV + INDEXER, "
-            "transfer_layer_num=%s",
-            len(layer_mapping),
-        )
     except Exception:
         logger.exception("attach_hybrid_nsa_pool_to_hiradix_cache failed")
         raise
