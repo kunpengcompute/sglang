@@ -1261,10 +1261,9 @@ class Indexer(MultiPlatformOp):
         x, q_lora = _validate_cpu_indexer_input(x, q_lora)
 
         if self.tp_split:
-            x_shard = x[
-                :,
-                self.k_shard_start : self.k_shard_start + self.k_shard_size,
-            ].contiguous()
+            x_shard = kunpeng.contiguous_kunpeng(
+                x[:, self.k_shard_start : self.k_shard_start + self.k_shard_size]
+            )
             weights = _bf16_linear_kunpeng(x_shard, self.weights_proj.weight)
             kunpeng.shm_allreduce_kunpeng(
                 weights, profile_name="shm_allreduce_kunpeng@indexer.weights_proj"
