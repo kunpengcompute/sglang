@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
     is_mla_backend,
+    is_nsa_pool,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
     prepare_abort,
@@ -75,7 +76,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
-    NSATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -475,10 +475,10 @@ class DecodePreallocQueue:
                     kv_args.state_dim_per_tensor = (
                         self.token_to_kv_pool.get_state_dim_per_tensor()
                     )
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+            elif is_nsa_pool(self.token_to_kv_pool):
                 kv_args.state_type = "nsa"
-                if self.draft_token_to_kv_pool is not None and isinstance(
-                    self.draft_token_to_kv_pool, NSATokenToKVPool
+                if self.draft_token_to_kv_pool is not None and is_nsa_pool(
+                    self.draft_token_to_kv_pool
                 ):
                     (
                         draft_state_data_ptrs,
@@ -991,7 +991,7 @@ class DecodePreallocQueue:
                 )
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+            elif is_nsa_pool(self.token_to_kv_pool):
                 seq_len = len(decode_req.req.origin_input_ids)
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len

@@ -559,6 +559,26 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, MLATokenToKVPool)
 
 
+def is_nsa_pool(target_kv_pool) -> bool:
+    """Whether the pool carries an NSA/DSA index-K cache to transfer in PD.
+
+    Matches the generic CUDA NSA pool and, on Kunpeng 920F, the flat-bf16
+    ``KunpengNSATokenToKVPool`` (a sibling class, not a subclass of the CUDA
+    pool). Both expose ``get_state_buf_infos``.
+    """
+    from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+
+    if isinstance(target_kv_pool, NSATokenToKVPool):
+        return True
+    if is_cpu_920f():
+        from sglang.srt.hardware_backend.cpu_kunpeng.memory_pool_kunpeng import (
+            KunpengNSATokenToKVPool,
+        )
+
+        return isinstance(target_kv_pool, KunpengNSATokenToKVPool)
+    return False
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
