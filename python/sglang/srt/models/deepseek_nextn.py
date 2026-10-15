@@ -134,11 +134,22 @@ class DeepseekModelNextN(nn.Module):
             )
 
         self.rot_weight = None
-        if _is_npu:
+        self.rot_weight_gemm = None
+        if _is_npu or _is_cpu_920f:
             rot_weight_path = get_global_server_args().model_path + "/rot.safetensors"
             if os.path.isfile(rot_weight_path):
                 self.rot_weight = load_file(rot_weight_path)
-                self.rot_weight = self.rot_weight["rot.weight"].npu()
+                self.rot_weight = self.rot_weight["rot.weight"]
+                if _is_npu:
+                    self.rot_weight = self.rot_weight.npu()
+                elif _is_cpu_920f:
+                    self.rot_weight_gemm = (
+                        self.rot_weight.t().to(torch.bfloat16).contiguous()
+                    )
+                    torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(
+                        self.rot_weight_gemm,
+                        get_global_server_args().max_prefill_tokens,
+                    )
 
         self.alt_stream = (
             torch.cuda.Stream()
@@ -216,13 +227,31 @@ class DeepseekModelNextN(nn.Module):
 
         if hidden_states.shape[0] > 0:
             e_input = self.enorm(hidden_states)
-            h_input = self.hnorm(
-                forward_batch.spec_info.hidden_states
-                if self.rot_weight is None
-                else torch.matmul(
-                    forward_batch.spec_info.hidden_states, self.rot_weight
-                )
-            )
+            h_cond = forward_batch.spec_info.hidden_states
+            if self.rot_weight is not None:
+                if _is_cpu_920f:
+                    h_in = h_cond
+                    M, K = h_in.shape
+                    N = self.rot_weight_gemm.shape[0]
+                    tile_m, tile_n, tile_k = (
+                        torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+                    )
+                    blocks_in_k = K // tile_k
+                    ws_numel = blocks_in_k * M * N + 1024 if blocks_in_k > 1 else 0
+                    packed_h = kunpeng.bf16_gemm_pack_kunpeng(h_in, tile_m, tile_k)
+                    h_cond = kunpeng.bf16_packed_gemm_kunpeng(
+                        packed_h,
+                        self.rot_weight_gemm,
+                        kunpeng.alloc_buffer(
+                            ws_numel,
+                            dtype=torch.bfloat16,
+                            alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get(),
+                        ),
+                        32,
+                    )
+                else:
+                    h_cond = torch.matmul(h_cond, self.rot_weight)
+            h_input = self.hnorm(h_cond)
             eh_input = kunpeng.cat_kunpeng(e_input, h_input, -1)
 
             if _is_cpu_920f:

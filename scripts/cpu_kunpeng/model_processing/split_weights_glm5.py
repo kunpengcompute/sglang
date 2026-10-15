@@ -1222,7 +1222,15 @@ if __name__ == "__main__":
         os.makedirs(mtp_meta_output_dir, exist_ok=True)
 
     for file in os.listdir(args.model_dir):
-        if os.path.splitext(file)[1] in (".safetensors",):
+        # rot.safetensors (QuaRot h-condition rotation) is read directly
+        # from model_path by the MTP draft loader (deepseek_nextn.py), so
+        # it must be carried into the split output; every other
+        # .safetensors is a source weight shard that must not clobber
+        # the split output.
+        if (
+            os.path.splitext(file)[1] in (".safetensors",)
+            and file != "rot.safetensors"
+        ):
             continue
         # kunpeng_state is a plain I8+FP32-scale format; the ModelSlim quant
         # metadata from the source checkpoint is not applicable and would make
