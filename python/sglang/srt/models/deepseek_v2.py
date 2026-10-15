@@ -36,6 +36,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
+    dsa_layer_skips_topk,
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
     get_nsa_index_topk,
@@ -2176,6 +2177,17 @@ class DeepseekV2Model(nn.Module):
                 ),
             ),
         )
+        # PP + DSA topk carry (Kunpeng): the indexer top-k travels in
+        # PPProxyTensors. A stage whose first layer is skip-topk (shared) owns no
+        # indexer and must reuse the predecessor's top-k; that predecessor ships
+        # it only when its own last layer is shared -- i.e. exactly when this
+        # stage needs it, so no switch is involved.
+        self._pp_topk_carry = _is_cpu_920f and is_deepseek_nsa(config)
+        self._pp_topk_carry_recv = (
+            self._pp_topk_carry
+            and not self.pp_group.is_first_rank
+            and dsa_layer_skips_topk(config, self.start_layer)
+        )
         # GLM-5 DSA: "shared" indexer 层 (skip_topk=True) 直接复用上一个 full
         # 层的 topk 索引, 且导出只在 full 层存 indexer 权重 -> 把 shared 层的
         # Indexer 对象替换为上一个 full 层的对象 (参数去重, 加载不缺 key).
@@ -2295,6 +2307,26 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        # DSA topk carry: this stage starts on a skip-topk (shared) layer, so the
+        # predecessor must have shipped its top-k. Idle/empty batches compute
+        # nothing and carry none by design.
+        initial_topk_indices = (
+            pp_proxy_tensors.tensors.get("topk_indices")
+            if self._pp_topk_carry_recv
+            else None
+        )
+        if (
+            self._pp_topk_carry_recv
+            and initial_topk_indices is None
+            and not forward_batch.forward_mode.is_idle()
+            and positions.shape[0] != 0
+        ):
+            raise RuntimeError(
+                f"PP stage starting at layer {self.start_layer} is skip-topk "
+                "(shared) and needs the DSA topk_indices from the previous "
+                "stage, but PPProxyTensors carries none: the predecessor stage "
+                "must end on a full (indexer) layer."
+            )
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -2345,7 +2377,7 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
-        topk_indices = None
+        topk_indices = initial_topk_indices
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2389,12 +2421,18 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
+            proxy_tensors = PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
                     "residual": residual,
                 }
             )
+            # The last layer is shared and already returns the carried top-k
+            # (next_skip_topk); that is exactly what the next stage's first
+            # layer needs. topk_indices is None when that first layer is full.
+            if self._pp_topk_carry and topk_indices is not None:
+                proxy_tensors.tensors["topk_indices"] = topk_indices
+            return proxy_tensors
         else:
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
