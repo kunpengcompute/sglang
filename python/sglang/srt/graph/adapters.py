@@ -1472,7 +1472,15 @@ def _setup_pad_q_left_mtp_kunpeng():
             src, seq_lens, dst, int(fill_value))
         return dst
 
-    register_op('pad_q_left_mtp_kunpeng', shape_infer, eager_fn)
+    def capture_scalar_args(src, seq_lens, max_seq_len, fill_value=0):
+        # max_seq_len determines the output shape only. The native kernel
+        # receives (src, seq_lens, dst, fill_value), including when the caller
+        # supplies fill_value by keyword or relies on the default Q padding.
+        return [int(fill_value)]
+
+    register_op(
+        'pad_q_left_mtp_kunpeng', shape_infer, eager_fn,
+        capture_scalar_args=capture_scalar_args)
 
 
 def _setup_unpad_o_right_mtp_kunpeng():

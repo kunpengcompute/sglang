@@ -29,11 +29,14 @@ class idle_forward_mode:
 
 
 class GraphOp:
-    def __init__(self, name, shape_infer, eager_fn=None, shm_fn=None):
+    def __init__(
+        self, name, shape_infer, eager_fn=None, shm_fn=None, *, capture_scalar_args=None
+    ):
         self.name = name
         self.shape_infer = shape_infer
         self.eager_fn = eager_fn
         self.shm_fn = shm_fn
+        self.capture_scalar_args = capture_scalar_args
 
     def __call__(self, *args, **kwargs):
         profile_name = kwargs.pop('profile_name', '')
@@ -91,7 +94,15 @@ class GraphOp:
             if t is not None and id(t) in shm_ids:
                 upgrade_storage_memory_type(t)
 
-        record_op(self.name, inputs, outputs, non_tensor_args, profile_name)
+        # Shape-only parameters and keyword/default values may not match the
+        # native kernel's scalar signature. Let those adapters specify exactly
+        # which scalars replay must receive, leaving shape inference unchanged.
+        scalar_args = (
+            self.capture_scalar_args(*args, **kwargs)
+            if self.capture_scalar_args is not None
+            else non_tensor_args
+        )
+        record_op(self.name, inputs, outputs, scalar_args, profile_name)
 
         if len(output_tensors) == 1:
             return output_tensors[0]
@@ -128,8 +139,12 @@ class _Ops:
 _registry = {}
 
 
-def register_op(name, shape_infer, eager_fn=None, shm_fn=None):
-    op = GraphOp(name, shape_infer, eager_fn, shm_fn)
+def register_op(
+    name, shape_infer, eager_fn=None, shm_fn=None, *, capture_scalar_args=None
+):
+    op = GraphOp(
+        name, shape_infer, eager_fn, shm_fn, capture_scalar_args=capture_scalar_args
+    )
     _registry[name] = op
 
 
