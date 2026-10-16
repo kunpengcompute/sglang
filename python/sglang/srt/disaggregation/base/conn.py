@@ -35,9 +35,11 @@ class KVArgs:
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
+    # Main-model layers owned by this prefill stage, excluding appended draft KV.
+    prefill_num_layers: int
     # for pp decode (start layer of the decode-side KV pool that dst_kv_ptrs points to)
     decode_start_layer: int
-    # num of layers the decode-side KV pool holds (used to slice prefill src when prefill pp < decode pp)
+    # Main-model layers in the decode-side pool, excluding appended draft KV.
     decode_num_layers: int
     # for system dp
     system_dp_rank: int

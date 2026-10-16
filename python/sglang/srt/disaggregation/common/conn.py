@@ -721,13 +721,19 @@ class CommonKVManager(BaseKVManager):
         layers_current_pp_stage = num_send_layers
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
-    def get_mla_kv_ptrs_with_pp(
+    def get_mla_kv_layer_indices_with_pp(
         self,
-        src_kv_ptrs: List[int],
-        dst_kv_ptrs: List[int],
+        num_src_layers: int,
+        num_dst_layers: int,
         decode_start_layer: Optional[int] = None,
         decode_num_layers: Optional[int] = None,
-    ) -> Tuple[List[int], List[int], int]:
+    ) -> Tuple[List[int], List[int]]:
+        """Map MLA buffers laid out as [main-model layers..., draft layers...].
+
+        Main-model layer ranges use global layer numbers. Draft pools have
+        their own layer numbering and must be paired separately at the tail.
+        Returning indices also lets senders select the matching item lengths.
+        """
         start_layer = self.kv_args.prefill_start_layer
         # See NOTE in get_mha_kv_ptrs_with_pp: per-request values must be passed
         # explicitly; the shared self.kv_args fallback is only for legacy callers.
@@ -735,13 +741,53 @@ class CommonKVManager(BaseKVManager):
             decode_start_layer = getattr(self.kv_args, "decode_start_layer", 0)
         if decode_num_layers is None:
             decode_num_layers = getattr(self.kv_args, "decode_num_layers", 0)
-        num_prefill_layers = len(src_kv_ptrs)
+        prefill_num_layers = getattr(self.kv_args, "prefill_num_layers", 0) or 0
+        if (
+            0 < prefill_num_layers <= num_src_layers
+            and 0 < decode_num_layers <= num_dst_layers
+        ):
+            overlap_begin = max(start_layer, decode_start_layer)
+            overlap_end = min(
+                start_layer + prefill_num_layers,
+                decode_start_layer + decode_num_layers,
+            )
+            if overlap_end <= overlap_begin:
+                return [], []
+            src_indices = list(
+                range(overlap_begin - start_layer, overlap_end - start_layer)
+            )
+            dst_indices = list(
+                range(
+                    overlap_begin - decode_start_layer,
+                    overlap_end - decode_start_layer,
+                )
+            )
+            # Only stages with an appended draft pool receive draft KV. For
+            # P=1 -> D=2 (78 main layers split 42/36), the last stage maps
+            # source [42:78] + [78:] to destination [0:36] + [36:].
+            num_draft_layers = min(
+                num_src_layers - prefill_num_layers,
+                num_dst_layers - decode_num_layers,
+            )
+            src_indices.extend(
+                range(prefill_num_layers, prefill_num_layers + num_draft_layers)
+            )
+            dst_indices.extend(
+                range(decode_num_layers, decode_num_layers + num_draft_layers)
+            )
+            return src_indices, dst_indices
+
+        # Preserve the legacy mapping when main-model metadata is unavailable
+        # (older peers), or this is an extra pool with a different layer layout.
+        src_indices = list(range(num_src_layers))
+        dst_indices = list(range(num_dst_layers))
+        num_prefill_layers = num_src_layers
 
         # prefill pp_size < decode pp_size: slice src to decode's layer range
         if decode_num_layers > 0 and decode_num_layers < num_prefill_layers:
             src_local_start = decode_start_layer - start_layer
             src_local_end = src_local_start + decode_num_layers
-            sliced_src_kv_ptrs = src_kv_ptrs[src_local_start:src_local_end]
+            sliced_src_indices = src_indices[src_local_start:src_local_end]
             dst_local_start = 0
             dst_local_end = decode_num_layers
         elif PP_LAYER_MAPPING_ENABLED and decode_num_layers > 0:
@@ -758,24 +804,41 @@ class CommonKVManager(BaseKVManager):
                 start_layer + num_prefill_layers, decode_start_layer + decode_num_layers
             )
             if overlap_end <= overlap_begin:
-                return [], [], 0
+                return [], []
             local_src_start = overlap_begin - start_layer
-            sliced_src_kv_ptrs = src_kv_ptrs[
+            sliced_src_indices = src_indices[
                 local_src_start : local_src_start + (overlap_end - overlap_begin)
             ]
             dst_local_start = overlap_begin - decode_start_layer
             dst_local_end = dst_local_start + (overlap_end - overlap_begin)
         else:
             # Legacy/full-decode path: no decode layer info, send the whole stage.
-            sliced_src_kv_ptrs = src_kv_ptrs
+            sliced_src_indices = src_indices
             dst_local_start = start_layer - decode_start_layer
             dst_local_end = dst_local_start + num_prefill_layers
 
-        if len(sliced_src_kv_ptrs) == len(dst_kv_ptrs):
-            sliced_dst_kv_ptrs = dst_kv_ptrs
+        if len(sliced_src_indices) == num_dst_layers:
+            sliced_dst_indices = dst_indices
         else:
-            sliced_dst_kv_ptrs = dst_kv_ptrs[dst_local_start:dst_local_end]
-        layers_current_pp_stage = len(sliced_src_kv_ptrs)
+            sliced_dst_indices = dst_indices[dst_local_start:dst_local_end]
+        return sliced_src_indices, sliced_dst_indices
+
+    def get_mla_kv_ptrs_with_pp(
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        decode_start_layer: Optional[int] = None,
+        decode_num_layers: Optional[int] = None,
+    ) -> Tuple[List[int], List[int], int]:
+        src_indices, dst_indices = self.get_mla_kv_layer_indices_with_pp(
+            len(src_kv_ptrs),
+            len(dst_kv_ptrs),
+            decode_start_layer=decode_start_layer,
+            decode_num_layers=decode_num_layers,
+        )
+        sliced_src_kv_ptrs = [src_kv_ptrs[i] for i in src_indices]
+        sliced_dst_kv_ptrs = [dst_kv_ptrs[i] for i in dst_indices]
+        layers_current_pp_stage = len(src_indices)
         return sliced_src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
 

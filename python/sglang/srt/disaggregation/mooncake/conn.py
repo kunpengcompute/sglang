@@ -648,37 +648,27 @@ class MooncakeKVManager(CommonKVManager):
 
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(
-                    src_data_ptrs,
-                    dst_data_ptrs,
+            src_layer_indices, dst_layer_indices = (
+                self.get_mla_kv_layer_indices_with_pp(
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
                     decode_start_layer=decode_start_layer,
                     decode_num_layers=decode_num_layers,
                 )
             )
-            # slice item_lens to match sliced src (MLA: only K part)
-            if decode_num_layers > 0 and decode_num_layers < len(item_lens):
-                k_item_lens = item_lens[
-                    decode_start_layer : decode_start_layer + decode_num_layers
-                ]
-                sliced_item_lens = list(k_item_lens)
-            else:
-                sliced_item_lens = item_lens
-            # Bounds guard (mirrors the MHA branch below): if the decode stage
-            # registered fewer KV buffers than the layer count we are about to
-            # send, indexing dst_kv_ptrs[layer_id] below would raise IndexError
-            # and kill the transfer thread. Fail this request instead.
+            layers_current_pp_stage = len(src_layer_indices)
+            # Pointers and byte strides must use the same source indices,
+            # including appended draft layers and nonzero prefill offsets.
             if (
-                layers_current_pp_stage > len(dst_kv_ptrs)
-                or layers_current_pp_stage > len(sliced_item_lens)
-                or layers_current_pp_stage > len(src_kv_ptrs)
+                layers_current_pp_stage != len(dst_layer_indices)
+                or any(i >= len(item_lens) for i in src_layer_indices)
             ):
                 logger.error(
                     "[mooncake-pp][mla_layer_mismatch] refusing to transfer: "
                     f"layers_current_pp_stage={layers_current_pp_stage} "
-                    f"len(src_kv_ptrs)={len(src_kv_ptrs)} "
-                    f"len(dst_kv_ptrs)={len(dst_kv_ptrs)} "
-                    f"len(sliced_item_lens)={len(sliced_item_lens)} "
+                    f"len(src_data_ptrs)={len(src_data_ptrs)} "
+                    f"len(dst_data_ptrs)={len(dst_data_ptrs)} "
+                    f"len(dst_layer_indices)={len(dst_layer_indices)} "
                     f"decode_start_layer={decode_start_layer} "
                     f"decode_num_layers={decode_num_layers} "
                     f"prefill_start_layer={getattr(self.kv_args, 'prefill_start_layer', 0)} "
@@ -689,11 +679,11 @@ class MooncakeKVManager(CommonKVManager):
                 return -1
             layers_params = [
                 (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    sliced_item_lens[layer_id],
+                    src_data_ptrs[src_index],
+                    dst_data_ptrs[dst_index],
+                    item_lens[src_index],
                 )
-                for layer_id in range(layers_current_pp_stage)
+                for src_index, dst_index in zip(src_layer_indices, dst_layer_indices)
             ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
