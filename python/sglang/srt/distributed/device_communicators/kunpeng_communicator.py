@@ -51,6 +51,12 @@ PP_KIND_TENSOR = 1
 PP_KIND_ACK = 2
 PP_KIND_BUNDLE = 3  # must match PP_KIND_BUNDLE in pp_comm.cpp
 PP_MSG_SLOTS = 8  # must match PP_MSG_SLOTS in pp_comm.cpp
+# Proxy (non-output) frames use a slot ring inside the single 64MB proxy region
+# (PP_PROXY_REGION_SIZE in pp_comm.cpp): the slot advances on every send, so a
+# sender never overwrites the segment a peer may still be reading from.
+# 4 * 16MB == PP_PROXY_REGION_SIZE, so no C++ (buffer layout) change is needed.
+PP_PROXY_SLOTS = 4
+PP_PROXY_SLOT_SIZE = 16 * 1024 * 1024
 # Bundle sub-kind rides in the frame header kind's bits 8..15 (base kind stays
 # in the low byte): the receiver demuxes the forward consensus (step2) from
 # the ring-back consensus (step6/7) WITHOUT unpickling a tag string.
@@ -445,6 +451,30 @@ class KunpengPPCommunicator:
         """Output ring slot where the data from src_rank will land."""
         return int(kernel.pp_get_output_recv_offset_kunpeng(src_rank))
 
+    def proxy_send_offset(self, dst_rank: int) -> int:
+        """Next proxy ring slot to copy data into before pp_put to dst_rank.
+
+        Counter is kept on the Python side: the C++ side only tracks the output
+        ring, and send_tensor_message is the single producer of proxy frames
+        while the peer consumes exactly one frame per recv, so a per-peer frame
+        counter keeps both ends on the same slot.
+        """
+        cnt = getattr(self, "_proxy_send_cnt", None)
+        if cnt is None:
+            cnt = self._proxy_send_cnt = {}
+        n = cnt.get(dst_rank, 0)
+        cnt[dst_rank] = n + 1
+        return (n % PP_PROXY_SLOTS) * PP_PROXY_SLOT_SIZE
+
+    def proxy_recv_offset(self, src_rank: int) -> int:
+        """Proxy ring slot where the data from src_rank will land."""
+        cnt = getattr(self, "_proxy_recv_cnt", None)
+        if cnt is None:
+            cnt = self._proxy_recv_cnt = {}
+        n = cnt.get(src_rank, 0)
+        cnt[src_rank] = n + 1
+        return (n % PP_PROXY_SLOTS) * PP_PROXY_SLOT_SIZE
+
     def send_tensor_batch(self, dst_rank: int, tensors):
         """Fused: copy all tensors into the batch region + one pp_put in C++."""
         kernel.pp_send_tensor_batch_kunpeng(dst_rank, tensors)
@@ -512,12 +542,18 @@ class KunpengPPCommunicator:
 
         pp_offset = 0
         # kutacc::pp_put writes local[off] -> remote[off] with the same offset,
-        # so a frame must live at an offset every rank agrees on. Output frames
-        # stream back-to-back and use a per-sender ring (the slot advances on
-        # every send); proxy frames reuse segment 0, which is safe because proxy
-        # traffic on the 1-D ring is alternating (recv -> forward -> send).
+        # so a frame must live at an offset every rank agrees on. Both output
+        # and proxy frames use a slot ring that advances on every send: with
+        # chunked prefill several micro-batches are in flight, so a single
+        # shared proxy segment (the old behaviour) could be overwritten by the
+        # next frame before the peer had read it, handing the receiver another
+        # chunk's hidden_states / top-k.
         is_output = _msg_type_from_metadata(metadata_list) == "output"
-        send_base = self.output_send_offset(dst_rank) if is_output else 0
+        send_base = (
+            self.output_send_offset(dst_rank)
+            if is_output
+            else self.proxy_send_offset(dst_rank)
+        )
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
