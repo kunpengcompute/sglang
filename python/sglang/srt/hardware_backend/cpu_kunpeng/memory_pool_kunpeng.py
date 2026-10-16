@@ -61,6 +61,9 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
             f"layer_num {layer_num}"
         )
         self.skip_topk_layers = list(skip_topk_layers)
+        # Placeholder for shared (skip-topk) layers in get_state_buf_infos();
+        # allocated lazily, never read (only the P side copies into/out of it).
+        self._state_scratch = None
 
         # Flat token-slot index-K buffers; None for shared (skip-topk) layers.
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -127,3 +130,35 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
             for buf in self.index_k_buffer
             if buf is not None
         )
+
+    def get_state_buf_infos(self):
+        """Per-layer index-K buffers for PD (de-)registration and transfer.
+
+        One entry PER LAYER in this pool's range, in layer order: the PD layer
+        mapping slices these lists by absolute layer id (see
+        get_mla_kv_ptrs_with_pp), so a list that skipped shared layers would
+        pair the wrong layers across a PP stage boundary. Shared (skip-topk)
+        layers have no index-K buffer; they get a shared placeholder of the
+        same size so the per-token copy stays in bounds -- the data written
+        there is never read (shared layers reuse the carried top-k).
+
+        NOTE: because every shared layer reuses the same placeholder, the
+        returned ``data_ptrs`` may contain the same region many times. Callers
+        that register with the transfer engine must de-duplicate first: the
+        engine rejects overlapping regions and would drop the WHOLE batch
+        (see MooncakeKVManager.register_buffer_to_engine).
+        """
+        if self._state_scratch is None:
+            ref = next(b for b in self.index_k_buffer if b is not None)
+            self._state_scratch = torch.zeros_like(ref)
+        bufs = [
+            b if b is not None else self._state_scratch for b in self.index_k_buffer
+        ]
+        data_ptrs = [b.data_ptr() for b in bufs]
+        data_lens = [b.nbytes for b in bufs]
+        # item_len is PER PAGE: the transfer addresses with page indices
+        # (addr = ptr + page_index * item_len). This buffer is flat
+        # [slot, index_head_dim], so one row is a single token -- scale it by
+        # page_size to match the main-KV convention (whose [0] is one page).
+        item_lens = [b[0].nbytes * self.page_size for b in bufs]
+        return data_ptrs, data_lens, item_lens

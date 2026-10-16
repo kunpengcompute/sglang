@@ -58,6 +58,7 @@ _hbw_resident_expert = is_kunpeng_hbw_resident_expert_weights()
 _hbw_resident_graph = is_kunpeng_hbw_resident_graph()
 _is_kunpeng_swap_expert = is_kunpeng_swap_expert()
 _is_kunpeng_graph_capture = is_kunpeng_graph_capture()
+_is_cpu_920f = is_cpu_920f()
 _is_scheduler_skip_all_gather = (
     os.environ.get("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "0") == "1"
 )
@@ -417,6 +418,16 @@ class KunpengGraphRunner:
         """
 
         self.swap_mgr.set_idle_forward(forward_batch.forward_mode.is_idle())
+
+        # DSA topk carry: expose the incoming top-k to the attention backend so
+        # it can pre-window it into this rank's row slice before the capture (an
+        # input storage may not get new views while capturing).
+        if _is_cpu_920f:
+            forward_batch.pp_topk_indices = (
+                pp_proxy_tensors.tensors.get("topk_indices")
+                if pp_proxy_tensors is not None
+                else None
+            )
 
         # Build common kwargs (mirrors forward_decode/forward_extend/forward_idle)
         kwargs: dict = {}
@@ -825,6 +836,18 @@ class KunpengGraphRunner:
         pp = kwargs.get("pp_proxy_tensors")
         if self.model_runner.support_pp and pp is not None:
             inputs.extend([pp.tensors["hidden_states"], pp.tensors["residual"]])
+            # DSA topk carried from the previous stage; present only when that
+            # stage had one to forward. The absorbed prefill path consumes the
+            # backend's pre-windowed view (built outside the capture); every
+            # other path consumes the raw tensor directly.
+            pp_topk = pp.tensors.get("topk_indices")
+            if pp_topk is not None:
+                carry_slots = (
+                    getattr(meta, "absorbed_carry_slots", None)
+                    if forward_mode.is_extend_without_speculative()
+                    else None
+                )
+                inputs.append(carry_slots if carry_slots is not None else pp_topk)
 
         return [item for item in inputs if item is not None]
 
@@ -1096,15 +1119,22 @@ class KunpengGraphRunner:
                     **kwargs,
                 )
                 is_pp_output = isinstance(ret, PPProxyTensors)
+                pp_topk = None
                 if is_pp_output:
                     hidden_states = ret.tensors["hidden_states"]
                     residual = ret.tensors["residual"]
+                    pp_topk = ret.tensors.get("topk_indices")
                 else:
                     logits = ret.next_token_logits
                     hidden_states = ret.hidden_states
 
             if is_pp_output:
-                graph_outputs = [hidden_states, residual]
+                # DSA topk carry: the model appends the indexer top-k when this
+                # stage ends on a skip-topk (shared) layer, for the next stage.
+                if pp_topk is not None:
+                    graph_outputs = [hidden_states, residual, pp_topk]
+                else:
+                    graph_outputs = [hidden_states, residual]
             else:
                 graph_outputs = (
                     [logits, hidden_states] if hidden_states is not None else [logits]
@@ -1161,10 +1191,12 @@ class KunpengGraphRunner:
 
             if _graph_profile_active:
                 graph.enable_profile(True)
+            has_pp_topk = bool(is_pp_output and pp_topk is not None)
             self._sglang_graph_cache[graph_cache_key] = (
                 graph,
                 is_pp_graph,
                 is_pp_output,
+                has_pp_topk,
             )
             logger.info(
                 f"[graph] captured mode={forward_batch.forward_mode.name}, "
@@ -1173,7 +1205,7 @@ class KunpengGraphRunner:
             )
         else:
             self._sglang_graph_cache.move_to_end(graph_cache_key)
-            graph, is_pp_graph, is_pp_output = self._sglang_graph_cache[
+            graph, is_pp_graph, is_pp_output, has_pp_topk = self._sglang_graph_cache[
                 graph_cache_key
             ]
 
@@ -1216,6 +1248,15 @@ class KunpengGraphRunner:
         last_call_timestamp = time.time()
 
         if is_pp_output:
+            if has_pp_topk:
+                hidden_states, residual, topk_indices = outputs
+                return PPProxyTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                        "topk_indices": topk_indices,
+                    }
+                )
             hidden_states, residual = outputs
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}

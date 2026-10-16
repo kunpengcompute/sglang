@@ -289,9 +289,29 @@ class MooncakeKVManager(CommonKVManager):
 
         # Batch register state/extra pool data buffers
         if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
-            self.engine.batch_register(
+            # state_data_ptrs is layer-aligned (one entry per layer) so the PD
+            # layer mapping can slice it by absolute layer id -- see
+            # get_mla_kv_ptrs_with_pp. Kunpeng DSA pools fill the shared
+            # (skip-topk) layers with a single shared placeholder buffer, so the
+            # same region can appear many times in the list. mooncake rejects
+            # overlapping regions and aborts the WHOLE batch, which leaves even
+            # the real layer buffers unregistered; the index-K (NSA state)
+            # transfer then fails with "Failed to get segment descriptor".
+            # Register unique regions only; the layer-aligned list is kept as-is
+            # for addressing.
+            uniq_ptrs: list[int] = []
+            uniq_lens: list[int] = []
+            seen: set = set()
+            for ptr, length in zip(
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-            )
+            ):
+                key = (ptr, length)
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq_ptrs.append(ptr)
+                uniq_lens.append(length)
+            self.engine.batch_register(uniq_ptrs, uniq_lens)
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)

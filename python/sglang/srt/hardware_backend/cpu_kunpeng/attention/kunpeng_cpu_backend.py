@@ -630,6 +630,24 @@ class KunpengCpuBackend(AttentionBackend):
         metadata.absorbed_row_start = row_start
         metadata.absorbed_rows = rows
 
+        # PP-carried topk: this rank's window view must be built outside the
+        # capture, otherwise slicing an input storage inside it fails with
+        # "input tensor (storage=N) has no matching view".
+        metadata.absorbed_carry_raw = None
+        metadata.absorbed_carry_slots = None
+        carry = getattr(forward_batch, "pp_topk_indices", None)
+        if carry is not None and carry.numel() > 0:
+            if row_start + rows > carry.shape[0]:
+                raise RuntimeError(
+                    f"absorbed prefill PP topk carry: rank window [{row_start}, "
+                    f"{row_start + rows}) exceeds the carried topk rows "
+                    f"({carry.shape[0]})"
+                )
+            metadata.absorbed_carry_raw = carry
+            metadata.absorbed_carry_slots = carry[
+                row_start : row_start + rows
+            ].view(rows, 1, carry.shape[-1])
+
         if _USE_FAKE_INDEXER:
             # Per-row slots, once per step: straight from req_to_token
             # (remapped HBM page table under block-wise swap; remapped may
@@ -2239,12 +2257,21 @@ class KunpengCpuBackend(AttentionBackend):
             return o
 
         if topk_indices is not None:
-            # Real indexer: slice this rank's window out of the full flat
-            # top-k (slot coords; -1 padded rows are trimmed by the kernel).
-            r0, rows = meta.absorbed_row_start, meta.absorbed_rows
-            slots = topk_indices[r0 : r0 + rows].view(
-                rows, 1, topk_indices.shape[-1]
-            )
+            if (
+                getattr(meta, "absorbed_carry_slots", None) is not None
+                and topk_indices is meta.absorbed_carry_raw
+            ):
+                # PP-carried topk: the window view was built before this capture
+                # and registered as a graph input (input storages may not get new
+                # views while capturing), so consume it as-is.
+                slots = meta.absorbed_carry_slots
+            else:
+                # Real indexer: slice this rank's window out of the full flat
+                # top-k (slot coords; -1 padded rows are trimmed by the kernel).
+                r0, rows = meta.absorbed_row_start, meta.absorbed_rows
+                slots = topk_indices[r0 : r0 + rows].view(
+                    rows, 1, topk_indices.shape[-1]
+                )
             topk_length = meta.absorbed_topk_length
         else:
             slots = meta.absorbed_slots
