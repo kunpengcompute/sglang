@@ -1522,12 +1522,13 @@ class SchedulerPPMixin:
         all_gather_rank = (
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
-# The recv side must read the offset the sender wrote to. kutacc::pp_put
+        # The recv side must read the offset the sender wrote to. kutacc::pp_put
         # writes local[off] -> remote[off] with one offset, so both sides agree
-        # on the slot: output frames use the per-sender ring slot that the
-        # sender picked, proxy frames reuse segment 0.
+        # on the slot: output and proxy frames each advance their own slot ring.
         is_output = _msg_type_from_metadata(recv_metadata_list) == "output"
-        offset_base = comm.output_recv_offset(src) if is_output else 0
+        offset_base = (
+            comm.output_recv_offset(src) if is_output else comm.proxy_recv_offset(src)
+        )
         comm.recv_batch(src, offset_base)
         tensor_dict: Dict[str, Any] = {}
         pending = []  # (key, shard, use_all_gather, orig_shape)
