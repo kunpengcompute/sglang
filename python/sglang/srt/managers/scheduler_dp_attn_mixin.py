@@ -190,13 +190,17 @@ class MLPSyncBatchInfo:
     @KunpengProfiler(depth=1)
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
+        comm_size = self.dp_size * self.tp_size * self.cp_size
+        # `all_gather_into_tensor` (Gloo backend) only supports a flat 1-D output
+        # whose numel equals group_size * input.numel(); a leading [comm_size, 6]
+        # shape would chunk into [1, 6] slices and fail the per-slice size check.
+        # Allocate flat [comm_size * 6] and restore the [dp, tp*cp, 6] view after.
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
+            comm_size * 6,
             dtype=torch.int64,
             device=device,
         )
 
-        comm_size = self.dp_size * self.tp_size * self.cp_size
         if _rdma_allgather_available():
             _rdma_allgather_info_kunpeng(
                 local_info_tensor, global_info_tensor, comm_size
@@ -205,6 +209,9 @@ class MLPSyncBatchInfo:
             torch.distributed.all_gather_into_tensor(
                 global_info_tensor, local_info_tensor, group=group
             )
+        global_info_tensor = global_info_tensor.view(
+            self.dp_size, self.tp_size * self.cp_size, 6
+        )
         if device == "cpu":
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
