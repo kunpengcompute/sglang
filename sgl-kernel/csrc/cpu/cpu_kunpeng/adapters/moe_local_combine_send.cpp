@@ -19,7 +19,7 @@
 #include "register_graph_kernels.h"
 
 void moe_local_combine_send_kunpeng(at::Tensor moe_down, at::Tensor token_ids, at::Tensor experts_offset,
-                                    at::Tensor combined_x, at::Tensor topk_idx,
+                                    at::Tensor token_src, at::Tensor combined_x, at::Tensor topk_idx,
                                     int64_t num_local_experts, int64_t hidden,
                                     int64_t batch_size);
 

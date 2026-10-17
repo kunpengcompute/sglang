@@ -753,17 +753,13 @@ class KunpengMoE(FusedMoE):
             # match etp_dense_buf sizing in token_dispatcher/kunpeng.py).
             recv_dense_size = _KunpengDispatcherState.get().etp_dense_max
         elif self.is_prefill and _KunpengDispatcherState.get().use_local_dis_com:
-            # pp16 single-node local SHM mode keeps the legacy tight-packing
-            # prefill layout (must match packed_recv_x/token_ids sizing in
-            # token_dispatcher/kunpeng.py)
-            max_tokens = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")) * int(
-                os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024")
-            )
-            recv_dense_size = (
-                num_local_experts
-                * _KunpengDispatcherState.get().moe_token_multiple
-                * max_tokens
-            )
+            # pp16 single-node local SHM mode now uses the Sample-style
+            # full-token layout: moe_down rows = max_tokens_per_mb * router_topk
+            # (each token contributes at most router_topk rows to its local
+            # rank; batch_size <= max_tokens_per_mb).  Must match the
+            # combine_send_buf / packed_recv_x sizing in token_dispatcher/kunpeng.py.
+            _local_state = _KunpengDispatcherState.get()
+            recv_dense_size = _local_state.max_tokens_per_mb * _local_state.router_topk
         else:
             # Prefill (RDMA) and decode share the decode worst-case
             # per-(expert, rank) slot layout (must match token_ids/packed_recv_x
@@ -879,6 +875,16 @@ class KunpengMoE(FusedMoE):
             tmp_scales_down,
         )
         t_down_end = time.perf_counter()
+
+        # Diagnostic: intra-node barrier as a graph node to measure MoE
+        # down-GEMM load imbalance.  A distinct profile_name makes the per-node
+        # profiler report it separately ("moe_comm_barrier_kunpeng@down") from
+        # the dispatch_send barrier.  Whichever rank finishes down first waits
+        # here, so the slowest-to-fastest spread surfaces directly in this op's
+        # wall time.
+        kunpeng.moe_comm_barrier_kunpeng(
+            profile_name="moe_comm_barrier_kunpeng@down"
+        )
 
         # ETP: each rank's down output is a partial sum over its 1/moe_tp_size
         # of the intermediate dim.  Reduce the moe_tp_size partials onto the

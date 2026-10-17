@@ -391,15 +391,18 @@ void top_k_top_p_sampling_from_probs_kunpeng(
 void moe_local_dispatch_init_kunpeng(at::Tensor dispatch_send_buf, at::Tensor combined_x,
                                      int64_t local_rank, int64_t local_size);
 void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::Tensor experts_offset,
-                                at::Tensor packed_recv_x, at::Tensor dispatch_send_buf,
+                                at::Tensor token_src, at::Tensor packed_recv_x, at::Tensor dispatch_send_buf,
                                 int64_t num_experts, int64_t num_local_experts, int64_t num_tokens,
                                 int64_t batch_size, int64_t hidden);
 void moe_local_combine_send_kunpeng(at::Tensor moe_down, at::Tensor token_ids, at::Tensor experts_offset,
-                                    at::Tensor combined_x, at::Tensor topk_idx,
+                                    at::Tensor token_src, at::Tensor combined_x, at::Tensor topk_idx,
                                     int64_t num_local_experts, int64_t hidden,
                                     int64_t batch_size);
 void moe_local_combine_recv_kunpeng(at::Tensor combined_x, at::Tensor topk_idx, at::Tensor topk_weights,
                                    int64_t num_local_experts, int64_t hidden, int64_t batch_size);
+void moe_local_sum_kunpeng(at::Tensor moe_down, at::Tensor topk_ids_index, at::Tensor topk_weights,
+                           at::Tensor token_weights, at::Tensor token_ids, at::Tensor output,
+                           int64_t num_local_experts, int64_t hidden, int64_t batch_size);
 
 // === SHM operator declarations ===
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
@@ -1117,19 +1120,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def(
         "moe_local_dispatch_kunpeng(Tensor topk_idx, Tensor(a!) token_ids, Tensor(b!) experts_offset, "
-        "Tensor packed_recv_x, Tensor dispatch_send_buf, "
+        "Tensor token_src, Tensor packed_recv_x, Tensor dispatch_send_buf, "
         "int num_experts, int num_local_experts, int num_tokens, int batch_size, int hidden) -> ()");
     m.impl("moe_local_dispatch_kunpeng", moe_local_dispatch_kunpeng);
 
     m.def(
         "moe_local_combine_send_kunpeng(Tensor moe_down, Tensor token_ids, Tensor experts_offset, "
-        "Tensor combined_x, Tensor topk_idx, int num_local_experts, int hidden, int batch_size) -> ()");
+        "Tensor token_src, Tensor combined_x, Tensor topk_idx, int num_local_experts, int hidden, int batch_size) -> ()");
     m.impl("moe_local_combine_send_kunpeng", moe_local_combine_send_kunpeng);
 
     m.def(
         "moe_local_combine_recv_kunpeng(Tensor combined_x, Tensor topk_idx, Tensor topk_weights, "
         "int num_local_experts, int hidden, int batch_size) -> ()");
     m.impl("moe_local_combine_recv_kunpeng", moe_local_combine_recv_kunpeng);
+
+    m.def(
+        "moe_local_sum_kunpeng(Tensor moe_down, Tensor topk_ids_index, Tensor topk_weights, "
+        "Tensor token_weights, Tensor token_ids, Tensor output, "
+        "int num_local_experts, int hidden, int batch_size) -> ()");
+    m.impl("moe_local_sum_kunpeng", moe_local_sum_kunpeng);
 
     // SHM operators
     m.def("shm_pool_create_kunpeng(int intra_node_pg, int intra_socket_pg, int intra_die_pg, int shm_size_mb) -> ()");

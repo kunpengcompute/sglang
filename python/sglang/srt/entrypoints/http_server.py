@@ -2013,6 +2013,16 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
+            # The prefill node captures its chunked-prefill graphs lazily on the
+            # first prefill chunk (~100s one-time cost). Warm up with a full
+            # chunked_prefill_size input so real requests skip that capture,
+            # instead of paying it on the first user prompt.
+            warmup_input_len = 4
+            if (
+                server_args.disaggregation_mode == "prefill"
+                and (server_args.chunked_prefill_size or 0) > 0
+            ):
+                warmup_input_len = server_args.chunked_prefill_size
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -2030,7 +2040,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                         for i in range(server_args.dp_size)
                     ]
                 ),
-                "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
+                "input_ids": [[10] * warmup_input_len] * server_args.dp_size,
             }
             res = requests.post(
                 url + request_name,

@@ -1148,12 +1148,39 @@ void cat_rows_kunpeng(
     int64_t live = rows_live_total(extend_seq_lens, prefix_lens, a.size(0));
     if (live == 0)
         return;
-    // Manual slice copies: at::cat_out may reject the narrowed (view) output.
-    auto a_l = a.narrow(0, 0, live);
-    auto b_l = b.narrow(0, 0, live);
-    auto o_l = out.narrow(0, 0, live);
-    o_l.narrow(dim, 0, a_l.size(dim)).copy_(a_l);
-    o_l.narrow(dim, a_l.size(dim), b_l.size(dim)).copy_(b_l);
+
+    // dim is the concatenation axis (=2, the trailing head dim). a/b share the
+    // leading [live, H] grid; b may be head-broadcast (stride(1)==0). `a` is a
+    // strided view into the kv_b GEMM output (row gap = 320), so a plain
+    // at::copy_ falls back to an unvectorized per-element strided copy. Split
+    // the work by row and copy each head's contiguous [A] / [B] slice with a
+    // full-width memcpy instead, parallelized over the token rows.
+    TORCH_CHECK(dim == a.dim() - 1, "cat_rows_kunpeng only supports dim == last dim");
+    int64_t H = a.size(1);
+    int64_t A = a.size(2);
+    int64_t B = b.size(2);
+
+    uint8_t *a_ptr = static_cast<uint8_t *>(a.data_ptr());
+    uint8_t *b_ptr = static_cast<uint8_t *>(b.data_ptr());
+    uint8_t *o_ptr = static_cast<uint8_t *>(out.data_ptr());
+    int64_t esz = a.element_size();
+
+    int64_t a_s0 = a.stride(0), a_s1 = a.stride(1);  // a_s1 == 320 (row gap)
+    int64_t b_s0 = b.stride(0), b_s1 = b.stride(1);  // b_s1 may be 0 (broadcast)
+    int64_t o_s0 = out.stride(0), o_s1 = out.stride(1);  // contiguous
+
+    kutacc::parallel_for(0, live, 1, [&](int64_t i_begin, int64_t i_end) {
+        for (int64_t i = i_begin; i < i_end; ++i) {
+            uint8_t *o_i = o_ptr + i * o_s0 * esz;
+            uint8_t *a_i = a_ptr + i * a_s0 * esz;
+            uint8_t *b_i = b_ptr + i * b_s0 * esz;
+            for (int64_t h = 0; h < H; ++h) {
+                uint8_t *o_row = o_i + h * o_s1 * esz;
+                std::memcpy(o_row, a_i + h * a_s1 * esz, A * esz);
+                std::memcpy(o_row + A * esz, b_i + h * b_s1 * esz, B * esz);
+            }
+        }
+    });
 }
 
 void contiguous_rows_kunpeng(
@@ -1163,7 +1190,30 @@ void contiguous_rows_kunpeng(
     int64_t live = rows_live_total(extend_seq_lens, prefix_lens, x.size(0));
     if (live == 0)
         return;
-    out.narrow(0, 0, live).copy_(x.narrow(0, 0, live));
+
+    // Same strided->contiguous compaction as above: x is a [..., v:] view into
+    // the kv_b GEMM output (row gap = 320), each head row is contiguous within
+    // itself. Per-row memcpy + parallel over token rows replaces the scalar
+    // at::copy_ path.
+    int64_t H = x.size(1);
+    int64_t D = x.size(2);
+
+    uint8_t *x_ptr = static_cast<uint8_t *>(x.data_ptr());
+    uint8_t *o_ptr = static_cast<uint8_t *>(out.data_ptr());
+    int64_t esz = x.element_size();
+
+    int64_t x_s0 = x.stride(0), x_s1 = x.stride(1);  // x_s1 == 320 (row gap)
+    int64_t o_s0 = out.stride(0), o_s1 = out.stride(1);  // contiguous
+
+    kutacc::parallel_for(0, live, 1, [&](int64_t i_begin, int64_t i_end) {
+        for (int64_t i = i_begin; i < i_end; ++i) {
+            uint8_t *o_i = o_ptr + i * o_s0 * esz;
+            uint8_t *x_i = x_ptr + i * x_s0 * esz;
+            for (int64_t h = 0; h < H; ++h) {
+                std::memcpy(o_i + h * o_s1 * esz, x_i + h * x_s1 * esz, D * esz);
+            }
+        }
+    });
 }
 
 // bf16 (bgemm) counterparts of the pack/gemm rows pair above, for the

@@ -939,6 +939,8 @@ class KunpengGraphRunner:
                 "combine_recv_buf",
                 "recv_token_ids_buf",
                 "recv_experts_offset",
+                "recv_token_src_buf",
+                "moe_sum_token_weights",
                 "combined_x",
                 "topk_weights_buf",
                 "topk_ids_flat_buf",
