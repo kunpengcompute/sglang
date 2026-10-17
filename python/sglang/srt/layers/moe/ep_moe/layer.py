@@ -877,14 +877,13 @@ class KunpengMoE(FusedMoE):
         t_down_end = time.perf_counter()
 
         # Diagnostic: intra-node barrier as a graph node to measure MoE
-        # down-GEMM load imbalance.  A distinct profile_name makes the per-node
-        # profiler report it separately ("moe_comm_barrier_kunpeng@down") from
-        # the dispatch_send barrier.  Whichever rank finishes down first waits
-        # here, so the slowest-to-fastest spread surfaces directly in this op's
-        # wall time.
-        kunpeng.moe_comm_barrier_kunpeng(
-            profile_name="moe_comm_barrier_kunpeng@down"
-        )
+        # down-GEMM load imbalance (prefill only).  A distinct profile_name
+        # makes the per-node profiler report it separately
+        # ("moe_comm_barrier_kunpeng@down") from the dispatch_send barrier.
+        if self.is_prefill:
+            kunpeng.moe_comm_barrier_kunpeng(
+                profile_name="moe_comm_barrier_kunpeng@down"
+            )
 
         # ETP: each rank's down output is a partial sum over its 1/moe_tp_size
         # of the intermediate dim.  Reduce the moe_tp_size partials onto the
