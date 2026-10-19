@@ -1388,16 +1388,28 @@ def _setup_paged_mqa_logits_topk_kunpeng():
     # output (flash_mla_sparse_decode style: caller allocates, shape_infer
     # returns no extra outputs). output_coord: 0 = absolute paged slot
     # (decode), 1 = in-sequence position (sparse prefill consumer with
-    # key_start_loc; also feeds dsa_topk_slots_kunpeng).
+    # key_start_loc; also feeds dsa_topk_slots_kunpeng). mode: 0 =
+    # kTokenBalance (prefill), 1 = kSplitKV (decode/verify/draft-extend).
+    # row_start/row_rows: TP-sharded scoring window into the effective row
+    # stream [0, sum(cur_lens)); rows outside the window are neither read
+    # nor written (each attn-TP rank scores its own window on the
+    # shared-shape full-batch inputs). row_rows < 0 = to the end of the
+    # stream; (0, -1) = full stream (legacy behavior). All three scalars
+    # are frozen per graph: they are pure geometry of quantities already in
+    # the graph cache key (forward_mode / batch_size / absorbed_flat_rows),
+    # so baked scalar_args are always correct per cached graph.
     def shape_infer(q, cur_kv_cache, weight, block_tables, seq_lens,
-                    cur_lens, output, workspace, topk, output_coord):
+                    cur_lens, output, workspace, topk, output_coord,
+                    mode, row_start, row_rows):
         return []
 
     def eager_fn(q, cur_kv_cache, weight, block_tables, seq_lens,
-                 cur_lens, output, workspace, topk, output_coord):
+                 cur_lens, output, workspace, topk, output_coord,
+                 mode, row_start, row_rows):
         torch.ops.sgl_kernel.paged_mqa_logits_topk_kunpeng(
             q, cur_kv_cache, weight, block_tables, seq_lens, cur_lens,
-            output, workspace, topk, output_coord)
+            output, workspace, topk, output_coord, mode, row_start,
+            row_rows)
         return None
 
     register_op('paged_mqa_logits_topk_kunpeng', shape_infer, eager_fn)
@@ -1498,6 +1510,30 @@ def _setup_pad_q_left_mtp_kunpeng():
     register_op(
         'pad_q_left_mtp_kunpeng', shape_infer, eager_fn,
         capture_scalar_args=capture_scalar_args)
+
+
+def _setup_fill_mtp_pad_prefix_kunpeng():
+    # Overwrite the left-pad PREFIX rows of a block-layout MTP tensor
+    # ([bs, n, ...], right-aligned live rows -- the layout pad_q_left
+    # produces) with an explicit value; the trailing live rows are
+    # untouched. Direct-write on the in-graph dst (paged_mqa style:
+    # shape_infer returns no extra outputs). Used by the real indexer's
+    # DRAFT_EXTEND path (TP-sharded scoring): q/weights are pre-padded
+    # (fill=0) so the scoring row window is geometric (row_start = ts*nv),
+    # the scorer covers ALL bs*n rows, and the pad rows come out as
+    # garbage top-k ids (q=0 -> all-tie -> smallest valid positions, which
+    # dsa_topk_slots' pos < seq_len filter cannot reject) -- this restores
+    # the all -1 pad-row contract right at the producer. fill_value is the
+    # only scalar and is baked per graph (constant -1 at the call site).
+    def shape_infer(dst, ext_lens, fill_value):
+        return []
+
+    def eager_fn(dst, ext_lens, fill_value):
+        torch.ops.sgl_kernel.fill_mtp_pad_prefix_kunpeng(
+            dst, ext_lens, int(fill_value))
+        return None
+
+    register_op('fill_mtp_pad_prefix_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_unpad_o_right_mtp_kunpeng():
@@ -1692,6 +1728,7 @@ def setup():
     _setup_bf16_gemm_pack_rows_kunpeng()
     _setup_bf16_packed_gemm_rows_kunpeng()
     _setup_pad_q_left_mtp_kunpeng()
+    _setup_fill_mtp_pad_prefix_kunpeng()
     _setup_unpad_o_right_mtp_kunpeng()
     _setup_topk_convert_kunpeng()
     _setup_igemm_fusedmoe_gateup_kunpeng()

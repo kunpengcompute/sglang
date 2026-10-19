@@ -650,6 +650,12 @@ class Envs:
     # GEMMs, no collectives) instead of the attn-TP weight-sharded path.
     # Read once at Indexer construction.
     SGLANG_KUNPENG_DISABLE_INDEXER_TP_SPLIT = EnvBool(False)
+    # DSA (NSA) indexer SCORING TP split escape hatch: set to 1 to score the
+    # FULL row stream on every attn-TP rank (legacy behavior) instead of
+    # each rank scoring only its own row window (kutacc
+    # attention_schedule.row_start/row_rows). Read per forward; orthogonal
+    # to the construction-time weight split above.
+    SGLANG_KUNPENG_DISABLE_INDEXER_SCORE_TP_SPLIT = EnvBool(False)
 
 envs = Envs()
 EnvField._allow_set_name = False

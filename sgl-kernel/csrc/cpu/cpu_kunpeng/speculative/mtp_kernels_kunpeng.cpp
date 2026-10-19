@@ -205,3 +205,79 @@ void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Ten
     _copy_mtp_strided(o_padded.data_ptr(), o_flat.data_ptr(), offsets.data(), ext_a.data(), bs,
                       max_ext_len, tail, o_flat.element_size(), false);
 }
+
+// Overwrite the left-pad prefix rows of a block-layout MTP tensor with an
+// explicit value. dst is [bs, n, ...] with right-aligned live rows (the
+// layout pad_q_left_mtp_kunpeng produces); for each sequence b the LEADING
+// n - ext_lens[b] rows are filled with fill_value, the trailing ext_lens[b]
+// live rows are untouched. Byte-level writes only (same style as
+// _copy_mtp_strided): the fill_value is materialized as the byte pattern
+// of dst's dtype (int32 / int64); a uniform pattern (0x00 for 0, 0xFF for
+// -1) takes the memset fast path, anything else copies the pattern per
+// element. Block-parallel over sequences.
+//
+// Used by the real indexer's DRAFT_EXTEND path (TP-sharded scoring, R3):
+// q/weights are pre-padded (fill=0) so the row window is geometric
+// (row_start = ts*nv), and the scorer covers ALL bs*n rows -- the pad rows
+// come out as garbage top-k ids (q=0 -> all-tie -> smallest ids, valid
+// positions that dsa_topk_slots' filters cannot reject). This kernel
+// restores the all -1 pad-row contract the consumers trim on, right at the
+// producer, so every downstream path sees a clean output.
+void fill_mtp_pad_prefix_kunpeng(at::Tensor dst, at::Tensor ext_lens, int64_t fill_value)
+{
+    TORCH_CHECK(ext_lens.dim() == 1 && ext_lens.scalar_type() == at::kInt && ext_lens.is_contiguous(),
+                "ext_lens must be contiguous [bs] int32");
+    TORCH_CHECK(dst.dim() >= 2 && dst.is_contiguous(),
+                "dst must be contiguous [bs, n, ...], got ", dst.sizes());
+    TORCH_CHECK(dst.scalar_type() == at::kInt || dst.scalar_type() == at::kLong,
+                "dst must be int32 or int64, got ", dst.scalar_type());
+    const int64_t bs = ext_lens.size(0);
+    TORCH_CHECK(dst.size(0) == bs, "dst batch ", dst.size(0), " != ext_lens batch ", bs);
+    const int64_t n = dst.size(1);
+
+    int64_t tail = 1; // trailing elements per row (dims >= 3)
+    for (int64_t i = 2; i < dst.dim(); ++i) {
+        tail *= dst.size(i);
+    }
+
+    // Byte pattern of fill_value in dst's dtype (little-endian host bytes
+    // of the typed value; identical for every element of the fill region).
+    uint8_t pattern[8] = {0};
+    const size_t elem = dst.element_size();
+    if (dst.scalar_type() == at::kInt) {
+        const int32_t v = static_cast<int32_t>(fill_value);
+        std::memcpy(pattern, &v, sizeof(v));
+    } else {
+        std::memcpy(pattern, &fill_value, sizeof(fill_value));
+    }
+    bool uniform = true;
+    for (size_t i = 1; i < elem; ++i) {
+        uniform = uniform && pattern[i] == pattern[0];
+    }
+
+    const auto ext_a = ext_lens.accessor<int32_t, 1>();
+    for (int64_t b = 0; b < bs; b++) {
+        TORCH_CHECK(ext_a[b] >= 0 && ext_a[b] <= n,
+                    "ext_lens[", b, "]=", ext_a[b], " out of [0, ", n, "]");
+    }
+
+    uint8_t* base = reinterpret_cast<uint8_t*>(dst.data_ptr());
+    const int64_t block_elems = n * tail; // elements per sequence block
+    kutacc::parallel_for(0, bs, 1, [&](int64_t start, int64_t end) {
+        for (int64_t b = start; b < end; b++) {
+            const int64_t pad = n - ext_a[b];
+            if (pad <= 0) {
+                continue;
+            }
+            uint8_t* row = base + b * block_elems * elem;
+            const int64_t cnt = pad * tail;
+            if (uniform) {
+                std::memset(row, pattern[0], static_cast<size_t>(cnt) * elem);
+            } else {
+                for (int64_t k = 0; k < cnt; ++k) {
+                    std::memcpy(row + k * elem, pattern, elem);
+                }
+            }
+        }
+    });
+}

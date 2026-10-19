@@ -57,6 +57,14 @@ _USE_FAKE_INDEXER = envs.SGLANG_KUNPENG_FAKE_INDEXER.get()
 # sched so the dense fallback path is fully usable (block_table built +
 # dense sched extra_bytes).
 _DISABLE_DSA_SPARSE_MTP = envs.SGLANG_KUNPENG_DISABLE_DSA_SPARSE_MTP.get()
+# Indexer SCORING TP split escape hatch: when True the indexer scores the
+# FULL row stream on every attn-TP rank (legacy) instead of its own row
+# window (kutacc attention_schedule.row_start/row_rows). Orthogonal to the
+# construction-time projection weight split
+# (SGLANG_KUNPENG_DISABLE_INDEXER_TP_SPLIT).
+_DISABLE_INDEXER_SCORE_TP_SPLIT = (
+    envs.SGLANG_KUNPENG_DISABLE_INDEXER_SCORE_TP_SPLIT.get()
+)
 
 
 def run_sdpa_forward_mha(
@@ -287,6 +295,26 @@ class KunpengCpuMetadata:
         self.indexer_cur_lens: Optional[torch.Tensor] = None
         self.indexer_block_table: Optional[torch.Tensor] = None
 
+        # Real-indexer TP-sharded SCORING window (kutacc
+        # attention_schedule.row_start / row_rows) into the effective row
+        # stream [0, sum(indexer_cur_lens)): each attn-TP rank scores only
+        # its own rows of the FULL-batch view, on the shared-shape inputs
+        # (q / weight / block_tables / seq_lens / cur_lens stay full-batch;
+        # rows outside the window are neither read nor written). The values
+        # are pure geometry of (token_slice_start, batchsize_per_tp,
+        # seqlen_q) -- all derived from batch_size / absorbed_flat_rows,
+        # which are graph cache key members, so the op scalars bake
+        # correctly per cached graph. None = full stream (tp=1 window is
+        # still filled when eligible; None is the escape hatch / unsupported
+        # modes). Python ints consumed inside the capture -- never a graph
+        # input.
+        # (DRAFT_EXTEND's pre-pad / pad-restore ext lens are NOT carried
+        # here: forward_cpu reads forward_batch.extend_seq_lens directly --
+        # natively int32 -- and the graph runner registers that tensor
+        # itself as the input anchor.)
+        self.indexer_score_row_start: Optional[int] = None
+        self.indexer_score_row_rows: Optional[int] = None
+
         # Long-context decode CP metadata (sparse flash MLA over the local
         # 1/cp KV shard). Built once per decode step, reused across layers.
         # ``long_context_indices`` is a PERSISTENT fixed-shape
@@ -432,6 +460,8 @@ class KunpengCpuBackend(AttentionBackend):
         self.forward_metadata.indexer_seq_lens = None
         self.forward_metadata.indexer_cur_lens = None
         self.forward_metadata.indexer_block_table = None
+        self.forward_metadata.indexer_score_row_start = None
+        self.forward_metadata.indexer_score_row_rows = None
         self.forward_metadata.long_context_topk_length = None
         self.forward_metadata.long_context_real_topk_length = None
         # long_context_indices / fill_len / last_req_idx / last_seq_len are
@@ -718,6 +748,21 @@ class KunpengCpuBackend(AttentionBackend):
             metadata.indexer_seq_lens = seq_lens
             metadata.indexer_cur_lens = ext.to(torch.int32)
             metadata.indexer_block_table = metadata.block_table
+            # TP-sharded SCORING window (same rank window as the
+            # consumption above, but CLAMPED to the effective row stream:
+            # the flat stream is padded up to the a2a multiple, so the
+            # trailing ranks' windows may extend past
+            # sum(extend_seq_lens) -- the scorer only accepts windows
+            # inside [0, sum(cur_lens)). A fully out-of-stream window
+            # (all-padding rank) degenerates to a 1-row window at the
+            # stream tail; its duplicate output row is never consumed.
+            # None = full stream (escape hatch).
+            if not _DISABLE_INDEXER_SCORE_TP_SPLIT:
+                n_eff = real_rows  # == sum(extend_seq_lens)
+                score_start = min(row_start, n_eff - 1)
+                score_rows = min(rows, n_eff - score_start)
+                metadata.indexer_score_row_start = score_start
+                metadata.indexer_score_row_rows = score_rows
 
     def _init_decode_metadata(
         self,
@@ -832,23 +877,34 @@ class KunpengCpuBackend(AttentionBackend):
             #                is normalized to num_tokens, so bs == q rows);
             #   VERIFY       uniform seqlen_q rows per sequence
             #                (bs * nv == q rows, lcm-aligned upstream);
-            #   DRAFT_EXTEND ragged live rows. The scorer natively handles
-            #                sum(cur_lens) <= T (it scores only the first
-            #                sum(cur_lens) rows; the trailing mlp-pad rows
-            #                stay unwritten and are never read --
-            #                pad_q_left_mtp_kunpeng copies only the leading
-            #                sum(ext) rows), so no equality contract with
-            #                the padded q rows is needed.
+            #   DRAFT_EXTEND the PRE-PADDED block layout (bs, nv): the
+            #                indexer left-pads q/weights (fill=0) before
+            #                scoring so the row window stays geometric
+            #                (row_start = ts * nv, same formula as verify)
+            #                instead of the ragged cumsum(ext[:ts]); the
+            #                live rows are right-aligned inside each nv-row
+            #                block and their k_end is element-for-element
+            #                identical to the ragged layout (pos =
+            #                nv - ext[b] + j => k_end = seq - ext[b] + j + 1).
+            #                The pad rows score as garbage (q=0 all-tie) and
+            #                are restored to -1 right at the producer
+            #                (fill_mtp_pad_prefix_kunpeng). The pre-pad /
+            #                pad-restore read forward_batch.extend_seq_lens
+            #                directly (natively int32; the graph runner
+            #                registers that tensor as the input anchor).
             with pp_span("indexer_view_build"):
                 metadata.indexer_seq_lens = seq_lens
                 if forward_batch.forward_mode.is_draft_extend():
-                    # Ragged live rows; the FULL extend_seq_lens
-                    # (metadata's is all2all-sliced). Leave cur_lens unset
-                    # (-> dense fallback) only for the DP padding mirror
+                    # The FULL extend_seq_lens (metadata's is
+                    # all2all-sliced). Leave cur_lens unset (-> dense
+                    # fallback) only for the DP padding mirror
                     # (extend_seq_lens all zero -- nothing to score).
                     ext = forward_batch.extend_seq_lens
                     if ext is not None and int(ext.sum()) > 0:
-                        metadata.indexer_cur_lens = ext.to(torch.int32)
+                        nv = self.speculative_num_draft_tokens
+                        metadata.indexer_cur_lens = torch.full(
+                            (seq_lens.shape[0],), nv, dtype=torch.int32
+                        )
                 else:
                     metadata.indexer_cur_lens = torch.full(
                         (seq_lens.shape[0],), seqlen_q, dtype=torch.int32
@@ -899,6 +955,22 @@ class KunpengCpuBackend(AttentionBackend):
 
         metadata.seq_lens = seq_lens
         metadata.req_pool_indices = req_pool_indices
+
+        # Real-indexer TP-sharded SCORING window: each attn-TP rank scores
+        # only its own rows of the full-batch view (rows outside the
+        # window are neither read nor written; the consumers' existing
+        # token_slice_start / absorbed_row_start slices of the shared-shape
+        # output keep reading exactly the rows THIS rank wrote). The window
+        # is pure geometry of (token_slice_start, batchsize_per_tp,
+        # seqlen_q) -- all derived from batch_size, a graph cache key
+        # member, so the op scalars bake correctly per cached graph. None
+        # (escape hatch / unsupported mode / DP mirror) = full stream.
+        if (
+            metadata.indexer_cur_lens is not None
+            and not _DISABLE_INDEXER_SCORE_TP_SPLIT
+        ):
+            metadata.indexer_score_row_start = token_slice_start * seqlen_q
+            metadata.indexer_score_row_rows = batchsize_per_tp * seqlen_q
 
         # Sparse-vs-dense sched decision, hoisted above the block-table
         # build so the dense path can build it too (the dense paged MLA

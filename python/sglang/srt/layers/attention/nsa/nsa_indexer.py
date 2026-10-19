@@ -1228,10 +1228,19 @@ class Indexer(MultiPlatformOp):
         SGLANG_KUNPENG_FAKE_INDEXER=1 switches to _forward_cpu_fake
         (bring-up cross-check).
 
-        Output contract (FULL batch, every rank repeats the computation):
+        Output contract (full-batch SHAPES; with the score TP split each
+        rank only WRITES its own row window -- metadata.
+        indexer_score_row_start/rows, geometry of batch_size /
+        absorbed_flat_rows -- and the consumers' token_slice_start /
+        absorbed_row_start windows coincide with exactly those rows, so
+        the unwritten rows are never read):
           - DECODE: [B, topk] in-sequence positions.
           - TARGET_VERIFY / DRAFT_EXTEND: [B, n, topk], -1 padding;
-            n = speculative_num_draft_tokens.
+            n = speculative_num_draft_tokens. DRAFT_EXTEND scores the
+            PRE-PADDED (bs, nv) block layout (q/weights left-padded
+            fill=0 before scoring so the row window stays geometric) and
+            restores the pad rows to -1 via fill_mtp_pad_prefix_kunpeng
+            right after scoring.
           - absorbed prefill: flat [T, topk] SLOT-coordinate stream
             (T == absorbed_flat_rows by the upstream a2a alignment).
         Consumers select their own windows (token_slice_start /
@@ -1310,17 +1319,41 @@ class Indexer(MultiPlatformOp):
         if not return_indices:
             return None
 
-        T = q.shape[0]
-        topk = self.index_topk
-        output = kunpeng.alloc_buffer(T * topk, dtype=torch.int32).view(T, topk)
-        if T == 0:
-            return output
-
         seq_lens = meta.indexer_seq_lens
         cur_lens = meta.indexer_cur_lens
         block_tables = meta.indexer_block_table
         if seq_lens is None or cur_lens is None or block_tables is None:
             return None
+
+        is_draft_extend = forward_batch.forward_mode.is_draft_extend()
+        if is_draft_extend:
+            # R3 pre-pad scoring: left-pad q/weights to the (bs, nv) block
+            # layout (fill=0) BEFORE scoring, so the row window stays
+            # geometric (row_start = ts * nv -- the verify formula, a pure
+            # function of batch_size) instead of the ragged
+            # cumsum(ext[:ts]) that changes per step and cannot be baked
+            # into a graph. The live rows are right-aligned per block and
+            # their k_end matches the ragged layout element-for-element
+            # (pos = nv - ext[b] + j => k_end = seq - nv + pos + 1 ==
+            # seq - ext[b] + j + 1). ext_lens comes straight from
+            # forward_batch (natively int32; the graph runner registers
+            # that tensor as the input anchor); reaching here implies the
+            # backend's cur_lens gate passed, so it is never None.
+            ext_lens = forward_batch.extend_seq_lens
+            nv = forward_batch.attn_backend.speculative_num_draft_tokens
+            bs = ext_lens.shape[0]
+            q = kunpeng.pad_q_left_mtp_kunpeng(
+                q, ext_lens, nv, fill_value=0
+            ).view(-1, self.n_heads, self.head_dim)
+            weights = kunpeng.pad_q_left_mtp_kunpeng(
+                weights, ext_lens, nv, fill_value=0
+            ).view(-1, self.n_heads)
+
+        T = q.shape[0]
+        topk = self.index_topk
+        output = kunpeng.alloc_buffer(T * topk, dtype=torch.int32).view(T, topk)
+        if T == 0:
+            return output
 
         page_size = pool.page_size
         kv_paged = pool.get_index_k_buffer(layer_id).view(
@@ -1334,9 +1367,30 @@ class Indexer(MultiPlatformOp):
             "and SGLANG_KUNPENG_FAKE_INDEXER is unset)"
         )
 
-        output_coord = (
-            0 if forward_batch.forward_mode.is_extend_without_speculative() else 1
-        )
+        # Scheduling mode + output coordinate share the same static split
+        # (both frozen per graph: forward_mode is a cache key member):
+        #   - absorbed prefill: kTokenBalance (0) -- the token dimension
+        #     already saturates the thread pool (T/a2a rows per rank);
+        #     kSlot (0) coordinates for the flat sparse-prefill consumer.
+        #   - decode / verify / draft-extend: kSplitKV (1) -- after the
+        #     score TP split each rank holds only Btp * seqlen_q rows (<=
+        #     n_threads), so splitting each row's KV range across threads
+        #     is what saturates the pool (the library falls back to
+        #     balance when row_rows > n_threads, semantically identical);
+        #     kPosition (1) coordinates for dsa_topk_slots_kunpeng.
+        is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        output_coord = 0 if is_prefill else 1
+        sched_mode = 0 if is_prefill else 1
+
+        # TP-sharded scoring window into the effective row stream (each
+        # attn-TP rank scores only its own rows of the shared-shape
+        # full-batch inputs; rows outside are neither read nor written).
+        # None = full stream (escape hatch / unsupported mode).
+        row_start = meta.indexer_score_row_start
+        row_rows = meta.indexer_score_row_rows
+        if row_start is None or row_rows is None:
+            row_start, row_rows = 0, -1
+
         kunpeng.paged_mqa_logits_topk_kunpeng(
             q,
             kv_paged,
@@ -1348,39 +1402,29 @@ class Indexer(MultiPlatformOp):
             workspace,
             topk,
             output_coord,
+            sched_mode,
+            row_start,
+            row_rows,
         )
-        return self._reshape_cpu_indexer_output(output, forward_batch, topk)
-
-    def _reshape_cpu_indexer_output(
-        self,
-        output: torch.Tensor,
-        forward_batch: ForwardBatch,
-        topk: int,
-    ) -> torch.Tensor:
-        """Reshape the flat [T, topk] scorer output to the consumer
-        contract: [B, n, topk] for TARGET_VERIFY / DRAFT_EXTEND (n =
-        speculative_num_draft_tokens); decode / absorbed prefill consume
-        the flat rows as-is. The scorer fills the FULL batch; consumers
-        select their own rows via token_slice_start / absorbed_row_start.
-        For DRAFT_EXTEND the full padded [T, topk] is fed (the kernel
-        copies only the leading sum(extend_seq_lens) live rows; slicing
-        would need a .item() host sync and freeze a dynamic bound inside
-        the graph).
-        """
-        from sglang.srt.graph import ops as kunpeng
-
-        mode = forward_batch.forward_mode
-        if mode.is_target_verify():
-            nv = forward_batch.attn_backend.speculative_num_draft_tokens
-            return output.view(-1, nv, topk)
-        if mode.is_draft_extend():
-            nv = forward_batch.attn_backend.speculative_num_draft_tokens
-            return kunpeng.pad_q_left_mtp_kunpeng(
-                output,
-                forward_batch.extend_seq_lens,
-                nv,
-                fill_value=-1,
+        if is_draft_extend:
+            # The pre-padded pad rows scored as garbage (q=0 -> all-tie ->
+            # smallest valid positions, which no downstream filter can
+            # reject); restore the all -1 pad-row contract right here at
+            # the producer, before any consumer sees the output.
+            kunpeng.fill_mtp_pad_prefix_kunpeng(
+                output.view(bs, nv, topk), ext_lens, -1
             )
+        # Reshape the flat [T, topk] scorer output to the consumer
+        # contract: [B, nv, topk] for TARGET_VERIFY / DRAFT_EXTEND (both
+        # score uniform nv rows per sequence -- draft-extend's pad rows
+        # carry -1 from the fill above; nv is re-fetched so the verify
+        # branch works without the pre-pad block); decode / absorbed
+        # prefill consume the flat rows as-is. The scorer fills the FULL
+        # batch; consumers select their own rows via token_slice_start /
+        # absorbed_row_start.
+        if is_draft_extend or forward_batch.forward_mode.is_target_verify():
+            nv = forward_batch.attn_backend.speculative_num_draft_tokens
+            output = output.view(-1, nv, topk)
         return output
 
     def _forward_cpu_fake(

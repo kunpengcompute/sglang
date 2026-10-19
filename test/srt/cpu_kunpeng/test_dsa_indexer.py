@@ -380,13 +380,15 @@ def _iter_random_kutacc_cases(seed=0, limit=20):
         yield cfg, q, kv, weight, bt, sl, cl, tk
 
 
-def _run_kutacc_topk(q, kv, weight, bt, sl, cl, tk, output_coord):
+def _run_kutacc_topk(q, kv, weight, bt, sl, cl, tk, output_coord,
+                     mode=0, row_start=0, row_rows=-1):
     out = torch.full((q.shape[0], tk), -1, dtype=torch.int32)
     max_k_end = int(sl.max())
     ws_bytes = int(_sgl_kernel.get_paged_mqa_logits_topk_workspace_size(max_k_end))
     workspace = torch.empty(ws_bytes, dtype=torch.uint8)
     _sgl_kernel.paged_mqa_logits_topk_kunpeng(
-        q, kv, weight, bt, sl, cl, out, workspace, tk, output_coord
+        q, kv, weight, bt, sl, cl, out, workspace, tk, output_coord,
+        mode, row_start, row_rows
     )
     return out
 
@@ -422,6 +424,29 @@ def test_kutacc_matches_cpu_position():
         assert out.tolist() == cpu.tolist(), (
             f"kutacc(position) != cpu (strict order) cfg={cfg}: {out} vs {cpu}"
         )
+
+
+def test_kutacc_matches_cpu_splitkv():
+    """kSplitKV mode (the decode/verify/draft-extend production mode after
+    the score TP split) on the same random inputs: strict elementwise
+    equality against the CPU golden in BOTH coordinates. The random cases
+    are small (T = sum(cur) <= 9 <= n_threads), so the split-kv path is
+    actually taken (no token-balance fallback)."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    for coord, name in (
+        (OUTPUT_COORD_SLOT, "slot"),
+        (OUTPUT_COORD_POSITION, "position"),
+    ):
+        for cfg, q, kv, weight, bt, sl, cl, tk in _iter_random_kutacc_cases():
+            cpu = paged_mqa_logits_topk_cpu(
+                q, kv, weight, bt, sl, cl, tk, output_coord=coord
+            )
+            out = _run_kutacc_topk(q, kv, weight, bt, sl, cl, tk, coord, mode=1)
+            assert out.tolist() == cpu.tolist(), (
+                f"kutacc(splitkv,{name}) != cpu cfg={cfg}: {out} vs {cpu}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1331,6 +1356,138 @@ def test_tp_split_bf16_gemm_shard():
 
 
 # ---------------------------------------------------------------------------
+# L. score TP split (kutacc row window) + R3 draft-extend pre-pad
+# ---------------------------------------------------------------------------
+
+def test_score_tp_split_window_equivalence():
+    """TP-sharded scoring windows: for random inputs, a full-stream call
+    and a set of disjoint row windows that tile the stream produce
+    element-for-element identical rows (the cross-rank sharding contract:
+    rows outside a window are neither read nor written). Covers both
+    scheduling modes (kTokenBalance / kSplitKV) x both output coordinates,
+    and row_start > 0 x kSplitKV -- the workspace per-row slot must be
+    indexed by the LOCAL row (the kutacc regression this deployment shape
+    exercises)."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    rng = random.Random(11)
+    for mode in (0, 1):
+        for coord in (OUTPUT_COORD_SLOT, OUTPUT_COORD_POSITION):
+            for cfg, q, kv, weight, bt, sl, cl, tk in _iter_random_kutacc_cases(
+                seed=23, limit=12
+            ):
+                full = _run_kutacc_topk(
+                    q, kv, weight, bt, sl, cl, tk, coord, mode=mode
+                )
+                T = q.shape[0]
+                # Tile the row stream with random disjoint windows.
+                bounds = [0]
+                while bounds[-1] < T:
+                    step = rng.randint(1, max(1, T // 2))
+                    bounds.append(min(bounds[-1] + step, T))
+                for r0, r1 in zip(bounds[:-1], bounds[1:]):
+                    win = _run_kutacc_topk(
+                        q, kv, weight, bt, sl, cl, tk, coord,
+                        mode=mode, row_start=r0, row_rows=r1 - r0,
+                    )
+                    assert win[r0:r1].tolist() == full[r0:r1].tolist(), (
+                        f"window [{r0},{r1}) mismatch (mode={mode}, "
+                        f"coord={coord}) cfg={cfg}: {win[r0:r1]} vs "
+                        f"{full[r0:r1]}"
+                    )
+
+
+def test_fill_mtp_pad_prefix():
+    """fill_mtp_pad_prefix_kunpeng: each [n, ...] block's LEADING
+    n - ext[b] rows are overwritten with fill_value; the right-aligned
+    live rows are untouched. Covers ext=0 (all-pad block), ext=n (no pad)
+    and ragged mixes, on 2D-style [bs, n, topk] blocks."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    bs, nv, topk = 5, 4, 3
+    for ext in ([0, 4, 1, 3, 4], [4, 4, 4, 4, 4], [0, 0, 2, 0, 0]):
+        dst = torch.arange(bs * nv * topk, dtype=torch.int32).view(bs, nv, topk)
+        before = dst.clone()
+        ext_t = torch.tensor(ext, dtype=torch.int32)
+        _sgl_kernel.fill_mtp_pad_prefix_kunpeng(dst, ext_t, -1)
+        for b in range(bs):
+            pad = nv - ext[b]
+            for j in range(nv):
+                row = dst[b, j]
+                if j < pad:
+                    assert torch.equal(
+                        row, torch.full((topk,), -1, dtype=torch.int32)
+                    ), f"pad row ({b},{j}) not filled: {row}"
+                else:
+                    assert torch.equal(row, before[b, j]), (
+                        f"live row ({b},{j}) was modified: {row} vs "
+                        f"{before[b, j]}"
+                    )
+
+
+def test_score_r3_draft_extend_equivalence():
+    """R3 draft-extend pre-pad scoring: the (bs, nv) block layout with
+    uniform cur_lens = nv scores the live (right-aligned) rows
+    element-for-element identically to the legacy ragged layout
+    (cur_lens = ext), and the pad rows come out all -1 after
+    fill_mtp_pad_prefix. This fixes the R3 math: pos = nv - ext[b] + j
+    => k_end = seq - nv + pos + 1 == seq - ext[b] + j + 1."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    rng = random.Random(31)
+    for trial in range(10):
+        bs = rng.randint(1, 4)
+        nv = rng.choice([2, 3, 4])
+        # Ragged accepted-token counts; keep at least one live row (the
+        # DP all-zero mirror takes the dense fallback, out of scope here).
+        ext = [rng.randint(0, nv) for _ in range(bs)]
+        if sum(ext) == 0:
+            ext[rng.randrange(bs)] = rng.randint(1, nv)
+        prefix = [rng.randint(0, 6) for _ in range(bs)]
+        H, D, block, topk = 2, 4, 2, 3
+
+        # Baseline: the ragged layout (cur_lens = ext) -- the historical
+        # draft-extend scoring shape.
+        q_r, kv, w_r, bt, sl, cl_r, tk, _, _ = _make_case(
+            rng, H, D, block, topk, bs, ext, prefix
+        )
+        base = _run_kutacc_topk(
+            q_r, kv, w_r, bt, sl, cl_r, tk, OUTPUT_COORD_POSITION, mode=1
+        )
+        # Right-align the ragged rows into the (bs, nv) block layout with
+        # -1 pad rows (the legacy pad_q_left output contract).
+        ref = torch.full((bs, nv, topk), -1, dtype=torch.int32)
+        off = 0
+        for b in range(bs):
+            if ext[b] > 0:
+                ref[b, nv - ext[b] :] = base[off : off + ext[b]]
+            off += ext[b]
+
+        # R3: pre-pad q/weights (fill=0), uniform cur_lens = nv, score,
+        # restore the pad rows to -1 at the producer.
+        ext_t = torch.tensor(ext, dtype=torch.int32)
+        q_pad = torch.empty(bs, nv, H, D, dtype=torch.bfloat16)
+        w_pad = torch.empty(bs, nv, H, dtype=torch.bfloat16)
+        _sgl_kernel.pad_q_left_mtp_kunpeng(q_r, ext_t, q_pad, 0)
+        _sgl_kernel.pad_q_left_mtp_kunpeng(w_r, ext_t, w_pad, 0)
+        cl_u = torch.full((bs,), nv, dtype=torch.int32)
+        got = _run_kutacc_topk(
+            q_pad.view(-1, H, D), kv, w_pad.view(-1, H), bt, sl, cl_u, tk,
+            OUTPUT_COORD_POSITION, mode=1,
+        )
+        _sgl_kernel.fill_mtp_pad_prefix_kunpeng(
+            got.view(bs, nv, topk), ext_t, -1
+        )
+        assert got.view(bs, nv, topk).tolist() == ref.tolist(), (
+            f"trial {trial} (bs={bs}, nv={nv}, ext={ext}, prefix={prefix}): "
+            f"{got.view(bs, nv, topk)} vs {ref}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1346,6 +1503,7 @@ def main():
         ("A. test_scorer_partial_rows", test_scorer_partial_rows),
         ("B. test_kutacc_matches_cpu", test_kutacc_matches_cpu),
         ("B. test_kutacc_matches_cpu_position", test_kutacc_matches_cpu_position),
+        ("B. test_kutacc_matches_cpu_splitkv", test_kutacc_matches_cpu_splitkv),
         ("C. test_kunpeng_index_k_pool", test_kunpeng_index_k_pool),
         ("C. test_kunpeng_index_k_pool_skip", test_kunpeng_index_k_pool_skip),
         ("C. test_kunpeng_index_k_pool_default_allocates_all", test_kunpeng_index_k_pool_default_allocates_all),
@@ -1372,6 +1530,9 @@ def main():
         ("K. test_tp_split_shard_bounds", test_tp_split_shard_bounds),
         ("K. test_tp_split_linear_shapes", test_tp_split_linear_shapes),
         ("K. test_tp_split_bf16_gemm_shard", test_tp_split_bf16_gemm_shard),
+        ("L. test_score_tp_split_window_equivalence", test_score_tp_split_window_equivalence),
+        ("L. test_fill_mtp_pad_prefix", test_fill_mtp_pad_prefix),
+        ("L. test_score_r3_draft_extend_equivalence", test_score_r3_draft_extend_equivalence),
     ]
     failed = 0
     for name, fn in tests:
