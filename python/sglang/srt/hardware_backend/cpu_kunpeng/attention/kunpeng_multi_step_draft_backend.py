@@ -50,6 +50,12 @@ class KunpengCpuMultiStepDraftBackend:
             KunpengCpuBackend(model_runner)
             for _ in range(speculative_num_steps - 1)
         ]
+        # Chain-step index of each per-step backend (step 0 = the first
+        # chain forward). The fake-indexer MTP top-k window cap reads it
+        # (see NSAIndexer._forward_cpu_fake and the sparse sched plan in
+        # KunpengCpuBackend); the debug probes also use it as a log tag.
+        for step, backend in enumerate(self.attn_backends):
+            backend._mtp_step_id = step
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize every per-step backend's decode metadata.
