@@ -780,6 +780,13 @@ class KunpengCpuBackend(AttentionBackend):
         if self._nsa_enabled:
             # DSA: update the persistent full-batch seq lens; the padded tail
             # is refilled with the fill value so padded rows stay consistent.
+            # FAKE MTP chain steps: the buffer carries the step's top-k
+            # window [0, base), base = seq_lens - step - 1 (M9: the indexer
+            # scores before the KV write, so in-flight rows are in nobody's
+            # top-k). The cap must run here, OUTSIDE the graph: the captured
+            # fake indexer op consumes this buffer directly and plain tensor
+            # arithmetic cannot be captured. Backends without _mtp_step_id
+            # keep the raw values.
             bs = seq_lens.shape[0]
             if metadata.full_seq_lens is None:
                 metadata.full_seq_lens = torch.full(
@@ -790,7 +797,13 @@ class KunpengCpuBackend(AttentionBackend):
                     f"DSA full_seq_lens buffer ({metadata.full_seq_lens.shape[0]})"
                     f" too small for batch {bs}; raise the initial size"
                 )
-            metadata.full_seq_lens[:bs].copy_(seq_lens)
+            step = getattr(self, "_mtp_step_id", None)
+            if _USE_FAKE_INDEXER and step is not None:
+                metadata.full_seq_lens[:bs].copy_(
+                    (seq_lens - (step + 1)).clamp_(min=1)
+                )
+            else:
+                metadata.full_seq_lens[:bs].copy_(seq_lens)
             if bs < metadata.full_seq_lens.shape[0]:
                 metadata.full_seq_lens[bs:].fill_(
                     self.speculative_num_draft_tokens
@@ -1034,11 +1047,9 @@ class KunpengCpuBackend(AttentionBackend):
                 topk_len = torch.minimum(
                     seq_lens, torch.full_like(seq_lens, self._nsa_topk)
                 ).clamp_(min=1)
-                # Mirror the forward-time fake top-k window cap so the
-                # sched plans the same window the kernel produces
-                # (otherwise the sched/kernel topk consistency check
-                # trips): the shared top-k covers only the committed
-                # prefix [0, base), so cap every chain step's plan at base.
+                # Mirror the full_seq_lens window cap above so the sched
+                # plans the same window the kernel produces (otherwise the
+                # sched/kernel topk consistency check trips).
                 if _USE_FAKE_INDEXER:
                     step = getattr(self, "_mtp_step_id", None)
                     if step is not None:

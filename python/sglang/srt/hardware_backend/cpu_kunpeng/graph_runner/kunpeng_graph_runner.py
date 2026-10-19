@@ -839,6 +839,16 @@ class KunpengGraphRunner:
                 )
             if getattr(spec_info, "hidden_states", None) is not None:
                 inputs.append(spec_info.hidden_states)
+            # M9 DSA top-k carry between the chain-step graphs: the step-0
+            # top-k (stuffed by _graph_forward after its replay; published
+            # by the model on the eager path) feeds the later steps'
+            # captured graphs, like spec_info.hidden_states above.
+            if (
+                forward_mode.is_decode()
+                and getattr(forward_batch, "reuse_dsa_topk_indices", False)
+                and getattr(spec_info, "dsa_topk_indices", None) is not None
+            ):
+                inputs.append(spec_info.dsa_topk_indices)
 
         # PP: proxy tensors consumed by this pipeline stage must be registered
         # as graph inputs so the capture system can track them.
@@ -1113,6 +1123,17 @@ class KunpengGraphRunner:
             all_padding_key,
         )
 
+        # M9 DSA top-k carry: the incoming carry (None at step 0 -- eagle
+        # clears it per round). The capture branch below distinguishes a
+        # freshly computed top-k (step 0) from a re-published one by
+        # object identity.
+        _spec_info = forward_batch.spec_info
+        _pre_topk_carry = (
+            getattr(_spec_info, "dsa_topk_indices", None)
+            if _spec_info is not None
+            else None
+        )
+
         if graph_cache_key not in self._sglang_graph_cache:
             while len(self._sglang_graph_cache) >= self._sglang_graph_max_cache:
                 self._sglang_graph_cache.popitem(last=False)
@@ -1150,6 +1171,24 @@ class KunpengGraphRunner:
                 graph_outputs = (
                     [logits, hidden_states] if hidden_states is not None else [logits]
                 )
+
+            # M9 DSA top-k carry (draft chain, non-PP): the step-0 graph
+            # computes the shared top-k; register it as an extra output so
+            # every replay returns the fresh values (the model's Python
+            # publish cannot run inside a captured graph).
+            has_mtp_topk = False
+            if (
+                self.model_runner.is_draft_worker
+                and not is_pp_output
+                and forward_batch.forward_mode.is_decode()
+                and getattr(forward_batch, "reuse_dsa_topk_indices", False)
+            ):
+                published = getattr(
+                    forward_batch.spec_info, "dsa_topk_indices", None
+                )
+                if published is not None and published is not _pre_topk_carry:
+                    graph_outputs.append(published)
+                    has_mtp_topk = True
 
             if KunpengGraphRunner._graph_shm_tensor is None:
                 remaining = torch.ops.sgl_kernel.shm_remaining_bytes_kunpeng()
@@ -1208,17 +1247,22 @@ class KunpengGraphRunner:
                 is_pp_graph,
                 is_pp_output,
                 has_pp_topk,
+                has_mtp_topk,
             )
             logger.info(
                 f"[graph] captured mode={forward_batch.forward_mode.name}, "
                 f"total_tokens={total_tokens}, batch_size={forward_batch.batch_size}, "
-                f"pp={is_pp_graph}"
+                f"pp={is_pp_graph}, mtp_topk={has_mtp_topk}"
             )
         else:
             self._sglang_graph_cache.move_to_end(graph_cache_key)
-            graph, is_pp_graph, is_pp_output, has_pp_topk = self._sglang_graph_cache[
-                graph_cache_key
-            ]
+            (
+                graph,
+                is_pp_graph,
+                is_pp_output,
+                has_pp_topk,
+                has_mtp_topk,
+            ) = self._sglang_graph_cache[graph_cache_key]
 
         t0 = time.time()
         with pp_span("graph_run"):
@@ -1272,6 +1316,21 @@ class KunpengGraphRunner:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+
+        # M9 DSA top-k carry: return the fresh step-0 top-k through
+        # spec_info. CLONE it out of the graph pool: per-step draft graphs
+        # share the pool, so later replays would overwrite the buffer in
+        # place (same reason the chain clones hidden_states).
+        if has_mtp_topk:
+            if graph.has_hidden_states:
+                logits, hidden_states, mtp_topk = outputs
+            else:
+                logits, mtp_topk = outputs
+                hidden_states = None
+            if forward_batch.spec_info is not None:
+                forward_batch.spec_info.dsa_topk_indices = mtp_topk.clone()
+            return logits, hidden_states
+
         if graph.has_hidden_states:
             logits, hidden_states = outputs
             return logits, hidden_states
