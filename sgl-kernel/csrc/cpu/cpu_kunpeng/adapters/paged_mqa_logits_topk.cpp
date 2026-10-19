@@ -23,12 +23,15 @@
 // caller-allocated tensors recorded as graph inputs (shape_infer returns
 // no extra outputs), so the dispatch expands tensors as (q, kv, weight,
 // block_tables, seq_lens, cur_lens, output, workspace) and scalars as
-// (topk, output_coord) -- identical to the Python call order.
+// (topk, output_coord, mode, row_start, row_rows) -- identical to the
+// Python call order.
 void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
                                    at::Tensor weight, at::Tensor block_tables,
                                    at::Tensor seq_lens, at::Tensor cur_lens,
                                    at::Tensor output, at::Tensor workspace,
-                                   int64_t topk, int64_t output_coord);
+                                   int64_t topk, int64_t output_coord,
+                                   int64_t mode, int64_t row_start,
+                                   int64_t row_rows);
 
 static KernelRegistrar _r_paged_mqa_logits_topk(
     "paged_mqa_logits_topk_kunpeng",

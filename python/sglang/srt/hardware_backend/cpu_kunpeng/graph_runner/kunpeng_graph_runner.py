@@ -793,6 +793,15 @@ class KunpengGraphRunner:
                             meta.indexer_block_table,
                         ]
                     )
+                # DRAFT_EXTEND (R3 pre-pad scoring): the per-sequence ext
+                # lens feed the indexer's pre-pad (pad_q_left) and the
+                # post-scoring pad-row restore (fill_mtp_pad_prefix) inside
+                # the capture; forward_cpu reads forward_batch.
+                # extend_seq_lens directly (natively int32), so register
+                # THAT tensor as the graph input anchor (same pattern as
+                # the extend branch's inputs list).
+                if forward_mode.is_draft_extend():
+                    inputs.append(forward_batch.extend_seq_lens)
             if (
                 absorbed_dsa_prefill
                 and meta is not None

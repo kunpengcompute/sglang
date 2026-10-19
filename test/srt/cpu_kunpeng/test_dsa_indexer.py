@@ -34,6 +34,12 @@ Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
      tensors pass through.
   J. should_run_indexer M9 reuse matrix (index_share_for_mtp_iteration:
      NextN + carry + prev -> reuse; otherwise rescore).
+  K. indexer attn-TP weight split (see nsa_indexer.Indexer.__init__ /
+     forward_cpu): the K-split partial-sum identity behind the RowParallel
+     wk / weights_proj + SHM allreduce, the head-aligned N-split column
+     stitch behind the ColumnParallel wq_b + batched allgather, the shard
+     boundary / head-alignment invariants, and the sharded linear weight
+     shapes (auto-skip when the modules are not importable).
 """
 
 import random
@@ -77,6 +83,16 @@ try:
     _HAVE_INDEXER_INPUT = True
 except Exception:
     _HAVE_INDEXER_INPUT = False
+
+try:
+    from sglang.srt.layers.linear import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+
+    _HAVE_LINEAR = True
+except Exception:
+    _HAVE_LINEAR = False
 
 try:
     from types import SimpleNamespace
@@ -364,13 +380,15 @@ def _iter_random_kutacc_cases(seed=0, limit=20):
         yield cfg, q, kv, weight, bt, sl, cl, tk
 
 
-def _run_kutacc_topk(q, kv, weight, bt, sl, cl, tk, output_coord):
+def _run_kutacc_topk(q, kv, weight, bt, sl, cl, tk, output_coord,
+                     mode=0, row_start=0, row_rows=-1):
     out = torch.full((q.shape[0], tk), -1, dtype=torch.int32)
     max_k_end = int(sl.max())
     ws_bytes = int(_sgl_kernel.get_paged_mqa_logits_topk_workspace_size(max_k_end))
     workspace = torch.empty(ws_bytes, dtype=torch.uint8)
     _sgl_kernel.paged_mqa_logits_topk_kunpeng(
-        q, kv, weight, bt, sl, cl, out, workspace, tk, output_coord
+        q, kv, weight, bt, sl, cl, out, workspace, tk, output_coord,
+        mode, row_start, row_rows
     )
     return out
 
@@ -406,6 +424,29 @@ def test_kutacc_matches_cpu_position():
         assert out.tolist() == cpu.tolist(), (
             f"kutacc(position) != cpu (strict order) cfg={cfg}: {out} vs {cpu}"
         )
+
+
+def test_kutacc_matches_cpu_splitkv():
+    """kSplitKV mode (the decode/verify/draft-extend production mode after
+    the score TP split) on the same random inputs: strict elementwise
+    equality against the CPU golden in BOTH coordinates. The random cases
+    are small (T = sum(cur) <= 9 <= n_threads), so the split-kv path is
+    actually taken (no token-balance fallback)."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    for coord, name in (
+        (OUTPUT_COORD_SLOT, "slot"),
+        (OUTPUT_COORD_POSITION, "position"),
+    ):
+        for cfg, q, kv, weight, bt, sl, cl, tk in _iter_random_kutacc_cases():
+            cpu = paged_mqa_logits_topk_cpu(
+                q, kv, weight, bt, sl, cl, tk, output_coord=coord
+            )
+            out = _run_kutacc_topk(q, kv, weight, bt, sl, cl, tk, coord, mode=1)
+            assert out.tolist() == cpu.tolist(), (
+                f"kutacc(splitkv,{name}) != cpu cfg={cfg}: {out} vs {cpu}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1129,6 +1170,324 @@ def test_indexer_input_validation():
 
 
 # ---------------------------------------------------------------------------
+# K. indexer attn-TP weight split (wk / weights_proj RowParallel K-split +
+#    SHM allreduce; wq_b ColumnParallel N-split + batched allgather)
+# ---------------------------------------------------------------------------
+
+
+def test_tp_split_k_shard_partial_sum():
+    """RowParallel (K-split) math for wk / weights_proj: the sum of the
+    per-rank partial GEMMs over disjoint K-shards of x equals the full GEMM
+    -- the SHM allreduce performs exactly this sum (fp32 accumulation, see
+    comm/allreduce.cpp). fp32 checks the identity tightly; bf16 checks the
+    realistic rounding budget (one bf16 partial per rank + fp32 reduce)."""
+    torch.manual_seed(2026)
+    tp, hidden, out, T = 4, 64, 16, 6
+    shard = hidden // tp
+    x32 = torch.randn(T, hidden, dtype=torch.float32)
+    w32 = torch.randn(out, hidden, dtype=torch.float32)
+
+    partials = [
+        torch.matmul(x32[:, r * shard : (r + 1) * shard], w32[:, r * shard : (r + 1) * shard].t())
+        for r in range(tp)
+    ]
+    reduced = torch.stack(partials).sum(dim=0)
+    assert torch.allclose(reduced, torch.matmul(x32, w32.t()), atol=1e-4), (
+        "fp32 K-shard partial sum must equal the full GEMM"
+    )
+
+    xb = x32.to(torch.bfloat16)
+    wb = w32.to(torch.bfloat16)
+    partials_b = [
+        torch.matmul(
+            xb[:, r * shard : (r + 1) * shard].contiguous(),
+            wb[:, r * shard : (r + 1) * shard].t().contiguous(),
+        )
+        for r in range(tp)
+    ]
+    reduced_b = torch.stack(partials_b).sum(dim=0, dtype=torch.float32).to(torch.bfloat16)
+    full_b = torch.matmul(xb, wb.t())
+    torch.testing.assert_close(
+        reduced_b.float(), full_b.float(), rtol=2e-2, atol=2e-2
+    )
+
+
+def test_tp_split_n_shard_head_stitch():
+    """ColumnParallel (N-split) math for wq_b: head-aligned column shards
+    concatenated in rank order (the batched allgather semantics, dim=-1)
+    rebuild the full [T, H*D] output with the head order preserved --
+    rank r owns heads [r*H/tp, (r+1)*H/tp), so the stitch needs no
+    permute and q.view(T, H, D) lands on the right heads."""
+    torch.manual_seed(2027)
+    tp, n_heads, head_dim, q_lora_rank, T = 4, 8, 16, 32, 6
+    out = n_heads * head_dim
+    n_shard = out // tp
+    heads_per_rank = n_heads // tp
+    assert n_shard == heads_per_rank * head_dim, "shard must be head-aligned"
+
+    xq = torch.randn(T, q_lora_rank, dtype=torch.float32)
+    wq = torch.randn(out, q_lora_rank, dtype=torch.float32)
+
+    shards = [
+        torch.matmul(xq, wq[r * n_shard : (r + 1) * n_shard].t())
+        for r in range(tp)
+    ]
+    q = torch.cat(shards, dim=-1)
+    full = torch.matmul(xq, wq.t())
+    assert torch.allclose(q, full, atol=1e-4), (
+        "N-shard column stitch must equal the full GEMM"
+    )
+
+    q3 = q.view(T, n_heads, head_dim)
+    full3 = full.view(T, n_heads, head_dim)
+    for r in range(tp):
+        h0 = r * heads_per_rank
+        local = shards[r].view(T, heads_per_rank, head_dim)
+        assert torch.allclose(local, full3[:, h0 : h0 + heads_per_rank], atol=1e-4), (
+            f"rank {r} shard must own heads [{h0}, {h0 + heads_per_rank})"
+        )
+    assert torch.allclose(q3, full3, atol=1e-4)
+
+
+def test_tp_split_shard_bounds():
+    """Shard-boundary invariants shared with Indexer.__init__ (GLM-5.3
+    dims): the K-shards tile hidden_size exactly (no gap, no overlap) and
+    the wq_b N-shard keeps whole heads (shard columns % head_dim == 0),
+    for both attn-TP deployment sizes."""
+    hidden_size, n_heads, head_dim = 6144, 32, 128
+    for tp in (1, 8, 16):
+        assert hidden_size % tp == 0
+        assert n_heads % tp == 0
+        k_shard = hidden_size // tp
+        starts = [r * k_shard for r in range(tp)]
+        ends = [s + k_shard for s in starts]
+        assert starts[0] == 0 and ends[-1] == hidden_size
+        assert all(ends[i] == starts[i + 1] for i in range(tp - 1))
+        n_shard = (n_heads * head_dim) // tp
+        assert n_shard % head_dim == 0
+        assert n_shard == (n_heads // tp) * head_dim
+
+
+def test_tp_split_linear_shapes():
+    """The sharded projections hold the expected per-rank weight shapes
+    when constructed with explicit attn-TP rank/size (o_proj / q_b_proj
+    style -- the default tensor-parallel rank lookup is bypassed, so no
+    parallel_state initialization is needed)."""
+    if not _HAVE_LINEAR:
+        print("  [skip] sglang.srt.layers.linear not importable (tp split shapes)")
+        return
+
+    hidden_size, n_heads, head_dim, q_lora_rank = 6144, 32, 128, 512
+    tp, rank = 16, 3
+    k_shard = hidden_size // tp
+    n_shard = (n_heads * head_dim) // tp
+
+    wk = RowParallelLinear(
+        hidden_size,
+        head_dim,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        prefix="test.indexer.wk",
+        tp_rank=rank,
+        tp_size=tp,
+    )
+    assert tuple(wk.weight.shape) == (head_dim, k_shard), (
+        f"RowParallel wk shard must be [{head_dim}, {k_shard}], got {tuple(wk.weight.shape)}"
+    )
+
+    wproj = RowParallelLinear(
+        hidden_size,
+        n_heads,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        prefix="test.indexer.weights_proj",
+        tp_rank=rank,
+        tp_size=tp,
+    )
+    assert tuple(wproj.weight.shape) == (n_heads, k_shard), (
+        f"RowParallel weights_proj shard must be [{n_heads}, {k_shard}], "
+        f"got {tuple(wproj.weight.shape)}"
+    )
+
+    wqb = ColumnParallelLinear(
+        q_lora_rank,
+        n_heads * head_dim,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        prefix="test.indexer.wq_b",
+        tp_rank=rank,
+        tp_size=tp,
+    )
+    assert tuple(wqb.weight.shape) == (n_shard, q_lora_rank), (
+        f"ColumnParallel wq_b shard must be [{n_shard}, {q_lora_rank}], "
+        f"got {tuple(wqb.weight.shape)}"
+    )
+
+
+def test_tp_split_bf16_gemm_shard():
+    """The _bf16_linear_kunpeng op chain accepts the K-sharded inputs
+    (x_shard [T, hidden/tp] x W_shard [out, hidden/tp]) that the tp-split
+    forward_cpu branch feeds it, and the partial output matches the fp32
+    reference. Runs only where the compiled sgl_kernel is available."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (bf16 gemm shard)")
+        return
+    try:
+        from sglang.srt.layers.attention.nsa.nsa_indexer import (
+            _bf16_linear_kunpeng,
+        )
+    except Exception:
+        print("  [skip] nsa_indexer not importable (bf16 gemm shard)")
+        return
+
+    torch.manual_seed(2028)
+    tp, hidden, out, T = 4, 128, 16, 8
+    shard = hidden // tp
+    x = torch.randn(T, hidden, dtype=torch.bfloat16)
+    w = torch.randn(out, hidden, dtype=torch.bfloat16)
+
+    partial = _bf16_linear_kunpeng(
+        x[:, :shard].contiguous(), w[:, :shard].contiguous()
+    )
+    assert partial.shape == (T, out) and partial.dtype == torch.bfloat16
+
+    ref = torch.matmul(x[:, :shard].float(), w[:, :shard].float().t())
+    torch.testing.assert_close(partial.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# L. score TP split (kutacc row window) + R3 draft-extend pre-pad
+# ---------------------------------------------------------------------------
+
+def test_score_tp_split_window_equivalence():
+    """TP-sharded scoring windows: for random inputs, a full-stream call
+    and a set of disjoint row windows that tile the stream produce
+    element-for-element identical rows (the cross-rank sharding contract:
+    rows outside a window are neither read nor written). Covers both
+    scheduling modes (kTokenBalance / kSplitKV) x both output coordinates,
+    and row_start > 0 x kSplitKV -- the workspace per-row slot must be
+    indexed by the LOCAL row (the kutacc regression this deployment shape
+    exercises)."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    rng = random.Random(11)
+    for mode in (0, 1):
+        for coord in (OUTPUT_COORD_SLOT, OUTPUT_COORD_POSITION):
+            for cfg, q, kv, weight, bt, sl, cl, tk in _iter_random_kutacc_cases(
+                seed=23, limit=12
+            ):
+                full = _run_kutacc_topk(
+                    q, kv, weight, bt, sl, cl, tk, coord, mode=mode
+                )
+                T = q.shape[0]
+                # Tile the row stream with random disjoint windows.
+                bounds = [0]
+                while bounds[-1] < T:
+                    step = rng.randint(1, max(1, T // 2))
+                    bounds.append(min(bounds[-1] + step, T))
+                for r0, r1 in zip(bounds[:-1], bounds[1:]):
+                    win = _run_kutacc_topk(
+                        q, kv, weight, bt, sl, cl, tk, coord,
+                        mode=mode, row_start=r0, row_rows=r1 - r0,
+                    )
+                    assert win[r0:r1].tolist() == full[r0:r1].tolist(), (
+                        f"window [{r0},{r1}) mismatch (mode={mode}, "
+                        f"coord={coord}) cfg={cfg}: {win[r0:r1]} vs "
+                        f"{full[r0:r1]}"
+                    )
+
+
+def test_fill_mtp_pad_prefix():
+    """fill_mtp_pad_prefix_kunpeng: each [n, ...] block's LEADING
+    n - ext[b] rows are overwritten with fill_value; the right-aligned
+    live rows are untouched. Covers ext=0 (all-pad block), ext=n (no pad)
+    and ragged mixes, on 2D-style [bs, n, topk] blocks."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    bs, nv, topk = 5, 4, 3
+    for ext in ([0, 4, 1, 3, 4], [4, 4, 4, 4, 4], [0, 0, 2, 0, 0]):
+        dst = torch.arange(bs * nv * topk, dtype=torch.int32).view(bs, nv, topk)
+        before = dst.clone()
+        ext_t = torch.tensor(ext, dtype=torch.int32)
+        _sgl_kernel.fill_mtp_pad_prefix_kunpeng(dst, ext_t, -1)
+        for b in range(bs):
+            pad = nv - ext[b]
+            for j in range(nv):
+                row = dst[b, j]
+                if j < pad:
+                    assert torch.equal(
+                        row, torch.full((topk,), -1, dtype=torch.int32)
+                    ), f"pad row ({b},{j}) not filled: {row}"
+                else:
+                    assert torch.equal(row, before[b, j]), (
+                        f"live row ({b},{j}) was modified: {row} vs "
+                        f"{before[b, j]}"
+                    )
+
+
+def test_score_r3_draft_extend_equivalence():
+    """R3 draft-extend pre-pad scoring: the (bs, nv) block layout with
+    uniform cur_lens = nv scores the live (right-aligned) rows
+    element-for-element identically to the legacy ragged layout
+    (cur_lens = ext), and the pad rows come out all -1 after
+    fill_mtp_pad_prefix. This fixes the R3 math: pos = nv - ext[b] + j
+    => k_end = seq - nv + pos + 1 == seq - ext[b] + j + 1."""
+    if _sgl_kernel is None:
+        print("  [skip] sgl_kernel not available (fused comparison)")
+        return
+    rng = random.Random(31)
+    for trial in range(10):
+        bs = rng.randint(1, 4)
+        nv = rng.choice([2, 3, 4])
+        # Ragged accepted-token counts; keep at least one live row (the
+        # DP all-zero mirror takes the dense fallback, out of scope here).
+        ext = [rng.randint(0, nv) for _ in range(bs)]
+        if sum(ext) == 0:
+            ext[rng.randrange(bs)] = rng.randint(1, nv)
+        prefix = [rng.randint(0, 6) for _ in range(bs)]
+        H, D, block, topk = 2, 4, 2, 3
+
+        # Baseline: the ragged layout (cur_lens = ext) -- the historical
+        # draft-extend scoring shape.
+        q_r, kv, w_r, bt, sl, cl_r, tk, _, _ = _make_case(
+            rng, H, D, block, topk, bs, ext, prefix
+        )
+        base = _run_kutacc_topk(
+            q_r, kv, w_r, bt, sl, cl_r, tk, OUTPUT_COORD_POSITION, mode=1
+        )
+        # Right-align the ragged rows into the (bs, nv) block layout with
+        # -1 pad rows (the legacy pad_q_left output contract).
+        ref = torch.full((bs, nv, topk), -1, dtype=torch.int32)
+        off = 0
+        for b in range(bs):
+            if ext[b] > 0:
+                ref[b, nv - ext[b] :] = base[off : off + ext[b]]
+            off += ext[b]
+
+        # R3: pre-pad q/weights (fill=0), uniform cur_lens = nv, score,
+        # restore the pad rows to -1 at the producer.
+        ext_t = torch.tensor(ext, dtype=torch.int32)
+        q_pad = torch.empty(bs, nv, H, D, dtype=torch.bfloat16)
+        w_pad = torch.empty(bs, nv, H, dtype=torch.bfloat16)
+        _sgl_kernel.pad_q_left_mtp_kunpeng(q_r, ext_t, q_pad, 0)
+        _sgl_kernel.pad_q_left_mtp_kunpeng(w_r, ext_t, w_pad, 0)
+        cl_u = torch.full((bs,), nv, dtype=torch.int32)
+        got = _run_kutacc_topk(
+            q_pad.view(-1, H, D), kv, w_pad.view(-1, H), bt, sl, cl_u, tk,
+            OUTPUT_COORD_POSITION, mode=1,
+        )
+        _sgl_kernel.fill_mtp_pad_prefix_kunpeng(
+            got.view(bs, nv, topk), ext_t, -1
+        )
+        assert got.view(bs, nv, topk).tolist() == ref.tolist(), (
+            f"trial {trial} (bs={bs}, nv={nv}, ext={ext}, prefix={prefix}): "
+            f"{got.view(bs, nv, topk)} vs {ref}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1144,6 +1503,7 @@ def main():
         ("A. test_scorer_partial_rows", test_scorer_partial_rows),
         ("B. test_kutacc_matches_cpu", test_kutacc_matches_cpu),
         ("B. test_kutacc_matches_cpu_position", test_kutacc_matches_cpu_position),
+        ("B. test_kutacc_matches_cpu_splitkv", test_kutacc_matches_cpu_splitkv),
         ("C. test_kunpeng_index_k_pool", test_kunpeng_index_k_pool),
         ("C. test_kunpeng_index_k_pool_skip", test_kunpeng_index_k_pool_skip),
         ("C. test_kunpeng_index_k_pool_default_allocates_all", test_kunpeng_index_k_pool_default_allocates_all),
@@ -1165,6 +1525,14 @@ def main():
         ("H. test_pad_q_left_extra_src_rows", test_pad_q_left_extra_src_rows),
         ("I. test_indexer_input_validation", test_indexer_input_validation),
         ("J. test_should_run_indexer_m9", test_should_run_indexer_m9),
+        ("K. test_tp_split_k_shard_partial_sum", test_tp_split_k_shard_partial_sum),
+        ("K. test_tp_split_n_shard_head_stitch", test_tp_split_n_shard_head_stitch),
+        ("K. test_tp_split_shard_bounds", test_tp_split_shard_bounds),
+        ("K. test_tp_split_linear_shapes", test_tp_split_linear_shapes),
+        ("K. test_tp_split_bf16_gemm_shard", test_tp_split_bf16_gemm_shard),
+        ("L. test_score_tp_split_window_equivalence", test_score_tp_split_window_equivalence),
+        ("L. test_fill_mtp_pad_prefix", test_fill_mtp_pad_prefix),
+        ("L. test_score_r3_draft_extend_equivalence", test_score_r3_draft_extend_equivalence),
     ]
     failed = 0
     for name, fn in tests:

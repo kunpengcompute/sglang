@@ -154,7 +154,9 @@ void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
                                    at::Tensor weight, at::Tensor block_tables,
                                    at::Tensor seq_lens, at::Tensor cur_lens,
                                    at::Tensor output, at::Tensor workspace,
-                                   int64_t topk, int64_t output_coord);
+                                   int64_t topk, int64_t output_coord,
+                                   int64_t mode, int64_t row_start,
+                                   int64_t row_rows);
 int64_t get_paged_mqa_logits_topk_workspace_size(int64_t max_k_end);
 
 void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices);
@@ -494,6 +496,8 @@ void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor 
 
 void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Tensor o_flat);
 
+void fill_mtp_pad_prefix_kunpeng(at::Tensor dst, at::Tensor ext_lens, int64_t fill_value);
+
 void repeat_interleave_kunpeng(at::Tensor x, at::Tensor out, int64_t repeats);
 
 // MTP performance kernels (kutacc::parallel_for, not graph ops)
@@ -736,11 +740,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "Tensor(a!) slots, Tensor(b!) topk_length) -> ()");
     m.impl("dsa_prefill_slots_kunpeng", dsa_prefill_slots_kunpeng);
 
-    // DSA indexer scoring kernel (kutacc adapter, bf16).
+    // DSA indexer scoring kernel (kutacc adapter, bf16). mode: 0 =
+    // kTokenBalance (prefill), 1 = kSplitKV (decode/verify/draft-extend).
+    // row_start/row_rows: TP-sharded scoring window into the effective row
+    // stream (row_rows < 0 = to the end; 0/-1 = full stream, legacy).
     m.def(
         "paged_mqa_logits_topk_kunpeng(Tensor q, Tensor cur_kv_cache, "
         "Tensor weight, Tensor block_tables, Tensor seq_lens, Tensor cur_lens, "
-        "Tensor(a!) output, Tensor workspace, int topk, int output_coord) -> ()");
+        "Tensor(a!) output, Tensor workspace, int topk, int output_coord, "
+        "int mode, int row_start, int row_rows) -> ()");
     m.impl("paged_mqa_logits_topk_kunpeng", paged_mqa_logits_topk_kunpeng);
     m.def("get_paged_mqa_logits_topk_workspace_size(int max_k_end) -> int");
     m.impl("get_paged_mqa_logits_topk_workspace_size", get_paged_mqa_logits_topk_workspace_size);
@@ -1271,6 +1279,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def("pad_q_left_mtp_kunpeng(Tensor q_heads, Tensor ext_lens, Tensor(a!) q_padded, "
           "int fill_value) -> ()");
     m.impl("pad_q_left_mtp_kunpeng", pad_q_left_mtp_kunpeng);
+
+    m.def("fill_mtp_pad_prefix_kunpeng(Tensor dst, Tensor ext_lens, int fill_value) -> ()");
+    m.impl("fill_mtp_pad_prefix_kunpeng", fill_mtp_pad_prefix_kunpeng);
 
     m.def("unpad_o_right_mtp_kunpeng(Tensor o_padded, Tensor ext_lens, Tensor o_flat) -> ()");
     m.impl("unpad_o_right_mtp_kunpeng", unpad_o_right_mtp_kunpeng);

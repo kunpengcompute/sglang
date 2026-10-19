@@ -17,8 +17,12 @@
       TP 切分时对前后两半分别切再拼接, 输出重命名为 gate_up_proj
       (与 sglang 模型参数名 MergedColumnParallelLinear 对齐). 专家的 w13
       同理 (w13_weight = [gate; up] 融合结果, 原样不切分).
-  3. indexer.* (wq_b/wk/weights_proj/k_norm) 均为 ReplicatedLinear
-     (见 nsa_indexer.py), 不切分, 原样复制到每个 rank.
+  3. indexer 投影随 nsa_indexer.py 的 tp_split 分支切分 (attn_tp 域):
+      wq_b 按 dim0 切 (ColumnParallel, int8 weight + scale 同切),
+      wk / weights_proj 按 dim1 切 (RowParallel, bf16);
+      k_norm 等其余 indexer.* 仍原样复制.
+      --replicate-indexer 回退全量复制 (配套模型侧
+      SGLANG_KUNPENG_DISABLE_INDEXER_TP_SPLIT=1).
   4. q_a_proj + kv_a_proj_with_mqa 融合为 fused_qkv_a_proj_with_mqa 并按
       socket_tp 切分 dim0 (920F 上该模块为 ColumnParallelLinear(tp_size=
       socket_tp_size), 见 deepseek_v2.py DeepseekV2AttentionMLA).
@@ -814,6 +818,7 @@ def split_non_moe_weights(
     num_hidden_layers=None,
     mtp_output_dir: Optional[str] = None,
     num_readers: int = 4,
+    replicate_indexer: bool = False,
 ):
     if ranks is None:
         ranks = list(range(attention_tp_size))
@@ -1003,6 +1008,26 @@ def split_non_moe_weights(
             _store_row_parallel(target_dict, base, w, s)
             return
 
+        # indexer 投影 (attn_tp 域, 对齐 nsa_indexer.py 的 tp_split 分支):
+        # wq_b 为 ColumnParallel (dim0 切, int8 weight + scale 同切),
+        # wk / weights_proj 为 RowParallel (dim1 切, bf16 无 scale)
+        elif base.endswith("self_attn.indexer.wq_b"):
+            if replicate_indexer:
+                _store_replicate(target_dict, base, w, s)
+            else:
+                _store_col_parallel(target_dict, base, w, s)
+            return
+
+        elif any(
+            base.endswith(k)
+            for k in ("self_attn.indexer.wk", "self_attn.indexer.weights_proj")
+        ):
+            if replicate_indexer:
+                _store_replicate(target_dict, base, w, s)
+            else:
+                _store_row_parallel(target_dict, base, w, s)
+            return
+
         elif base.endswith("self_attn.q_a_proj"):
             if fused_qkva:
                 return  # 与 kv_a_proj_with_mqa 一起融合处理
@@ -1040,8 +1065,8 @@ def split_non_moe_weights(
             _store_col_parallel(target_dict, base, w, s)
             return
 
-        # 其余 (norm / mlp.gate / indexer.* / enorm / hnorm / shared_head.norm)
-        # 均为 replicated: indexer 的 wq_b/wk/weights_proj 见 nsa_indexer.py
+        # 其余 (norm / mlp.gate / indexer.k_norm / enorm / hnorm /
+        # shared_head.norm) 均为 replicated
         else:
             _store_replicate(target_dict, base, w, s)
 
@@ -1117,6 +1142,15 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--replicate-indexer",
+        action="store_true",
+        default=False,
+        help="indexer 投影 (wq_b/wk/weights_proj) 不切分, 原样复制到每个 rank; "
+        "配套模型侧 SGLANG_KUNPENG_DISABLE_INDEXER_TP_SPLIT=1 使用。"
+        "默认按 attn_tp 切分 (对齐 nsa_indexer.py 的 tp_split 分支)",
+    )
+
+    parser.add_argument(
         "--num_hidden_layers",
         type=int,
         default=None,
@@ -1155,6 +1189,10 @@ if __name__ == "__main__":
         print(f"输出目录 (output_dir)     : {args.output_dir}")
         print(f"Attention TP 大小         : {args.attention_tp_size}")
         print(f"Socket TP 大小            : {args.socket_tp_size}")
+        print(
+            f"indexer 切分              : "
+            f"{'关闭 (replicate)' if args.replicate_indexer else '开启 (attn_tp)'}"
+        )
         if args.num_hidden_layers is not None:
             print(f"隐藏层数量                : {args.num_hidden_layers}")
             print(
@@ -1182,6 +1220,7 @@ if __name__ == "__main__":
             num_hidden_layers=args.num_hidden_layers,
             mtp_output_dir=mtp_output_dir,
             num_readers=args.readers,
+            replicate_indexer=args.replicate_indexer,
         )
     else:
         print("=================== MoE 专家切分配置 ===================")

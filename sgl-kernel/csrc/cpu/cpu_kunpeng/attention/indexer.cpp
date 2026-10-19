@@ -49,12 +49,30 @@
 //   output_coord  0 = absolute paged slot (decode consumer),
 //                 1 = in-sequence position (sparse prefill consumer with
 //                 key_start_loc; also feeds dsa_topk_slots_kunpeng).
+//   mode          0 = kTokenBalance (prefill: the token dimension already
+//                 saturates the pool), 1 = kSplitKV (decode/verify/
+//                 draft-extend: splits each row's KV range across threads;
+//                 the library falls back to kTokenBalance when
+//                 row_rows > n_threads -- semantically identical).
+//   row_start / row_rows  Scoring row window into the EFFECTIVE row stream
+//                 [0, sum(cur_lens)) (TP-sharded scoring: each attn-TP rank
+//                 scores only its own window on the shared-shape inputs;
+//                 rows OUTSIDE the window are neither read nor written --
+//                 the caller relies on this to keep one full-shape output
+//                 per rank). row_rows < 0 = "from row_start to the end of
+//                 the stream"; defaults (0, -1) = full stream (legacy
+//                 behavior). Sequence lookup / pos / k_end / output
+//                 addressing all follow GLOBAL row numbers, so a windowed
+//                 call is element-for-element identical to the full call's
+//                 corresponding rows (see kutacc.h attention_schedule).
 // ---------------------------------------------------------------------------
 void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
                                    at::Tensor weight, at::Tensor block_tables,
                                    at::Tensor seq_lens, at::Tensor cur_lens,
                                    at::Tensor output, at::Tensor workspace,
-                                   int64_t topk, int64_t output_coord)
+                                   int64_t topk, int64_t output_coord,
+                                   int64_t mode, int64_t row_start,
+                                   int64_t row_rows)
 {
     auto kt_q = to_kutacc<bfloat16_t, 3>(q);
     auto kt_kv = to_kutacc<bfloat16_t, 3>(cur_kv_cache);
@@ -66,10 +84,13 @@ void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
     auto kt_workspace = to_kutacc<uint8_t, 1>(workspace);
 
     kutacc::attention_schedule schedule;
-    schedule.mode = kutacc::attention_schedule::Mode::kTokenBalance;
+    schedule.mode = mode == 1 ? kutacc::attention_schedule::Mode::kSplitKV
+                              : kutacc::attention_schedule::Mode::kTokenBalance;
     schedule.output_coord = output_coord == 1
                                 ? kutacc::attention_schedule::OutputCoord::kPosition
                                 : kutacc::attention_schedule::OutputCoord::kSlot;
+    schedule.row_start = static_cast<int32_t>(row_start);
+    schedule.row_rows = static_cast<int32_t>(row_rows);
 
     kutacc::paged_mqa_logits_topk(kt_q, kt_kv, kt_weight, kt_block_tables,
                                   kt_seq, kt_cur, kt_output, schedule,

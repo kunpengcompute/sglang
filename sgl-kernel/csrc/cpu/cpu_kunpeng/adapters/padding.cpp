@@ -22,8 +22,14 @@ void pad_q_left_mtp_kunpeng(at::Tensor q_heads, at::Tensor ext_lens, at::Tensor 
 
 void unpad_o_right_mtp_kunpeng(at::Tensor o_padded, at::Tensor ext_lens, at::Tensor o_flat);
 
+void fill_mtp_pad_prefix_kunpeng(at::Tensor dst, at::Tensor ext_lens, int64_t fill_value);
+
 static KernelRegistrar _r_pad_q_left_mtp("pad_q_left_mtp_kunpeng",
                                          make_dispatch_v<decltype(&pad_q_left_mtp_kunpeng), &pad_q_left_mtp_kunpeng>);
 
 static KernelRegistrar _r_unpad_o_right_mtp(
     "unpad_o_right_mtp_kunpeng", make_dispatch_v<decltype(&unpad_o_right_mtp_kunpeng), &unpad_o_right_mtp_kunpeng>);
+
+static KernelRegistrar _r_fill_mtp_pad_prefix(
+    "fill_mtp_pad_prefix_kunpeng",
+    make_dispatch_v<decltype(&fill_mtp_pad_prefix_kunpeng), &fill_mtp_pad_prefix_kunpeng>);
