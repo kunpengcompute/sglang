@@ -19,7 +19,7 @@
 #include "register_graph_kernels.h"
 
 void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::Tensor experts_offset,
-                                at::Tensor packed_recv_x, at::Tensor dispatch_send_buf,
+                                at::Tensor token_src, at::Tensor packed_recv_x, at::Tensor dispatch_send_buf,
                                 int64_t num_experts, int64_t num_local_experts, int64_t num_tokens,
                                 int64_t batch_size, int64_t hidden);
 

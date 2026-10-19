@@ -44,10 +44,9 @@ usage() {
   echo "              --disaggregation-transfer-backend. Port auto-derived from"
   echo "              the decode entry in INSTANCES; CURL_PORT overrides."
   echo "  -p          Enable profiling (start/stop_profile via separate curl calls;"
-  echo "              PD layout: sent to the decode side's tokenizer HTTP port,"
-  echo "              auto-derived as 30001 + the decode entry's position in"
-  echo "              INSTANCES; native layout: sent to the target."
-  echo "              CURL_DECODE_INSTANCE / CURL_DECODE_PORT select/override)"
+  echo "              PD layout: sent to each side's tokenizer HTTP port — prefill"
+  echo "              (30001 + prefill entry position) and decode (30001 + decode"
+  echo "              entry position)"
   echo "  -c CONC     Max concurrent requests (default: unbounded)"
   echo "  -i          Interactive chat mode — multi-turn streaming conversation"
   exit 0
@@ -220,6 +219,47 @@ resolve_decode_tok_port() {
   fi
 }
 
+# Prefill tokenizer HTTP port on the router node — symmetric to the decode
+# resolver above: 30001 + the prefill entry's position in INSTANCES.
+# CURL_PREFILL_INSTANCE selects among multiple prefill entries;
+# CURL_PREFILL_PORT overrides everything.
+resolve_prefill_tok_port() {
+  if [ -n "${CURL_PREFILL_PORT:-}" ]; then
+    echo "$CURL_PREFILL_PORT"
+    return
+  fi
+  local base want insts="" g="" i=0 e f
+  base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  want="prefill${CURL_PREFILL_INSTANCE:+_$CURL_PREFILL_INSTANCE}"
+  if [ -n "${INSTANCES:-}" ]; then
+    insts="${INSTANCES//,/$'\n'}"
+  else
+    for f in "$base/.user_env.sh" "$base/runtime/.user_env_base.sh" \
+             "$base/runtime/env_base.sh"; do
+      [ -f "$f" ] || continue
+      insts=$(grep -E '^[[:space:]]*(export[[:space:]]+)?INSTANCES=' "$f" \
+        | head -n1 | cut -d'"' -f2 | tr ',' '\n')
+      [ -n "$insts" ] && break
+    done
+  fi
+  if [ -n "$insts" ]; then
+    while IFS= read -r e; do
+      e="${e//[[:space:]]/}"
+      [ -z "$e" ] && continue
+      if [ "$e" = "$want" ] || { [ -z "${CURL_PREFILL_INSTANCE:-}" ] && [ "${e%%_*}" = "prefill" ]; }; then
+        g=$i
+        break
+      fi
+      i=$((i + 1))
+    done <<< "$insts"
+  fi
+  if [ -n "$g" ]; then
+    echo $((30001 + g))
+  elif [ "${1:-1}" = "0" ]; then
+    echo 30001
+  fi
+}
+
 IP=${CURL_HOST:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}
 if [ "$FAKE" = true ]; then
   PORT=${CURL_PORT:-$(resolve_decode_tok_port 0)}
@@ -237,24 +277,32 @@ if [ "$INTERACTIVE" = false ] && [ "$PROFILE" = false ]; then
 fi
 
 # start/stop_profile control (used by -p). Addressing rules:
-#   - PD layout (a decode entry exists in the runtime layout): the decode
-#     side's own tokenizer HTTP server is addressed. Under the default
-#     primary target (router gateway :30000) the gateway is skipped — it
-#     does not proxy control endpoints; an explicit CURL_PORT (or -F, which
-#     derives PORT the same way and dedupes) is addressed as well.
-#   - Native layout (no decode entry): the primary target only, as before.
+#   - PD layout: each side's own tokenizer HTTP server is addressed —
+#     prefill (30001 + prefill entry position) and decode (30001 + decode
+#     entry position). Under the default primary target (router gateway
+#     :30000) the gateway is skipped 
 profile_req() {
-  local action=$1 u urls
-  local decode_tok_port
+  local action=$1 u urls prefill_tok_port decode_tok_port
+  prefill_tok_port=$(resolve_prefill_tok_port)
   decode_tok_port=$(resolve_decode_tok_port)
-  if [ -z "$decode_tok_port" ]; then
+
+  # Build the endpoint list (deduped). An explicit CURL_PORT / -F keeps the
+  # primary target; otherwise only each side's tokenizer HTTP server is
+  # addressed (the router gateway does not proxy control endpoints).
+  urls=""
+  if [ -n "${CURL_PORT:-}" ] || [ "$FAKE" = true ]; then
     urls="http://${IP}:${PORT}"
-  elif [ -n "${CURL_PORT:-}" ] || [ "$FAKE" = true ]; then
-    urls="http://${IP}:${PORT}"
-    [ "$decode_tok_port" != "$PORT" ] && urls="$urls http://${IP}:${decode_tok_port}"
-  else
-    urls="http://${IP}:${decode_tok_port}"
   fi
+  if [ -n "$prefill_tok_port" ] && [ "$prefill_tok_port" != "$PORT" ]; then
+    urls="${urls:+$urls }http://${IP}:${prefill_tok_port}"
+  fi
+  if [ -n "$decode_tok_port" ] && [ "$decode_tok_port" != "$PORT" ] &&
+     [ "$decode_tok_port" != "$prefill_tok_port" ]; then
+    urls="${urls:+$urls }http://${IP}:${decode_tok_port}"
+  fi
+  # Native layout (no tokenizer endpoint resolved): fall back to the target.
+  [ -z "$urls" ] && urls="http://${IP}:${PORT}"
+
   for u in $urls; do
     echo "profile: ${action} -> $u" >&2
     curl --noproxy "*" "$u/$action"

@@ -102,6 +102,9 @@ class _KunpengDispatcherState:
         # topk_convert outputs (filled after dispatch_recv)
         self.recv_token_ids_buf: Optional[torch.Tensor] = None
         self.recv_experts_offset: Optional[torch.Tensor] = None
+        # moe_local_sum workspace: token_weights (float32, [capacity]) written by
+        # the local-path token_convert; capacity == recv_token_ids_buf rows.
+        self.moe_sum_token_weights: Optional[torch.Tensor] = None
 
         self.topk_weights_buf: Optional[torch.Tensor] = None
         self.topk_ids_index_buf: Optional[torch.Tensor] = None
@@ -507,14 +510,14 @@ def _init_buffers(state: _KunpengDispatcherState):
     # can never overflow.  It is kept there to avoid the worst-case memory
     # footprint and preserve the original local dispatch/combine mode.
     local_layout = state.use_local_dis_com
-    multiple = state.moe_token_multiple
 
     if local_layout:
+        # Local (single-node SHM) mode now uses the Sample-style full-token
+        # layout: packed_recv_x = [max_tokens_per_mb, hidden+4] allgathered
+        # data, moe_down = [max_tokens_per_mb * router_topk, hidden] dense rows
+        # (each token contributes at most router_topk rows to its local rank).
         state.dispatch_recv_size = (
-            state.num_local_experts
-            * multiple
-            * state.max_tokens_per_mb
-            * (state.hidden_size + 4)
+            state.max_tokens_per_mb * (state.hidden_size + 4)
             + state.num_experts * (max_dispatch_tokens * 2 + 1) * 2 * 3
         )
         state.dispatch_recv_buf = _zeros(
@@ -524,10 +527,7 @@ def _init_buffers(state: _KunpengDispatcherState):
             force_ddr=prefill_force_ddr,
         )
         state.combine_send_buf = _zeros(
-            (
-                state.num_local_experts * multiple * state.max_tokens_per_mb,
-                state.hidden_size,
-            ),
+            (state.max_tokens_per_mb * state.router_topk, state.hidden_size),
             torch.bfloat16,
             "combine_send_buf",
             force_ddr=prefill_force_ddr,
@@ -584,15 +584,9 @@ def _init_buffers(state: _KunpengDispatcherState):
         )
 
     if local_layout:
-        packed_recv_x_bytes = (
-            state.num_local_experts
-            * multiple
-            * state.max_tokens_per_mb
-            * (state.hidden_size + 4)
-        )
+        packed_recv_x_bytes = state.max_tokens_per_mb * (state.hidden_size + 4)
         state.packed_recv_x = state.dispatch_recv_buf[:packed_recv_x_bytes].view(
-            state.num_local_experts,
-            multiple * state.max_tokens_per_mb,
+            state.max_tokens_per_mb,
             (state.hidden_size + 4),
         )
     else:
@@ -631,8 +625,12 @@ def _init_buffers(state: _KunpengDispatcherState):
 
     if local_layout:
         state.recv_token_ids_buf = torch.zeros(
-            state.num_local_experts * multiple * state.max_tokens_per_mb,
+            state.max_tokens_per_mb * state.router_topk,
             dtype=torch.int32,
+        )
+        state.moe_sum_token_weights = torch.zeros(
+            state.max_tokens_per_mb * state.router_topk,
+            dtype=torch.float32,
         )
     else:
         # Slot indices go up to num_local_experts * num_ranks * max_dispatch
@@ -640,13 +638,19 @@ def _init_buffers(state: _KunpengDispatcherState):
         state.recv_token_ids_buf = torch.zeros(
             state.slot_space_num_experts * max_dispatch_tokens, dtype=torch.int32
         )
+        state.moe_sum_token_weights = None
     state.recv_experts_offset = torch.zeros(
         state.num_local_experts + 1, dtype=torch.int32
     )
+    state.recv_token_src_buf = torch.zeros_like(state.recv_token_ids_buf)
 
     state.combined_x = kernel.create_shm_tensor_kunpeng(
         torch.bfloat16, [state.max_tokens_per_mb, state.hidden_size]
     )
+    # Local path runs an in-place shm_allreduce over the FULL combined_x, so
+    # the padding rows beyond batch_size must start at zero (moe_local_sum only
+    # overwrites [0, batch_size)); otherwise the allreduce sums stale padding.
+    state.combined_x.zero_()
 
     state.topk_weights_buf = kernel.create_shm_tensor_kunpeng(
         torch.float32, [state.max_tokens_per_mb, state.router_topk]
@@ -869,6 +873,7 @@ class KunpengDispatcher(BaseDispatcher):
                 state.topk_ids_index_buf,
                 state.recv_token_ids_buf,
                 state.recv_experts_offset,
+                state.recv_token_src_buf,
                 state.packed_recv_x,
                 state.dispatch_send_buf,
                 state.num_experts,
@@ -1029,13 +1034,17 @@ class KunpengDispatcher(BaseDispatcher):
         t_send_start = time.perf_counter()
         batch_id = 0
         if state.use_local_dis_com:
-            # Local combine send: write expert outputs to peers' combined_x via SHM
-            kunpeng.moe_local_combine_send_kunpeng(
+            # Local combine send: fold combine_send + combine_recv into a single
+            # local moe_sum (token_convert + SVE weighted reduce), mirroring
+            # DeepSeek-V3-Sample's local-path moe_sum.  combine_recv() then only
+            # runs the cross-rank shm_allreduce over combined_x.
+            kunpeng.moe_local_sum_kunpeng(
                 state.combine_send_buf,
-                state.recv_token_ids_buf,
-                state.recv_experts_offset,
-                state.combined_x,
                 state.topk_ids_index_buf,
+                state.topk_weights_buf,
+                state.moe_sum_token_weights,
+                state.recv_token_ids_buf,
+                state.combined_x,
                 state.num_local_experts,
                 state.hidden_size,
                 batch_size,
@@ -1086,13 +1095,9 @@ class KunpengDispatcher(BaseDispatcher):
 
         t_recv_start = time.perf_counter()
         if state.use_local_dis_com:
-            kunpeng.moe_local_combine_recv_kunpeng(
+            kunpeng.shm_allreduce_kunpeng(
                 state.combined_x,
-                state.topk_ids_index_buf,
-                state.topk_weights_buf,
-                state.num_local_experts,
-                state.hidden_size,
-                batch_size,
+                profile_name="shm_allreduce_kunpeng@moe_local_combine",
             )
         else:
             kunpeng.moe_combine_recv_kunpeng(

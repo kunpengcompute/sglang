@@ -630,16 +630,16 @@ def _setup_moe_combine_recv_kunpeng():
 
 
 def _setup_moe_local_dispatch_kunpeng():
-    def shape_infer(topk_idx, token_ids, experts_offset, packed_recv_x,
-                    dispatch_send_buf, num_experts, num_local_experts,
-                    num_tokens, batch_size, hidden):
+    def shape_infer(topk_idx, token_ids, experts_offset, token_src,
+                    packed_recv_x, dispatch_send_buf, num_experts,
+                    num_local_experts, num_tokens, batch_size, hidden):
         return []
 
-    def eager_fn(topk_idx, token_ids, experts_offset, packed_recv_x,
-                 dispatch_send_buf, num_experts, num_local_experts,
-                 num_tokens, batch_size, hidden):
+    def eager_fn(topk_idx, token_ids, experts_offset, token_src,
+                 packed_recv_x, dispatch_send_buf, num_experts,
+                 num_local_experts, num_tokens, batch_size, hidden):
         torch.ops.sgl_kernel.moe_local_dispatch_kunpeng(
-            topk_idx, token_ids, experts_offset, packed_recv_x,
+            topk_idx, token_ids, experts_offset, token_src, packed_recv_x,
             dispatch_send_buf, num_experts, num_local_experts,
             num_tokens, batch_size, hidden)
         return None
@@ -648,14 +648,16 @@ def _setup_moe_local_dispatch_kunpeng():
 
 
 def _setup_moe_local_combine_send_kunpeng():
-    def shape_infer(moe_down, token_ids, experts_offset, combined_x,
-                    topk_idx, num_local_experts, hidden, batch_size):
+    def shape_infer(moe_down, token_ids, experts_offset, token_src,
+                    combined_x, topk_idx, num_local_experts, hidden,
+                    batch_size):
         return []
 
-    def eager_fn(moe_down, token_ids, experts_offset, combined_x,
-                 topk_idx, num_local_experts, hidden, batch_size):
+    def eager_fn(moe_down, token_ids, experts_offset, token_src,
+                 combined_x, topk_idx, num_local_experts, hidden,
+                 batch_size):
         torch.ops.sgl_kernel.moe_local_combine_send_kunpeng(
-            moe_down, token_ids, experts_offset, combined_x,
+            moe_down, token_ids, experts_offset, token_src, combined_x,
             topk_idx, num_local_experts, hidden, batch_size)
         return None
 
@@ -675,6 +677,21 @@ def _setup_moe_local_combine_recv_kunpeng():
         return None
 
     register_op('moe_local_combine_recv_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_moe_local_sum_kunpeng():
+    def shape_infer(moe_down, topk_ids_index, topk_weights, token_weights,
+                    token_ids, output, num_local_experts, hidden, batch_size):
+        return []
+
+    def eager_fn(moe_down, topk_ids_index, topk_weights, token_weights,
+                 token_ids, output, num_local_experts, hidden, batch_size):
+        torch.ops.sgl_kernel.moe_local_sum_kunpeng(
+            moe_down, topk_ids_index, topk_weights, token_weights, token_ids,
+            output, num_local_experts, hidden, batch_size)
+        return None
+
+    register_op('moe_local_sum_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_moe_etp_dispatch_share_kunpeng():
@@ -1638,6 +1655,7 @@ def setup():
     _setup_moe_local_dispatch_kunpeng()
     _setup_moe_local_combine_send_kunpeng()
     _setup_moe_local_combine_recv_kunpeng()
+    _setup_moe_local_sum_kunpeng()
     _setup_kupl_sdma_memcpy_chunked()
     _setup_kupl_sdma_kv_swapin()
     _setup_kupl_sdma_kv_block_swapin()

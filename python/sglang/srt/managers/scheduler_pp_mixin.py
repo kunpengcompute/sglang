@@ -52,6 +52,14 @@ logger = logging.getLogger(__name__)
 
 _is_cpu_920f = is_cpu_920f()
 
+# When "1", delay the prefill loop's send ack commits until after
+# _pp_launch_batch so the downstream ack wait overlaps with graph_run compute
+# instead of stalling the CPU before the forward pass. Default "0" keeps the
+# original schedule (safe rollback / A-B comparison).
+_pp_prefill_overlap_comm = (
+    os.environ.get("SGLANG_KUNPENG_PP_PREFILL_OVERLAP_COMM", "0") == "1"
+)
+
 _DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
 _is_scheduler_skip_all_gather = (
     os.environ.get("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "0") == "1"
@@ -267,6 +275,10 @@ class SchedulerPPMixin:
         """
         self.init_pp_loop_state()
 
+        # Communication overlap is only enabled for prefill with PP=16; other
+        # pp_size values are not validated, so keep the original schedule.
+        pp_prefill_overlap_comm = _pp_prefill_overlap_comm and self.pp_size == 16
+
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
@@ -276,6 +288,8 @@ class SchedulerPPMixin:
         send_prefill_consensus_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
+
+        pp_perf_affinity("scheduler main thread")
 
         while True:
             server_is_idle = True
@@ -291,10 +305,11 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
+                pp_perf_start(f"mb{mb_id}", tag=f"pp{self.pp_group.rank_in_group}")
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
 
-                if not self.pp_group.is_last_rank:
+                if not self.pp_group.is_last_rank and not pp_prefill_overlap_comm:
                     self._pp_commit_comm_work(self.send_req_work)
 
                 # 2.PD consensus (bootstrap / transfer): all local polls first,
@@ -305,7 +320,8 @@ class SchedulerPPMixin:
                 )
                 bmbs[mb_id] = bootstrapped_rids
                 tmbs[mb_id] = transferred_rids
-                self._pp_commit_comm_work(send_prefill_consensus_work)
+                if not pp_prefill_overlap_comm:
+                    self._pp_commit_comm_work(send_prefill_consensus_work)
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
@@ -325,7 +341,8 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                if not pp_prefill_overlap_comm:
+                    self._pp_commit_comm_work(self.send_proxy_work)
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -333,6 +350,15 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                if pp_prefill_overlap_comm:
+                    # Ack recycling is deferred until after compute: during
+                    # graph_run the downstream rank consumes the previous round's
+                    # messages and acks back in parallel, so recycling here needs
+                    # almost no wait and hides the communication latency.
+                    if not self.pp_group.is_last_rank:
+                        self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(send_prefill_consensus_work)
+                    self._pp_commit_comm_work(self.send_proxy_work)
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -402,6 +428,13 @@ class SchedulerPPMixin:
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
                 self.running_batch.batch_is_full = False
+
+                pp_perf_report(
+                    print_report=not (
+                        _is_idle_only_batch(self.cur_batch)
+                        and _is_idle_only_batch(self.mbs[next_mb_id])
+                    )
+                )
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
@@ -621,7 +654,7 @@ class SchedulerPPMixin:
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
-        self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors, int]] = deque()
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -1380,6 +1413,7 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
         msg_type: str = "default",
+        dst: Optional[int] = None,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -1392,6 +1426,7 @@ class SchedulerPPMixin:
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
+                dst=dst,
                 all_gather_group=(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
@@ -1587,6 +1622,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str,
         all_gather_group: Optional = None,
+        src: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Receive the next message of the expected kind over the unified RDMA
         channel, stashing any other kind that arrives first (demux by kind).
@@ -1602,7 +1638,8 @@ class SchedulerPPMixin:
             all_gather_group = (
                 self.attn_tp_group if self.require_attn_tp_allgather else None
             )
-        src = (self.pp_rank - 1) % self.pp_size
+        if src is None:
+            src = (self.pp_rank - 1) % self.pp_size
         while True:
             msg = self._pp_consume_message(src, all_gather_group)
             if msg is None:
@@ -1785,10 +1822,12 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors | None,
     ) -> List[P2PWork]:
         send_output_work = []
+
+        # Original ring-forward path (default).
         if self.pp_group.is_last_rank:
             # send ready PP output to rank 0
             if mbs[next_first_rank_mb_id] is not None:
-                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                q_event, pp_outputs_to_send, _ = last_rank_comm_queue.popleft()
                 if not mbs[next_first_rank_mb_id].forward_mode.is_prebuilt():
                     if not _is_cpu_920f:
                         self.device_module.current_stream().wait_event(q_event)
@@ -1816,7 +1855,7 @@ class SchedulerPPMixin:
         next_mb_id: int,
         mbs: List[ScheduleBatch],
         mb_metadata: List[PPBatchMetadata],
-        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
+        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors, int]],
         pp_outputs: PPProxyTensors | None,
     ) -> Tuple[
         Optional[PPProxyTensors],
@@ -1916,14 +1955,10 @@ class SchedulerPPMixin:
                     event.synchronize = lambda: None
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
-                    last_rank_comm_queue.append(
-                        (
-                            event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, self.cur_batch)
-                            ),
-                        )
+                    pp_outputs_local = PPProxyTensors(
+                        self._pp_prepare_tensor_dict(result, self.cur_batch)
                     )
+                    last_rank_comm_queue.append((event, pp_outputs_local, mb_id))
                     if (
                         self._pp_mtp_enabled
                         and result.draft_tokens is not None
