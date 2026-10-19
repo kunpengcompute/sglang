@@ -1034,6 +1034,17 @@ class KunpengCpuBackend(AttentionBackend):
                 topk_len = torch.minimum(
                     seq_lens, torch.full_like(seq_lens, self._nsa_topk)
                 ).clamp_(min=1)
+                # Mirror the forward-time fake top-k window cap so the
+                # sched plans the same window the kernel produces
+                # (otherwise the sched/kernel topk consistency check
+                # trips): the shared top-k covers only the committed
+                # prefix [0, base), so cap every chain step's plan at base.
+                if _USE_FAKE_INDEXER:
+                    step = getattr(self, "_mtp_step_id", None)
+                    if step is not None:
+                        topk_len = torch.minimum(
+                            topk_len, seq_lens - (step + 1)
+                        ).clamp_(min=1)
                 ext = forward_batch.extend_seq_lens
                 if ext is not None:
                     # Padding rows (extend_seq_lens == 0) carry the 1-entry

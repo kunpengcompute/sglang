@@ -1478,6 +1478,13 @@ class Indexer(MultiPlatformOp):
             )
 
         seq_lens = backend.forward_metadata.full_seq_lens[: q_lora[0].shape[0]]
+        # The M9 shared top-k covers only the committed prefix [0, base):
+        # the indexer scores in prepare, BEFORE the core writes the step's
+        # KV row, so the in-flight rows are in nobody's top-k. Cap every
+        # chain step's select-all window at base (= full_seq_lens - step - 1).
+        step = getattr(backend, "_mtp_step_id", None)
+        if step is not None:
+            seq_lens = seq_lens - (step + 1)
         return kunpeng.fake_indexer_topk_kunpeng(seq_lens, self.index_topk)
 
     def forward_cuda(
