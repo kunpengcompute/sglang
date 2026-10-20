@@ -85,6 +85,9 @@ HTTP_COMMON_ARGS=(
     --enable-dynamic-batch-tokenizer
     --batch-notify-size "$SGLANG_KUNPENG_MAX_SEQ_NUM"
     --tokenizer-backend "${SGLANG_TOKENIZER_BACKEND:-huggingface}"
+    ${CHAT_TEMPLATE:+--chat-template "$CHAT_TEMPLATE"}
+    ${TOOL_CALL_PARSER:+--tool-call-parser "$TOOL_CALL_PARSER"}
+    ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"}
 )
 
 echo "Launching $TOK_SIDE${TOK_INSTANCE:+ ($TOK_INSTANCE)} HTTP server on port $TOK_PORT..."

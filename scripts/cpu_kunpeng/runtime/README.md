@@ -60,6 +60,10 @@ env_base.sh（含 .user_env_base.sh，所有角色共享）
 | prefill_pp16 | 1 | 30002 | 9002 | 4 | 5100 |
 | decode_64p | 2 | 30003 | 9001 | 8 | 5010 |
 
+实例识别（停止/重启时的清理）：tokenizer 进程按 **HTTP 端口** 或 **master 端口** 匹配（`runtime/stop_tokenizer.sh`）。master 端口是实例内部端口块（`port_base = master 端口 + 1`，见 `PortArgs`）的稳定标识，不随条目顺序变化——条目顺序改变只会移动 HTTP 端口，所以只按 HTTP 端口匹配会漏掉仍占着内部端口块的旧进程。
+
+因此 **实例必须在 `INSTANCES` 中列出**：显式指定一个未列出的实例（如 `./launch.sh prefill 128p` 而 `INSTANCES` 无 `prefill_128p`）会直接报错，而不是静默退化成序号 0 的端口（否则会和真正的序号 0 实例抢同一段端口/NUMA）。
+
 日志目录同样按实例隔离：`$LOG_BASE_DIR/<日期>/<role>[_<instance>]/<时间>/`。
 
 ## 4. 路由：分组模式（短/长序列固定分组）

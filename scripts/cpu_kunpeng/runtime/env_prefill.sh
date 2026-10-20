@@ -60,11 +60,22 @@ fi
 #                          tokenizer's ZMQ port block is port_base..+37
 #                          (port_base = master_port + 1, see server_args
 #                          PortArgs), so instances need disjoint blocks.
-# Entries not listed in INSTANCES fall back to the single-instance
-# defaults (30001 / 9001 / 0 / 5000). Instance env files may still
-# override any of these.
+# A no-instance call (plain "prefill", e.g. the launch_router.sh fallback)
+# falls back to the single-instance defaults (30001 / 9001 / 0 / 5000); an
+# EXPLICIT instance that is not listed in INSTANCES is refused instead: its
+# derived ports would silently collapse onto side 0's block and collide with
+# the real side-0 instance (see runtime/README.md section 1). Instance env
+# files may still override any of these.
 # ------------------------------------------------------------
+# Drop inherited values first: these vars are exported, so a stale copy from
+# the calling shell would beat the derivation below (making two entries claim
+# the same router-node port). Instance env files, sourced below, still win.
+unset PREFILL_TOK_PORT PREFILL_BOOTSTRAP_PORT PREFILL_NUMA_BASE PREFILL_MASTER_PORT
 read -r _pf_g _pf_s <<< "$(_instance_indexes "prefill${INSTANCE:+_$INSTANCE}")"
+if [[ "$_pf_s" -lt 0 && -n "${INSTANCE:-}" ]]; then
+    echo "ERROR: prefill instance '$INSTANCE' (entry 'prefill_$INSTANCE') is not in INSTANCES='$INSTANCES'" >&2
+    return 1 2>/dev/null || exit 1
+fi
 [[ "$_pf_s" -lt 0 ]] && _pf_s=0
 [[ "$_pf_g" -lt 0 ]] && _pf_g=0
 export PREFILL_TOK_PORT="${PREFILL_TOK_PORT:-$((30001 + _pf_g))}"
