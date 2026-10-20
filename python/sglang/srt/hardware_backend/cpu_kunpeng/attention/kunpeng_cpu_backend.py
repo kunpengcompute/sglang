@@ -748,21 +748,28 @@ class KunpengCpuBackend(AttentionBackend):
             metadata.indexer_seq_lens = seq_lens
             metadata.indexer_cur_lens = ext.to(torch.int32)
             metadata.indexer_block_table = metadata.block_table
-            # TP-sharded SCORING window (same rank window as the
-            # consumption above, but CLAMPED to the effective row stream:
-            # the flat stream is padded up to the a2a multiple, so the
-            # trailing ranks' windows may extend past
-            # sum(extend_seq_lens) -- the scorer only accepts windows
-            # inside [0, sum(cur_lens)). A fully out-of-stream window
-            # (all-padding rank) degenerates to a 1-row window at the
-            # stream tail; its duplicate output row is never consumed.
+            # TP-sharded SCORING window: each attn-TP rank scores its own rows of
+            # the shared-shape full-batch inputs (floor of the a2a split, same as
+            # the consumption above). kutacc validates the window against
+            # sum(cur_lens), so only the start is baked -- see below.
             # None = full stream (escape hatch).
             if not _DISABLE_INDEXER_SCORE_TP_SPLIT:
-                n_eff = real_rows  # == sum(extend_seq_lens)
-                score_start = min(row_start, n_eff - 1)
-                score_rows = min(rows, n_eff - score_start)
-                metadata.indexer_score_row_start = score_start
-                metadata.indexer_score_row_rows = score_rows
+                # The window length depends on sum(extend_seq_lens), which varies per
+                # request, so a baked length goes stale on replay. Bake only the start
+                # (a pure function of the key's absorbed_flat_rows) and pass -1 ("to the
+                # end of the stream") so kutacc derives the length from live cur_lens.
+                # The effective stream is never shorter than flat_rows - (a2a - 1).
+                if row_start + rows <= flat_rows - (a2a - 1):
+                    metadata.indexer_score_row_start = row_start
+                    metadata.indexer_score_row_rows = rows
+                elif flat_rows >= a2a * a2a:
+                    # Block start always inside the stream: exactly this rank's live rows.
+                    metadata.indexer_score_row_start = row_start
+                    metadata.indexer_score_row_rows = -1
+                else:
+                    # Tiny stream: a trailing rank can be past it, fall back to full stream.
+                    metadata.indexer_score_row_start = 0
+                    metadata.indexer_score_row_rows = -1
 
     def _init_decode_metadata(
         self,
