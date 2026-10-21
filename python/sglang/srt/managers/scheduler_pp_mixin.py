@@ -45,12 +45,19 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.distributed import get_socket_tp_group
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_bool_env_var, get_device_module, is_xpu, is_cpu_920f, is_shm_available
 
 logger = logging.getLogger(__name__)
 
 _is_cpu_920f = is_cpu_920f()
+
+# Tensors whose valid content is partitioned by token-row OWNERSHIP: the DSA
+# indexer writes only its own scoring window (socket granularity, a2a), so a
+# 1/attn_tp slice of the flattened tensor can straddle rows the sender never
+# wrote. These must shard/gather on the owner group (socket) instead.
+_PP_ROW_OWNER_KEYS = frozenset({"topk_indices"})
 
 # When "1", delay the prefill loop's send ack commits until after
 # _pp_launch_batch so the downstream ack wait overlaps with graph_run compute
@@ -1430,6 +1437,7 @@ class SchedulerPPMixin:
                 all_gather_group=(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
+                per_key_group=self._pp_per_key_shard_groups(),
                 async_send=async_send,
             )
         )
@@ -1479,8 +1487,38 @@ class SchedulerPPMixin:
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_all_gather_shard(self, tensor: torch.Tensor, all_gather_group):
         """Rebuild the full tensor from this rank's shard; the fence wait for
-        all attn_tp ranks to arrive lands inside this span."""
+        all ranks of ``all_gather_group`` to arrive lands inside this span."""
         return all_gather_group.all_gather(tensor, dim=0)
+
+    def _pp_shard_group_for(self, key: str, default_group):
+        """Shard/gather group for one tensor key.
+
+        Row-partitioned tensors (_PP_ROW_OWNER_KEYS) are only valid in the rows
+        their owner rank scored, so they travel on the owner group (socket
+        sized, the indexer's scoring granularity). Everything else keeps the
+        default attn_tp group, where every rank holds a full valid copy.
+        """
+        if (
+            _is_cpu_920f
+            and key in _PP_ROW_OWNER_KEYS
+            and default_group is not None
+        ):
+            owner = get_socket_tp_group()
+            if owner is not None and owner.world_size < default_group.world_size:
+                return owner
+        return default_group
+
+    def _pp_per_key_shard_groups(self):
+        """Non-default groups to use per tensor key on the send side."""
+        if not _is_cpu_920f:
+            return None
+        default_group = self.attn_tp_group if self.require_attn_tp_allgather else None
+        groups = {}
+        for key in _PP_ROW_OWNER_KEYS:
+            group = self._pp_shard_group_for(key, default_group)
+            if group is not None and group is not default_group:
+                groups[key] = group
+        return groups or None
 
     def _pp_resolve_deferred_all_gather(
         self: Scheduler, msg: Dict[str, Any], all_gather_group: Optional
@@ -1497,10 +1535,12 @@ class SchedulerPPMixin:
         if all_gather_group is None:
             return
         tensor_dict = msg["tensor_dict"]
-        for key, orig_shape in deferred.items():
+        for key, entry in deferred.items():
+            orig_shape, group = entry
+            group = group if group is not None else all_gather_group
             shard = tensor_dict[key]
             tensor_dict[key] = self._pp_all_gather_shard(
-                shard, all_gather_group
+                shard, group
             ).reshape(orig_shape)
 
     def _pp_consume_message(
@@ -1551,12 +1591,9 @@ class SchedulerPPMixin:
         from sglang.srt.distributed.parallel_state import TensorMetadata
 
         recv_metadata_list = pickle.loads(payload)
-        all_gather_size = (
-            1 if all_gather_group is None else all_gather_group.world_size
-        )
-        all_gather_rank = (
-            0 if all_gather_group is None else all_gather_group.rank_in_group
-        )
+        # Per-key shard group: row-partitioned tensors (see _PP_ROW_OWNER_KEYS)
+        # gather on the owner group, everything else on attn_tp.
+        default_group = all_gather_group
         # The recv side must read the offset the sender wrote to. kutacc::pp_put
         # writes local[off] -> remote[off] with one offset, so both sides agree
         # on the slot: output and proxy frames each advance their own slot ring.
@@ -1566,7 +1603,7 @@ class SchedulerPPMixin:
         )
         comm.recv_batch(src, offset_base)
         tensor_dict: Dict[str, Any] = {}
-        pending = []  # (key, shard, use_all_gather, orig_shape)
+        pending = []  # (key, shard, use_all_gather, orig_shape, group)
         pp_offset = 0
         for key, value in recv_metadata_list:
             if not isinstance(value, TensorMetadata):
@@ -1576,28 +1613,31 @@ class SchedulerPPMixin:
             if tensor.numel() == 0:
                 tensor_dict[key] = tensor
                 continue
+            group = self._pp_shard_group_for(key, default_group)
+            ag_size = 1 if group is None else group.world_size
+            ag_rank = 0 if group is None else group.rank_in_group
             use_all_gather = (
-                all_gather_group is not None
-                and tensor.numel() % all_gather_size == 0
+                group is not None
+                and tensor.numel() % ag_size == 0
                 and (
                     tensor.dim() != 1
-                    or (tensor.numel() // all_gather_size) % SHM_ALIGN_SIZE == 0
+                    or (tensor.numel() // ag_size) % SHM_ALIGN_SIZE == 0
                 )
             )
             orig_shape = None
             if use_all_gather:
                 orig_shape = tensor.shape
-                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                tensor = tensor.reshape(ag_size, -1)[ag_rank]
             if not tensor.is_cpu:
                 raise RuntimeError("Kunpeng PP RDMA channel requires CPU tensors")
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
             comm.copy_from_buffer(tensor, offset_base + pp_offset)
             pp_offset += tensor.nbytes
-            pending.append((key, tensor, use_all_gather, orig_shape))
+            pending.append((key, tensor, use_all_gather, orig_shape, group))
 
         deferred = {}
-        for key, shard, use_all_gather, orig_shape in pending:
+        for key, shard, use_all_gather, orig_shape, group in pending:
             tensor = shard
             if use_all_gather:
                 if defer_all_gather:
@@ -1607,9 +1647,9 @@ class SchedulerPPMixin:
                     # force the 16 independent PP chains into a node-local
                     # barrier while this rank is still spinning on a downstream
                     # ACK, which deadlocks the ring.
-                    deferred[key] = orig_shape
+                    deferred[key] = (orig_shape, group)
                 else:
-                    tensor = self._pp_all_gather_shard(tensor, all_gather_group)
+                    tensor = self._pp_all_gather_shard(tensor, group)
                     tensor = tensor.reshape(orig_shape)
             tensor_dict[key] = tensor
         msg_type = tensor_dict.get("__msg_type__", "default")

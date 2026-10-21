@@ -17,6 +17,7 @@
 #include <kutacc.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 
@@ -91,6 +92,17 @@ void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
                                 : kutacc::attention_schedule::OutputCoord::kSlot;
     schedule.row_start = static_cast<int32_t>(row_start);
     schedule.row_rows = static_cast<int32_t>(row_rows);
+
+    // Windowed (TP-sharded) scoring only writes the rows inside this rank's
+    // window; rows outside keep whatever the buffer held from a previous
+    // batch (raw heap bytes / stale index ids) and a NaN query row produces no
+    // candidate at all, so the consumer would read that residue as KV slot
+    // ids. Pre-fill with the "no candidate" sentinel -1 so every unwritten
+    // row is a no-op for the consumer's pos >= 0 filter.
+    if (row_start != 0 || row_rows >= 0) {
+        int32_t *out_p = output.data_ptr<int32_t>();
+        std::fill(out_p, out_p + output.numel(), -1);
+    }
 
     kutacc::paged_mqa_logits_topk(kt_q, kt_kv, kt_weight, kt_block_tables,
                                   kt_seq, kt_cur, kt_output, schedule,
