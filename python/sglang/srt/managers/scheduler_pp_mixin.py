@@ -45,12 +45,31 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.distributed import get_socket_tp_group
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_bool_env_var, get_device_module, is_xpu, is_cpu_920f, is_shm_available
 
 logger = logging.getLogger(__name__)
 
 _is_cpu_920f = is_cpu_920f()
+
+# Tensors whose valid content is partitioned by token-row OWNERSHIP: the DSA
+# indexer writes only its own scoring window (socket granularity, a2a), so a
+# 1/attn_tp slice of the flattened tensor can straddle rows the sender never
+# wrote. These must shard/gather on the owner group (socket) instead.
+_PP_ROW_OWNER_KEYS = frozenset({"topk_indices"})
+
+# PP control ring depth (must match PP_MSG_SLOTS in pp_comm.cpp /
+# kunpeng_communicator.py). Acks are no longer drained to zero every iteration
+# (that serialized a whole iteration on the downstream's consume point):
+# _PP_MAX_INFLIGHT_MSG is the watermark the commit drains to. Keeping the
+# watermark at ring-1 makes every commit a non-blocking drain (the RDMA send
+# has no isend work handle to wait on, unlike the gloo path), while the hard
+# cap is enforced at the send site (_pp_ensure_send_slot), keeping one slot
+# spare for the message being posted. Proxy data frames are <= 1 per iteration,
+# so at most 2 of them stay in flight, well under PP_PROXY_SLOTS = 4.
+_PP_MSG_SLOTS = 8
+_PP_MAX_INFLIGHT_MSG = _PP_MSG_SLOTS - 1
 
 # When "1", delay the prefill loop's send ack commits until after
 # _pp_launch_batch so the downstream ack wait overlaps with graph_run compute
@@ -1230,14 +1249,17 @@ class SchedulerPPMixin:
             # Tensor sends (send_tensor_dict / send_tensor_message) always use
             # Kunpeng RDMA regardless of the SGLANG_KUNPENG_RDMA_PP_COMM toggle,
             # so their acks must always be reclaimed here to free ring slots.
-            self._pp_wait_acks()
+            # Reclaim down to the slot budget only: waiting for inflight == 0
+            # serialized a whole iteration on the downstream's ack.
+            self._pp_wait_acks(max_inflight=_PP_MAX_INFLIGHT_MSG)
         for p2p_work in work:
             if p2p_work.work is not None:
                 p2p_work.work.wait()
         work.clear()
 
-    def _pp_wait_acks(self: Scheduler) -> None:
-        """Wait until every posted message has been acked by its peer.
+    def _pp_wait_acks(self: Scheduler, max_inflight: int = 0) -> None:
+        """Reclaim downstream ack frames until at most ``max_inflight``
+        messages are still unacked (0 = drain everything).
 
         A blocking wait on the downstream peer forms a circular ACK wait across
         the PP ring: every rank blocks on its downstream's ACK while never
@@ -1282,7 +1304,12 @@ class SchedulerPPMixin:
                 continue
 
             # 2) No upstream frame: check the downstream ack (non-blocking).
-            dsts = [d for d in range(comm.comm_size) if comm.inflight(d) > 0]
+            #    Only peers above the slot budget block us; a receiver that is
+            #    one iteration behind keeps its frames in flight instead of
+            #    stalling the sender's CPU.
+            dsts = [
+                d for d in range(comm.comm_size) if comm.inflight(d) > max_inflight
+            ]
             if not dsts:
                 return
             if comm.try_peek_msg(dsts[0]) < 0:
@@ -1321,6 +1348,19 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
+    def _pp_ensure_send_slot(self: Scheduler) -> None:
+        """Block only when the downstream control ring is about to overflow.
+
+        Keep one spare slot for the message being posted; reclaim acks down to
+        that budget instead of draining the ring to zero.
+        """
+        comm = self.pp_group.kunpeng_pp_communicator
+        if comm is None:
+            return
+        dst = (self.pp_rank + 1) % self.pp_size
+        while comm.inflight(dst) >= _PP_MSG_SLOTS - 1:
+            self._pp_wait_acks(max_inflight=_PP_MSG_SLOTS - 2)
+
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
@@ -1328,6 +1368,7 @@ class SchedulerPPMixin:
             if self.pp_group.kunpeng_pp_communicator is not None and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1":
                 # Unified RDMA message (async single-sided write); the peer
                 # acks on receive and the commit waits for the ack.
+                self._pp_ensure_send_slot()
                 self.pp_group.kunpeng_pp_communicator.send_pyobj(
                     data, (self.pp_rank + 1) % self.pp_size
                 )
@@ -1422,6 +1463,11 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        if (
+            self.pp_group.use_kunpeng_pp_communicator
+            and self.pp_group.kunpeng_pp_communicator is not None
+        ):
+            self._pp_ensure_send_slot()
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1430,6 +1476,7 @@ class SchedulerPPMixin:
                 all_gather_group=(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
+                per_key_group=self._pp_per_key_shard_groups(),
                 async_send=async_send,
             )
         )
@@ -1479,8 +1526,38 @@ class SchedulerPPMixin:
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_all_gather_shard(self, tensor: torch.Tensor, all_gather_group):
         """Rebuild the full tensor from this rank's shard; the fence wait for
-        all attn_tp ranks to arrive lands inside this span."""
+        all ranks of ``all_gather_group`` to arrive lands inside this span."""
         return all_gather_group.all_gather(tensor, dim=0)
+
+    def _pp_shard_group_for(self, key: str, default_group):
+        """Shard/gather group for one tensor key.
+
+        Row-partitioned tensors (_PP_ROW_OWNER_KEYS) are only valid in the rows
+        their owner rank scored, so they travel on the owner group (socket
+        sized, the indexer's scoring granularity). Everything else keeps the
+        default attn_tp group, where every rank holds a full valid copy.
+        """
+        if (
+            _is_cpu_920f
+            and key in _PP_ROW_OWNER_KEYS
+            and default_group is not None
+        ):
+            owner = get_socket_tp_group()
+            if owner is not None and owner.world_size < default_group.world_size:
+                return owner
+        return default_group
+
+    def _pp_per_key_shard_groups(self):
+        """Non-default groups to use per tensor key on the send side."""
+        if not _is_cpu_920f:
+            return None
+        default_group = self.attn_tp_group if self.require_attn_tp_allgather else None
+        groups = {}
+        for key in _PP_ROW_OWNER_KEYS:
+            group = self._pp_shard_group_for(key, default_group)
+            if group is not None and group is not default_group:
+                groups[key] = group
+        return groups or None
 
     def _pp_resolve_deferred_all_gather(
         self: Scheduler, msg: Dict[str, Any], all_gather_group: Optional
@@ -1497,10 +1574,12 @@ class SchedulerPPMixin:
         if all_gather_group is None:
             return
         tensor_dict = msg["tensor_dict"]
-        for key, orig_shape in deferred.items():
+        for key, entry in deferred.items():
+            orig_shape, group = entry
+            group = group if group is not None else all_gather_group
             shard = tensor_dict[key]
             tensor_dict[key] = self._pp_all_gather_shard(
-                shard, all_gather_group
+                shard, group
             ).reshape(orig_shape)
 
     def _pp_consume_message(
@@ -1551,12 +1630,9 @@ class SchedulerPPMixin:
         from sglang.srt.distributed.parallel_state import TensorMetadata
 
         recv_metadata_list = pickle.loads(payload)
-        all_gather_size = (
-            1 if all_gather_group is None else all_gather_group.world_size
-        )
-        all_gather_rank = (
-            0 if all_gather_group is None else all_gather_group.rank_in_group
-        )
+        # Per-key shard group: row-partitioned tensors (see _PP_ROW_OWNER_KEYS)
+        # gather on the owner group, everything else on attn_tp.
+        default_group = all_gather_group
         # The recv side must read the offset the sender wrote to. kutacc::pp_put
         # writes local[off] -> remote[off] with one offset, so both sides agree
         # on the slot: output and proxy frames each advance their own slot ring.
@@ -1566,7 +1642,7 @@ class SchedulerPPMixin:
         )
         comm.recv_batch(src, offset_base)
         tensor_dict: Dict[str, Any] = {}
-        pending = []  # (key, shard, use_all_gather, orig_shape)
+        pending = []  # (key, shard, use_all_gather, orig_shape, group)
         pp_offset = 0
         for key, value in recv_metadata_list:
             if not isinstance(value, TensorMetadata):
@@ -1576,28 +1652,31 @@ class SchedulerPPMixin:
             if tensor.numel() == 0:
                 tensor_dict[key] = tensor
                 continue
+            group = self._pp_shard_group_for(key, default_group)
+            ag_size = 1 if group is None else group.world_size
+            ag_rank = 0 if group is None else group.rank_in_group
             use_all_gather = (
-                all_gather_group is not None
-                and tensor.numel() % all_gather_size == 0
+                group is not None
+                and tensor.numel() % ag_size == 0
                 and (
                     tensor.dim() != 1
-                    or (tensor.numel() // all_gather_size) % SHM_ALIGN_SIZE == 0
+                    or (tensor.numel() // ag_size) % SHM_ALIGN_SIZE == 0
                 )
             )
             orig_shape = None
             if use_all_gather:
                 orig_shape = tensor.shape
-                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                tensor = tensor.reshape(ag_size, -1)[ag_rank]
             if not tensor.is_cpu:
                 raise RuntimeError("Kunpeng PP RDMA channel requires CPU tensors")
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
             comm.copy_from_buffer(tensor, offset_base + pp_offset)
             pp_offset += tensor.nbytes
-            pending.append((key, tensor, use_all_gather, orig_shape))
+            pending.append((key, tensor, use_all_gather, orig_shape, group))
 
         deferred = {}
-        for key, shard, use_all_gather, orig_shape in pending:
+        for key, shard, use_all_gather, orig_shape, group in pending:
             tensor = shard
             if use_all_gather:
                 if defer_all_gather:
@@ -1607,9 +1686,9 @@ class SchedulerPPMixin:
                     # force the 16 independent PP chains into a node-local
                     # barrier while this rank is still spinning on a downstream
                     # ACK, which deadlocks the ring.
-                    deferred[key] = orig_shape
+                    deferred[key] = (orig_shape, group)
                 else:
-                    tensor = self._pp_all_gather_shard(tensor, all_gather_group)
+                    tensor = self._pp_all_gather_shard(tensor, group)
                     tensor = tensor.reshape(orig_shape)
             tensor_dict[key] = tensor
         msg_type = tensor_dict.get("__msg_type__", "default")
@@ -2236,6 +2315,7 @@ class SchedulerPPMixin:
                 self.pp_group.kunpeng_pp_communicator is not None
                 and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
             ):
+                self._pp_ensure_send_slot()
                 self.pp_group.kunpeng_pp_communicator.send_pyobjs_bundle(
                     data_list, (self.pp_rank + 1) % self.pp_size, sub_kind
                 )
