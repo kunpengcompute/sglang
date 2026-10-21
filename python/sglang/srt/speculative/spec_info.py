@@ -151,6 +151,14 @@ class SpecInputType(IntEnum):
 class SpecInput(ABC):
     # DSA indexer topk carried across MTP draft steps (see IndexTopKShareState).
     dsa_topk_indices = None
+    # index_share_for_mtp_iteration: set by the worker right before a
+    # draft-extend forward that must capture its indexer top-k as the
+    # next draft round's seed. Non-None makes the NextN layer return /
+    # publish its [bs, nv, topk] block so the worker can extract each
+    # request's last live row (the root). Placeholder tensor: kunpeng
+    # moves the block via the graph-output mechanism, no copy happens
+    # into this buffer itself.
+    dsa_seed_topk_capture = None
 
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type

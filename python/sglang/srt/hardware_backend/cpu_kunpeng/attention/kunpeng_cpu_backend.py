@@ -788,12 +788,13 @@ class KunpengCpuBackend(AttentionBackend):
             # DSA: update the persistent full-batch seq lens; the padded tail
             # is refilled with the fill value so padded rows stay consistent.
             # FAKE MTP chain steps: the buffer carries the step's top-k
-            # window [0, base), base = seq_lens - step - 1 (M9: the indexer
-            # scores before the KV write, so in-flight rows are in nobody's
-            # top-k). The cap must run here, OUTSIDE the graph: the captured
-            # fake indexer op consumes this buffer directly and plain tensor
-            # arithmetic cannot be captured. Backends without _mtp_step_id
-            # keep the raw values.
+            # window [0, base), base = seq_lens - step - 1 (the indexer
+            # scores in prepare, BEFORE the core writes the step's KV row,
+            # so the in-flight rows are in nobody's top-k). The cap must
+            # run here, OUTSIDE the graph: the captured fake indexer op
+            # consumes this buffer directly and plain tensor arithmetic
+            # cannot be captured. Backends without _mtp_step_id keep the
+            # raw values.
             bs = seq_lens.shape[0]
             if metadata.full_seq_lens is None:
                 metadata.full_seq_lens = torch.full(
@@ -914,6 +915,26 @@ class KunpengCpuBackend(AttentionBackend):
             #                registers that tensor as the input anchor).
             with pp_span("indexer_view_build"):
                 metadata.indexer_seq_lens = seq_lens
+                # index_share_for_mtp_iteration chain steps: the whole
+                # chain shares ONE top-k over the committed prefix
+                # [0, base), base = seq_lens - step - 1 -- the rows the
+                # chain steps write are in nobody's top-k (mirrors the
+                # fake-indexer full_seq_lens cap above). Cap the SCORING
+                # view as well so a no-seed fallback step 0 that
+                # re-scores produces exactly the shared window (its own
+                # in-flight row is excluded); the sched-plan cap below
+                # then matches the kernel on every step, seed or
+                # fallback. The block table below keeps the UNCAPPED
+                # lens -- every selected position (< base) stays covered.
+                _share_step = getattr(self, "_mtp_step_id", None)
+                if (
+                    _share_step is not None
+                    and getattr(self, "_mtp_topk_share", False)
+                    and not forward_batch.forward_mode.is_draft_extend()
+                ):
+                    metadata.indexer_seq_lens = (
+                        seq_lens - (_share_step + 1)
+                    ).clamp_(min=1)
                 if forward_batch.forward_mode.is_draft_extend():
                     # The FULL extend_seq_lens (metadata's is
                     # all2all-sliced). Leave cur_lens unset (-> dense
@@ -1055,9 +1076,23 @@ class KunpengCpuBackend(AttentionBackend):
                     seq_lens, torch.full_like(seq_lens, self._nsa_topk)
                 ).clamp_(min=1)
                 # Mirror the full_seq_lens window cap above so the sched
-                # plans the same window the kernel produces (otherwise the
-                # sched/kernel topk consistency check trips).
+                # plans the same window the kernel produces (otherwise
+                # the sched/kernel topk consistency check trips).
                 if _USE_FAKE_INDEXER:
+                    step = getattr(self, "_mtp_step_id", None)
+                    if step is not None:
+                        topk_len = torch.minimum(
+                            topk_len, seq_lens - (step + 1)
+                        ).clamp_(min=1)
+                elif getattr(self, "_mtp_topk_share", False):
+                    # index_share_for_mtp_iteration (real indexer): every
+                    # chain step consumes the draft-extend seed, whose
+                    # scoring window is the committed prefix [0, base)
+                    # with base = seq_lens - step - 1. Cap the sched plan
+                    # to the same window or the sched/kernel topk
+                    # consistency check trips on the reuse steps. Without
+                    # the share each step re-scores its full window
+                    # ([0, seq_lens)), so no cap is applied.
                     step = getattr(self, "_mtp_step_id", None)
                     if step is not None:
                         topk_len = torch.minimum(

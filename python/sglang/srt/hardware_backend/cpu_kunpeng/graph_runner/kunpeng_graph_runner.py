@@ -667,7 +667,26 @@ class KunpengGraphRunner:
                 # SAME views the op consumes.
                 inputs.append(forward_batch.req_to_token_pool.req_to_token)
                 inputs.append(meta.req_pool_indices)
-                if meta.indexer_block_table is not None:
+                # index_share_for_mtp_iteration reuse steps (decode with a
+                # carried top-k) never call the indexer inside the graph,
+                # so the scoring view has no in-graph consumer -- skip it
+                # (the carried top-k itself registers as a graph input in
+                # the draft-worker block below). Scoring steps (step 0 /
+                # the share disabled) register the SAME views the scoring
+                # op consumes.
+                _mtp_reuse_step = (
+                    getattr(forward_batch, "reuse_dsa_topk_indices", False)
+                    and getattr(
+                        getattr(forward_batch, "spec_info", None),
+                        "dsa_topk_indices",
+                        None,
+                    )
+                    is not None
+                )
+                if (
+                    meta.indexer_block_table is not None
+                    and not _mtp_reuse_step
+                ):
                     inputs.extend(
                         [
                             meta.indexer_seq_lens,
@@ -839,10 +858,11 @@ class KunpengGraphRunner:
                 )
             if getattr(spec_info, "hidden_states", None) is not None:
                 inputs.append(spec_info.hidden_states)
-            # M9 DSA top-k carry between the chain-step graphs: the step-0
-            # top-k (stuffed by _graph_forward after its replay; published
-            # by the model on the eager path) feeds the later steps'
-            # captured graphs, like spec_info.hidden_states above.
+            # index_share_for_mtp_iteration: the carried top-k (the
+            # draft-extend seed / the previous step's publish, stuffed
+            # by the worker or by _graph_forward after the producing
+            # step's replay) feeds the later chain steps' captured
+            # graphs, like spec_info.hidden_states above.
             if (
                 forward_mode.is_decode()
                 and getattr(forward_batch, "reuse_dsa_topk_indices", False)
@@ -1111,6 +1131,23 @@ class KunpengGraphRunner:
         all_padding_key = bool(
             getattr(attn_backend.forward_metadata, "sparse_all_padding", False)
         )
+        # index_share_for_mtp_iteration: whether this draft chain step
+        # enters the graph WITH a carried top-k (reuse branch -- no
+        # scoring op, the carry is a graph input) or WITHOUT one (the
+        # no-seed fallback re-scores). The branch is a Python condition
+        # frozen at capture and the carry comes and goes across rounds
+        # (first round after prefill has no seed), so the two variants
+        # must not share a cached graph.
+        mtp_carry_key = None
+        if (
+            self.model_runner.is_draft_worker
+            and forward_batch.forward_mode.is_decode()
+            and getattr(forward_batch, "reuse_dsa_topk_indices", False)
+        ):
+            _carry_si = forward_batch.spec_info
+            mtp_carry_key = _carry_si is not None and (
+                getattr(_carry_si, "dsa_topk_indices", None) is not None
+            )
         graph_cache_key = (
             forward_batch.forward_mode,
             total_tokens,
@@ -1121,12 +1158,14 @@ class KunpengGraphRunner:
             else None,
             absorbed_prefill_key,
             all_padding_key,
+            mtp_carry_key,
         )
 
-        # M9 DSA top-k carry: the incoming carry (None at step 0 -- eagle
-        # clears it per round). The capture branch below distinguishes a
-        # freshly computed top-k (step 0) from a re-published one by
-        # object identity.
+        # index_share_for_mtp_iteration: the incoming carry (the
+        # draft-extend seed for the chain's step 0, or the previous
+        # step's publish inside the chain; None when absent). The
+        # capture branch below distinguishes a freshly computed top-k
+        # from a re-published one by object identity.
         _spec_info = forward_batch.spec_info
         _pre_topk_carry = (
             getattr(_spec_info, "dsa_topk_indices", None)
@@ -1172,16 +1211,38 @@ class KunpengGraphRunner:
                     [logits, hidden_states] if hidden_states is not None else [logits]
                 )
 
-            # M9 DSA top-k carry (draft chain, non-PP): the step-0 graph
-            # computes the shared top-k; register it as an extra output so
-            # every replay returns the fresh values (the model's Python
-            # publish cannot run inside a captured graph).
+            # index_share_for_mtp_iteration: register the freshly
+            # published top-k as an extra graph output so every replay
+            # returns the fresh values (the model's Python publish
+            # cannot run inside a captured graph). Two producers:
+            #   - draft chain steps (decode + reuse flag): the carried /
+            #     step-0 top-k for the later chain steps;
+            #   - draft-extend with the seed-capture flag: the
+            #     [bs, nv, topk] block the worker mines the root-row
+            #     seed from.
             has_mtp_topk = False
             if (
                 self.model_runner.is_draft_worker
                 and not is_pp_output
-                and forward_batch.forward_mode.is_decode()
-                and getattr(forward_batch, "reuse_dsa_topk_indices", False)
+                and (
+                    (
+                        forward_batch.forward_mode.is_decode()
+                        and getattr(
+                            forward_batch, "reuse_dsa_topk_indices", False
+                        )
+                    )
+                    or (
+                        forward_batch.forward_mode.is_draft_extend()
+                        and getattr(
+                            getattr(
+                                forward_batch, "spec_info", None
+                            ),
+                            "dsa_seed_topk_capture",
+                            None,
+                        )
+                        is not None
+                    )
+                )
             ):
                 published = getattr(
                     forward_batch.spec_info, "dsa_topk_indices", None
@@ -1317,10 +1378,12 @@ class KunpengGraphRunner:
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        # M9 DSA top-k carry: return the fresh step-0 top-k through
-        # spec_info. CLONE it out of the graph pool: per-step draft graphs
-        # share the pool, so later replays would overwrite the buffer in
-        # place (same reason the chain clones hidden_states).
+        # index_share_for_mtp_iteration: return the fresh top-k (the
+        # chain's carried/step top-k, or the draft-extend seed block)
+        # through spec_info. CLONE it out of the graph pool: per-step
+        # draft graphs share the pool, so later replays would overwrite
+        # the buffer in place (same reason the chain clones
+        # hidden_states).
         if has_mtp_topk:
             if graph.has_hidden_states:
                 logits, hidden_states, mtp_topk = outputs
