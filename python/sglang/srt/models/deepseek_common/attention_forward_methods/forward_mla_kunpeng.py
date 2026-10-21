@@ -93,11 +93,12 @@ class DeepseekMLAKunpengForwardMixin:
         >index_topk garbling. The is_nextn clause is the sole intentional
         fallback (the NextN layer has its own weights).
 
-        M9 (index_share_for_mtp_iteration, topk == 1): during a draft
-        round with the carry enabled, the NextN layer reuses the step-0
-        top-k instead of re-scoring every step (the step-0 window misses
-        only the last i draft tokens; verify recovers any loss). Outside
-        the carry (or with sharing disabled) the NextN layer re-scores.
+        index_share_for_mtp_iteration (topk == 1): during a draft round
+        with the carry enabled, the NextN layer reuses the draft-extend
+        seed / the previous step's top-k instead of re-scoring every
+        step (the shared window misses only the last i draft tokens;
+        verify recovers any loss). Outside the carry (or with sharing
+        disabled) the NextN layer re-scores.
         """
         if (
             self.is_nextn
@@ -308,6 +309,39 @@ class DeepseekMLAKunpengForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+        )
+
+    def should_publish_mtp_topk(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        """Whether forward_absorb_core_kunpeng must return the indexer
+        top-k alongside the attention output for the
+        index_share_for_mtp_iteration carry (the NextN layer has
+        next_skip_topk=False, so without this clause the top-k would be
+        dropped). Two producers:
+
+        - draft chain steps (decode + reuse_dsa_topk_indices): the
+          carried / step top-k is published to spec_info.dsa_topk_indices
+          for the later chain steps and the step-0 graph output;
+        - draft-extend with the seed-capture flag set by the worker: the
+          [bs, nv, topk] block is published so the worker can extract
+          each request's last live row (the root) as the chain seed.
+        """
+        if not self.is_nextn:
+            return False
+        if (
+            getattr(forward_batch, "reuse_dsa_topk_indices", False)
+            and forward_batch.forward_mode.is_decode()
+        ):
+            return True
+        return forward_batch.forward_mode.is_draft_extend() and (
+            getattr(
+                getattr(forward_batch, "spec_info", None),
+                "dsa_seed_topk_capture",
+                None,
+            )
+            is not None
         )
 
     def forward_absorb_core_kunpeng(
@@ -623,7 +657,14 @@ class DeepseekMLAKunpengForwardMixin:
         if self.next_skip_topk is None:
             return output
 
-        if not self.next_skip_topk:
+        # index_share_for_mtp_iteration: the NextN layer must hand its
+        # top-k back even though next_skip_topk is False -- the carry
+        # spans draft iterations, not decoder layers. topk_indices is
+        # None on a scoring fallback; update(None) / publish() are
+        # no-ops then, so returning the tuple is safe.
+        if not self.next_skip_topk and not self.should_publish_mtp_topk(
+            forward_batch
+        ):
             return output, None
         else:
             return output, topk_indices

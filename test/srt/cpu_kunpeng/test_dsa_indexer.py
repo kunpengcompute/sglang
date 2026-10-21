@@ -16,7 +16,8 @@ Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
   D. dsa_layer_skips_topk scheduling rules + count_indexer_layers +
      the skip_topk propagation chain mirror.
   E. IndexTopKShareState MTP cross-iteration carry semantics (enter/publish/
-     exit lifecycle, idempotent publish, disabled no-op).
+      exit lifecycle, idempotent publish, disabled no-op, draft-extend seed
+      capture).
   F. DSA sparse prefill attention vs an fp32 reference + workspace-size
      contracts. NOTE: the glm5 absorbed-prefill branch dropped the MHA-form
      flash_attention_sparse_prefill_kunpeng operator, so the sparse-prefill
@@ -32,8 +33,10 @@ Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
      920F fused add+rmsnorm+quant path are rejected (fail-loudly -- casting
      the raw int8 codes to bf16 silently produced garbage); bf16/fp32
      tensors pass through.
-  J. should_run_indexer M9 reuse matrix (index_share_for_mtp_iteration:
-     NextN + carry + prev -> reuse; otherwise rescore).
+  J. should_run_indexer mtp reuse matrix (index_share_for_mtp_iteration:
+      NextN + carry + prev -> reuse; otherwise rescore) and the
+      should_publish_mtp_topk core-return clause (chain steps +
+      seed-capturing draft-extend).
   K. indexer attn-TP weight split (see nsa_indexer.Indexer.__init__ /
      forward_cpu): the K-split partial-sum identity behind the RowParallel
      wk / weights_proj + SHM allreduce, the head-aligned N-split column
@@ -756,8 +759,47 @@ def test_index_topk_share():
         assert spec_info.dsa_topk_indices is None
 
 
+def test_index_topk_share_seed_capture():
+    """index_share_for_mtp_iteration seed capture: a draft-extend forward
+    (reuse flag OFF) with spec_info.dsa_seed_topk_capture set still
+    publishes its top-k (the worker then mines the root-row seed);
+    without the flag (regular draft-extend / share disabled) nothing is
+    published. from_mtp_carry stays None (the chain has not started)."""
+    if not _HAVE_TOPK_SHARE:
+        print("  [skip] index_topk_share not importable (seed capture)")
+        return
+    from types import SimpleNamespace
+
+    block = torch.zeros(2, 3, 4, dtype=torch.int32)  # [bs, nv, topk]
+
+    # Draft-extend round with the seed-capture flag: publish lands in
+    # spec_info.dsa_topk_indices even though the reuse gate is off.
+    spec_info = SimpleNamespace(
+        dsa_topk_indices=None, dsa_seed_topk_capture=torch.empty(0)
+    )
+    forward_batch = SimpleNamespace(
+        spec_info=spec_info, reuse_dsa_topk_indices=False
+    )
+    share = IndexTopKShareState.from_mtp_carry(forward_batch)
+    assert share.topk_indices is None  # chain not started: no carry read
+    assert share.enabled is False
+    assert share.should_publish is True
+    share.update(block)
+    share.publish()
+    assert spec_info.dsa_topk_indices is block
+
+    # Flag cleared again (worker consumes the seed): publish is a no-op.
+    spec_info.dsa_seed_topk_capture = None
+    spec_info.dsa_topk_indices = None
+    share2 = IndexTopKShareState.from_mtp_carry(forward_batch)
+    assert share2.should_publish is False
+    share2.update(block)
+    share2.publish()
+    assert spec_info.dsa_topk_indices is None
+
+
 # ---------------------------------------------------------------------------
-# F. DSA sparse prefill attention (M6) + workspace-size contracts
+# F. DSA sparse prefill attention + workspace-size contracts
 # ---------------------------------------------------------------------------
 
 def _ref_sparse_prefill(q, k, v, indices, query_start_loc, key_start_loc, softmax_scale):
@@ -1077,13 +1119,13 @@ def test_scorer_partial_rows():
         assert bool((out_full[live:] == -1).all())
 
 
-def test_should_run_indexer_m9():
-    """should_run_indexer M9 reuse matrix (index_share_for_mtp_iteration,
+def test_should_run_indexer_mtp_reuse():
+    """should_run_indexer mtp reuse matrix (index_share_for_mtp_iteration,
     topk == 1): during a draft round with the carry enabled, the NextN
-    layer reuses the step-0 top-k instead of re-scoring; with sharing off
+    layer reuses the carried top-k instead of re-scoring; with sharing off
     (or no carry / no prev) it rescores. Shared layers always reuse."""
     if not _HAVE_MLA_KUNPENG:
-        print("  [skip] forward_mla_kunpeng not importable (M9 matrix)")
+        print("  [skip] forward_mla_kunpeng not importable (mtp reuse matrix)")
         return
     prev = torch.zeros(2, 3, dtype=torch.int32)  # any non-None tensor
 
@@ -1094,9 +1136,9 @@ def test_should_run_indexer_m9():
         )
 
     # NextN layer (skip_topk=False, own weights):
-    assert call(True, False, prev, True) is False   # M9: reuse step-0 top-k
+    assert call(True, False, prev, True) is False   # reuse the carried top-k
     assert call(True, False, prev, False) is True   # sharing off: rescore
-    assert call(True, False, None, True) is True    # step 0 (no prev): rescore
+    assert call(True, False, None, True) is True    # no seed yet: rescore
     assert call(True, False, None, False) is True
     # Shared layer (skip_topk=True, no indexer weights): always reuse.
     assert call(False, True, prev, True) is False
@@ -1105,6 +1147,55 @@ def test_should_run_indexer_m9():
     # Normal full layer (skip_topk=False): always runs.
     assert call(False, False, None, False) is True
     assert call(False, False, prev, False) is True
+
+
+def test_should_publish_mtp_topk():
+    """should_publish_mtp_topk (the core return clause): the NextN layer
+    must return its top-k for the index_share_for_mtp_iteration carry
+    when (a) a draft chain step runs (decode + reuse flag) or (b) a
+    draft-extend forward carries the seed-capture flag. Everything else
+    (verify / target decode / draft-extend without the flag / non-NextN
+    layers) keeps the plain (output, None) return."""
+    if not _HAVE_MLA_KUNPENG:
+        print("  [skip] forward_mla_kunpeng not importable (publish matrix)")
+        return
+    from types import SimpleNamespace
+
+    try:
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    except Exception:
+        print("  [skip] ForwardMode not importable (publish matrix)")
+        return
+
+    def call(is_nextn, mode, reuse=False, seed_capture=None):
+        self = SimpleNamespace(is_nextn=is_nextn)
+        spec_info = SimpleNamespace(dsa_seed_topk_capture=seed_capture)
+        forward_batch = SimpleNamespace(
+            forward_mode=mode,
+            reuse_dsa_topk_indices=reuse,
+            spec_info=spec_info,
+        )
+        return DeepseekMLAKunpengForwardMixin.should_publish_mtp_topk(
+            self, forward_batch
+        )
+
+    # NextN draft chain step (decode + reuse flag): publish.
+    assert call(True, ForwardMode.DECODE, reuse=True) is True
+    # NextN step without the carry gate (share disabled / verify):
+    assert call(True, ForwardMode.DECODE, reuse=False) is False
+    assert call(True, ForwardMode.TARGET_VERIFY, reuse=True) is False
+    # NextN draft-extend: publish only with the seed-capture flag.
+    assert (
+        call(True, ForwardMode.DRAFT_EXTEND, seed_capture=torch.empty(0))
+        is True
+    )
+    assert call(True, ForwardMode.DRAFT_EXTEND) is False
+    # Non-NextN layers (target model): never.
+    assert call(False, ForwardMode.DECODE, reuse=True) is False
+    assert (
+        call(False, ForwardMode.DRAFT_EXTEND, seed_capture=torch.empty(0))
+        is False
+    )
 
 
 def test_indexer_input_validation():
@@ -1517,6 +1608,7 @@ def main():
         ("D. test_count_indexer_layers_ranges", test_count_indexer_layers_ranges),
         ("D. test_skip_topk_chain", test_skip_topk_chain),
         ("E. test_index_topk_share", test_index_topk_share),
+        ("E. test_index_topk_share_seed_capture", test_index_topk_share_seed_capture),
         ("F. test_sparse_prefill_matches_reference", test_sparse_prefill_matches_reference),
         ("F. test_workspace_helpers", test_workspace_helpers),
         ("H. test_dsa_topk_slots_mtp", test_dsa_topk_slots_mtp),
@@ -1524,7 +1616,8 @@ def main():
         ("H. test_pad_q_left_fill_indices", test_pad_q_left_fill_indices),
         ("H. test_pad_q_left_extra_src_rows", test_pad_q_left_extra_src_rows),
         ("I. test_indexer_input_validation", test_indexer_input_validation),
-        ("J. test_should_run_indexer_m9", test_should_run_indexer_m9),
+        ("J. test_should_run_indexer_mtp_reuse", test_should_run_indexer_mtp_reuse),
+        ("J. test_should_publish_mtp_topk", test_should_publish_mtp_topk),
         ("K. test_tp_split_k_shard_partial_sum", test_tp_split_k_shard_partial_sum),
         ("K. test_tp_split_n_shard_head_stitch", test_tp_split_n_shard_head_stitch),
         ("K. test_tp_split_shard_bounds", test_tp_split_shard_bounds),

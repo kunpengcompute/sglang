@@ -46,6 +46,13 @@ class KunpengCpuMultiStepDraftBackend:
         self.speculative_num_steps = speculative_num_steps
         self.model_runner = model_runner
         self.device = model_runner.device
+        # index_share_for_mtp_iteration state, injected by EAGLEWorker
+        # after construction (set_index_topk_share). The per-step
+        # backends' sched-plan cap reads it at metadata time, which runs
+        # before EAGLEWorker.draft_forward sets the forward-batch reuse
+        # flag, so the share state must reach them through this side
+        # channel.
+        self.index_share_for_mtp_iteration = False
         self.attn_backends: List[KunpengCpuBackend] = [
             KunpengCpuBackend(model_runner)
             for _ in range(speculative_num_steps - 1)
@@ -56,6 +63,13 @@ class KunpengCpuMultiStepDraftBackend:
         # KunpengCpuBackend); the debug probes also use it as a log tag.
         for step, backend in enumerate(self.attn_backends):
             backend._mtp_step_id = step
+
+    def set_index_topk_share(self, enabled: bool):
+        """Propagate the index_share_for_mtp_iteration state to the
+        per-step backends (their sched-plan cap reads it)."""
+        self.index_share_for_mtp_iteration = enabled
+        for backend in self.attn_backends:
+            backend._mtp_topk_share = enabled
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize every per-step backend's decode metadata.
