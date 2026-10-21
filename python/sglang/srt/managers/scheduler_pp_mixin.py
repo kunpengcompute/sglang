@@ -59,6 +59,18 @@ _is_cpu_920f = is_cpu_920f()
 # wrote. These must shard/gather on the owner group (socket) instead.
 _PP_ROW_OWNER_KEYS = frozenset({"topk_indices"})
 
+# PP control ring depth (must match PP_MSG_SLOTS in pp_comm.cpp /
+# kunpeng_communicator.py). Acks are no longer drained to zero every iteration
+# (that serialized a whole iteration on the downstream's consume point):
+# _PP_MAX_INFLIGHT_MSG is the watermark the commit drains to. Keeping the
+# watermark at ring-1 makes every commit a non-blocking drain (the RDMA send
+# has no isend work handle to wait on, unlike the gloo path), while the hard
+# cap is enforced at the send site (_pp_ensure_send_slot), keeping one slot
+# spare for the message being posted. Proxy data frames are <= 1 per iteration,
+# so at most 2 of them stay in flight, well under PP_PROXY_SLOTS = 4.
+_PP_MSG_SLOTS = 8
+_PP_MAX_INFLIGHT_MSG = _PP_MSG_SLOTS - 1
+
 # When "1", delay the prefill loop's send ack commits until after
 # _pp_launch_batch so the downstream ack wait overlaps with graph_run compute
 # instead of stalling the CPU before the forward pass. Default "0" keeps the
@@ -1237,14 +1249,17 @@ class SchedulerPPMixin:
             # Tensor sends (send_tensor_dict / send_tensor_message) always use
             # Kunpeng RDMA regardless of the SGLANG_KUNPENG_RDMA_PP_COMM toggle,
             # so their acks must always be reclaimed here to free ring slots.
-            self._pp_wait_acks()
+            # Reclaim down to the slot budget only: waiting for inflight == 0
+            # serialized a whole iteration on the downstream's ack.
+            self._pp_wait_acks(max_inflight=_PP_MAX_INFLIGHT_MSG)
         for p2p_work in work:
             if p2p_work.work is not None:
                 p2p_work.work.wait()
         work.clear()
 
-    def _pp_wait_acks(self: Scheduler) -> None:
-        """Wait until every posted message has been acked by its peer.
+    def _pp_wait_acks(self: Scheduler, max_inflight: int = 0) -> None:
+        """Reclaim downstream ack frames until at most ``max_inflight``
+        messages are still unacked (0 = drain everything).
 
         A blocking wait on the downstream peer forms a circular ACK wait across
         the PP ring: every rank blocks on its downstream's ACK while never
@@ -1289,7 +1304,12 @@ class SchedulerPPMixin:
                 continue
 
             # 2) No upstream frame: check the downstream ack (non-blocking).
-            dsts = [d for d in range(comm.comm_size) if comm.inflight(d) > 0]
+            #    Only peers above the slot budget block us; a receiver that is
+            #    one iteration behind keeps its frames in flight instead of
+            #    stalling the sender's CPU.
+            dsts = [
+                d for d in range(comm.comm_size) if comm.inflight(d) > max_inflight
+            ]
             if not dsts:
                 return
             if comm.try_peek_msg(dsts[0]) < 0:
@@ -1328,6 +1348,19 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
+    def _pp_ensure_send_slot(self: Scheduler) -> None:
+        """Block only when the downstream control ring is about to overflow.
+
+        Keep one spare slot for the message being posted; reclaim acks down to
+        that budget instead of draining the ring to zero.
+        """
+        comm = self.pp_group.kunpeng_pp_communicator
+        if comm is None:
+            return
+        dst = (self.pp_rank + 1) % self.pp_size
+        while comm.inflight(dst) >= _PP_MSG_SLOTS - 1:
+            self._pp_wait_acks(max_inflight=_PP_MSG_SLOTS - 2)
+
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
@@ -1335,6 +1368,7 @@ class SchedulerPPMixin:
             if self.pp_group.kunpeng_pp_communicator is not None and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1":
                 # Unified RDMA message (async single-sided write); the peer
                 # acks on receive and the commit waits for the ack.
+                self._pp_ensure_send_slot()
                 self.pp_group.kunpeng_pp_communicator.send_pyobj(
                     data, (self.pp_rank + 1) % self.pp_size
                 )
@@ -1429,6 +1463,11 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        if (
+            self.pp_group.use_kunpeng_pp_communicator
+            and self.pp_group.kunpeng_pp_communicator is not None
+        ):
+            self._pp_ensure_send_slot()
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -2276,6 +2315,7 @@ class SchedulerPPMixin:
                 self.pp_group.kunpeng_pp_communicator is not None
                 and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
             ):
+                self._pp_ensure_send_slot()
                 self.pp_group.kunpeng_pp_communicator.send_pyobjs_bundle(
                     data_list, (self.pp_rank + 1) % self.pp_size, sub_kind
                 )
