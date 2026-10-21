@@ -1055,6 +1055,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accepted_tokens = self._pad_tensor_to_size(
                     spec_info.num_accepted_tokens, bs
                 )
+            # index_share_for_mtp_iteration carry (index_topk_share.py):
+            # the draft-extend seed keeps the DRAFT_EXTEND batch size
+            # (token-level lcm alignment of bs * num_tokens_per_req),
+            # which can be SMALLER than the decode-aligned batch (e.g.
+            # bs=8, nv=4: draft-extend stays 8, decode pads to
+            # ceil_align(8, attn_tp)=16) -- the chain steps' all2all
+            # slices then read past the seed rows (dsa_topk_slots
+            # row_start + bs > carry rows). Pad with -1 (invalid
+            # positions): the padded rows hit the LC dummy path in
+            # dsa_topk_slots and their outputs are dropped by the
+            # gather-side unpad, exactly like a re-scored pad row.
+            # Grow-only: a larger carry stays untouched -- the consumer
+            # reads [row_start, row_start + bs) which stays in range,
+            # and _pad_tensor_to_size cannot shrink.
+            _dsa_carry = getattr(spec_info, "dsa_topk_indices", None)
+            if _dsa_carry is not None and _dsa_carry.shape[0] < bs:
+                spec_info.dsa_topk_indices = self._pad_tensor_to_size(
+                    _dsa_carry, bs, value=-1
+                )
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
             )
