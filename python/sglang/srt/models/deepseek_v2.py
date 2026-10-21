@@ -394,12 +394,12 @@ class MoEGate(nn.Module):
                 packed_hs = kunpeng.bf16_gemm_pack_kunpeng(
                     hidden_states, tile_m, tile_k
                 )
-                logits = kunpeng.bf16_packed_gemm_kunpeng(
+                logits = kunpeng.bf16_packed_gemm_f32_kunpeng(
                     packed_hs,
                     self.weight,
                     kunpeng.alloc_buffer(
                         ws_numel,
-                        dtype=torch.bfloat16,
+                        dtype=torch.float32,
                         alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get(),
                     ),
                     32,
