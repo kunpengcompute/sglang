@@ -100,6 +100,9 @@ void bf16_gemm_pack_kunpeng(at::Tensor input, at::Tensor out, int64_t split_r, i
 void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
                               int64_t num_threads);
 
+void bf16_packed_gemm_f32_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
+                                  int64_t num_threads);
+
 at::Tensor bf16_bmm_prepack_kunpeng(const at::Tensor &weight, int64_t batch_size);
 
 void bmm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor out);
@@ -645,6 +648,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "bf16_packed_gemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output, Tensor workspace, int num_threads) "
         "-> ()");
     m.impl("bf16_packed_gemm_kunpeng", bf16_packed_gemm_kunpeng);
+
+    // bgemm, fp32 output (fp32 K-split partials + fp32 store)
+    m.def(
+        "bf16_packed_gemm_f32_kunpeng(Tensor input, Tensor weight, Tensor(a!) output, Tensor workspace, int "
+        "num_threads) -> ()");
+    m.impl("bf16_packed_gemm_f32_kunpeng", bf16_packed_gemm_f32_kunpeng);
 
     // bmm prepack
     m.def("bf16_bmm_prepack_kunpeng(Tensor weight, int batch_size) -> Tensor");

@@ -357,19 +357,22 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
                           const c10::optional<at::Tensor> experts_offset, bool renormalize, bool scoring_func_sigmoid,
                           bool moe_balance, int64_t v2)
 {
-    TORCH_CHECK(router_logits.scalar_type() == at::kBFloat16, "router_logits must be BF16");
+    TORCH_CHECK(router_logits.scalar_type() == at::kBFloat16 || router_logits.scalar_type() == at::kFloat,
+                "router_logits must be BF16 or Float");
     TORCH_CHECK(token_weights.scalar_type() == at::kFloat, "token_weights must be Float");
     TORCH_CHECK(token_ids.scalar_type() == at::kShort, "token_ids must be Int16");
     TORCH_CHECK(router_logits.dim() == 2, "router_logits must be 2D");
     TORCH_CHECK(token_weights.dim() == 2, "token_weights must be 2D");
     TORCH_CHECK(token_ids.dim() == 2, "token_ids must be 2D");
 
+    bool logits_is_f32 = router_logits.scalar_type() == at::kFloat;
+    const float *logits_f32_data = logits_is_f32 ? router_logits.data_ptr<float>() : nullptr;
+    const __bf16 *logits_bf16_data = logits_is_f32 ? nullptr : (const __bf16 *)router_logits.data_ptr();
+    int64_t router_logits_stride = router_logits.stride(0);
     bool sort_by_experts = experts_offset.has_value() && experts_offset->defined();
     int64_t num_token = router_logits.size(0);
     int64_t num_expert = router_logits.size(1);
     int64_t group_size = num_expert / num_expert_group;
-    auto router_logits_data = (__bf16 *)router_logits.data_ptr();
-    int64_t router_logits_stride = router_logits.stride(0);
     auto bias_data = (bias.has_value() && bias->defined()) ? bias->data_ptr<float>() : nullptr;
     int64_t token_weights_stride = token_weights.stride(0);
     int64_t token_ids_stride = token_ids.stride(0);
@@ -404,9 +407,14 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
                 // copy to origin_score, apply scoring_func
                 for (int64_t i = 0; i < num_expert; i += vl) {
                     svbool_t pg32 = svwhilelt_b32(i, num_expert);
-                    svbool_t pg16_half = svuzp1_b16(pg32, svpfalse());
-                    auto bf16 = svld1(pg16_half, router_logits_data + bi * router_logits_stride + i);
-                    auto f32 = svreinterpret_f32(svzip1(svdup_bf16(0), bf16));
+                    svfloat32_t f32;
+                    if (logits_is_f32) {
+                        f32 = svld1(pg32, logits_f32_data + bi * router_logits_stride + i);
+                    } else {
+                        svbool_t pg16_half = svuzp1_b16(pg32, svpfalse());
+                        auto bf16 = svld1(pg16_half, logits_bf16_data + bi * router_logits_stride + i);
+                        f32 = svreinterpret_f32(svzip1(svdup_bf16(0), bf16));
+                    }
                     if (scoring_func_sigmoid) {
                         f32 = kmath::sigmoid(pg32, f32);
                     }
