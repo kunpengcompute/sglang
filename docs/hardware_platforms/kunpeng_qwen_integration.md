@@ -137,7 +137,7 @@ Qwen provider负责KV/GDN状态、输入别名、权重和workspace绑定；层�
 
 ### 7.4 SGLang/KuTACC公开接口不同步
 
-两仓库分别最新不保证配套。实际编译发现SGLang引用的部分DSA/MLA/RDMA/MoE/批量BF16接口在公共KuTACC起点不存在。
+两仓库分别最新不保证配套。实际编译发现SGLang引用的部分DSA/MLA/RDMA/MoE/批量BF16及FP32输出packed GEMM接口在公共KuTACC起点不存在。
 
 新增CMake开关默认OFF。只有显式开启后，逐接口做编译探测：存在则编译原实现，缺失则生成调用时明确报错的适配器。独立Qwen构建工具显式开启；当前验收路径不使用这些缺失接口。没有返回零张量或静默吞掉计算。
 

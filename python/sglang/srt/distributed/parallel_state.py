@@ -1447,6 +1447,7 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        per_key_group: Optional[Dict[str, "GroupCoordinator"]] = None,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
@@ -1498,18 +1499,33 @@ class GroupCoordinator:
                 all_gather_group=all_gather_group,
                 all_gather_size=all_gather_size,
                 all_gather_rank=all_gather_rank,
+                per_key_group=per_key_group,
             )
             return []
         else:
             p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
-            for tensor in tensor_list:
+            tensor_keys = [
+                key for key, value in metadata_list if isinstance(value, TensorMetadata)
+            ]
+            for send_idx, tensor in enumerate(tensor_list):
                 if tensor.numel() == 0:
                     continue
+                key_group = (
+                    per_key_group.get(tensor_keys[send_idx])
+                    if per_key_group and send_idx < len(tensor_keys)
+                    else None
+                )
+                if key_group is not None:
+                    shard_size = key_group.world_size
+                    shard_rank = key_group.rank_in_group
+                else:
+                    shard_size = all_gather_size
+                    shard_rank = all_gather_rank
                 if (
                     all_gather_group is not None
-                    and tensor.numel() % all_gather_size == 0
+                    and tensor.numel() % shard_size == 0
                 ):
-                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                    tensor = tensor.reshape(shard_size, -1)[shard_rank]
                 comm_group = metadata_group if tensor.is_cpu else group
                 work = send_func(tensor, self.ranks[dst], group=comm_group)
                 if async_send:

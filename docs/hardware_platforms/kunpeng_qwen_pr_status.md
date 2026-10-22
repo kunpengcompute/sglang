@@ -4,10 +4,10 @@
 
 | 项目 | 起点 |
 |---|---|
-| SGLang 上游 | `v0.5.11`, `f82f42a07aa2c5fc0152bf90d35755f2153ca3af` |
+| SGLang 上游 | `v0.5.11`, 初始`f82f42a07aa2c5fc0152bf90d35755f2153ca3af`；同步到`16cc02ca2c1f5593eb1267487161eeee828d404e` |
 | KuTACC 上游 | `main`, `7b042b250a79851d19f4fefc80aa53d889c3ab71` |
 | 历史性能/实现参考 | 冻结 job1935371；MTP OFF |
-| 当前工作 | 本地 PR 候选整理；没有 push 或创建远端 PR |
+| 当前工作 | PR草稿准备；以远端分支和PR状态为准，本文历史测试不替代当前候选验收 |
 
 遵循最新要求：冲突处优先使用上游新实现，先测试，再依据实际失败增加最小兼容处理。以历史上游 `152f6d6` 作为暂定三方合并祖先，不把它当作已证明的原始 fork commit。
 
@@ -96,7 +96,7 @@ SGLang 正常调度 / model.forward
 3. 已使用匹配920F Torch/KuPL环境实跑；部署仍须保持相同ABI和厂商补丁，详见工具版本清单。
 4. 视觉/MTP保留结构与参数，但执行不在此次验收范围。多请求prefill仍存在继承的eager回落；不能声称完整图覆盖。
 5. 本轮仅C1/C8短测，未重新验收长上下文/C16/C32。所有激活的实际物理放置尚无完整账本；embedding保留DDR。
-6. 两仓库仅本地待审，未提交、推送或创建远端PR。构建和额外部署材料说明见`kunpeng_qwen_integration.md`第9节。
+6. 两仓库分别提交草稿PR供评审；SGLang依赖配套KuTACC分支。构建和额外部署材料说明见`kunpeng_qwen_integration.md`第9节。
 
 ## 2026-10-22 PR范围整理（区别于上述已实跑版本）
 
@@ -106,3 +106,9 @@ SGLang 正常调度 / model.forward
 - 无provider时不执行Qwen专用decode/prefill覆盖统计。C++ Graph执行/plan_memory算法没有重写；新增plan描述属于只读诊断。
 - 已通过主机C++实际分流函数检查（SME计算callee替身）、Python实际捕获/runner入口的接口替身检查、语法及diff检查。它们验证开关和默认路径，不等于DeepSeek模型回归或920F重新实编。
 - 上表性能对应整理前已实跑快照。线上冻结部署不随本地文件移动或门控修改而更新；本次整理后的源码尚需独立构建与有限模型回归后才能称为新的已验收版本。
+
+## 2026-10-22 同步上游16cc02ca2
+
+- `graph/adapters.py`两处相邻新增注册产生文本冲突；同时保留上游`bf16_packed_gemm_f32_kunpeng`及Qwen的small-output/workspace注册，不改写上游FP32 router或MoE实现。
+- 上游新增FP32 split-K入口调用的`kutacc::bf16_packed_gemm_f32`尚不在本次公开KuTACC起点中。沿用已有显式兼容开关添加能力探测：有API时保留原函数体；缺API且开启兼容构建时，该可选入口调用即报错。默认严格构建不变，不提供伪FP32替代计算。
+- 其余自动合并保留上游PP per-key传输、MTP/Indexer与FP32 MoE gate更新；同步后的完整原生构建和DeepSeek/Qwen实机回归仍待补齐。

@@ -337,6 +337,26 @@ def _setup_bf16_small_output_gemm_workspace_kunpeng():
     register_op("bf16_small_output_gemm_workspace_kunpeng", shape_infer, eager_fn)
 
 
+def _setup_bf16_packed_gemm_f32_kunpeng():
+    # fp32-output split-K GEMM: bf16 inputs, fp32 partials + fp32 store.
+    # Used by the MoE gate so router logits skip the two bf16 rounding
+    # points of the K-split path (per-block partial and final output).
+    def shape_infer(input, weight, workspace, num_threads):
+        M = input.shape[0]
+        N = weight.shape[0]
+        return [((M, N), torch.float32, MEMORY_ALIGNMENT)]
+
+    def eager_fn(input, weight, workspace, num_threads):
+        M = input.shape[0]
+        N = weight.shape[0]
+        output = torch.empty((M, N), dtype=torch.float32)
+        torch.ops.sgl_kernel.bf16_packed_gemm_f32_kunpeng(
+            input, weight, output, workspace, num_threads)
+        return output
+
+    register_op('bf16_packed_gemm_f32_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_grouped_topk_kunpeng():
     def shape_infer(router_logits, bias, topk, num_expert_group, topk_group,
                     renormalize, scoring_func_sigmoid, moe_balance, v2):
@@ -1710,6 +1730,7 @@ def setup():
     _setup_bf16_packed_gemm_kunpeng()
     _setup_bf16_small_output_gemm_kunpeng()
     _setup_bf16_small_output_gemm_workspace_kunpeng()
+    _setup_bf16_packed_gemm_f32_kunpeng()
     _setup_grouped_topk_kunpeng()
     _setup_grouped_topk_inplace_kunpeng()
     _setup_load_balance_padded_tokens_kunpeng()

@@ -536,7 +536,7 @@ class KunpengPPCommunicator:
 
     def send_tensor_message(self, metadata_list, tensor_list, dst_rank: int,
                             all_gather_group=None, all_gather_size=1,
-                            all_gather_rank=0):
+                            all_gather_rank=0, per_key_group=None):
         """Asynchronously send a tensor dict: metadata via message slot (TENSOR),
         payloads staged in the batch region (single fused pp_put)."""
         self.pp_comm_init()
@@ -566,18 +566,34 @@ class KunpengPPCommunicator:
             if is_output
             else self.proxy_send_offset(dst_rank)
         )
-        for tensor in tensor_list:
+        from sglang.srt.distributed.parallel_state import TensorMetadata
+
+        tensor_keys = [
+            key for key, value in metadata_list if isinstance(value, TensorMetadata)
+        ]
+        for send_idx, tensor in enumerate(tensor_list):
             if tensor.numel() == 0:
                 continue
+            key_group = (
+                per_key_group.get(tensor_keys[send_idx])
+                if per_key_group and send_idx < len(tensor_keys)
+                else None
+            )
+            size = all_gather_size
+            rank = all_gather_rank
+            if key_group is not None:
+                size = key_group.world_size
+                rank = key_group.rank_in_group
             if (
                 all_gather_group is not None
-                and tensor.numel() % all_gather_size == 0
+                and size > 1
+                and tensor.numel() % size == 0
                 and (
                     tensor.dim() != 1
-                    or (tensor.numel() // all_gather_size) % SHM_ALIGN_SIZE == 0
+                    or (tensor.numel() // size) % SHM_ALIGN_SIZE == 0
                 )
             ):
-                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                tensor = tensor.reshape(size, -1)[rank]
             if not tensor.is_cpu:
                 raise RuntimeError("Kunpeng PP RDMA channel requires CPU tensors")
             if not tensor.is_contiguous():

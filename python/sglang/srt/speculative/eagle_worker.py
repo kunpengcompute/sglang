@@ -393,6 +393,16 @@ class EAGLEWorker(TpModelWorker):
         # Initialize decode attention backend
         self.draft_attn_backend = draft_backend_factory.create_decode_backend()
 
+        # index_share_for_mtp_iteration: the multi-step draft backend's
+        # sched-plan cap needs the share state at metadata time
+        # (draft_forward sets forward_batch.reuse_dsa_topk_indices only
+        # later, inside the step loop). Duck-typed to avoid a hard
+        # kunpeng import here.
+        if self.index_share_for_mtp_iteration and hasattr(
+            self.draft_attn_backend, "set_index_topk_share"
+        ):
+            self.draft_attn_backend.set_index_topk_share(True)
+
         # Initialize draft extend attention backend (respects speculative_attention_mode setting)
         self.draft_extend_attn_backend = (
             draft_backend_factory.create_draft_extend_backend()
@@ -1017,17 +1027,16 @@ class EAGLEWorker(TpModelWorker):
         parents_list: List[torch.Tensor] = []
 
         # DSA indexer top-k shared across MTP draft iterations: enable the
-        # carry for the whole step loop (step 0 recomputes via the NextN
-        # fallback, later steps read the published step-0 top-k through
-        # IndexTopKShareState in the NextN model); cleared after the loop so
-        # it never leaks past this draft round. Equivalent to
-        # IndexTopKShareState.mtp_iteration(forward_batch, enabled=...)
-        # without re-indenting the step loop.
+        # carry for the whole step loop. With index_share_for_mtp_iteration
+        # the draft-extend forward already extracted its root-row top-k
+        # into spec_info.dsa_topk_indices -- KEEP it so step 0 reuses the
+        # seed instead of re-scoring (upstream keep_carry_seed semantics);
+        # without a seed (idle round / scoring fallback) it stays None and
+        # step 0 recomputes via the NextN fallback. The carry is cleared
+        # after the loop so it never leaks past this draft round.
         _dsa_share_enabled = self.index_share_for_mtp_iteration
         if _dsa_share_enabled:
             forward_batch.reuse_dsa_topk_indices = True
-            if forward_batch.spec_info is not None:
-                forward_batch.spec_info.dsa_topk_indices = None
         # Forward multiple steps
         scores = None
         topk1 = _is_cpu_920f and self.topk == 1
@@ -1429,6 +1438,20 @@ class EAGLEWorker(TpModelWorker):
         else:
             forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
 
+        # index_share_for_mtp_iteration: signal the NextN layer to
+        # return / publish its [bs, nv, topk] block so this forward's
+        # root row becomes the next draft round's seed (the placeholder
+        # tensor is a flag only -- the block travels via spec_info /
+        # the graph-output mechanism, never through this buffer).
+        _seed_capture = (
+            self.index_share_for_mtp_iteration
+            and not forward_batch.forward_mode.is_idle()
+        )
+        if _seed_capture:
+            forward_batch.spec_info.dsa_seed_topk_capture = torch.empty(
+                0, dtype=torch.int32
+            )
+
         # Run
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
@@ -1461,6 +1484,23 @@ class EAGLEWorker(TpModelWorker):
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             self.capture_for_decode(logits_output, forward_batch.spec_info)
+
+        if _seed_capture:
+            # Extract the seed: the LAST live row of each (bs, nv) block
+            # is the root token (right-aligned pre-pad layout; its
+            # scoring window [0, seq_lens) is exactly the committed
+            # prefix). Zero-length sequences (DP padding mirror) keep
+            # the all -1 padding row -- consumers treat it as dummy.
+            # A missing / malformed block (scoring fallback) stays None
+            # and the chain's step 0 recomputes via the NextN fallback.
+            _topk_block = forward_batch.spec_info.dsa_topk_indices
+            if _topk_block is not None and _topk_block.dim() == 3:
+                forward_batch.spec_info.dsa_topk_indices = (
+                    _topk_block[:, -1, :].contiguous()
+                )
+            else:
+                forward_batch.spec_info.dsa_topk_indices = None
+            forward_batch.spec_info.dsa_seed_topk_capture = None
 
         maybe_detect_nan(
             logits_output.next_token_logits,

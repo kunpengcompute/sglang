@@ -17,6 +17,10 @@
 #include <arm_bf16.h>
 #include <kutacc.h>
 
+#ifndef SGLANG_KUTACC_HAS_BF16_PACKED_GEMM_F32
+#define SGLANG_KUTACC_HAS_BF16_PACKED_GEMM_F32 1
+#endif
+
 #ifndef SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM
 #define SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM 1
 #endif
@@ -219,6 +223,49 @@ void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor ou
     kutacc::bf16_packed_gemm(m, n, k, t, reinterpret_cast<bfloat16_t *>(input.data_ptr()),
                              reinterpret_cast<bfloat16_t *>(weight.data_ptr()),
                              reinterpret_cast<bfloat16_t *>(output.data_ptr()), tmpc);
+}
+
+void bf16_packed_gemm_f32_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
+                                  int64_t num_threads)
+{
+#if SGLANG_KUTACC_HAS_BF16_PACKED_GEMM_F32
+    TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
+    TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be bfloat16");
+    TORCH_CHECK(output.scalar_type() == at::kFloat, "output must be float32");
+    TORCH_CHECK(workspace.scalar_type() == at::kFloat, "workspace must be float32");
+
+    TORCH_CHECK(input.dim() == 2, "input must be 2D [m, k]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [n, k]");
+    TORCH_CHECK(output.dim() == 2, "output must be 2D [m, n]");
+
+    int64_t m = input.size(0);
+    int64_t n = weight.size(0);
+    int64_t k = input.size(1);
+
+    TORCH_CHECK(weight.size(1) == k, "A.k != W.k");
+    TORCH_CHECK(output.size(0) == m && output.size(1) == n, "output shape mismatch");
+
+    kutacc::MatrixTilingBlock t = bgemm_find_optimal_tiling_plan(m, n, k);
+    auto [tile_m, tile_n, tile_k] = t;
+
+    TORCH_CHECK(tile_k % 2 == 0, "bf16_packed_gemm_f32 kernel only support tile_k % 2 == 0");
+
+    int64_t blocks_in_k = k / tile_k;
+    if (blocks_in_k > 1) {
+        // The +1024 margin covers the L2 prefetch over-read in reduce_filter
+        // (prefetch_dis <= 288 elements), which does not fault but must stay in-bounds.
+        TORCH_CHECK(workspace.numel() >= blocks_in_k * n * m + 1024, "workspace is out of memory! shape=[", m, ", ", n,
+                    ", ", k, "], tile=[", tile_m, ", ", tile_n, ", ", tile_k,
+                    "], workspace.numel()=", workspace.numel());
+    }
+
+    float *tmpc = reinterpret_cast<float *>(workspace.data_ptr());
+    kutacc::bf16_packed_gemm_f32(m, n, k, t, reinterpret_cast<bfloat16_t *>(input.data_ptr()),
+                                 reinterpret_cast<bfloat16_t *>(weight.data_ptr()),
+                                 reinterpret_cast<float *>(output.data_ptr()), tmpc);
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide bf16_packed_gemm_f32; install a matching KuTACC release to use the FP32 router GEMM");
+#endif
 }
 
 void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size)

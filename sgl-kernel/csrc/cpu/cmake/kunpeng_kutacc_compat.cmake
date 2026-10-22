@@ -55,6 +55,12 @@ if(SGLANG_KUNPENG_ALLOW_MISSING_OPTIONAL_KUTACC_APIS)
         "kutacc::batch_bf16_bf16_packed_gemm_bf16(1,1,32,32,32,32,
             static_cast<bfloat16_t*>(nullptr),static_cast<bfloat16_t*>(nullptr),
             static_cast<bfloat16_t*>(nullptr));")
+    kunpeng_optional_kutacc_api(SGLANG_KUTACC_HAS_BF16_PACKED_GEMM_F32
+        cpu_kunpeng/matmul/bgemm.cpp
+        "kutacc::MatrixTilingBlock t{1,1,2};
+         kutacc::bf16_packed_gemm_f32(1,1,2,t,
+            static_cast<bfloat16_t*>(nullptr),static_cast<bfloat16_t*>(nullptr),
+            static_cast<float*>(nullptr),static_cast<float*>(nullptr));")
     kunpeng_optional_kutacc_api(SGLANG_KUTACC_HAS_CTRL_DOMAIN
         cpu_kunpeng/moe/kunpeng_moe.cpp
         "kutacc::kurmcl_conn_info_h c=nullptr;
