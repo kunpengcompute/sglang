@@ -103,6 +103,7 @@ def alloc_extend_kernel_kunpeng(
                 free_pages[end_new_pages[i] - 1] * page_size + pos_in_page[:num3]
             ).view(-1)
 
+
 class KunpengPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     """
     An allocator managing the indices to kv cache data for KunpengCPU.
@@ -135,10 +136,10 @@ class KunpengPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             .sum()
             .item()
         )
-        if self.need_sort and num_new_pages + 1 > len(self.free_pages):
+        if self.need_sort and num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
 
-        if num_new_pages + 1 > len(self.free_pages):
+        if num_new_pages > len(self.free_pages):
             return None
 
         out_indices = torch.empty(
@@ -194,20 +195,20 @@ class KunpengPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         need_new_pages = (seq_lens % self.page_size == 1).int()
         num_new_pages = need_new_pages.sum().item()
 
-        if num_new_pages + 1 > len(self.free_pages):
+        if num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
 
-        if num_new_pages + 1 > len(self.free_pages):
+        if num_new_pages > len(self.free_pages):
             return None
 
-        end_new_pages = torch.cumsum(need_new_pages, 0)
-        start_new_pages = end_new_pages - need_new_pages
-        if num_new_pages == 0:
-            out_indices = last_loc + 1
-        else:
-            out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
-                start_new_pages
-            ] * self.page_size * need_new_pages
+        out_indices = last_loc + 1
+        if num_new_pages:
+            # Only rows crossing a page boundary read free_pages. Other rows
+            # may follow the last new-page row, so their prefix-sum index would
+            # be one past the end when the final free page is consumed.
+            out_indices[need_new_pages.bool()] = (
+                self.free_pages[:num_new_pages] * self.page_size
+            ).to(out_indices.dtype)
 
         if self.debug_mode:
             if len(torch.unique(out_indices)) != len(out_indices):

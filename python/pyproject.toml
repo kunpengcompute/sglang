@@ -118,6 +118,7 @@ dev = ["sglang[test]"]
 sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
+"sglang.srt.hardware_backend.cpu_kunpeng.qwen" = ["weight_mapping.json"]
 "sglang" = [
   "srt/**/*",
   "jit_kernel/**/*"

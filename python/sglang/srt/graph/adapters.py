@@ -294,6 +294,49 @@ def _setup_bf16_packed_gemm_kunpeng():
     register_op('bf16_packed_gemm_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_bf16_small_output_gemm_kunpeng():
+    def shape_infer(input, weight):
+        assert input.dtype == weight.dtype == torch.bfloat16
+        assert input.device.type == weight.device.type == "cpu"
+        assert input.ndim == weight.ndim == 2
+        assert input.is_contiguous() and weight.is_contiguous()
+        assert 1 <= input.shape[0] <= 32 and input.shape[1] == 5120
+        assert tuple(weight.shape) == (6, 5120)
+        return [((input.shape[0], weight.shape[0]), input.dtype)]
+
+    def eager_fn(input, weight):
+        output = torch.empty((input.shape[0], weight.shape[0]), dtype=input.dtype)
+        torch.ops.sgl_kernel.bf16_small_output_gemm_kunpeng(input, weight, output)
+        return output
+
+    register_op("bf16_small_output_gemm_kunpeng", shape_infer, eager_fn)
+
+
+def _setup_bf16_small_output_gemm_workspace_kunpeng():
+    def shape_infer(input, weight, workspace):
+        assert input.dtype == weight.dtype == workspace.dtype == torch.bfloat16
+        assert input.device.type == weight.device.type == workspace.device.type == "cpu"
+        assert input.ndim == weight.ndim == 2 and workspace.ndim == 1
+        assert (
+            input.is_contiguous()
+            and weight.is_contiguous()
+            and workspace.is_contiguous()
+        )
+        assert 1 <= input.shape[0] <= 4096 and input.shape[1] == 5120
+        assert tuple(weight.shape) == (6, 5120)
+        assert workspace.numel() >= input.shape[0] * 32
+        return [((input.shape[0], 6), input.dtype)]
+
+    def eager_fn(input, weight, workspace):
+        output = torch.empty((input.shape[0], 6), dtype=input.dtype)
+        torch.ops.sgl_kernel.bf16_small_output_gemm_kunpeng.workspace(
+            input, weight, workspace, output
+        )
+        return output
+
+    register_op("bf16_small_output_gemm_workspace_kunpeng", shape_infer, eager_fn)
+
+
 def _setup_grouped_topk_kunpeng():
     def shape_infer(router_logits, bias, topk, num_expert_group, topk_group,
                     renormalize, scoring_func_sigmoid, moe_balance, v2):
@@ -1665,6 +1708,8 @@ def setup():
     _setup_s8_s8_gemm_bf16_dq_kunpeng()
     _setup_bf16_gemm_pack_kunpeng()
     _setup_bf16_packed_gemm_kunpeng()
+    _setup_bf16_small_output_gemm_kunpeng()
+    _setup_bf16_small_output_gemm_workspace_kunpeng()
     _setup_grouped_topk_kunpeng()
     _setup_grouped_topk_inplace_kunpeng()
     _setup_load_balance_padded_tokens_kunpeng()
@@ -1737,5 +1782,6 @@ def setup():
     _setup_moe_etp_dispatch_share_kunpeng()
     _setup_moe_etp_reduce_kunpeng()
     _setup_etp_remap_topk_ids_kunpeng()
+
 
 setup()

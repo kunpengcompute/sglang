@@ -297,6 +297,15 @@ class TokenizerManager(
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
+        from sglang.srt.model_executor.model_capabilities import (
+            initial_policy_for_model_config,
+            validate_startup_capabilities,
+        )
+
+        self._runtime_capability_policy = initial_policy_for_model_config(
+            self.model_config
+        )
+        validate_startup_capabilities(self._runtime_capability_policy, server_args)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
@@ -560,6 +569,13 @@ class TokenizerManager(
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        from sglang.srt.model_executor.model_capabilities import (
+            validate_request_capabilities,
+        )
+
+        validate_request_capabilities(
+            getattr(self, "_runtime_capability_policy", None), obj
+        )
         self._set_default_priority(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
@@ -741,6 +757,13 @@ class TokenizerManager(
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        from sglang.srt.model_executor.model_capabilities import (
+            validate_request_capabilities,
+        )
+
+        validate_request_capabilities(
+            getattr(self, "_runtime_capability_policy", None), obj
+        )
         # Tokenize
         input_embeds = None
         input_text = obj.text

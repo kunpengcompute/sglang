@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from http import HTTPStatus
@@ -1393,8 +1394,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("thinking") is not False
             )
-        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
-            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+        if self.reasoning_parser == "qwen3":
+            # Keep an explicit request value authoritative.  When the request
+            # omits it, deployments can choose the Qwen default without
+            # changing other reasoning parsers or every client payload.
+            if (
+                request.chat_template_kwargs is not None
+                and "enable_thinking" in request.chat_template_kwargs
+            ):
+                return request.chat_template_kwargs.get("enable_thinking") is not False
+            return os.environ.get("SGLANG_QWEN_DEFAULT_THINKING", "1") != "0"
+        if self.reasoning_parser in ["glm45", "nemotron_3", "interns1"]:
+            # Models that think by default and can be disabled explicitly.
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking") is not False

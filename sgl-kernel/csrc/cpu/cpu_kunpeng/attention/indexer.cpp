@@ -15,6 +15,10 @@
  */
 
 #include <kutacc.h>
+
+#ifndef SGLANG_KUTACC_HAS_DSA_INDEXER
+#define SGLANG_KUTACC_HAS_DSA_INDEXER 1
+#endif
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -74,6 +78,7 @@ void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
                                    int64_t mode, int64_t row_start,
                                    int64_t row_rows)
 {
+#if SGLANG_KUTACC_HAS_DSA_INDEXER
     auto kt_q = to_kutacc<bfloat16_t, 3>(q);
     auto kt_kv = to_kutacc<bfloat16_t, 3>(cur_kv_cache);
     auto kt_weight = to_kutacc<bfloat16_t, 2>(weight);
@@ -95,6 +100,11 @@ void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
     kutacc::paged_mqa_logits_topk(kt_q, kt_kv, kt_weight, kt_block_tables,
                                   kt_seq, kt_cur, kt_output, schedule,
                                   kt_workspace, static_cast<int>(topk));
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_DSA_INDEXER; install a matching KuTACC release to use paged_mqa_logits_topk_kunpeng");
+
+#endif
 }
 
 // Workspace bytes for paged_mqa_logits_topk_kunpeng: one (fp32 score, int id)
@@ -103,6 +113,12 @@ void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
 // bfloat16 uncompressed path).
 int64_t get_paged_mqa_logits_topk_workspace_size(int64_t max_k_end)
 {
+#if SGLANG_KUTACC_HAS_DSA_INDEXER
     TORCH_CHECK(max_k_end > 0, "max_k_end must be positive, got ", max_k_end);
     return kutacc::get_thread_num() * max_k_end * 8;
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_DSA_INDEXER; install a matching KuTACC release to use get_paged_mqa_logits_topk_workspace_size");
+
+#endif
 }

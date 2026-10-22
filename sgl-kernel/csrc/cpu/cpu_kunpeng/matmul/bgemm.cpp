@@ -16,6 +16,10 @@
 
 #include <arm_bf16.h>
 #include <kutacc.h>
+
+#ifndef SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM
+#define SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM 1
+#endif
 #include <torch/extension.h>
 
 #include "common.h"
@@ -133,6 +137,7 @@ at::Tensor batched_bgemm_prepack_kunpeng(const at::Tensor &weight)
 
 void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output)
 {
+#if SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM
     //   input  [B, M, K] bf16 (外维可 strided, 如 transpose 视图; 末维连续)
     //   weight [B, N, K] bf16 (batched_bgemm_prepack_kunpeng 的 SME 打包输出)
     //   output [B, M, N] bf16 (直接写入; 外维可 strided)
@@ -171,6 +176,10 @@ void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor outpu
         reinterpret_cast<bfloat16_t *>(act_packed.data_ptr()),
         reinterpret_cast<bfloat16_t *>(weight.data_ptr()),
         reinterpret_cast<bfloat16_t *>(output.data_ptr()));
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM; install a matching KuTACC release to use batched_bgemm_kunpeng");
+#endif
 }
 
 void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,

@@ -10,7 +10,11 @@ from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     is_deepseek_nsa,
 )
-from sglang.srt.distributed.parallel_state import get_pp_group, get_tp_group, get_world_group
+from sglang.srt.distributed.parallel_state import (
+    get_pp_group,
+    get_tp_group,
+    get_world_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
@@ -467,9 +471,7 @@ class ModelRunnerKVCacheMixin:
                 )
 
                 kunpeng_kwargs = {
-                    k: v
-                    for k, v in nsa_pool_kwargs.items()
-                    if k != "kv_cache_dim"
+                    k: v for k, v in nsa_pool_kwargs.items() if k != "kv_cache_dim"
                 }
                 kunpeng_kwargs["skip_topk_layers"] = [
                     dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -590,6 +592,11 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            and not (
+                                self.device == "cpu"
+                                and getattr(self, "borrowed_qwen_target_runner", None)
+                                is not None
+                            )
                         ),
                     )
                 else:
@@ -610,6 +617,11 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            and not (
+                                self.device == "cpu"
+                                and getattr(self, "borrowed_qwen_target_runner", None)
+                                is not None
+                            )
                         ),
                     )
 
@@ -695,25 +707,29 @@ class ModelRunnerKVCacheMixin:
                         if is_cpu():
                             from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_allocator import (
                                 KunpengPagedTokenToKVPoolAllocator,
-                            )   
-                            self.token_to_kv_pool_allocator = KunpengPagedTokenToKVPoolAllocator(
-                                self.max_total_num_tokens,
-                                page_size=self.page_size,
-                                dtype=self.kv_cache_dtype,
-                                device=self.device,
-                                kvcache=self.token_to_kv_pool,
-                                need_sort=need_sort,
+                            )
+
+                            self.token_to_kv_pool_allocator = (
+                                KunpengPagedTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                )
                             )
                         else:
-                            self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                                self.max_total_num_tokens,
-                                page_size=self.page_size,
-                                dtype=self.kv_cache_dtype,
-                                device=self.device,
-                                kvcache=self.token_to_kv_pool,
-                                need_sort=need_sort,
-                            )   
-
+                            self.token_to_kv_pool_allocator = (
+                                PagedTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                )
+                            )
 
         else:
             assert self.is_draft_worker

@@ -361,12 +361,18 @@ class GroupCoordinator:
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
-        self.use_kunpeng_communicator = (
-            _is_cpu_920f
-            and self.world_size < torch.distributed.get_world_size()  # attn_tp_group
-            and self.world_size % 8 == 0  # attn_tp_size must be divisible by 8
-            and self.world_size
-            <= 16  # only for attn_tp_group (size=16), not TP group (size=64)
+        self.use_kunpeng_communicator = _is_cpu_920f and (
+            (
+                os.environ.get("SGLANG_KUNPENG_QWEN") == "1"
+                and self.world_size == 16
+                and group_name in ("tp", "attention_tp")
+            )
+            or (
+                os.environ.get("SGLANG_KUNPENG_QWEN") != "1"
+                and self.world_size < torch.distributed.get_world_size()
+                and self.world_size % 8 == 0
+                and self.world_size <= 16
+            )
         )
 
         # Lazy import to avoid documentation build error
@@ -528,7 +534,10 @@ class GroupCoordinator:
         if use_message_queue_broadcaster and self.world_size > 1 and not recovered_rank:
             # Recovered ranks create their mq_broadcaster in elastic_ep.py
             self.mq_broadcaster = MessageQueue.create_from_process_group(
-                self.cpu_group, 1 << 22, 6, zmq_core_binding_offset=zmq_core_binding_offset
+                self.cpu_group,
+                1 << 22,
+                6,
+                zmq_core_binding_offset=zmq_core_binding_offset,
             )
 
     def __repr__(self):
@@ -665,9 +674,16 @@ class GroupCoordinator:
             ):
                 if _enable_shm_fence:
                     kunpeng.shm_fence_kunpeng(self.world_size)
-                kunpeng.shm_allreduce_kunpeng(
-                    input_, profile_name=f"shm_allreduce_kunpeng@{self.unique_name}"
-                )
+                if os.environ.get("SGLANG_KUNPENG_QWEN") == "1":
+                    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+                        allreduce,
+                    )
+
+                    allreduce(input_)
+                else:
+                    kunpeng.shm_allreduce_kunpeng(
+                        input_, profile_name=f"shm_allreduce_kunpeng@{self.unique_name}"
+                    )
             else:
                 torch.distributed.all_reduce(
                     input_,
@@ -2247,7 +2263,11 @@ def initialize_model_parallel(
     assert (
         _SOCKET_TP is None
     ), "socket tensor model parallel group is already initialized"
-    if socket_tp_size <= 1 or socket_tp_size == tensor_model_parallel_size:
+    if (
+        tensor_model_parallel_size <= 1
+        or socket_tp_size <= 1
+        or socket_tp_size == tensor_model_parallel_size
+    ):
         _SOCKET_TP = _TP
     else:
         group_ranks = []

@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 import threading
 import time
 import weakref
 from collections import OrderedDict
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -106,19 +108,25 @@ class KunpengGraphRunner:
 
         # Graph capture state
         self.graph_fixed_weights: Optional[List[torch.Tensor]] = None
+        self._graph_provider = None
+        self._graph_provider_resolved = False
+        self._graph_bindings = None
         self._sglang_graph_cache: OrderedDict = OrderedDict()
+        self._graph_capture_count = 0
+        self._graph_replay_count = 0
+        self._decode_coverage = {}
+        self._prefill_coverage = {}
         self._sglang_graph_max_cache = int(
             os.environ.get("SGLANG_KUNPENG_GRAPH_CACHE_SIZE", "4")
         )
 
         # HBW pool and swap manager
         self.weight_hbw_pool = None
+        self._forward_hbw = None
         self.swap_mgr = None
 
     @classmethod
-    def create(
-        cls, model_runner: ModelRunner
-    ) -> Optional["KunpengGraphRunner"]:
+    def create(cls, model_runner: ModelRunner) -> Optional["KunpengGraphRunner"]:
         """Create and initialize the Kunpeng runner if on Kunpeng CPU 920F.
 
         Returns None on other platforms. HBW pool (when enabled) and swap
@@ -134,6 +142,22 @@ class KunpengGraphRunner:
             residency["graph"],
         )
         runner = cls(model_runner)
+        target = getattr(model_runner, "borrowed_qwen_target_runner", None)
+        if target is not None:
+            runner._borrowed_target_runner = target  # Strong owner/lifetime reference.
+            owner = target.kunpeng_runner
+            if (
+                owner is None
+                or owner.weight_hbw_pool is None
+                or owner._forward_hbw is None
+            ):
+                raise ValueError(
+                    "Attached MTP requires the initialized target pool and arena"
+                )
+            runner.weight_hbw_pool = owner.weight_hbw_pool
+            runner._forward_hbw = owner._forward_hbw
+            runner.swap_mgr = owner.swap_mgr
+            return runner
         if _is_kunpeng_hbw_pool:
             runner.init_hbw_pool()
         runner.init_swap_manager()
@@ -169,6 +193,12 @@ class KunpengGraphRunner:
 
     def init_swap_buffers(self):
         """Initialize HBM swap buffers for expert weights and KV cache."""
+        if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
+            if self.swap_mgr.enable_swap_expert or self.swap_mgr.enable_swap_kv_in:
+                raise ValueError(
+                    "Attached MTP requires independent DDR KV with swap disabled"
+                )
+            return
         model = self.model_runner.model.model  # DeepseekV2Model or DeepseekModelNextN
 
         if self.swap_mgr.enable_swap_expert and (
@@ -209,6 +239,51 @@ class KunpengGraphRunner:
                 dtype=self.model_runner.kv_cache_dtype,
             )
 
+    def _move_parameter_to_hbw(self, name, param, label=None):
+        """Move a parameter while preserving CPU920F scale backing views."""
+        if not name.endswith(".weight_scale"):
+            return self.weight_hbw_pool.move_to_hbw(param, label=label)
+        owner = self.model_runner.model.get_submodule(name.rsplit(".", 1)[0])
+        storage = getattr(owner, "_cpu920f_w8a8_scale_storage", None)
+        if storage is None:
+            return self.weight_hbw_pool.move_to_hbw(param, label=label)
+        n = param.shape[0]
+        if (
+            param.dtype != torch.float32
+            or tuple(param.shape) != (n, 1)
+            or storage.dtype != torch.float32
+            or tuple(storage.shape) != (n + 16, 1)
+            or not param.is_contiguous()
+            or not storage.is_contiguous()
+            or param.storage_offset() != storage.storage_offset()
+            or storage.storage_offset() != 0
+            or param.data_ptr() != storage.data_ptr()
+            or param.untyped_storage().data_ptr()
+            != storage.untyped_storage().data_ptr()
+            or storage.untyped_storage().nbytes() < (n + 16) * 4
+        ):
+            raise ValueError(
+                "CPU920F logical weight scale lost its N+16 backing before HBW move: "
+                + name
+            )
+        storage_hbw = self.weight_hbw_pool.move_to_hbw(storage, label=label)
+        logical_hbw = storage_hbw[:n]
+        if (
+            logical_hbw.data_ptr() != storage_hbw.data_ptr()
+            or logical_hbw.untyped_storage().data_ptr()
+            != storage_hbw.untyped_storage().data_ptr()
+            or logical_hbw.untyped_storage().nbytes() < (n + 16) * 4
+        ):
+            raise ValueError(
+                "HBW scale view does not retain its physical tail: " + name
+            )
+        owner._cpu920f_w8a8_scale_storage = storage_hbw
+        self._int8_scale_backing_hbw_count += 1
+        self._int8_scale_backing_hbw_bytes += (
+            storage_hbw.numel() * storage_hbw.element_size()
+        )
+        return logical_hbw
+
     def move_weights_to_hbw(self):
         """Move model parameters to HBW memory pool.
 
@@ -238,6 +313,8 @@ class KunpengGraphRunner:
         non_expert_bytes = 0
         expert_bytes = 0
 
+        self._int8_scale_backing_hbw_count = 0
+        self._int8_scale_backing_hbw_bytes = 0
         for name, param in self.model_runner.model.named_parameters():
             if "embed_tokens" in name:
                 continue
@@ -251,9 +328,33 @@ class KunpengGraphRunner:
                 if not _hbw_resident_non_expert:
                     continue
                 used_before = pool.used_bytes
-                tensor_hbw = pool.move_to_hbw(param, label="non_expert_weights")
+                try:
+                    tensor_hbw = self._move_parameter_to_hbw(
+                        name, param, label="non_expert_weights"
+                    )
+                except RuntimeError as exc:
+                    if os.environ.get(
+                        "SGLANG_KUNPENG_HBW_ALLOW_DDR_FALLBACK", "0"
+                    ) != "1" or "HBW pool exhausted" not in str(exc):
+                        raise
+                    logger.warning(
+                        "[KunpengHBMSpill] parameter=%s bytes=%d remains in DDR",
+                        name,
+                        param.numel() * param.element_size(),
+                    )
+                    continue
                 non_expert_bytes += pool.used_bytes - used_before
             param.data = tensor_hbw
+        if os.environ.get("SGLANG_KUNPENG_HBW_LOG_PLACEMENT", "0") == "1":
+            logger.info(
+                "[KunpengHBMPool] used_bytes=%d free_bytes=%d allocations=%d "
+                "int8_scale_backings=%d int8_scale_backing_bytes=%d",
+                self.weight_hbw_pool.used_bytes,
+                self.weight_hbw_pool.free_bytes,
+                self.weight_hbw_pool.num_allocated,
+                self._int8_scale_backing_hbw_count,
+                self._int8_scale_backing_hbw_bytes,
+            )
 
         mb = 1024 * 1024
         logger.info(
@@ -370,8 +471,71 @@ class KunpengGraphRunner:
         Called by ModelRunner right after the model weights are loaded; the
         feature flags are checked internally.
         """
+        if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
+            owner = self._borrowed_target_runner.kunpeng_runner
+            if (
+                self.weight_hbw_pool is not owner.weight_hbw_pool
+                or self._forward_hbw is not owner._forward_hbw
+            ):
+                raise RuntimeError("Borrowed target pool/arena identity changed")
+            if _is_kunpeng_graph_capture:
+                self.init_graph_capture()
+            return  # No second move/pack/reservation of target-owned weights.
         if _is_kunpeng_hbw_pool:
             self.move_weights_to_hbw()
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
+                enabled as qwen_enabled,
+            )
+
+            if qwen_enabled() and not self.model_runner.is_draft_worker:
+                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+                    prepare_model_lm_head,
+                )
+
+                self._packed_lm_head_enabled = prepare_model_lm_head(
+                    self.model_runner.model, self.weight_hbw_pool
+                )
+            initial_backing = self.weight_hbw_pool.backing_snapshot()
+            self._shm_native_init_used_bytes = initial_backing.get("shm_used_bytes")
+            arena_mib = int(os.environ.get("SGLANG_KUNPENG_FORWARD_HBW_ARENA_MB", "0"))
+            if qwen_enabled() and arena_mib:
+                from sglang.srt.hardware_backend.cpu_kunpeng.allocator.forward_hbw import (
+                    ForwardHBWArena,
+                )
+
+                # Ordinary ATen and native tensor outputs need their own reusable
+                # reservation before the common graph claims the remaining pool.
+                # Gemma effective weights are buffers rather than Parameters.
+                # Preserve the existing placement policy for embedding/vision/MTP.
+                seen = {}
+                for module in self.model_runner.model.modules():
+                    if not getattr(module, "_kunpeng_qwen", False):
+                        continue
+                    buffer = getattr(module, "gemma_weight", None)
+                    if buffer is not None:
+                        key = buffer.untyped_storage().data_ptr()
+                        if key not in seen:
+                            seen[key] = self.weight_hbw_pool.move_to_hbw(buffer)
+                        module.gemma_weight = seen[key]
+                self._static_hbw_bytes = self.weight_hbw_pool.used_bytes - getattr(
+                    self.weight_hbw_pool, "_payload_reserved_bytes", 0
+                )
+                self._forward_hbw = ForwardHBWArena(
+                    self.weight_hbw_pool,
+                    os.environ.get(
+                        "SGLANG_KUNPENG_FORWARD_HBW_LIBRARY",
+                        str(
+                            Path(__import__("sgl_kernel").__file__).parent
+                            / "libscoped_hbw_allocator.so"
+                        ),
+                    ),
+                    arena_mib * 1024 * 1024,
+                )
+                logger.info(
+                    "[ForwardHBWArena] capacity_bytes=%d graph_remaining_bytes=%d",
+                    arena_mib * 1024 * 1024,
+                    self.weight_hbw_pool.free_bytes,
+                )
         if _is_kunpeng_graph_capture:
             self.init_graph_capture()
 
@@ -541,19 +705,391 @@ class KunpengGraphRunner:
 
     # ── Mode-specific forward (internal) ─────────────────────────────────
 
+    def memory_placement_snapshot(self):
+        """Small on-demand ledger; never scans tensors in the timed forward."""
+        pool = self.weight_hbw_pool
+        if pool is None:
+            return {"hbm_enabled": False}
+        pool.sweep()
+        graph = KunpengGraphRunner._graph_hbw_tensor
+        maps = []
+        with open("/proc/self/numa_maps") as stream:
+            for line in stream:
+                try:
+                    address = int(line.split()[0], 16)
+                except (ValueError, IndexError):
+                    continue
+                if address == pool._base_addr:
+                    maps.append(line.strip())
+        arena = self._forward_hbw.stats() if self._forward_hbw is not None else None
+        backing = pool.backing_snapshot()
+        from sglang.srt.hardware_backend.cpu_kunpeng.allocator.placement_snapshot import (
+            physical_window_snapshot,
+        )
+
+        expected_node = int(self.model_runner.tp_rank) + 16
+        if backing.get("transport_mode") == "split":
+            shm_placement = physical_window_snapshot(
+                backing["shm_base"],
+                backing["shm_bytes"],
+                expected_node,
+                allow_regular=True,
+            )
+            private_placement = physical_window_snapshot(
+                pool._base_addr, pool.pool_size, expected_node
+            )
+            placement = {
+                "complete": shm_placement["complete"] and private_placement["complete"],
+                "total_budget_bytes": backing["total_budget_bytes"],
+                "ranges": {
+                    "shm_payload": shm_placement,
+                    "private_hbw": private_placement,
+                },
+            }
+        else:
+            placement = physical_window_snapshot(
+                pool._base_addr, pool.pool_size, expected_node
+            )
+        raw_graph_bytes = getattr(self, "_graph_hbw_raw_bytes", 0)
+        arena_bytes = 0 if arena is None else arena["capacity_bytes"]
+        static_bytes = getattr(self, "_static_hbw_bytes", 0)
+        prefix_bytes = backing.get("shm_prefix_bytes", 0)
+        shm_base = backing.get("shm_base", pool._base_addr)
+        private_reserved = getattr(pool, "_payload_reserved_bytes", 0)
+        other_bytes = (
+            pool.used_bytes
+            - private_reserved
+            - static_bytes
+            - arena_bytes
+            - raw_graph_bytes
+        )
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as qwen_enabled
+
+        prefill = None
+        if qwen_enabled():
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen import prefill
+
+        arena_lo = (
+            0 if self._forward_hbw is None else self._forward_hbw.backing.data_ptr()
+        )
+        arena_hi = arena_lo + arena_bytes
+        workspace_rows = []
+        for name, tensor in zip(
+            ("q", "packed_k", "packed_v", "out", "scratch"),
+            getattr(getattr(prefill, "_shared_flash_workspace", None), "_hbm_buffers", ()),
+        ):
+            workspace_rows.append(
+                {
+                    "name": "prefill." + name,
+                    "bytes": tensor.nbytes,
+                    "address": tensor.data_ptr(),
+                    "in_forward_arena": arena_lo <= tensor.data_ptr()
+                    and tensor.data_ptr() + tensor.nbytes <= arena_hi,
+                }
+            )
+        provider = self._graph_provider
+        for batch, (_, tensor) in getattr(provider, "dense_plans", {}).items():
+            workspace_rows.append(
+                {
+                    "name": "dense." + str(batch),
+                    "bytes": tensor.nbytes,
+                    "address": tensor.data_ptr(),
+                    "in_forward_arena": arena_lo <= tensor.data_ptr()
+                    and tensor.data_ptr() + tensor.nbytes <= arena_hi,
+                }
+            )
+        plans = []
+        from collections import Counter
+
+        for key, entry in self._sglang_graph_cache.items():
+            captured = entry[0]
+            row = {
+                "cache_key": str(key),
+                "plan_available": hasattr(captured, "describe_plan"),
+            }
+            if not row["plan_available"]:
+                row["plan_unavailable_reason"] = "pinned executor has no describe_plan"
+            if row["plan_available"]:
+                (
+                    storages,
+                    views,
+                    records,
+                    inputs,
+                    needed,
+                    capacity,
+                    shm_needed,
+                    shm_capacity,
+                ) = captured.describe_plan()
+                export_path = os.environ.get("SGLANG_KUNPENG_M1_PLAN_EXPORT_PATH")
+                if (
+                    export_path
+                    and int(self.model_runner.tp_rank) == 0
+                    and not getattr(self, "_m1_plan_exported", False)
+                    and len(key) >= 4
+                    and key[0].is_decode()
+                    and int(key[1])
+                    == int(os.environ.get("SGLANG_KUNPENG_PLAN_EXPORT_TOKENS", "1"))
+                    and int(key[2])
+                    == int(os.environ.get("SGLANG_KUNPENG_PLAN_EXPORT_BATCH", "1"))
+                    and not key[3]
+                ):
+                    import json
+
+                    if not os.path.isabs(export_path) or os.path.exists(export_path):
+                        raise RuntimeError(
+                            "Graph plan export requires a fresh absolute path"
+                        )
+                    export = {
+                        "pid": os.getpid(),
+                        "rank": 0,
+                        "cache_key": str(key),
+                        "num_inputs": int(inputs),
+                        "required_regular_bytes": int(needed),
+                        "external_pool_bytes": int(capacity),
+                        "required_shm_bytes": int(shm_needed),
+                        "external_shm_pool_bytes": int(shm_capacity),
+                        "storages": [
+                            {
+                                "id": int(s.id),
+                                "pointer": int(s.data_ptr),
+                                "bytes": int(s.size),
+                                "born": int(s.born_op),
+                                "death": int(s.death_op),
+                                "type": str(s.memory_type),
+                                "in_pool": bool(s.in_pool),
+                            }
+                            for s in storages
+                        ],
+                        "views": [
+                            {
+                                "id": int(v.id),
+                                "storage": int(v.storage_id),
+                                "shape": list(v.shape),
+                                "stride": list(v.strides),
+                                "offset": int(v.storage_offset),
+                                "scalar_type": int(v.scalar_type),
+                                "element_size": int(v.element_size),
+                            }
+                            for v in views
+                        ],
+                        "records": [
+                            {
+                                "ordinal": i,
+                                "op_name": str(r.op_name),
+                                "profile_name": str(r.profile_name),
+                                "input_view_ids": list(r.input_view_ids),
+                                "output_view_ids": list(r.output_view_ids),
+                            }
+                            for i, r in enumerate(records)
+                        ],
+                    }
+                    temporary = export_path + ".tmp." + str(os.getpid())
+                    with open(temporary, "x") as stream:
+                        json.dump(export, stream, indent=2, allow_nan=False)
+                        stream.write("\n")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, export_path)
+                    self._m1_plan_exported = True
+                row.update(
+                    required_regular_bytes=needed,
+                    external_pool_bytes=capacity,
+                    required_shm_bytes=shm_needed,
+                    external_shm_pool_bytes=shm_capacity,
+                    storage_count=len(storages),
+                    op_count=len(records),
+                    op_counts=dict(Counter(record.op_name for record in records)),
+                    profile_name_counts=dict(
+                        Counter(record.profile_name for record in records)
+                    ),
+                    shm_outputs_outside_prefix=sum(
+                        bool(storage.size)
+                        and not (
+                            shm_base <= storage.data_ptr
+                            and storage.data_ptr + storage.size
+                            <= shm_base + prefix_bytes
+                        )
+                        for storage in storages
+                        if storage.in_pool and str(storage.memory_type).endswith("SHM")
+                    ),
+                    regular_outputs_outside_hbm=sum(
+                        bool(storage.size)
+                        and not (
+                            pool._base_addr + private_reserved <= storage.data_ptr
+                            and storage.data_ptr + storage.size
+                            <= pool._base_addr + pool.pool_size
+                        )
+                        for storage in storages
+                        if storage.in_pool
+                        and str(storage.memory_type).endswith("REGULAR")
+                    ),
+                )
+            plans.append(row)
+        arena_ok = (
+            arena is not None
+            and placement["complete"]
+            and arena["allocations"] > 0
+            and arena["allocation_failures"] == 0
+            and arena["allocator_ddr_fallback_count"] == 0
+        )
+        scope_coverage = {
+            "c10_storage_allocations": arena_ok,
+            "aten_tensor_outputs": arena_ok,
+            "boxed_graph_replay": arena_ok
+            and any(p.get("op_counts", {}).get("aten_boxed", 0) for p in plans)
+            and self._graph_replay_count > 0,
+            "persistent_prefill_and_dense_workspace": arena_ok
+            and len(workspace_rows) >= 5
+            and all(r["in_forward_arena"] for r in workspace_rows),
+        }
+        packed_lm_heads = []
+        if getattr(self, "_packed_lm_head_enabled", False):
+            from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import (
+                placement_snapshot,
+            )
+
+            packed_lm_heads = placement_snapshot(self.model_runner.model, pool)
+        return {
+            "hbm_enabled": True,
+            "packed_lm_head_buffers": packed_lm_heads,
+            "shared_hbw_backing": backing,
+            "physical_hbm": placement,
+            "allocation_path_coverage": scope_coverage,
+            "forward_ddr_fallback_count": (
+                None if arena is None else arena["allocator_ddr_fallback_count"]
+            ),
+            "persistent_workspace_buffers": workspace_rows,
+            "prefill_shared_flash_calls": getattr(
+                getattr(prefill, "_kutacc_prefill", None), "_shared_flash_calls", 0
+            ),
+            "tail_class_bytes": {
+                "static_weight_scale_norm": static_bytes,
+                "forward_arena_backing": arena_bytes,
+                "regular_graph_raw": raw_graph_bytes,
+                "other_allocations_and_alignment": other_bytes,
+            },
+            "native_init_used_bytes": getattr(
+                self, "_shm_native_init_used_bytes", None
+            ),
+            "prefix_before_graph_bytes": getattr(
+                self, "_shm_prefix_before_graph_bytes", None
+            ),
+            "pool_capacity_bytes": pool.pool_size,
+            "rank_total_hbm_budget_bytes": getattr(
+                pool, "total_budget_bytes", pool.pool_size
+            ),
+            "pool_base_address": pool._base_addr,
+            "pool_used_bytes": pool.used_bytes,
+            "static_weight_scale_buffer_bytes": getattr(
+                self, "_static_hbw_bytes", None
+            ),
+            "largest_free_block_bytes": pool.largest_free_bytes,
+            "pool_free_bytes": pool.free_bytes,
+            "graph_backing_bytes": raw_graph_bytes,
+            "graph_effective_backing_bytes": 0 if graph is None else graph.numel(),
+            "graph_plans": plans,
+            "eager_prefill_arena": arena,
+            "int8_scale_backing_count": self._int8_scale_backing_hbw_count,
+            "int8_scale_backing_bytes": self._int8_scale_backing_hbw_bytes,
+            "pool_numa_maps": maps,
+            "coverage_note": "allocator counters do not certify non-Tensor native scratch; inspect explicit scratch contract",
+        }
+
+    def _forward_hbw_scope(self):
+        return (
+            self._forward_hbw.forward()
+            if self._forward_hbw is not None
+            else nullcontext()
+        )
+
+    def _provider_for_forward(self):
+        if not self._graph_provider_resolved:
+            from sglang.srt.graph.bindings import resolve_graph_provider
+
+            self._graph_provider = resolve_graph_provider(self.model_runner)
+            self._graph_provider_resolved = True
+        return self._graph_provider
+
+    def _graph_supports_forward(self, forward_batch, kwargs):
+        if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
+            # Generic inputs/fixed tensors are DeepSeek-specific; no draft provider yet.
+            return False
+        if not self.is_graph_active():
+            return False
+        provider = self._provider_for_forward()
+        return provider is None or provider.supports(forward_batch, kwargs)
+
+    def graph_coverage_snapshot(self):
+        """Cumulative metadata only; safe to collect once after a test batch."""
+        return {
+            "capture_count": self._graph_capture_count,
+            "replay_count": self._graph_replay_count,
+            "decode": [dict(row) for _, row in sorted(self._decode_coverage.items())],
+            "prefill": [dict(row) for _, row in sorted(self._prefill_coverage.items())],
+            "prefill_backend": os.environ.get(
+                "SGLANG_KUNPENG_QWEN_PREFILL_BACKEND", "torch"
+            ),
+            "shared_prefill_kv": os.environ.get(
+                "SGLANG_KUNPENG_QWEN_SHARED_PREFILL_KV", "0"
+            ),
+        }
+
+    def _decode_coverage_row(self, fb, supported, reason):
+        key = (int(fb.batch_size), int(fb.input_ids.numel()), bool(supported), reason)
+        row = self._decode_coverage.get(key)
+        if row is None:
+            row = dict(
+                batch=key[0],
+                tokens=key[1],
+                supported=key[2],
+                reason=reason,
+                attempts=0,
+                cache_misses=0,
+                captures=0,
+                replays=0,
+                eager=0,
+            )
+            self._decode_coverage[key] = row
+        return row
+
     def _forward_decode(
         self,
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[PPProxyTensors, tuple]:
-        if not self.is_graph_active():
+        supported = self._graph_supports_forward(forward_batch, kwargs)
+        provider = self._provider_for_forward()
+        reason = "supported"
+        if not supported:
+            if (
+                getattr(self.model_runner, "borrowed_qwen_target_runner", None)
+                is not None
+            ):
+                reason = "attached_draft_provider_unavailable"
+            elif not self.is_graph_active():
+                reason = "graph_disabled"
+            elif provider is not None and hasattr(provider, "unsupported_reason"):
+                reason = provider.unsupported_reason(forward_batch, kwargs)
+            else:
+                reason = "provider_unsupported"
+        coverage = (
+            self._decode_coverage_row(forward_batch, supported, reason)
+            if provider is not None
+            else None
+        )
+        if coverage is not None:
+            coverage["attempts"] += 1
+        if not supported:
+            if coverage is not None:
+                coverage["eager"] += 1
             # Eager fallback – plain model.forward
-            return self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+            with self._forward_hbw_scope():
+                return self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
 
         with pp_span("build_graph_inputs"):
             inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
@@ -566,14 +1102,62 @@ class KunpengGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[PPProxyTensors, tuple]:
-        if not self.is_graph_active():
-            return self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
+        provider = self._provider_for_forward()
+        row = None
+        if provider is not None:
+            key = (int(forward_batch.input_ids.numel()), int(forward_batch.batch_size))
+            row = self._prefill_coverage.setdefault(
+                key,
+                dict(
+                    tokens=key[0],
+                    batch=key[1],
+                    calls=0,
+                    max_prefix=0,
+                    supported=0,
+                    eager=0,
+                    cache_misses=0,
+                    cache_hits=0,
+                    captures=0,
+                    replays=0,
+                    reasons={},
+                ),
             )
+            row["calls"] += 1
+            prefixes = forward_batch.extend_prefix_lens_cpu
+            if prefixes is not None:
+                row["max_prefix"] = max(
+                    row["max_prefix"], max(map(int, prefixes), default=0)
+                )
+        supported = self._graph_supports_forward(forward_batch, kwargs)
+        if not supported:
+            reason = (
+                "attached_draft_provider_unavailable"
+                if getattr(self.model_runner, "borrowed_qwen_target_runner", None)
+                is not None
+                else (
+                    "graph_disabled"
+                    if not self.is_graph_active()
+                    else (
+                        provider.unsupported_reason(forward_batch, kwargs)
+                        if provider is not None
+                        and hasattr(provider, "unsupported_reason")
+                        else "provider_unsupported"
+                    )
+                )
+            )
+            if row is not None:
+                row["eager"] += 1
+                row["reasons"][reason] = row["reasons"].get(reason, 0) + 1
+            with self._forward_hbw_scope():
+                return self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
 
+        if row is not None:
+            row["supported"] += 1
         inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
         return self._graph_forward(
             forward_batch,
@@ -588,13 +1172,14 @@ class KunpengGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[PPProxyTensors, tuple]:
-        if not self.is_graph_active():
-            return self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+        if not self._graph_supports_forward(forward_batch, kwargs):
+            with self._forward_hbw_scope():
+                return self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
 
         inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
         return self._graph_forward(
@@ -630,10 +1215,16 @@ class KunpengGraphRunner:
         The input set differs per forward mode; PP proxy tensors are appended
         when pipeline parallelism is active, and None entries are filtered out.
         """
+        provider = self._provider_for_forward()
+        if provider is not None:
+            with self._forward_hbw_scope():
+                self._graph_bindings = provider.bind(
+                    self.model_runner, forward_batch, kwargs
+                ).validate()
+            return list(self._graph_bindings.inputs.values())
+        self._graph_bindings = None
         forward_mode = forward_batch.forward_mode
-        attn_backend = self._resolve_attn_backend(
-            self.model_runner, forward_batch
-        )
+        attn_backend = self._resolve_attn_backend(self.model_runner, forward_batch)
         meta = attn_backend.forward_metadata
 
         if forward_mode.is_idle():
@@ -648,20 +1239,15 @@ class KunpengGraphRunner:
             ]
             if meta is not None:
                 inputs.extend([meta.block_table, meta.seq_lens])
-            inputs.extend(
-                [forward_batch.out_cache_loc, attn_backend._decode_meta]
-            )
+            inputs.extend([forward_batch.out_cache_loc, attn_backend._decode_meta])
             if getattr(attn_backend, "_nsa_enabled", False):
                 # DSA: full-batch seq lens consumed by the (fake) CPU indexer
                 # graph op; the real indexer reads the per-step full-batch
                 # view (metadata.indexer_*, built outside the capture).
                 # Register the SAME views the ops consume.
-                inputs.append(
-                    meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
-                )
-            if (
-                getattr(attn_backend, "_nsa_enabled", False)
-                and not getattr(attn_backend, "_lc_enabled", False)
+                inputs.append(meta.full_seq_lens[: forward_batch.seq_lens.shape[0]])
+            if getattr(attn_backend, "_nsa_enabled", False) and not getattr(
+                attn_backend, "_lc_enabled", False
             ):
                 # dsa_topk_slots reads req_to_token directly; register the
                 # SAME views the op consumes.
@@ -767,10 +1353,7 @@ class KunpengGraphRunner:
             if (
                 getattr(attn_backend, "_nsa_enabled", False)
                 and not getattr(attn_backend, "_lc_enabled", False)
-                and (
-                    forward_mode.is_target_verify()
-                    or forward_mode.is_draft_extend()
-                )
+                and (forward_mode.is_target_verify() or forward_mode.is_draft_extend())
             ):
                 # DSA + MTP verify/draft-extend: the (fake) MTP indexer op
                 # (inside the capture) reads the persistent FULL-batch seq
@@ -778,9 +1361,7 @@ class KunpengGraphRunner:
                 # (metadata.indexer_*, built outside the capture). Register
                 # the SAME views the ops consume. (The absorbed prefill no
                 # longer consumes them.)
-                inputs.append(
-                    meta.full_seq_lens[: forward_batch.seq_lens.shape[0]]
-                )
+                inputs.append(meta.full_seq_lens[: forward_batch.seq_lens.shape[0]])
                 # dsa_topk_slots reads req_to_token directly; register the
                 # SAME views the op consumes.
                 inputs.append(forward_batch.req_to_token_pool.req_to_token)
@@ -834,9 +1415,7 @@ class KunpengGraphRunner:
         spec_info = getattr(forward_batch, "spec_info", None)
         if self.model_runner.is_draft_worker and spec_info is not None:
             if forward_mode.is_idle():
-                spec_info.hidden_states = torch.tensor(
-                    [0, 7168], dtype=torch.bfloat16
-                )
+                spec_info.hidden_states = torch.tensor([0, 7168], dtype=torch.bfloat16)
             if getattr(spec_info, "hidden_states", None) is not None:
                 inputs.append(spec_info.hidden_states)
             # M9 DSA top-k carry between the chain-step graphs: the step-0
@@ -873,6 +1452,8 @@ class KunpengGraphRunner:
     def _build_graph_fixed_tensors(
         self, forward_batch: ForwardBatch
     ) -> List[torch.Tensor]:
+        if self._graph_bindings is not None:
+            return list(self._graph_bindings.all_fixed_tensors())
         fixed = self.graph_fixed_weights[:]
         for kv in self.model_runner.token_to_kv_pool.kv_buffer:
             fixed.append(kv)
@@ -883,9 +1464,7 @@ class KunpengGraphRunner:
         # indexer weights (wq_b / wk / weights_proj / k_norm) and the
         # rotary cos_sin caches are already covered by
         # collect_model_weights.
-        attn_backend = self._resolve_attn_backend(
-            self.model_runner, forward_batch
-        )
+        attn_backend = self._resolve_attn_backend(self.model_runner, forward_batch)
         index_k_buffers = getattr(
             self.model_runner.token_to_kv_pool, "index_k_buffer", None
         )
@@ -1073,8 +1652,7 @@ class KunpengGraphRunner:
         # Received proxy tensors must be registered as graph inputs so the
         # capture system can track them (otherwise consuming graph ops fail).
         is_pp_graph = (
-            kwargs.get("pp_proxy_tensors") is not None
-            and self.model_runner.support_pp
+            kwargs.get("pp_proxy_tensors") is not None and self.model_runner.support_pp
         )
         # Batch size must be part of the key: per-sequence ops (e.g.
         # last_tokens, MTP pad/unpad) fix their output shape at capture, so two
@@ -1085,9 +1663,7 @@ class KunpengGraphRunner:
         # steps assign draft_attn_backend.attn_backends[i] per step). Each such
         # backend owns distinct metadata tensors, so they must not share a
         # captured graph.
-        attn_backend = self._resolve_attn_backend(
-            self.model_runner, forward_batch
-        )
+        attn_backend = self._resolve_attn_backend(self.model_runner, forward_batch)
         # Absorbed DSA prefill: the flat row count fixes the kernel/slots
         # shapes and is not a function of total_tokens/batch_size, so it
         # joins the cache key (shapes never depend on
@@ -1109,16 +1685,20 @@ class KunpengGraphRunner:
         # _forward_mla_sparse_paged -- a Python branch frozen at capture,
         # so the flag must split the graph cache key.
         all_padding_key = bool(
-            getattr(attn_backend.forward_metadata, "sparse_all_padding", False)
+            getattr(
+                getattr(attn_backend, "forward_metadata", None), "sparse_all_padding", False
+            )
         )
         graph_cache_key = (
             forward_batch.forward_mode,
             total_tokens,
             forward_batch.batch_size,
             is_pp_graph,
-            id(attn_backend)
-            if attn_backend is not self.model_runner.attn_backend
-            else None,
+            (
+                id(attn_backend)
+                if attn_backend is not self.model_runner.attn_backend
+                else None
+            ),
             absorbed_prefill_key,
             all_padding_key,
         )
@@ -1133,14 +1713,37 @@ class KunpengGraphRunner:
             if _spec_info is not None
             else None
         )
+        if self._graph_bindings is not None:
+            graph_cache_key += (self._graph_bindings.cache_signature(),)
 
+        decode_coverage = None
+        if self._graph_bindings is not None and forward_batch.forward_mode.is_decode():
+            decode_coverage = self._decode_coverage_row(
+                forward_batch, True, "supported"
+            )
+        prefill_coverage = None
+        if self._graph_bindings is not None and forward_batch.forward_mode.name == "EXTEND":
+            prefill_coverage = self._prefill_coverage[
+                (int(total_tokens), int(forward_batch.batch_size))
+            ]
         if graph_cache_key not in self._sglang_graph_cache:
+            if prefill_coverage is not None:
+                prefill_coverage["cache_misses"] += 1
+            if decode_coverage is not None:
+                decode_coverage["cache_misses"] += 1
             while len(self._sglang_graph_cache) >= self._sglang_graph_max_cache:
                 self._sglang_graph_cache.popitem(last=False)
 
             fixed = self._build_graph_fixed_tensors(forward_batch)
 
-            with capture(inputs=inputs, fixed=fixed):
+            provider = self._provider_for_forward()
+            context = (
+                provider.capture_context()
+                if provider is not None and hasattr(provider, "capture_context")
+                else nullcontext()
+            )
+            capture_options = getattr(provider, "capture_options", {})
+            with capture(inputs=inputs, fixed=fixed, **capture_options), context:
                 # pp_proxy_tensors must be passed to model.forward() even in
                 # non-decode modes (e.g. PP1 idle), otherwise the model's
                 # assert (pp_proxy_tensors is not None) will fail.
@@ -1183,15 +1786,22 @@ class KunpengGraphRunner:
                 and forward_batch.forward_mode.is_decode()
                 and getattr(forward_batch, "reuse_dsa_topk_indices", False)
             ):
-                published = getattr(
-                    forward_batch.spec_info, "dsa_topk_indices", None
-                )
+                published = getattr(forward_batch.spec_info, "dsa_topk_indices", None)
                 if published is not None and published is not _pre_topk_carry:
                     graph_outputs.append(published)
                     has_mtp_topk = True
 
             if KunpengGraphRunner._graph_shm_tensor is None:
                 remaining = torch.ops.sgl_kernel.shm_remaining_bytes_kunpeng()
+                backing = (
+                    self.weight_hbw_pool.backing_snapshot()
+                    if self.weight_hbw_pool
+                    else {}
+                )
+                if backing.get("enabled"):
+                    self._shm_prefix_before_graph_bytes = (
+                        backing["shm_prefix_bytes"] - remaining
+                    )
                 if remaining > 0:
                     KunpengGraphRunner._graph_shm_tensor = (
                         torch.ops.sgl_kernel.create_shm_tensor_kunpeng(
@@ -1217,6 +1827,7 @@ class KunpengGraphRunner:
                     raw = self.weight_hbw_pool.alloc(
                         (remaining,), torch.uint8, label="graph_capture"
                     )
+                    self._graph_hbw_raw_bytes = raw.numel()
                     # Round the pool base up to 2M so that per-storage offset
                     # alignment in pack_intervals (2M/512K/1K workspace bufs)
                     # equals absolute-address alignment.
@@ -1249,12 +1860,20 @@ class KunpengGraphRunner:
                 has_pp_topk,
                 has_mtp_topk,
             )
+            if self._graph_bindings is not None:
+                self._graph_capture_count += 1
+            if prefill_coverage is not None:
+                prefill_coverage["captures"] += 1
+            if decode_coverage is not None:
+                decode_coverage["captures"] += 1
             logger.info(
                 f"[graph] captured mode={forward_batch.forward_mode.name}, "
                 f"total_tokens={total_tokens}, batch_size={forward_batch.batch_size}, "
                 f"pp={is_pp_graph}, mtp_topk={has_mtp_topk}"
             )
         else:
+            if prefill_coverage is not None:
+                prefill_coverage["cache_hits"] += 1
             self._sglang_graph_cache.move_to_end(graph_cache_key)
             (
                 graph,
@@ -1265,8 +1884,14 @@ class KunpengGraphRunner:
             ) = self._sglang_graph_cache[graph_cache_key]
 
         t0 = time.time()
-        with pp_span("graph_run"):
+        with pp_span("graph_run"), self._forward_hbw_scope():
             outputs = graph.run(inputs)
+        if self._graph_bindings is not None:
+            self._graph_replay_count += 1
+        if prefill_coverage is not None:
+            prefill_coverage["replays"] += 1
+        if decode_coverage is not None:
+            decode_coverage["replays"] += 1
         t1 = time.time()
         # With SGLANG_SCHEDULER_SKIP_ALL_GATHER the scheduler issues an idle
         # forward every iteration even when no requests arrive; skip logging
@@ -1277,9 +1902,12 @@ class KunpengGraphRunner:
         global last_call_timestamp
         if (
             not skip_idle_log
+            and os.environ.get("SGLANG_KUNPENG_GRAPH_LOG_REPLAY", "1") != "0"
             and os.environ.get("SGLANG_KUNPENG_PP_PROFILE", "0") == "0"
         ):
-            logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms, others {1000 * (t0 - last_call_timestamp):.3f} ms.")
+            logger.info(
+                f"[graph] run {1000 * (t1 - t0):.3f} ms, others {1000 * (t0 - last_call_timestamp):.3f} ms."
+            )
 
         # Idle replays would grow the profile records unboundedly.
         if _graph_profile_active and not skip_idle_log:

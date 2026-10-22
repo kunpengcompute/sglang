@@ -141,8 +141,21 @@ class KunpengSwapManager:
         if _is_kunpeng_hbw_pool:
             self._hbw_pool = KunpengHBWPool.get_instance()
 
-        self._ensure_sdma_initialized()
-        sdma_event_num = torch.ops.sgl_kernel.get_sdma_event_num()
+        swap_disabled = not any(
+            (
+                self.enable_swap_expert,
+                self.enable_swap_kv_in,
+                self.enable_swap_kv_out,
+                self.enable_swap_kv_blockwise,
+            )
+        )
+        if swap_disabled:
+            # No enabled swap operation consumes an SDMA event or queue.
+            sdma_event_num = 0
+            logger.info("All swap operations disabled: SDMA initialization skipped")
+        else:
+            self._ensure_sdma_initialized()
+            sdma_event_num = torch.ops.sgl_kernel.get_sdma_event_num()
         self._expert_event_tensor = torch.zeros(sdma_event_num, dtype=torch.int32)
         self._expert_event_num_tensor = torch.tensor([0], dtype=torch.int32)
         self._kv_swap_in_event_tensor = torch.zeros(sdma_event_num, dtype=torch.int32)

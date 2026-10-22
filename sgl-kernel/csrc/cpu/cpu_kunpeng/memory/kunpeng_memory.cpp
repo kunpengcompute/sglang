@@ -16,6 +16,7 @@
 
 #include <torch/all.h>
 #include <cstdint>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <errno.h>
@@ -27,10 +28,45 @@
 constexpr int64_t PAGE_SIZE = 2 * 1024 * 1024;  // 2MB huge page
 constexpr int BENCH_LOOPS = 10;
 
+namespace {
+class HBWAllocationPolicy {
+    int old_mode_ = 0;
+    unsigned long old_mask_ = 0;
+    bool active_ = false;
+public:
+    explicit HBWAllocationPolicy(int node) {
+        const char* enabled = std::getenv("SGLANG_KUNPENG_HBW_BIND_BEFORE_MMAP");
+        if (!enabled || std::strcmp(enabled, "1") != 0) return;
+        TORCH_CHECK(node >= 0 && node < 64, "HBW node exceeds policy mask");
+        TORCH_CHECK(get_mempolicy(&old_mode_, &old_mask_, 64, nullptr, 0) == 0,
+                    "Cannot read caller NUMA policy: ", std::strerror(errno));
+        unsigned long mask = 1UL << node;
+        TORCH_CHECK(set_mempolicy(MPOL_BIND, &mask, 64) == 0,
+                    "Cannot bind HBW allocation policy: ", std::strerror(errno));
+        active_ = true;
+    }
+    void restore() {
+        if (!active_) return;
+        TORCH_CHECK(set_mempolicy(old_mode_, &old_mask_, 64) == 0,
+                    "Cannot restore caller NUMA policy: ", std::strerror(errno));
+        active_ = false;
+    }
+    ~HBWAllocationPolicy() {
+        if (active_) set_mempolicy(old_mode_, &old_mask_, 64);
+    }
+};
+} // namespace
+
 at::Tensor hbw_allocator_kunpeng(int64_t size)
 {
+    TORCH_CHECK(size > 0 && size <= INT64_MAX - PAGE_SIZE, "Invalid HBW pool size");
     int64_t aligned_size = (size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
     int64_t num_pages = aligned_size / PAGE_SIZE;
+
+    int cpu = sched_getcpu();
+    int cpu_node = numa_node_of_cpu(cpu);
+    int hbm_node = cpu_node + 16;
+    HBWAllocationPolicy allocation_policy(hbm_node);
 
     // Step 1: mmap with MAP_HUGETLB + MAP_POPULATE
     auto *hbm = static_cast<uint8_t *>(mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
@@ -40,10 +76,14 @@ at::Tensor hbw_allocator_kunpeng(int64_t size)
         throw std::runtime_error("mmap with MAP_HUGETLB failed");
     }
 
+    try {
+        allocation_policy.restore();
+    } catch (...) {
+        munmap(hbm, aligned_size);
+        throw;
+    }
+
     // Step 2: mbind to HBM NUMA node
-    int cpu = sched_getcpu();
-    int cpu_node = numa_node_of_cpu(cpu);
-    int hbm_node = cpu_node + 16;
     unsigned long mask = 1UL << hbm_node;
 
     int ret = mbind(hbm, aligned_size, MPOL_BIND, &mask, sizeof(mask) * 8, MPOL_MF_STRICT);

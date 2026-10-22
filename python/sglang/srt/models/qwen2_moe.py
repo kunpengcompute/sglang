@@ -184,8 +184,29 @@ class Qwen2MoeMLP(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ):
+        from sglang.srt.layers.quantization.modelslim.schemes.cpu920f_w8a8_dynamic import (
+            CPU920FModelSlimW8A8Dynamic,
+            validate_fused_silu_mul_domain,
+        )
+
+        gate_scheme = getattr(self.gate_up_proj, "scheme", None)
+        down_scheme = getattr(self.down_proj, "scheme", None)
+        gate_w8a8 = isinstance(gate_scheme, CPU920FModelSlimW8A8Dynamic)
+        down_w8a8 = isinstance(down_scheme, CPU920FModelSlimW8A8Dynamic)
+        if gate_w8a8 != down_w8a8:
+            raise ValueError(
+                "Fused CPU W8A8 MLP requires matching gate/up and down schemes"
+            )
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if gate_w8a8:
+            from sglang.srt.graph import ops as kunpeng
+
+            # Reuse the generic native op already used by the DeepSeek CPU path.
+            # Its UP-half mutation/domain follow the reviewed generic native ABI.
+            validate_fused_silu_mul_domain(gate_up)
+            x = kunpeng.silu_mul_quant_kunpeng(gate_up)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
