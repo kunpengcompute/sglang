@@ -502,7 +502,7 @@ if [ "$INTERACTIVE" = false ]; then
         -w '%{time_starttransfer} %{time_total}' \
         -d @"$body_file" > "$RESULT_DIR/ttfb_${idx}" 2>/dev/null &
       local curl_pid=$!
-      local ttft_done=0 echo_on=0
+      local ttft_done=0 echo_on=0 think_on=0
       [ "$NUM_REQUESTS" -eq 1 ] && echo_on=1
       # Content marker: completions SSE carries "text", chat SSE carries
       # "content":" (string values only — null-content deltas never match
@@ -528,19 +528,32 @@ if [ "$INTERACTIVE" = false ]; then
           printf '%s\n' "$line"
         else
           # Live echo: decoded text/content only (printf %b expands \n etc.).
-          # Chat mode also streams the reasoning phase, dimmed so the
-          # content phase stands out when it starts. Usage-only chunks
+          # Chat mode also streams the reasoning phase, in cyan between
+          # explicit [thinking]/[answer] banners — ANSI dim (\033[2m) is
+          # invisible in terminals that ignore it (e.g. Xshell), so the
+          # phase is marked by text as well as color. Usage-only chunks
           # carry no marker and print nothing; error payloads and the
           # [DONE] marker stay raw.
           case "$line" in
-            'data: [DONE]'*) printf '\n%s\n' "$line" ;;
+            'data: [DONE]'*)
+              [ "$think_on" = 1 ] && printf '\033[0m'
+              printf '\n%s\n' "$line"
+              ;;
             *'"reasoning_content":"'*)
               text=${line#*\"reasoning_content\":\"}
-              printf '\033[2m%b\033[0m' "${text%%\"*}"
+              if [ "$think_on" = 0 ]; then
+                printf '\n\033[36m[thinking]\n'
+                think_on=1
+              fi
+              printf '%b' "${text%%\"*}"
               ;;
             *"$marker"*)
               if [ "$CHAT" = true ]; then
                 text=${line#*\"content\":\"}
+                if [ "$think_on" = 1 ]; then
+                  printf '\033[0m\n[answer]\n'
+                  think_on=0
+                fi
               else
                 text=${line#*\"text\":\"}
               fi
