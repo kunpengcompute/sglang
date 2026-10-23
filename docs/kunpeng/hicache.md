@@ -226,6 +226,45 @@ scripts/cpu_kunpeng/
 解析优先级：`extra_config`（代码传入）> JSON 文件 > 环境变量。
 另有引擎侧默认值，一般不用改：`MOONCAKE_MASTER_METRICS_PORT`（`9003`）、`MOONCAKE_CHECK_SERVER`（`False`）、`MOONCAKE_STANDALONE_STORAGE`（`False`）、`MOONCAKE_CLIENT`（未设置）。
 
+**⑥ SSD offload（可选，默认关）**
+
+L3 默认全部驻留在 store 进程的 DRAM segment（`MOONCAKE_STORE_SEGMENT_SIZE`）。打开后，内存压力下对象由 master 指示落盘，读取未命中时再从本地磁盘回读；offloaded 对象在 master 中记为 `LOCAL_DISK` 副本，对客户端透明。
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `MOONCAKE_ENABLE_SSD_OFFLOAD` | `0` | **总开关**。`1` 时 master 与 store service 都带 `--enable_offload=true` |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | **必须显式设置** | store 节点的磁盘目录（绝对路径，`server_store.sh` 会 `mkdir -p`）。开关打开但未设置时启动直接报错 |
+| `MOONCAKE_OFFLOAD_ON_EVICT` | `0` | `1` = 只在实际淘汰时落盘（`--offload_on_evict=true`）；`0` = put 完成即异步落盘 |
+| `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | 磁盘布局：`bucket_storage_backend` / `file_per_key_storage_backend` / `offset_allocator_storage_backend` |
+| `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `1099511627776`（1TB） | 磁盘用量上限 |
+| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `lru` | bucket 后端的淘汰策略：`none` / `fifo` / `lru` |
+
+开启方式：在 `.user_env_base.sh` 写总开关和磁盘目录，然后重启 mooncake：
+
+```bash
+export MOONCAKE_ENABLE_SSD_OFFLOAD=1
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
+
+sh stop.sh store
+sh stop.sh mooncake
+sh launch.sh mooncake
+sh launch.sh store
+```
+
+加载 store 角色环境时会打印实际落盘位置：
+
+```
+[store] SSD offload enabled -> /nvme/mooncake_offload
+```
+
+要点：
+
+- offload 只配在 **store 进程**（唯一持有 segment 的 real client）；prefill/native 客户端不需要改。
+- **一个磁盘目录只能被一个 live client 占用**，不要多个 rank 共享同一路径。
+- 磁盘读写由 store 节点承担，读延迟明显高于 DRAM：换到的是容量上限，不是热路径性能。
+- 开启前确认版本支持：`python -m mooncake.mooncake_store_service --help | grep -i offload`。
+- 成功时 store 日志中不再出现 `Storage root directory is not set. persisting data is disabled.`
+
 ---
 
 ## 4. 常见问题
@@ -234,6 +273,9 @@ scripts/cpu_kunpeng/
 |---|---|
 | 日志出现 `L3 disabled, running L1<->L2 only` | `KUNPENG_HICACHE_BACKEND=file` 且 `KUNPENG_HICACHE_L3_DIR` 为空 → 填目录 |
 | warmup 报 `invalid rpc arg` / `RPC_FAIL` | master 与客户端 mooncake 版本不一致（如一个来自源码构建、一个来自 wheel）。确认 `MOONCAKE_MASTER_BIN` 与客户端同源 |
+| store 环境报 `requires MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | 开了 `MOONCAKE_ENABLE_SSD_OFFLOAD=1` 但没设磁盘目录 → 显式设置绝对路径 |
+| store 启动报 `unknown argument '--enable_offload'` | 当前 mooncake 版本不支持 SSD offload：把 `MOONCAKE_ENABLE_SSD_OFFLOAD` 设回 `0`，或升级 mooncake |
+| store 日志持续出现 `persisting data is disabled` | `MOONCAKE_ENABLE_SSD_OFFLOAD=1` 未生效，或 `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` 不可写 |
 | 节点 DDR 被吃满 | 三级模式下 `RATIO`/`SIZE` 过大；改用两级模式 `KUNPENG_HICACHE_L1L3=1`（默认） |
 | `--hicache-ratio` 看起来没生效 | 两级模式下该参数**不传**，属预期；要调 L2 需先 `KUNPENG_HICACHE_L1L3=0` |
 | 启动时报 `NotImplementedError: ... MLA pools only` | 两级模式只支持 MLA 池 |

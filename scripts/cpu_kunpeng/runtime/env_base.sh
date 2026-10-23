@@ -253,3 +253,8 @@ export MOONCAKE_MASTER="${MOONCAKE_MASTER:-$MOONCAKE_MASTER_NODE:$MOONCAKE_MASTE
 # still overrides the hostname for the store role.
 export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-roceroh0,roceroh3,roceroh4,roceroh7}"
 export MOONCAKE_LOCAL_HOSTNAME="${MOONCAKE_LOCAL_HOSTNAME:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}"
+
+# SSD offload is opt-in. Off by default keeps the DRAM-only store unchanged.
+# When on, MOONCAKE_OFFLOAD_FILE_STORAGE_PATH must be set (see env_store.sh).
+export MOONCAKE_ENABLE_SSD_OFFLOAD="${MOONCAKE_ENABLE_SSD_OFFLOAD:-0}"
+export MOONCAKE_OFFLOAD_ON_EVICT="${MOONCAKE_OFFLOAD_ON_EVICT:-0}"
