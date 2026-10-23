@@ -1296,6 +1296,7 @@ class HybridLinearKVPool(KVCache):
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
         self.start_layer = start_layer if start_layer is not None else 0
+        self.end_layer = self.start_layer + self.full_layer_nums
         self.layer_transfer_counter = None
         self.head_num = head_num
         self.head_dim = head_dim
