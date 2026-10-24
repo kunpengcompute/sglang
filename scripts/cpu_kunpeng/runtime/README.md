@@ -86,9 +86,7 @@ export ROUTER_PREFILL_LENGTH_THRESHOLD=8192  # 字符阈值（≈1.5-2 字符/to
 
 ### 必须注意的环境变量
 
-1. **`PREFILL_PP_SIZE=16` + `DECODE_PP_SIZE=2` 必须同时出现在需要启用层映射的进程里**
-   （`disaggregation/common/conn.py` 的 `_pp_layer_mapping_enabled` 要求两值同时满足）。
-   只写在**两侧对应的实例文件**中（`prefill_pp16` 实例补 `DECODE_PP_SIZE=2`；`decode` 实例补 `PREFILL_PP_SIZE=16`），**严禁放进 `.user_env_base.sh`**——否则普通 prefill 实例的 `PP_SIZE` 会被污染成 16，且其 pp1→pp2 的 legacy 传输路径会被错误切换。
+1. **层区间映射按运行时 pp 大小自动判定**（decode 的 `pp_size` 与 bootstrap 返回的 prefill `pp_size`），不再读取 `PREFILL_PP_SIZE`；`DECODE_PP_SIZE` 仅供 decode 侧 draft 权重驻留判断使用，与层映射无关。
 
 2. **`SGLANG_PP_LAYER_PARTITION`（如 `"35,26"`）只在 decode 实例文件中设置**
    约束：项数 = `DECODE_PP_SIZE`，总和 = 模型总层数（DeepSeek-R1 为 61），且所有 decode 节点一致。若泄漏到 prefill（pp16）进程，`len(partitions)=2 != pp_size=16` 会启动即崩。decode 侧改这个值是安全的——层区间选择、覆盖校验、prefill 侧切片全部由它动态推导，无需改其他配置。
@@ -121,7 +119,7 @@ export ROUTER_PREFILL_LENGTH_THRESHOLD=8192  # 字符阈值（≈1.5-2 字符/to
 - [ ] `INSTANCES` 中每个带实例名的条目都有对应的 `.user_env_<role>_<instance>.sh`；
 - [ ] **各实例节点集互不重叠**（`stop_server.sh` 按节点集清理，重叠会导致误杀；IP_SPEC 按 `10.36.173. | a-b` 范围写法配置）；
 - [ ] 同实例所有节点加载同一份实例 env（实例文件改动需同步到该实例全部节点）；
-- [ ] 混布 pp16 prefill 时：`prefill_pp16` 实例文件有 `DECODE_PP_SIZE=2`，decode 实例文件有 `PREFILL_PP_SIZE=16`，且二者均不在 `.user_env_base.sh`；
+- [ ] 混布 pp16 prefill 时：层映射由两侧实际 `pp_size` 自动判定，无需再配对设置 `PREFILL_PP_SIZE`/`DECODE_PP_SIZE`；
 - [ ] `SGLANG_PP_LAYER_PARTITION` 只出现在 decode 实例文件中，项数/总和正确；
 - [ ] 路由分组顺序符合预期（INSTANCES 前部 = 短序列组）；
 - [ ] 每实例 tokenizer 端口、master 端口未被同节点其他服务占用（自动推导已错开，显式覆盖时注意避让）。

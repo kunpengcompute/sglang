@@ -49,28 +49,7 @@ logger = logging.getLogger(__name__)
 
 _is_tokenizer_separate = is_tokenizer_separate()
 _is_http_only = is_http_only()
-
-# PP layer-interval mapping: map decode PP stages onto prefill PP ranks by layer
-# interval (instead of by rank index) and validate that every decode stage's
-# layer range is fully covered. Only the prefill pp16 / decode pp2 topology needs
-# it (with 61 layers the two partitions' boundaries do not nest there). The
-# switch is read from the launch environment (set by the role scripts, which
-# export PREFILL_PP_SIZE / DECODE_PP_SIZE into every server process), so for
-# every other topology the feature is completely off and the code below behaves
-# exactly like before it was introduced.
-def _pp_layer_mapping_enabled() -> bool:
-    if not is_cpu_920f():
-        return False
-    try:
-        return (
-            int(os.environ.get("PREFILL_PP_SIZE", "0")) == 16
-            and int(os.environ.get("DECODE_PP_SIZE", "0")) == 2
-        )
-    except ValueError:
-        return False
-
-
-PP_LAYER_MAPPING_ENABLED: bool = _pp_layer_mapping_enabled()
+_is_cpu_920f = is_cpu_920f()
 
 
 class PPPartitionError(RuntimeError):
@@ -421,7 +400,7 @@ class CommonKVManager(BaseKVManager):
         # pp16 -> decode pp2 and alike); all other topologies take the original
         # rank-index paths below unchanged.
         has_prefill_layer_map = (
-            PP_LAYER_MAPPING_ENABLED
+            _is_cpu_920f
             and info.pp_size > self.pp_size
             and self.pp_size > 1
             and bool(info.pp_layer_ranges)
@@ -505,7 +484,7 @@ class CommonKVManager(BaseKVManager):
         # pp coarser than decode pp, e.g. prefill pp16 -> decode pp2) need this
         # check; every other topology keeps the original code path untouched.
         if (
-            not PP_LAYER_MAPPING_ENABLED
+            not _is_cpu_920f
             or info.pp_size <= self.pp_size
             or self.pp_size <= 1
             or not info.pp_layer_ranges
@@ -581,12 +560,12 @@ class CommonKVManager(BaseKVManager):
             # payload is then identical to the pre-pp-layer-mapping one).
             "start_layer": (
                 getattr(self.kv_args, "prefill_start_layer", None)
-                if PP_LAYER_MAPPING_ENABLED and self.pp_size > 1
+                if _is_cpu_920f and self.pp_size > 1
                 else None
             ),
             "num_layers": (
                 getattr(self.kv_args, "prefill_num_layers", None)
-                if PP_LAYER_MAPPING_ENABLED and self.pp_size > 1
+                if _is_cpu_920f and self.pp_size > 1
                 else None
             ),
         }
@@ -657,7 +636,7 @@ class CommonKVManager(BaseKVManager):
             # src is sliced to decode's range, so dst starts at local index 0.
             dst_local_start = 0
             dst_local_end = num_send_layers
-        elif PP_LAYER_MAPPING_ENABLED and decode_num_layers > 0:
+        elif _is_cpu_920f and decode_num_layers > 0:
             # decode is coarser/equal (decode pp_size <= prefill pp_size): this
             # prefill stage is a sub-range [start_layer, +num_kv_layers) of the
             # target decode stage [decode_start_layer, +decode_num_layers). Slice
@@ -667,8 +646,8 @@ class CommonKVManager(BaseKVManager):
             # second-half prefill stage starting before decode pp1's start_layer),
             # skip the send instead of indexing the dst buffer with a negative
             # slice, which wrote into garbage addresses and failed the transfer.
-            # Only taken when the layer-interval mapping is enabled; otherwise the
-            # legacy branch below is used unchanged.
+            # Only taken on the kunpeng path when the decode side reports its
+            # layer range; otherwise the legacy branch below is used unchanged.
             overlap_begin = max(start_layer, decode_start_layer)
             overlap_end = min(
                 start_layer + num_kv_layers, decode_start_layer + decode_num_layers
@@ -790,15 +769,15 @@ class CommonKVManager(BaseKVManager):
             sliced_src_indices = src_indices[src_local_start:src_local_end]
             dst_local_start = 0
             dst_local_end = decode_num_layers
-        elif PP_LAYER_MAPPING_ENABLED and decode_num_layers > 0:
+        elif _is_cpu_920f and decode_num_layers > 0:
             # decode is coarser/equal (decode pp_size <= prefill pp_size): this
             # prefill stage is a sub-range of the target decode stage. Slice both
             # src and dst to the overlapping layers; skip when there is no overlap.
             # Otherwise `dst_local_start = start_layer - decode_start_layer` is
             # negative for a second-half prefill stage starting below the decode
             # stage boundary (prefill pp16 -> decode pp2) and corrupts dst pointers.
-            # Only taken when the layer-interval mapping is enabled; otherwise the
-            # legacy branch below is used unchanged.
+            # Only taken on the kunpeng path when the decode side reports its
+            # layer range; otherwise the legacy branch below is used unchanged.
             overlap_begin = max(start_layer, decode_start_layer)
             overlap_end = min(
                 start_layer + num_prefill_layers, decode_start_layer + decode_num_layers
