@@ -33,6 +33,14 @@ ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/mooncake/latest"
 mkdir -p "$LOG_BASE_DIR/latest"
 ln -sfn "$LOG_BASE_DIR/$LOG_DATE/mooncake/$LOG_TIME" "$LOG_BASE_DIR/latest/mooncake"
 
+_mc_offload_args=""
+if [[ "${MOONCAKE_ENABLE_SSD_OFFLOAD:-0}" == "1" ]]; then
+    _mc_offload_args=" --enable_offload=true"
+    if [[ "${MOONCAKE_OFFLOAD_ON_EVICT:-0}" == "1" ]]; then
+        _mc_offload_args+=" --offload_on_evict=true"
+    fi
+fi
+
 echo "[$(date +%T)] Launching mooncake master on $MOONCAKE_MASTER_NODE ($MOONCAKE_MASTER)"
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
     "root@$MOONCAKE_MASTER_NODE" \
@@ -41,7 +49,7 @@ ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
        --port=$MOONCAKE_MASTER_PORT \
        --enable_http_metadata_server=true \
        --http_metadata_server_port=$MOONCAKE_METADATA_PORT \
-       --eviction_high_watermark_ratio=$MOONCAKE_EVICTION_WATERMARK \
+       --eviction_high_watermark_ratio=$MOONCAKE_EVICTION_WATERMARK$_mc_offload_args \
        </dev/null >\"$LOG_DIR/mooncake_master.log\" 2>&1 &" \
     >"$LOG_DIR/ssh_mooncake.log" 2>&1 &
 
