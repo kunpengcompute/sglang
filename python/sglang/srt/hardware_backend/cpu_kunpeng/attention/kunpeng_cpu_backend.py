@@ -1098,6 +1098,38 @@ class KunpengCpuBackend(AttentionBackend):
                         topk_len = torch.minimum(
                             topk_len, seq_lens - (step + 1)
                         ).clamp_(min=1)
+                        # With the carry present every chain step
+                        # reuses it, and the carry's DECODE padding rows
+                        # are all -1 (_pad_inputs_to_size) -- the kernel
+                        # maps them to the 1-entry LC dummy pattern, not
+                        # min(pad_seq_lens, topk, cap). A no-seed
+                        # fallback re-score instead produces full-length
+                        # garbage rows for the padding rows, so the plain
+                        # plan stays correct there; gate on the carry.
+                        _share_carry = (
+                            getattr(
+                                forward_batch.spec_info,
+                                "dsa_topk_indices",
+                                None,
+                            )
+                            if forward_batch.spec_info is not None
+                            else None
+                        )
+                        _real_bs = getattr(
+                            forward_batch, "_original_batch_size", None
+                        )
+                        if _share_carry is not None and _real_bs is not None:
+                            _g = torch.arange(
+                                metadata.token_slice_start,
+                                metadata.token_slice_start
+                                + seq_lens.shape[0],
+                                dtype=topk_len.dtype,
+                            )
+                            topk_len = torch.where(
+                                _g >= _real_bs,
+                                torch.ones_like(topk_len),
+                                topk_len,
+                            )
                 ext = forward_batch.extend_seq_lens
                 if ext is not None:
                     # Padding rows (extend_seq_lens == 0) carry the 1-entry
