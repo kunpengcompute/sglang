@@ -2,7 +2,7 @@
 # Strict upstream compilation remains the default. Opting in retains the native
 # implementation when its API exists, otherwise the adapter raises on use.
 option(SGLANG_KUNPENG_ALLOW_MISSING_OPTIONAL_KUTACC_APIS
-    "Build unsupported optional KuTACC adapters as explicit runtime errors" OFF)
+    "Build unsupported optional KuTACC adapters as explicit runtime errors" ON)
 if(SGLANG_KUNPENG_ALLOW_MISSING_OPTIONAL_KUTACC_APIS)
     include(CheckCXXSourceCompiles)
     set(_saved_try_compile_target_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
