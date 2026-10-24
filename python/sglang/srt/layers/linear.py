@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import itertools
 import logging
 import re
@@ -25,6 +26,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
+    is_symmetric_memory_enabled,
 )
 from sglang.srt.graph import ops as kunpeng
 from sglang.srt.layers.dp_attention import (
@@ -1552,7 +1554,11 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        if self.use_dp_attention_reduce:
+        if _is_cpu_920f and not is_symmetric_memory_enabled():
+            # No symmetric pool exists on this CPU path. Avoid evaluating an
+            # unused group handle; collective logic below remains unchanged.
+            symm_ctx = nullcontext()
+        elif self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_attention_tp_group())
         else:
             symm_ctx = use_symmetric_memory(
@@ -1567,16 +1573,23 @@ class RowParallelLinear(LinearBase):
                     kunpeng.shm_fence_kunpeng(
                         get_attn_tensor_model_parallel_world_size()
                     )
-                kunpeng.shm_allreduce_kunpeng(
-                    output_parallel,
-                    # Role-level tag for profiling, derived from the weight
-                    # loading prefix with the layer index stripped, e.g.
-                    # "model.layers.5.self_attn.o_proj" -> "self_attn.o_proj".
-                    profile_name=(
-                        f"shm_allreduce_kunpeng@"
-                        f"{_kunpeng_allreduce_role(self) or 'row_parallel_linear'}"
-                    ),
-                )
+                if getattr(self, "_kunpeng_qwen_dense", False):
+                    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+                        allreduce,
+                    )
+
+                    allreduce(output_parallel)
+                else:
+                    kunpeng.shm_allreduce_kunpeng(
+                        output_parallel,
+                        # Role-level tag for profiling, derived from the weight
+                        # loading prefix with the layer index stripped, e.g.
+                        # "model.layers.5.self_attn.o_proj" -> "self_attn.o_proj".
+                        profile_name=(
+                            f"shm_allreduce_kunpeng@"
+                            f"{_kunpeng_allreduce_role(self) or 'row_parallel_linear'}"
+                        ),
+                    )
                 output = output_parallel
             elif self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,100 @@ try:
     from flashinfer.fused_moe.core import ActivationType
 except ImportError:
     flashinfer_cutlass_fused_moe = None
+
+
+# Generic capability, default off. The native library reads the same opt-in.
+_SMALL_M_FULL_K = os.environ.get("KUTACC_BF16_SMALL_M_FULL_K", "0") == "1"
+_SMALL_OUTPUT_DOT = os.environ.get("KUTACC_BF16_SMALL_OUTPUT_DOT", "0") == "1"
+
+
+def _small_output_decode_bf16_linear(x, weight, bias):
+    """Continuous-M BF16 row capability; preserve legal existing full-K routes."""
+    if (
+        bias is not None
+        or not isinstance(x, torch.Tensor)
+        or not isinstance(weight, torch.Tensor)
+        or x.ndim != 2
+        or weight.ndim != 2
+        or x.device.type != "cpu"
+        or weight.device.type != "cpu"
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+        or not 1 <= x.shape[0] <= 4096
+        or x.shape[1] != 5120
+        or tuple(weight.shape) != (6, 5120)
+    ):
+        return None
+    # Bounded continuous small-work route: one GraphOp, no caller allocation.
+    if x.shape[0] <= 32:
+        return kunpeng.bf16_small_output_gemm_kunpeng(x, weight)
+    # Retain the previously measured large-work full-K route when its public
+    # plan is legal. Nonaligned/tail M is handled by dot6, never an M whitelist.
+    if _SMALL_M_FULL_K and x.numel() >= 1024 * 5120:
+        packed = _small_output_bf16_linear(x, weight, bias)
+        if packed is not None:
+            return packed
+    workspace = kunpeng.alloc_buffer(x.shape[0] * 32, dtype=torch.bfloat16)
+    return kunpeng.bf16_small_output_gemm_workspace_kunpeng(x, weight, workspace)
+
+
+def _small_output_bf16_linear(x, weight, bias):
+    """Compute a small-output BF16 projection through the common packed GEMM.
+
+    Logical [M,K] @ [N,K].T becomes native [N,K] @ [M,K].T. Both
+    runtime Packs and the final contiguous transpose belong to this call.
+    Return None when the existing path should handle the input.
+    """
+    if (
+        bias is not None
+        or not isinstance(x, torch.Tensor)
+        or not isinstance(weight, torch.Tensor)
+        or x.ndim != 2
+        or weight.ndim != 2
+        or x.device.type != "cpu"
+        or weight.device.type != "cpu"
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        return None
+    m, k = x.shape
+    n = weight.shape[0]
+    if weight.shape[1] != k or m < 1024 or m % 32 or n != 6 or k < 4096 or k % 2:
+        return None
+    try:
+        # Pure scalar capability lookup: no Tensor computation is bypassed.
+        with torch._C._DisableTorchDispatch():
+            tile_m, tile_n, tile_k = map(
+                int, torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(n, m, k)
+            )
+    except RuntimeError:
+        # Capability lookup may have no legal 32-task plan for a genericK.
+        # Execution failures after this lookup remain visible to the caller.
+        return None
+    # No split-K BF16 partials; the right-hand live M rows form 32 tasks.
+    if (
+        tile_m != n
+        or tile_n < 32
+        or tile_n % 32
+        or tile_k != k
+        or m % tile_n
+        or m // tile_n != 32
+    ):
+        return None
+    # Keep the original short-circuit: query workers only for a legal plan.
+    with torch._C._DisableTorchDispatch():
+        threads = int(torch.ops.sgl_kernel.get_flash_attention_thread_num())
+    if threads != 32:
+        return None
+    left = kunpeng.bf16_gemm_pack_kunpeng(weight, n, k)
+    right = kunpeng.bf16_gemm_pack_kunpeng(x, tile_n, k)
+    workspace = kunpeng.alloc_buffer(1, dtype=torch.bfloat16)
+    transposed = kunpeng.bf16_packed_gemm_kunpeng(left, right, workspace, 32)
+    return transposed.transpose(0, 1).contiguous()
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -150,6 +245,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        elif getattr(layer, "_kunpeng_qwen_dense", False):
+            torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(layer.weight, 1)
+            layer._kunpeng_bf16_weight_packed = True
 
     def apply(
         self,
@@ -174,6 +272,43 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
+        if (
+            _is_cpu_920f
+            and _SMALL_OUTPUT_DOT
+            and not getattr(layer, "_kunpeng_bf16_weight_packed", False)
+        ):
+            output = _small_output_decode_bf16_linear(x, layer.weight, bias)
+            if output is not None:
+                return output
+
+        if (
+            _is_cpu_920f
+            and _SMALL_M_FULL_K
+            and not getattr(layer, "_kunpeng_bf16_weight_packed", False)
+        ):
+            output = _small_output_bf16_linear(x, layer.weight, bias)
+            if output is not None:
+                return output
+
+        if getattr(layer, "_kunpeng_bf16_weight_packed", False):
+            from sglang.srt.graph.torch_capture import native_call
+
+            shape = x.shape
+            flat = x.reshape(-1, shape[-1])
+            if flat.shape[0] >= 1024:
+                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.prefill import (
+                    dense_prefill,
+                )
+
+                output = dense_prefill(flat, layer.weight, bias)
+            else:
+                output = native_call(
+                    torch.ops.sgl_kernel.bf16_linear_kunpeng.default,
+                    flat,
+                    layer.weight,
+                    bias,
+                )
+            return output.reshape(*shape[:-1], layer.weight.shape[0])
         return F.linear(x, layer.weight, bias)
 
 

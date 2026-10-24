@@ -340,6 +340,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        borrowed_qwen_target_runner: Optional[ModelRunner] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -361,6 +362,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.borrowed_qwen_target_runner = borrowed_qwen_target_runner
+        if borrowed_qwen_target_runner is not None and not is_draft_worker:
+            raise ValueError("Only a draft runner may borrow attached Qwen MTP")
         self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
         self.device_timer = None
@@ -717,7 +721,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
         # In layered loading, torchao may have been applied
-        if not torchao_applied:
+        if not torchao_applied and self.borrowed_qwen_target_runner is None:
             apply_torchao_config_to_model(
                 self.model, get_global_server_args().torchao_config
             )
@@ -749,6 +753,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
+        if self.borrowed_qwen_target_runner is not None:
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_bridge import (
+                validate_borrowed_pools,
+            )
+
+            validate_borrowed_pools(self)
 
         # Init Kunpeng CPU swap HBM buffers (expert weights + KV cache).
         if _is_cpu_920f:
@@ -1369,7 +1379,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         if self.device == "cpu":
             if _is_cpu_920f:
-                pass
+                from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
+                    enabled,
+                    validate_config,
+                )
+
+                if enabled():
+                    validate_config(self)
+                    if self.borrowed_qwen_target_runner is None:
+                        self.model_config = adjust_config_with_unaligned_cpu_tp(
+                            self.model_config, self.load_config, get_attention_tp_size()
+                        )
             else:
                 self.model_config = adjust_config_with_unaligned_cpu_tp(
                     self.model_config, self.load_config, self.tp_size
@@ -1404,14 +1424,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
         ):
-            self.loader = get_model_loader(
-                load_config=self.load_config,
-                model_config=self.model_config,
-            )
-            self.model = self.loader.load_model(
-                model_config=self.model_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
-            )
+            if self.borrowed_qwen_target_runner is not None:
+                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_bridge import (
+                    bind_borrowed_model,
+                )
+
+                self.loader = None
+                self.model = bind_borrowed_model(self)
+            else:
+                self.loader = get_model_loader(
+                    load_config=self.load_config,
+                    model_config=self.model_config,
+                )
+                self.model = self.loader.load_model(
+                    model_config=self.model_config,
+                    device_config=DeviceConfig(self.device, self.gpu_id),
+                )
             if _is_cpu_920f:
                 self.kunpeng_runner.init_after_model_load()
 
@@ -1444,7 +1472,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._publish_modelexpress_metadata()
 
-        get_offloader().post_init()
+        if self.borrowed_qwen_target_runner is None:
+            get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
@@ -2159,6 +2188,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def hybrid_gdn_config(self):
+        if self.borrowed_qwen_target_runner is not None:
+            return None
         config = self.model_config.hf_config.get_text_config()
         if isinstance(
             config,
@@ -2316,6 +2347,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
+        if self.borrowed_qwen_target_runner is not None:
+            from sglang.srt.layers.attention.torch_native_backend import (
+                TorchNativeAttnBackend,
+            )
+
+            return TorchNativeAttnBackend(self)
         draft_attn_backend = self.server_args.speculative_draft_attention_backend
         if self.is_draft_worker and draft_attn_backend:
             logger.warning(

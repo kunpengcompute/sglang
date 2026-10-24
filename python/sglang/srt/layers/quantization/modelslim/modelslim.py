@@ -21,7 +21,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8MoE,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import apply_module_patch
+from sglang.srt.utils import apply_module_patch, is_cpu_920f
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -87,7 +87,20 @@ class ModelSlimConfig(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as qwen_enabled
+
+        self._cpu920f = is_cpu_920f() and qwen_enabled()
         self.quant_description = quant_config
+        if self._cpu920f:
+            normalized = {}
+            for key, value in self.quant_description.items():
+                canonical = key.replace("model.language_model.", "model.", 1)
+                if canonical in normalized:
+                    raise ValueError(
+                        f"ModelSlim description prefix collision: {canonical}"
+                    )
+                normalized[canonical] = value
+            self.quant_description = normalized
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
@@ -96,7 +109,7 @@ class ModelSlimConfig(QuantizationConfig):
         )
 
         for name in self.quant_description.keys():
-            if "norm.bias" in name:
+            if not self._cpu920f and "norm.bias" in name:
                 apply_module_patch(
                     "sglang.srt.layers.layernorm.RMSNorm",
                     "__init__",
@@ -107,6 +120,21 @@ class ModelSlimConfig(QuantizationConfig):
                     "forward_npu",
                     [npu_wrapper_rmsnorm_forward],
                 )
+
+    def for_component(self, component, *, execution_enabled=False):
+        # Independent config view; original language fused mapping is unchanged.
+        if not self._cpu920f or component not in ("vision", "mtp"):
+            raise ValueError("Deferred component requires explicit CPU ModelSlim")
+        if type(execution_enabled) is not bool or (
+            execution_enabled and component != "mtp"
+        ):
+            raise ValueError("Only explicit attached MTP can enable a component")
+        from copy import copy
+
+        result = copy(self)
+        result._execution_component = component
+        result._component_execution_enabled = execution_enabled
+        return result
 
     def get_linear_method(self) -> ModelSlimLinearMethod:
         return ModelSlimLinearMethod(self)
@@ -141,6 +169,36 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            component = getattr(self, "_execution_component", None)
+            if component is not None:
+                from sglang.srt.layers.quantization.modelslim.schemes.deferred_raw_w8a8_dynamic import (
+                    DeferredRawW8A8Dynamic,
+                )
+
+                layer._runtime_component = component
+                canonical = prefix.replace("model.language_model.", "model.", 1)
+                # Vision checkpoint QKV is already fused; language/MTP QKV is not.
+                mapping = {} if component == "vision" else self.packed_modules_mapping
+                if component == "vision":
+                    canonical = canonical.replace(".attn.qkv_proj", ".attn.qkv")
+                if self.is_layer_skipped(canonical, mapping):
+                    return UnquantizedLinearMethod()
+                proj = canonical.rsplit(".", 1)[-1]
+                source = mapping.get(proj, [proj])[0]
+                canonical = canonical.rsplit(".", 1)[0] + "." + source
+                if getattr(self, "_component_execution_enabled", False):
+                    if component != "mtp":
+                        raise ValueError(
+                            "Only attached MTP may execute a component scheme"
+                        )
+                    layer.scheme = self.get_linear_scheme(layer, canonical)
+                else:
+                    layer.scheme = DeferredRawW8A8Dynamic(
+                        self.quant_description, canonical
+                    )
+                return ModelSlimLinearMethod(self)
+            if self._cpu920f:
+                prefix = prefix.replace("model.language_model.", "model.", 1)
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
             if "vision_model" in prefix:
@@ -153,13 +211,26 @@ class ModelSlimConfig(QuantizationConfig):
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
-            if proj_name in packed_modules_mapping_subset:
-                prefix_in_quant_config = prefix.replace(
-                    proj_name, packed_modules_mapping_subset[proj_name][0]
+            source_mapping = (
+                self.packed_modules_mapping
+                if self._cpu920f
+                else packed_modules_mapping_subset
+            )
+            if proj_name in source_mapping:
+                prefix_in_quant_config = (
+                    prefix.rsplit(".", 1)[0] + "." + source_mapping[proj_name][0]
+                    if self._cpu920f
+                    else prefix.replace(proj_name, source_mapping[proj_name][0])
                 )
-            if self.is_layer_skipped(
-                prefix, packed_modules_mapping_subset
-            ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
+            skip_layer = (
+                self.is_layer_skipped(prefix, self.packed_modules_mapping)
+                if self._cpu920f
+                else (
+                    self.is_layer_skipped(prefix, packed_modules_mapping_subset)
+                    or self.is_layer_skipped(prefix, self.packed_modules_mapping)
+                )
+            )
+            if skip_layer:
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             return ModelSlimLinearMethod(self)
@@ -175,6 +246,18 @@ class ModelSlimConfig(QuantizationConfig):
         get_scheme method adjusted for modelslim, taken from
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
         """
+
+        if self._cpu920f:
+            from sglang.srt.layers.quantization.modelslim.schemes.cpu920f_w8a8_dynamic import (
+                CPU920FModelSlimW8A8Dynamic,
+            )
+
+            mode = self.quant_description.get(prefix + ".weight")
+            if mode != "W8A8_DYNAMIC":
+                raise ValueError(
+                    f"CPU920F requires W8A8_DYNAMIC, got {mode!r} for {prefix}"
+                )
+            return CPU920FModelSlimW8A8Dynamic(self.quant_description, prefix)
 
         linear_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
@@ -228,6 +311,23 @@ class ModelSlimConfig(QuantizationConfig):
     ):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
+        if self._cpu920f:
+            sources = fused_mapping.get(proj_name, [proj_name])
+            modes = [
+                self.quant_description.get(
+                    prefix.rsplit(".", 1)[0] + "." + source + ".weight"
+                )
+                for source in sources
+            ]
+            if any(mode not in ("FLOAT", "W8A8_DYNAMIC") for mode in modes):
+                raise ValueError(
+                    f"CPU920F missing/unsupported quant description for {prefix}: {modes}"
+                )
+            if len(set(modes)) != 1:
+                raise ValueError(
+                    f"CPU920F mixed quant precision in fused {prefix}: {modes}"
+                )
+            return modes[0] == "FLOAT"
         if proj_name in fused_mapping:
             shard_prefixes = [
                 prefix.replace(proj_name, shard_proj_name)

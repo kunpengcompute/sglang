@@ -751,6 +751,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if hasattr(self, "_runtime_capabilities"):
+            self._runtime_capabilities.require("vision")
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
@@ -861,6 +863,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if hasattr(self, "_runtime_capabilities"):
+            self._runtime_capabilities.require("vision")
         (
             x,
             cu_seqlens,
@@ -882,6 +886,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if hasattr(self, "_runtime_capabilities"):
+            self._runtime_capabilities.require("vision")
         (
             x,
             cu_seqlens,
@@ -905,6 +911,10 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if hasattr(self, "_runtime_capabilities"):
+            raise RuntimeError(
+                "Attached visual weights must use the enclosing whole checkpoint loader"
+            )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("attn.qkv.", "attn.q.", "q"),
@@ -1089,6 +1099,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         language_model_cls=Qwen3LLMModel,
+        visual_quant_config=None,
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
@@ -1100,7 +1111,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=None,
+            quant_config=visual_quant_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("model.visual", prefix),
             use_data_parallel=self.use_data_parallel,
@@ -1147,7 +1158,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        rope_config = (
+            getattr(self.config, "rope_parameters", None)
+            or getattr(self.config, "rope_scaling", None)
+            or {}
+        )
+        self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -1191,6 +1207,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if hasattr(self, "runtime_capabilities"):
+            self.runtime_capabilities.require("vision")
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -1210,6 +1228,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if hasattr(self, "runtime_capabilities"):
+            self.runtime_capabilities.require("vision")
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -1256,6 +1276,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
+        if hasattr(self, "runtime_capabilities"):
+            self.runtime_capabilities.require("language")
+            if forward_batch.contains_mm_inputs():
+                self.runtime_capabilities.require("vision")
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 

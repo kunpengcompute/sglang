@@ -29,18 +29,24 @@ __all__ = [
     "KunpengHBWPool",
 ]
 
+
 def dtype_str(dtype: torch.dtype) -> str:
     """Convert torch.dtype to numpy dtype string.
-    
+
     Note: numpy does not support bfloat16, use uint16 as base.
     """
     if dtype == torch.bfloat16:
         return "uint16"
-    return {torch.float32: "float32", torch.float16: "float16",
-            torch.float64: "float64",
-            torch.int32: "int32", torch.int64: "int64",
-            torch.int8: "int8", torch.uint8: "uint8",
-            torch.bool: "bool"}.get(dtype, str(dtype).split(".")[-1])
+    return {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.float64: "float64",
+        torch.int32: "int32",
+        torch.int64: "int64",
+        torch.int8: "int8",
+        torch.uint8: "uint8",
+        torch.bool: "bool",
+    }.get(dtype, str(dtype).split(".")[-1])
 
 
 class KunpengHBWPool:
@@ -69,14 +75,62 @@ class KunpengHBWPool:
         self.alignment = alignment
 
         # Allocate the entire pool (returns a uint8 tensor wrapping the HBM memory)
-        self._base_tensor = torch.ops.sgl_kernel.hbw_allocator_kunpeng(pool_size_bytes)
+        self._borrowed_shared = (
+            os.environ.get("SGLANG_KUNPENG_SHARED_HBW_BACKING") == "1"
+        )
+        self._split_shared = (
+            os.environ.get("SGLANG_KUNPENG_SHARED_HBW_BACKING") == "split"
+        )
+        self.total_budget_bytes = pool_size_bytes
+        self._payload_reserved_bytes = 0
+        if self._split_shared:
+            if name != "default" or pool_size_bytes != 4000 * 1024 * 1024:
+                raise RuntimeError(
+                    "Split HBW mode requires the default pool and 4000 MiB total rank budget"
+                )
+            info = torch.ops.sgl_kernel.shared_hbw_info_kunpeng()
+            if not info[0] or info[2] != info[3] or info[6] != 0 or info[7] != 0:
+                raise RuntimeError(
+                    "Split HBW mode requires one initialized prefix-only KuPL window"
+                )
+            pool_size_bytes -= int(info[2])
+            if pool_size_bytes <= 0:
+                raise RuntimeError("SHM payload exhausts total rank budget")
+            self.pool_size = pool_size_bytes
+        if self._borrowed_shared:
+            if name != "default":
+                raise RuntimeError(
+                    "Shared HBW backing supports only the existing default pool"
+                )
+            self._base_tensor = torch.ops.sgl_kernel.shared_hbw_backing_kunpeng(
+                pool_size_bytes
+            )
+            info = torch.ops.sgl_kernel.shared_hbw_info_kunpeng()
+            if not info[0] or info[2] != pool_size_bytes:
+                raise RuntimeError("Shared HBW window/pool budget mismatch")
+            self._payload_reserved_bytes = int(info[3])
+        else:
+            self._base_tensor = torch.ops.sgl_kernel.hbw_allocator_kunpeng(
+                pool_size_bytes
+            )
         self._base_addr = self._base_tensor.data_ptr()
         if self._base_addr == 0:
-            raise RuntimeError(f"HBW pool allocation failed for {pool_size_bytes} bytes")
+            raise RuntimeError(
+                f"HBW pool allocation failed for {pool_size_bytes} bytes"
+            )
 
-        self._free_blocks: list = [(0, pool_size_bytes)]
+        self._free_blocks: list = [
+            (
+                self._payload_reserved_bytes,
+                pool_size_bytes - self._payload_reserved_bytes,
+            )
+        ]
         self._allocated: dict = {}
         self._pending_free: list = []
+        self._reserved_offsets = set()
+        if self._payload_reserved_bytes:
+            self._allocated[0] = (0, self._payload_reserved_bytes, 0)
+            self._reserved_offsets.add(0)
 
         self._alloc_version = 0
         self._lock = threading.Lock()
@@ -158,7 +212,7 @@ class KunpengHBWPool:
         num_bytes = math.prod(shape) * dtype.itemsize
 
         if num_bytes == 0:
-            return torch.empty(shape, dtype=dtype, device=self._buffer.device)
+            return torch.empty(shape, dtype=dtype, device=self._base_tensor.device)
 
         with self._lock:
             self._process_pending_free()
@@ -195,11 +249,22 @@ class KunpengHBWPool:
                 continue
 
             # Create tensor
-            chunk = (ctypes.c_char * num_bytes).from_address(self._base_addr + aligned_start)
-            np_arr = np.frombuffer(chunk, dtype=np.dtype(dtype_str(dtype)))
-            tensor = torch.from_numpy(np_arr).reshape(shape)
-            if dtype == torch.bfloat16:
-                tensor = tensor.view(torch.int16).view(torch.bfloat16)
+            if self._borrowed_shared:
+                tensor = (
+                    torch.ops.sgl_kernel.shared_hbw_slice_kunpeng(
+                        aligned_start, num_bytes
+                    )
+                    .view(dtype)
+                    .reshape(shape)
+                )
+            else:
+                chunk = (ctypes.c_char * num_bytes).from_address(
+                    self._base_addr + aligned_start
+                )
+                np_arr = np.frombuffer(chunk, dtype=np.dtype(dtype_str(dtype)))
+                tensor = torch.from_numpy(np_arr).reshape(shape)
+                if dtype == torch.bfloat16:
+                    tensor = tensor.view(torch.int16).view(torch.bfloat16)
 
             self._free_blocks.pop(i)
             if padding > 0:
@@ -219,11 +284,20 @@ class KunpengHBWPool:
             return tensor
         return None
 
+    def reserve(self, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """Pin a process-lifetime arena; its Storage owns suballocation leases."""
+        tensor = self.alloc(shape, dtype, auto_free=False)
+        with self._lock:
+            self._reserved_offsets.add(tensor.data_ptr() - self._base_addr)
+        return tensor
+
     def free(self, tensor: torch.Tensor) -> None:
         """Free a previously allocated tensor."""
         offset = tensor.data_ptr() - self._base_addr
         with self._lock:
             self._process_pending_free()
+            if offset in self._reserved_offsets:
+                raise RuntimeError("HBW arena is reserved for process lifetime")
             if offset not in self._allocated:
                 raise KeyError(
                     f"Tensor at offset {offset} is not from this pool "
@@ -267,6 +341,8 @@ class KunpengHBWPool:
     def reset(self) -> None:
         """Reset the pool, freeing all allocations at once."""
         with self._lock:
+            if self._reserved_offsets:
+                raise RuntimeError("Cannot reset HBW pool with live reserved arenas")
             self._free_blocks = [(0, self.pool_size)]
             self._allocated.clear()
             self._pending_free.clear()
@@ -291,11 +367,103 @@ class KunpengHBWPool:
         """Return number of currently allocated tensors."""
         return len(self._allocated)
 
+    @property
+    def free_bytes(self) -> int:
+        """Return total free bytes after flushing pending finalizers."""
+        with self._lock:
+            self._process_pending_free()
+            return sum(size for _, size in self._free_blocks)
+
+    def backing_snapshot(self):
+        """Read-only accounting; physical placement is verified independently."""
+        if self._split_shared:
+            enabled, shm_base, shm_bytes, prefix, used_shm, remaining, _, _, rank = map(
+                int, torch.ops.sgl_kernel.shared_hbw_info_kunpeng()
+            )
+            leases, pending = map(
+                int, torch.ops.sgl_kernel.shared_hbw_lease_info_kunpeng()
+            )
+            with self._lock:
+                self._process_pending_free()
+                used = self.used_bytes
+                free = sum(size for _, size in self._free_blocks)
+            return dict(
+                enabled=bool(enabled),
+                transport_mode="split",
+                mapping_count=2,
+                backing_owner="kupl_shm_and_private_hbw",
+                owns_mapping=True,
+                shared_owns_mapping=False,
+                total_budget_bytes=self.total_budget_bytes,
+                shm_base=shm_base,
+                shm_bytes=shm_bytes,
+                shm_prefix_bytes=prefix,
+                shm_used_bytes=used_shm,
+                shm_remaining_bytes=remaining,
+                intra_node_rank=rank,
+                private_base=self._base_addr,
+                private_bytes=self.pool_size,
+                pool_bytes=self.pool_size,
+                pool_used_bytes=used,
+                pool_free_bytes=free,
+                pool_payload_reserved_bytes=0,
+                budget_reserved_shm_bytes=shm_bytes,
+                tail_used_bytes=used,
+                tail_free_bytes=free,
+                total_used_bytes=shm_bytes + used,
+                total_free_bytes=free,
+                lease_count=leases,
+                destroy_requested=bool(pending),
+                mapping_ranges=[
+                    dict(kind="shm_payload", base=shm_base, bytes=shm_bytes),
+                    dict(
+                        kind="private_hbw", base=self._base_addr, bytes=self.pool_size
+                    ),
+                ],
+            )
+        if not self._borrowed_shared:
+            return {
+                "enabled": False,
+                "backing_owner": "private_hbw",
+                "owns_mapping": True,
+            }
+        keys = (
+            "enabled",
+            "window_base",
+            "window_bytes",
+            "shm_prefix_bytes",
+            "shm_used_bytes",
+            "shm_remaining_bytes",
+            "tail_base",
+            "tail_bytes",
+            "intra_node_rank",
+        )
+        info = dict(zip(keys, map(int, torch.ops.sgl_kernel.shared_hbw_info_kunpeng())))
+        leases, pending = map(int, torch.ops.sgl_kernel.shared_hbw_lease_info_kunpeng())
+        with self._lock:
+            self._process_pending_free()
+            used = self.used_bytes
+            free = sum(size for _, size in self._free_blocks)
+        info.update(
+            pool_bytes=self.pool_size,
+            pool_used_bytes=used,
+            pool_free_bytes=free,
+            payload_reserved_bytes=self._payload_reserved_bytes,
+            tail_used_bytes=used - self._payload_reserved_bytes,
+            tail_free_bytes=free,
+            backing_owner="kupl_window",
+            owns_mapping=False,
+            lease_count=leases,
+            destroy_requested=bool(pending),
+        )
+        return info
+
     def __del__(self):
         tensor = getattr(self, "_base_tensor", None)
         if tensor is not None:
             try:
-                torch.ops.sgl_kernel.hbw_destroy_kunpeng(tensor)
+                if not getattr(self, "_borrowed_shared", False):
+                    torch.ops.sgl_kernel.hbw_destroy_kunpeng(tensor)
             except Exception:
                 pass
             self._base_tensor = None

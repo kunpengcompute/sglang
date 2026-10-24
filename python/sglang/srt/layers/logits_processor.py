@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as qwen_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,
@@ -929,6 +930,16 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            elif _is_cpu_920f and getattr(lm_head, "_kunpeng_lm_head_role", False):
+                from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import (
+                    try_linear,
+                )
+
+                hs = hidden_states.to(lm_head.weight.dtype)
+                logits = try_linear(hs, lm_head, embedding_bias)
+                if logits is None:
+                    # Always use the original logical weight for M1/other paths.
+                    logits = torch.matmul(hs, lm_head.weight.T)
             elif _is_cpu_920f:
                 M, K = hidden_states.shape
                 # The optimal kernel of BGEMM requires M to be a multiple of 64, so we need to align M to 64.

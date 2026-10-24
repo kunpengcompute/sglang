@@ -7,6 +7,7 @@ from sglang.srt.graph._capture import (
     lookup_or_register,
     record_op,
     register_output,
+    suppress_adapter_dispatch,
     upgrade_storage_memory_type,
 )
 
@@ -15,6 +16,7 @@ from sglang.srt.graph._capture import (
 # diagnosis.
 _DEBUG = os.environ.get("SGLANG_GRAPH_DEBUG_PRINT", "0") not in ("", "0")
 _IDLE = False
+
 
 class idle_forward_mode:
     """Mark the current forward as IDLE to suppress op debug prints."""
@@ -39,10 +41,15 @@ class GraphOp:
         self.capture_scalar_args = capture_scalar_args
 
     def __call__(self, *args, **kwargs):
-        profile_name = kwargs.pop('profile_name', '')
+        profile_name = kwargs.pop("profile_name", "")
         if is_capturing():
             if _DEBUG and not _IDLE:
                 print(f"[capture] {self.name}", flush=True)
+            # Explicit registered ops already declare their full computation.
+            # Do not record placeholder allocations inside their shape adapter.
+            if suppress_adapter_dispatch():
+                with torch._C._DisableTorchDispatch():
+                    return self._capture(args, kwargs, profile_name)
             return self._capture(args, kwargs, profile_name)
         if self.eager_fn:
             if _DEBUG and not _IDLE:

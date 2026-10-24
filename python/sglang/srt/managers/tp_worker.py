@@ -237,6 +237,7 @@ class TpModelWorker(BaseTpWorker):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
+        borrowed_qwen_target_runner: Optional[ModelRunner] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -251,6 +252,11 @@ class TpModelWorker(BaseTpWorker):
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
         self.is_multi_layer_eagle = is_multi_layer_eagle
+        self.borrowed_qwen_target_runner = borrowed_qwen_target_runner
+        if borrowed_qwen_target_runner is not None and (
+            not is_draft_worker or is_multi_layer_eagle
+        ):
+            raise ValueError("Attached Qwen MTP requires one borrowed draft runner")
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.memory_pool_config = memory_pool_config
@@ -343,6 +349,15 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=self.is_draft_worker,
         )
 
+        if self.borrowed_qwen_target_runner is not None:
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_bridge import (
+                configure_borrowed_draft,
+            )
+
+            self.model_config = configure_borrowed_draft(
+                self.model_config, self.borrowed_qwen_target_runner
+            )
+
     def _init_model_runner(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -364,6 +379,7 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            borrowed_qwen_target_runner=self.borrowed_qwen_target_runner,
         )
 
     def _init_multi_layer_eagle_model_runners(self):

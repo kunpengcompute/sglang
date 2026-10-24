@@ -31,6 +31,10 @@
 #include "../memory/kunpeng_shm.h"
 #include <kutacc.h>
 
+#ifndef SGLANG_KUTACC_HAS_FULL_ALLGATHER
+#define SGLANG_KUTACC_HAS_FULL_ALLGATHER 1
+#endif
+
 static kutacc::shm_allgather_request_h g_ag_request = nullptr;        // comm16
 static kutacc::shm_allgather_request_h g_ag_request_comm8 = nullptr;  // comm8
 static bool g_ag_initialized = false;
@@ -254,6 +258,7 @@ void shm_allgather_finalize_kunpeng()
 
 void rdma_allgather_full_init_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size)
 {
+#if SGLANG_KUTACC_HAS_FULL_ALLGATHER
     TORCH_CHECK(g_comm_initialized, "MoE RDMA communication domain not initialized");
     ensure_ctrl_domain_kunpeng();  // no-op after the first call
     TORCH_CHECK(g_ctrl_ds_conn_info != nullptr, "ctrl RDMA communication domain not initialized");
@@ -263,10 +268,16 @@ void rdma_allgather_full_init_kunpeng(at::Tensor send_buf, int64_t send_size, at
 
     kutacc::kurmcl_allgather_full_init(send_buf_ptr, static_cast<int>(send_size), recv_buf_ptr,
                                        static_cast<int>(recv_size), g_ctrl_ds_conn_info);
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_FULL_ALLGATHER; install a matching KuTACC release to use rdma_allgather_full_init_kunpeng");
+
+#endif
 }
 
 void rdma_allgather_full_kunpeng(at::Tensor send_buf, int64_t send_size, at::Tensor recv_buf, int64_t recv_size)
 {
+#if SGLANG_KUTACC_HAS_FULL_ALLGATHER
     TORCH_CHECK(g_ctrl_ds_conn_info != nullptr, "ctrl RDMA communication domain not initialized");
 
     void *send_buf_ptr = reinterpret_cast<void *>(send_buf.data_ptr());
@@ -275,10 +286,19 @@ void rdma_allgather_full_kunpeng(at::Tensor send_buf, int64_t send_size, at::Ten
     int ret = kutacc::kurmcl_allgather_full(send_buf_ptr, static_cast<int>(send_size), recv_buf_ptr,
                                             static_cast<int>(recv_size), g_ctrl_ds_conn_info);
     TORCH_CHECK(ret == 0, "kurmcl_allgather_full failed with code ", ret);
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_FULL_ALLGATHER; install a matching KuTACC release to use rdma_allgather_full_kunpeng");
+
+#endif
 }
 
 void rdma_allgather_full_finalize_kunpeng()
 {
+#if SGLANG_KUTACC_HAS_FULL_ALLGATHER
     TORCH_CHECK(g_comm_initialized, "RDMA communication domain not initialized");
     kutacc::kurmcl_allgather_full_finalize();
+
+#else
+#endif
 }

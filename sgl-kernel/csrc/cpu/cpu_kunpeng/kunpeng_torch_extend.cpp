@@ -413,12 +413,18 @@ void moe_local_sum_kunpeng(at::Tensor moe_down, at::Tensor topk_ids_index, at::T
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb);
 
 void shm_pool_destroy_kunpeng();
+std::vector<int64_t> shared_hbw_info_kunpeng();
+std::vector<int64_t> shared_hbw_lease_info_kunpeng();
+at::Tensor shared_hbw_backing_kunpeng(int64_t expected_bytes);
+at::Tensor shared_hbw_slice_kunpeng(int64_t offset, int64_t bytes);
 
 bool is_shm_tensor(at::Tensor tensor);
 
 int64_t shm_remaining_bytes_kunpeng();
 
 at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t> shape);
+
+at::Tensor get_or_create_shm_tensor(int64_t dim, int64_t bs);
 
 void shm_reduce_scatter_init_kunpeng();
 
@@ -1163,6 +1169,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("shm_pool_destroy_kunpeng() -> ()");
     m.impl("shm_pool_destroy_kunpeng", shm_pool_destroy_kunpeng);
+    m.def("shared_hbw_info_kunpeng() -> int[]");
+    m.impl("shared_hbw_info_kunpeng", shared_hbw_info_kunpeng);
+    m.def("shared_hbw_lease_info_kunpeng() -> int[]");
+    m.impl("shared_hbw_lease_info_kunpeng", shared_hbw_lease_info_kunpeng);
+    m.def("shared_hbw_backing_kunpeng(int expected_bytes) -> Tensor");
+    m.impl("shared_hbw_backing_kunpeng", shared_hbw_backing_kunpeng);
+    m.def("shared_hbw_slice_kunpeng(int offset, int bytes) -> Tensor");
+    m.impl("shared_hbw_slice_kunpeng", shared_hbw_slice_kunpeng);
 
     m.def("is_shm_tensor(Tensor tensor) -> bool");
     m.impl("is_shm_tensor", is_shm_tensor);
@@ -1172,6 +1186,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 
     m.def("create_shm_tensor_kunpeng(ScalarType dtype, int[] shape) -> Tensor");
     m.impl("create_shm_tensor_kunpeng", create_shm_tensor_kunpeng);
+
+    m.def("get_or_create_shm_tensor_kunpeng(int dim, int bs) -> Tensor");
+    m.impl("get_or_create_shm_tensor_kunpeng", get_or_create_shm_tensor);
 
     // SHM Reduce Scatter operators
     m.def("shm_reduce_scatter_init_kunpeng() -> ()");

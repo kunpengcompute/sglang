@@ -40,10 +40,15 @@
 
 #include <kutacc.h>
 
+#ifndef SGLANG_KUTACC_HAS_MLA_REDUCE
+#define SGLANG_KUTACC_HAS_MLA_REDUCE 1
+#endif
+
 #include "../utils/utils.h"
 
 void flash_mla_reduce_kunpeng(at::Tensor input, at::Tensor softmax_lse, at::Tensor out)
 {
+#if SGLANG_KUTACC_HAS_MLA_REDUCE
     TORCH_CHECK(input.scalar_type() == at::kBFloat16 && input.is_contiguous(),
                 "input must be contiguous bf16");
     TORCH_CHECK(softmax_lse.scalar_type() == at::kFloat && softmax_lse.is_contiguous(),
@@ -63,4 +68,9 @@ void flash_mla_reduce_kunpeng(at::Tensor input, at::Tensor softmax_lse, at::Tens
 
     kutacc::flash_mla_reduce(to_kutacc<bfloat16_t, 3>(input), to_kutacc<float, 2>(softmax_lse),
                              to_kutacc<bfloat16_t, 2>(out));
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_MLA_REDUCE; install a matching KuTACC release to use flash_mla_reduce_kunpeng");
+
+#endif
 }

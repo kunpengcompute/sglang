@@ -219,6 +219,7 @@ void init_graph_cpp(py::module& m)
         .def_readwrite("has_hidden_states", &Graph::has_hidden_states)
         .def("run", &Graph::run)
         .def("set_fixed", &Graph::set_fixed)
+        .def("describe_plan", &Graph::describe_plan)
         .def("enable_profile", &Graph::enable_profile)
         .def("get_profile_row", &Graph::get_profile_row)
         .def("profile_op_names", &Graph::profile_op_names,

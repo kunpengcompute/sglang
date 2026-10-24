@@ -727,6 +727,17 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
+    def get_kunpeng_graph_provider(self, runner):
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled
+
+        if enabled():
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.graph_provider import (
+                QwenHybridGraphProvider,
+            )
+
+            return QwenHybridGraphProvider(runner)
+        return None
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
@@ -966,6 +977,40 @@ class HybridLinearAttnBackend(AttentionBackend):
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled
+
+        if enabled() and ssm_states.device.type == "cpu":
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.speculative import (
+                commit_states,
+            )
+
+            commit_states(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                accepted_steps,
+            )
+            commit_states(
+                conv_states,
+                intermediate_conv_window_cache,
+                state_indices_tensor,
+                accepted_steps,
+            )
+            if mamba_track_indices is not None:
+                commit_states(
+                    ssm_states,
+                    intermediate_state_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+                commit_states(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+            return
 
         # Use fully fused kernel that handles masking internally
         # This avoids separate nonzero() and index_select() calls

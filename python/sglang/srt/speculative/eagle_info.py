@@ -1,7 +1,7 @@
 import logging
 import os
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import torch
@@ -99,6 +99,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
+
+    # Worker-owned eligibility; excluded from the public constructor.
+    _kunpeng_attached_qwen_greedy: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
@@ -715,7 +718,32 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+            logits = logits_output.next_token_logits
+            if (
+                self._kunpeng_attached_qwen_greedy
+                and is_all_greedy
+                and is_cpu_920f()
+                and logits.device.type == "cpu"
+                and logits.dtype == torch.bfloat16
+                and logits.ndim == 2
+                and logits.is_contiguous()
+                and logits.shape[0] == bs * self.draft_token_num
+                and logits.shape[1] > 0
+            ):
+                # Match the existing CPU greedy sampler's tie policy on the
+                # same processed BF16 logits; do not run preprocessing twice.
+                height, width = logits.shape
+                target_predict = torch.empty(
+                    height, dtype=torch.int64, device=logits.device
+                )
+                token_probs = torch.empty(
+                    height, dtype=torch.float32, device=logits.device
+                )
+                torch.ops.sgl_kernel.argmax_kunpeng(
+                    logits, target_predict, token_probs, height, width
+                )
+            else:
+                target_predict = torch.argmax(logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_accepted_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
@@ -816,9 +844,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(
-            zip(batch.reqs, accept_index_cpu)
-        ):
+        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
             num_accepted = 0
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
@@ -853,9 +879,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
-            accepted_draft_tokens = (
-                sum(1 for idx in accept_index_row if idx != -1) - 1
-            )
+            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
             req.spec_accepted_drafts += accepted_draft_tokens
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
@@ -919,15 +943,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
-                src_cache_loc, tgt_cache_loc, to_free_num_slots = (
-                    get_src_tgt_cache_loc(
-                        batch.seq_lens,
-                        batch.out_cache_loc,
-                        accept_index,
-                        num_accepted_drafts,
-                        self.draft_token_num,
-                        page_size,
-                    )
+                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    accept_index,
+                    num_accepted_drafts,
+                    self.draft_token_num,
+                    page_size,
                 )
                 to_free_slots = torch.empty(
                     (to_free_num_slots.sum().item(),),

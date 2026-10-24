@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.utils import (
@@ -215,9 +216,6 @@ def adjust_config_with_unaligned_cpu_tp(
                 + model_config.hf_config.qk_rope_head_dim,
             )
 
-        query_heads_per_kv = (
-            model_config.num_attention_heads // model_config.get_total_num_kv_heads()
-        )
         total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
@@ -225,10 +223,23 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config, model_config.num_attention_heads, True
         )
 
-        pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
-        num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
-
-        num_attention_heads = num_key_value_heads * query_heads_per_kv
+        use_qwen36_compact_heads = (
+            os.environ.get("SGLANG_KUNPENG_QWEN", "0") == "1"
+            and tp_size == 16
+            and model_config.num_attention_heads == 24
+            and total_kv_heads == 4
+            and head_dim == 256
+        )
+        if use_qwen36_compact_heads:
+            # Four replicas of each real KV head. Its six real Q heads are
+            # distributed 2/2/1/1, with two zero O-projection dummy slots.
+            num_key_value_heads = 16
+            num_attention_heads = 32
+        else:
+            query_heads_per_kv = model_config.num_attention_heads // total_kv_heads
+            pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
+            num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
+            num_attention_heads = num_key_value_heads * query_heads_per_kv
         for config in [
             model_config,
             model_config.hf_config,

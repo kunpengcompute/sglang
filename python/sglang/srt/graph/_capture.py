@@ -11,17 +11,25 @@ _captured_num_inputs = None
 _captured_fixed = None
 _none_storage_id = None
 _captured_input_map = None
+_captured_input_views = None
+_suppress_adapter_dispatch = False
 
 
 class _CaptureContext:
-    def __init__(self, inputs, fixed=None):
+    def __init__(
+        self, inputs, fixed=None, *, allow_input_aliases=False,
+        suppress_adapter_dispatch=False,
+    ):
         self.inputs = inputs
         self.fixed = fixed or []
+        self.allow_input_aliases = allow_input_aliases
+        self.suppress_adapter_dispatch = suppress_adapter_dispatch
 
     def __enter__(self):
-        global _captured_storages, _captured_views, _captured_ops, \
-               _captured_num_inputs, _captured_fixed, _none_storage_id, \
-               _captured_input_map
+        global _suppress_adapter_dispatch
+        global _captured_storages, _captured_views, _captured_ops
+        global _captured_num_inputs, _captured_fixed, _none_storage_id
+        global _captured_input_map, _captured_input_views
         _captured_storages = None
         _captured_views = None
         _captured_ops = None
@@ -32,25 +40,51 @@ class _CaptureContext:
         mgr = _C.CaptureManager.instance()
         mgr.begin_capture(self.inputs, self.fixed)
         _captured_input_map = {}
+        _captured_input_views = {} if self.allow_input_aliases else None
+        _suppress_adapter_dispatch = self.suppress_adapter_dispatch
         for i, t in enumerate(self.inputs):
             _captured_input_map[id(t)] = (i, _C.storage_offset(t), i)
+            if _captured_input_views is not None:
+                _captured_input_views[
+                    (i, t.storage_offset(), tuple(t.shape), tuple(t.stride()), t.dtype)
+                ] = i
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _captured_storages, _captured_views, _captured_ops, \
-               _captured_num_inputs, _captured_fixed, _captured_input_map
+        global _suppress_adapter_dispatch
+        global _captured_storages, _captured_views, _captured_ops
+        global _captured_num_inputs, _captured_fixed
+        global _captured_input_map, _captured_input_views
         mgr = _C.CaptureManager.instance()
-        if mgr.is_capturing():
-            _captured_storages, _captured_views, _captured_ops, \
-                _captured_num_inputs = mgr.end_capture()
-            n = len(self.inputs)
-            _captured_fixed = {n + i: t for i, t in enumerate(self.fixed)}
-        _captured_input_map = None
+        try:
+            if mgr.is_capturing():
+                _captured_storages, _captured_views, _captured_ops, _captured_num_inputs = (
+                    mgr.end_capture()
+                )
+                n = len(self.inputs)
+                _captured_fixed = {n + i: t for i, t in enumerate(self.fixed)}
+        finally:
+            _captured_input_map = None
+            _captured_input_views = None
+            _suppress_adapter_dispatch = False
         return False
 
 
-def capture(inputs, fixed=None):
-    return _CaptureContext(inputs, fixed)
+def capture(
+    inputs, fixed=None, *, allow_input_aliases=False,
+    suppress_adapter_dispatch=False,
+):
+    """Capture with the upstream contract unless a provider opts into extensions."""
+    return _CaptureContext(
+        inputs, fixed,
+        allow_input_aliases=allow_input_aliases,
+        suppress_adapter_dispatch=suppress_adapter_dispatch,
+    )
+
+
+def suppress_adapter_dispatch():
+    """Only automatic ATen capture must hide GraphOp placeholder allocations."""
+    return _suppress_adapter_dispatch
 
 
 def finalize(outputs, external_pool=None, external_shm_pool=None):
@@ -150,13 +184,36 @@ def lookup_or_register(tensor, idx=0):
         )
     assert sid >= 0, "non-return-value parameter tensor not registered"
 
-    vid = mgr.find_or_register_view(sid, so, tensor)
+    if _captured_input_views is not None and sid < len(_captured_input_map):
+        # The common executor already rebinds secondary input views on every
+        # run. Register metadata-only aliases here for DSOs whose capture
+        # manager still insists that external inputs use their primary view.
+        key = (sid, so, tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+        vid = _captured_input_views.get(key)
+        if vid is None:
+            assert all(s >= 0 for s in tensor.stride()), "Negative graph input stride"
+            end = so + (
+                1 + sum((n - 1) * s for n, s in zip(tensor.shape, tensor.stride()))
+                if tensor.numel()
+                else 0
+            )
+            assert (
+                0 <= so
+                and end * tensor.element_size() <= tensor.untyped_storage().nbytes()
+            )
+            _, view = _C.tensor_to_buf_and_view(tensor)
+            view.storage_id = sid
+            view.is_return = False
+            vid = mgr.register_view(view)
+            _captured_input_views[key] = vid
+    else:
+        vid = mgr.find_or_register_view(sid, so, tensor)
     return vid, so, sid
 
 
 _MEMORY_TYPE_TO_ENUM = {
-    'regular': _C.MemoryType.REGULAR,
-    'shm': _C.MemoryType.SHM,
+    "regular": _C.MemoryType.REGULAR,
+    "shm": _C.MemoryType.SHM,
 }
 
 
