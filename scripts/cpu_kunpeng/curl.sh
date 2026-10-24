@@ -23,16 +23,24 @@ usage() {
   echo ""
   echo "Options:"
   echo "  -h          Show this help message"
-  echo "  -f FILE     Prompt file, one prompt per line (default: prompts/128.txt)."
-  echo "              JSON-string lines (gen_st_prompts.py output) are spliced"
-  echo "              verbatim."
+  echo "  -f FILE|DIR Prompt source (default: prompts/128.txt). A file is read"
+  echo "              one prompt per line; JSON-string lines (gen_st_prompts.py"
+  echo "              output) are spliced verbatim. A directory takes each"
+  echo "              *.txt/*.md inside as ONE whole-file prompt (multi-line"
+  echo "              content, e.g. rendered 16k chat-template strings), sorted"
+  echo "              by name and cycled when -n exceeds the file count."
+  echo "  -J          Chat mode: -f file is JSONL with one chat request body"
+  echo "              per line ({\"model\", \"messages\", \"tools\"}); posts to"
+  echo "              /v1/chat/completions so the server renders the chat"
+  echo "              template (no offline prompt rendering)."
   echo "  -s          Enable streaming mode"
   echo "  -m TOKENS   Max tokens per request / per turn (default: 10 benchmark, 1024 chat)"
   echo "  -d RANK|RANGE  DP rank (e.g. 5: every request pinned to it) or ranks"
   echo "              (e.g. 0-15, 0,2,5: requests round-robin across them)."
   echo "              Omit -d for the server default load balancing (round robin)."
   echo "  -n NUM      Number of requests (default: all lines from file; prompts"
-  echo "              cycle when NUM exceeds the file size)"
+  echo "              cycle when NUM exceeds the file size). NUM=1 keeps EOS"
+  echo "              enabled (no ignore_eos), so the model may stop naturally."
   echo "  -r RATE     Send rate in req/s (default: 32, must be > 0)"
   echo "  -v          Verbose stats (only active when NUM > 1): decode throughput"
   echo "              table; with -s also accept rate. Writes per-request latency"
@@ -53,6 +61,7 @@ usage() {
 }
 
 PROFILE=false
+CHAT=false
 MAX_TOKENS=10
 MAX_TOKENS_SET=false
 NUM_REQUESTS=0
@@ -69,10 +78,11 @@ ROUND_ROBIN=false
 RATE=32
 FAKE=false
 
-while getopts "d:hiFpsvn:m:c:r:f:" opt; do
+while getopts "d:hiJFpsvn:m:c:r:f:" opt; do
   case $opt in
     h) usage ;;
     i) INTERACTIVE=true ;;
+    J) CHAT=true ;;
     p) PROFILE=true ;;
     s) STREAM=true ;;
     v) VERBOSE=true ;;
@@ -105,28 +115,49 @@ fi
 # Common setup
 # =============================================================================
 
-if [ "$INTERACTIVE" = false ] && [ ! -f "$PROMPT_FILE" ]; then
+if [ "$INTERACTIVE" = false ] && [ ! -e "$PROMPT_FILE" ]; then
   echo "Error: file not found: $PROMPT_FILE" >&2
   exit 1
 fi
 
-# Read prompts from file (one per line) — only for non-interactive modes
+# Read prompts — only for non-interactive modes. A file is read one prompt
+# per line; a directory takes each *.txt/*.md inside as ONE whole-file
+# prompt (multi-line content such as a rendered 16k chat-template string),
+# sorted by name and cycled when -n exceeds the file count.
 PROMPTS=()
 if [ "$INTERACTIVE" = false ]; then
-  while IFS= read -r line || [ -n "$line" ]; do
-    PROMPTS+=("$line")
-  done < "$PROMPT_FILE"
+  if [ "$CHAT" = true ] && [ -d "$PROMPT_FILE" ]; then
+    echo "Error: -J chat mode takes a JSONL file (-f), not a directory" >&2
+    exit 1
+  fi
+  if [ -d "$PROMPT_FILE" ]; then
+    while IFS= read -r f; do
+      PROMPTS+=("$(cat "$f")")
+    done < <(find "$PROMPT_FILE" -maxdepth 1 -type f \
+               \( -name '*.txt' -o -name '*.md' \) | sort)
+  else
+    while IFS= read -r line || [ -n "$line" ]; do
+      PROMPTS+=("$line")
+    done < "$PROMPT_FILE"
+  fi
 
   if [ ${#PROMPTS[@]} -eq 0 ]; then
-    echo "Error: prompt file is empty" >&2
+    echo "Error: prompt file is empty (directory: no *.txt/*.md inside?)" >&2
     exit 1
   fi
 
-  # Default NUM_REQUESTS to all lines from file if not specified
+  # Default NUM_REQUESTS to all prompts if not specified
   if [ "$NUM_REQUESTS" -eq 0 ]; then
     NUM_REQUESTS=${#PROMPTS[@]}
   fi
 fi
+
+# A single request is a diagnostic run, not a throughput measurement: leave EOS
+# enabled so the model can stop naturally. With ignore_eos a greedy model that
+# has reached its natural end keeps emitting the whole -m window and degenerates
+# into repetition, which is indistinguishable from a real correctness bug.
+IGNORE_EOS=true
+[ "$NUM_REQUESTS" -eq 1 ] && IGNORE_EOS=false
 
 # Escape JSON special characters in a string
 json_escape() {
@@ -266,7 +297,11 @@ if [ "$FAKE" = true ]; then
 else
   PORT=${CURL_PORT:-30000}
 fi
-URL="http://${IP}:${PORT}/v1/completions"
+if [ "$CHAT" = true ]; then
+  URL="http://${IP}:${PORT}/v1/chat/completions"
+else
+  URL="http://${IP}:${PORT}/v1/completions"
+fi
 # Print the resolved target for non-interactive runs: a stale/wrong port
 # silently redirects requests to the wrong instance (e.g. -F hitting a
 # prefill tokenizer), which is hard to notice from the response alone.
@@ -397,29 +432,42 @@ if [ "$INTERACTIVE" = false ]; then
       fake_line=",\"bootstrap_host\": \"2.2.2.2\",\"bootstrap_room\": $((ROOM_BASE + idx))"
     fi
     local raw="${PROMPTS[$((idx % ${#PROMPTS[@]}))]}"
-    local prompt_field
-    # JSON string lines (gen_st_prompts.py) splice verbatim — they may carry
-    # escaped newlines a plain-line re-escape would corrupt. Heuristic: a
-    # line both starting and ending with '"' is taken as a JSON string.
-    case "$raw" in
-      '"'*'"') prompt_field="$raw" ;;
-      *) prompt_field="\"$(json_escape "$raw")\"" ;;
-    esac
+    local body
+    if [ "$CHAT" = true ]; then
+      # Chat JSONL mode: each line is a complete request base
+      # {"model":..., "messages":[...], "tools":[...]}. Request-level knobs
+      # are appended by re-opening the trailing brace; JSON duplicate keys
+      # resolve last-wins, and the exporter emits none of these.
+      body="${raw%\}*},\"stream\":$STREAM,\"max_tokens\":$MAX_TOKENS,\"ignore_eos\":$IGNORE_EOS,\"temperature\":0$rank_line$fake_line"
+      if [ "$STREAM" = true ]; then
+        body+=",\"stream_options\":{\"include_usage\":true}"
+      fi
+      body+="}"
+    else
+      local prompt_field
+      # JSON string lines (gen_st_prompts.py) splice verbatim — they may carry
+      # escaped newlines a plain-line re-escape would corrupt. Heuristic: a
+      # line both starting and ending with '"' is taken as a JSON string.
+      case "$raw" in
+        '"'*'"') prompt_field="$raw" ;;
+        *) prompt_field="\"$(json_escape "$raw")\"" ;;
+      esac
 
-    local body="{
+      body="{
         \"model\": \"DeepSeek-R1\",
         \"prompt\": $prompt_field,
         \"stream\": $STREAM,
         \"max_tokens\": $MAX_TOKENS,
-        \"ignore_eos\": true,
+        \"ignore_eos\": $IGNORE_EOS,
         \"temperature\": 0$rank_line$fake_line"
 
-    if [ "$STREAM" = true ]; then
-      body+=",\"stream_options\":{\"include_usage\":true}"
-    fi
+      if [ "$STREAM" = true ]; then
+        body+=",\"stream_options\":{\"include_usage\":true}"
+      fi
 
-    body+="
+      body+="
       }"
+    fi
 
     local body_file
     body_file=$(mktemp)
@@ -434,17 +482,19 @@ if [ "$INTERACTIVE" = false ]; then
     local rid="${RUN_ID}-${idx}"
     echo "$rid" > "$RESULT_DIR/rid_${idx}"
 
-    # -o keeps the response body clean; -w captures curl-INTERNAL clocks so
-    # the TPOT decode span (time_total - starttransfer) is sampled inside
-    # the curl process, immune to subshell scheduling gaps around fork/exit.
-    # Captured in both modes: non-streaming stats use tokens/throughput only.
-    if [ "$STREAM" = true ] && [ "$NUM_REQUESTS" -eq 1 ]; then
-      # Single streaming request: echo each SSE line live (like the old
-      # single-request path) while still capturing the body for parsing.
-      # A FIFO splits curl's two outputs: body -> FIFO (read + echoed here),
-      # -w clocks -> ttfb file, so the TPOT math stays curl-internal.
+    # -o keeps the response body clean; -w captures curl-INTERNAL clocks.
+    # Streaming: EVERY request goes through a FIFO + reader — curl's
+    # time_starttransfer fires on the SSE response HEADERS, which the
+    # gateway streams before prefill even starts (≈0.001s), so using it as
+    # TTFT would swallow the whole prefill into the TPOT span. The reader
+    # wall-clocks the first token (content, or reasoning_content in chat
+    # mode — whichever comes first) instead. The single-request run also
+    # echoes the stream live; multi runs only stamp.
+    if [ "$STREAM" = true ]; then
       local fifo="$RESULT_DIR/body_${idx}.fifo"
       mkfifo "$fifo"
+      local t0
+      t0=$(date +%s.%N)
       curl --noproxy "*" -N -s "$URL" \
         -H "Content-Type: application/json" \
         -H "X-Request-Id: $rid" \
@@ -452,20 +502,61 @@ if [ "$INTERACTIVE" = false ]; then
         -w '%{time_starttransfer} %{time_total}' \
         -d @"$body_file" > "$RESULT_DIR/ttfb_${idx}" 2>/dev/null &
       local curl_pid=$!
+      local ttft_done=0 echo_on=0 think_on=0
+      [ "$NUM_REQUESTS" -eq 1 ] && echo_on=1
+      # Content marker: completions SSE carries "text", chat SSE carries
+      # "content":" (string values only — null-content deltas never match
+      # the leading quote).
+      local marker='"text"' rmarker=''
+      [ "$CHAT" = true ] && { marker='"content":"'; rmarker='"reasoning_content":"'; }
       while IFS= read -r line; do
         # Raw body always captured for parsing (usage tokens, chunk count).
         printf '%s\n' "$line" >> "$resp_file"
+        if [ "$ttft_done" = 0 ]; then
+          if [[ "$line" == 'data:'*"$marker"* ]] \
+             || { [ -n "$rmarker" ] && [[ "$line" == 'data:'*"$rmarker"* ]]; }; then
+            # Stamps: <first-token wall time> <curl launch wall time>
+            echo "$(date +%s.%N) $t0" > "$RESULT_DIR/ttft_${idx}"
+            ttft_done=1
+          fi
+        fi
+        if [ "$echo_on" = 0 ]; then
+          continue
+        fi
         if [ "$VERBOSE" = true ]; then
           # -v: original raw SSE echo (full data: lines, inspection mode).
           printf '%s\n' "$line"
         else
-          # Live echo: decoded "text" only (printf %b expands \n etc.).
-          # Usage-only chunks carry no "text" and print nothing; error
-          # payloads and the [DONE] marker stay raw.
+          # Live echo: decoded text/content only (printf %b expands \n etc.).
+          # Chat mode also streams the reasoning phase, in cyan between
+          # explicit [thinking]/[answer] banners — ANSI dim (\033[2m) is
+          # invisible in terminals that ignore it (e.g. Xshell), so the
+          # phase is marked by text as well as color. Usage-only chunks
+          # carry no marker and print nothing; error payloads and the
+          # [DONE] marker stay raw.
           case "$line" in
-            'data: [DONE]'*) printf '\n%s\n' "$line" ;;
-            *'"text":"'*)
-              text=${line#*\"text\":\"}
+            'data: [DONE]'*)
+              [ "$think_on" = 1 ] && printf '\033[0m'
+              printf '\n%s\n' "$line"
+              ;;
+            *'"reasoning_content":"'*)
+              text=${line#*\"reasoning_content\":\"}
+              if [ "$think_on" = 0 ]; then
+                printf '\n\033[36m[thinking]\n'
+                think_on=1
+              fi
+              printf '%b' "${text%%\"*}"
+              ;;
+            *"$marker"*)
+              if [ "$CHAT" = true ]; then
+                text=${line#*\"content\":\"}
+                if [ "$think_on" = 1 ]; then
+                  printf '\033[0m\n[answer]\n'
+                  think_on=0
+                fi
+              else
+                text=${line#*\"text\":\"}
+              fi
               printf '%b' "${text%%\"*}"
               ;;
             *'"error"'*) printf '%s\n' "$line" ;;
@@ -496,19 +587,34 @@ if [ "$INTERACTIVE" = false ]; then
     if [ "$STREAM" = true ]; then
       # Content chunks ≈ decode steps: spec decoding emits ALL tokens accepted
       # in one step inside a single chunk, so tokens/chunks is the per-request
-      # accept rate. Count "text" keys only — usage-only chunks and
-      # "data: [DONE]" carry no text field.
-      local chunks
-      chunks=$(grep -c '"text"' "$resp_file" 2>/dev/null || true)
+      # accept rate. Count content-marker keys only — usage-only chunks and
+      # "data: [DONE]" carry none. Chat mode also counts the reasoning phase
+      # (thinking models emit reasoning_content before content; shown as
+      # accept (r) when content never starts).
+      local chunks marker rmarker rchunks
+      marker='"text"'
+      rmarker=''
+      [ "$CHAT" = true ] && { marker='"content":"'; rmarker='"reasoning_content":"'; }
+      chunks=$(grep -cF "$marker" "$resp_file" 2>/dev/null || true)
       chunks="${chunks:-0}"
+      rchunks=0
+      if [ -n "$rmarker" ]; then
+        rchunks=$(grep -cF "$rmarker" "$resp_file" 2>/dev/null || true)
+        rchunks="${rchunks:-0}"
+      fi
       # Prefer actual token count from usage; fall back to chunk count
       echo "${comp_tokens:-$chunks}" > "$RESULT_DIR/tokens_${idx}"
       echo "$chunks" > "$RESULT_DIR/chunks_${idx}"
+      echo "$rchunks" > "$RESULT_DIR/rchunks_${idx}"
     else
       echo "${comp_tokens:-0}" > "$RESULT_DIR/tokens_${idx}"
     fi
     # Prompt token count (aisbench InputTokens row)
     [[ ! -z "$prompt_tokens" ]] && echo "$prompt_tokens" > "$RESULT_DIR/ptokens_${idx}"
+    # Reasoning token split (chat + reasoning parser), for the (r) fallback
+    local reason_tokens
+    reason_tokens=$(grep -oP '"reasoning_tokens":\s*\K\d+' "$resp_file" 2>/dev/null | tail -n1)
+    [[ ! -z "$reason_tokens" ]] && echo "$reason_tokens" > "$RESULT_DIR/rtokens_${idx}"
 
     rm -f "$body_file"
   }
@@ -666,14 +772,32 @@ if [ "$INTERACTIVE" = false ]; then
     if [[ "$ttfb" =~ ^[0-9.]+$ ]] && [[ "$total" =~ ^[0-9.]+$ ]]; then
       if [ "$STREAM" = true ]; then
         ch=0; read -r ch 2>/dev/null < "$RESULT_DIR/chunks_0" || ch=0
-        # TPOT from curl-internal clocks: (time_total - starttransfer) /
-        # (tokens - 1). Accept rate = (tokens-1)/(chunks-1). Both exclude
-        # the prefill's first token/chunk.
-        TPOT=$(awk -v t="$ttfb" -v tot="$total" -v n="$toks" \
+        # TTFT = first content chunk minus curl launch (wall clock from the
+        # FIFO reader; starttransfer is the SSE header time, ~0 on a stream).
+        # Fall back to starttransfer when no content chunk arrived (error).
+        tt="$ttfb"
+        if [ -f "$RESULT_DIR/ttft_0" ]; then
+          tt=$(awk '{ printf "%.3f", $1 - $2 }' "$RESULT_DIR/ttft_0")
+        fi
+        # TPOT: (time_total - TTFT) / (tokens - 1). Accept rate =
+        # (tokens-1)/(chunks-1). Both exclude the prefill's first token/chunk.
+        TPOT=$(awk -v t="$tt" -v tot="$total" -v n="$toks" \
           'BEGIN { dn=n-1; if (dn>0 && tot>t) printf "%.1f", (tot-t)/dn*1000; else print "N/A" }')
-        ACC=$(awk -v t="$toks" -v c="$ch" \
-          'BEGIN { if (c>1 && t ~ /^[0-9]+$/) printf "%.2f", (t-1)/(c-1); else print "N/A" }')
-        echo "TTFT: ${ttfb}s | Total: ${total}s | TPOT: ${TPOT} ms/tok"
+        # Accept rate over the content phase (reasoning tokens stripped);
+        # thinking models that never reach content fall back to the
+        # reasoning phase, marked (r) — mirrors the replay per-turn table.
+        rch=0
+        [ -f "$RESULT_DIR/rchunks_0" ] && read -r rch < "$RESULT_DIR/rchunks_0"
+        rtok=""
+        [ -f "$RESULT_DIR/rtokens_0" ] && read -r rtok < "$RESULT_DIR/rtokens_0"
+        ACC=$(awk -v t="$toks" -v c="$ch" -v rc="$rch" -v rt="$rtok" '
+          BEGIN {
+            ct = t; if (rt ~ /^[0-9]+$/) ct = t - rt;
+            if (c > 1 && t ~ /^[0-9]+$/ && ct > 1) printf "%.2f", (ct - 1) / (c - 1);
+            else if (rc > 1 && rt ~ /^[0-9]+$/ && rt > 1) printf "%.2f(r)", (rt - 1) / (rc - 1);
+            else print "N/A";
+          }')
+        echo "TTFT: ${tt}s | Total: ${total}s | TPOT: ${TPOT} ms/tok"
         echo "Output Tokens: $toks | Chunks: $ch | Accept Rate: $ACC"
       else
         echo "Total: ${total}s | Output Tokens: $toks"
@@ -840,11 +964,42 @@ if [ "$INTERACTIVE" = false ]; then
       e2e_ns=$(( e - s ))
       [ "$e2e_ns" -gt 0 ] || continue
       # TPOT (streaming only — non-streaming TTFB ≈ total): decode span from
-      # curl-internal clocks (time_total - starttransfer), no subshell
-      # scheduling gaps, falling back to the subshell E2E clock for old
-      # single-field files. Float seconds -> integer ns without awk forks.
+      # first-token wall stamp minus curl-internal time_total. The
+      # time_starttransfer fallback below is the SSE HEADER time on the
+      # gateway (~0) — kept only for runs predating the ttft stamp.
+      # Float seconds -> integer ns without awk forks.
       tpot="-"
-      if [ "$STREAM" = true ] && [[ "$ttfb" =~ ^[0-9.]+$ ]] && [ "$toks" -ge 2 ]; then
+      ttft_ns=""
+      if [ "$STREAM" = true ] && [ -f "$RESULT_DIR/ttft_${i}" ]; then
+        fs=""; ts0=""
+        read -r fs ts0 < "$RESULT_DIR/ttft_${i}"
+        if [[ "$fs" =~ ^[0-9]+$ ]] && [[ "$ts0" =~ ^[0-9]+$ ]]; then
+          ttft_ns=$(( fs * 1000000000 - ts0 ))
+        elif [[ "$fs" =~ ^[0-9.]+\.[0-9]+$ ]] && [[ "$ts0" =~ ^[0-9.]+\.[0-9]+$ ]]; then
+          fs_s=${fs%%.*}; fs_f=${fs#*.}
+          fs_f="${fs_f}000000000"; fs_f="${fs_f:0:9}"
+          t0_s=${ts0%%.*}; t0_f=${ts0#*.}
+          t0_f="${t0_f}000000000"; t0_f="${t0_f:0:9}"
+          ttft_ns=$(( (10#$fs_s * 1000000000 + 10#$fs_f) \
+                    - (10#$t0_s * 1000000000 + 10#$t0_f) ))
+        fi
+      fi
+      if [ "$STREAM" = true ] && [ "$toks" -ge 2 ] \
+         && [ -n "$ttft_ns" ] && [ "$ttft_ns" -gt 0 ]; then
+        if [[ "$total" =~ ^[0-9.]+$ ]]; then
+          tot_s=${total%%.*}; tot_f=${total#*.}
+          [[ "$tot_f" =~ ^[0-9]+$ ]] || tot_f=0
+          tot_f="${tot_f}000000000"; tot_f="${tot_f:0:9}"
+          total_ns=$(( 10#${tot_s:-0} * 1000000000 + 10#$tot_f ))
+        else
+          total_ns=$e2e_ns
+        fi
+        decode_ns=$(( total_ns - ttft_ns ))
+        if [ "$decode_ns" -gt 0 ]; then
+          per_tok_ns=$(( decode_ns / (toks - 1) ))
+          printf -v tpot '%d.%03d' $(( per_tok_ns / 1000000 )) $(( (per_tok_ns / 1000) % 1000 ))
+        fi
+      elif [ "$STREAM" = true ] && [[ "$ttfb" =~ ^[0-9.]+$ ]] && [ "$toks" -ge 2 ]; then
         if [[ "$ttfb" == *.* ]]; then
           ttfb_s=${ttfb%%.*}; ttfb_f=${ttfb#*.}
           [[ "$ttfb_f" =~ ^[0-9]+$ ]] || ttfb_f=0
@@ -1038,12 +1193,7 @@ if [ "$INTERACTIVE" = true ]; then
     BODY_FILE=$(mktemp)
     printf '%s' "$BODY" > "$BODY_FILE"
 
-    # Build curl header args; X-Data-Parallel-Rank has higher priority than
-    # the body field and survives proxy/router hops.
     CURL_HEADERS=(-H "Content-Type: application/json")
-    if [ "$DP_ENABLED" = true ]; then
-      CURL_HEADERS+=(-H "X-Data-Parallel-Rank: $DP_RANK")
-    fi
 
     TURN_START=$(date +%s.%N)
     FIRST_TOKEN_TS=""
