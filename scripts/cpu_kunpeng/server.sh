@@ -207,12 +207,29 @@ if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICAC
             BASE_ARGS+=(--hicache-ratio "${KUNPENG_HICACHE_RATIO:-1.0}")
         fi
     fi
+    HICACHE_EXTRA_CONFIG_JSON=""
+    if [[ -n "${KUNPENG_HICACHE_EXTRA_CONFIG:-}" ]]; then
+        HICACHE_EXTRA_CONFIG_JSON="$KUNPENG_HICACHE_EXTRA_CONFIG"
+    elif [[ -n "${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-}" || -n "${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-}" ]]; then
+        t_base="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-1}"
+        t_per_k="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-0.25}"
+        for v in "$t_base" "$t_per_k"; do
+            if [[ ! "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                echo "Error: prefetch timeout must be a number, got '$v'" >&2
+                exit 1
+            fi
+        done
+        HICACHE_EXTRA_CONFIG_JSON="{\"prefetch_timeout_base\": $t_base, \"prefetch_timeout_per_ki_token\": $t_per_k}"
+    fi
+    if [[ -n "$HICACHE_EXTRA_CONFIG_JSON" ]]; then
+        BASE_ARGS+=(--hicache-storage-backend-extra-config "$HICACHE_EXTRA_CONFIG_JSON")
+    fi
     case "$HICACHE_BACKEND" in
         mooncake)
             # MOONCAKE_MASTER* come from env_base.sh / .user_env.sh.
             BASE_ARGS+=(
                 --hicache-storage-backend mooncake
-                --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-wait_complete}"
+                --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-timeout}"
             )
             ;;
         file)
@@ -221,7 +238,7 @@ if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICAC
                 export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$KUNPENG_HICACHE_L3_DIR"
                 BASE_ARGS+=(
                     --hicache-storage-backend file
-                    --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-wait_complete}"
+                    --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-timeout}"
                 )
             else
                 echo "KUNPENG_HICACHE_L3_DIR is empty: HiCache L3 disabled, running L1<->L2 only" >&2
