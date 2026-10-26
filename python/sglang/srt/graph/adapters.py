@@ -1498,6 +1498,25 @@ def _setup_batched_bgemm_kunpeng():
     register_op('batched_bgemm_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_batched_bgemm_inplace_kunpeng():
+    # In-place variant of batched_bgemm_kunpeng: the caller provides the
+    # output tensor, typically a strided (B, M, N) view over a (M, B, N)
+    # buffer or a column slice of a wider row (e.g. the latent nope prefix
+    # of q_combined). The GEMM then writes the value's final resting layout
+    # directly (the C++ side already honors output.stride(0/1); only the
+    # last dim must be contiguous), so the post-GEMM transpose+contiguous
+    # /cat passes disappear. Same calling convention as
+    # batched_gemm_woqs8_allthreads_inplace_kunpeng.
+    def shape_infer(input, weight, out):
+        return []
+
+    def eager_fn(input, weight, out):
+        torch.ops.sgl_kernel.batched_bgemm_kunpeng(input, weight, out)
+        return None
+
+    register_op('batched_bgemm_inplace_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_shm_mla_o_alltoall_long_context_kunpeng():
     # Zero-copy pure-read exchange over the persistent SHM regions (the
     # flash MLA writes O/LSE into them directly via lc_stage_base_buffers).
@@ -1779,6 +1798,7 @@ def setup():
     _setup_fake_indexer_topk_mtp_kunpeng()
     _setup_paged_mqa_logits_topk_kunpeng()
     _setup_batched_bgemm_kunpeng()
+    _setup_batched_bgemm_inplace_kunpeng()
     _setup_shm_mla_o_alltoall_long_context_kunpeng()
     _setup_lc_mark_empty_lse_kunpeng()
     _setup_flash_mla_reduce_kunpeng()
