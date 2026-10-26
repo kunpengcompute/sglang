@@ -24,3 +24,13 @@ void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor outpu
 static KernelRegistrar _r_bgemm(
     "batched_bgemm_kunpeng",
     make_dispatch_v<decltype(&batched_bgemm_kunpeng), &batched_bgemm_kunpeng>);
+
+// In-place form of batched_bgemm_kunpeng: the output is a caller-provided
+// (possibly strided) view over a pre-allocated buffer, e.g. a transposed
+// view over a (M, B, N) tensor or a column slice of a wider row. Tensor
+// order = [input, weight, out], no scalars -- same kernel as above, but a
+// separate graph-op name so the replay dispatch keeps the two calling
+// conventions distinct.
+static KernelRegistrar _r_bgemm_inplace(
+    "batched_bgemm_inplace_kunpeng",
+    make_dispatch_v<decltype(&batched_bgemm_kunpeng), &batched_bgemm_kunpeng>);

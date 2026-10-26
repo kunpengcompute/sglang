@@ -234,15 +234,34 @@ class DeepseekMLAKunpengForwardMixin:
                     self.rotary_emb.cos_sin_cache)
                 k_pe = k_pe_out
 
+        elif self.q_lora_rank is not None and self.rotary_emb is not None:
+            # bf16 kv_b + q_lora (GLM-5): SME bgemm fused into q_combined
+            # exactly like the int8 path above -- the GEMM writes the latent
+            # nope prefix slice directly (strided out) and rope_inplace
+            # fills the rope tail, so the bgemm->transpose->cat pass over
+            # the full q tensor disappears.
+            rows = q_nope.size(0)
+            bs = q_nope.size(1)
+            qk_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            q_combined = kunpeng.alloc_buffer(
+                rows * bs * qk_dim, dtype=torch.bfloat16
+            ).view(rows, bs, qk_dim)
+            kunpeng.batched_bgemm_inplace_kunpeng(
+                q_nope.transpose(0, 1), self.w_kc_bf16_packed,
+                q_combined.transpose(0, 1)[:, :, : self.kv_lora_rank])
+            k_pe_out = kunpeng.alloc_buffer(
+                rows * self.qk_rope_head_dim, dtype=torch.bfloat16
+            ).view(rows, 1, self.qk_rope_head_dim)
+            kunpeng.rope_inplace_kunpeng(
+                positions, q_pe, k_pe,
+                q_combined[:, :, self.kv_lora_rank:], k_pe_out,
+                self.rotary_emb.cos_sin_cache)
+            k_pe = k_pe_out
         elif self.q_lora_rank is not None:
-            # bf16 kv_b + q_lora (GLM-5): SME bgemm
+            # bf16 kv_b + q_lora without RoPE: keep the explicit cat
             q_nope_input = q_nope.transpose(0, 1)
             q_nope_out = kunpeng.batched_bgemm_kunpeng(q_nope_input, self.w_kc_bf16_packed)
             q_nope_out = q_nope_out.transpose(0, 1)
-
-            if self.rotary_emb is not None:
-                q_pe, k_pe = kunpeng.rope_kunpeng(
-                    positions, q_pe, k_pe, self.rotary_emb.cos_sin_cache)
 
             q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
 
@@ -367,6 +386,11 @@ class DeepseekMLAKunpengForwardMixin:
             forward_batch.forward_mode.is_extend_without_speculative()
         )
         orig_rows = q.shape[0]
+        # Row count the w_vc OUTPUT must carry (o_proj consumes the padded
+        # stream). The absorbed branch defers the flat_rows -> orig_rows
+        # pad from the attention output to the w_vc output for the bf16
+        # path; None = keep attn_output's own row count.
+        w_vc_out_rows = None
         if is_draft_extend:
             q = kunpeng.pad_q_left_mtp_kunpeng(
                 q,
@@ -534,13 +558,23 @@ class DeepseekMLAKunpengForwardMixin:
             # Trim back to the packed batch; dummy-row outputs and the
             # zeroed tail are dropped by the gather-side DP unpad.
             if flat_rows < orig_rows:
-                buf = kunpeng.alloc_buffer(
-                    orig_rows * numhead_local_q * self.kv_lora_rank,
-                    dtype=attn_output.dtype,
-                ).view(orig_rows, numhead_local_q, self.kv_lora_rank)
-                kunpeng.copy_kunpeng(buf[:flat_rows], attn_output)
-                kunpeng.zero_(buf[flat_rows:])
-                attn_output = buf
+                if self.q_lora_rank is not None and not self._kv_b_is_int8():
+                    # bf16 w_vc: keep the unpadded attn_output and pad on
+                    # the w_vc OUTPUT instead (strided slice write + zero
+                    # tail, half the pad bytes of zeroing the input) --
+                    # the flat_rows -> orig_rows full-tensor copy
+                    # disappears. Zero input rows through w_vc produce
+                    # zero output rows, so the o_proj / allreduce stream
+                    # is element-for-element identical.
+                    w_vc_out_rows = orig_rows
+                else:
+                    buf = kunpeng.alloc_buffer(
+                        orig_rows * numhead_local_q * self.kv_lora_rank,
+                        dtype=attn_output.dtype,
+                    ).view(orig_rows, numhead_local_q, self.kv_lora_rank)
+                    kunpeng.copy_kunpeng(buf[:flat_rows], attn_output)
+                    kunpeng.zero_(buf[flat_rows:])
+                    attn_output = buf
             else:
                 attn_output = attn_output[:orig_rows]
             # reshape back to flattened for w_vc
@@ -636,13 +670,27 @@ class DeepseekMLAKunpengForwardMixin:
                 -1, self.num_local_heads * self.v_head_dim
             )
         elif self.q_lora_rank is not None:
-            # bf16 kv_b + q_lora (GLM-5): SME bgemm
-            attn_bmm_input = attn_output.transpose(0, 1)
-            c_tensor_3d = kunpeng.batched_bgemm_kunpeng(attn_bmm_input, self.w_vc_bf16_packed)
-            attn_bmm_output = kunpeng.contiguous_kunpeng(
-                c_tensor_3d.transpose(0, 1)).reshape(
-                -1, self.num_local_heads * self.v_head_dim
-            )
+            # bf16 kv_b + q_lora (GLM-5): SME bgemm writing the
+            # (tokens, heads, v) layout directly via a transposed strided
+            # out view (the C++ side already honors strided out dims), so
+            # the post-GEMM transpose + contiguous copy over the o tensor
+            # disappears.
+            rows = attn_output.size(0)
+            bs = attn_output.size(1)
+            n = self.v_head_dim
+            # Absorbed prefill may hand an unpadded attn_output and ask
+            # for an orig_rows-sized output: the bgemm writes the real
+            # rows into the head slice and the pad tail is zeroed here
+            # (see the absorbed branch above).
+            out_rows = rows if w_vc_out_rows is None else w_vc_out_rows
+            attn_bmm_out = kunpeng.alloc_buffer(
+                out_rows * bs * n, dtype=torch.bfloat16).view(out_rows, bs, n)
+            kunpeng.batched_bgemm_inplace_kunpeng(
+                attn_output.transpose(0, 1), self.w_vc_bf16_packed,
+                attn_bmm_out[:rows].transpose(0, 1))
+            if out_rows > rows:
+                kunpeng.zero_(attn_bmm_out[rows:])
+            attn_bmm_output = attn_bmm_out.reshape(-1, bs * n)
         else:
             attn_bmm_input = attn_output.transpose(0, 1)
             c_tensor_3d = kunpeng.bmm_kunpeng(attn_bmm_input, self.w_vc_packed)
