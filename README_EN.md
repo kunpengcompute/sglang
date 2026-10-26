@@ -2,6 +2,7 @@
 
 ## Release Notes
 
+- \[2026/10] Added GLM-5.3 deployment guide (weight preprocessing, configuration, startup).
 - \[2026/09] Updated deployment docs: added multi-instance deployment, tokenizer-separate PD disaggregated deployment, and related environment variables.
 - \[2026/05] This release is based on SGLang official v0.5.11 with optimizations and adaptations.
 
@@ -101,7 +102,7 @@ Taking the DeepSeek V3 int8 quantized version as an example, the recommended nat
 | `runtime/.user_env_prefill[_<instance>].sh` | Prefill role/instance override files |
 | `runtime/.user_env_decode[_<instance>].sh` | Decode role/instance override files |
 
-Configure the model path, conda environment name, and native node information (`NATIVE_IP_SPEC`/`NATIVE_IP_FILE`, `NATIVE_MASTER_ADDR`) in `runtime/env_base.sh` (or override via `.user_env.sh`); configure prefill/decode node sets and parallel sizes in the corresponding role files. See Section 3.3 for the full configuration loading order.
+Configure the model path, conda environment name, and native node information (`NATIVE_IP_SPEC`/`NATIVE_IP_FILE`, `NATIVE_MASTER_ADDR`) in `runtime/env_base.sh` (or override via `.user_env.sh`); configure prefill/decode node sets and parallel sizes in the corresponding role files. See Section 3.4 for the full configuration loading order.
 
 Since loading the V3 quantized weights is relatively slow, set `LOAD_FORMAT` in the configuration files to enable sharded loading for faster startup. Two formats are supported: `sharded_state` and `kunpeng_state`. Before the first use, preprocess the original weights using the `scripts/cpu_kunpeng/model_processing/split_weights_dsv3.py` script.
 
@@ -112,13 +113,75 @@ sh launch.sh native
 sh stop.sh server native
 ```
 
-See Section 3.4 for PD disaggregated deployment.
+See Section 3.5 for PD disaggregated deployment.
 
-### 3.2 Using Non-DeepSeek Models
+### 3.2 Using GLM-5.3 Models
+
+GLM-5.3 (`GlmMoeDsaForCausalLM`) reuses the DeepseekV2 model stack (MLA attention + DSA sparse-attention indexer + MoE), and `sglang.srt.models.glm4_moe` is already in the 920F model whitelist of `srt/models/registry.py` — no code changes are required. Deployment follows the same configuration files and launch commands as DeepSeek V3 (Section 3.1); the differences are the weight preprocessing script, the model paths, and the chat template/parsers.
+
+**1. Weight preprocessing**
+
+Before the first use, preprocess the original quantized GLM-5.3 weights with `scripts/cpu_kunpeng/model_processing/split_weights_glm5.py` (instead of `split_weights_dsv3.py`), then set `LOAD_FORMAT=kunpeng_state` to enable sharded loading. The script automatically recognizes both GLM-5 export naming conventions (`<module>` + `<module>.scale`) and the DeepSeek pipeline convention (`<module>.weight` + `<module>.weight_scale`), and both fused (`gateup_proj`/`gate_up_proj`) and separate (`gate_proj` + `up_proj`) gate/up exports (separate exports are fused into `[gate; up]` on the fly).
+
+Non-MoE weights (one run, outputs per attention-TP rank):
+
+```shell
+cd scripts/cpu_kunpeng/model_processing
+python split_weights_glm5.py \
+    --model_dir /path-to-glm5.3-quantized \
+    --output_dir /path-to-glm5.3-split \
+    --attention_tp_size 16 \
+    --num_hidden_layers 78
+```
+
+MoE expert weights (one run; add `--layer_range <start> <end>` to parallelize across machines, each writing a disjoint layer range):
+
+```shell
+python split_weights_glm5.py --moe \
+    --model_dir /path-to-glm5.3-quantized \
+    --output_dir /path-to-glm5.3-split \
+    --num_hidden_layers 78
+```
+
+`--num_hidden_layers` is the number of main layers (78 for GLM-5.3, per its `config.json`). The MTP layer (layer 78) is redirected to a separate `{output_dir}_mtp/` directory so it can be loaded independently as the draft model.
+
+GLM-5.3-specific splitting handled by the script:
+
+- `q_a_proj` + `kv_a_proj_with_mqa` are fused into `fused_qkv_a_proj_with_mqa` and split along dim0 by `--socket_tp_size` (default 8).
+- DSA indexer projections follow the model-side attention-TP split by default (`indexer.wq_b` split along dim0; `indexer.wk` / `indexer.weights_proj` split along dim1). Pass `--replicate-indexer` and set `SGLANG_KUNPENG_DISABLE_INDEXER_TP_SPLIT=1` on the serving side to replicate them on every rank instead.
+- bf16 tensors without a scale (`kv_b_proj`, `indexer.wk`, `weights_proj`, `lm_head`, embeddings, etc.) are copied as-is.
+- MoE experts take a byte-level fast path (sendfile) when the source shards are standard safetensors; expert output layout matches the DeepSeek script (`experts/layer_L/expert_E.safetensors`, `w13_weight` = fused `[gate; up]`).
+
+**2. Configuration**
+
+In `runtime/env_base.sh` (or `.user_env.sh`), point the paths to the split outputs and enable sharded loading:
+
+```shell
+MODEL_PATH="/path-to-glm5.3-split"
+SPECULATIVE_DRAFT_MODEL_PATH="/path-to-glm5.3-split_mtp"
+export LOAD_FORMAT="kunpeng_state"
+```
+
+Set the chat template and parsers for GLM in `.user_env.sh` as needed (see the `CHAT_TEMPLATE` / `TOOL_CALL_PARSER` / `REASONING_PARSER` notes in `runtime/env_base.sh`), e.g. `TOOL_CALL_PARSER=glm47`.
+
+Parallel sizes (TP/DP/EP/PP), native/PD modes, and MTP speculative decoding (`SGLANG_ENABLE_MTP=1`, `SPECULATIVE_DRAFT_MODEL_PATH` pointing to the `_mtp` directory) are configured exactly as for DeepSeek V3 — see Section 3.1, Section 3.5, and Section 3.6.1.
+
+**3. Startup**
+
+Identical to DeepSeek V3:
+
+```shell
+sh launch.sh native          # native mode
+sh stop.sh server native
+# or the PD disaggregated flow (Section 3.5):
+sh launch.sh all
+```
+
+### 3.3 Using Other Non-DeepSeek Models
 
 When using non-DeepSeek models, you need to comment out the condition at lines 98~102 in `srt/models/registry.py`. This logic skips loading non-DeepSeek model dependencies to improve startup speed. Alternatively, you can change the condition value to the corresponding value of the specific model being used, for example, `sglang.srt.models.qwen3`.
 
-### 3.3 Deployment Modes
+### 3.4 Deployment Modes
 
 Select the deployment role via `./launch.sh <role> [instance]`:
 
@@ -153,7 +216,7 @@ runtime/env_base.sh (shared defaults; loads .user_env.sh then runtime/.user_env_
 
 Role defaults: prefill sets `SGLANG_KUNPENG_MAX_SEQ_NUM=8` and `SGLANG_KUNPENG_MAX_CUR_LEN=576`; decode sets `SGLANG_KUNPENG_MAX_SEQ_NUM=64` and `SGLANG_KUNPENG_MAX_CUR_LEN=1` (automatically `SGLANG_SPECULATIVE_NUM_STEPS+1` when MTP is enabled).
 
-### 3.4 PD Disaggregated Deployment
+### 3.5 PD Disaggregated Deployment
 
 In PD disaggregation mode the tokenizer is separated from the inference processes by default (`SGLANG_ENABLE_TOKENIZER_SEPERATE=1`, set automatically per role by `env_base.sh`; off by default in native mode). The request path is: client → SGLang Model Gateway (router node) → per-side tokenizer HTTP servers (router node, default ports 30001 for prefill and 30002 for decode) → prefill/decode clusters. The Model Gateway's backend addresses are the tokenizer ports instead of the inference masters' port 30000, and each prefill backend also carries its instance's bootstrap port (default 9001) for KV transfer bootstrap.
 
@@ -188,9 +251,9 @@ sh stop.sh tokenizer prefill   # prefill|decode|all supported
 
 For multi-instance deployment (same-role multi-instance, automatic port/NUMA staggering, short/long grouped routing, etc.), see the [multi-instance deployment guide](scripts/cpu_kunpeng/runtime/README.md).
 
-### 3.5 Environment Variables
+### 3.6 Environment Variables
 
-#### 3.5.1 Functional
+#### 3.6.1 Functional
 
 **1. SGLANG\_ENABLE\_BINARY\_LAUNCH / SGLANG\_ENABLE\_NUMA\_DUPLICATION — Binary Launch Mode**
 
@@ -277,7 +340,7 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # long-sequence threshold
 
 - **Effect**: Requests with `input_len + max_new_tokens` greater than or equal to the threshold are routed to the LC DP ranks for context-parallel decode; other requests go to regular ranks. Both variables must be identical between prefill and decode instances.
 
-#### 3.5.2 Other Toggles
+#### 3.6.2 Other Toggles
 
 - **SGLANG\_USE\_CPU\_920F**: Identifies Kunpeng 920F platform, triggering fork startup, loading only deepseek models, CPU affinity, and other platform optimizations.
 - **SGLANG\_USE\_CPU\_ENGINE**: Forces CPU inference engine.
@@ -298,7 +361,7 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # long-sequence threshold
 - **KUPL\_SHM\_TYPE / KUPL\_SHM\_ON\_PACKAGE / KUPL\_SHM\_ENABLE\_HUGEPAGE**: kupl SHM backend (sls), package memory, and hugepage toggles.
 - **SGLANG\_SET\_ZMQ\_CPU\_AFFINITY\_OFFSET**: Starting core for ZMQ thread CPU affinity.
 
-#### 3.5.3 Size / Threshold
+#### 3.6.3 Size / Threshold
 
 **Shared Memory Pool**
 
@@ -346,7 +409,7 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # long-sequence threshold
 - **KUCCL\_PATH**: kuccl installation path (required when `SGLANG_ENABLE_KUCCL=1`).
 - **LIBPTHREAD\_HOOK\_PATH**: libpthread_hook.so path (used in tokenizer-separate mode).
 
-#### 3.5.4 Routing Policy
+#### 3.6.4 Routing Policy
 
 - **ROUTER\_PREFILL\_POLICY**: Model Gateway prefill routing policy. Empty = use the main policy (cache_aware); set to `bucket` to enable the bucket policy (requires at least 2 prefill entries in `INSTANCES`).
 - **ROUTER\_BALANCE\_ABS\_THRESHOLD**: Bucket-policy absolute character-count difference threshold between two instances, default 64.
