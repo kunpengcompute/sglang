@@ -1482,17 +1482,21 @@ def _setup_batched_bgemm_kunpeng():
     # SME bf16 batched GEMM for the bf16 kv_b_proj MLA absorb path (e.g.
     # GLM-5): out = input @ weight^T per batch item. weight is the
     # batched_bgemm_prepack_kunpeng SME-packed output ([B, N, K]); input [B, M, K]
-    # (outer dims may be strided views).
-    def shape_infer(input, weight):
+    # (outer dims may be strided views). workspace is a caller-allocated,
+    # contiguous [B*M*K] bf16 buffer that receives the per-call act SME pack:
+    # passing it in keeps the temporary in HBW (eager) / in a graph-owned
+    # buffer (capture+replay) instead of allocating DDR inside the kernel.
+    def shape_infer(input, weight, workspace):
         B, M, K = input.shape
         N = weight.shape[1]
         return [((B, M, N), input.dtype)]
 
-    def eager_fn(input, weight):
+    def eager_fn(input, weight, workspace):
         B, M, K = input.shape
         N = weight.shape[1]
         out = torch.empty((B, M, N), dtype=input.dtype, device=input.device)
-        torch.ops.sgl_kernel.batched_bgemm_kunpeng(input, weight, out)
+        torch.ops.sgl_kernel.batched_bgemm_kunpeng(
+            input, weight, out, workspace)
         return out
 
     register_op('batched_bgemm_kunpeng', shape_infer, eager_fn)
@@ -1506,12 +1510,14 @@ def _setup_batched_bgemm_inplace_kunpeng():
     # directly (the C++ side already honors output.stride(0/1); only the
     # last dim must be contiguous), so the post-GEMM transpose+contiguous
     # /cat passes disappear. Same calling convention as
-    # batched_gemm_woqs8_allthreads_inplace_kunpeng.
-    def shape_infer(input, weight, out):
+    # batched_gemm_woqs8_allthreads_inplace_kunpeng. workspace is the
+    # caller-allocated act SME pack buffer (see above).
+    def shape_infer(input, weight, workspace, out):
         return []
 
-    def eager_fn(input, weight, out):
-        torch.ops.sgl_kernel.batched_bgemm_kunpeng(input, weight, out)
+    def eager_fn(input, weight, workspace, out):
+        torch.ops.sgl_kernel.batched_bgemm_kunpeng(
+            input, weight, out, workspace)
         return None
 
     register_op('batched_bgemm_inplace_kunpeng', shape_infer, eager_fn)
