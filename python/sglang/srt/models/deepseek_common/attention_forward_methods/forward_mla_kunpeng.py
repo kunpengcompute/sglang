@@ -246,8 +246,12 @@ class DeepseekMLAKunpengForwardMixin:
             q_combined = kunpeng.alloc_buffer(
                 rows * bs * qk_dim, dtype=torch.bfloat16
             ).view(rows, bs, qk_dim)
+            q_nope_input = q_nope.transpose(0, 1)
+            bgemm_ws = kunpeng.alloc_buffer(
+                q_nope_input.numel(), dtype=torch.bfloat16,
+                alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get())
             kunpeng.batched_bgemm_inplace_kunpeng(
-                q_nope.transpose(0, 1), self.w_kc_bf16_packed,
+                q_nope_input, self.w_kc_bf16_packed, bgemm_ws,
                 q_combined.transpose(0, 1)[:, :, : self.kv_lora_rank])
             k_pe_out = kunpeng.alloc_buffer(
                 rows * self.qk_rope_head_dim, dtype=torch.bfloat16
@@ -260,7 +264,11 @@ class DeepseekMLAKunpengForwardMixin:
         elif self.q_lora_rank is not None:
             # bf16 kv_b + q_lora without RoPE: keep the explicit cat
             q_nope_input = q_nope.transpose(0, 1)
-            q_nope_out = kunpeng.batched_bgemm_kunpeng(q_nope_input, self.w_kc_bf16_packed)
+            bgemm_ws = kunpeng.alloc_buffer(
+                q_nope_input.numel(), dtype=torch.bfloat16,
+                alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get())
+            q_nope_out = kunpeng.batched_bgemm_kunpeng(
+                q_nope_input, self.w_kc_bf16_packed, bgemm_ws)
             q_nope_out = q_nope_out.transpose(0, 1)
 
             q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
@@ -685,8 +693,12 @@ class DeepseekMLAKunpengForwardMixin:
             out_rows = rows if w_vc_out_rows is None else w_vc_out_rows
             attn_bmm_out = kunpeng.alloc_buffer(
                 out_rows * bs * n, dtype=torch.bfloat16).view(out_rows, bs, n)
+            bgemm_input = attn_output.transpose(0, 1)
+            bgemm_ws = kunpeng.alloc_buffer(
+                bgemm_input.numel(), dtype=torch.bfloat16,
+                alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get())
             kunpeng.batched_bgemm_inplace_kunpeng(
-                attn_output.transpose(0, 1), self.w_vc_bf16_packed,
+                bgemm_input, self.w_vc_bf16_packed, bgemm_ws,
                 attn_bmm_out[:rows].transpose(0, 1))
             if out_rows > rows:
                 kunpeng.zero_(attn_bmm_out[rows:])

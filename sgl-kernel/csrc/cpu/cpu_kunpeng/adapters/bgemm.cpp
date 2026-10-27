@@ -17,20 +17,31 @@
 #include "register_graph_kernels.h"
 #include <ATen/Tensor.h>
 
-void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output);
+void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace);
 
-// 直写式 (output 为注册的图输出张量), 张量序 = [input, weight, output],
-// 无标量参数, 直接注册原函数.
+// Graph wrapper: swaps workspace (graph input from alloc_buffer) and output
+// (graph output) to match the kernel signature.
+// Graph flat_vids:  [input, weight, workspace, output]
+// Kernel signature: (input, weight, output, workspace)
+static void batched_bgemm_graph(at::Tensor input, at::Tensor weight, at::Tensor workspace,
+                                at::Tensor output)
+{
+    batched_bgemm_kunpeng(input, weight, output, workspace);
+}
+
+// Direct-write form (output is the registered graph output tensor): tensor
+// order = [input, weight, workspace], with output produced by shape_infer;
+// no scalar args, reordered to the kernel signature by the wrapper.
 static KernelRegistrar _r_bgemm(
     "batched_bgemm_kunpeng",
-    make_dispatch_v<decltype(&batched_bgemm_kunpeng), &batched_bgemm_kunpeng>);
+    make_dispatch_v<decltype(&batched_bgemm_graph), &batched_bgemm_graph>);
 
 // In-place form of batched_bgemm_kunpeng: the output is a caller-provided
 // (possibly strided) view over a pre-allocated buffer, e.g. a transposed
 // view over a (M, B, N) tensor or a column slice of a wider row. Tensor
-// order = [input, weight, out], no scalars -- same kernel as above, but a
-// separate graph-op name so the replay dispatch keeps the two calling
+// order = [input, weight, workspace, out], no scalars -- same kernel as above,
+// but a separate graph-op name so the replay dispatch keeps the two calling
 // conventions distinct.
 static KernelRegistrar _r_bgemm_inplace(
     "batched_bgemm_inplace_kunpeng",
-    make_dispatch_v<decltype(&batched_bgemm_kunpeng), &batched_bgemm_kunpeng>);
+    make_dispatch_v<decltype(&batched_bgemm_graph), &batched_bgemm_graph>);

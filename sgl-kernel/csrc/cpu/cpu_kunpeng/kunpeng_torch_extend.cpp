@@ -166,7 +166,7 @@ void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Ten
 void fake_indexer_topk_mtp_kunpeng(const at::Tensor &seq_lens, const c10::optional<at::Tensor> &extend_seq_lens,
                                    int64_t num_rows, int64_t topk, at::Tensor indices);
 
-void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output);
+void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace);
 
 at::Tensor batched_bgemm_prepack_kunpeng(const at::Tensor &weight);
 
@@ -785,9 +785,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("fake_indexer_topk_mtp_kunpeng", fake_indexer_topk_mtp_kunpeng);
 
     // SME bf16 batched GEMM for the bf16 kv_b_proj MLA absorb path
-    // (e.g. GLM-5): weight prepacked by batched_bgemm_prepack_kunpeng, act packed
-    // per call, compute via batch_bf16_bf16_packed_gemm_bf16.
-    m.def("batched_bgemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output) -> ()");
+    // (e.g. GLM-5): weight prepacked by batched_bgemm_prepack_kunpeng,
+    // caller-provided workspace receives the per-call act pack, compute via
+    // batch_bf16_bf16_packed_gemm_bf16.
+    m.def(
+        "batched_bgemm_kunpeng(Tensor input, Tensor weight, Tensor(a!) output, "
+        "Tensor workspace) -> ()");
     m.impl("batched_bgemm_kunpeng", batched_bgemm_kunpeng);
 
     m.def("batched_bgemm_prepack_kunpeng(Tensor weight) -> Tensor");
