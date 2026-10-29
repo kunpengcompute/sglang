@@ -211,8 +211,8 @@ if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICAC
     if [[ -n "${KUNPENG_HICACHE_EXTRA_CONFIG:-}" ]]; then
         HICACHE_EXTRA_CONFIG_JSON="$KUNPENG_HICACHE_EXTRA_CONFIG"
     elif [[ -n "${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-}" || -n "${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-}" ]]; then
-        t_base="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-1}"
-        t_per_k="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-0.25}"
+        t_base="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-2}"
+        t_per_k="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-0.5}"
         for v in "$t_base" "$t_per_k"; do
             if [[ ! "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
                 echo "Error: prefetch timeout must be a number, got '$v'" >&2

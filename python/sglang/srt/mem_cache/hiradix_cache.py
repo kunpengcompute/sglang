@@ -1523,6 +1523,28 @@ class HiRadixCache(RadixCache):
             completed_tokens_tensor, torch.distributed.ReduceOp.MIN
         )
         min_completed_tokens = completed_tokens_tensor.item()
+        if min_completed_tokens == 0:
+            # No token prefix is common to every TP rank, so nothing can be
+            # published and the scheduler will recompute the whole request
+            # anyway. Release this rank's slots now instead of walking the
+            # insert path with an empty prefix.
+            self.cache_controller.append_host_mem_release(
+                host_indices[:completed_tokens]
+            )
+            last_host_node.release_host()
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            if _hicache_debug():
+                logger.info(
+                    "[hicache] prefetch discarded: req=%s, 0 token(s) reusable "
+                    "across TP ranks (this rank completed %d/%d), all tokens "
+                    "will be recomputed",
+                    req_id,
+                    completed_tokens,
+                    total_tokens,
+                )
+            return True
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         if self.l1l3_only:

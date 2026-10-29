@@ -350,6 +350,16 @@ class PrefetchOperation(StorageOperation):
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
+    def mark_transfer_start(self):
+        """Restart the timeout budget when the transfer actually begins.
+
+        An operation may sit in the per-rank prefetch queue while earlier
+        transfers drain. Counting that wait against the prefetch timeout made
+        queued requests expire with 0 tokens loaded, so the budget must measure
+        transfer time, not queue time.
+        """
+        self.start_time = time.monotonic()
+
     def increment(self, num_tokens: int):
         with self._lock:
             if self._terminated_flag:
@@ -411,6 +421,11 @@ class HiCacheController:
         self.flat_read_idx: Optional[torch.Tensor] = None
         self.indexer_page_elems = 0
         self.indexer_key_suffix = "@idx"
+        self.tp0_bcast = (
+            os.environ.get("SGLANG_KUNPENG_HICACHE_TP0_BCAST", "1") == "1"
+        )
+        self.tp0_bcast_shm = None
+        self.tp0_bcast_seq = 0
         self.write_policy = write_policy
         self.page_size = page_size
         self.io_backend = io_backend
@@ -679,6 +694,21 @@ class HiCacheController:
                         "SGLANG_KUNPENG_HICACHE_L1L3_ONLY."
                     )
                 self._alloc_flat_io_buffers()
+                if self.tp0_bcast:
+                    # Creating the broadcast slots registers ~1.5 GB with the
+                    # RDMA backend (seconds) and faults every page in; the first
+                    # prefetch of the first request would pay all of that.
+                    # A broken broadcast must not disable L3 storage, so fall
+                    # back to per-rank reads instead of failing the attach.
+                    try:
+                        self._init_tp0_bcast()
+                    except Exception:
+                        self.tp0_bcast = False
+                        self.tp0_bcast_shm = None
+                        logger.exception(
+                            "[hicache] tp0-bcast init failed at startup; "
+                            "disabling broadcast on this rank"
+                        )
             else:
                 self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
@@ -1006,6 +1036,18 @@ class HiCacheController:
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
+            # The aux thread only checks storage_stop_event between transfers,
+            # so it must be joined *before* the event is cleared below. Otherwise
+            # it survives the reset, follows the new prefetch_buffer and runs a
+            # second concurrent transfer path on the same flat_read buffer and
+            # the same broadcast slots.
+            if getattr(self, "prefetch_io_aux_thread", None) is not None:
+                try:
+                    self.prefetch_buffer.put_nowait(None)
+                except Exception:
+                    pass
+                self.prefetch_io_aux_thread.join()
+                self.prefetch_io_aux_thread = None
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
@@ -1449,7 +1491,432 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+    def _tp0_bcast_active(self):
+        if not getattr(self, "tp0_bcast", False) or not getattr(
+            self, "l1l3_only", False
+        ):
+            return False
+        if getattr(self, "tp0_bcast_shm", None) is None:
+            try:
+                self._init_tp0_bcast()
+            except Exception:
+                # A broken broadcast setup must not disable prefetching for this
+                # rank (the whole TP group would then lose L3 reuse); fall back
+                # to the per-rank read path for this process.
+                self.tp0_bcast = False
+                self.tp0_bcast_shm = None
+                logger.exception(
+                    "[hicache] tp0-bcast init failed; disabling broadcast on "
+                    "this rank and falling back to per-rank reads"
+                )
+                return False
+        return self.tp0_bcast_shm is not None
+
+    def _init_tp0_bcast(self):
+        import hashlib
+        import socket
+        import struct
+        from multiprocessing import shared_memory
+
+        self.tp0_bcast_pages = self.flat_io_batch_pages
+        self.tp0_bcast_nranks = int(self.tp_size)
+        self.tp0_bcast_page_bytes = (
+            self.flat_read[0].numel() * self.flat_read.element_size()
+        )
+        self.tp0_bcast_timeout = float(
+            os.environ.get("SGLANG_KUNPENG_HICACHE_TP0_BCAST_TIMEOUT", "10")
+        )
+        # Two batch-sized slots used as a ping-pong buffer: while followers copy
+        # batch i out of slot i%2, the leader can already read batch i+1 from L3
+        # and publish it into the other slot. A slot is only overwritten after
+        # every follower acknowledged its previous use (see tp0_bcast_last_seq).
+        self.tp0_bcast_slots = 2
+        self.tp0_bcast_last_seq = [0] * self.tp0_bcast_slots
+        self.tp0_bcast_ack_bytes = 8 * self.tp0_bcast_nranks
+        self.tp0_bcast_data_off = 64 + self.tp0_bcast_ack_bytes
+        self.tp0_bcast_slot_bytes = (
+            self.tp0_bcast_data_off + self.tp0_bcast_pages * self.tp0_bcast_page_bytes
+        )
+        # The slot pages are first touched by the leader: the L3 read writes
+        # them, or the RDMA registration pins them. Without a policy that pins
+        # every page to the leader's NUMA node while the other TP ranks pull the
+        # whole prefix from that single memory controller. Interleave instead.
+        self.tp0_bcast_interleaved = False
+        if self.tp_rank == 0:
+            from sglang.srt.utils.numa_utils import set_interleave_memory_policy
+
+            self.tp0_bcast_interleaved = set_interleave_memory_policy()
+        key = hashlib.md5(
+            f"{socket.gethostname()}:{os.environ.get('SGLANG_DP_RANK', '0')}".encode()
+        ).hexdigest()[:12]
+        name = f"sgk_hicache_bcast_{key}"
+        size = self.tp0_bcast_slots * self.tp0_bcast_slot_bytes
+        try:
+            shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+            for slot in range(self.tp0_bcast_slots):
+                base = slot * self.tp0_bcast_slot_bytes
+                struct.pack_into("<QQQQQQ", shm.buf, base, 0, 0, 0, 0, 0, 0)
+                for rank in range(self.tp0_bcast_nranks):
+                    struct.pack_into("<Q", shm.buf, base + 64 + 8 * rank, 0)
+        except FileExistsError:
+            shm = shared_memory.SharedMemory(name=name)
+        self.tp0_bcast_shm = shm
+        # Slot payload views: the leader reads L3 straight into a slot and the
+        # followers scatter straight out of one, so neither side needs the
+        # per-rank flat bounce buffer in the broadcast path.
+        blob_elems = self.flat_read.size(1)
+        self.tp0_bcast_slot_views = [
+            torch.frombuffer(
+                shm.buf,
+                dtype=self.flat_read.dtype,
+                count=self.tp0_bcast_pages * blob_elems,
+                offset=slot * self.tp0_bcast_slot_bytes + self.tp0_bcast_data_off,
+            ).view(self.tp0_bcast_pages, blob_elems)
+            for slot in range(self.tp0_bcast_slots)
+        ]
+        self.tp0_bcast_direct = True
+        if self.tp_rank == 0:
+            try:
+                for view in self.tp0_bcast_slot_views:
+                    self.storage_backend.register_io_buffer(view)
+            except Exception:
+                # RDMA backends must register the target of a zero-copy read;
+                # if that is refused the leader keeps the flat buffer and pays
+                # the extra copy instead.
+                self.tp0_bcast_direct = False
+                logger.exception(
+                    "[hicache] tp0-bcast: slot registration failed; leader falls "
+                    "back to flat-buffer reads"
+                )
+        # Touch every page once so the first L3 read does not pay the page
+        # faults (and the interleaved placement) on the request path.
+        if self.tp_rank == 0:
+            for view in self.tp0_bcast_slot_views:
+                view.zero_()
+            # Both slots are populated now; put the calling thread back on the
+            # default first-touch policy so its later allocations stay local.
+            from sglang.srt.utils.numa_utils import set_local_memory_policy
+
+            set_local_memory_policy()
+        # Seeded from the wall clock so an ack left behind by a previous server
+        # on the same node can never equal a sequence number of this process
+        # (acks are matched exactly, not by ordering).
+        self.tp0_bcast_seq = time.time_ns()
+        logger.info(
+            "[hicache] tp0-bcast enabled: rank=%d shm=%s slots=%d nranks=%d "
+            "page_bytes=%d direct=%s interleave=%s timeout=%.1fs",
+            self.tp_rank,
+            name,
+            self.tp0_bcast_slots,
+            self.tp0_bcast_nranks,
+            self.tp0_bcast_page_bytes,
+            self.tp0_bcast_direct,
+            self.tp0_bcast_interleaved,
+            self.tp0_bcast_timeout,
+        )
+
+    def _bcast_publish(
+        self, slot, batch_idx, pages, hit_pages, tag, op_tag, copy_from_flat=False
+    ):
+        import struct
+
+        base = slot * self.tp0_bcast_slot_bytes
+        nbytes = hit_pages * self.tp0_bcast_page_bytes
+        if nbytes and copy_from_flat:
+            src = self.flat_read[:hit_pages].contiguous().view(torch.uint8).reshape(-1)
+            dst = torch.frombuffer(
+                self.tp0_bcast_shm.buf,
+                dtype=torch.uint8,
+                count=nbytes,
+                offset=base + self.tp0_bcast_data_off,
+            )
+            dst.copy_(src)
+        self.tp0_bcast_seq += 1
+        seq = self.tp0_bcast_seq
+        struct.pack_into(
+            "<QQQQQQ",
+            self.tp0_bcast_shm.buf,
+            base,
+            seq,
+            pages,
+            hit_pages,
+            tag,
+            batch_idx,
+            op_tag,
+        )
+        # The leader is trivially done with its own batch.
+        struct.pack_into(
+            "<Q", self.tp0_bcast_shm.buf, base + 64 + 8 * self.tp_rank, seq
+        )
+        return seq
+
+    def _bcast_wait_acks(self, slot, seq) -> bool:
+        """Wait until every follower released the previous use of ``slot``.
+
+        A slot is rewritten only after all followers acknowledged the sequence
+        that was in it, so a slow rank never has its payload overwritten
+        mid-copy. The wait happens once per slot reuse, not once per batch,
+        which is what lets the leader run one batch ahead. On timeout the
+        leader moves on and the laggard falls back to per-batch L3 reads; the
+        wait is bounded, so a dead rank cannot wedge the whole group.
+        """
+        import struct
+
+        ack_base = slot * self.tp0_bcast_slot_bytes + 64
+        pending = {
+            rank for rank in range(self.tp0_bcast_nranks) if rank != self.tp_rank
+        }
+        deadline = time.monotonic() + self.tp0_bcast_timeout
+        while pending:
+            for rank in list(pending):
+                acked = struct.unpack_from(
+                    "<Q", self.tp0_bcast_shm.buf, ack_base + 8 * rank
+                )[0]
+                if acked == seq:
+                    pending.discard(rank)
+            if not pending:
+                return True
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "[hicache] tp0-bcast ack timeout: slot=%d seq=%d, %d/%d "
+                    "follower(s) pending ranks=%s, continuing "
+                    "(laggards read L3 per-rank)",
+                    slot,
+                    seq,
+                    len(pending),
+                    self.tp0_bcast_nranks - 1,
+                    sorted(pending),
+                )
+                return False
+            time.sleep(0.0005)
+        return True
+
+    def _bcast_receive(self, slot, batch_idx, pages, tag, op_tag):
+        """Hand out the slot view of one published batch.
+
+        The caller scatters it and then calls ``_bcast_ack``: the bytes are read
+        in place, so the slot stays valid only until the leader sees the ack.
+        """
+        import struct
+
+        base = slot * self.tp0_bcast_slot_bytes
+        deadline = time.monotonic() + self.tp0_bcast_timeout
+        while True:
+            seq_h, pages_h, hit_h, tag_h, batch_h, op_h = struct.unpack_from(
+                "<QQQQQQ", self.tp0_bcast_shm.buf, base
+            )
+            if (
+                op_h == op_tag
+                and tag_h == tag
+                and pages_h == pages
+                and batch_h == batch_idx
+            ):
+                hit_h = int(hit_h)
+                src = self.tp0_bcast_slot_views[slot][:hit_h] if hit_h else None
+                # The leader only reuses a slot after every follower acked it,
+                # so a changed sequence here means this read raced with an
+                # overwrite (peer ack timeout) and the bytes are untrustworthy.
+                if struct.unpack_from("<Q", self.tp0_bcast_shm.buf, base)[0] != seq_h:
+                    return -1, None, 0
+                return hit_h, src, seq_h
+            if time.monotonic() > deadline:
+                return -1, None, 0
+            time.sleep(0.0005)
+
+    def _bcast_ack(self, slot, seq):
+        import struct
+
+        struct.pack_into(
+            "<Q",
+            self.tp0_bcast_shm.buf,
+            slot * self.tp0_bcast_slot_bytes + 64 + 8 * self.tp_rank,
+            seq,
+        )
+
+    def _read_batch_from_l3(
+        self, batch_hashes, pages, extra_info, buffers=None
+    ) -> int:
+        """Read one batch from L3 into ``buffers`` (default: the flat buffer)."""
+        if buffers is None:
+            buffers = [self.flat_read[j] for j in range(pages)]
+        hits = self.storage_backend.batch_get_flat(
+            batch_hashes, buffers, extra_info
+        )
+        hit_pages = 0
+        for hit in hits:
+            if not hit:
+                break
+            hit_pages += 1
+        return hit_pages
+
+    def _page_transfer_l1l3_bcast(self, operation):
+        import zlib
+
+        debug = _hicache_debug()
+        prefix_keys = operation.prefix_keys
+        layers = self.mem_pool_device.kv_buffer
+        is_leader = self.tp_rank == 0
+        op_tag = zlib.crc32(operation.request_id.encode())
+        bcast_ok = True
+
+        for i in range(0, len(operation.hash_value), self.storage_batch_size):
+            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+            pages = len(batch_hashes)
+            batch_indices = operation.host_indices[
+                i * self.page_size : (i + pages) * self.page_size
+            ]
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            tag = zlib.crc32(batch_hashes[0].encode())
+            batch_idx = i // self.storage_batch_size
+            slot = batch_idx % self.tp0_bcast_slots
+
+            # Per-batch stage timing (debug only). For the leader wait = ack
+            # wait, read = L3 read, pub = publish; for a follower wait = waiting
+            # for the leader to publish, read = its own L3 fallback read (0 when
+            # the broadcast worked) and pub = 0.
+            t_b = time.perf_counter() if debug else 0.0
+            t_wait = t_read = t_pub = 0.0
+            slot_src = None
+            slot_seq = 0
+            if is_leader:
+                # Ping-pong pipeline: batch i+1 goes into the other slot, so the
+                # leader does not wait for the followers to finish batch i. It
+                # only waits here, before overwriting a slot, for the followers
+                # that were still consuming that slot's previous batch.
+                prev_seq = self.tp0_bcast_last_seq[slot]
+                if prev_seq:
+                    self._bcast_wait_acks(slot, prev_seq)
+                if debug:
+                    t_wait = time.perf_counter() - t_b
+                direct = getattr(self, "tp0_bcast_direct", False)
+                buffers = (
+                    [self.tp0_bcast_slot_views[slot][j] for j in range(pages)]
+                    if direct
+                    else None
+                )
+                hit_pages = self._read_batch_from_l3(
+                    batch_hashes, pages, extra_info, buffers
+                )
+                if debug:
+                    t_read = time.perf_counter() - t_b - t_wait
+                if hit_pages < pages:
+                    logger.warning(
+                        "[hicache] tp0-bcast read: req=%s, %d/%d page(s) failed",
+                        operation.request_id,
+                        pages - hit_pages,
+                        pages,
+                    )
+                seq = self._bcast_publish(
+                    slot,
+                    batch_idx,
+                    pages,
+                    hit_pages,
+                    tag,
+                    op_tag,
+                    copy_from_flat=not direct,
+                )
+                if debug:
+                    t_pub = time.perf_counter() - t_b - t_wait - t_read
+                self.tp0_bcast_last_seq[slot] = seq
+                slot_src = (
+                    self.tp0_bcast_slot_views[slot][:hit_pages] if hit_pages else None
+                )
+            elif bcast_ok:
+                hit_pages, slot_src, slot_seq = self._bcast_receive(
+                    slot, batch_idx, pages, tag, op_tag
+                )
+                if debug:
+                    t_wait = time.perf_counter() - t_b
+                if hit_pages < 0:
+                    logger.warning(
+                        "[hicache] tp0-bcast fallback: req=%s, batch=%d, "
+                        "reading this and the remaining batch(es) from L3 per-rank",
+                        operation.request_id,
+                        batch_idx,
+                    )
+                    bcast_ok = False
+                    hit_pages = self._read_batch_from_l3(
+                        batch_hashes, pages, extra_info
+                    )
+                if debug:
+                    t_read = time.perf_counter() - t_b - t_wait
+            else:
+                hit_pages = self._read_batch_from_l3(batch_hashes, pages, extra_info)
+                if debug:
+                    t_read = time.perf_counter() - t_b
+
+            if hit_pages and self.indexer_page_elems:
+                idx_hits = self.storage_backend.batch_get_flat(
+                    self._indexer_keys(batch_hashes[:hit_pages]),
+                    [self.flat_read_idx[j] for j in range(hit_pages)],
+                    extra_info,
+                )
+                idx_hit_pages = 0
+                for hit in idx_hits:
+                    if not hit:
+                        break
+                    idx_hit_pages += 1
+                hit_pages = min(hit_pages, idx_hit_pages)
+
+            if hit_pages:
+                page_starts = self._device_page_starts(
+                    batch_indices[: hit_pages * self.page_size],
+                    hit_pages,
+                    "L3->L1",
+                )
+                hicache_page_unflatten_batch(
+                    layers,
+                    slot_src[:hit_pages]
+                    if slot_src is not None
+                    else self.flat_read[:hit_pages],
+                    page_starts,
+                    self.page_size,
+                )
+                if self.indexer_page_elems:
+                    hicache_page_unflatten_batch(
+                        self._indexer_page_layers(),
+                        self.flat_read_idx[:hit_pages],
+                        page_starts // self.page_size,
+                        1,
+                    )
+                if debug:
+                    t_scatter = time.perf_counter() - t_b - t_wait - t_read - t_pub
+                    logger.info(
+                        "[hicache] tp0-bcast: req=%s, %d/%d page(s), device%s, "
+                        "done=%d/%d, wait=%.3f read=%.3f pub=%.3f scatter=%.3f",
+                        operation.request_id,
+                        hit_pages,
+                        pages,
+                        _idx_range(batch_indices),
+                        operation.completed_tokens + hit_pages * self.page_size,
+                        len(operation.hash_value) * self.page_size,
+                        t_wait,
+                        t_read,
+                        t_pub,
+                        t_scatter,
+                    )
+
+            if slot_seq:
+                # Released only after the scatter: a follower reads the slot in
+                # place, so the leader must not reuse it before this point.
+                self._bcast_ack(slot, slot_seq)
+
+            if hit_pages == 0:
+                operation.mark_terminate()
+                break
+            still_running = operation.increment(hit_pages * self.page_size)
+            if not still_running:
+                operation.mark_terminate()
+                break
+            if prefix_keys and len(prefix_keys) > 0:
+                prefix_keys += batch_hashes
+
     def _page_transfer_l1l3(self, operation):
+        if self._tp0_bcast_active():
+            return self._page_transfer_l1l3_bcast(operation)
+        return self._page_transfer_l1l3_plain(operation)
+
+    def _page_transfer_l1l3_plain(self, operation):
         """Two-tier L3 -> L1 read: get a batch into the flat buffer, then scatter
         it straight into the batch's pre-allocated L1 device slots.
 
@@ -1575,7 +2042,18 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
+                operation.mark_transfer_start()
+                try:
+                    self._page_transfer(operation)
+                except Exception:
+                    # One bad transfer must not kill this thread and starve all
+                    # later prefetches on the rank.
+                    logger.exception(
+                        "[hicache] prefetch transfer failed: req=%s; terminating "
+                        "the operation and continuing",
+                        operation.request_id,
+                    )
+                    operation.mark_terminate()
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
@@ -1630,11 +2108,20 @@ class HiCacheController:
         Manage prefetching operations from storage backend to host memory.
         """
         _pin_storage_thread("prefetch")
-        self.prefetch_buffer = Queue()
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_io_aux_thread.start()
+        aux = getattr(self, "prefetch_io_aux_thread", None)
+        if aux is None or not aux.is_alive():
+            self.prefetch_buffer = Queue()
+            self.prefetch_io_aux_thread = threading.Thread(
+                target=self.prefetch_io_aux_func, daemon=True
+            )
+            self.prefetch_io_aux_thread.start()
+        else:
+            # Reuse the live consumer and its buffer; a second one would race on
+            # the shared flat_read buffer and the broadcast slots.
+            logger.warning(
+                "[hicache] prefetch_io_aux thread already running; "
+                "reusing it instead of starting a second one"
+            )
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)

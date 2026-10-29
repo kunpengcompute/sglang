@@ -14,7 +14,8 @@
 
 #!/bin/bash
 # stop_server.sh - Kill sglang on the role's cluster nodes (all of them,
-# in parallel via SSH), then clean up zombies / shm / hugepages.
+# in parallel via SSH), then clean up zombies / shm / hugepages (incl. the
+# stale HiCache tp0-bcast segment when that feature is enabled).
 # Invoked by: ./stop.sh server [prefill|decode|native] [instance]
 # Usage: bash runtime/stop_server.sh [prefill|decode|native] [instance]
 
@@ -31,6 +32,20 @@ cd "$SCRIPT_DIR"
 # Source config for the specified role (+ optional instance)
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
 SKIP_CONDA=1 source ./env.sh "$ROLE" "$INSTANCE"
+
+# HiCache tp0-bcast leaves a POSIX shm segment (sgk_hicache_bcast_*) on each
+# node. It is created lazily at the first prefetch and never unlinked, so it
+# outlives the server. A later run with a different
+# KUNPENG_HICACHE_IO_BATCH_PAGES would attach the stale segment, index past
+# its end and kill the prefetch I/O thread (ValueError in tp0's publish,
+# struct.error in the other ranks' receive). Wipe it on stop whenever this
+# role/instance actually runs HiCache with tp0-bcast.
+CLEAN_HICACHE_BCAST=0
+if [[ "$ROLE" == "prefill" || "$ROLE" == "native" ]] &&
+   [[ "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]] &&
+   [[ "${SGLANG_KUNPENG_HICACHE_TP0_BCAST:-0}" == "1" ]]; then
+    CLEAN_HICACHE_BCAST=1
+fi
 
 # Convert space-separated IP list to array
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
@@ -79,6 +94,10 @@ for i in "${!NODES[@]}"; do
         fi
 
         rm -rf /dev/shm/shm_mmap_*
+        if [ "'"${CLEAN_HICACHE_BCAST}"'" = "1" ]; then
+            echo "Removing stale HiCache tp0-bcast shm on '"$node"'"
+            rm -f /dev/shm/sgk_hicache_bcast_*
+        fi
         for i in $(seq 0 31); do
             echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
         done

@@ -43,10 +43,10 @@ usage() {
   echo "              enabled (no ignore_eos), so the model may stop naturally."
   echo "  -r RATE     Send rate in req/s (default: 32, must be > 0)"
   echo "  -v          Verbose stats (only active when NUM > 1): decode throughput"
-  echo "              table; with -s also accept rate. Writes per-request latency"
-  echo "              rows + response bodies to <run-id>_detail.txt. With a single"
-  echo "              streaming request, echoes the raw SSE lines instead of the"
-  echo "              decoded text."
+  echo "              table; with -s also per-request TTFT and accept rate. Writes"
+  echo "              per-request latency/TTFT rows + response bodies to"
+  echo "              <run-id>_detail.txt. With a single streaming request, echoes"
+  echo "              the raw SSE lines instead of the decoded text."
   echo "  -F          Fake-transfer mode: inject bootstrap_host=2.2.2.2 + a unique"
   echo "              bootstrap_room per request; decode skips KV transfer without"
   echo "              --disaggregation-transfer-backend. Port auto-derived from"
@@ -848,14 +848,14 @@ if [ "$INTERACTIVE" = false ]; then
   LAT_FILE="$RESULT_DIR/all_latencies"
   : > "$LAT_FILE"
 
-  # With -v, per-request rows and response bodies go to a file instead of
-  # the terminal (row count scales with -n and can be huge).
+  # With -v, per-request rows (including streaming TTFT) and response bodies
+  # go to a file instead of the terminal (row count scales with -n).
   DETAIL_FILE=""
   if [ "$VERBOSE" = true ]; then
     DETAIL_FILE="${RUN_ID}_detail.txt"
     {
       echo "Per-Request Latency (relative to test start)"
-      printf "%-6s %-6s %-12s %-12s %-10s %-8s %-8s %s\n" "Req#" "Rank" "Start(s)" "End(s)" "Latency(s)" "Tokens" "Accept" "ReqID"
+      printf "%-6s %-6s %-12s %-12s %-10s %-12s %-8s %-8s %s\n" "Req#" "Rank" "Start(s)" "End(s)" "Latency(s)" "TTFT(s)" "Tokens" "Accept" "ReqID"
     } > "$DETAIL_FILE"
   fi
 
@@ -874,8 +874,24 @@ if [ "$INTERACTIVE" = false ]; then
       toks="?"
       rid="N/A"
       acc="N/A"
+      ttft_s="N/A"
       read -r toks < "$RESULT_DIR/tokens_${i}" 2>/dev/null || toks="?"
       read -r rid < "$RESULT_DIR/rid_${i}" 2>/dev/null || rid="N/A"
+      # Per-request TTFT = first-token wall stamp - curl launch stamp (both
+      # sec.ns). Integer-ns math, no awk fork: -n may be in the thousands on
+      # a loaded node.
+      if [ -s "$RESULT_DIR/ttft_${i}" ]; then
+        read -r fs ts0 < "$RESULT_DIR/ttft_${i}"
+        if [[ "$fs" =~ ^[0-9.]+\.[0-9]+$ ]] && [[ "$ts0" =~ ^[0-9.]+\.[0-9]+$ ]]; then
+          fs_s=${fs%%.*}; fs_f="${fs#*.}000000000"; fs_f="${fs_f:0:9}"
+          t0_s=${ts0%%.*}; t0_f="${ts0#*.}000000000"; t0_f="${t0_f:0:9}"
+          tt_ns=$(( (10#$fs_s * 1000000000 + 10#$fs_f) \
+                    - (10#$t0_s * 1000000000 + 10#$t0_f) ))
+          if [ "$tt_ns" -gt 0 ]; then
+            printf -v ttft_s '%d.%03d' $((tt_ns / 1000000000)) $((tt_ns / 1000000 % 1000))
+          fi
+        fi
+      fi
       # Per-request accept rate = (tokens-1)/(chunks-1): the first chunk
       # carries the prefill's first token; only decode steps can accept
       # draft tokens.
@@ -887,11 +903,11 @@ if [ "$INTERACTIVE" = false ]; then
         [[ "$acc" != "N/A" ]] && echo "$toks $ch" >> "$RESULT_DIR/all_accepts"
       fi
       if [ "$VERBOSE" = true ]; then
-        printf "%-6d %-6s %-12s %-12s %-10s %-8s %-8s %s\n" "$i" "$rank" "$rel_start" "$rel_end" "$dur" "$toks" "$acc" "$rid" >> "$DETAIL_FILE"
+        printf "%-6d %-6s %-12s %-12s %-10s %-12s %-8s %-8s %s\n" "$i" "$rank" "$rel_start" "$rel_end" "$dur" "$ttft_s" "$toks" "$acc" "$rid" >> "$DETAIL_FILE"
       fi
     else
       if [ "$VERBOSE" = true ]; then
-        printf "%-6d %-6s %-12s %-12s %-10s %-8s %s\n" "$i" "$rank" "N/A" "N/A" "N/A" "N/A" "N/A" >> "$DETAIL_FILE"
+        printf "%-6d %-6s %-12s %-12s %-10s %-12s %-8s %-8s %s\n" "$i" "$rank" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "" >> "$DETAIL_FILE"
       fi
     fi
   done

@@ -212,6 +212,41 @@ def _can_set_mempolicy() -> bool:
         return False
 
 
+def set_interleave_memory_policy() -> bool:
+    """Allocate this thread's future pages round-robin over every NUMA node.
+
+    For a buffer that one process fills and many others read (the HiCache
+    tp0-broadcast slots) the default first-touch policy puts every page on the
+    writer's node, so all readers pull the whole buffer from a single memory
+    controller. Returns True when the policy was applied.
+    """
+    if not _can_set_mempolicy():
+        return False
+    try:
+        all_nodes = ctypes.c_void_p.in_dll(libnuma, "numa_all_nodes_ptr").value
+        if not all_nodes:
+            return False
+        return libnuma.numa_set_interleave_mask(ctypes.c_void_p(all_nodes)) == 0
+    except Exception:
+        return False
+
+
+def set_local_memory_policy() -> bool:
+    """Restore the default first-touch (local) allocation policy.
+
+    Counterpart of :func:`set_interleave_memory_policy`; call it once the
+    buffer that needs interleaving has been populated so the calling thread's
+    later allocations stay NUMA-local.
+    """
+    if libnuma is None:
+        return False
+    try:
+        libnuma.numa_set_localalloc()
+        return True
+    except Exception:
+        return False
+
+
 def _is_numa_available() -> bool:
     """
     Check if NUMA is available and not already configured externally.
