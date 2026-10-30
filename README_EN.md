@@ -2,7 +2,7 @@
 
 ## Release Notes
 
-- \[2026/10] Added GLM-5.3 deployment guide (weight preprocessing, configuration, startup).
+- \[2026/10] Added GLM-5.3 deployment guide (weight preprocessing, configuration, startup); added HiCache tiered KV cache with the mooncake L3 backend, and mooncake/store deployment roles.
 - \[2026/09] Updated deployment docs: added multi-instance deployment, tokenizer-separate PD disaggregated deployment, and related environment variables.
 - \[2026/05] This release is based on SGLang official v0.5.11 with optimizations and adaptations.
 
@@ -33,7 +33,7 @@ In addition, compiling the SGLang kernel module requires the Bisheng Compiler. P
 
 Two more components are required for running and compilation; see the corresponding repositories for detailed installation steps:
 
-- **kutacc**: Kunpeng CPU communication and operator library (RDMA collectives, shm allreduce, etc.); use the branch at <https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang>.
+- **kutacc**: Kunpeng CPU communication and operator library (RDMA collectives, shm allreduce, etc.); use the branch at <https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang> (the RDMA allgather/broadcast features require a kutacc build from the sglang_930 branch, see Section 3.7.1 item 8).
 - **kupl**: Kunpeng acceleration runtime (kupl multi-threading backend, SHM/SDMA, etc.); use the branch at <https://gitcode.com/kunpengcompute/kupl/tree/sglang_830>.
 
 In PD (Prefill-Decode) disaggregated deployment mode, two additional components, SGLang Model Gateway and Mooncake, are required to handle request distribution and KVCache data transfer between Prefill and Decode instances:
@@ -95,10 +95,13 @@ Taking the DeepSeek V3 int8 quantized version as an example, the recommended nat
 | File | Description |
 |---|---|
 | `runtime/env_base.sh` | Shared defaults: paths, `INSTANCES` list, TP/DP/EP/PP sizes, functional toggles |
+| `runtime/env_native.sh` | Native role defaults: node set, SHM/HBW pools, chunked prefill, etc. (prefill-side values) |
 | `runtime/env_prefill.sh` | Prefill role defaults: node set, master address, port/NUMA auto-derivation |
 | `runtime/env_decode.sh` | Decode role defaults: node set, master address, port/NUMA auto-derivation |
+| `runtime/env_mooncake.sh` / `runtime/env_store.sh` | HiCache mooncake-backend role defaults (store master / store service, see Section 3.6) |
 | `.user_env.sh` | Cluster-level user override file (loaded first), may branch on the role argument |
 | `runtime/.user_env_base.sh` | Optional all-role shared override file (loaded after `.user_env.sh`) |
+| `runtime/.user_env_native[_<instance>].sh` | Native role/instance override files |
 | `runtime/.user_env_prefill[_<instance>].sh` | Prefill role/instance override files |
 | `runtime/.user_env_decode[_<instance>].sh` | Decode role/instance override files |
 
@@ -164,7 +167,7 @@ export LOAD_FORMAT="kunpeng_state"
 
 Set the chat template and parsers for GLM in `.user_env.sh` as needed (see the `CHAT_TEMPLATE` / `TOOL_CALL_PARSER` / `REASONING_PARSER` notes in `runtime/env_base.sh`), e.g. `TOOL_CALL_PARSER=glm47`.
 
-Parallel sizes (TP/DP/EP/PP), native/PD modes, and MTP speculative decoding (`SGLANG_ENABLE_MTP=1`, `SPECULATIVE_DRAFT_MODEL_PATH` pointing to the `_mtp` directory) are configured exactly as for DeepSeek V3 — see Section 3.1, Section 3.5, and Section 3.6.1.
+Parallel sizes (TP/DP/EP/PP), native/PD modes, and MTP speculative decoding (`SGLANG_ENABLE_MTP=1`, `SPECULATIVE_DRAFT_MODEL_PATH` pointing to the `_mtp` directory) are configured exactly as for DeepSeek V3 — see Section 3.1, Section 3.5, and Section 3.7.1.
 
 **3. Startup**
 
@@ -179,7 +182,7 @@ sh launch.sh all
 
 ### 3.3 Using Other Non-DeepSeek Models
 
-When using non-DeepSeek models, you need to comment out the condition at lines 98~102 in `srt/models/registry.py`. This logic skips loading non-DeepSeek model dependencies to improve startup speed. Alternatively, you can change the condition value to the corresponding value of the specific model being used, for example, `sglang.srt.models.qwen3`.
+When using non-DeepSeek models, you need to comment out the condition at lines 99~114 in `srt/models/registry.py`. This logic skips loading of models outside the whitelist to improve startup speed. Alternatively, you can change the condition value to the corresponding value of the specific model being used, for example, `sglang.srt.models.qwen3`. The whitelist already covers the DeepSeek family and GLM-5.3 (`sglang.srt.models.glm4_moe`, see Section 3.2 — no changes needed); the Qwen3.5 family (`qwen3_5`/`qwen3_5_mtp`) can be allowed by setting `SGLANG_KUNPENG_QWEN=1`. For single-node Qwen3.8 deployment, refer to the [Qwen3.8 deployment guide](docs/kunpeng/Qwen3.8_README.md).
 
 ### 3.4 Deployment Modes
 
@@ -190,7 +193,9 @@ Select the deployment role via `./launch.sh <role> [instance]`:
 - **decode**: PD disaggregation decode role. Nodes read from `DECODE_IP_SPEC`/`DECODE_IP_FILE` (defaults in `runtime/env_decode.sh`).
 - **router**: PD disaggregation router node, single-node SGLang Model Gateway (`sgl-model-gateway`, Rust binary, resolved from `bin/sgl-model-gateway` in the conda env by default, overridable via `MODEL_GATEWAY_BIN`), default policy `cache_aware`.
 - **tokenizer**: Start one side's tokenizer HTTP server on the router node, usage: `./launch.sh tokenizer <prefill|decode> [instance]`, used in PD disaggregation mode.
-- **all**: One-shot deployment: per `INSTANCES` entry, launch each instance's server cluster, then each instance's tokenizer, then the router.
+- **mooncake**: When the HiCache L3 backend is mooncake, run the mooncake store master on `MOONCAKE_MASTER_NODE` (default `ROUTER_IP`; binary resolved from `bin/mooncake_master` in the conda env by default, overridable via `MOONCAKE_MASTER_BIN`).
+- **store**: Run the mooncake store service on `MOONCAKE_STORE_NODE` (the process that actually holds the L3 shared memory segment).
+- **all**: One-shot deployment: per `INSTANCES` entry, launch each instance's server cluster, then each instance's tokenizer, then the router; when any prefill/native instance enables HiCache with the mooncake L3 backend, the mooncake store master and store service are launched first automatically.
 - **update**: Regenerate `.time_env.sh` and refresh NUMA binary replicas.
 
 Script call hierarchy (`launch.sh` is a pure task dispatcher; the real logic lives in sub-scripts):
@@ -201,6 +206,8 @@ launch.sh (dispatcher: ./launch.sh <role> [instance])
   │      └─→ server.sh (single-node process launch)
   ├─→ runtime/launch_tokenizer.sh (tokenizer: SSH to the router node)
   │      └─→ runtime/server_tokenizer.sh (tokenizer HTTP server)
+  ├─→ runtime/launch_mooncake.sh (mooncake: store master)
+  ├─→ runtime/launch_store.sh (store: store service)
   └─→ runtime/launch_router.sh (router: wait for all backends, then launch the Model Gateway)
          └─→ runtime/server_router.sh (SGLang Model Gateway)
 ```
@@ -209,12 +216,12 @@ Configuration loading order (`source env.sh <role> [instance]`):
 
 ```
 runtime/env_base.sh (shared defaults; loads .user_env.sh then runtime/.user_env_base.sh)
-  └─ runtime/env_prefill.sh / runtime/env_decode.sh (role defaults, ${VAR:-...} fallbacks, never overwrite set values)
+  └─ runtime/env_native.sh / runtime/env_prefill.sh / runtime/env_decode.sh / runtime/env_mooncake.sh / runtime/env_store.sh (role defaults, ${VAR:-...} fallbacks, never overwrite set values)
        └─ runtime/.user_env_<role>_<instance>.sh (only this instance file when an instance is specified)
           or runtime/.user_env_<role>.sh (role default file when no instance is given)
 ```
 
-Role defaults: prefill sets `SGLANG_KUNPENG_MAX_SEQ_NUM=8` and `SGLANG_KUNPENG_MAX_CUR_LEN=576`; decode sets `SGLANG_KUNPENG_MAX_SEQ_NUM=64` and `SGLANG_KUNPENG_MAX_CUR_LEN=1` (automatically `SGLANG_SPECULATIVE_NUM_STEPS+1` when MTP is enabled).
+Role defaults: prefill sets `SGLANG_KUNPENG_MAX_SEQ_NUM=8` and `SGLANG_KUNPENG_MAX_CUR_LEN=576` (native uses the same prefill-side values); decode sets `SGLANG_KUNPENG_MAX_SEQ_NUM=64` and `SGLANG_KUNPENG_MAX_CUR_LEN=1` (automatically `SGLANG_SPECULATIVE_NUM_STEPS+1` when MTP is enabled).
 
 ### 3.5 PD Disaggregated Deployment
 
@@ -227,7 +234,7 @@ Deployment steps:
 2. One-shot launch (recommended, run on any node):
 
 ```shell
-sh launch.sh all   # Per INSTANCES: each instance's servers → tokenizers → router
+sh launch.sh all   # Per INSTANCES: each instance's servers → tokenizers → router (mooncake master + store launched first for the mooncake backend)
 ```
 
 3. Step-by-step launch (cluster commands run on each master node; tokenizer/router SSH to `ROUTER_IP` automatically):
@@ -243,7 +250,7 @@ sh launch.sh router             # wait for all backends, then launch the Model G
 4. Shutdown:
 
 ```shell
-sh stop.sh all                 # router + all tokenizers + per-INSTANCES servers
+sh stop.sh all                 # router + all tokenizers + per-INSTANCES servers (store + mooncake master stopped last for the mooncake backend)
 sh stop.sh server prefill      # instance name supported: sh stop.sh server decode 128p
 sh stop.sh router
 sh stop.sh tokenizer prefill   # prefill|decode|all supported
@@ -251,9 +258,28 @@ sh stop.sh tokenizer prefill   # prefill|decode|all supported
 
 For multi-instance deployment (same-role multi-instance, automatic port/NUMA staggering, short/long grouped routing, etc.), see the [multi-instance deployment guide](scripts/cpu_kunpeng/runtime/README.md).
 
-### 3.6 Environment Variables
+### 3.6 HiCache (Tiered KV Cache) Deployment
 
-#### 3.6.1 Functional
+HiCache splits the KV cache into tiers: the further back the tier, the larger the capacity and the higher the latency. Only the prefill/native roles participate (decode does not); the page granularity is 64 tokens, and 1 object in L3 = 1 page:
+
+- **L1**: the main KV cache pool (DDR), i.e. the original main pool;
+- **L2**: an extra DDR pool (host pool), sized by `KUNPENG_HICACHE_RATIO`/`KUNPENG_HICACHE_SIZE` (three-tier mode only);
+- **L3**: the external storage backend, selected by `KUNPENG_HICACHE_BACKEND` and shared by all prefill nodes.
+
+```
+export ENABLE_KUNPENG_HICACHE=1   # master switch, default 0
+export KUNPENG_HICACHE_L1L3=1     # default 1 = two-tier mode (L1+L3, L2 host pool removed in favor of a fixed-size flat transfer buffer); 0 = three-tier mode (L1+L2+L3)
+```
+
+- **mooncake backend (default)**: `launch.sh all` auto-detects "prefill/native instance with HiCache enabled and the mooncake backend" and launches the mooncake store master and store service first; `stop.sh all` stops them last. Main variables: `MOONCAKE_MASTER_NODE`/`MOONCAKE_MASTER_PORT` (default `ROUTER_IP:50061`), `MOONCAKE_STORE_NODE` (defaults to the master node), `MOONCAKE_STORE_PORT` (default 8081), `MOONCAKE_STORE_SEGMENT_SIZE` (default 64gb), `MOONCAKE_DEVICE` (RDMA device list), `MOONCAKE_ENABLE_SSD_OFFLOAD` (=1 enables SSD offload; requires `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`). The memory layout is automatically set to `page_first`.
+- **file backend**: set `KUNPENG_HICACHE_BACKEND=file` and point `KUNPENG_HICACHE_L3_DIR` to a directory shared by all prefill nodes (empty = L3 off, L1↔L2 only); the memory layout is `layer_first`.
+- **Other settings**: `KUNPENG_HICACHE_WRITE_POLICY` (write policy, default `write_through`), `KUNPENG_HICACHE_PREFETCH_POLICY` (L3 prefetch policy, default `wait_complete`, i.e. wait for the whole page load to finish to avoid recompute; `timeout`/`best_effort` give up early), `KUNPENG_HICACHE_RATIO`/`KUNPENG_HICACHE_SIZE` (L2 size, SIZE takes precedence over RATIO), `SGLANG_HICACHE_DEBUG` (=1 verbose transfer logs).
+
+For per-tier variable details and tuning, see the [HiCache guide](docs/kunpeng/hicache.md).
+
+### 3.7 Environment Variables
+
+#### 3.7.1 Functional
 
 **1. SGLANG\_ENABLE\_BINARY\_LAUNCH / SGLANG\_ENABLE\_NUMA\_DUPLICATION — Binary Launch Mode**
 
@@ -329,7 +355,7 @@ export SGLANG_KUNPENG_RDMA_BCAST=1      # default on
 export SGLANG_KUNPENG_RDMA_PP_COMM=1    # default on
 ```
 
-- **Effect**: Scheduler-level allgather/broadcast synchronization runs over RDMA (kutacc implementation), and rid transfer between PP ranks runs over RDMA. Requires a kutacc build from the br_sglang branch.
+- **Effect**: Scheduler-level allgather/broadcast synchronization runs over RDMA (kutacc implementation), and rid transfer between PP ranks runs over RDMA. Requires a kutacc build from the sglang_930 branch.
 
 **9. SGLANG\_KUNPENG\_LC\_DP\_RANKS / LC\_MIN\_SEQ\_LEN — Long-Context Decode CP**
 
@@ -340,7 +366,15 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # long-sequence threshold
 
 - **Effect**: Requests with `input_len + max_new_tokens` greater than or equal to the threshold are routed to the LC DP ranks for context-parallel decode; other requests go to regular ranks. Both variables must be identical between prefill and decode instances.
 
-#### 3.6.2 Other Toggles
+**10. ENABLE\_KUNPENG\_HICACHE — Tiered KV Cache**
+
+```
+export ENABLE_KUNPENG_HICACHE=0  # default off
+```
+
+- **Effect**: When =1, enables the HiCache tiered KV cache (prefill/native roles only); the L3 backend is selected by `KUNPENG_HICACHE_BACKEND` (mooncake/file). See Section 3.6 and the [HiCache guide](docs/kunpeng/hicache.md).
+
+#### 3.7.2 Other Toggles
 
 - **SGLANG\_USE\_CPU\_920F**: Identifies Kunpeng 920F platform, triggering fork startup, loading only deepseek models, CPU affinity, and other platform optimizations.
 - **SGLANG\_USE\_CPU\_ENGINE**: Forces CPU inference engine.
@@ -360,8 +394,17 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # long-sequence threshold
 - **KUTACC\_ASYNC\_LAUNCH**: kutacc async kernel launch, default 1; when =0, `KUPL_EXECUTOR_COUNT` must be set to 32.
 - **KUPL\_SHM\_TYPE / KUPL\_SHM\_ON\_PACKAGE / KUPL\_SHM\_ENABLE\_HUGEPAGE**: kupl SHM backend (sls), package memory, and hugepage toggles.
 - **SGLANG\_SET\_ZMQ\_CPU\_AFFINITY\_OFFSET**: Starting core for ZMQ thread CPU affinity.
+- **SGLANG\_KUNPENG\_QWEN**: =1 allows loading the Qwen3.5 family models (`qwen3_5`/`qwen3_5_mtp`) (see Section 3.3).
+- **SGLANG\_KUNPENG\_DISABLE\_MLA\_ALL2ALL**: =1 disables the MLA alltoall path, default 0.
+- **SGLANG\_KUNPENG\_ALLTOALL\_FENCE**: =1 appends an explicit `kupl_shm_fence` after the MLA shm alltoall, default 0.
+- **SGLANG\_KUNPENG\_ALLREDUCE\_NAIVE**: =1 uses the non-kutacc naive shm allreduce, default 0.
+- **SGLANG\_KUNPENG\_ENABLE\_SHM\_FENCE**: SHM fence toggle, default 0.
+- **SGLANG\_ENABLE\_OVERLAP**: Scheduler overlap toggle, default 0; `SGLANG_ENABLE_OVERLAP_TRACE` is the corresponding trace toggle.
+- **SGLANG\_KUNPENG\_HBW\_RESIDENT\_NON\_EXPERT\_WEIGHTS / \_EXPERT\_WEIGHTS / \_GRAPH**: HBW-residency toggles for non-expert/expert weights and graph weights. Non-expert and graph default 1; expert weights default 0 globally and 1 on the decode side.
+- **SGLANG\_KUNPENG\_MOE\_PREFILL\_FORCE\_DDR**: =1 forces prefill MoE weights to DDR (for long-prompt prefill instances).
+- **LONG\_PROMPT\_PREFILL\_INSTANCE**: =1 enables the long-prompt prefill instance preset (TP=16/DP=1/PP=16, chunk 2048, MoE forced to DDR).
 
-#### 3.6.3 Size / Threshold
+#### 3.7.3 Size / Threshold
 
 **Shared Memory Pool**
 
@@ -400,16 +443,17 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # long-sequence threshold
 **Multi-Thread Backend**
 
 - **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**: Specifies the kupl multi-threading backend and thread count. Standard PyTorch only supports omp. `KUPL_EXECUTOR_COUNT` defaults to 33 (set to 32 when `KUTACC_ASYNC_LAUNCH=0`).
+- **KUTACC\_FUSEDMOE\_MULTIEXPT**: kutacc fusedmoe multi-expert parallelism group count (decode side). Default 0 = serial per-expert path (bit-exact); when set to G, the worker pool is split into G groups, each owning a share of the local experts.
 
 **Others**
 
 - **DROP\_CACHES**: =1 drops the node OS page cache in stop.sh.
-- **GEMM\_TILING\_PLAN\_FILE**: GEMM tiling plan file path.
+- **GEMM\_TILING\_PLAN\_FILE**: GEMM tiling plan file path, default `scripts/cpu_kunpeng/configs/gemm_32_tiling.csv`.
 - **SDMA\_KO\_PATH**: SDMA driver ko file path.
 - **KUCCL\_PATH**: kuccl installation path (required when `SGLANG_ENABLE_KUCCL=1`).
 - **LIBPTHREAD\_HOOK\_PATH**: libpthread_hook.so path (used in tokenizer-separate mode).
 
-#### 3.6.4 Routing Policy
+#### 3.7.4 Routing Policy
 
 - **ROUTER\_PREFILL\_POLICY**: Model Gateway prefill routing policy. Empty = use the main policy (cache_aware); set to `bucket` to enable the bucket policy (requires at least 2 prefill entries in `INSTANCES`).
 - **ROUTER\_BALANCE\_ABS\_THRESHOLD**: Bucket-policy absolute character-count difference threshold between two instances, default 64.
@@ -431,6 +475,7 @@ sh curl.sh                       # basic inference (default prompts/128.txt, 32 
 sh curl.sh -s -m 50              # streaming, 50 tokens
 sh curl.sh -n 10 -m 20           # 10 requests
 sh curl.sh -s -f prompts/1k.txt  # long prompt
+sh curl.sh -J -f chat.jsonl      # chat mode: -f is a JSONL request-body file, posted to /v1/chat/completions
 sh curl.sh -i                    # multi-turn interactive chat
 ```
 
@@ -446,7 +491,8 @@ sh curl.sh -d 0-15 -n 10 -m 20
 ### 4.3 Profiling
 
 ```shell
-# Profile mode (automatically calls start_profile / stop_profile)
+# Profile mode (automatically calls start_profile / stop_profile;
+# in PD layout, sent to each side's tokenizer HTTP port)
 sh curl.sh -p -s -f prompts/ragged.txt
 ```
 
@@ -454,19 +500,31 @@ sh curl.sh -p -s -f prompts/ragged.txt
 
 | Option | Description | Default |
 |---|---|---|
-| `-p` | Enable profiling (start/stop) | off |
+| `-p` | Enable profiling (start/stop; sent to each side's tokenizer HTTP ports in PD layout) | off |
 | `-s` | Enable streaming | off |
 | `-d RANK\|RANGE` | Pin to a DP rank, or round-robin across a rank set (e.g. `0-15`, `0,2,5`) | server load balancing |
 | `-n NUM` | Number of requests (prompts cycle when NUM exceeds the file size) | all lines in file |
 | `-m TOKENS` | Max tokens per request / per turn | 10 (1024 in chat mode) |
 | `-r RATE` | Send rate in req/s (must be > 0) | 32 |
 | `-c CONC` | Max concurrent requests | equals request count |
-| `-f FILE` | Prompt file (one per line; JSON-string lines from gen_st_prompts.py supported) | prompts/128.txt |
+| `-f FILE\|DIR` | Prompt source: a file (one prompt per line; JSON-string lines from gen_st_prompts.py supported) or a directory (each \*.txt/\*.md file inside as ONE whole-file prompt, sorted by name and cycled) | prompts/128.txt |
+| `-J` | Chat mode: `-f` file is JSONL with one chat request body per line (`model`/`messages`), posted to `/v1/chat/completions` so the server renders the chat template | off |
 | `-v` | Verbose stats (active when NUM > 1): decode throughput table, accept rate (with `-s`), per-request latency details | off |
-| `-F` | Fake-transfer mode (injects bootstrap_host=2.2.2.2; decode skips KV transfer, port defaults to 30002) | off |
+| `-F` | Fake-transfer mode (injects bootstrap_host=2.2.2.2; decode skips KV transfer; port auto-derived from the decode entry in INSTANCES, `CURL_PORT` overrides) | off |
 | `-i` | Multi-turn interactive chat mode | off |
 
 The target address and port can be overridden via the `CURL_HOST`/`CURL_PORT` environment variables (default: local NIC IP:30000). Verify correctness based on the response returned by the request.
+
+### 4.5 Benchmarks
+
+`scripts/cpu_kunpeng/benchmark.sh` supports GSM8K and MMLU accuracy benchmarks plus aisbench performance runs (against the gateway port):
+
+```shell
+bash benchmark.sh gsm8k --max-new-tokens 128 --num-questions 50
+bash benchmark.sh mmlu  --nsub 60 --parallel 32
+```
+
+Defaults for each benchmark can be overridden via environment variables; see the script header for details.
 
 ## 5. Multi-Instance Deployment
 
