@@ -151,7 +151,10 @@ scripts/cpu_kunpeng/
 |---|---|---|---|
 | `KUNPENG_HICACHE_BACKEND` | `mooncake` | 开关 | 选 L3 后端：`file` / `mooncake` |
 | `KUNPENG_HICACHE_WRITE_POLICY` | `write_through` | 行为 | **写透策略**：`write_through` 首次插入即写 L3；`write_through_selective` 命中 2 次后才写。`write_back` 在两级模式**不支持**（会报错） |
-| `KUNPENG_HICACHE_PREFETCH_POLICY` | `wait_complete` | 行为 | L3→L1 预取策略：`wait_complete` 阻塞到整个前缀加载完（不重算）；`timeout` / `best_effort` 提前放弃，可能部分重算 |
+| `KUNPENG_HICACHE_PREFETCH_POLICY` | `timeout` | 行为 | L3→L1 预取策略：`timeout` 超时即放弃、只保留已取到的连续前缀（默认 `1s + 页数 × 0.25s/Ki token`，16k 前缀约 5s）；`wait_complete` 阻塞到整个前缀加载完（丢页会永久等待，不建议配合不可靠的 L3）；`best_effort` 不等待 |
+| `KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE` | 空（=1） | 秒 | 仅 `timeout` 策略生效：超时公式的固定项。留空用代码默认 1s |
+| `KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN` | 空（=0.25） | 秒/Ki token | 仅 `timeout` 策略生效：每 1024 token 追加的预算。16k 前缀配 `0.6` 约为 `2 + 16×0.6 = 11.6s` |
+| `KUNPENG_HICACHE_EXTRA_CONFIG` | 空 | JSON | 直接透传 `--hicache-storage-backend-extra-config`，可设置 `prefetch_threshold` 等任意字段；非空时覆盖上面两个 timeout 变量 |
 
 #### 3.3.2 后端 A：`file`
 
