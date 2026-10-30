@@ -1573,7 +1573,30 @@ class RowParallelLinear(LinearBase):
                     kunpeng.shm_fence_kunpeng(
                         get_attn_tensor_model_parallel_world_size()
                     )
-                if getattr(self, "_kunpeng_qwen_dense", False):
+                if getattr(self, "_runtime_component", None) == "vision":
+                    # Vision component TP reduction. The Kunpeng SHM all-reduce
+                    # contract is a 2D [tokens, dim] payload whose eager buffer
+                    # for a given width must be reserved before graph capture
+                    # claims the whole pool. The vision tower instead feeds 3D
+                    # rows ([tokens, 1, hidden] from the MLP, [1, tokens,
+                    # hidden] from attention) at widths nothing reserved, which
+                    # would both mis-size the SHM buffer and exhaust the pool.
+                    # The vision traffic is negligible next to the text
+                    # decoder, so reduce it over the shape-agnostic gloo group.
+                    # gloo's bf16 allreduce is unvalidated on the Bisheng build,
+                    # so round-trip through fp32 - whose gloo support is
+                    # guaranteed - and cast back.
+                    if output_parallel.dtype == torch.bfloat16:
+                        reduce_fp32 = output_parallel.to(torch.float32)
+                        torch.distributed.all_reduce(
+                            reduce_fp32, group=get_tp_group().cpu_group
+                        )
+                        output_parallel.copy_(reduce_fp32)
+                    else:
+                        torch.distributed.all_reduce(
+                            output_parallel, group=get_tp_group().cpu_group
+                        )
+                elif getattr(self, "_kunpeng_qwen_dense", False):
                     from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
                         allreduce,
                     )

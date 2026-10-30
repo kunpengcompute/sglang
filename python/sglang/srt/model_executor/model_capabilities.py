@@ -11,8 +11,45 @@ ATTACHED_MTP_COMPONENT_POLICY = {
     "vision": {"execution_enabled": False, "pack_policy": "deferred"},
     "mtp": {"execution_enabled": True, "pack_policy": "once"},
 }
+# Vision-execution stage: the vision tower dequantizes its checkpoint INT8
+# weights to BF16 at load time (no AMX pack; the TP16 vision projections do
+# not satisfy the 32-task tile plan and carry bias) and executes in BF16.
+# Enabled by default; opt out with SGLANG_KUNPENG_QWEN_VISION=0. A
+# regenerated pinned plan can also select it.
+VISION_STAGE_COMPONENT_POLICY = {
+    "language": {"execution_enabled": True, "pack_policy": "once"},
+    "vision": {"execution_enabled": True, "pack_policy": "once"},
+    "mtp": {"execution_enabled": False, "pack_policy": "deferred"},
+}
+VISION_ATTACHED_MTP_COMPONENT_POLICY = {
+    "language": {"execution_enabled": True, "pack_policy": "once"},
+    "vision": {"execution_enabled": True, "pack_policy": "once"},
+    "mtp": {"execution_enabled": True, "pack_policy": "once"},
+}
 # Generic SGLang metadata registry; no model/native class is imported here.
 MODEL_COMPONENT_POLICIES = {"Qwen3_5ForConditionalGeneration": STAGE_COMPONENT_POLICY}
+MODEL_VISION_COMPONENT_POLICIES = {
+    "Qwen3_5ForConditionalGeneration": VISION_STAGE_COMPONENT_POLICY
+}
+
+
+def _vision_execution_enabled():
+    import os
+
+    # Default-on for Qwen3.5 conditional-generation serving on 920F;
+    # SGLANG_KUNPENG_QWEN_VISION=0 opts back into text-only serving.
+    return os.environ.get("SGLANG_KUNPENG_QWEN_VISION", "1") != "0"
+
+
+def default_kunpeng_qwen_policy():
+    """Component policy used when no pinned checkpoint plan is present.
+
+    Shared by the model constructor and the Kunpeng backend validator so the
+    scheduler, tokenizer manager and model all agree on one default.
+    """
+    if _vision_execution_enabled():
+        return {"language": True, "vision": True, "mtp": False}
+    return {"language": True, "vision": False, "mtp": False}
 
 
 class ModelCapabilityError(ValueError):
@@ -28,6 +65,8 @@ class ModelCapabilities:
             not in (
                 {"language": True, "vision": False, "mtp": False},
                 {"language": True, "vision": False, "mtp": True},
+                {"language": True, "vision": True, "mtp": False},
+                {"language": True, "vision": True, "mtp": True},
             )
         ):
             raise ValueError("Unapproved initial component policy")
@@ -114,7 +153,12 @@ def initial_policy_from_spec(spec):
 
     plan = json.loads(raw, object_pairs_hook=pairs)
     policy = plan["capability_policy"]
-    approved = (STAGE_COMPONENT_POLICY, ATTACHED_MTP_COMPONENT_POLICY)
+    approved = (
+        STAGE_COMPONENT_POLICY,
+        ATTACHED_MTP_COMPONENT_POLICY,
+        VISION_STAGE_COMPONENT_POLICY,
+        VISION_ATTACHED_MTP_COMPONENT_POLICY,
+    )
     if not any(
         json.dumps(policy, sort_keys=True) == json.dumps(expected, sort_keys=True)
         for expected in approved
@@ -187,7 +231,11 @@ def initial_policy_for_model_config(model_config):
     ):
         return None
     policies = [
-        MODEL_COMPONENT_POLICIES[name]
+        (
+            MODEL_VISION_COMPONENT_POLICIES[name]
+            if _vision_execution_enabled()
+            else MODEL_COMPONENT_POLICIES[name]
+        )
         for name in getattr(model_config.hf_config, "architectures", [])
         if name in MODEL_COMPONENT_POLICIES
     ]

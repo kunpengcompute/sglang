@@ -42,6 +42,7 @@ def validate_config(runner):
         # Validate execution capabilities before allocating components. The
         # checkpoint loader subsequently checks names, geometry and shards.
         from sglang.srt.model_executor.model_capabilities import (
+            default_kunpeng_qwen_policy,
             initial_policy_from_spec,
             validate_startup_capabilities,
         )
@@ -49,7 +50,7 @@ def validate_config(runner):
         policy = (
             initial_policy_from_spec(spec)
             if spec is not None
-            else {"language": True, "vision": False, "mtp": False}
+            else default_kunpeng_qwen_policy()
         )
         validate_startup_capabilities(policy, runner.server_args)
 

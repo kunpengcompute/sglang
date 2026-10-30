@@ -99,6 +99,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
+
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1587,6 +1588,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         spec = getattr(config, "checkpoint_loader_spec", None)
         if unified:
             from sglang.srt.model_executor.model_capabilities import (
+                default_kunpeng_qwen_policy,
                 initial_policy_from_spec,
                 validate_startup_capabilities,
             )
@@ -1594,7 +1596,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             policy = (
                 initial_policy_from_spec(spec)
                 if spec is not None
-                else {"language": True, "vision": False, "mtp": False}
+                else default_kunpeng_qwen_policy()
             )
             validate_startup_capabilities(policy, get_global_server_args())
         if unified:
@@ -1644,14 +1646,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 raise ValueError(
                     "Unified checkpoint plan requires matching TP16, DP encoder/attention off"
                 )
+        visual_quant_config = None
+        if unified:
+            visual_quant_config = quant_config.for_component(
+                "vision", execution_enabled=policy["vision"]
+            )
         super().__init__(
             config,
             quant_config,
             prefix,
             language_model_cls,
-            visual_quant_config=(
-                quant_config.for_component("vision") if unified else None
-            ),
+            visual_quant_config=visual_quant_config,
         )
         if unified:
             from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
@@ -1680,7 +1685,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shared = {
                 id(m) for root in (self.model, self.lm_head) for m in root.modules()
             }
-            self.runtime_capabilities.attach_disabled(self.visual, "vision", shared)
+            if policy["vision"]:
+                # Executable vision component: no disabled hook. The loader's
+                # loaded_validated("vision") marks it executable, and
+                # get_image_feature asserts require("vision") at runtime.
+                pass
+            else:
+                self.runtime_capabilities.attach_disabled(self.visual, "vision", shared)
             attach_mtp = (
                 self.runtime_capabilities.attach_enabled
                 if policy["mtp"]
