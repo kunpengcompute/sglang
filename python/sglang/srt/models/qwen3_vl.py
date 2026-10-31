@@ -337,12 +337,19 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         if self.pp_group.is_first_rank:
+            # On CPU the 2,304 x 1,152 position table (~5 MB) is replicated on
+            # every rank instead of running the vocab-parallel masked lookup +
+            # TP all-reduce: the bilinear interpolation gathers 4 * patches rows
+            # per image, and the eager Kunpeng SHM collective buffer for that
+            # width is not reserved before graph capture claims the whole pool,
+            # so the lazy request fails with "Not enough shared memory".
+            pos_embed_tp = not use_data_parallel and not _is_cpu
             self.pos_embed = VocabParallelEmbedding(
                 self.num_position_embeddings,
                 self.hidden_size,
                 quant_config=quant_config,
-                enable_tp=not use_data_parallel,
-                use_attn_tp_group=is_dp_attention_enabled() and not use_data_parallel,
+                enable_tp=pos_embed_tp,
+                use_attn_tp_group=is_dp_attention_enabled() and pos_embed_tp,
                 prefix=add_prefix("pos_embed", prefix),
             )
         else:

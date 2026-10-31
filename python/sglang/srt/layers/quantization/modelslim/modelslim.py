@@ -126,9 +126,9 @@ class ModelSlimConfig(QuantizationConfig):
         if not self._cpu920f or component not in ("vision", "mtp"):
             raise ValueError("Deferred component requires explicit CPU ModelSlim")
         if type(execution_enabled) is not bool or (
-            execution_enabled and component != "mtp"
+            execution_enabled and component not in ("vision", "mtp")
         ):
-            raise ValueError("Only explicit attached MTP can enable a component")
+            raise ValueError("Only vision and attached MTP can enable a component")
         from copy import copy
 
         result = copy(self)
@@ -187,11 +187,24 @@ class ModelSlimConfig(QuantizationConfig):
                 source = mapping.get(proj, [proj])[0]
                 canonical = canonical.rsplit(".", 1)[0] + "." + source
                 if getattr(self, "_component_execution_enabled", False):
-                    if component != "mtp":
-                        raise ValueError(
-                            "Only attached MTP may execute a component scheme"
+                    if component == "mtp":
+                        layer.scheme = self.get_linear_scheme(layer, canonical)
+                    elif component == "vision":
+                        # Executable vision: dequantize-once BF16 scheme. The
+                        # AMX pack path cannot serve the TP16 vision geometry
+                        # (32-task tile plan) and its vision projections carry
+                        # bias, which the text AMX scheme rejects.
+                        from sglang.srt.layers.quantization.modelslim.schemes.cpu920f_vision_dequant_w8a8 import (
+                            CPU920FVisionDequantW8A8Dynamic,
                         )
-                    layer.scheme = self.get_linear_scheme(layer, canonical)
+
+                        layer.scheme = CPU920FVisionDequantW8A8Dynamic(
+                            self.quant_description, canonical
+                        )
+                    else:
+                        raise ValueError(
+                            "Only vision and attached MTP may execute a component scheme"
+                        )
                 else:
                     layer.scheme = DeferredRawW8A8Dynamic(
                         self.quant_description, canonical
