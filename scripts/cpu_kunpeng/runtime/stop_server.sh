@@ -95,8 +95,8 @@ for i in "${!NODES[@]}"; do
 
         rm -rf /dev/shm/shm_mmap_*
         if [ "'"${CLEAN_HICACHE_BCAST}"'" = "1" ]; then
-            echo "Removing stale HiCache tp0-bcast shm on '"$node"'"
-            rm -f /dev/shm/sgk_hicache_bcast_*
+            echo "Removing stale HiCache TP shard/bcast shm on '"$node"'"
+            rm -f /dev/shm/sgk_hicache_shard_* /dev/shm/sgk_hicache_bcast_*
         fi
         for i in $(seq 0 31); do
             echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
