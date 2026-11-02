@@ -583,6 +583,18 @@ class KunpengGraphRunner:
 
         self.swap_mgr.set_idle_forward(forward_batch.forward_mode.is_idle())
 
+        # Non-greedy sampling (temperature > 0) makes the sampler return
+        # int32 next_token_ids, which become the next decode step's
+        # input_ids. Captured graphs bind runtime tensors directly and were
+        # recorded with int64 ids, so a dtype flip at replay would read the
+        # buffer with the wrong element size (and trips the int64 assert in
+        # _graph_forward). Normalise once, for every graph mode.
+        if (
+            forward_batch.input_ids is not None
+            and forward_batch.input_ids.dtype != torch.int64
+        ):
+            forward_batch.input_ids = forward_batch.input_ids.to(torch.int64)
+
         # DSA topk carry: expose the incoming top-k to the attention backend so
         # it can pre-window it into this rank's row slice before the capture (an
         # input storage may not get new views while capturing).

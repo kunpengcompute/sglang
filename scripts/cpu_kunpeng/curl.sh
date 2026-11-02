@@ -15,8 +15,8 @@
 
 usage() {
   echo "Usage:"
-  echo "  $0 -f FILE [-s] [-m TOKENS] [-d RANK|RANGE] [-n NUM] [-r RATE] [-v] [-F] [-p] [-c CONC]"
-  echo "  $0 [-i] [-d RANK] [-m TOKENS] [-h]                                   # interactive chat"
+  echo "  $0 -f FILE [-s] [-m TOKENS] [-t TEMP] [-d RANK|RANGE] [-n NUM] [-r RATE] [-v] [-F] [-p] [-c CONC]"
+  echo "  $0 [-i] [-d RANK] [-m TOKENS] [-t TEMP] [-h]                         # interactive chat"
   echo ""
   echo "Benchmark mode (default, non-interactive): one prompt per request,"
   echo "sent at -r RATE req/s. -i starts a multi-turn interactive chat instead."
@@ -35,6 +35,8 @@ usage() {
   echo "              template (no offline prompt rendering)."
   echo "  -s          Enable streaming mode"
   echo "  -m TOKENS   Max tokens per request / per turn (default: 10 benchmark, 1024 chat)"
+  echo "  -t TEMP     Sampling temperature. Omitted from the request body by"
+  echo "              default; when given it is sent as-is (e.g. -t 0 for greedy)."
   echo "  -d RANK|RANGE  DP rank (e.g. 5: every request pinned to it) or ranks"
   echo "              (e.g. 0-15, 0,2,5: requests round-robin across them)."
   echo "              Omit -d for the server default load balancing (round robin)."
@@ -64,6 +66,7 @@ PROFILE=false
 CHAT=false
 MAX_TOKENS=10
 MAX_TOKENS_SET=false
+TEMPERATURE=""
 NUM_REQUESTS=0
 STREAM=false
 VERBOSE=false
@@ -78,7 +81,7 @@ ROUND_ROBIN=false
 RATE=32
 FAKE=false
 
-while getopts "d:hiJFpsvn:m:c:r:f:" opt; do
+while getopts "d:hiJFpsvn:m:c:r:f:t:" opt; do
   case $opt in
     h) usage ;;
     i) INTERACTIVE=true ;;
@@ -92,6 +95,7 @@ while getopts "d:hiJFpsvn:m:c:r:f:" opt; do
     c) CONCURRENCY=$OPTARG; CONCURRENCY_SET=true ;;
     r) RATE=$OPTARG ;;
     m) MAX_TOKENS=$OPTARG; MAX_TOKENS_SET=true ;;
+    t) TEMPERATURE=$OPTARG ;;
     f) PROMPT_FILE=$OPTARG; PROMPT_FILE_SET=true ;;
     *) echo "Invalid option: -$OPTARG" >&2
        exit 1 ;;
@@ -110,6 +114,15 @@ if ! [[ "$NUM_REQUESTS" =~ ^[0-9]+$ ]]; then
   echo "Error: -n must be a non-negative integer" >&2
   exit 1
 fi
+if [ -n "$TEMPERATURE" ] && ! [[ "$TEMPERATURE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "Error: -t must be a non-negative number" >&2
+  exit 1
+fi
+
+# temperature is only emitted when -t was given (empty = leave it to the
+# server default). TEMP_LINE carries its own escaped quotes, like rank_line.
+TEMP_LINE=""
+[ -n "$TEMPERATURE" ] && TEMP_LINE=",\"temperature\": $TEMPERATURE"
 
 # =============================================================================
 # Common setup
@@ -438,7 +451,7 @@ if [ "$INTERACTIVE" = false ]; then
       # {"model":..., "messages":[...], "tools":[...]}. Request-level knobs
       # are appended by re-opening the trailing brace; JSON duplicate keys
       # resolve last-wins, and the exporter emits none of these.
-      body="${raw%\}*},\"stream\":$STREAM,\"max_tokens\":$MAX_TOKENS,\"ignore_eos\":$IGNORE_EOS,\"temperature\":0$rank_line$fake_line"
+      body="${raw%\}*},\"stream\":$STREAM,\"max_tokens\":$MAX_TOKENS,\"ignore_eos\":$IGNORE_EOS$TEMP_LINE$rank_line$fake_line"
       if [ "$STREAM" = true ]; then
         body+=",\"stream_options\":{\"include_usage\":true}"
       fi
@@ -458,8 +471,7 @@ if [ "$INTERACTIVE" = false ]; then
         \"prompt\": $prompt_field,
         \"stream\": $STREAM,
         \"max_tokens\": $MAX_TOKENS,
-        \"ignore_eos\": $IGNORE_EOS,
-        \"temperature\": 0$rank_line$fake_line"
+        \"ignore_eos\": $IGNORE_EOS$TEMP_LINE$rank_line$fake_line"
 
       if [ "$STREAM" = true ]; then
         body+=",\"stream_options\":{\"include_usage\":true}"
@@ -1200,8 +1212,8 @@ if [ "$INTERACTIVE" = true ]; then
     BODY+="\"model\":\"DeepSeek-R1\","
     BODY+="\"messages\":$MESSAGES,"
     BODY+="\"stream\":true,"
-    BODY+="\"max_tokens\":$MAX_TOKENS,"
-    BODY+="\"temperature\":0"
+    BODY+="\"max_tokens\":$MAX_TOKENS"
+    [ -n "$TEMPERATURE" ] && BODY+=",\"temperature\":$TEMPERATURE"
     BODY+="$DP_LINE"
     BODY+=",\"stream_options\":{\"include_usage\":true}"
     BODY+="}"
