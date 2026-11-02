@@ -15,8 +15,8 @@
 
 usage() {
   echo "Usage:"
-  echo "  $0 -f FILE [-s] [-m TOKENS] [-d RANK|RANGE] [-n NUM] [-r RATE] [-v] [-F] [-p] [-c CONC]"
-  echo "  $0 [-i] [-d RANK] [-m TOKENS] [-h]                                   # interactive chat"
+  echo "  $0 -f FILE [-s] [-m TOKENS] [-t TEMP] [-d RANK|RANGE] [-n NUM] [-r RATE] [-v] [-F] [-p] [-c CONC]"
+  echo "  $0 [-i] [-d RANK] [-m TOKENS] [-t TEMP] [-h]                         # interactive chat"
   echo ""
   echo "Benchmark mode (default, non-interactive): one prompt per request,"
   echo "sent at -r RATE req/s. -i starts a multi-turn interactive chat instead."
@@ -35,6 +35,8 @@ usage() {
   echo "              template (no offline prompt rendering)."
   echo "  -s          Enable streaming mode"
   echo "  -m TOKENS   Max tokens per request / per turn (default: 10 benchmark, 1024 chat)"
+  echo "  -t TEMP     Sampling temperature. Omitted from the request body by"
+  echo "              default; when given it is sent as-is (e.g. -t 0 for greedy)."
   echo "  -d RANK|RANGE  DP rank (e.g. 5: every request pinned to it) or ranks"
   echo "              (e.g. 0-15, 0,2,5: requests round-robin across them)."
   echo "              Omit -d for the server default load balancing (round robin)."
@@ -51,10 +53,10 @@ usage() {
   echo "              bootstrap_room per request; decode skips KV transfer without"
   echo "              --disaggregation-transfer-backend. Port auto-derived from"
   echo "              the decode entry in INSTANCES; CURL_PORT overrides."
-  echo "  -p          Enable profiling (start/stop_profile via separate curl calls;"
-  echo "              PD layout: sent to each side's tokenizer HTTP port — prefill"
-  echo "              (30001 + prefill entry position) and decode (30001 + decode"
-  echo "              entry position)"
+  echo "  -p          Enable profiling (start/stop_profile via separate curl calls)."
+  echo "              PD layout, addressed per side: tokenizer-separate mode -> each"
+  echo "              side's tokenizer HTTP server (30001 + entry position); without"
+  echo "              tokenizer separation -> the prefill/decode masters' own :30000"
   echo "  -c CONC     Max concurrent requests (default: unbounded)"
   echo "  -i          Interactive chat mode — multi-turn streaming conversation"
   exit 0
@@ -64,6 +66,7 @@ PROFILE=false
 CHAT=false
 MAX_TOKENS=10
 MAX_TOKENS_SET=false
+TEMPERATURE=""
 NUM_REQUESTS=0
 STREAM=false
 VERBOSE=false
@@ -78,7 +81,7 @@ ROUND_ROBIN=false
 RATE=32
 FAKE=false
 
-while getopts "d:hiJFpsvn:m:c:r:f:" opt; do
+while getopts "d:hiJFpsvn:m:c:r:f:t:" opt; do
   case $opt in
     h) usage ;;
     i) INTERACTIVE=true ;;
@@ -92,6 +95,7 @@ while getopts "d:hiJFpsvn:m:c:r:f:" opt; do
     c) CONCURRENCY=$OPTARG; CONCURRENCY_SET=true ;;
     r) RATE=$OPTARG ;;
     m) MAX_TOKENS=$OPTARG; MAX_TOKENS_SET=true ;;
+    t) TEMPERATURE=$OPTARG ;;
     f) PROMPT_FILE=$OPTARG; PROMPT_FILE_SET=true ;;
     *) echo "Invalid option: -$OPTARG" >&2
        exit 1 ;;
@@ -110,6 +114,15 @@ if ! [[ "$NUM_REQUESTS" =~ ^[0-9]+$ ]]; then
   echo "Error: -n must be a non-negative integer" >&2
   exit 1
 fi
+if [ -n "$TEMPERATURE" ] && ! [[ "$TEMPERATURE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "Error: -t must be a non-negative number" >&2
+  exit 1
+fi
+
+# temperature is only emitted when -t was given (empty = leave it to the
+# server default). TEMP_LINE carries its own escaped quotes, like rank_line.
+TEMP_LINE=""
+[ -n "$TEMPERATURE" ] && TEMP_LINE=",\"temperature\": $TEMPERATURE"
 
 # =============================================================================
 # Common setup
@@ -202,22 +215,21 @@ parse_ranks() {
 # multiple decode entries (e.g. "64p-etp8" for entry "decode_64p-etp8");
 # CURL_PORT overrides everything.
 
-# Decode tokenizer HTTP port on the router node: 30001 + the decode entry's
-# position in INSTANCES. INSTANCES resolution mirrors env_base.sh's load
-# order: an exported shell variable first (e.g. the user sourced env.sh),
-# then .user_env.sh, then runtime/.user_env_base.sh, then the built-in
-# default layout in runtime/env_base.sh. Echoes nothing when the layout has
-# no decode entry (native) and strict=1 (default); -F passes strict=0 to
-# keep the classic "prefill,decode" fallback (30002). CURL_DECODE_PORT
-# overrides everything.
-resolve_decode_tok_port() {
-  if [ -n "${CURL_DECODE_PORT:-}" ]; then
-    echo "$CURL_DECODE_PORT"
-    return
-  fi
-  local base want insts="" g="" i=0 e f
+# INSTANCES resolution mirrors env_base.sh's load order: an exported shell
+# variable first (e.g. the user sourced env.sh), then .user_env.sh, then
+# runtime/.user_env_base.sh, then the built-in default layout in
+# runtime/env_base.sh.
+
+# Locate a side's INSTANCES entry: echoes "<global index>|<instance suffix>"
+# for the first match — an exact "<side>_<CURL_<SIDE>_INSTANCE>" when an
+# explicit instance is requested, otherwise the FIRST entry with the side's
+# role prefix ("decode" or "decode_*", same semantics as launch_router.sh /
+# _instance_indexes' role check). Echoes nothing when the layout has no such
+# entry (e.g. native).
+_side_entry() {
+  local side=$1 sel=$2 base want insts="" g="" i=0 e f
   base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  want="decode${CURL_DECODE_INSTANCE:+_$CURL_DECODE_INSTANCE}"
+  want="$side${sel:+_$sel}"
   if [ -n "${INSTANCES:-}" ]; then
     insts="${INSTANCES//,/$'\n'}"
   else
@@ -229,66 +241,85 @@ resolve_decode_tok_port() {
       [ -n "$insts" ] && break
     done
   fi
-  if [ -n "$insts" ]; then
-    while IFS= read -r e; do
-      e="${e//[[:space:]]/}"
-      [ -z "$e" ] && continue
-      # Exact match when CURL_DECODE_INSTANCE is set; otherwise take the
-      # FIRST entry with the decode role prefix ("decode" or "decode_*",
-      # same semantics as _instance_indexes' role check).
-      if [ "$e" = "$want" ] || { [ -z "${CURL_DECODE_INSTANCE:-}" ] && [ "${e%%_*}" = "decode" ]; }; then
-        g=$i
-        break
-      fi
-      i=$((i + 1))
-    done <<< "$insts"
-  fi
-  if [ -n "$g" ]; then
+  [ -z "$insts" ] && return
+  while IFS= read -r e; do
+    e="${e//[[:space:]]/}"
+    [ -z "$e" ] && continue
+    if [ "$e" = "$want" ] || { [ -z "$sel" ] && [ "${e%%_*}" = "$side" ]; }; then
+      g=$i
+      break
+    fi
+    i=$((i + 1))
+  done <<< "$insts"
+  [ -n "$g" ] || return
+  if [[ "$e" == *_* ]]; then echo "$g|${e#*_}"; else echo "$g|"; fi
+}
+
+# Tokenizer HTTP port on the router node: 30001 + the entry's position in
+# INSTANCES. Echoes nothing when the layout has no entry for the side and
+# strict=1 (default); -F passes strict=0 to keep the classic
+# "prefill,decode" fallback (prefill 30001, decode 30002). CURL_<SIDE>_PORT
+# overrides everything.
+resolve_side_tok_port() {
+  local side=$1 sel=$2 strict=$3 ent g
+  ent=$(_side_entry "$side" "$sel")
+  if [ -n "$ent" ]; then
+    g=${ent%%|*}
     echo $((30001 + g))
-  elif [ "${1:-1}" = "0" ]; then
-    echo 30002
+  elif [ "$strict" = "0" ]; then
+    if [ "$side" = "prefill" ]; then echo 30001; else echo 30002; fi
   fi
 }
 
-# Prefill tokenizer HTTP port on the router node — symmetric to the decode
-# resolver above: 30001 + the prefill entry's position in INSTANCES.
-# CURL_PREFILL_INSTANCE selects among multiple prefill entries;
-# CURL_PREFILL_PORT overrides everything.
+resolve_decode_tok_port() {
+  echo "${CURL_DECODE_PORT:-$(resolve_side_tok_port decode "${CURL_DECODE_INSTANCE:-}" "${1:-1}")}"
+}
+
+# Prefill tokenizer HTTP port — symmetric to the decode resolver above.
+# CURL_PREFILL_INSTANCE selects among multiple prefill entries.
 resolve_prefill_tok_port() {
-  if [ -n "${CURL_PREFILL_PORT:-}" ]; then
-    echo "$CURL_PREFILL_PORT"
+  echo "${CURL_PREFILL_PORT:-$(resolve_side_tok_port prefill "${CURL_PREFILL_INSTANCE:-}" "${1:-1}")}"
+}
+
+# The side's own HTTP endpoint when the tokenizer HTTP server is NOT split
+# out (SGLANG_ENABLE_TOKENIZER_SEPERATE=0): the prefill/decode master hosts
+# it on --port 30000 (see server.sh / server_router.sh's backend URL), so
+# there is no router-node tokenizer port to address. The master address is
+# read from the side's role env (per-instance overrides included) in a
+# subshell, exactly like launch_router.sh. Echoes nothing when the layout
+# has no entry for the side.
+resolve_side_master_endpoint() {
+  local side=$1 sel=$2 ent inst var addr base
+  ent=$(_side_entry "$side" "$sel")
+  [ -n "$ent" ] || return
+  inst="${ent#*|}"
+  base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ "$side" = "prefill" ]; then
+    var=PREFILL_MASTER_ADDR
+  else
+    var=DECODE_MASTER_ADDR
+  fi
+  addr=$(SKIP_CONDA=1 bash -c "
+    source '$base/env.sh' '$side' '$inst' >/dev/null 2>&1
+    echo \"\$$var\"" 2>/dev/null)
+  [ -n "$addr" ] && echo "$addr:30000"
+}
+
+# Tokenizer-separate switch, resolved like server_router.sh does: an
+# exported shell variable first, otherwise the base env (env.sh none =
+# runtime/env_base.sh defaults plus .user_env.sh / .user_env_base.sh, whose
+# default is 1 for PD roles).
+tokenizer_separate() {
+  local base v
+  if [ -n "${SGLANG_ENABLE_TOKENIZER_SEPERATE:-}" ]; then
+    echo "$SGLANG_ENABLE_TOKENIZER_SEPERATE"
     return
   fi
-  local base want insts="" g="" i=0 e f
   base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  want="prefill${CURL_PREFILL_INSTANCE:+_$CURL_PREFILL_INSTANCE}"
-  if [ -n "${INSTANCES:-}" ]; then
-    insts="${INSTANCES//,/$'\n'}"
-  else
-    for f in "$base/.user_env.sh" "$base/runtime/.user_env_base.sh" \
-             "$base/runtime/env_base.sh"; do
-      [ -f "$f" ] || continue
-      insts=$(grep -E '^[[:space:]]*(export[[:space:]]+)?INSTANCES=' "$f" \
-        | head -n1 | cut -d'"' -f2 | tr ',' '\n')
-      [ -n "$insts" ] && break
-    done
-  fi
-  if [ -n "$insts" ]; then
-    while IFS= read -r e; do
-      e="${e//[[:space:]]/}"
-      [ -z "$e" ] && continue
-      if [ "$e" = "$want" ] || { [ -z "${CURL_PREFILL_INSTANCE:-}" ] && [ "${e%%_*}" = "prefill" ]; }; then
-        g=$i
-        break
-      fi
-      i=$((i + 1))
-    done <<< "$insts"
-  fi
-  if [ -n "$g" ]; then
-    echo $((30001 + g))
-  elif [ "${1:-1}" = "0" ]; then
-    echo 30001
-  fi
+  v=$(SKIP_CONDA=1 bash -c "
+    source '$base/env.sh' none >/dev/null 2>&1
+    echo \"\${SGLANG_ENABLE_TOKENIZER_SEPERATE:-1}\"" 2>/dev/null)
+  echo "${v:-1}"
 }
 
 IP=${CURL_HOST:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}
@@ -312,30 +343,43 @@ if [ "$INTERACTIVE" = false ] && [ "$PROFILE" = false ]; then
 fi
 
 # start/stop_profile control (used by -p). Addressing rules:
-#   - PD layout: each side's own tokenizer HTTP server is addressed —
-#     prefill (30001 + prefill entry position) and decode (30001 + decode
-#     entry position). Under the default primary target (router gateway
-#     :30000) the gateway is skipped 
+#   - PD + tokenizer separation: each side's own tokenizer HTTP server on the
+#     router node — prefill (30001 + prefill entry position) and decode
+#     (30001 + decode entry position).
+#   - PD without tokenizer separation: each side's MASTER hosts the HTTP
+#     server itself, so the control request goes to
+#     http://<prefill|decode master>:30000 (the tokenizer port does not exist).
+#   - Native layout: the primary target (:30000).
+# Under the default primary target (router gateway :30000) the gateway is
+# skipped: it does not proxy control endpoints.
 profile_req() {
-  local action=$1 u urls prefill_tok_port decode_tok_port
-  prefill_tok_port=$(resolve_prefill_tok_port)
-  decode_tok_port=$(resolve_decode_tok_port)
+  local action=$1 u urls prefill_ep decode_ep p
+  if [ "$(tokenizer_separate)" = "1" ]; then
+    p=$(resolve_prefill_tok_port)
+    prefill_ep=""
+    [ -n "$p" ] && prefill_ep="${IP}:${p}"
+    p=$(resolve_decode_tok_port)
+    decode_ep=""
+    [ -n "$p" ] && decode_ep="${IP}:${p}"
+  else
+    prefill_ep=$(resolve_side_master_endpoint prefill "${CURL_PREFILL_INSTANCE:-}")
+    decode_ep=$(resolve_side_master_endpoint decode "${CURL_DECODE_INSTANCE:-}")
+  fi
 
   # Build the endpoint list (deduped). An explicit CURL_PORT / -F keeps the
-  # primary target; otherwise only each side's tokenizer HTTP server is
-  # addressed (the router gateway does not proxy control endpoints).
+  # primary target; otherwise only each side's own HTTP server is addressed.
   urls=""
   if [ -n "${CURL_PORT:-}" ] || [ "$FAKE" = true ]; then
     urls="http://${IP}:${PORT}"
   fi
-  if [ -n "$prefill_tok_port" ] && [ "$prefill_tok_port" != "$PORT" ]; then
-    urls="${urls:+$urls }http://${IP}:${prefill_tok_port}"
+  if [ -n "$prefill_ep" ] && [ "$prefill_ep" != "${IP}:${PORT}" ]; then
+    urls="${urls:+$urls }http://${prefill_ep}"
   fi
-  if [ -n "$decode_tok_port" ] && [ "$decode_tok_port" != "$PORT" ] &&
-     [ "$decode_tok_port" != "$prefill_tok_port" ]; then
-    urls="${urls:+$urls }http://${IP}:${decode_tok_port}"
+  if [ -n "$decode_ep" ] && [ "$decode_ep" != "${IP}:${PORT}" ] &&
+     [ "$decode_ep" != "$prefill_ep" ]; then
+    urls="${urls:+$urls }http://${decode_ep}"
   fi
-  # Native layout (no tokenizer endpoint resolved): fall back to the target.
+  # Native layout (no side endpoint resolved): fall back to the target.
   [ -z "$urls" ] && urls="http://${IP}:${PORT}"
 
   for u in $urls; do
@@ -438,7 +482,7 @@ if [ "$INTERACTIVE" = false ]; then
       # {"model":..., "messages":[...], "tools":[...]}. Request-level knobs
       # are appended by re-opening the trailing brace; JSON duplicate keys
       # resolve last-wins, and the exporter emits none of these.
-      body="${raw%\}*},\"stream\":$STREAM,\"max_tokens\":$MAX_TOKENS,\"ignore_eos\":$IGNORE_EOS,\"temperature\":0$rank_line$fake_line"
+      body="${raw%\}*},\"stream\":$STREAM,\"max_tokens\":$MAX_TOKENS,\"ignore_eos\":$IGNORE_EOS$TEMP_LINE$rank_line$fake_line"
       if [ "$STREAM" = true ]; then
         body+=",\"stream_options\":{\"include_usage\":true}"
       fi
@@ -458,8 +502,7 @@ if [ "$INTERACTIVE" = false ]; then
         \"prompt\": $prompt_field,
         \"stream\": $STREAM,
         \"max_tokens\": $MAX_TOKENS,
-        \"ignore_eos\": $IGNORE_EOS,
-        \"temperature\": 0$rank_line$fake_line"
+        \"ignore_eos\": $IGNORE_EOS$TEMP_LINE$rank_line$fake_line"
 
       if [ "$STREAM" = true ]; then
         body+=",\"stream_options\":{\"include_usage\":true}"
@@ -1200,8 +1243,8 @@ if [ "$INTERACTIVE" = true ]; then
     BODY+="\"model\":\"DeepSeek-R1\","
     BODY+="\"messages\":$MESSAGES,"
     BODY+="\"stream\":true,"
-    BODY+="\"max_tokens\":$MAX_TOKENS,"
-    BODY+="\"temperature\":0"
+    BODY+="\"max_tokens\":$MAX_TOKENS"
+    [ -n "$TEMPERATURE" ] && BODY+=",\"temperature\":$TEMPERATURE"
     BODY+="$DP_LINE"
     BODY+=",\"stream_options\":{\"include_usage\":true}"
     BODY+="}"
