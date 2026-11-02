@@ -132,7 +132,7 @@ export SGLANG_LOG_MS=1
 #                       (prefill / decode), so the two sides stay separate.
 #                       Set to "stdout" to log to console only. Files are
 #                       written as <hostname>_<rank>.log and rotated hourly.
-export LOG_REQUESTS=1
+export LOG_REQUESTS=0
 export LOG_REQUESTS_LEVEL=3
 export LOG_REQUESTS_FORMAT=json
 export LOG_REQUESTS_TARGET=""
