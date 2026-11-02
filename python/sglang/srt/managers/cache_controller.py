@@ -55,7 +55,41 @@ def _hicache_debug() -> bool:
 
 # CPU added to SGLANG_KUNPENG_HICACHE_CPU_OFFSET per storage thread, so the three
 # threads of one rank never share a core.
-_STORAGE_THREAD_CPU_DELTA = {"prefetch": 0, "backup": 1, "prefetch_io_aux": 2}
+_STORAGE_THREAD_CPU_DELTA = {
+    "prefetch": 0,
+    "backup": 1,
+    "prefetch_io_aux": 2,
+    # Read-ahead shares the prefetch core: it is NAS-bound and the prefetch
+    # thread is idle while the aux thread gathers a batch.
+    "tp_shard_ahead": 0,
+}
+
+
+class _ShardAheadJob:
+    """One batch handed to the tp-shard read-ahead thread."""
+
+    __slots__ = (
+        "pages",
+        "hashes",
+        "prefix_keys",
+        "seq",
+        "slot",
+        "batch_idx",
+        "done",
+        "error",
+        "published",
+    )
+
+    def __init__(self, pages, hashes, prefix_keys, seq, slot, batch_idx):
+        self.pages = pages
+        self.hashes = hashes
+        self.prefix_keys = prefix_keys
+        self.seq = seq
+        self.slot = slot
+        self.batch_idx = batch_idx
+        self.done = threading.Event()
+        self.error = False
+        self.published = False
 
 
 def _fmt_cpus(cpus) -> str:
@@ -421,13 +455,19 @@ class HiCacheController:
         self.flat_read_idx: Optional[torch.Tensor] = None
         self.indexer_page_elems = 0
         self.indexer_key_suffix = "@idx"
-        self.tp0_bcast = (
-            os.environ.get("SGLANG_KUNPENG_HICACHE_TP0_BCAST", "1") == "1"
+        self.tp_shard_enabled = (
+            os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD", "1") == "1"
         )
         self.tp_shard_shm = None
         self.tp_shard_views = None
+        self.tp_shard_idx_views = None
         self.tp_shard_last_seq = []
+        self.tp_shard_idx_last_seq = []
         self.tp_shard_no_ack_wait = False
+        self.tp_shard_ahead_queue = None
+        self.tp_shard_ahead_stop = None
+        self.tp_shard_ahead_pending = None
+        self.tp_shard_ahead_lock = threading.Lock()
         self.write_policy = write_policy
         self.page_size = page_size
         self.io_backend = io_backend
@@ -696,7 +736,7 @@ class HiCacheController:
                         "SGLANG_KUNPENG_HICACHE_L1L3_ONLY."
                     )
                 self._alloc_flat_io_buffers()
-                if self.tp0_bcast:
+                if self.tp_shard_enabled:
                     # Building the shared segment first-touches every region
                     # page; the first prefetch of the first request would
                     # otherwise pay those page faults. A broken group setup must
@@ -705,7 +745,7 @@ class HiCacheController:
                     try:
                         self._init_tp_shard()
                     except Exception:
-                        self.tp0_bcast = False
+                        self.tp_shard_enabled = False
                         self.tp_shard_shm = None
                         logger.exception(
                             "[hicache] tp-shard init failed at startup; "
@@ -967,7 +1007,15 @@ class HiCacheController:
         # the next attach rebuilds it (the name carries the slot size).
         self.tp_shard_shm = None
         self.tp_shard_views = None
+        self.tp_shard_idx_views = None
         self.tp_shard_last_seq = []
+        self.tp_shard_idx_last_seq = []
+        # Stop the read-ahead consumer; the next attach starts a new one.
+        if self.tp_shard_ahead_stop is not None:
+            self.tp_shard_ahead_stop.set()
+        self.tp_shard_ahead_queue = None
+        self.tp_shard_ahead_stop = None
+        self.tp_shard_ahead_pending = None
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
         # Now it's safe to clear the stop event for future re-attach.
@@ -1499,7 +1547,7 @@ class HiCacheController:
                 prefix_keys += batch_hashes
 
     def _tp_shard_active(self):
-        if not getattr(self, "tp0_bcast", False) or not getattr(
+        if not getattr(self, "tp_shard_enabled", False) or not getattr(
             self, "l1l3_only", False
         ):
             return False
@@ -1510,7 +1558,7 @@ class HiCacheController:
                 # A broken group setup must not disable prefetching for this
                 # rank (the whole TP group would then lose L3 reuse); fall back
                 # to the per-rank read path for this process.
-                self.tp0_bcast = False
+                self.tp_shard_enabled = False
                 self.tp_shard_shm = None
                 logger.exception(
                     "[hicache] tp-shard init failed; disabling the cooperative "
@@ -1545,29 +1593,50 @@ class HiCacheController:
             self.flat_read[0].numel() * self.flat_read.element_size()
         )
         self.tp_shard_timeout = float(
-            os.environ.get("SGLANG_KUNPENG_HICACHE_TP0_BCAST_TIMEOUT", "10")
+            os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD_TIMEOUT", "10")
         )
-        # Two ping-pong slots: while the group still copies batch i out of slot
-        # i%2, batch i+1 lands in the other slot. A slot is rewritten only after
-        # every rank acknowledged its previous use.
-        self.tp_shard_slots = 2
+        # Ping-pong slots: while the group still copies batch i out of slot i%2,
+        # batch i+1 lands in the other slot. A slot is rewritten only after every
+        # rank acknowledged its previous use. Two slots already cover that
+        # hand-off; more slots only pay off with multi-batch read-ahead, and each
+        # one costs a full slot of /dev/shm (nranks * cap * page_bytes).
+        self.tp_shard_slots = max(
+            2, int(os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD_SLOTS", "2"))
+        )
         self.tp_shard_last_seq = [0] * self.tp_shard_slots
         self.tp_shard_no_ack_wait = False
-        # Per-rank arrays: published sequence, consumed sequence, hit mask.
+        # Per-rank pub/ack/mask triplets for the KV and index-K shards.
+        n = self.tp_shard_nranks
         self.tp_shard_pub_off = 64
-        self.tp_shard_ack_off = 64 + 8 * self.tp_shard_nranks
-        self.tp_shard_mask_off = 64 + 16 * self.tp_shard_nranks
-        self.tp_shard_data_off = 64 + 24 * self.tp_shard_nranks
-        self.tp_shard_slot_bytes = (
+        self.tp_shard_ack_off = 64 + 8 * n
+        self.tp_shard_mask_off = 64 + 16 * n
+        self.tp_shard_idx_pub_off = 64 + 24 * n
+        self.tp_shard_idx_ack_off = 64 + 32 * n
+        self.tp_shard_idx_mask_off = 64 + 40 * n
+        self.tp_shard_data_off = 64 + 48 * n
+        self.tp_shard_idx_page_bytes = 0
+        if self.indexer_page_elems and self.flat_read_idx is not None:
+            self.tp_shard_idx_page_bytes = (
+                self.indexer_page_elems * self.flat_read_idx.element_size()
+            )
+        self.tp_shard_idx_data_off = (
             self.tp_shard_data_off
-            + self.tp_shard_nranks * self.tp_shard_cap * self.tp_shard_page_bytes
+            + n * self.tp_shard_cap * self.tp_shard_page_bytes
+        )
+        self.tp_shard_slot_bytes = (
+            self.tp_shard_idx_data_off
+            + n * self.tp_shard_cap * self.tp_shard_idx_page_bytes
         )
         key = hashlib.md5(
             f"{socket.gethostname()}:{os.environ.get('SGLANG_DP_RANK', '0')}".encode()
         ).hexdigest()[:12]
-        # The slot size is part of the name, so a segment left behind by a run
-        # with another TP size is never attached with the wrong geometry.
-        name = f"sgk_hicache_shard_{key}_{self.tp_shard_slot_bytes >> 10}K"
+        # Slot size and count are part of the name, so a segment left behind by a
+        # run with another TP size or slot count is never attached with the wrong
+        # geometry.
+        name = (
+            f"sgk_hicache_shard_{key}_{self.tp_shard_slot_bytes >> 10}K"
+            f"_s{self.tp_shard_slots}"
+        )
         size = self.tp_shard_slots * self.tp_shard_slot_bytes
         try:
             shm = shared_memory.SharedMemory(name=name, create=True, size=size)
@@ -1592,27 +1661,109 @@ class HiCacheController:
         my = int(self.tp_rank) % self.tp_shard_nranks
         for slot in range(self.tp_shard_slots):
             self.tp_shard_views[slot][my].zero_()
+        # Index-K regions: one row per page, same rank split as the KV shard.
+        self.tp_shard_idx_views = None
+        self.tp_shard_idx_last_seq = [0] * self.tp_shard_slots
+        if self.tp_shard_idx_page_bytes:
+            self.tp_shard_idx_views = [
+                torch.frombuffer(
+                    shm.buf,
+                    dtype=self.flat_read_idx.dtype,
+                    count=(
+                        self.tp_shard_nranks
+                        * self.tp_shard_cap
+                        * self.indexer_page_elems
+                    ),
+                    offset=(
+                        slot * self.tp_shard_slot_bytes + self.tp_shard_idx_data_off
+                    ),
+                ).view(
+                    self.tp_shard_nranks, self.tp_shard_cap, self.indexer_page_elems
+                )
+                for slot in range(self.tp_shard_slots)
+            ]
+            for slot in range(self.tp_shard_slots):
+                self.tp_shard_idx_views[slot][my].zero_()
+        # Read-ahead: the prefetch core reads batch i+1 while the aux core gathers i.
+        self.tp_shard_ahead_pending = None
+        import queue as _queue
+
+        self.tp_shard_ahead_queue = _queue.Queue(maxsize=1)
+        self.tp_shard_ahead_stop = threading.Event()
+        threading.Thread(
+            target=self._tp_shard_ahead_func,
+            name="hicache_shard_ahead",
+            daemon=True,
+        ).start()
         logger.info(
             "[hicache] tp-shard enabled: rank=%d shm=%s slots=%d nranks=%d "
-            "shard_pages=%d page_bytes=%d timeout=%.1fs",
+            "shard_pages=%d page_bytes=%d idx_page_bytes=%d timeout=%.1fs",
             self.tp_rank,
             name,
             self.tp_shard_slots,
             self.tp_shard_nranks,
             self.tp_shard_cap,
             self.tp_shard_page_bytes,
+            self.tp_shard_idx_page_bytes,
             self.tp_shard_timeout,
         )
+        # Touch every region of every slot so the first request does not pay the
+        # cold cross-rank read path inside its gather.
+        t0 = time.perf_counter()
+        try:
+            for slot in range(self.tp_shard_slots):
+                seq = (1 << 64) - 1 - slot
+                self._shard_publish(slot, my, seq, 0)
+                deadline = time.monotonic() + 3.0
+                for k in range(n):
+                    r = (my + k) % n
+                    while not self._shard_ready(slot, r, seq):
+                        if time.monotonic() > deadline:
+                            logger.warning(
+                                "[hicache] tp-shard warmup: rank %d missing on %s",
+                                r,
+                                name,
+                            )
+                            break
+                        time.sleep(0.0005)
+                    else:
+                        self.flat_read[: self.tp_shard_cap].copy_(
+                            self.tp_shard_views[slot][r][: self.tp_shard_cap]
+                        )
+                        if self.tp_shard_idx_views is not None:
+                            self.flat_read_idx[: self.tp_shard_cap].copy_(
+                                self.tp_shard_idx_views[slot][r][: self.tp_shard_cap]
+                            )
+                self._shard_ack(slot, seq)
+                self.tp_shard_last_seq[slot] = seq
+            logger.info(
+                "[hicache] tp-shard warmup done: slots=%d elapsed=%.3fs",
+                self.tp_shard_slots,
+                time.perf_counter() - t0,
+            )
+        except Exception:
+            logger.exception("[hicache] tp-shard warmup failed")
 
-    def _shard_publish(self, slot, rank, seq, kv_mask):
+    def _shard_offsets(self, idx):
+        """(pub, ack, mask) header offsets of the KV or the index-K shard."""
+        if idx:
+            return (
+                self.tp_shard_idx_pub_off,
+                self.tp_shard_idx_ack_off,
+                self.tp_shard_idx_mask_off,
+            )
+        return self.tp_shard_pub_off, self.tp_shard_ack_off, self.tp_shard_mask_off
+
+    def _shard_publish(self, slot, rank, seq, kv_mask, idx=False):
         """Publish one rank's shard: the hit mask first, then the ready flag."""
         import struct
 
+        pub_off, _, mask_off = self._shard_offsets(idx)
         base = slot * self.tp_shard_slot_bytes
         struct.pack_into(
             "<Q",
             self.tp_shard_shm.buf,
-            base + self.tp_shard_mask_off + 8 * rank,
+            base + mask_off + 8 * rank,
             kv_mask,
         )
         # The region payload and the mask are written before this flag, so a
@@ -1620,54 +1771,57 @@ class HiCacheController:
         struct.pack_into(
             "<Q",
             self.tp_shard_shm.buf,
-            base + self.tp_shard_pub_off + 8 * rank,
+            base + pub_off + 8 * rank,
             seq,
         )
 
-    def _shard_ready(self, slot, rank, seq) -> bool:
+    def _shard_ready(self, slot, rank, seq, idx=False) -> bool:
         import struct
 
+        pub_off, _, _ = self._shard_offsets(idx)
         return (
             struct.unpack_from(
                 "<Q",
                 self.tp_shard_shm.buf,
-                slot * self.tp_shard_slot_bytes + self.tp_shard_pub_off + 8 * rank,
+                slot * self.tp_shard_slot_bytes + pub_off + 8 * rank,
             )[0]
             == seq
         )
 
-    def _shard_region_mask(self, slot, rank) -> int:
+    def _shard_region_mask(self, slot, rank, idx=False) -> int:
         import struct
 
+        _, _, mask_off = self._shard_offsets(idx)
         return struct.unpack_from(
             "<Q",
             self.tp_shard_shm.buf,
-            slot * self.tp_shard_slot_bytes + self.tp_shard_mask_off + 8 * rank,
+            slot * self.tp_shard_slot_bytes + mask_off + 8 * rank,
         )[0]
 
-    def _shard_wait_publish(self, slot, rank, seq):
+    def _shard_wait_publish(self, slot, rank, seq, idx=False):
         """Wait for ``rank`` to publish the batch tagged ``seq``; return its mask."""
         deadline = time.monotonic() + self.tp_shard_timeout
         while True:
-            if self._shard_ready(slot, rank, seq):
-                return True, self._shard_region_mask(slot, rank)
+            if self._shard_ready(slot, rank, seq, idx):
+                return True, self._shard_region_mask(slot, rank, idx)
             if time.monotonic() > deadline:
                 return False, 0
             time.sleep(0.0005)
 
-    def _shard_ack(self, slot, seq):
+    def _shard_ack(self, slot, seq, idx=False):
         import struct
 
+        _, ack_off, _ = self._shard_offsets(idx)
         struct.pack_into(
             "<Q",
             self.tp_shard_shm.buf,
             slot * self.tp_shard_slot_bytes
-            + self.tp_shard_ack_off
+            + ack_off
             + 8 * (int(self.tp_rank) % self.tp_shard_nranks),
             seq,
         )
 
-    def _shard_wait_acks(self, slot, seq) -> bool:
+    def _shard_wait_acks(self, slot, seq, idx=False) -> bool:
         """Wait until every rank released the previous use of ``slot``.
 
         An owner rewrites its region only after all ranks acknowledged the
@@ -1678,7 +1832,8 @@ class HiCacheController:
         """
         import struct
 
-        base = slot * self.tp_shard_slot_bytes + self.tp_shard_ack_off
+        _, ack_off, _ = self._shard_offsets(idx)
+        base = slot * self.tp_shard_slot_bytes + ack_off
         my = int(self.tp_rank) % self.tp_shard_nranks
         pending = {rank for rank in range(self.tp_shard_nranks) if rank != my}
         deadline = time.monotonic() + self.tp_shard_timeout
@@ -1711,6 +1866,122 @@ class HiCacheController:
         if rank >= pages:
             return 0
         return (pages - 1 - rank) // self.tp_shard_nranks + 1
+
+    def _tp_shard_ahead_func(self):
+        """Read-ahead consumer: own shard of one batch, on the prefetch core."""
+        import queue as _queue
+
+        _pin_storage_thread("tp_shard_ahead")
+        stop = self.tp_shard_ahead_stop
+        while not stop.is_set():
+            try:
+                job = self.tp_shard_ahead_queue.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+            if job is None:
+                return
+            try:
+                self._tp_shard_read_own(job)
+            except Exception:
+                job.error = True
+                logger.exception(
+                    "[hicache] tp-shard read-ahead failed: batch=%d", job.batch_idx
+                )
+            finally:
+                job.done.set()
+
+    def _tp_shard_read_own(self, job):
+        """Read this rank's shard into its region and publish it."""
+        with self.tp_shard_ahead_lock:
+            slot, pages = job.slot, job.pages
+            nranks = self.tp_shard_nranks
+            my = int(self.tp_rank) % nranks
+            last = self.tp_shard_last_seq[slot]
+            if last and not self.tp_shard_no_ack_wait:
+                self._shard_wait_acks(slot, last)
+            n_mine = self._shard_page_count(my, pages)
+            kv_mask = 0
+            if n_mine:
+                hits = self.storage_backend.batch_get_flat(
+                    [job.hashes[j] for j in range(my, pages, nranks)],
+                    [self.flat_read[s] for s in range(n_mine)],
+                    HiCacheStorageExtraInfo(prefix_keys=job.prefix_keys),
+                )
+                for s, hit in enumerate(hits):
+                    if hit:
+                        kv_mask |= 1 << s
+                self.tp_shard_views[slot][my][:n_mine].copy_(self.flat_read[:n_mine])
+            self._shard_publish(slot, my, job.seq, kv_mask)
+            self.tp_shard_last_seq[slot] = job.seq
+            job.published = True
+
+    def _tp_shard_ahead_submit(self, operation, op_tag, i, batch_idx, prefix_keys):
+        hashes = operation.hash_value[i : i + self.storage_batch_size]
+        if not hashes or self.tp_shard_ahead_queue is None:
+            return
+        seq = ((op_tag << 32) | (batch_idx & 0xFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+        self.tp_shard_ahead_pending = _ShardAheadJob(
+            len(hashes),
+            list(hashes),
+            list(prefix_keys) if prefix_keys else None,
+            seq,
+            batch_idx % self.tp_shard_slots,
+            batch_idx,
+        )
+        self.tp_shard_ahead_queue.put(self.tp_shard_ahead_pending)
+
+    def _tp_shard_ahead_drain(self):
+        """Drop the queued job; ack the slot this rank will never gather."""
+        job, self.tp_shard_ahead_pending = self.tp_shard_ahead_pending, None
+        if job is None:
+            return
+        if job.done.wait(timeout=self.tp_shard_timeout) and job.published:
+            self._shard_ack(job.slot, job.seq)
+        else:
+            logger.warning(
+                "[hicache] tp-shard ahead dropped: batch=%d", job.batch_idx
+            )
+
+    def _shard_gather(
+        self, operation, slot, seq, batch_idx, pages, layers, views, starts,
+        page_size, idx=False,
+    ):
+        """Copy every published region into L1; returns (ok, hit_pages)."""
+        nranks = self.tp_shard_nranks
+        my = int(self.tp_rank) % nranks
+        order = [(my + k) % nranks for k in range(nranks)]
+        tag = "tp-shard idx" if idx else "tp-shard"
+        fail = f"[hicache] {tag} fallback: req=%s batch=%d rank=%d"
+        gone = f"[hicache] {tag} recycled: req=%s batch=%d rank=%d"
+        masks = [0] * nranks
+        ok_all = True
+        for r in order:
+            ok, mask = self._shard_wait_publish(slot, r, seq, idx)
+            if not ok:
+                logger.warning(fail, operation.request_id, batch_idx, r)
+                ok_all = False
+                break
+            masks[r] = mask
+            n_r = self._shard_page_count(r, pages)
+            if not n_r:
+                continue
+            # Own pages are in this rank's region too: the read-ahead thread may
+            # already be refilling flat_read for the next batch, so never read it here.
+            src = views[slot][r][:n_r]
+            st = starts[r::nranks].contiguous()
+            hicache_page_unflatten_batch(layers, src, st, page_size)
+            if not self._shard_ready(slot, r, seq, idx):
+                logger.warning(gone, operation.request_id, batch_idx, r)
+                ok_all = False
+                break
+        hit_pages = 0
+        if ok_all:
+            hit_pages = pages
+            for j in range(pages):
+                if not (masks[j % nranks] >> (j // nranks)) & 1:
+                    hit_pages = j
+                    break
+        return ok_all, hit_pages
 
     def _l1l3_read_scatter_batch(self, batch_hashes, batch_indices, prefix_keys):
         """Read one whole batch per-rank from L3 and scatter it into L1.
@@ -1773,6 +2044,8 @@ class HiCacheController:
 
         Only the leading run of hits is published through ``completed_tokens``,
         and only after its bytes have landed in L1, as in the per-rank path.
+
+        The DSA index-K blobs use the same key on every rank, so they are sharded too.
         """
         import zlib
 
@@ -1783,9 +2056,6 @@ class HiCacheController:
         my = int(self.tp_rank) % nranks
         op_tag = zlib.crc32(operation.request_id.encode())
         shared_ok = True
-        # Staggered order: rank r starts at region r and wraps.
-        order = [(my + k) % nranks for k in range(nranks)]
-
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             pages = len(batch_hashes)
@@ -1802,111 +2072,104 @@ class HiCacheController:
             t_b = time.perf_counter() if debug else 0.0
             t_wait = t_read = 0.0
 
-            # ---- own shard: read from L3, copy into this rank's region ----
-            if self.tp_shard_last_seq[slot] and not self.tp_shard_no_ack_wait:
-                self._shard_wait_acks(slot, self.tp_shard_last_seq[slot])
-            if debug:
-                t_wait = time.perf_counter() - t_b
-            n_mine = self._shard_page_count(my, pages)
-            kv_mask = 0
-            if n_mine:
-                hits = self.storage_backend.batch_get_flat(
-                    [batch_hashes[j] for j in range(my, pages, nranks)],
-                    [self.flat_read[s] for s in range(n_mine)],
-                    HiCacheStorageExtraInfo(prefix_keys=prefix_keys),
+            # ---- own shard: the read-ahead published it while we gathered i-1 ----
+            if self.tp_shard_ahead_pending is None:
+                self._tp_shard_ahead_submit(
+                    operation, op_tag, i, batch_idx, prefix_keys
                 )
-                for s, hit in enumerate(hits):
-                    if hit:
-                        kv_mask |= 1 << s
-                self.tp_shard_views[slot][my][:n_mine].copy_(self.flat_read[:n_mine])
-            self._shard_publish(slot, my, seq, kv_mask)
-            self.tp_shard_last_seq[slot] = seq
+            job = self.tp_shard_ahead_pending
+            self.tp_shard_ahead_pending = None
+            if not job.done.wait(timeout=self.tp_shard_timeout) or job.error:
+                logger.warning(
+                    "[hicache] tp-shard ahead late: batch=%d", job.batch_idx
+                )
+            self._tp_shard_ahead_submit(
+                operation,
+                op_tag,
+                i + self.storage_batch_size,
+                batch_idx + 1,
+                (prefix_keys + batch_hashes) if prefix_keys else None,
+            )
             if debug:
-                t_read = time.perf_counter() - t_b - t_wait
+                t_read = time.perf_counter() - t_b
 
             # ---- all-gather: copy every region into L1, staggered by rank ----
-            masks = [0] * nranks
             if shared_ok:
-                for r in order:
-                    ok, mask = self._shard_wait_publish(slot, r, seq)
-                    if not ok:
-                        logger.warning(
-                            "[hicache] tp-shard fallback: req=%s, batch=%d, rank=%d "
-                            "did not publish in time; reading this and the remaining "
-                            "batch(es) from L3 per-rank",
-                            operation.request_id,
-                            batch_idx,
-                            r,
-                        )
-                        shared_ok = False
-                        break
-                    masks[r] = mask
-                    n_r = self._shard_page_count(r, pages)
-                    if not n_r:
-                        continue
-                    # This rank's own pages already sit in the flat buffer, so
-                    # skip the shared-memory round trip for them.
-                    src = (
-                        self.flat_read[:n_r]
-                        if r == my
-                        else self.tp_shard_views[slot][r][:n_r]
-                    )
-                    hicache_page_unflatten_batch(
-                        layers,
-                        src,
-                        page_starts[r::nranks].contiguous(),
-                        self.page_size,
-                    )
-                    if not self._shard_ready(slot, r, seq):
-                        # A laggard let the slot be recycled mid-copy, so the
-                        # bytes just written to L1 are untrustworthy.
-                        logger.warning(
-                            "[hicache] tp-shard recycled: req=%s, batch=%d, rank=%d; "
-                            "re-reading the batch per-rank",
-                            operation.request_id,
-                            batch_idx,
-                            r,
-                        )
-                        shared_ok = False
-                        break
+                shared_ok, hit_pages = self._shard_gather(
+                    operation, slot, seq, batch_idx, pages,
+                    layers, self.tp_shard_views, page_starts, self.page_size,
+                )
             self._shard_ack(slot, seq)
 
-            if shared_ok:
-                # A page is a hit iff its owner fetched it; the prefix is the
-                # first page of the batch that is not.
-                hit_pages = pages
-                for j in range(pages):
-                    if not (masks[j % nranks] >> (j // nranks)) & 1:
-                        hit_pages = j
-                        break
-            else:
+            if not shared_ok:
+                # The fallback reuses flat_read: let the in-flight read finish
+                # (its job is still pending, so the next batch consumes it).
+                if self.tp_shard_ahead_pending is not None:
+                    self.tp_shard_ahead_pending.done.wait(
+                        timeout=self.tp_shard_timeout
+                    )
                 hit_pages = self._l1l3_read_scatter_batch(
                     batch_hashes, batch_indices, prefix_keys
                 )
 
             if shared_ok and hit_pages and self.indexer_page_elems:
-                # The DSA indexer pool is not replicated per page object the way
-                # the MLA latent is, so every rank reads its own copy, exactly
-                # like the per-rank path.
-                idx_hits = self.storage_backend.batch_get_flat(
-                    self._indexer_keys(batch_hashes[:hit_pages]),
-                    [self.flat_read_idx[j] for j in range(hit_pages)],
-                    HiCacheStorageExtraInfo(prefix_keys=prefix_keys),
-                )
-                idx_hit_pages = 0
-                for hit in idx_hits:
-                    if not hit:
-                        break
-                    idx_hit_pages += 1
-                if idx_hit_pages < hit_pages:
-                    hit_pages = idx_hit_pages
-                if hit_pages:
-                    hicache_page_unflatten_batch(
-                        self._indexer_page_layers(),
-                        self.flat_read_idx[:hit_pages],
-                        page_starts[:hit_pages] // self.page_size,
-                        1,
+                # Same "@idx" key on every rank, so shard it like the MLA latent.
+                idx_page_starts = page_starts[:hit_pages] // self.page_size
+                idx_seq = seq ^ 0x9E3779B97F4A7C15
+                n_mine_idx = self._shard_page_count(my, hit_pages)
+                idx_mask = 0
+                idx_ok = self.tp_shard_idx_views is not None
+                if idx_ok:
+                    if (
+                        self.tp_shard_idx_last_seq[slot]
+                        and not self.tp_shard_no_ack_wait
+                    ):
+                        self._shard_wait_acks(
+                            slot, self.tp_shard_idx_last_seq[slot], idx=True
+                        )
+                    if n_mine_idx:
+                        idx_hits = self.storage_backend.batch_get_flat(
+                            self._indexer_keys(batch_hashes[my:hit_pages:nranks]),
+                            [self.flat_read_idx[s] for s in range(n_mine_idx)],
+                            HiCacheStorageExtraInfo(prefix_keys=prefix_keys),
+                        )
+                        for s, hit in enumerate(idx_hits):
+                            if hit:
+                                idx_mask |= 1 << s
+                        self.tp_shard_idx_views[slot][my][:n_mine_idx].copy_(
+                            self.flat_read_idx[:n_mine_idx]
+                        )
+                    self._shard_publish(slot, my, idx_seq, idx_mask, idx=True)
+                    self.tp_shard_idx_last_seq[slot] = idx_seq
+                    idx_ok, idx_hit_pages = self._shard_gather(
+                        operation, slot, idx_seq, batch_idx, hit_pages,
+                        self._indexer_page_layers(), self.tp_shard_idx_views,
+                        idx_page_starts, 1, idx=True,
                     )
+                    self._shard_ack(slot, idx_seq, idx=True)
+                    if idx_ok:
+                        hit_pages = idx_hit_pages
+                if not idx_ok:
+                    # Per-rank fallback: read the whole index-K prefix.
+                    idx_hits = self.storage_backend.batch_get_flat(
+                        self._indexer_keys(batch_hashes[:hit_pages]),
+                        [self.flat_read_idx[j] for j in range(hit_pages)],
+                        HiCacheStorageExtraInfo(prefix_keys=prefix_keys),
+                    )
+                    idx_hit_pages = 0
+                    for hit in idx_hits:
+                        if not hit:
+                            break
+                        idx_hit_pages += 1
+                    if idx_hit_pages < hit_pages:
+                        hit_pages = idx_hit_pages
+                    if hit_pages:
+                        hicache_page_unflatten_batch(
+                            self._indexer_page_layers(),
+                            self.flat_read_idx[:hit_pages],
+                            page_starts[:hit_pages] // self.page_size,
+                            1,
+                        )
 
             if hit_pages == 0:
                 operation.mark_terminate()
@@ -1940,6 +2203,10 @@ class HiCacheController:
                 break
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
+
+        # Last batch queued a job that was never gathered; ack its slot so the
+        # group can reuse it.
+        self._tp_shard_ahead_drain()
 
     def _page_transfer_l1l3(self, operation):
         if self._tp_shard_active():
@@ -2051,13 +2318,29 @@ class HiCacheController:
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
+    def _query_shards(self) -> int:
+        """Ranks that share the L3 existence query (1 = every rank asks all)."""
+        if os.environ.get("SGLANG_KUNPENG_HICACHE_QUERY_SHARD", "1") != "1":
+            return 1
+        return max(1, int(getattr(self, "tp_size", 1)))
+
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        """Return the operation's hash chain and its first missing page.
+
+        With query sharding each page is checked by exactly one rank of the
+        group (``page_index % tp_size``), so the metadata cost is divided by
+        the group size. The caller MIN-reduces the first missing page, which
+        is the leading run of hits every rank needs.
+        """
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
+        shards = self._query_shards()
+        my_shard = int(getattr(self, "tp_rank", 0)) % shards
 
-        storage_query_count = 0
+        first_miss_page = len(tokens_to_fetch) // self.page_size
         hash_value = []
+        page_base = 0
 
         for start in range(
             0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
@@ -2073,15 +2356,32 @@ class HiCacheController:
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
-            hash_value.extend(batch_hashes[:hit_page_num])
-            storage_query_count += hit_page_num * self.page_size
-            if hit_page_num < len(batch_hashes):
-                break
-            if prefix_keys and len(prefix_keys) > 0:
+            pages = len(batch_hashes)
+            if page_base < first_miss_page:
+                if shards == 1:
+                    hit_page_num = self.storage_backend.batch_exists(
+                        batch_hashes, extra_info
+                    )
+                    if hit_page_num < pages:
+                        first_miss_page = page_base + hit_page_num
+                else:
+                    mine = [
+                        i for i in range(pages) if (page_base + i) % shards == my_shard
+                    ]
+                    if mine:
+                        bits = self.storage_backend.batch_exists_bits(
+                            [batch_hashes[i] for i in mine], extra_info
+                        )
+                        for i, exists in zip(mine, bits):
+                            if not exists:
+                                first_miss_page = page_base + i
+                                break
+            hash_value.extend(batch_hashes)
+            page_base += pages
+            if prefix_keys and len(prefix_keys) > 0 and page_base <= first_miss_page:
                 prefix_keys += batch_hashes
 
-        return hash_value, storage_query_count
+        return hash_value, first_miss_page
 
     def prefetch_thread_func(self):
         """
@@ -2107,14 +2407,12 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
-                )
+                hash_value, first_miss_page = self._storage_hit_query(operation)
+                first_miss_page_tensor = torch.tensor(first_miss_page, dtype=torch.int)
                 self._all_reduce_prefetch_groups(
-                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+                    first_miss_page_tensor, torch.distributed.ReduceOp.MIN
                 )
-                storage_hit_count = storage_hit_count_tensor.item()
+                storage_hit_count = int(first_miss_page_tensor.item()) * self.page_size
 
                 if _hicache_debug():
                     logger.info(

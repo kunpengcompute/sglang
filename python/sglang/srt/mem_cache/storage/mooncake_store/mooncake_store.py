@@ -1076,34 +1076,46 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         exist_result = self._batch_exist([key])
         return exist_result[0] == 1
 
+    def _exists_query_keys(self, keys: List[str]) -> Tuple[List[str], int]:
+        """Storage keys that make up one page, and how many per page."""
+        if self.is_mla_backend:
+            return [f"{key}_{self.mla_suffix}_k" for key in keys], 1
+        if self.storage_config.should_split_heads:
+            query_keys = []
+            for key in keys:
+                for suffix in self.mha_suffix:
+                    query_keys.append(f"{key}_{suffix}_k")
+                    query_keys.append(f"{key}_{suffix}_v")
+            return query_keys, 2 * self.split_factor
+        query_keys = []
+        for key in keys:
+            query_keys.append(f"{key}_{self.mha_suffix}_k")
+            query_keys.append(f"{key}_{self.mha_suffix}_v")
+        return query_keys, 2
+
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
-
-        if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
-        else:
-            query_keys = []
-            if self.storage_config.should_split_heads:
-                for key in keys:
-                    for suffix in self.mha_suffix:
-                        query_keys.append(f"{key}_{suffix}_k")
-                        query_keys.append(f"{key}_{suffix}_v")
-                key_multiplier = 2 * self.split_factor
-            else:
-                for key in keys:
-                    query_keys.append(f"{key}_{self.mha_suffix}_k")
-                    query_keys.append(f"{key}_{self.mha_suffix}_v")
-                key_multiplier = 2
-
+        query_keys, key_multiplier = self._exists_query_keys(keys)
         exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
+
+    def batch_exists_bits(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> List[bool]:
+        """Per-page existence in one metadata call (sharded hit query)."""
+        keys = self._tag_keys(keys)
+        query_keys, key_multiplier = self._exists_query_keys(keys)
+        exist_result = self._batch_exist(query_keys)
+        return [
+            all(exist_result[i0 + i] == 1 for i in range(key_multiplier))
+            for i0 in range(0, len(query_keys), key_multiplier)
+        ]
 
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
