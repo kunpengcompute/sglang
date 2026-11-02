@@ -1568,22 +1568,13 @@ class HiCacheController:
         return self.tp_shard_shm is not None
 
     def _init_tp_shard(self):
-        """One shared segment per (node, DP rank), one region per TP rank.
-
-        A batch of pages is cut into ``nranks`` page-interleaved shards: rank r
-        reads pages ``r, r+nranks, ...`` straight from L3 into region r, so the
-        group moves each page once instead of every rank reading the whole
-        batch. MLA KV is replicated across TP ranks, so every rank then copies
-        every region into its own L1, starting from its own region and wrapping
-        around to keep the ranks from pulling the same region at the same time.
-        """
+        """One segment per (node, DP rank); one page-interleaved region per rank."""
         import hashlib
         import socket
         from multiprocessing import shared_memory
 
         self.tp_shard_nranks = int(self.tp_size)
-        # Pages per rank in one batch; a short tail batch simply leaves the
-        # high ranks with no page.
+        # Pages per rank in one batch; the tail batch leaves high ranks empty.
         self.tp_shard_cap = max(
             1,
             (self.flat_io_batch_pages + self.tp_shard_nranks - 1)
@@ -1595,11 +1586,7 @@ class HiCacheController:
         self.tp_shard_timeout = float(
             os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD_TIMEOUT", "10")
         )
-        # Ping-pong slots: while the group still copies batch i out of slot i%2,
-        # batch i+1 lands in the other slot. A slot is rewritten only after every
-        # rank acknowledged its previous use. Two slots already cover that
-        # hand-off; more slots only pay off with multi-batch read-ahead, and each
-        # one costs a full slot of /dev/shm (nranks * cap * page_bytes).
+        # Ping-pong slots; each extra slot costs another nranks*cap*page_bytes.
         self.tp_shard_slots = max(
             2, int(os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD_SLOTS", "2"))
         )
@@ -1630,9 +1617,7 @@ class HiCacheController:
         key = hashlib.md5(
             f"{socket.gethostname()}:{os.environ.get('SGLANG_DP_RANK', '0')}".encode()
         ).hexdigest()[:12]
-        # Slot size and count are part of the name, so a segment left behind by a
-        # run with another TP size or slot count is never attached with the wrong
-        # geometry.
+        # Geometry is part of the name: never attach a stale segment.
         name = (
             f"sgk_hicache_shard_{key}_{self.tp_shard_slot_bytes >> 10}K"
             f"_s{self.tp_shard_slots}"
@@ -1766,8 +1751,7 @@ class HiCacheController:
             base + mask_off + 8 * rank,
             kv_mask,
         )
-        # The region payload and the mask are written before this flag, so a
-        # consumer that sees the flag reads bytes of this batch.
+        # Payload and mask are written before this flag.
         struct.pack_into(
             "<Q",
             self.tp_shard_shm.buf,
@@ -1822,14 +1806,7 @@ class HiCacheController:
         )
 
     def _shard_wait_acks(self, slot, seq, idx=False) -> bool:
-        """Wait until every rank released the previous use of ``slot``.
-
-        An owner rewrites its region only after all ranks acknowledged the
-        previous batch in that slot, so nobody can be reading it. The wait is
-        bounded: after one timeout this rank stops waiting, and consumers
-        re-check the published sequence after each copy and fall back to
-        per-rank reads if the slot moved underneath them.
-        """
+        """Wait until every rank released the previous use of ``slot``."""
         import struct
 
         _, ack_off, _ = self._shard_offsets(idx)
@@ -1965,8 +1942,7 @@ class HiCacheController:
             n_r = self._shard_page_count(r, pages)
             if not n_r:
                 continue
-            # Own pages are in this rank's region too: the read-ahead thread may
-            # already be refilling flat_read for the next batch, so never read it here.
+            # Own pages: never read flat_read here, the read-ahead may refill it.
             src = views[slot][r][:n_r]
             st = starts[r::nranks].contiguous()
             hicache_page_unflatten_batch(layers, src, st, page_size)
@@ -2033,19 +2009,9 @@ class HiCacheController:
         return hit_pages
 
     def _page_transfer_l1l3_shard(self, operation):
-        """Cooperative L3 -> L1 read for one prefetch operation.
-
-        Every batch is split into one page-interleaved shard per TP rank: rank
-        r reads pages ``r, r+nranks, ...`` straight from L3 into region r of the
-        shared segment and publishes it, so the group reads each page once. MLA
-        KV is replicated across TP ranks, so each rank then copies all regions
-        into its own L1, starting at its own region and wrapping around, which
-        keeps the ranks from pulling the same region at the same time.
-
-        Only the leading run of hits is published through ``completed_tokens``,
-        and only after its bytes have landed in L1, as in the per-rank path.
-
-        The DSA index-K blobs use the same key on every rank, so they are sharded too.
+        """Cooperative L3 -> L1 read: rank r fetches pages r, r+nranks, ... and
+        every rank copies all regions into its own L1; only the leading run of
+        hits is published, after its bytes landed in L1.
         """
         import zlib
 
@@ -2102,8 +2068,7 @@ class HiCacheController:
             self._shard_ack(slot, seq)
 
             if not shared_ok:
-                # The fallback reuses flat_read: let the in-flight read finish
-                # (its job is still pending, so the next batch consumes it).
+                # Fallback reuses flat_read: wait for the in-flight read.
                 if self.tp_shard_ahead_pending is not None:
                     self.tp_shard_ahead_pending.done.wait(
                         timeout=self.tp_shard_timeout
@@ -2204,8 +2169,7 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
-        # Last batch queued a job that was never gathered; ack its slot so the
-        # group can reuse it.
+        # Ack the last queued job that was never gathered.
         self._tp_shard_ahead_drain()
 
     def _page_transfer_l1l3(self, operation):
