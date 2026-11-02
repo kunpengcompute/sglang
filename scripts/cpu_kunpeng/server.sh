@@ -71,6 +71,18 @@ BASE_ARGS=(
     --stream-interval "$STREAM_INTERVAL"
 )
 
+# Request logging (inputs/outputs of all requests), gated by LOG_REQUESTS
+if [[ "${LOG_REQUESTS:-0}" == "1" ]]; then
+    BASE_ARGS+=(
+        --log-requests
+        --log-requests-level "${LOG_REQUESTS_LEVEL:-3}"
+        --log-requests-format "${LOG_REQUESTS_FORMAT:-json}"
+        # LOG_REQUESTS_TARGET holds space-separated targets ("stdout" and/or
+        # dirs); empty falls back to a request_log/ subdir of this run's log dir
+        --log-requests-target ${LOG_REQUESTS_TARGET:-"$LOG_PATH/request_log"}
+    )
+fi
+
 # Add redundant experts only when enabled (REDUNDANT_EXPERTS > 0)
 if [[ "${REDUNDANT_EXPERTS:-0}" -gt 0 ]]; then
     BASE_ARGS+=(--ep-num-redundant-experts "$REDUNDANT_EXPERTS")

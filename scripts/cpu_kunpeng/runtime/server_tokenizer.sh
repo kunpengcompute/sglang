@@ -90,6 +90,21 @@ HTTP_COMMON_ARGS=(
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"}
 )
 
+# Request logging (inputs/outputs of all requests), gated by LOG_REQUESTS.
+# The HTTP server / tokenizer manager runs here in PD-separated mode, so the
+# Receive/Finish request logs are emitted by this process.
+if [[ "${LOG_REQUESTS:-0}" == "1" ]]; then
+    # Default target: per-side (per-instance) subdir of this run's log dir, so
+    # the prefill and decode tokenizer logs never share one file (both run on
+    # the router node and would otherwise use the same <hostname>_0.log name).
+    HTTP_COMMON_ARGS+=(
+        --log-requests
+        --log-requests-level "${LOG_REQUESTS_LEVEL:-3}"
+        --log-requests-format "${LOG_REQUESTS_FORMAT:-json}"
+        --log-requests-target ${LOG_REQUESTS_TARGET:-"$LOG_PATH/request_log/${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}"}
+    )
+fi
+
 echo "Launching $TOK_SIDE${TOK_INSTANCE:+ ($TOK_INSTANCE)} HTTP server on port $TOK_PORT..."
 # Record this instance's invocation and full environment for debugging
 {

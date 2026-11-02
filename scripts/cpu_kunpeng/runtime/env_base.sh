@@ -117,6 +117,30 @@ export SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET=18
 
 # SGLang
 export SGLANG_LOG_MS=1
+# Request logging: record per-request metadata and input/output text
+# (python/sglang/srt/utils/request_logger.py). LOG_REQUESTS=1 adds the
+# --log-requests flags in server.sh (native role) and runtime/server_tokenizer.sh
+# (PD roles, where the HTTP server and tokenizer manager live).
+#   LOG_REQUESTS_LEVEL  0 = metadata only, 1 = + sampling params,
+#                       2 = + truncated input/output (2048 chars),
+#                       3 = + full input/output text
+#   LOG_REQUESTS_FORMAT "text" or "json" (one JSON line per event)
+#   LOG_REQUESTS_TARGET space-separated: "stdout" and/or directory paths.
+#                       Empty = write under the run log dir (created
+#                       automatically): native role -> $LOG_DIR/request_log,
+#                       PD roles -> $LOG_DIR/request_log/<side>[_<instance>]
+#                       (prefill / decode), so the two sides stay separate.
+#                       Set to "stdout" to log to console only. Files are
+#                       written as <hostname>_<rank>.log and rotated hourly.
+export LOG_REQUESTS=1
+export LOG_REQUESTS_LEVEL=3
+export LOG_REQUESTS_FORMAT=json
+export LOG_REQUESTS_TARGET=""
+# Only log finished requests slower than this (ms); -1 = log every request
+export SGLANG_LOG_REQUEST_EXCEEDED_MS=-1
+# Extra request headers to include in the request log (comma-separated,
+# e.g. "x-request-id,my-trace-id")
+export SGLANG_LOG_REQUEST_HEADERS=""
 export SGLANG_USE_CPU_ENGINE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
