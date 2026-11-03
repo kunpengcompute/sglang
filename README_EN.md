@@ -466,7 +466,7 @@ For policy details and multi-instance routing, see the [multi-instance deploymen
 
 ## 4. Correctness Verification
 
-The verification script `scripts/cpu_kunpeng/curl.sh` supports multiple features. Common usage examples:
+The verification script `scripts/cpu_kunpeng/curl.sh` supports multiple features. Common usage examples; `scripts/cpu_kunpeng/client/tokenize.py` reports the actual token count of prompts.
 
 ### 4.1 Basic Usage
 
@@ -477,7 +477,10 @@ sh curl.sh -n 10 -m 20           # 10 requests
 sh curl.sh -s -f prompts/1k.txt  # long prompt
 sh curl.sh -J -f chat.jsonl      # chat mode: -f is a JSONL request-body file, posted to /v1/chat/completions
 sh curl.sh -i                    # multi-turn interactive chat
+python3 client/tokenize.py -f prompts/1k.txt  # token count of the prompt (posts to /v1/tokenize)
 ```
+
+`client/tokenize.py` usage: `-f FILE[,FILE...]|DIR` selects the prompt source (each file is ONE whole prompt, multi-line content OK; separate multiple files with commas; a directory takes each `*.txt`/`*.md` inside, sorted by name, as one prompt). The target can be overridden with the `HOST`/`PORT` environment variables (default: `ROUTER_IP` or `127.0.0.1`, port 30000).
 
 ### 4.2 Routing Test
 
