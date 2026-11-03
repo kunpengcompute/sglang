@@ -130,6 +130,8 @@ export SGLANG_KUNPENG_SWAP_EXPERT="${SGLANG_KUNPENG_SWAP_EXPERT:-1}"
 export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-8}"
 export SGLANG_KUNPENG_MAX_CUR_LEN="${SGLANG_KUNPENG_MAX_CUR_LEN:-576}"
 export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-65536}"
+# Fused MoE GEMM inner tile (rows); 2048 = prefill reference. Sync with ep_moe/layer.py.
+export KUTACC_FUSEDMOE_TILEBUF="${KUTACC_FUSEDMOE_TILEBUF:-2048}"
 
 # Per-server overrides (sourced after role defaults so they take priority).
 # With an instance (env.sh prefill 128p -> INSTANCE=128p), ONLY the instance

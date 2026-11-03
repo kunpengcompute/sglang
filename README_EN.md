@@ -33,7 +33,7 @@ In addition, compiling the SGLang kernel module requires the Bisheng Compiler. P
 
 Two more components are required for running and compilation; see the corresponding repositories for detailed installation steps:
 
-- **kutacc**: Kunpeng CPU communication and operator library (RDMA collectives, shm allreduce, etc.); use the branch at <https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang> (the RDMA allgather/broadcast features require a kutacc build from the sglang_930 branch, see Section 3.7.1 item 8).
+- **kutacc**: Kunpeng CPU communication and operator library (RDMA collectives, shm allreduce, etc.); use the branch at <https://gitcode.com/zhengzhong722/kutacc/tree/sglang_930>.
 - **kupl**: Kunpeng acceleration runtime (kupl multi-threading backend, SHM/SDMA, etc.); use the branch at <https://gitcode.com/kunpengcompute/kupl/tree/sglang_830>.
 
 In PD (Prefill-Decode) disaggregated deployment mode, two additional components, SGLang Model Gateway and Mooncake, are required to handle request distribution and KVCache data transfer between Prefill and Decode instances:
@@ -443,7 +443,7 @@ export ENABLE_KUNPENG_HICACHE=0  # default off
 **Multi-Thread Backend**
 
 - **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**: Specifies the kupl multi-threading backend and thread count. Standard PyTorch only supports omp. `KUPL_EXECUTOR_COUNT` defaults to 33 (set to 32 when `KUTACC_ASYNC_LAUNCH=0`).
-- **KUTACC\_FUSEDMOE\_MULTIEXPT**: kutacc fusedmoe multi-expert parallelism group count (decode side). Default 0 = serial per-expert path (bit-exact); when set to G, the worker pool is split into G groups, each owning a share of the local experts.
+- **KUTACC\_FUSEDMOE\_MULTI\_OPERAND\_GEMM**: kutacc fusedmoe gateup multi-operand GEMM (decode side). Default 1 merges the streaming/ZA entry of all local experts into one kernel call; 0 falls back to the per-expert loop.
 
 **Others**
 

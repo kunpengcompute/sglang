@@ -149,8 +149,14 @@ class _ActivationTraceState:
             self.actual_experts_id_list,
         )
         path = os.path.join(out_dir, prefix + ".json")
-        with open(path, "w", encoding="utf-8") as f:
+        # Atomic rewrite: the JSON is rewritten at the end of every forward
+        # batch, so writing in place exposes concurrent readers (and kill -9)
+        # to a truncated or empty file. Write to a tmp sibling and rename over
+        # it; readers always see either the previous or the new full file.
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(content)
+        os.replace(tmp_path, path)
         logger.info("[ATTrace] saved %s", path)
 
 

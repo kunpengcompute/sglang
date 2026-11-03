@@ -1353,6 +1353,7 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
             dispatch_map,
             expert_location_dispatch_info.num_physical_experts,
             ep_size,
+            state.moe_tp_size,
         )
     elif algorithm in ("dynamic", "fake"):
         # Every logical expert has a group of physical copies; pick one per

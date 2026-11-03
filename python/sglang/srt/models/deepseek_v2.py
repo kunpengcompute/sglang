@@ -912,6 +912,7 @@ class DeepseekV2MoE(nn.Module):
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
+                    is_nextn=self.is_nextn,
                 ),
             )
         else:
@@ -1168,6 +1169,7 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
+                        is_nextn=self.is_nextn,
                     ),
                 )
         else:
