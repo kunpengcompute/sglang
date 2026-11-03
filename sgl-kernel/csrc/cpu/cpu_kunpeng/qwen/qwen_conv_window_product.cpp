@@ -102,3 +102,72 @@ extern "C" void qwen_graph_conv_window_product_dispatch(std::vector<at::Tensor> 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
     m.def("qwen_registered_conv_window_product(Tensor windows, Tensor weight) -> Tensor", &eager);
 }
+
+// W4-only producer/reduction fusion. Preserve the existing product function
+// above byte-for-byte; the caller retains BF16 conversion, SiLU and state writes.
+namespace {
+void reduce4(std::vector<at::Tensor> &t) {
+    TORCH_CHECK(t.size() == 3, "Conv window reduce ABI");
+    const auto &windows = t[0];
+    const auto &weight = t[1];
+    auto &output = t[2];
+    TORCH_CHECK(windows.device().is_cpu() && windows.scalar_type() == at::kBFloat16 &&
+        windows.dim() == 4 && windows.size(0) == 1, "Conv reduce BF16 window");
+    const int64_t channels = windows.size(1), rows = windows.size(2);
+    TORCH_CHECK(channels > 0 && 128 < rows && rows <= 4096 && windows.size(3) == 4 &&
+        windows.stride(3) == 1 && windows.stride(2) == 1 &&
+        windows.stride(1) == rows + 3 && windows.stride(0) == channels * (rows + 3),
+        "Conv reduce W4 geometry/stride");
+    TORCH_CHECK(weight.device().is_cpu() && weight.scalar_type() == at::kFloat &&
+        weight.sizes() == at::IntArrayRef({1, channels, 1, 4}) && weight.is_contiguous(),
+        "Conv reduce existing F32 weights");
+    TORCH_CHECK(output.device().is_cpu() && output.scalar_type() == at::kFloat &&
+        output.sizes() == at::IntArrayRef({1, channels, rows}) && output.is_contiguous(),
+        "Conv reduce dense F32 output");
+    no_overlap(output, windows);
+    no_overlap(output, weight);
+    const auto *x = reinterpret_cast<const uint16_t *>(windows.data_ptr());
+    const auto *w = weight.data_ptr<float>();
+    auto *out = output.data_ptr<float>();
+    const int64_t step = svcntw();
+    kutacc::parallel_for(0, channels, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t c = begin; c < end; ++c) {
+            const auto *joined = x + c * windows.stride(1);
+            const auto *weights = w + 4 * c;
+            for (int64_t row = 0; row < rows; row += step) {
+                const auto pg = svwhilelt_b32(row, rows);
+                const auto x0 = svreinterpret_f32_u32(svlsl_n_u32_z(pg, svld1uh_u32(pg, joined + row), 16));
+                const auto x1 = svreinterpret_f32_u32(svlsl_n_u32_z(pg, svld1uh_u32(pg, joined + row + 1), 16));
+                const auto x2 = svreinterpret_f32_u32(svlsl_n_u32_z(pg, svld1uh_u32(pg, joined + row + 2), 16));
+                const auto x3 = svreinterpret_f32_u32(svlsl_n_u32_z(pg, svld1uh_u32(pg, joined + row + 3), 16));
+                // Separate strict FMULs, followed by the short inner-sum left fold.
+                // +0 initialization/final accumulation also preserve zero sign.
+                const auto p0 = svmul_n_f32_z(pg, x0, weights[0]);
+                const auto p1 = svmul_n_f32_z(pg, x1, weights[1]);
+                const auto p2 = svmul_n_f32_z(pg, x2, weights[2]);
+                const auto p3 = svmul_n_f32_z(pg, x3, weights[3]);
+                auto sum = svadd_f32_z(pg, svdup_f32(0.0f), p0);
+                sum = svadd_f32_z(pg, sum, p1);
+                sum = svadd_f32_z(pg, sum, p2);
+                sum = svadd_f32_z(pg, sum, p3);
+                sum = svadd_f32_z(pg, svdup_f32(0.0f), sum);
+                svst1_f32(pg, out + c * rows + row, sum);
+            }
+        }
+    });
+}
+at::Tensor eager_reduce4(at::Tensor windows, at::Tensor weight) {
+    auto out = at::empty({1, windows.size(1), windows.size(2)}, windows.options().dtype(at::kFloat));
+    std::vector<at::Tensor> t{windows, weight, out};
+    reduce4(t);
+    return out;
+}
+} // namespace
+extern "C" void qwen_graph_conv_window_reduce_dispatch(std::vector<at::Tensor> &t,
+    const std::vector<ScalarArg> &scalars) {
+    TORCH_CHECK(scalars.empty(), "Conv reduce has no scalar ABI");
+    reduce4(t);
+}
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+    m.def("qwen_registered_conv_window_reduce(Tensor windows, Tensor weight) -> Tensor", &eager_reduce4);
+}

@@ -1,5 +1,20 @@
 # Kunpeng Qwen 适配的合入边界
 
+> **2026-11-03，PR #299 显式图整合版**：当前 Kunpeng Qwen 文本路径使用
+> `qwen/backend.py` 与公共显式 GraphOp，经 backend 的 `get_graph_inputs` /
+> `get_graph_fixed_tensors` 接入原 runner / finalize，不解析 Qwen Provider，
+> 不启用 AutomaticTorchCapture / boxed 桥接或 forward arena。
+> 下文涉及 Provider、boxed、arena 的段落及配方属于旧实现记录，不能作为本版启动要求。
+> 本版仅验证 Qwen3.6-27B-W8A8 文本服务；视觉、MTP 及其他模型回归未验收。
+> 本次合并及验证结果以 PR #299 描述为准，旧状态文档中的历史结果不代表本版。
+> 若启动继承 DDR 的 `--membind`，需启用上游现有的
+> `SGLANG_KUNPENG_HBW_BIND_BEFORE_MMAP=1`，使大页申请先绑定 HBM 并恢复调用者策略。
+> Qwen 在 HBW 与 POSIX SHM 启用时，默认复用现有 `SGLANG_KUNPENG_SHARED_HBW_BACKING=split`
+> 初始化：SHM payload 在本地 HBM 首次触页，其容量从总 HBW 预算扣除。
+> 现有 split 模式要求每 rank 总预算 4000MiB；SHM 为 384MiB 时私有池为 3616MiB。
+> 其他自定义总预算不自动切换 split，保持原放置方式。
+> 不新增启动参数，显式的共享模式/容量配置仍优先；其他模型和非 POSIX 路径不变。
+
 本说明对应本目录待审代码；实际验证状态见 `kunpeng_qwen_pr_status.md`。构建与部署边界见第9节；选频、启动、压测和工具调用工具包独立维护，不进入本PR。
 
 ## 1. 一次前向如何进入原生算子

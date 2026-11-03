@@ -1,105 +1,43 @@
-"""Explicit Qwen CPU model and attention hooks using common registered operators."""
-
+"""Explicit Kunpeng Qwen primitives. No automatic capture, provider, or arena."""
 import ctypes
 import os
-import threading
 from functools import lru_cache
-
 import torch
 from sgl_kernel import common_ops
-
-from sglang.srt.graph import is_capturing, ops
-from sglang.srt.graph.torch_capture import install_boxed_bridge, register_native_shape
-from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm, rms_norm_ref
-from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
-    LinearAttnKernelBase,
-)
+from sglang.srt.graph import ops, is_capturing
 from sglang.srt.layers.layernorm import GemmaRMSNorm
-
+from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
 from . import ops as primitives
-from .prefill import conv_prefill, gating
+from .capabilities import get_capabilities
 
+def contiguous(x):
+    return x if x.is_contiguous() else ops.contiguous_kunpeng(x)
+
+def cast(x, dtype):
+    if x.dtype == dtype:
+        return x
+    out = ops.alloc_buffer(x.numel(), dtype=dtype).view(x.shape)
+    ops.copy_kunpeng(out, x)
+    return out
+
+def select(x, indices):
+    return ops.tensor_select(x, indices)
+
+def scatter(x, indices, source):
+    ops.tensor_scatter(x, cast(indices, torch.int64), cast(source, x.dtype))
 
 @lru_cache()
 def initialize():
-    library = primitives.register_primitives()
+    lib = primitives.register_primitives()
     primitives.register_rows()
-    install_boxed_bridge(common_ops.__file__)
-    register_native_shape(
-        torch.ops.sgl_kernel.bf16_linear_kunpeng.default,
-        lambda x, w, bias=None: torch.empty(
-            (*x.shape[:-1], w.shape[0]), dtype=x.dtype, device="meta"
-        ),
-    )
+    from ..activation_ops import register_sigmoid_mul_bf16
+    register_sigmoid_mul_bf16()
+    from .layout import register_projection_split
+    register_projection_split(common_ops.__file__)
+    return lib
 
-    def split_shape(qkvz, ba, hk, hv, dk, dv):
-        n = qkvz.shape[0]
-        return tuple(
-            torch.empty(shape, dtype=qkvz.dtype, device="meta")
-            for shape in ((n, 2 * hk * dk + hv * dv), (n, hv, dv), (n, hv), (n, hv))
-        )
-
-    register_native_shape(
-        torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu.default,
-        split_shape,
-    )
-    library.qwen36_gdn_prefill_with_workspace.restype = ctypes.c_int
-    library.qwen36_gdn_prefill_with_workspace.argtypes = (
-        [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 6 + [ctypes.c_void_p, ctypes.c_int64]
-    )
-    library.qwen36_gdn_prefill_parallel_with_workspace.restype = ctypes.c_int
-    library.qwen36_gdn_prefill_parallel_with_workspace.argtypes = (
-        [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 7 + [ctypes.c_void_p, ctypes.c_int64]
-    )
-    return library
-
-
-def configure_modules(model):
-    initialize()
-    shapes = {
-        (2176, 5120),
-        (5120, 1088),
-        (1024, 5120),
-        (5120, 384),
-        (1536, 5120),
-        (5120, 512),
-    }
-    from sglang.srt.layers.quantization.modelslim.schemes.cpu920f_w8a8_dynamic import (
-        CPU920FModelSlimW8A8Dynamic,
-    )
-
-    for module in model.modules():
-        # Declare capability from the actual downstream projection. GDN's
-        # BF16 BA projection shares its input norm and keeps BF16 output.
-        mlp = getattr(module, "mlp", None)
-        gate_up = getattr(mlp, "gate_up_proj", None)
-        post_norm = getattr(module, "post_attention_layernorm", None)
-        if post_norm is not None and isinstance(
-            getattr(gate_up, "scheme", None), CPU920FModelSlimW8A8Dynamic
-        ):
-            post_norm._kunpeng_int8_consumer = True
-        qkv = getattr(module, "qkv_proj", None)
-        input_norm = getattr(module, "input_layernorm", None)
-        if input_norm is not None and isinstance(
-            getattr(qkv, "scheme", None), CPU920FModelSlimW8A8Dynamic
-        ):
-            input_norm._kunpeng_int8_consumer = True
-        weight = getattr(module, "weight", None)
-        if weight is not None and tuple(weight.shape) in shapes:
-            module._kunpeng_qwen_dense = True
-
-
-def prepare_model_lm_head(model, pool):
-    # The architecture backend supplies a semantic role, not a shape whitelist.
-    # Shared MTP references retain this same module and its logical weight.
-    head = getattr(model, "lm_head", None)
-    if head is None or not hasattr(head, "weight"):
-        return False
-    head._kunpeng_lm_head_role = True
-    from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import prepare_weight
-
-    return prepare_weight(head, pool)
-
+from .prefill import conv_prefill, gating
 
 class QwenGemmaRMSNorm(GemmaRMSNorm):
     _kunpeng_qwen = True
@@ -118,7 +56,7 @@ class QwenGemmaRMSNorm(GemmaRMSNorm):
                     flat_x, self.gemma_weight, self.variance_epsilon
                 )
             if post_residual_addition is not None:
-                residual = residual + post_residual_addition
+                residual = ops.tensor_binary(residual, post_residual_addition, 0)
             q, scale = ops.fused_add_rmsnorm_quant_kunpeng(
                 flat_x,
                 residual.reshape(-1, residual.shape[-1]),
@@ -131,7 +69,7 @@ class QwenGemmaRMSNorm(GemmaRMSNorm):
             return (q, scale), residual
         if residual is not None:
             if post_residual_addition is not None:
-                residual = residual + post_residual_addition
+                residual = ops.tensor_binary(residual, post_residual_addition, 0)
             out = ops.fused_add_rmsnorm_kunpeng(
                 x.reshape(-1, x.shape[-1]),
                 residual.reshape(-1, residual.shape[-1]),
@@ -144,64 +82,9 @@ class QwenGemmaRMSNorm(GemmaRMSNorm):
         ).reshape_as(x)
 
 
-def _prefill_gated_rms_norm_capture_ref(x, weight, z, eps):
-    """Selected rms_norm_ref contract, with explicit scalar overload schemas.
-
-    Keep sqrt -> reciprocal -> multiply1, not rsqrt or fused native math.
-    This caller fixes biasNone, groupNone, norm_before_gate=True, upcast=True.
-    """
-    dtype = x.dtype
-    weight = weight.float()
-    x = x.float()
-    z = z.float()
-    variance = x.square().mean(dim=-1, keepdim=True)
-    variance = torch.ops.aten.add.Scalar(variance, eps)
-    denominator = torch.sqrt(variance)
-    rstd = torch.ops.aten.mul.Scalar(torch.reciprocal(denominator), 1)
-    out = x * rstd * weight
-    out *= torch.nn.functional.silu(z)
-    return out.to(dtype)
-
-
-class QwenGatedRMSNorm(RMSNorm):
-    def forward(self, x, z=None):
-        if (
-            z is not None
-            and x.ndim == 2
-            and x.shape == z.shape
-            and 1 <= x.shape[0] <= 96
-        ):
-            return ops.qwen_gated_norm(
-                x.contiguous(), self.weight, z.contiguous(), self.eps
-            )
-        if (
-            is_capturing()
-            and os.environ.get("SGLANG_KUNPENG_ENABLE_PREFILL_GRAPH", "0") == "1"
-            and z is not None
-            and x.ndim == 2
-            and x.shape == z.shape
-            and 1 <= x.shape[0] <= 3 * 4096
-            and x.shape[0] % 3 == 0
-            and x.shape[1] == self.weight.numel() == 128
-            and x.device.type == z.device.type == self.weight.device.type == "cpu"
-            and x.dtype == z.dtype == torch.bfloat16
-        ):
-            # Local HV3 unfolds each legal C1 prefill M into 3*M rows of128.
-            # Eager and the established <=96-row native path stay unchanged.
-            return _prefill_gated_rms_norm_capture_ref(x, self.weight, z, self.eps)
-        return rms_norm_ref(
-            x=x,
-            weight=self.weight,
-            bias=None,
-            z=z,
-            eps=self.eps,
-            group_size=None,
-            norm_before_gate=True,
-        )
-
-
 class QwenGDNKernel(LinearAttnKernelBase):
     _kunpeng_validate_extend_metadata = True
+    _kunpeng_accepts_postconv_base = True
 
     def decode(
         self,
@@ -218,18 +101,44 @@ class QwenGDNKernel(LinearAttnKernelBase):
         query_start_loc,
         **kwargs,
     ):
-        q0, k0, v0 = q[0].contiguous(), k[0].contiguous(), v[0].contiguous()
+        get_capabilities().require_decode(q.shape[1], q.shape[1])
+        post_conv_base = kwargs.get("post_conv_base")
+        if is_capturing() and primitives.p20_enabled_for_base(post_conv_base):
+            if (8 <= post_conv_base.shape[0] <= 32
+                    and q.ndim == k.ndim == v.ndim == 4
+                    and q.shape[0] == k.shape[0] == v.shape[0] == 1
+                    and q.shape[2:] == k.shape[2:] == (1, 128)
+                    and v.shape[2:] == (3, 128)
+                    and q.shape[1] == k.shape[1] == v.shape[1] == post_conv_base.shape[0]
+                    and primitives.p2_gdn_head_selected(
+                        post_conv_base.shape[0], q.shape[2], v.shape[2], q.shape[3], v.shape[3])):
+                q_view, k_view, v_view = q[0], k[0], v[0]
+                if primitives.p20_selected(post_conv_base, q_view, k_view, v_view):
+                    workspace = ops.alloc_buffer(
+                        q_view.shape[0] * (2 * q_view.shape[1] + 3 * v_view.shape[2]),
+                        dtype=torch.float32,
+                    )
+                    return ops.qwen_p20_gdn_postconv(
+                        A_log, dt_bias, post_conv_base, contiguous(a), contiguous(b),
+                        ssm_states, cache_indices, workspace, q_view.shape[1],
+                    ).unsqueeze(1)
+        q0, k0, v0 = contiguous(q[0]), contiguous(k[0]), contiguous(v[0])
         workspace = ops.alloc_buffer(
             q0.shape[0] * (2 * q0.shape[1] + 3 * v0.shape[2]), dtype=torch.float32
         )
-        return ops.qwen_gdn_decode(
+        operation = ops.qwen_gdn_decode
+        if q0.shape[0] >= 8 and primitives.p2_gdn_head_selected(
+            q0.shape[0], q0.shape[1], v0.shape[1], q0.shape[2], v0.shape[2]
+        ):
+            operation = ops.qwen_p2_gdn_head
+        return operation(
             A_log,
             dt_bias,
             q0,
             k0,
             v0,
-            a.contiguous(),
-            b.contiguous(),
+            contiguous(a),
+            contiguous(b),
             ssm_states,
             cache_indices,
             workspace,
@@ -238,9 +147,9 @@ class QwenGDNKernel(LinearAttnKernelBase):
     def extend(
         self, q, k, v, g, beta, *, ssm_states, cache_indices, query_start_loc, **kwargs
     ):
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        g, beta = g.float().contiguous(), beta.float().contiguous()
-        state = ssm_states[cache_indices].contiguous()
+        q, k, v = contiguous(q), contiguous(k), contiguous(v)
+        g, beta = contiguous(cast(g, torch.float32)), contiguous(cast(beta, torch.float32))
+        state = select(ssm_states, cache_indices)
         from . import prefill_graph
 
         if prefill_graph.enabled() and prefill_graph.gdn_supported(q, k, v):
@@ -254,6 +163,11 @@ class QwenGDNKernel(LinearAttnKernelBase):
                 q, k, v, g, beta, state, query_start_loc, workspace, grain
             )
             return output, state, None
+        if is_capturing():
+            raise RuntimeError(
+                "Qwen GDN prefill geometry has no registered graph primitive; "
+                "ctypes execution during capture is forbidden"
+            )
         output = torch.empty_like(v)
         library = initialize()
         parallel = q.shape[1] > 32
@@ -344,7 +258,10 @@ def conv_decode(x, state, weight, bias, activation, conv_state_indices, **kwargs
             kwargs["intermediate_conv_window"],
             kwargs["intermediate_state_indices"],
         )
-    return ops.qwen_causal_conv(x.contiguous(), state, weight, conv_state_indices)
+    get_capabilities().require_decode(x.shape[0], x.shape[0])
+    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1" and 8 <= x.shape[0] <= 32:
+        return ops.qwen_p2_decode_conv_requests(contiguous(x), state, weight, conv_state_indices)
+    return ops.qwen_causal_conv(contiguous(x), state, weight, conv_state_indices)
 
 
 class QwenAttention:
@@ -356,10 +273,10 @@ class QwenAttention:
         vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if save_kv_cache:
             ops.set_kv_buffer_kunpeng(
-                kb.view(-1, 256), fb.out_cache_loc, k.reshape(-1, 256).contiguous()
+                kb.view(-1, 256), fb.out_cache_loc, contiguous(k.reshape(-1, 256))
             )
             ops.set_kv_buffer_kunpeng(
-                vb.view(-1, 256), fb.out_cache_loc, v.reshape(-1, 256).contiguous()
+                vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256))
             )
         steps = fb.spec_info.draft_token_num
         lengths = (
@@ -369,7 +286,7 @@ class QwenAttention:
             ]
         ).reshape(-1)
         requests = fb.req_pool_indices.repeat_interleave(steps)
-        query = q.reshape(-1, layer.tp_q_head_num, 256).contiguous()
+        query = contiguous(q.reshape(-1, layer.tp_q_head_num, 256))
         op = (
             ops.qwen_gqa_rows
             if is_capturing() and query.shape[0] >= 8
@@ -387,16 +304,18 @@ class QwenAttention:
         return output.reshape(-1, layer.tp_q_head_num * 256)
 
     def forward_decode(self, q, k, v, layer, fb, save_kv_cache=True):
+        # Reject unsupported geometry before the first persistent KV write.
+        get_capabilities().require_decode(fb.batch_size, fb.input_ids.numel())
         kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
         vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if save_kv_cache:
             ops.set_kv_buffer_kunpeng(
-                kb.view(-1, 256), fb.out_cache_loc, k.reshape(-1, 256).contiguous()
+                kb.view(-1, 256), fb.out_cache_loc, contiguous(k.reshape(-1, 256))
             )
             ops.set_kv_buffer_kunpeng(
-                vb.view(-1, 256), fb.out_cache_loc, v.reshape(-1, 256).contiguous()
+                vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256))
             )
-        query = q.reshape(-1, layer.tp_q_head_num, 256).contiguous()
+        query = contiguous(q.reshape(-1, layer.tp_q_head_num, 256))
         op = (
             ops.qwen_gqa_rows
             if is_capturing() and query.shape[0] >= 8
@@ -485,88 +404,66 @@ def qknorm_rope(module, positions, q, k):
     )
 
 
-# The native collective request and its eager SHM caches are process-global.
-# A busy call must not fall back into a cache borrowed by another call.
-_allreduce_cache_lock = threading.Lock()
+def configure_modules(model):
+    initialize()
+    torch.set_num_threads(int(os.environ.get("SGLANG_KUNPENG_TORCH_NUM_THREADS", "32")))
+    from .linear import apply_dense, declare_projection, prepare_dense
+    from sglang.srt.layers.quantization.modelslim.schemes.cpu920f_w8a8_dynamic import CPU920FModelSlimW8A8Dynamic
+    for module in model.modules():
+        mlp = getattr(module, 'mlp', None)
+        gate = getattr(mlp, 'gate_up_proj', None)
+        post = getattr(module, 'post_attention_layernorm', None)
+        if post is not None:
+            post._kunpeng_int8_consumer = isinstance(getattr(gate, 'scheme', None), CPU920FModelSlimW8A8Dynamic)
+        qkv = getattr(module, 'qkv_proj', None)
+        norm = getattr(module, 'input_layernorm', None)
+        if norm is not None:
+            norm._kunpeng_int8_consumer = isinstance(getattr(qkv, 'scheme', None), CPU920FModelSlimW8A8Dynamic)
+        if getattr(module, '_cpu_projection_role', None):
+            if module.weight.dtype == torch.bfloat16:
+                module._cpu_linear_prepare = prepare_dense
+                module._cpu_linear_apply = apply_dense
+            module._cpu_allreduce = allreduce
+        if isinstance(module, QwenGemmaRMSNorm):
+            module._cpu_allreduce = allreduce
 
+class QwenGatedRMSNorm(RMSNorm):
+    def forward(self, x, z=None):
+        if z is None:
+            raise ValueError('GDN gated Norm requires its gate')
+        if x.shape[0] <= 96:
+            from .norm_rowgroups_full_occupancy import decode_norm
+            return decode_norm(contiguous(x), self.weight, contiguous(z), self.eps)
+        if os.environ.get("SGLANG_KUNPENG_P2_NORM_REDUCE_KEEP_SILU", "0") == "1":
+            from . import prefill_graph
+            prefill_graph.register()
+            activated = ops.tensor_unary(cast(z, torch.float32), 5)
+            width = int(os.environ["SGLANG_KUNPENG_P2_REFERENCE_VECTOR_WIDTH"])
+            return ops.qwen_p2_norm_reduce_keep_silu(x, self.weight, activated, float(self.eps), width)
+        original = x.dtype
+        x, z, weight = cast(x, torch.float32), cast(z, torch.float32), cast(self.weight, torch.float32)
+        variance = ops.tensor_mean_last(ops.tensor_unary(x, 0))
+        denominator = ops.tensor_unary(ops.tensor_scalar(variance, float(self.eps), 0), 1)
+        rstd = ops.tensor_unary(denominator, 2)
+        value = ops.tensor_binary(ops.tensor_binary(x, rstd, 1), weight, 1)
+        value = ops.tensor_binary(value, ops.tensor_unary(z, 5), 1)
+        return cast(value, original)
+
+def apply_gqa_output_gate(output, gate, forward_batch):
+    return ops.sigmoid_mul_bf16_kunpeng(output, gate)
 
 def allreduce(tensor):
-    if not _allreduce_cache_lock.acquire(blocking=False):
-        raise RuntimeError(
-            "Qwen allreduce is already using the native collective/cache"
-        )
-    try:
-        # Preserve B1's 256 feature partitions and its owner-die/rounding order.
-        rows = tensor.shape[0]
-        if tensor.ndim == 2 and tensor.shape[1] == 5120 and 1 < rows <= 4096:
-            packed = None
-            blocked = False
-            eligible_blocked = (
-                rows > 128
-                and tensor.device.type == "cpu"
-                and tensor.dtype == torch.bfloat16
-                and tensor.is_contiguous()
-            )
-            if eligible_blocked and is_capturing():
-                packed = ops.qwen_ar_pack_block(tensor, 256)
-                blocked = True
-            if (
-                packed is None
-                and not is_capturing()
-                and tensor.device.type == "cpu"
-                and tensor.dtype == torch.bfloat16
-                and tensor.is_contiguous()
-            ):
-                # This is the same small/large cache already reserved by the
-                # graph provider for eager collectives, not a new SHM buffer.
-                cache = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng(
-                    5120, rows
-                )
-                if (
-                    cache.device.type == "cpu"
-                    and cache.dtype == torch.bfloat16
-                    and cache.ndim == 2
-                    and cache.shape[1] == 5120
-                    and cache.shape[0] >= rows
-                    and cache.is_contiguous()
-                    and torch.ops.sgl_kernel.is_shm_tensor(cache)
-                ):
-                    src_lo, cache_lo = tensor.data_ptr(), cache.data_ptr()
-                    if (
-                        src_lo + tensor.nbytes <= cache_lo
-                        or cache_lo + cache.nbytes <= src_lo
-                    ):
-                        # Each partition has M*20 live elements. Slicing a
-                        # [256, capacity, 20] view would give the wrong stride.
-                        packed = cache.view(-1)[: rows * 5120].view(rows, 5120)
-                        if eligible_blocked:
-                            torch.ops.sgl_kernel.qwen_registered_ar_pack_block_into(
-                                packed, tensor, 256
-                            )
-                            blocked = True
-                        else:
-                            packed.view(256, rows, 20).copy_(
-                                tensor.view(rows, 256, 20).transpose(0, 1)
-                            )
-            if packed is None:
-                # Unknown layouts retain the original allocation and alias
-                # semantics; never attach the eager shared scratch to a graph.
-                packed = (
-                    tensor.reshape(rows, 256, 20)
-                    .transpose(0, 1)
-                    .contiguous()
-                    .view(rows, 5120)
-                )
-            result = ops.shm_allreduce_kunpeng(packed)
-            # Keep the original destination storage and its aliases. The
-            # synchronous collective and this copy finish before cache release.
-            if blocked:
-                ops.qwen_ar_unpack_block(tensor, packed, 256)
-            else:
-                tensor.view(rows, 256, 20).copy_(
-                    packed.view(256, rows, 20).transpose(0, 1)
-                )
-            return result
-        return ops.shm_allreduce_kunpeng(tensor)
-    finally:
-        _allreduce_cache_lock.release()
+    rows = tensor.shape[0]
+    if tensor.ndim == 2 and tensor.shape[1] == 5120 and rows > 1:
+        packed = contiguous(tensor.view(rows, 256, 20).transpose(0, 1)).view(rows, 5120)
+        ops.shm_allreduce_kunpeng(packed)
+        ops.copy_kunpeng(tensor.view(rows, 256, 20), packed.view(256, rows, 20).transpose(0, 1))
+    else:
+        ops.shm_allreduce_kunpeng(tensor)
+    return tensor
+
+
+def zeros_like(x):
+    out = ops.alloc_buffer(x.numel(), dtype=x.dtype).view(x.shape)
+    ops.zero_(out)
+    return out

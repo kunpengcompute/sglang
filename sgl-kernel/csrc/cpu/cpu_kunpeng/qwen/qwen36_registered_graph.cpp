@@ -6,6 +6,7 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include "qwen36_graph_limits.h"
 
 using ScalarArg = std::variant<bool, int64_t, double, std::string>;
 extern "C" int qwen36_gdn_decode_with_workspace(const float *, const uint16_t *, const uint16_t *,
@@ -104,7 +105,7 @@ extern "C" void qwen_graph_gdn_dispatch(std::vector<at::Tensor> &t,
                 "GDN graph tensor ranks/shapes mismatch");
     auto b = t[2].size(0), hq = t[2].size(1), dk = t[2].size(2);
     auto hv = t[4].size(1), dv = t[4].size(2), slots = t[7].size(0);
-    TORCH_CHECK(b > 0 && b <= 32 && hq > 0 && hv % hq == 0 && dk == 128 && dv == 128 &&
+    TORCH_CHECK(b > 0 && b <= qwen_graph_limits::decode_tokens && hq > 0 && hv % hq == 0 && dk == 128 && dv == 128 &&
                     t[4].size(0) == b && t[0].numel() == hv && t[1].numel() == hv &&
                     t[5].numel() == b * hv && t[6].numel() == b * hv && t[7].size(1) == hv &&
                     t[7].size(2) == dk && t[7].size(3) == dv && t[8].numel() == b &&
@@ -137,7 +138,8 @@ extern "C" void qwen_graph_norm_dispatch(std::vector<at::Tensor> &t,
     TORCH_CHECK(t.size() == 4 && s.size() == 1, "Norm graph dispatch ABI mismatch");
     for (const auto &x : t)
         check(x, at::kBFloat16);
-    TORCH_CHECK(t[0].dim() == 2 && t[0].size(1) == 128 && t[0].size(0) <= 96 && t[1].dim() == 1 &&
+    TORCH_CHECK(t[0].dim() == 2 && t[0].size(1) == 128 && t[0].size(0) > 0 &&
+                    t[0].size(0) <= qwen_graph_limits::gated_norm_rows && t[1].dim() == 1 &&
                     t[1].numel() == 128 && t[2].sizes() == t[0].sizes() &&
                     t[3].sizes() == t[0].sizes(),
                 "Norm graph shape contract");
@@ -160,7 +162,7 @@ extern "C" void qwen_graph_conv_dispatch(std::vector<at::Tensor> &t,
     check(t[3], at::kInt);
     TORCH_CHECK(t[0].dim() == 2 && t[1].dim() == 3 && t[2].dim() == 2, "Conv graph ranks");
     auto b = t[0].size(0), dim = t[0].size(1), slots = t[1].size(0);
-    TORCH_CHECK(b > 0 && b <= 32 && t[1].size(1) == dim && t[1].size(2) == 3 &&
+    TORCH_CHECK(b > 0 && b <= qwen_graph_limits::decode_tokens && t[1].size(1) == dim && t[1].size(2) == 3 &&
                     t[2].size(0) == dim && t[2].size(1) == 4 && t[3].numel() == b &&
                     t[4].sizes() == t[0].sizes(),
                 "Conv graph shapes");
@@ -199,7 +201,7 @@ extern "C" void qwen_graph_gqa_dispatch(std::vector<at::Tensor> &t,
                     t[3].dim() == 2,
                 "GQA graph ranks");
     auto batch = t[0].size(0), heads = t[0].size(1), capacity = t[3].size(1), slots = t[1].size(0);
-    TORCH_CHECK(batch > 0 && batch <= 32 && (heads == 2 || heads == 6) && t[0].size(2) == 256 &&
+    TORCH_CHECK(batch > 0 && batch <= qwen_graph_limits::decode_tokens && (heads == 2 || heads == 6) && t[0].size(2) == 256 &&
                     t[1].size(1) == 1 && t[1].size(2) == 256 && t[4].numel() == batch &&
                     t[5].numel() == batch && t[6].sizes() == t[0].sizes() && t[7].dim() == 1 &&
                     t[7].numel() >= heads * (capacity + 256),
