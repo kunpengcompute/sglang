@@ -274,7 +274,9 @@ class DeepseekModelNextN(nn.Module):
                     32,
                 )
                 hidden_states = get_attention_tp_group().batch_all_gather(
-                    hidden_states, dim=-1
+                    hidden_states,
+                    dim=-1,
+                    profile_name="shm_batched_allgather_kunpeng@nextn.eh_proj",
                 )
             elif isinstance(self.eh_proj, ReplicatedLinear):
                 hidden_states, _ = self.eh_proj(eh_input)

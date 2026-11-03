@@ -267,8 +267,11 @@ class DeepseekMLAKunpengForwardMixin:
             bgemm_ws = kunpeng.alloc_buffer(
                 q_nope_input.numel(), dtype=torch.bfloat16,
                 alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get())
+            bg_b, bg_m, bg_k = q_nope_input.shape
             q_nope_out = kunpeng.batched_bgemm_kunpeng(
-                q_nope_input, self.w_kc_bf16_packed, bgemm_ws)
+                q_nope_input, self.w_kc_bf16_packed, bgemm_ws,profile_name=(
+                    f"batched_bgemm_kunpeng@B{bg_b}xM{bg_m}"
+                    f"xN{self.w_kc_bf16_packed.shape[1]}xK{bg_k}"))
             q_nope_out = q_nope_out.transpose(0, 1)
 
             q_combined = kunpeng.cat_kunpeng(q_nope_out, q_pe, -1)  # (B, num_local_heads, D_qk)
