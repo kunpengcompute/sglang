@@ -92,23 +92,6 @@ class _ShardAheadJob:
         self.published = False
 
 
-def _fmt_cpus(cpus) -> str:
-    """Render a CPU set as "a-b,c" for log lines."""
-    spans = []
-    start = prev = None
-    for cpu in sorted(cpus):
-        if start is None:
-            start = prev = cpu
-        elif cpu == prev + 1:
-            prev = cpu
-        else:
-            spans.append(f"{start}" if start == prev else f"{start}-{prev}")
-            start = prev = cpu
-    if start is not None:
-        spans.append(f"{start}" if start == prev else f"{start}-{prev}")
-    return ",".join(spans)
-
-
 def _pin_storage_thread(name: str) -> None:
     """Pin the calling HiCache storage thread to a dedicated CPU.
 
@@ -127,14 +110,9 @@ def _pin_storage_thread(name: str) -> None:
         name, 0
     )
     try:
-        previous = os.sched_getaffinity(0)
         os.sched_setaffinity(0, {cpu})
-        logger.info(
-            "[hicache] %s thread pinned to CPU %d (process mask was %s)",
-            name,
-            cpu,
-            _fmt_cpus(previous),
-        )
+        if _hicache_debug():
+            logger.info("[hicache] %s -> CPU %d", name, cpu)
     except (AttributeError, OSError) as e:
         logger.warning("[hicache] %s thread pinning failed: %s", name, e)
 
@@ -551,17 +529,15 @@ class HiCacheController:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
-        if is_cpu_920f():
+        if is_cpu_920f() and _hicache_debug():
             logger.info(
-                "[hicache] controller ready: io_backend=%s write_policy=%s "
-                "page_size=%d layers=%d device=%s L3=%s tiers=%s",
+                "[hicache] ready: io=%s policy=%s page=%d layers=%d tiers=%s L3=%s",
                 self.io_backend,
                 self.write_policy,
                 self.page_size,
                 self.layer_num,
-                self.mem_pool_device.device,
-                self.storage_backend_type if self.enable_storage else "disabled",
-                "L1+L3 (no L2 pool)" if self.l1l3_only else "L1+L2+L3",
+                "L1+L3" if self.l1l3_only else "L1+L2+L3",
+                self.storage_backend_type if self.enable_storage else "off",
             )
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
@@ -812,35 +788,33 @@ class HiCacheController:
                         if self.flat_write is not None
                         else 0
                     )
-                    logger.info(
-                        "[hicache] L3 storage ready (L1+L3 two-tier, no L2 pool): "
-                        "backend=%s page_size=%d page_bytes=%d batch_pages=%d "
-                        "flat_buffer=%.2f GB x2 registered=%s prefetch_threshold=%d "
-                        "prefetch_capacity_limit=%d backup_skip=%s",
-                        self.storage_backend_type,
-                        self.page_size,
-                        blob_bytes,
-                        self.storage_batch_size,
-                        blob_bytes * self.storage_batch_size / 1e9,
-                        self.storage_backend.supports_flat_io(),
-                        self.prefetch_threshold,
-                        self.prefetch_capacity_limit,
-                        self.backup_skip,
-                    )
+                    if _hicache_debug():
+                        logger.info(
+                            "[hicache] L3 ready: backend=%s page=%d/%dB batch=%d "
+                            "buf=%.1fGB prefetch=%d/%d skip=%s",
+                            self.storage_backend_type,
+                            self.page_size,
+                            blob_bytes,
+                            self.storage_batch_size,
+                            blob_bytes * self.storage_batch_size / 1e9,
+                            self.prefetch_threshold,
+                            self.prefetch_capacity_limit,
+                            self.backup_skip,
+                        )
                 else:
-                    logger.info(
-                        "[hicache] L3 storage ready: backend=%s dir=%s page_size=%d "
-                        "page_bytes=%d batch_pages=%d prefetch_threshold=%d "
-                        "prefetch_capacity_limit=%d backup_skip=%s",
-                        self.storage_backend_type,
-                        getattr(self.storage_backend, "file_path", "-"),
-                        self.page_size,
-                        self.mem_pool_host.get_size_per_token() * self.page_size,
-                        self.storage_batch_size,
-                        self.prefetch_threshold,
-                        self.prefetch_capacity_limit,
-                        self.backup_skip,
-                    )
+                    if _hicache_debug():
+                        logger.info(
+                            "[hicache] L3 ready: backend=%s dir=%s page=%d/%dB "
+                            "batch=%d prefetch=%d/%d skip=%s",
+                            self.storage_backend_type,
+                            getattr(self.storage_backend, "file_path", "-"),
+                            self.page_size,
+                            self.mem_pool_host.get_size_per_token() * self.page_size,
+                            self.storage_batch_size,
+                            self.prefetch_threshold,
+                            self.prefetch_capacity_limit,
+                            self.backup_skip,
+                        )
         except Exception:
             # Best-effort cleanup for partial init.
             try:
@@ -1680,52 +1654,62 @@ class HiCacheController:
             name="hicache_shard_ahead",
             daemon=True,
         ).start()
-        logger.info(
-            "[hicache] tp-shard enabled: rank=%d shm=%s slots=%d nranks=%d "
-            "shard_pages=%d page_bytes=%d idx_page_bytes=%d timeout=%.1fs",
-            self.tp_rank,
-            name,
-            self.tp_shard_slots,
-            self.tp_shard_nranks,
-            self.tp_shard_cap,
-            self.tp_shard_page_bytes,
-            self.tp_shard_idx_page_bytes,
-            self.tp_shard_timeout,
-        )
-        # Touch every region of every slot so the first request does not pay the
-        # cold cross-rank read path inside its gather.
+        if _hicache_debug():
+            logger.info(
+                "[hicache] tp-shard: %s rank=%d slots=%d/%d pages=%d "
+                "page=%dB idx=%dB timeout=%.0fs",
+                name,
+                self.tp_rank,
+                self.tp_shard_slots,
+                self.tp_shard_nranks,
+                self.tp_shard_cap,
+                self.tp_shard_page_bytes,
+                self.tp_shard_idx_page_bytes,
+                self.tp_shard_timeout,
+            )
+        # Warm up every slot: the segment itself is the barrier (each rank waits
+        # for all peers to publish the sentinel seq before touching regions,
+        # because rank start-up times differ by seconds), then touch every
+        # region once so the first request does not pay the cold cross-rank read
+        # inside its gather.
         t0 = time.perf_counter()
         try:
             for slot in range(self.tp_shard_slots):
                 seq = (1 << 64) - 1 - slot
                 self._shard_publish(slot, my, seq, 0)
-                deadline = time.monotonic() + 3.0
+                ready = []
+                deadline = time.monotonic() + self.tp_shard_timeout
                 for k in range(n):
                     r = (my + k) % n
                     while not self._shard_ready(slot, r, seq):
                         if time.monotonic() > deadline:
-                            logger.warning(
-                                "[hicache] tp-shard warmup: rank %d missing on %s",
-                                r,
-                                name,
-                            )
                             break
                         time.sleep(0.0005)
                     else:
-                        self.flat_read[: self.tp_shard_cap].copy_(
-                            self.tp_shard_views[slot][r][: self.tp_shard_cap]
+                        ready.append(r)
+                for r in ready:
+                    self.flat_read[: self.tp_shard_cap].copy_(
+                        self.tp_shard_views[slot][r][: self.tp_shard_cap]
+                    )
+                    if self.tp_shard_idx_views is not None:
+                        self.flat_read_idx[: self.tp_shard_cap].copy_(
+                            self.tp_shard_idx_views[slot][r][: self.tp_shard_cap]
                         )
-                        if self.tp_shard_idx_views is not None:
-                            self.flat_read_idx[: self.tp_shard_cap].copy_(
-                                self.tp_shard_idx_views[slot][r][: self.tp_shard_cap]
-                            )
                 self._shard_ack(slot, seq)
                 self.tp_shard_last_seq[slot] = seq
-            logger.info(
-                "[hicache] tp-shard warmup done: slots=%d elapsed=%.3fs",
-                self.tp_shard_slots,
-                time.perf_counter() - t0,
-            )
+                if _hicache_debug() and len(ready) < n:
+                    logger.warning(
+                        "[hicache] tp-shard warmup: %d/%d rank(s) missing on %s",
+                        n - len(ready),
+                        n,
+                        name,
+                    )
+            if _hicache_debug():
+                logger.info(
+                    "[hicache] tp-shard warmup done: slots=%d elapsed=%.3fs",
+                    self.tp_shard_slots,
+                    time.perf_counter() - t0,
+                )
         except Exception:
             logger.exception("[hicache] tp-shard warmup failed")
 
