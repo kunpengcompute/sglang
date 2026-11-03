@@ -666,6 +666,11 @@ class KunpengMoE(FusedMoE):
         # Shared-experts output produced during the dispatch send/recv gap
         # when a shared_experts_fn callback is supplied to forward().
         self._shared_output: Optional[torch.Tensor] = None
+        # k-partial workspace size (blocks_in_k = K / tile_k) of the gateup /
+        # down GEMMs; resolved on the first forward, when the local shard
+        # shapes are known.
+        self._gateup_blocks_in_k: Optional[int] = None
+        self._down_blocks_in_k: Optional[int] = None
 
         self.swap_mgr = KunpengSwapManager.get_instance()
 
@@ -779,15 +784,14 @@ class KunpengMoE(FusedMoE):
             )
         moe_gateup = moe_down_flat[:gateup_numel].view(recv_dense_size, inter_dim * 2)
 
-        # Workspace buffers (sizes follow C++ reference heuristic).
-        if self.is_prefill:
-            # Matches DeepSeek-V3-Sample PREFILL_FUSEDMOE_TILEBUF (=2048,
-            # inner-loop tile size).  TODO(kunpeng): if flash_comm is enabled
-            # later, bump to max(2048, max_tokens_per_mb) as sample moe.cpp
-            # L175-176 does for the flash_comm + shared-expert full-token path.
-            fusedmoe_fixed_size = 2048
-        else:
-            fusedmoe_fixed_size = 256
+        # Fused MoE GEMM inner tile (rows); must match the kernel's
+        # get_fusedmoe_tilebuf_size() (sgl-kernel moe/kunpeng_moe.cpp).
+        fusedmoe_fixed_size = int(
+            os.environ.get("KUTACC_FUSEDMOE_TILEBUF") or 0
+        )
+        # prefill 2048 = DeepSeek-V3-Sample reference (TODO: max(2048, max_tokens_per_mb)
+        # once flash_comm lands)
+        fusedmoe_fixed_size = fusedmoe_fixed_size or (2048 if self.is_prefill else 256)
 
         # Workspace alignments mirror DeepSeek-V3-Sample moe.cpp
         # (utils::ALIGNMENT_2M / ALIGNMENT_512K / ALIGNMENT_1K); buffers the
@@ -797,8 +801,22 @@ class KunpengMoE(FusedMoE):
         tmpx_gateup = kunpeng.alloc_buffer(
             fusedmoe_fixed_size * hidden, dtype=torch.int8, alignment=align_2m
         )
+        # The kernel's per-expert k-partial stride is N * blocks_in_k / 2
+        # floats (blocks_in_k = K / tile_k), so size the workspace with the
+        # same tiling lookup instead of assuming blocks_in_k == 4 (ETP
+        # gateup uses tile_k = 896 -> blocks_in_k = 8).
+        if self._gateup_blocks_in_k is None:
+            gateup_tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(
+                fusedmoe_fixed_size, inter_dim * 2, hidden
+            )[2]
+            down_tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(
+                fusedmoe_fixed_size, hidden, inter_dim
+            )[2]
+            self._gateup_blocks_in_k = hidden // gateup_tile_k
+            self._down_blocks_in_k = inter_dim // down_tile_k
         tmpy_gateup = kunpeng.alloc_buffer(
-            fusedmoe_fixed_size * inter_dim * 4, dtype=torch.float32
+            fusedmoe_fixed_size * inter_dim * self._gateup_blocks_in_k,
+            dtype=torch.float32,
         )
         tmp_scales_gateup = kunpeng.alloc_buffer(fusedmoe_fixed_size * 4, dtype=torch.float32)
 
@@ -872,7 +890,9 @@ class KunpengMoE(FusedMoE):
             fusedmoe_fixed_size * inter_dim, dtype=torch.int8, alignment=align_512k
         )
         tmpy_down = kunpeng.alloc_buffer(
-            fusedmoe_fixed_size * hidden, dtype=torch.float32, alignment=align_512k
+            fusedmoe_fixed_size * hidden * self._down_blocks_in_k // 2,
+            dtype=torch.float32,
+            alignment=align_512k,
         )
         tmp_scales_down = kunpeng.alloc_buffer(
             fusedmoe_fixed_size * 4, dtype=torch.float32, alignment=align_1k

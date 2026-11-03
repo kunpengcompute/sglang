@@ -443,7 +443,7 @@ export ENABLE_KUNPENG_HICACHE=0  # default off
 **Multi-Thread Backend**
 
 - **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**: Specifies the kupl multi-threading backend and thread count. Standard PyTorch only supports omp. `KUPL_EXECUTOR_COUNT` defaults to 33 (set to 32 when `KUTACC_ASYNC_LAUNCH=0`).
-- **KUTACC\_FUSEDMOE\_MULTIEXPT**: kutacc fusedmoe multi-expert parallelism group count (decode side). Default 0 = serial per-expert path (bit-exact); when set to G, the worker pool is split into G groups, each owning a share of the local experts.
+- **KUTACC\_FUSEDMOE\_MULTI\_OPERAND\_GEMM**: kutacc fusedmoe gateup multi-operand GEMM (decode side). Default 1 merges the streaming/ZA entry of all local experts into one kernel call; 0 falls back to the per-expert loop.
 
 **Others**
 

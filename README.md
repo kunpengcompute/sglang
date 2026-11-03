@@ -442,7 +442,7 @@ export ENABLE_KUNPENG_HICACHE=0  # 默认关
 **多线程后端**
 
 - **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**：指定kupl多线程后端与线程数。常规PyTorch仅支持omp。`KUPL_EXECUTOR_COUNT`默认33（`KUTACC_ASYNC_LAUNCH=0`时需设为32）。
-- **KUTACC\_FUSEDMOE\_MULTIEXPT**：kutacc fusedmoe多专家并行分组数（decode侧）。默认0=串行逐专家（位精确）；设为G时worker池分为G组，每组负责一份本地专家。
+- **KUTACC\_FUSEDMOE\_MULTI\_OPERAND\_GEMM**：kutacc fusedmoe gateup 多操作数 GEMM（decode 侧）。默认 1 = 8 个本地专家的 streaming/ZA 入口合并为一次内核调用；0 = 逐专家调用（回退）。
 
 **其他**
 
