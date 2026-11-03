@@ -465,7 +465,7 @@ export ENABLE_KUNPENG_HICACHE=0  # 默认关
 
 ## 4. 正确性验证
 
-验证脚本`scripts/cpu_kunpeng/curl.sh`支持多种功能，以下为常用用法。
+验证脚本`scripts/cpu_kunpeng/curl.sh`支持多种功能，以下为常用用法；`scripts/cpu_kunpeng/client/tokenize.py`用于统计prompt的实际token数。
 
 ### 4.1 基本用法
 
@@ -476,7 +476,10 @@ sh curl.sh -n 10 -m 20           # 10个请求
 sh curl.sh -s -f prompts/1k.txt  # 长prompt
 sh curl.sh -J -f chat.jsonl      # chat模式：-f为JSONL请求体，直发/v1/chat/completions
 sh curl.sh -i                    # 多轮交互式对话
+python3 client/tokenize.py -f prompts/1k.txt  # 统计prompt的token数（发往/v1/tokenize）
 ```
+
+`client/tokenize.py`用法：`-f FILE[,FILE...]|DIR`指定prompt来源（每个文件整体作为一个prompt，支持多行；多个文件用逗号分隔；目录取其中`*.txt`/`*.md`按文件名排序逐个作为prompt）。目标地址可用`HOST`/`PORT`环境变量覆盖（默认`ROUTER_IP`或`127.0.0.1`的30000端口）。
 
 ### 4.2 路由测试
 

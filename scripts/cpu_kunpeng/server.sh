@@ -130,7 +130,7 @@ case "$ROLE" in
         SPECIFIC_ARGS=(
             --disaggregation-mode prefill
             --max-prefill-tokens $((SGLANG_KUNPENG_MAX_SEQ_NUM * SGLANG_KUNPENG_MAX_CUR_LEN))
-            --max-total-tokens 65536
+            --max-total-tokens "${PREFILL_MAX_TOTAL_TOKENS:-65536}"
             --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
             --max-running-requests $((8 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
             --load-balance-method round_robin
@@ -141,7 +141,7 @@ case "$ROLE" in
     decode)
         SPECIFIC_ARGS=(
             --disaggregation-mode decode
-            --max-total-tokens 180000
+            --max-total-tokens "${DECODE_MAX_TOTAL_TOKENS:-180000}"
             --load-balance-method round_robin
             --decode-log-interval 1
             --num-reserved-decode-tokens 1024
