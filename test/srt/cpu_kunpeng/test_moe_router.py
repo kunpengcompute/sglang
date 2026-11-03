@@ -242,7 +242,55 @@ def test_biased_grouped_topk_kunpeng():
         import traceback
         traceback.print_exc()
 
+
+def test_static_remap_topk_ids_to_rank_slot_etp():
+    topk_ids = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int16)
+    for num_physical, ep_size, moe_tp_size in [
+        (16, 4, 1),
+        (16, 4, 2),
+        (15, 5, 2),
+        (256, 32, 8),
+    ]:
+        dispatch_map = (
+            torch.tensor([0, 4, 8, 12, 14, 1], dtype=torch.int64) % num_physical
+        )
+        full_buf = torch.full((2, 6), -1, dtype=torch.int16)
+        torch.ops.sgl_kernel.remap_topk_ids_to_rank_slot_kunpeng(
+            topk_ids,
+            full_buf,
+            dispatch_map,
+            num_physical,
+            ep_size,
+            moe_tp_size,
+        )
+        num_local = num_physical // ep_size
+        expected_rank = (dispatch_map // num_local) * moe_tp_size
+        expected_local = dispatch_map % num_local
+        torch.testing.assert_close(
+            full_buf[:, 0::2], expected_rank.view(2, 3).to(torch.int16)
+        )
+        torch.testing.assert_close(
+            full_buf[:, 1::2], expected_local.view(2, 3).to(torch.int16)
+        )
+
+    invalid_ids = torch.tensor([[6]], dtype=torch.int16)
+    try:
+        torch.ops.sgl_kernel.remap_topk_ids_to_rank_slot_kunpeng(
+            invalid_ids,
+            torch.zeros((1, 2), dtype=torch.int16),
+            torch.arange(6, dtype=torch.int64),
+            12,
+            4,
+            2,
+        )
+        raise AssertionError("invalid logical expert id should be rejected")
+    except RuntimeError:
+        pass
+    print("[static_remap_topk_ids_to_rank_slot_etp] PASS")
+
+
 if __name__ == "__main__":
     test_linear_kunpeng()
     test_grouped_topk_kunpeng()
     test_biased_grouped_topk_kunpeng()
+    test_static_remap_topk_ids_to_rank_slot_etp()
