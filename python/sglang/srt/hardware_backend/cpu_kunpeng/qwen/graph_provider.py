@@ -33,7 +33,16 @@ class QwenHybridGraphProvider:
         self.static_weights = None
         self.use_static_weights = True
         self.context = None
-        self.decompose_dense = True
+        # Retired: this legacy mechanism decomposed the sgl_kernel::bf16_linear_kunpeng
+        # op (emitted by the retired _kunpeng_qwen_dense packing path, which also set
+        # _kunpeng_bf16_weight_packed) into pack+GEMM graph ops under a provider-planned
+        # tiling/workspace. The upstream rebuild replaced that execution path with the
+        # _cpu_projection_role hooks (configure_modules -> prepare_dense/apply_dense):
+        # apply_dense calls the registered packed-GEMM GraphOps directly, so the
+        # projections self-register during capture and neither the marker nor the
+        # intercepted op exists anymore. Keeping this True aborts bind with
+        # "No packed dense weights for decomposition".
+        self.decompose_dense = False
         self.decompose_clone = True
         self.dense_plans = {}
         self.dense_context = None
