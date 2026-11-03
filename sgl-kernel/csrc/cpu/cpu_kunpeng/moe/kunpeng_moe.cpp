@@ -1480,7 +1480,7 @@ void moe_etp_reduce_kunpeng(at::Tensor moe_down, at::Tensor etp_total, at::Tenso
     // which is ordered behind the leader's next bcast, i.e. behind this
     // reduce completing on all ranks.  SVE pattern mirrors kutacc's combine
     // reduction; pool-parallel over rows, summation order (p ascending) is
-    // bit-identical to the previous leader-only implementation.
+    // fixed, so the result is reproducible run to run.
     const int64_t chunk = (total + moe_tp_size - 1) / moe_tp_size;
     int64_t seg_begin = gid * chunk;
     int64_t seg_end = seg_begin + chunk;
@@ -1488,7 +1488,7 @@ void moe_etp_reduce_kunpeng(at::Tensor moe_down, at::Tensor etp_total, at::Tenso
     if (seg_end > total) seg_end = total;
 
     kutacc::parallel_for(seg_begin, seg_end, 1, [&](int64_t row_begin, int64_t row_end) {
-        const int64_t vec_bf16 = svcntb();
+        const int64_t vec_bf16 = svcnth();  // bf16 elements, not svcntb() bytes
         const svbool_t ptrue32 = svptrue_b16();
         const svbfloat16_t sve_zero = svdup_bf16(0.0f);
         for (int64_t i = row_begin; i < row_end; ++i) {
