@@ -10,6 +10,20 @@ def enabled():
     )
 
 
+def image_decode_graph_enabled():
+    # Allow image-carrying DECODE batches into the
+    # graph cache and the native fused attention path. M-RoPE decode
+    # positions are (mrope_position_delta + seq_len) repeated across all
+    # three components (ForwardBatch._expand_mrope_from_input), so fused
+    # kernels that read one position per token row stay correct for image
+    # requests while decoding. PREFILL must remain excluded: image prefill
+    # positions have genuinely distinct t/h/w rows. The graph gate
+    # (graph_provider.py) and the use_native_batch gate (qwen3_5.py) must
+    # always flip together because decode graphs share one cache key, hence
+    # a single env for both. Opt out with SGLANG_KUNPENG_GRAPH_IMAGE_DECODE=0.
+    return os.environ.get("SGLANG_KUNPENG_GRAPH_IMAGE_DECODE", "1") != "0"
+
+
 def validate_config(runner):
     if getattr(runner, "borrowed_qwen_target_runner", None) is not None:
         from .mtp_bridge import validate_borrowed_config

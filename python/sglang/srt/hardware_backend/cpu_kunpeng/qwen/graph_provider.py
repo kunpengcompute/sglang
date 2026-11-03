@@ -8,7 +8,7 @@ import contextlib
 import os
 import torch
 from sglang.srt.graph import ops
-from . import prefill_graph
+from . import image_decode_graph_enabled, prefill_graph
 from sglang.srt.graph.bindings import (
     GraphBindings,
     StaticTensorBindings,
@@ -58,7 +58,15 @@ class QwenHybridGraphProvider:
             return "tokens_outside_1_32"
         if not fb.forward_mode.is_target_verify() and tokens != fb.batch_size:
             return "decode_token_batch_mismatch"
-        if fb.contains_image_inputs():
+        if fb.contains_image_inputs() and not (
+            # Decode batches carry mm_inputs until
+            # the request finishes but never consume them; decode M-RoPE
+            # rows are equal (see qwen/__init__.image_decode_graph_enabled),
+            # so replay-safe with text decode graphs. Target-verify stays
+            # excluded, and image PREFILL still falls to eager.
+            fb.forward_mode.is_decode()
+            and image_decode_graph_enabled()
+        ):
             return "image_inputs"
         if fb.mamba_track_mask is not None:
             return "mamba_state_tracking"

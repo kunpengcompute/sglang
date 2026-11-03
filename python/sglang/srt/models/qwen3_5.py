@@ -107,7 +107,10 @@ _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_amx_available = cpu_has_amx_support()
-from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as qwen_kunpeng_enabled
+from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
+    enabled as qwen_kunpeng_enabled,
+    image_decode_graph_enabled,
+)
 
 _use_kunpeng_qwen = qwen_kunpeng_enabled()
 if _use_kunpeng_qwen:
@@ -959,7 +962,20 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and self.attn_tp_size == 16
             and qkv.shape[0] > 0
             and self.attn_output_gate
-            and not forward_batch.contains_image_inputs()
+            and (
+                # Image PREFILL keeps the manual
+                # split path (its M-RoPE rows genuinely differ per component,
+                # which the fused single-position kernels cannot read), but
+                # image DECODE positions repeat one scalar delta across all
+                # three rows, so the fused path is exact there. This also
+                # keeps captured image decode graphs structurally identical
+                # to text decode graphs (shared cache key).
+                not forward_batch.contains_image_inputs()
+                or (
+                    forward_batch.forward_mode.is_decode()
+                    and image_decode_graph_enabled()
+                )
+            )
         )
         if use_native_batch:
             q, k, v, gate = qkv_layout(qkv)
