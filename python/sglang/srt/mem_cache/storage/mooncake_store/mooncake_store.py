@@ -490,30 +490,41 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             raise ValueError("Launch mooncake store server timeout")
 
     def warmup(self):
-        warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
+        retry_delay = 2.0
+        deadline = time.time() + 180
 
-        # Retry logic to handle Transfer Engine startup race condition
-        max_retries = 10
-        retry_delay = 1.0  # seconds
-
-        for attempt in range(max_retries):
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
             ret = self.store.put(warmup_key, warmup_value)
             if ret == 0:
-                break
+                try:
+                    if self.store.is_exist(warmup_key) == 1 and (
+                        self.store.get(warmup_key) == warmup_value
+                    ):
+                        if attempt > 1:
+                            logger.info(
+                                f"[TP{self.local_rank}] Warmup succeeded after "
+                                f"{attempt} attempt(s)"
+                            )
+                        return
+                except Exception as e:
+                    logger.warning(
+                        f"[TP{self.local_rank}] Warmup get raised on attempt "
+                        f"{attempt}: {e}"
+                    )
             logger.warning(
-                f"[TP{self.local_rank}] Warmup put failed (attempt {attempt + 1}/{max_retries}), "
-                f"ret={ret}, retrying in {retry_delay}s..."
+                f"[TP{self.local_rank}] Warmup attempt {attempt} failed, "
+                f"put_ret={ret}, retrying in {retry_delay}s..."
             )
             time.sleep(retry_delay)
-        else:
-            raise RuntimeError(
-                f"[TP{self.local_rank}] Warmup put failed after {max_retries} attempts, "
-                "Transfer Engine might not be ready"
-            )
 
-        assert self.store.is_exist(warmup_key) == 1
-        assert self.store.get(warmup_key) == warmup_value
+        raise RuntimeError(
+            f"[TP{self.local_rank}] Warmup failed after {attempt} attempts: "
+            "data did not land in the store within the retry window"
+        )
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)

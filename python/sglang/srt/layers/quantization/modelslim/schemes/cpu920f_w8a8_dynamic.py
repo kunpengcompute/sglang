@@ -137,6 +137,14 @@ def validate_fused_silu_mul_domain(gateup):
         )
 
 
+def _fused_mlp_activation(gateup):
+    from sglang.srt.graph import ops
+
+    validate_fused_silu_mul_domain(gateup)
+    # Preserve UP-half mutation and the existing (INT8, F32 scale) result.
+    return ops.silu_mul_quant_kunpeng(gateup)
+
+
 class CPU920FModelSlimW8A8Dynamic(ModelSlimLinearScheme):
     """CPU920F W8A8_DYNAMIC scheme."""
 
@@ -145,6 +153,11 @@ class CPU920FModelSlimW8A8Dynamic(ModelSlimLinearScheme):
             raise ValueError("CPU920F scheme accepts only explicit W8A8_DYNAMIC")
         self.quant_config = quant_config
         self.prefix = prefix
+
+    def get_fused_mlp_activation(self, consumer_scheme):
+        if not isinstance(consumer_scheme, CPU920FModelSlimW8A8Dynamic):
+            raise ValueError("Fused CPU W8A8 MLP requires a W8A8 down consumer")
+        return _fused_mlp_activation
 
     def create_weights(
         self,

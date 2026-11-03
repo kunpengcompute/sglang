@@ -1058,12 +1058,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     if _is_cpu_920f:
                         if _enable_shm_fence:
                             kunpeng.shm_fence_kunpeng(context.attn_tp_size)
-                        if getattr(layernorm, "_kunpeng_qwen", False):
-                            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
-                                allreduce,
-                            )
-
-                            allreduce(hidden_states)
+                        collective = getattr(layernorm, '_cpu_allreduce', None)
+                        if collective is not None:
+                            collective(hidden_states)
                         else:
                             kunpeng.shm_allreduce_kunpeng(
                                 hidden_states,
@@ -1148,12 +1145,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     if _is_cpu_920f:
                         if _enable_shm_fence:
                             kunpeng.shm_fence_kunpeng(context.attn_tp_size)
-                        if getattr(layernorm, "_kunpeng_qwen", False):
-                            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
-                                allreduce,
-                            )
-
-                            allreduce(hidden_states)
+                        collective = getattr(layernorm, '_cpu_allreduce', None)
+                        if collective is not None:
+                            collective(hidden_states)
                         else:
                             kunpeng.shm_allreduce_kunpeng(
                                 hidden_states,

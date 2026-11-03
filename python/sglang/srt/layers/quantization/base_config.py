@@ -262,3 +262,9 @@ def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> 
     class_embedding = inspect.getattr_static(method_class, "embedding", None)
 
     return class_embedding is not None and class_embedding is not base_embedding
+
+
+def resolve_mlp_activation(producer, consumer):
+    scheme = getattr(producer, 'scheme', None)
+    resolve = getattr(scheme, 'get_fused_mlp_activation', None)
+    return resolve(getattr(consumer, 'scheme', None)) if resolve is not None else None

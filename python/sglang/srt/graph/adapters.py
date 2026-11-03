@@ -1482,20 +1482,45 @@ def _setup_batched_bgemm_kunpeng():
     # SME bf16 batched GEMM for the bf16 kv_b_proj MLA absorb path (e.g.
     # GLM-5): out = input @ weight^T per batch item. weight is the
     # batched_bgemm_prepack_kunpeng SME-packed output ([B, N, K]); input [B, M, K]
-    # (outer dims may be strided views).
-    def shape_infer(input, weight):
+    # (outer dims may be strided views). workspace is a caller-allocated,
+    # contiguous [B*M*K] bf16 buffer that receives the per-call act SME pack:
+    # passing it in keeps the temporary in HBW (eager) / in a graph-owned
+    # buffer (capture+replay) instead of allocating DDR inside the kernel.
+    def shape_infer(input, weight, workspace):
         B, M, K = input.shape
         N = weight.shape[1]
         return [((B, M, N), input.dtype)]
 
-    def eager_fn(input, weight):
+    def eager_fn(input, weight, workspace):
         B, M, K = input.shape
         N = weight.shape[1]
         out = torch.empty((B, M, N), dtype=input.dtype, device=input.device)
-        torch.ops.sgl_kernel.batched_bgemm_kunpeng(input, weight, out)
+        torch.ops.sgl_kernel.batched_bgemm_kunpeng(
+            input, weight, out, workspace)
         return out
 
     register_op('batched_bgemm_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_batched_bgemm_inplace_kunpeng():
+    # In-place variant of batched_bgemm_kunpeng: the caller provides the
+    # output tensor, typically a strided (B, M, N) view over a (M, B, N)
+    # buffer or a column slice of a wider row (e.g. the latent nope prefix
+    # of q_combined). The GEMM then writes the value's final resting layout
+    # directly (the C++ side already honors output.stride(0/1); only the
+    # last dim must be contiguous), so the post-GEMM transpose+contiguous
+    # /cat passes disappear. Same calling convention as
+    # batched_gemm_woqs8_allthreads_inplace_kunpeng. workspace is the
+    # caller-allocated act SME pack buffer (see above).
+    def shape_infer(input, weight, workspace, out):
+        return []
+
+    def eager_fn(input, weight, workspace, out):
+        torch.ops.sgl_kernel.batched_bgemm_kunpeng(
+            input, weight, out, workspace)
+        return None
+
+    register_op('batched_bgemm_inplace_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_shm_mla_o_alltoall_long_context_kunpeng():
@@ -1779,6 +1804,7 @@ def setup():
     _setup_fake_indexer_topk_mtp_kunpeng()
     _setup_paged_mqa_logits_topk_kunpeng()
     _setup_batched_bgemm_kunpeng()
+    _setup_batched_bgemm_inplace_kunpeng()
     _setup_shm_mla_o_alltoall_long_context_kunpeng()
     _setup_lc_mark_empty_lse_kunpeng()
     _setup_flash_mla_reduce_kunpeng()
@@ -1806,3 +1832,86 @@ def setup():
 
 
 setup()
+
+
+# General tensor operations with explicit graph-owned output storage.
+def _setup_tensor_operations():
+    def unary_shape(x, kind):
+        return [(tuple(x.shape), x.dtype)]
+    def binary_shape(x, y, kind):
+        return [(tuple(torch.broadcast_shapes(x.shape, y.shape)), x.dtype)]
+    def scalar_shape(x, value, kind):
+        return [(tuple(x.shape), torch.bool if kind == 2 else x.dtype)]
+    def mean_shape(x):
+        return [(tuple(x.shape[:-1]) + (1,), x.dtype)]
+    def select_shape(x, indices):
+        return [((indices.numel(),) + tuple(x.shape[1:]), x.dtype)]
+    def where_shape(condition, x, y):
+        return [(tuple(torch.broadcast_shapes(condition.shape, x.shape, y.shape)), x.dtype)]
+    # Eager functions use the same algebra; registered C++ dispatch uses out APIs.
+    unary = (torch.square, torch.sqrt, torch.reciprocal, torch.exp, torch.sigmoid,
+             torch.nn.functional.silu)
+    register_op('tensor_unary', unary_shape, lambda x, kind: unary[kind](x))
+    register_op('tensor_binary', binary_shape,
+                lambda x, y, kind: x + y if kind == 0 else x * y)
+    register_op('tensor_scalar', scalar_shape,
+                lambda x, value, kind: (x + value if kind == 0 else
+                                       x * value if kind == 1 else x > value))
+    register_op('tensor_mean_last', mean_shape, lambda x: x.mean(-1, keepdim=True))
+    register_op('tensor_softplus', lambda x, beta, threshold: [(tuple(x.shape), x.dtype)],
+                lambda x, beta, threshold: torch.nn.functional.softplus(x, beta, threshold))
+    register_op('tensor_select', select_shape, lambda x, indices: x.index_select(0, indices))
+    register_op('tensor_scatter', lambda *args: [],
+                lambda x, indices, source: x.index_copy_(0, indices, source))
+    register_op('tensor_where', where_shape, torch.where)
+
+_setup_tensor_operations()
+
+
+def _setup_bf16_small_output_gemm_kunpeng():
+    def shape_infer(input, weight):
+        assert input.dtype == weight.dtype == torch.bfloat16
+        assert input.device.type == weight.device.type == "cpu"
+        assert input.ndim == weight.ndim == 2
+        assert input.is_contiguous() and weight.is_contiguous()
+        assert 1 <= input.shape[0] <= 32 and input.shape[1] == 5120
+        assert tuple(weight.shape) == (6, 5120)
+        return [((input.shape[0], weight.shape[0]), input.dtype)]
+
+    def eager_fn(input, weight):
+        output = torch.empty((input.shape[0], weight.shape[0]), dtype=input.dtype)
+        torch.ops.sgl_kernel.bf16_small_output_gemm_kunpeng(input, weight, output)
+        return output
+
+    register_op("bf16_small_output_gemm_kunpeng", shape_infer, eager_fn)
+
+
+def _setup_bf16_small_output_gemm_workspace_kunpeng():
+    def shape_infer(input, weight, workspace):
+        assert input.dtype == weight.dtype == workspace.dtype == torch.bfloat16
+        assert input.device.type == weight.device.type == workspace.device.type == "cpu"
+        assert input.ndim == weight.ndim == 2 and workspace.ndim == 1
+        assert (
+            input.is_contiguous()
+            and weight.is_contiguous()
+            and workspace.is_contiguous()
+        )
+        assert 1 <= input.shape[0] <= 4096 and input.shape[1] == 5120
+        assert tuple(weight.shape) == (6, 5120)
+        assert workspace.numel() >= input.shape[0] * 32
+        return [((input.shape[0], 6), input.dtype)]
+
+    def eager_fn(input, weight, workspace):
+        output = torch.empty((input.shape[0], 6), dtype=input.dtype)
+        torch.ops.sgl_kernel.bf16_small_output_gemm_kunpeng.workspace(
+            input, weight, workspace, output
+        )
+        return output
+
+    register_op("bf16_small_output_gemm_workspace_kunpeng", shape_infer, eager_fn)
+
+_setup_bf16_small_output_gemm_kunpeng()
+_setup_bf16_small_output_gemm_workspace_kunpeng()
+
+register_op('tensor_mm', lambda x, w: [((x.shape[0], w.shape[0]), x.dtype)],
+            lambda x, w: torch.nn.functional.linear(x, w))

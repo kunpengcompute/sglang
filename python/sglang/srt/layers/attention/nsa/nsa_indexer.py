@@ -1207,9 +1207,9 @@ class Indexer(MultiPlatformOp):
         asserted in _validate_cpu_indexer_input (x = unquantized bf16
         hidden_states, q_lora = quantized (int8, scale) tuple):
           w = weights_proj(x)                [T, H] bf16 (unscaled gates)
-          q = wq_b(q_lora) -> [T, H, D] bf16; split rope/nope
-          k = k_norm(wk(x)) -> [T, D];      split rope/nope
-          rotary_emb(positions, q_pe, k_pe); concat back
+          q = wq_b(q_lora) -> [T, H, D] bf16; RoPE in place on the per-head
+            rope prefix, native [rope | nope] column order kept end-to-end
+          k = k_norm(wk(x)) -> [T, D];      RoPE in place on the rope prefix
           pool.set_index_k_buffer(layer_id, out_cache_loc, k)
           scoring via the kutacc paged kernel: per-head ReLU, fp32
           accumulation, top-k ties -> smaller id.
@@ -1294,10 +1294,16 @@ class Indexer(MultiPlatformOp):
             )
             k_proj = _bf16_linear_kunpeng(x, self.wk.weight)
 
+        # wq_b / wk emit [rope | nope] per head. RoPE is applied in place
+        # on the rope slices and that native column order is kept
+        # end-to-end: the only in-platform consumers of q / the index-K
+        # cache are the row padder and the scoring kernel (plain per-head
+        # dot product, column-order invariant as long as q and k agree),
+        # so re-materializing [nope | rope] via cat was pure bandwidth
+        # cost. In/out are separate view objects over the same slices --
+        # the kernel is pairwise (reads x[i], x[i+1] before writing
+        # y[i], y[i+1]), so the aliasing is safe.
         q = q.view(-1, self.n_heads, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-        )
 
         k = kunpeng.layernorm_kunpeng(
             k_proj,
@@ -1305,15 +1311,15 @@ class Indexer(MultiPlatformOp):
             self.k_norm.bias,
             self.k_norm.variance_epsilon,
         )
-        k_pe, k_nope = torch.split(
-            k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-        )
 
-        q_pe, k_pe = kunpeng.rope_kunpeng(
-            positions, q_pe, k_pe.unsqueeze(1), self.rotary_emb.cos_sin_cache
+        kunpeng.rope_inplace_kunpeng(
+            positions,
+            q[..., : self.rope_head_dim],
+            k[:, : self.rope_head_dim].unsqueeze(1),
+            q[..., : self.rope_head_dim],
+            k[:, : self.rope_head_dim].unsqueeze(1),
+            self.rotary_emb.cos_sin_cache,
         )
-        q = kunpeng.cat_kunpeng(q_nope, q_pe, -1)
-        k = kunpeng.cat_kunpeng(k_nope, k_pe.squeeze(1), -1)
 
         pool.set_index_k_buffer(layer_id=layer_id, loc=out_loc, index_k=k)
         if not return_indices:

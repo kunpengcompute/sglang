@@ -14,9 +14,14 @@
 
 #!/bin/bash
 # stop_tokenizer.sh - Kill the tokenizer HTTP server parent(s)
-# (python -m sglang.launch_server ... --port <tok_port>) and all their
-# child workers (sglang::detokenizer / sglang::tokenizer_worker) on the
-# router node, so no orphan children survive a kill -9 fallback.
+# (python -m sglang.launch_server ...) and all their child workers
+# (sglang::detokenizer / sglang::tokenizer_worker) on the router node, so
+# no orphan children survive a kill -9 fallback.
+# Matched by the target instance's HTTP port (--port, 30001 + global entry
+# index) or its master port (--dist-init-addr <master>:<side>_MASTER_PORT =
+# 5000/5010 + 100 * same-role index, which keys the internal port block).
+# The master-port arm catches a leftover whose HTTP port moved after an
+# INSTANCES change but which still holds the block the new launch needs.
 # Invoked by: ./stop.sh tokenizer [prefill|decode|all]
 # Usage: bash runtime/stop_tokenizer.sh [prefill|decode|all]
 #   Each argument may carry an instance suffix (e.g. decode_128p); "all"
@@ -24,8 +29,8 @@
 
 TOK_ENTRY="${1:-all}"
 # Accept "<side>[_<instance>]" (e.g. "decode_128p"): the instance selects
-# the side's instance env when sourcing; the kill pattern matches the
-# side's per-instance tokenizer HTTP port (<side>_TOK_PORT).
+# the side's instance env when sourcing; the kill pattern matches the side's
+# per-instance HTTP port (<side>_TOK_PORT) or master port (<side>_MASTER_PORT).
 if [[ "$TOK_ENTRY" == *_* ]]; then
     TOK_SIDE="${TOK_ENTRY%%_*}"
 else
@@ -41,8 +46,9 @@ cd "$SCRIPT_DIR"
 
 # Source config to get ROUTER_IP. Sides load only their own role env
 # (env.sh tokenizer "<side>[_<instance>]"); "all" iterates the INSTANCES
-# entries so every instance's tokenizer port is covered.
+# entries so every instance's ports are covered.
 ports=()
+masters=()
 if [[ "$TOK_SIDE" == "all" ]]; then
     SKIP_CONDA=1 source ./env.sh none
     IFS=',' read -ra _INST_LIST <<< "$INSTANCES"
@@ -54,31 +60,44 @@ if [[ "$TOK_SIDE" == "all" ]]; then
         # Unset the derived vars so each entry re-derives its own values
         # (sequential sourcing in this shell would otherwise keep the
         # first entry's ports).
-        unset PREFILL_TOK_PORT PREFILL_BOOTSTRAP_PORT PREFILL_NUMA_BASE
-        unset DECODE_TOK_PORT DECODE_BOOTSTRAP_PORT DECODE_NUMA_BASE
+        unset PREFILL_TOK_PORT PREFILL_BOOTSTRAP_PORT PREFILL_NUMA_BASE PREFILL_MASTER_PORT
+        unset DECODE_TOK_PORT DECODE_BOOTSTRAP_PORT DECODE_NUMA_BASE DECODE_MASTER_PORT
         SKIP_CONDA=1 source ./env.sh tokenizer "$_entry" >/dev/null 2>&1
         if [[ "$_side" == "prefill" ]]; then
             ports+=("${PREFILL_TOK_PORT:-30001}")
+            masters+=("${PREFILL_MASTER_PORT:-5000}")
         else
             ports+=("${DECODE_TOK_PORT:-30002}")
+            masters+=("${DECODE_MASTER_PORT:-5010}")
         fi
     done
     # Fallback: INSTANCES empty/unparsed -> both default ports.
-    [[ ${#ports[@]} -eq 0 ]] && ports=(30001 30002)
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        ports=(30001 30002)
+        masters=(5000 5010)
+    fi
 else
     SKIP_CONDA=1 source ./env.sh tokenizer "$TOK_ENTRY"
     if [[ "$TOK_SIDE" == "prefill" ]]; then
         ports+=("${PREFILL_TOK_PORT:-30001}")
+        masters+=("${PREFILL_MASTER_PORT:-5000}")
     else
         ports+=("${DECODE_TOK_PORT:-30002}")
+        masters+=("${DECODE_MASTER_PORT:-5010}")
     fi
 fi
 # Dedupe (default + instance entries may resolve to the same port)
 ports=($(printf '%s\n' "${ports[@]}" | sort -u))
+masters=($(printf '%s\n' "${masters[@]}" | sort -u))
 
-TOK_PAT="sglang[.]launch_server.*--port ($(IFS='|'; echo "${ports[*]}"))"
+# --port <p>/--dist-init-addr <host>:<p> with p in ports|masters, followed by
+# a space or end of line (so a port is never matched as a prefix of a longer
+# number). `\$` keeps the end anchor literal once embedded in the ssh command.
+_pat_ports="$(IFS='|'; echo "${ports[*]}")"
+_pat_masters="$(IFS='|'; echo "${masters[*]}")"
+TOK_PAT="sglang[.]launch_server.*(--port |--dist-init-addr [^[:space:]]*:)(${_pat_ports}|${_pat_masters})([[:space:]]|\$)"
 
-echo "Killing tokenizer ($TOK_SIDE) HTTP server(s) on $ROUTER_IP (port(s): ${ports[*]})"
+echo "Killing tokenizer ($TOK_SIDE) on $ROUTER_IP (HTTP port(s): ${ports[*]}; master port(s): ${masters[*]})"
 ssh "root@$ROUTER_IP" "
     MAIN_PIDS=\$(ps aux | grep -E '$TOK_PAT' | grep -v grep | awk '{print \$2}')
     echo \"Main tokenizer PID(s): \$MAIN_PIDS\"

@@ -59,6 +59,22 @@ DEFAULT_AIS_MAX_OUT_LEN=384         # (aisbench) model-side max_out_len
 DEFAULT_AIS_REQUEST_RATE=32         # (aisbench) request_rate (0 = burst, >0 = req/s)
 DEFAULT_AIS_TASKSET_CPUS=266-302    # (aisbench) CPU range for taskset (empty = no binding)
 
+# sharegpt (perf run via the official sglang bench_serving, offline)
+DEFAULT_SHAREGPT_PORT=30000         # (sharegpt) gateway port (not $DEFAULT_PORT:
+                                    #  .user_env_base.sh overrides that to 30002
+                                    #  for aisbench's decode-tokenizer target)
+DEFAULT_SHAREGPT_BACKEND=sglang     # (sharegpt) bench_serving backend
+DEFAULT_SHAREGPT_MODEL=glm-5.3      # (sharegpt) served model name
+DEFAULT_SHAREGPT_NUM_PROMPTS=1000   # (sharegpt) number of requests
+# (sharegpt) local ShareGPT JSON. Set SHAREGPT_DATASET_PATH in
+# runtime/.user_env_base.sh to point at the pre-downloaded file; bench_serving
+# downloads from HuggingFace only when this is empty, which offline nodes can't.
+DEFAULT_SHAREGPT_DATASET_PATH=/data/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json
+# (sharegpt) client core binding. Default reuses the aisbench client range
+# (DEFAULT_AIS_TASKSET_CPUS, tuned in runtime/.user_env_base.sh, e.g.
+# 532-568 = NUMA 14) — a NUMA that is idle on the router node. Override with
+# SHAREGPT_TASKSET_CPUS; empty = no taskset binding.
+
 # Load environment: conda env + SGLANG_PATH / ROUTER_IP / MODEL_PATH / DATASET_PATH
 source "$SCRIPT_DIR/env.sh" native
 # MODEL_PATH is a plain shell var in env.sh; export it so the python subprocess sees it
@@ -76,12 +92,16 @@ show_help() {
     cat <<'EOF'
 Usage: bash benchmark.sh <suite> [extra python args...]
 
-Available test suites (3):
+Available test suites (4):
   gsm8k    Few-shot GSM8K evaluation
            defaults: --num-questions 100 --num-shots 5 --max-new-tokens 256
                      --temperature 0 --parallel 10
   mmlu     MMLU evaluation
            defaults: --ntrain 2 --nsub 3 --parallel 10 --backend srt
+  sharegpt Perf run via the official sglang bench_serving on the local
+           ShareGPT JSON (offline: never downloads from HuggingFace).
+           Requires SHAREGPT_DATASET_PATH in runtime/.user_env_base.sh.
+           defaults: backend sglang, model glm-5.3, 1000 prompts
   aisbench Throughput/perf run via ais_bench (in a dedicated conda env).
            Patches the two ais_bench config files in place, switches to the
            ais_bench conda env, then runs "ais_bench --mode perf".
@@ -90,6 +110,13 @@ Available test suites (3):
 Env overrides (runtime): HOST PORT PARALLEL
   gsm8k:    NUM_QUESTIONS NUM_SHOTS MAX_NEW_TOKENS TEMPERATURE DATA_PATH
   mmlu:     NTRAIN NSUB BACKEND RESULT_FILE RAW_RESULT_FILE DATA_DIR
+  sharegpt: SHAREGPT_BACKEND SHAREGPT_MODEL SHAREGPT_NUM_PROMPTS
+            SHAREGPT_DATASET_PATH (dataset path default is in this script;
+            tokenizer reuses ST_TOKENIZER, i.e. $MODEL_PATH; port defaults to
+            the gateway's 30000 and is overridden by PORT)
+            SHAREGPT_TASKSET_CPUS (default = aisbench's
+            DEFAULT_AIS_TASKSET_CPUS, the router node's idle NUMA;
+            empty = no taskset binding)
   aisbench: AIS_CONDA_ENV AIS_BASE (default: auto-detected from the conda env)
             AIS_TYPE AIS_REQUESTS AIS_IN_LEN AIS_IN_LEN_MAX
             AIS_OUT_LEN AIS_OUT_LEN_MAX AIS_MAX_OUT_LEN AIS_BATCH
@@ -106,6 +133,7 @@ Examples:
   bash benchmark.sh gsm8k --max-new-tokens 128 --num-questions 50
   bash benchmark.sh mmlu  --nsub 60 --parallel 32
   bash benchmark.sh mmlu -h    # show the mmlu python script's own args
+  SHAREGPT_NUM_PROMPTS=2000 bash benchmark.sh sharegpt
   AIS_REQUESTS=512 AIS_IN_LEN=1024 AIS_OUT_LEN=256 bash benchmark.sh aisbench
 EOF
 }
@@ -247,6 +275,38 @@ case "$SUITE" in
             ais_bench --models "$AIS_MODEL_CFG" --datasets "$AIS_DATASET_CFG" \
             --mode perf --debug \
             "${work_dir_args[@]}" \
+            "$@"
+        ;;
+    sharegpt)
+        # Offline ShareGPT perf run via the official sglang bench_serving.
+        # The host reuses GATEWAY_HOST (HOST/ROUTER_IP); the tokenizer reuses
+        # ST_TOKENIZER (= $MODEL_PATH). The port defaults to the gateway's
+        # 30000 (PORT overrides). The dataset path comes from
+        # SHAREGPT_DATASET_PATH (set it in runtime/.user_env_base.sh); a local
+        # file is mandatory — bench_serving only downloads from HuggingFace
+        # when the path is empty, which offline nodes cannot do.
+        #
+        # Core binding (mirrors aisbench's AIS_TASKSET_CPUS): the default
+        # reuses the aisbench client range (DEFAULT_AIS_TASKSET_CPUS, tuned in
+        # .user_env_base.sh, e.g. 532-568 = NUMA 14) so this client runs on a
+        # NUMA that is idle on the router node. Empty = no taskset binding.
+        SHAREGPT_TASKSET_CPUS="${SHAREGPT_TASKSET_CPUS:-${AIS_TASKSET_CPUS:-$DEFAULT_AIS_TASKSET_CPUS}}"
+        launch_prefix=()
+        if [[ -n "$SHAREGPT_TASKSET_CPUS" ]]; then
+            launch_prefix=(taskset -c "$SHAREGPT_TASKSET_CPUS")
+            echo "taskset: $SHAREGPT_TASKSET_CPUS (router-node cores)" >&2
+        fi
+        export HF_HUB_OFFLINE=1
+        export TRANSFORMERS_OFFLINE=1
+        exec "${launch_prefix[@]}" python3 -m sglang.bench_serving \
+            --backend "${SHAREGPT_BACKEND:-$DEFAULT_SHAREGPT_BACKEND}" \
+            --host "$GATEWAY_HOST" \
+            --port "${PORT:-$DEFAULT_SHAREGPT_PORT}" \
+            --model "${SHAREGPT_MODEL:-$DEFAULT_SHAREGPT_MODEL}" \
+            --tokenizer "${ST_TOKENIZER:-$MODEL_PATH}" \
+            --dataset-name sharegpt \
+            --dataset-path "${SHAREGPT_DATASET_PATH:-$DEFAULT_SHAREGPT_DATASET_PATH}" \
+            --num-prompts "${SHAREGPT_NUM_PROMPTS:-$DEFAULT_SHAREGPT_NUM_PROMPTS}" \
             "$@"
         ;;
     *)

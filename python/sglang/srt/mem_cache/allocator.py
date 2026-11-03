@@ -153,7 +153,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if need_size > len(self.free_pages):
             return None
 
-        select_index = self.free_pages[:need_size]
+        # Return an owned tensor rather than a view into `free_pages`: callers
+        # bind it as a graph input, and its storage offset would otherwise move
+        # with every allocation, changing the binding signature and invalidating
+        # the captured graph on each forward.
+        select_index = self.free_pages[:need_size].clone()
         self.free_pages = self.free_pages[need_size:]
         return select_index
 

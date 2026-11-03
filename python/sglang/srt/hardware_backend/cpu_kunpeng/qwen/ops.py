@@ -5,31 +5,45 @@ The eager reference calls the existing C ABI, while replay calls C++ dispatch.
 """
 
 import ctypes
+import os
 from functools import lru_cache
 from sgl_kernel import common_ops
 import torch
+from .capabilities import NATIVE_DECODE_MAX_TOKENS
 
 _libraries = []
 rows_capture_count = 0
+_p2_gdn_head_route = None
+_P20_FLAG = "SGLANG_KUNPENG_P20_GDN_POSTCONV_STRIDED"
+_p20_bridge = None
+
+
+def _register_graph_dispatch(bridge, name, symbol):
+    from sgl_kernel import graph_cpp
+
+    info = graph_cpp.OpInfo()
+    info.dispatch_fn = ctypes.cast(getattr(bridge, symbol), ctypes.c_void_p).value
+    graph_cpp.GraphOpRegistry.instance().register_op(name, info)
+
+
+def p2_gdn_head_selected(B, HQ, HV, DK, DV):
+    if B < 8 or os.getenv("SGLANG_KUNPENG_P2_GDN_HEAD_PARALLEL", "0") != "1":
+        return False
+    return _p2_gdn_head_route is not None and bool(_p2_gdn_head_route(B, HQ, HV, DK, DV))
 
 
 def register_rows():
-    from sgl_kernel import graph_cpp
     from sglang.srt.graph import register_op
 
     bridge = ctypes.CDLL(common_ops.__file__)
     _libraries.append(bridge)
-    info = graph_cpp.OpInfo()
-    info.dispatch_fn = ctypes.cast(
-        bridge.qwen_graph_gqa_rows_dispatch, ctypes.c_void_p
-    ).value
-    graph_cpp.GraphOpRegistry.instance().register_op("qwen_gqa_rows", info)
+    _register_graph_dispatch(bridge, "qwen_gqa_rows", "qwen_graph_gqa_rows_dispatch")
 
     def shape(q, k, v, t, r, l, s):
         global rows_capture_count
         rows_capture_count += 1
-        if not 1 <= q.shape[0] <= 128:
-            raise ValueError("GQA query rows must be in 1..128")
+        if not 1 <= q.shape[0] <= NATIVE_DECODE_MAX_TOKENS:
+            raise ValueError(f"GQA query rows must be in 1..{NATIVE_DECODE_MAX_TOKENS}")
         return [
             (tuple(q.shape), q.dtype),
             ((min(q.shape[0], 32) * q.shape[1] * (t.shape[1] + 256),), torch.float32),
@@ -43,7 +57,7 @@ def register_rows():
 
 @lru_cache()
 def register_primitives():
-    from sgl_kernel import graph_cpp
+    global _p2_gdn_head_route
     from sglang.srt.graph import register_op
 
     bridge = ctypes.CDLL(common_ops.__file__)
@@ -71,6 +85,10 @@ def register_primitives():
         ctypes.c_int64
     ] * 3
     conv.qwen36_gdn_causal_conv_bf16_row_major.restype = ctypes.c_int
+    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
+        request_conv = conv.qwen36_gdn_causal_conv_bf16_row_major_requests
+        request_conv.argtypes = conv.qwen36_gdn_causal_conv_bf16_row_major.argtypes
+        request_conv.restype = ctypes.c_int
     for name in (
         "qwen36_gqa_decode_bf16_serial_with_workspace",
         "qwen36_gqa_decode_bf16_parallel_with_workspace",
@@ -82,7 +100,6 @@ def register_primitives():
             + [ctypes.c_float, ctypes.c_void_p, ctypes.c_int64]
         )
         fn.restype = ctypes.c_int
-    registry = graph_cpp.GraphOpRegistry.instance()
     for name, symbol in [
         ("qwen_gdn_decode", "qwen_graph_gdn_dispatch"),
         ("qwen_gated_norm", "qwen_graph_norm_dispatch"),
@@ -93,9 +110,10 @@ def register_primitives():
         ("qwen_ar_pack_block", "qwen_graph_ar_pack_block_dispatch"),
         ("qwen_ar_unpack_block", "qwen_graph_ar_unpack_block_dispatch"),
     ]:
-        info = graph_cpp.OpInfo()
-        info.dispatch_fn = ctypes.cast(getattr(bridge, symbol), ctypes.c_void_p).value
-        registry.register_op(name, info)
+        _register_graph_dispatch(bridge, name, symbol)
+    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
+        _register_graph_dispatch(bridge, "qwen_p2_decode_conv_requests",
+                                 "qwen_graph_p2_decode_conv_requests_dispatch")
 
     def ar_pack_block_shape(x, partitions):
         if not (
@@ -127,6 +145,36 @@ def register_primitives():
         ),
     )
 
+    if os.environ.get("SGLANG_KUNPENG_P2_AR_SMALLROW_COPY", "0") == "1":
+        for name, symbol in [
+            ("qwen_p2_ar_pack_smallrow", "qwen_graph_p2_ar_pack_smallrow_dispatch"),
+            ("qwen_p2_ar_unpack_smallrow", "qwen_graph_p2_ar_unpack_smallrow_dispatch"),
+        ]:
+            _register_graph_dispatch(bridge, name, symbol)
+
+        def smallrow_supported(x, partitions):
+            return (x.device.type == "cpu" and x.dtype == torch.bfloat16 and x.ndim == 2
+                    and 1 <= x.shape[0] <= 32 and x.shape[1] > 0
+                    and tuple(x.stride()) == (x.shape[1], 1)
+                    and partitions > 0 and x.shape[1] % partitions == 0)
+
+        def smallrow_pack_shape(x, partitions):
+            if not smallrow_supported(x, partitions):
+                raise ValueError("Smallrow AR copy dense BF16 rows1..32 contract")
+            return [(tuple(x.shape), x.dtype)]
+
+        def smallrow_unpack_shape(x, packed, partitions):
+            if not (smallrow_supported(x, partitions) and smallrow_supported(packed, partitions)
+                    and x.shape == packed.shape):
+                raise ValueError("Smallrow AR unpack shape/stride/dtype contract")
+            return []
+
+        register_op("qwen_p2_ar_pack_smallrow", smallrow_pack_shape,
+                    lambda x, p: torch.ops.sgl_kernel.qwen_registered_p2_ar_pack_smallrow(x, p),
+                    shm_fn=lambda x, out, p: [out])
+        register_op("qwen_p2_ar_unpack_smallrow", smallrow_unpack_shape,
+                    lambda x, packed, p: torch.ops.sgl_kernel.qwen_registered_p2_ar_unpack_smallrow(x, packed, p))
+
     def validate_workspace(workspace, tensors):
         assert workspace.device.type == "cpu" and workspace.dtype == torch.float32
         assert workspace.ndim == 1 and workspace.is_contiguous()
@@ -142,7 +190,7 @@ def register_primitives():
         assert q.ndim == k.ndim == v.ndim == 3 and state.ndim == 4
         return [(tuple(v.shape), v.dtype)]
 
-    def gdn_eager(A, bias, q, k, v, a, b, state, indices, workspace):
+    def run_gdn_eager(fn, label, A, bias, q, k, v, a, b, state, indices, workspace):
         assert workspace.numel() >= q.shape[0] * (2 * q.shape[1] + 3 * v.shape[2])
         output = torch.empty_like(v)
         tensors = [A, bias, q, k, v, a, b, state, indices, output]
@@ -150,7 +198,7 @@ def register_primitives():
         assert all(t.is_contiguous() and t.device.type == "cpu" for t in tensors)
         assert A.dtype == state.dtype == torch.float32 and indices.dtype == torch.int32
         assert all(t.dtype == torch.bfloat16 for t in (bias, q, k, v, a, b, output))
-        rc = gdn.qwen36_gdn_decode_with_workspace(
+        rc = fn(
             *(t.data_ptr() for t in tensors),
             state.shape[0],
             q.shape[0],
@@ -162,8 +210,12 @@ def register_primitives():
             workspace.numel(),
         )
         if rc:
-            raise RuntimeError(f"GDN eager failed {rc}")
+            raise RuntimeError(f"{label} eager failed {rc}")
         return output
+
+    def gdn_eager(A, bias, q, k, v, a, b, state, indices, workspace):
+        return run_gdn_eager(gdn.qwen36_gdn_decode_with_workspace, "GDN",
+                             A, bias, q, k, v, a, b, state, indices, workspace)
 
     def norm_eager(x, weight, gate, eps):
         output = torch.empty_like(x)
@@ -181,6 +233,22 @@ def register_primitives():
         return output
 
     register_op("qwen_gdn_decode", gdn_shape, gdn_eager)
+    if os.getenv("SGLANG_KUNPENG_P20_GDN_POSTCONV_STRIDED", "0") == "1":
+        _register_p20(bridge)
+    if os.getenv("SGLANG_KUNPENG_P2_GDN_HEAD_PARALLEL", "0") == "1":
+        head_native = bridge.qwen36_gdn_decode_head_parallel_with_workspace
+        head_native.argtypes = gdn.qwen36_gdn_decode_with_workspace.argtypes
+        head_native.restype = ctypes.c_int
+        _p2_gdn_head_route = bridge.qwen_p2_gdn_head_shape_eligible
+        _p2_gdn_head_route.argtypes = [ctypes.c_int64] * 5
+        _p2_gdn_head_route.restype = ctypes.c_int
+        _register_graph_dispatch(bridge, "qwen_p2_gdn_head", "qwen_graph_p2_gdn_head_dispatch")
+
+        def head_eager(A, bias, q, k, v, a, b, state, indices, workspace):
+            return run_gdn_eager(head_native, "GDN head",
+                                 A, bias, q, k, v, a, b, state, indices, workspace)
+
+        register_op("qwen_p2_gdn_head", gdn_shape, head_eager)
     register_op(
         "qwen_gated_norm", lambda x, w, g, e: [(tuple(x.shape), x.dtype)], norm_eager
     )
@@ -200,6 +268,16 @@ def register_primitives():
         if rc:
             raise RuntimeError(f"Conv eager failed {rc}")
         return output
+
+    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
+        def request_conv_eager(x, state, weight, indices):
+            output = torch.empty_like(x)
+            rc = request_conv(x.data_ptr(), state.data_ptr(), weight.data_ptr(), indices.data_ptr(),
+                              output.data_ptr(), state.shape[0], x.shape[0], x.shape[1])
+            if rc:
+                raise RuntimeError(f"Conv requests eager failed {rc}")
+            return output
+        register_op("qwen_p2_decode_conv_requests", lambda x, state, weight, indices: [(tuple(x.shape), x.dtype)], request_conv_eager)
 
     def gqa_shape(q, k, v, table, requests, lengths, scale):
         return [
@@ -280,3 +358,104 @@ def register_primitives():
         ctypes.c_uint64
     )
     return bridge
+
+
+def p20_enabled_for_base(base):
+    # Avoid introducing even extra q[0]/k[0]/v[0] aliases on default0/M1/largeM.
+    return (os.getenv(_P20_FLAG, "0") == "1" and _p20_bridge is not None and base is not None
+            and base.ndim == 2 and 2 <= base.shape[0] <= 32)
+
+
+def p20_selected(base, q, k, v):
+    """Metadata only. Base is passed explicitly from the conv producer."""
+    if not p20_enabled_for_base(base):
+        return False
+    import torch
+    if not all(t.device.type == "cpu" and t.dtype == torch.bfloat16
+               for t in (base, q, k, v)):
+        return False
+    if base.ndim != 2 or not base.is_contiguous() or q.ndim != 3 or v.ndim != 3:
+        return False
+    B, HQ, DK = q.shape
+    HV, DV = v.shape[1:]
+    C = 2 * HQ * DK + HV * DV
+    if not (2 <= B <= 32 and HQ > 0 and HV > 0 and HV % HQ == 0
+            and DK == DV == 128 and tuple(k.shape) == tuple(q.shape)
+            and tuple(v.shape) == (B, HV, 128) and tuple(base.shape) == (B, C)):
+        return False
+    # Inputs may be views with nonzero storage offset. No q._base inference.
+    storage_base = base.untyped_storage().data_ptr()
+    if (base.storage_offset() + base.numel()) * 2 > base.untyped_storage().nbytes():
+        return False
+    for t, heads, offset in ((q, HQ, 0), (k, HQ, HQ * 128),
+                             (v, HV, 2 * HQ * 128)):
+        span = (B - 1) * C + heads * 128
+        if not (tuple(t.stride()) == (C, 128, 1)
+                and t.untyped_storage().data_ptr() == storage_base
+                and t.data_ptr() == base.data_ptr() + 2 * offset
+                and (t.storage_offset() + span) * 2 <= t.untyped_storage().nbytes()):
+            return False
+    return True
+
+
+def _p20_shape(A, bias, base, a, b, state, indices, workspace, HQ):
+    import torch
+    values = (A, bias, base, a, b, state, indices, workspace)
+    dtypes = (torch.float32, torch.bfloat16, torch.bfloat16, torch.bfloat16,
+              torch.bfloat16, torch.float32, torch.int32, torch.float32)
+    if not all(t.device.type == "cpu" and t.dtype == dt and t.is_contiguous()
+               for t, dt in zip(values, dtypes)):
+        raise ValueError("P20 postconv dense CPU exact dtype")
+    if base.ndim != 2 or state.ndim != 4 or workspace.ndim != 1 or type(HQ) is not int:
+        raise ValueError("P20 postconv ranks/HQ")
+    B, C = base.shape
+    slots, HV, DK, DV = state.shape
+    if not (2 <= B <= 32 and HQ > 0 and HV > 0 and HV % HQ == 0
+            and slots > 0 and DK == DV == 128 and C == (2 * HQ + HV) * 128
+            and A.numel() == bias.numel() == HV and a.numel() == b.numel() == B * HV
+            and indices.numel() == B and workspace.numel() >= B * (2 * HQ + 384)):
+        raise ValueError("P20 postconv shape/workspace")
+    spans = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in values]
+    for target in (5, 7):
+        for other in range(len(values)):
+            if target != other and spans[target][0] < spans[other][1] and spans[other][0] < spans[target][1]:
+                raise ValueError("P20 postconv mutable input alias")
+    # Capture is metadata only: no scan/read of dynamic index values here.
+    return [((B, HV, 128), torch.bfloat16)]
+
+
+def _register_p20(bridge):
+    global _p20_bridge
+    if os.getenv(_P20_FLAG, "0") != "1":
+        return
+    import torch
+    from sglang.srt.graph import register_op
+    fn = bridge.qwen36_gdn_decode_strided_small_with_workspace
+    # First18 parameters are the real old ABI, then Sq/Sk/Sv.
+    fn.argtypes = ([ctypes.c_void_p] * 10 + [ctypes.c_int64] * 6
+                   + [ctypes.c_void_p, ctypes.c_int64] + [ctypes.c_int64] * 3)
+    fn.restype = ctypes.c_int
+    _register_graph_dispatch(bridge, "qwen_p20_gdn_postconv",
+                             "qwen_graph_p20_gdn_postconv_dispatch")
+
+    def eager(A, bias, base, a, b, state, indices, workspace, HQ):
+        shape, dtype = _p20_shape(A, bias, base, a, b, state, indices, workspace, HQ)[0]
+        B, HV, _ = shape
+        # Match new strict Graph leaf's no-write invalid/duplicate contract.
+        # B<=32; raw entry intentionally retains old raw partial-write behavior.
+        ids = indices.reshape(-1).tolist()
+        if any(i < 0 or i >= state.shape[0] for i in ids) or len(set(ids)) != B:
+            raise ValueError("P20 postconv slot range/duplicate")
+        out = torch.empty(shape, dtype=dtype, device="cpu")  # Explicit dense output.
+        x = base.data_ptr()
+        C = base.shape[1]
+        rc = fn(A.data_ptr(), bias.data_ptr(), x, x + HQ * 128 * 2,
+                x + 2 * HQ * 128 * 2, a.data_ptr(), b.data_ptr(), state.data_ptr(),
+                indices.data_ptr(), out.data_ptr(), state.shape[0], B, HQ, HV,
+                128, 128, workspace.data_ptr(), workspace.numel(), C, C, C)
+        if rc:
+            raise RuntimeError("P20 postconv raw failure " + str(rc))
+        return out
+
+    register_op("qwen_p20_gdn_postconv", _p20_shape, eager)
+    _p20_bridge = bridge  # Existing primitives library list owns the DSO lifetime.

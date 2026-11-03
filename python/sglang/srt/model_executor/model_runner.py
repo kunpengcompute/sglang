@@ -495,6 +495,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_threads_binding()
 
         # Get available memory before model loading
+        if self.device == "cpu" and _is_cpu_920f:
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen import configure_hbw_shm
+
+            configure_hbw_shm()
         pre_model_load_memory = self.init_torch_distributed()
 
         # Initialize MooncakeTransferEngine
@@ -1381,11 +1385,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if _is_cpu_920f:
                 from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
                     enabled,
-                    validate_config,
                 )
 
                 if enabled():
-                    validate_config(self)
                     if self.borrowed_qwen_target_runner is None:
                         self.model_config = adjust_config_with_unaligned_cpu_tp(
                             self.model_config, self.load_config, get_attention_tp_size()
