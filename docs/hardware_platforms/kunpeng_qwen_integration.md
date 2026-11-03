@@ -9,6 +9,11 @@
 > 本次合并及验证结果以 PR #299 描述为准，旧状态文档中的历史结果不代表本版。
 > 若启动继承 DDR 的 `--membind`，需启用上游现有的
 > `SGLANG_KUNPENG_HBW_BIND_BEFORE_MMAP=1`，使大页申请先绑定 HBM 并恢复调用者策略。
+> Qwen 在 HBW 与 POSIX SHM 启用时，默认复用现有 `SGLANG_KUNPENG_SHARED_HBW_BACKING=split`
+> 初始化：SHM payload 在本地 HBM 首次触页，其容量从总 HBW 预算扣除。
+> 现有 split 模式要求每 rank 总预算 4000MiB；SHM 为 384MiB 时私有池为 3616MiB。
+> 其他自定义总预算不自动切换 split，保持原放置方式。
+> 不新增启动参数，显式的共享模式/容量配置仍优先；其他模型和非 POSIX 路径不变。
 
 本说明对应本目录待审代码；实际验证状态见 `kunpeng_qwen_pr_status.md`。构建与部署边界见第9节；选频、启动、压测和工具调用工具包独立维护，不进入本PR。
 

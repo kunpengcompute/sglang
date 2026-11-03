@@ -495,6 +495,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_threads_binding()
 
         # Get available memory before model loading
+        if self.device == "cpu" and _is_cpu_920f:
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen import configure_hbw_shm
+
+            configure_hbw_shm()
         pre_model_load_memory = self.init_torch_distributed()
 
         # Initialize MooncakeTransferEngine
