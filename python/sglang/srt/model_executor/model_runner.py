@@ -1367,13 +1367,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
         )
-        if self.device == "cpu":
-            if _is_cpu_920f:
-                pass
-            else:
-                self.model_config = adjust_config_with_unaligned_cpu_tp(
-                    self.model_config, self.load_config, self.tp_size
-                )
+        if self.device == "cpu" and (
+            not _is_cpu_920f or os.environ.get("SGLANG_KUNPENG_QWEN", "0") == "1"
+        ):
+            self.model_config = adjust_config_with_unaligned_cpu_tp(
+                self.model_config, self.load_config, self.tp_size
+            )
 
         if (
             self.server_args.load_format == LoadFormat.REMOTE_INSTANCE

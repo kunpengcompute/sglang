@@ -102,6 +102,7 @@ def import_model_classes(package_name: str, strict: bool = False):
                     # (GlmMoeDsaForCausalLM reuses the DeepseekV2 stack).
                     "sglang.srt.models.deepseek",
                     "sglang.srt.models.glm4_moe",
+                    "sglang.srt.models.qwen3_5",
                 )
             ):
                 continue

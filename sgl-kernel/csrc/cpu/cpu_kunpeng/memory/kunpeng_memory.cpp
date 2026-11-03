@@ -32,19 +32,32 @@ at::Tensor hbw_allocator_kunpeng(int64_t size)
     int64_t aligned_size = (size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
     int64_t num_pages = aligned_size / PAGE_SIZE;
 
-    // Step 1: mmap with MAP_HUGETLB + MAP_POPULATE
-    auto *hbm = static_cast<uint8_t *>(mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
-                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0));
-    if (hbm == MAP_FAILED) {
-        std::cerr << "    FAILED: errno=" << errno << " (" << strerror(errno) << ")" << std::endl;
-        throw std::runtime_error("mmap with MAP_HUGETLB failed");
-    }
-
-    // Step 2: mbind to HBM NUMA node
-    int cpu = sched_getcpu();
-    int cpu_node = numa_node_of_cpu(cpu);
+    int cpu_node = numa_node_of_cpu(sched_getcpu());
     int hbm_node = cpu_node + 16;
     unsigned long mask = 1UL << hbm_node;
+    unsigned long previous_mask = 0;
+    int previous_mode = MPOL_DEFAULT;
+    constexpr auto mask_bits = sizeof(mask) * 8;
+    if (get_mempolicy(&previous_mode, &previous_mask, mask_bits, nullptr, 0) != 0)
+        throw std::runtime_error("Cannot read allocating thread's NUMA policy");
+    if (set_mempolicy(MPOL_BIND, &mask, mask_bits) != 0)
+        throw std::runtime_error("Cannot bind HBW allocation to HBM");
+
+    // Hugepage reservation also obeys the allocating thread's policy. Restore
+    // the caller's policy immediately so later DDR/KV allocations stay local.
+    auto *hbm = static_cast<uint8_t *>(mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0));
+    const int mapping_errno = errno;
+    const int restored = set_mempolicy(previous_mode,
+        previous_mode == MPOL_DEFAULT ? nullptr : &previous_mask, mask_bits);
+    if (restored != 0) {
+        if (hbm != MAP_FAILED) munmap(hbm, aligned_size);
+        throw std::runtime_error("Cannot restore allocating thread's NUMA policy");
+    }
+    if (hbm == MAP_FAILED) {
+        std::cerr << "HBW mmap failed: " << strerror(mapping_errno) << std::endl;
+        throw std::runtime_error("mmap with MAP_HUGETLB failed");
+    }
 
     int ret = mbind(hbm, aligned_size, MPOL_BIND, &mask, sizeof(mask) * 8, MPOL_MF_STRICT);
     if (ret != 0) {

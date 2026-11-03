@@ -177,6 +177,11 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        from sglang.srt.layers.quantization.base_config import resolve_mlp_activation
+
+        self._fused_activation = resolve_mlp_activation(
+            self.gate_up_proj, self.down_proj
+        )
 
     def forward(
         self,
@@ -185,7 +190,10 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self._fused_activation is not None:
+            x = self._fused_activation(gate_up)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )

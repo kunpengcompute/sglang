@@ -363,7 +363,10 @@ class GroupCoordinator:
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
         self.use_kunpeng_communicator = (
             _is_cpu_920f
-            and self.world_size < torch.distributed.get_world_size()  # attn_tp_group
+            and (
+                self.world_size < torch.distributed.get_world_size()
+                or group_name == "tp"
+            )
             and self.world_size % 8 == 0  # attn_tp_size must be divisible by 8
             and self.world_size
             <= 16  # only for attn_tp_group (size=16), not TP group (size=64)

@@ -21,7 +21,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8MoE,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import apply_module_patch
+from sglang.srt.utils import apply_module_patch, is_cpu_920f
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -87,7 +87,10 @@ class ModelSlimConfig(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
-        self.quant_description = quant_config
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled
+        self._cpu920f = is_cpu_920f() and enabled()
+        self.quant_description = ({key.replace('model.language_model.', 'model.', 1): value
+                                  for key, value in quant_config.items()} if self._cpu920f else quant_config)
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
@@ -96,7 +99,7 @@ class ModelSlimConfig(QuantizationConfig):
         )
 
         for name in self.quant_description.keys():
-            if "norm.bias" in name:
+            if not self._cpu920f and "norm.bias" in name:
                 apply_module_patch(
                     "sglang.srt.layers.layernorm.RMSNorm",
                     "__init__",
@@ -141,6 +144,17 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            if self._cpu920f:
+                from sglang.srt.layers.quantization.modelslim.schemes.cpu920f_w8a8_dynamic import CPU920FModelSlimW8A8Dynamic
+                prefix = prefix.replace('model.language_model.', 'model.', 1)
+                mapping = self.packed_modules_mapping
+                if self.is_layer_skipped(prefix, mapping):
+                    return UnquantizedLinearMethod()
+                proj = prefix.rsplit('.', 1)[-1]
+                if proj in mapping:
+                    prefix = prefix.rsplit('.', 1)[0] + '.' + mapping[proj][0]
+                layer.scheme = CPU920FModelSlimW8A8Dynamic(self.quant_description, prefix)
+                return ModelSlimLinearMethod(self)
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
             if "vision_model" in prefix:

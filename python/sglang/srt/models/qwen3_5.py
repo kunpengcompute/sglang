@@ -106,6 +106,23 @@ _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_amx_available = cpu_has_amx_support()
+from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as qwen_kunpeng_enabled
+
+_use_kunpeng_qwen = qwen_kunpeng_enabled()
+if _use_kunpeng_qwen:
+    from sglang.srt.graph import ops
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+        QwenGemmaRMSNorm as GemmaRMSNorm,
+        QwenGatedRMSNorm as RMSNormGated,
+        apply_gqa_output_gate,
+        compact_weight_loaders,
+        qkv_layout,
+        qknorm_rope,
+    )
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import configure_modules
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.linear import declare_projection
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.layout import split_gdn_projection
+
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -250,6 +267,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
+        if _use_kunpeng_qwen:
+            declare_projection(self.in_proj_qkvz, "gdn.qkvz")
+            declare_projection(self.in_proj_ba, "gdn.ba")
+            declare_projection(self.out_proj, "gdn.out")
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -275,7 +296,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _bind_packed_weight_loaders(self, module):
         """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
-        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "weight_offset",
+            "input_scale",
+        ):
             param = getattr(module, attr_name, None)
             if param is None:
                 continue
@@ -473,6 +500,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 triton.cdiv(self.num_v_heads, self.attn_tp_size),
                 self.head_k_dim,
                 self.head_v_dim,
+            )
+        elif _use_kunpeng_qwen and 1 <= projected_states_qkvz.shape[0] <= 4096:
+            mixed_qkv, z, b, a = split_gdn_projection(
+                projected_states_qkvz,
+                projected_states_ba,
+                self.num_k_heads // self.attn_tp_size,
+                self.num_v_heads // self.attn_tp_size,
+                self.head_k_dim,
+                self.head_v_dim,
+                forward_batch=forward_batch,
             )
         elif _is_cpu and _is_amx_available:
             mixed_qkv, z, b, a = (
@@ -741,6 +778,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        if _use_kunpeng_qwen:
+            declare_projection(self.qkv_proj, "gqa.qkv")
+            declare_projection(self.o_proj, "gqa.out")
+        if _use_kunpeng_qwen and self.attn_tp_size == 16:
+            compact_weight_loaders(self)
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -844,7 +887,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Full attention forward pass."""
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn_output_gate:
+        use_native_batch = (
+            _use_kunpeng_qwen
+            and self.attn_tp_size == 16
+            and qkv.shape[0] > 0
+            and self.attn_output_gate
+            and not forward_batch.contains_image_inputs()
+        )
+        if use_native_batch:
+            q, k, v, gate = qkv_layout(qkv)
+        elif self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
@@ -856,13 +908,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        if use_native_batch:
+            q, k = qknorm_rope(self, positions, q, k)
+        else:
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if use_native_batch and forward_batch.forward_mode.is_decode():
+                attn_output = apply_gqa_output_gate(attn_output, gate, forward_batch)
+            else:
+                gate = ops.tensor_unary(gate, 4) if _use_kunpeng_qwen else torch.sigmoid(gate)
+                attn_output = ops.tensor_binary(attn_output, gate, 1) if _use_kunpeng_qwen else attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -1007,6 +1065,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         is_nextn: bool = False,
+        shared_embed_tokens=None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1017,11 +1076,15 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Embedding layer
         if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                enable_tp=not is_dp_attention_enabled(),
+            self.embed_tokens = (
+                shared_embed_tokens
+                if shared_embed_tokens is not None
+                else VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    org_num_embeddings=config.vocab_size,
+                    enable_tp=not is_dp_attention_enabled(),
+                )
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -1058,6 +1121,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
         self.layers_to_capture = []
+        if _use_kunpeng_qwen:
+            configure_modules(self)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1975,5 +2040,42 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_groups=None,
         )
 
+
+if _use_kunpeng_qwen:
+    class Qwen3_5ForConditionalGeneration(nn.Module):
+        packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+        supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
+        def __init__(self, config, quant_config=None, prefix=""):
+            super().__init__()
+            from sglang.srt.layers.logits_processor import LogitsProcessor
+            from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+            self.config = config
+            text = config.text_config
+            self.model = Qwen3_5ForCausalLM(text, quant_config, prefix=add_prefix('model', prefix))
+            self.lm_head = ParallelLMHead(text.vocab_size, text.hidden_size, org_num_embeddings=text.vocab_size,
+                                          quant_config=None, prefix=add_prefix('lm_head', prefix))
+            from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import linear
+            self.lm_head._cpu_lm_head_apply = linear
+            self.logits_processor = LogitsProcessor(text)
+            self.pp_group = get_pp_group()
+            self.is_mrope_enabled = False
+        def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
+            if forward_batch.contains_image_inputs():
+                raise ValueError('This explicit Kunpeng build supports text forward only')
+            hidden = self.model(input_ids, positions, forward_batch, input_embeds=input_embeds)
+            return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
+        def load_weights(self, weights):
+            loaded = Qwen3_5ForCausalLM.load_weights(self, weights)
+            return loaded
+        def get_input_embeddings(self):
+            return self.model.embed_tokens
+        @property
+        def start_layer(self):
+            return self.model.start_layer
+        @property
+        def end_layer(self):
+            return self.model.end_layer
+        def pad_input_ids(self, input_ids, mm_inputs):
+            return input_ids
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

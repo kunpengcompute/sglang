@@ -251,7 +251,14 @@ class KunpengGraphRunner:
                 if not _hbw_resident_non_expert:
                     continue
                 used_before = pool.used_bytes
-                tensor_hbw = pool.move_to_hbw(param, label="non_expert_weights")
+                owner_name, _, field = name.rpartition('.')
+                owner = self.model_runner.model.get_submodule(owner_name)
+                tail = getattr(owner, '_cpu920f_w8a8_scale_storage', None)
+                if field == 'weight_scale' and tail is not None:
+                    owner._cpu920f_w8a8_scale_storage = pool.move_to_hbw(tail, label='weight_scale_with_tail')
+                    tensor_hbw = owner._cpu920f_w8a8_scale_storage[:param.shape[0]]
+                else:
+                    tensor_hbw = pool.move_to_hbw(param, label="non_expert_weights")
                 non_expert_bytes += pool.used_bytes - used_before
             param.data = tensor_hbw
 
@@ -630,6 +637,9 @@ class KunpengGraphRunner:
         The input set differs per forward mode; PP proxy tensors are appended
         when pipeline parallelism is active, and None entries are filtered out.
         """
+        backend = self._resolve_attn_backend(self.model_runner, forward_batch)
+        if hasattr(backend, "get_graph_inputs"):
+            return backend.get_graph_inputs(forward_batch)
         forward_mode = forward_batch.forward_mode
         attn_backend = self._resolve_attn_backend(
             self.model_runner, forward_batch
@@ -894,6 +904,11 @@ class KunpengGraphRunner:
         self, forward_batch: ForwardBatch
     ) -> List[torch.Tensor]:
         fixed = self.graph_fixed_weights[:]
+        backend = self._resolve_attn_backend(self.model_runner, forward_batch)
+        if hasattr(backend, "get_graph_fixed_tensors"):
+            fixed.extend(backend.get_graph_fixed_tensors(forward_batch))
+            seen = set()
+            return [t for t in fixed if not (t.untyped_storage().data_ptr() in seen or seen.add(t.untyped_storage().data_ptr()))]
         for kv in self.model_runner.token_to_kv_pool.kv_buffer:
             fixed.append(kv)
         # DSA real indexer: the index-K pool buffers (allocated separately
@@ -1338,6 +1353,7 @@ class KunpengGraphRunner:
         global last_call_timestamp
         if (
             not skip_idle_log
+            and os.environ.get("SGLANG_KUNPENG_GRAPH_LOG_REPLAY", "1") != "0"
             and os.environ.get("SGLANG_KUNPENG_PP_PROFILE", "0") == "0"
         ):
             logger.info(f"[graph] run {1000 * (t1 - t0):.3f} ms, others {1000 * (t0 - last_call_timestamp):.3f} ms.")

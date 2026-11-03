@@ -243,6 +243,13 @@ class MambaPool:
             enable=enable_memory_saver
         )
         num_mamba_layers = len(mamba_layer_ids)
+        def state_zeros(*, size, dtype, device):
+            from sglang.srt.utils import is_kunpeng_hbw_pool
+            if str(device) == 'cpu' and is_kunpeng_hbw_pool():
+                from sglang.srt.hardware_backend.cpu_kunpeng.allocator.kunpeng_hbw_allocator import KunpengHBWPool
+                tensor = KunpengHBWPool.get_instance().alloc(size, dtype)
+                return tensor.zero_()
+            return torch.zeros(size=size, dtype=dtype, device=device)
 
         self.size = size
         self.device = device
@@ -258,7 +265,7 @@ class MambaPool:
             else nullcontext()
         ):
             conv_state = [
-                torch.zeros(
+                state_zeros(
                     size=(num_mamba_layers, size + 1) + conv_shape,
                     dtype=conv_dtype,
                     device=device,
@@ -281,7 +288,7 @@ class MambaPool:
                 # CPU uses a different layout of conv_state for kernel optimization
                 conv_state = _init_amx_conv_state(conv_state)
 
-            temporal_state = torch.zeros(
+            temporal_state = state_zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,
                 device=device,

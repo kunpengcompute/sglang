@@ -148,6 +148,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        prepare = getattr(layer, "_cpu_linear_prepare", None)
+        if prepare is not None:
+            return prepare(layer)
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
@@ -157,6 +160,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        apply = getattr(layer, "_cpu_linear_apply", None)
+        if apply is not None:
+            return apply(layer, x, bias)
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

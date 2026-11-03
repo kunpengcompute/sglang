@@ -929,6 +929,8 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            elif _is_cpu_920f and getattr(lm_head, '_cpu_lm_head_apply', None) is not None:
+                logits = lm_head._cpu_lm_head_apply(hidden_states, lm_head, embedding_bias)
             elif _is_cpu_920f:
                 M, K = hidden_states.shape
                 # The optimal kernel of BGEMM requires M to be a multiple of 64, so we need to align M to 64.
