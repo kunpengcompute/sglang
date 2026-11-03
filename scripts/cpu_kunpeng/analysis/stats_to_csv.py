@@ -19,7 +19,10 @@
 #     working directory), with per-stage reference sections appended.
 #   Mode 2 (legacy): stats_to_csv.py <in.jsonl> <out.csv> [batch_size]
 #     Converts a single profile jsonl into stats csv.
+#   Both modes merge ops carrying a shape suffix (e.g. igemm@M16N3584K7168)
+#   into a single row (igemm); pass --split-shapes to keep them separate.
 
+import argparse
 import glob
 import json
 import os
@@ -71,72 +74,37 @@ def compute_stats(durs, num_runs):
     }
 
 
-def to_csv(input_path, output_path, bs_filter=None):
-    modes = []
-    current_mode = None
-    current_run = []
-    runs_by_mode = []
+def _norm_op_name(name, split_shapes):
+    # Ops may carry a shape suffix from their call-site profile_name
+    # (e.g. "igemm@M16N3584K7168"); merge all shapes into one row unless
+    # split_shapes is set.
+    if split_shapes:
+        return name
+    return name.split("@", 1)[0]
 
-    for line in open(input_path):
-        for obj in parse_line_objs(line):
-            if obj["_type"] == "meta":
-                if current_run and current_mode is not None:
-                    runs_by_mode[-1][1].append(current_run)
-                # Group by (forward_mode, batch_size): graphs are captured per
-                # (mode, total_tokens, batch_size), so runs of different batch
-                # sizes must not be averaged together.
-                current_mode = (
-                    obj.get("forward_mode", "unknown"),
-                    obj.get("batch_size"),
-                )
-                current_run = []
-                if not runs_by_mode or runs_by_mode[-1][0] != current_mode:
-                    runs_by_mode.append((current_mode, []))
-            elif obj["_type"] == "op":
-                current_run.append((obj["name"], obj["dur_ns"] / 1000.0))
 
-    if current_run and current_mode is not None:
-        runs_by_mode[-1][1].append(current_run)
-
-    op_stats = {}
-    op_order = {}
-    for mode_name, all_runs in runs_by_mode:
-        # Optional filter: only keep runs matching a given batch size
-        if bs_filter is not None and mode_name[1] != bs_filter:
-            continue
-        if len(all_runs) > 1:
-            all_runs = all_runs[1:]
-        groups = defaultdict(list)
-        seen = set()
-        order = []
-        for run in all_runs:
-            for name, dur in run:
-                groups[name].append(dur)
-                if name not in seen:
-                    seen.add(name)
-                    order.append(name)
-        op_order[mode_name] = order
-        stats = {}
-        num_runs = len(all_runs)
-        for name, durs in groups.items():
-            stats[name] = compute_stats(durs, num_runs)
-        total_all_ms = sum(s["total_ms"] for s in stats.values())
-        for name, s in stats.items():
-            s["percent"] = (
-                (s["total_ms"] / total_all_ms * 100) if total_all_ms > 0 else 0.0
-            )
-        op_stats[mode_name] = stats
+def to_csv(input_path, output_path, bs_filter=None, split_shapes=False):
+    # Pool ALL runs per (forward_mode, batch_size) across the whole file via
+    # load_stage_file + merge_stats. The same key may appear in several
+    # non-contiguous segments (e.g. DECODE and DRAFT_EXTEND alternate); the
+    # old per-segment implementation keyed op_stats/op_order by (mode, bs),
+    # so later segments silently overwrote earlier ones with the same key.
+    # merge_stats also drops each group's first (warmup) run.
+    group_order, groups = load_stage_file(input_path, split_shapes)
+    results = merge_stats([(group_order, groups)])
 
     with open(output_path, "w") as f:
-        for mode_name, stats in op_stats.items():
-            mode, batch_size = mode_name
+        for (mode, batch_size), order, stats in results:
+            # Optional filter: only keep groups matching a given batch size
+            if bs_filter is not None and batch_size != bs_filter:
+                continue
             title = (
                 f"{mode} (batch_size={batch_size})" if batch_size is not None else mode
             )
             f.write(f"## {title}\n")
             f.write(",count,min_us,max_us,avg_us,total_ms,percent\n")
             total_ms = 0
-            for name in op_order.get(mode_name, []):
+            for name in order:
                 s = stats[name]
                 f.write(
                     f"{name},{s['count']:.1f},{s['min_us']:.1f},{s['max_us']:.1f},"
@@ -147,7 +115,7 @@ def to_csv(input_path, output_path, bs_filter=None):
             f.write("\n")
 
 
-def load_stage_file(path):
+def load_stage_file(path, split_shapes=False):
     """Parse one profile jsonl into per-(mode, bs) run lists.
 
     Returns (group_order, groups):
@@ -173,7 +141,9 @@ def load_stage_file(path):
                     group_order.append(cur_key)
                 cur_run = []
             elif obj.get("_type") == "op" and cur_run is not None:
-                cur_run.append((obj["name"], obj["dur_ns"] / 1000.0))
+                cur_run.append(
+                    (_norm_op_name(obj["name"], split_shapes), obj["dur_ns"] / 1000.0)
+                )
     close_run()
     return group_order, groups
 
@@ -275,7 +245,7 @@ def write_table_rows(f, rows):
         f.write("\n")
 
 
-def merge_to_csv(path, rank):
+def merge_to_csv(path, rank, split_shapes=False, with_sources=True):
     profiler_dir = (
         path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
     )
@@ -300,7 +270,7 @@ def merge_to_csv(path, rank):
 
     stages = []
     for file_path in files:
-        group_order, groups = load_stage_file(file_path)
+        group_order, groups = load_stage_file(file_path, split_shapes)
         stages.append((group_order, groups))
 
     # Write the summary CSV to the current working directory instead of the
@@ -315,19 +285,72 @@ def merge_to_csv(path, rank):
         # yields on its own, labeled by source file. DRAFT_EXTEND (MTP
         # draft) groups are already covered by the merged summary above,
         # so skip them here to avoid repeating that data.
-        for file_path, (group_order, groups) in zip(files, stages):
-            f.write(f"## source: {os.path.basename(file_path)}\n")
-            kept_order = [k for k in group_order if k[0] != "DRAFT_EXTEND"]
-            kept_groups = {k: v for k, v in groups.items() if k[0] != "DRAFT_EXTEND"}
-            write_table_rows(f, _mode_rows(merge_stats([(kept_order, kept_groups)])))
+        if with_sources:
+            for file_path, (group_order, groups) in zip(files, stages):
+                f.write(f"## source: {os.path.basename(file_path)}\n")
+                kept_order = [k for k in group_order if k[0] != "DRAFT_EXTEND"]
+                kept_groups = {
+                    k: v for k, v in groups.items() if k[0] != "DRAFT_EXTEND"
+                }
+                write_table_rows(
+                    f, _mode_rows(merge_stats([(kept_order, kept_groups)]))
+                )
 
     print(f"Wrote merged stats from {len(files)} file(s) to {output_path}")
 
 
-if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[2].lstrip("-").isdigit():
-        merge_to_csv(sys.argv[1], int(sys.argv[2]))
-    else:
-        to_csv(
-            sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else None
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert Kunpeng graph profile jsonl(s) into stats csv. "
+        "Mode 1: <profiler_dir_or_jsonl> <tp_rank> merges "
+        "sglang_graph_pp*_dp*_tp<tp_rank>.jsonl into "
+        "sglang_graph_tp<tp_rank>_<YYYYMMDDHHMM>.csv in the current directory. "
+        "Mode 2: <in.jsonl> <out.csv> [batch_size] converts a single jsonl."
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        metavar="ARG",
+        help="mode 1: <profiler_dir_or_jsonl> <tp_rank>; "
+        "mode 2: <in.jsonl> <out.csv> [batch_size]",
+    )
+    parser.add_argument(
+        "--split-shapes",
+        action="store_true",
+        help="keep ops with a shape suffix (e.g. igemm@M16N3584K7168) as "
+        "separate rows; by default all shapes merge into one row (igemm)",
+    )
+    parser.add_argument(
+        "--no-sources",
+        action="store_true",
+        help="skip the per-stage '## source:' reference sections in mode 1 "
+        "(only the merged stats are written)",
+    )
+    ns = parser.parse_args()
+    inputs = ns.inputs
+    split_shapes = ns.split_shapes
+    with_sources = not ns.no_sources
+
+    if len(inputs) == 2 and inputs[1].lstrip("-").isdigit():
+        merge_to_csv(
+            inputs[0],
+            int(inputs[1]),
+            split_shapes=split_shapes,
+            with_sources=with_sources,
         )
+    elif 2 <= len(inputs) <= 3:
+        to_csv(
+            inputs[0],
+            inputs[1],
+            int(inputs[2]) if len(inputs) > 2 else None,
+            split_shapes=split_shapes,
+        )
+    else:
+        parser.error(
+            "expected either <profiler_dir_or_jsonl> <tp_rank> "
+            "or <in.jsonl> <out.csv> [batch_size]"
+        )
+
+
+if __name__ == "__main__":
+    main()

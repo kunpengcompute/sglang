@@ -1285,7 +1285,11 @@ class Indexer(MultiPlatformOp):
             assert q_shard.dtype == torch.bfloat16, (
                 f"wq_b IGEMM output must be bf16, got {q_shard.dtype}"
             )
-            q = get_attention_tp_group().batch_all_gather(q_shard, dim=-1)
+            q = get_attention_tp_group().batch_all_gather(
+                q_shard,
+                dim=-1,
+                profile_name="shm_batched_allgather_kunpeng@indexer.q",
+            )
         else:
             weights = _bf16_linear_kunpeng(x, self.weights_proj.weight)
             q, _ = self.wq_b(q_lora)

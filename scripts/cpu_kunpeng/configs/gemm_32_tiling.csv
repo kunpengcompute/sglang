@@ -1,3 +1,5 @@
+# is_prefill,gemm_type,n,k,tile_n,tile_k
+# gemm_type: 0=igemm, 1=bgemm
 1,0,264,7168,264,896
 1,0,1536,1536,768,1536
 1,0,2048,512,256,512
