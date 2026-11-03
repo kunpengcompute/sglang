@@ -96,6 +96,15 @@ export PP_SIZE=1  # >1 enable pp  eg: 2
 export REDUNDANT_EXPERTS=0
 export INIT_EXPERT_LOCATION=""
 export EP_DISPATCH_ALGORITHM=""  # e.g. static, dynamic
+# Expert heat collection is opt-in per instance; reset inherited shell state.
+export SGLANG_KUNPENG_EXPERT_DISTRIBUTION_AUTO_DUMP=0
+# 1 = record the NextN (MTP draft) layer's expert heat into the target's
+# last MoE-layer row (kunpeng_cpu backend only)
+export SGLANG_KUNPENG_EXPERT_DISTRIBUTION_INCLUDE_MTP=0
+export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="/tmp"
+export EXPERT_DISTRIBUTION_RECORDER_MODE=""
+export EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE=""
+export EPLB_ALGORITHM=""
 # Dynamic redundant-expert remap shuffle mode: 0 = round-robin, 1 = random
 export SGLANG_KUNPENG_MOE_SHUFFLE_MODE=0
 

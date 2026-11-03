@@ -128,8 +128,65 @@ MTP steps每+1，dense相关SHM按steps+1线性放大（见SGLANG_KUNPENG_ETP_DE
 
 - tp%ep==0且moe_tp>1；moe_dp==1；仅decode角色
 - moe_tp整除每节点rank数（组不出节点）
-- 无EPLB、冗余专家、静态路由、fused shared experts（后者自动关闭并打日志）
-- FORCE_LOAD_BALANCE放行但仅限压测（改写路由、不保正确性；每个expert均匀即每个moe_tp组dense行数均匀）
+- 仅支持重启生效的static EPLB；不支持在线EPLB、冗余专家、`ENABLE_STATIC_ROUTING`、fused shared experts（后者自动关闭并打日志）
+- FORCE_LOAD_BALANCE放行但仅限压测（改写路由、不保正确性；每个expert均匀即每个moe_tp组dense行数均匀）；采集热度或导入静态布局时必须设为0
+
+### 静态 EPLB（采集→导出→导入）
+
+仅在ETP decode实例上操作，prefill保持原配置。以下变量由`server.sh`透传；热度目录需要各decode节点可访问。
+
+1. 采集前关闭压测用的强制均衡，配置recorder并启动server：
+
+```bash
+export SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE=0
+export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=/home/xxxx/eplb
+export EXPERT_DISTRIBUTION_RECORDER_MODE=stat
+export EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE=2048
+export EPLB_REBALANCE_NUM_ITERATIONS=2048
+```
+
+2. 通过实例首节点HTTP端口开始记录，跑一把数据集，然后导出：
+
+```bash
+curl --location 'http://127.0.0.1:8000/start_expert_distribution_record'
+# 跑数据集
+curl --location 'http://127.0.0.1:8000/dump_expert_distribution_record'
+```
+
+导出文件为`expert_distribution_recorder_<timestamp>.pt`，内容是按层聚合的`logical_count`。采集支持eager和graph replay；ETP仅group leader计数，PP仅全局rank 0写文件，MTP只统计target模型。
+
+3. 将同一个`.pt`文件分发到全部decode节点，关闭recorder并配置静态导入后重启：
+
+```bash
+export SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE=0
+export EP_DISPATCH_ALGORITHM=static
+export INIT_EXPERT_LOCATION=/home/xxxx/eplb/expert_distribution_recorder_<timestamp>.pt
+# 不再设置EXPERT_DISTRIBUTION_RECORDER_MODE；EPLB_ALGORITHM缺省为auto
+```
+
+静态导入会跳过按trivial布局生成的`experts_etp{N}`目录，必须保留原始`experts/`整专家权重，由loader按新映射加载并执行ETP切分。NextN draft不参与热度采集，其权重、HBW和路由统一复用target最后一层映射。该流程只在重启时生效，不进行在线权重或专家位置更新。
+
+### 无 HTTP 的自动采集与离线合并（PP 临时流程）
+
+需要避开PP控制请求和dump集合通信时，可在采集实例增加：
+
+```bash
+export SGLANG_KUNPENG_EXPERT_DISTRIBUTION_AUTO_DUMP=1
+export EXPERT_DISTRIBUTION_RECORDER_MODE=stat
+export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=/home/xxxx/eplb/raw
+```
+
+recorder随server自动启动，不需要调用start/stop/dump HTTP端点。target模型每次非idle forward结束后，仅ETP group leader把本次热度累加到本地汇总，并覆盖写`expert_distribution_recorder_rank_<world_rank>.pt`中的最新累计快照；普通EP仍由每个rank写出，draft、idle和ETP peer不写。每个leader固定只有一个文件，不保存逐forward历史，因此文件数量不随请求数增长，单个文件也只包含有效热度而不包含循环缓冲区中的空槽。该路径不做`all_reduce`或指标broadcast，因此不存在PP间dump同步。记录中的`forward_id`只用于本rank排查，不同DP的forward编号不要求对齐，离线合并时直接累加各leader的最新快照。
+
+数据集跑完后，等所有rank文件落盘，再合并成现有静态导入格式：
+
+```bash
+python scripts/cpu_kunpeng/analysis/merge_expert_distribution.py \
+    --input-dir /home/xxxx/eplb/raw \
+    --output /home/xxxx/eplb/expert_distribution_recorder_merged.pt
+```
+
+将合并后的文件按上一节方式分发并导入。每个rank文件在每次dump时整体覆盖为最新累计快照，文件大小不随forward轮数增长；重新调用start_record会清空该rank的本地累计。
 
 ## 4. 性能与调优（32p-etp8实测，DSV3，单请求1kin/128out/MTP1）
 

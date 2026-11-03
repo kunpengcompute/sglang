@@ -1564,6 +1564,18 @@ class KunpengGraphRunner:
                 fixed.append(at_counter)
         except Exception:
             pass
+        try:
+            from sglang.srt.eplb.expert_distribution import (
+                get_global_expert_distribution_recorder,
+            )
+
+            recorder_counter = (
+                get_global_expert_distribution_recorder().get_kunpeng_counter()
+            )
+            if recorder_counter is not None:
+                fixed.append(recorder_counter)
+        except Exception:
+            pass
         # EPLB static dispatch map (logical -> physical expert per layer),
         # consumed by remap_topk_ids_to_rank_slot_kunpeng during graph
         # capture.  Each MoE layer reads its own `[layer_id, :]` slice view,

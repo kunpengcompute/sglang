@@ -99,6 +99,20 @@ if [[ -n "${INIT_EXPERT_LOCATION:-}" ]]; then
     BASE_ARGS+=(--init-expert-location "$INIT_EXPERT_LOCATION")
 fi
 
+# Static EPLB heat recording and import options
+if [[ -n "${EXPERT_DISTRIBUTION_RECORDER_MODE:-}" ]]; then
+    BASE_ARGS+=(--expert-distribution-recorder-mode "$EXPERT_DISTRIBUTION_RECORDER_MODE")
+fi
+if [[ -n "${EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE:-}" ]]; then
+    BASE_ARGS+=(--expert-distribution-recorder-buffer-size "$EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE")
+fi
+if [[ -n "${EPLB_REBALANCE_NUM_ITERATIONS:-}" ]]; then
+    BASE_ARGS+=(--eplb-rebalance-num-iterations "$EPLB_REBALANCE_NUM_ITERATIONS")
+fi
+if [[ -n "${EPLB_ALGORITHM:-}" ]]; then
+    BASE_ARGS+=(--eplb-algorithm "$EPLB_ALGORITHM")
+fi
+
 # Disable radix cache
 if [[ "$SGLANG_DISABLE_RADIX_CACHE" == "1" ]]; then
     BASE_ARGS+=(--disable-radix-cache)

@@ -1772,7 +1772,16 @@ class KunpengStateLoader(BaseModelLoader):
         if moe_modules:
             first_moe = next(iter(moe_modules.values()))
             moe_tp_size = getattr(first_moe, "moe_tp_size", 1)
-            if moe_tp_size > 1:
+            trivial_expert_location = (
+                get_global_server_args().init_expert_location == "trivial"
+            )
+            if moe_tp_size > 1 and not trivial_expert_location:
+                logger.info(
+                    "KunpengStateLoader: skip ETP pre-sharded weights because "
+                    "the expert-location mapping is non-trivial; load and shard "
+                    "the original experts instead."
+                )
+            if moe_tp_size > 1 and trivial_expert_location:
                 etp_preshard_dir = os.path.join(
                     model_config.model_path, f"experts_etp{moe_tp_size}"
                 )
@@ -1817,10 +1826,15 @@ class KunpengStateLoader(BaseModelLoader):
             if not os.path.isdir(layer_dir):
                 raise RuntimeError(f"Cannot find expert layer dir `{layer_dir}`")
 
+            metadata_layer_id = (
+                metadata.num_layers - 1 if model_config.is_draft_model else layer_id
+            )
             for local_i in range(moe._num_local_routed):
                 global_phys = moe.moe_ep_rank * moe._num_local_routed + local_i
                 logical_id = int(
-                    metadata.physical_to_logical_map[layer_id, global_phys].item()
+                    metadata.physical_to_logical_map[
+                        metadata_layer_id, global_phys
+                    ].item()
                 )
 
                 # Invalid (-1) slots are never routed to, so their weights are
@@ -1844,8 +1858,82 @@ class KunpengStateLoader(BaseModelLoader):
                 loaded += 1
 
         logger.info("KunpengStateLoader: loaded %d preprocessed expert files.", loaded)
+        self._log_expert_group_heat_after_load(
+            model_config, metadata, sorted(moe_modules.keys())
+        )
 
         return loaded > 0
+
+    def _log_expert_group_heat_after_load(
+        self, model_config: ModelConfig, metadata, layer_ids: List[int]
+    ) -> None:
+        if model_config.is_draft_model or get_tensor_model_parallel_rank() != 0:
+            return
+
+        expert_location = get_global_server_args().init_expert_location
+        if not expert_location.endswith(".pt"):
+            return
+        data = torch.load(expert_location, weights_only=True, map_location="cpu")
+        logical_count = data.get("logical_count")
+        if logical_count is None:
+            return
+
+        if logical_count.ndim == 2:
+            logical_count = logical_count.unsqueeze(0)
+        heat = logical_count.to(torch.int64).sum(dim=0)
+        physical_to_logical = metadata.physical_to_logical_map_cpu.to(torch.int64)
+        physical_heat = heat.gather(1, physical_to_logical)
+        group_heat = physical_heat.view(
+            metadata.num_layers,
+            metadata.ep_size,
+            metadata.num_local_physical_experts,
+        ).sum(dim=-1)
+
+        logger.info(
+            "EPLB group heat after weight load: groups_per_layer=%d; "
+            "max_per_mean closer to 1 means better balance; "
+            "max_per_lower closer to 1 means closer to the theoretical lower bound",
+            metadata.ep_size,
+        )
+        for layer_id in layer_ids:
+            values = group_heat[layer_id]
+            total = values.sum().item()
+            mean = total / metadata.ep_size
+            group_max = values.max().item()
+            expert_max = heat[layer_id].max().item()
+            # Every group must hold exactly num_local_physical_experts
+            # experts, so the group containing the hottest expert also
+            # carries the (num_local_physical_experts - 1) coldest experts
+            # of the layer: no packing can make the hottest group lighter
+            # than expert_max + that companion floor.
+            companion_floor = (
+                heat[layer_id]
+                .sort()
+                .values[: metadata.num_local_physical_experts - 1]
+                .sum()
+                .item()
+            )
+            lower_bound = max(
+                (total + metadata.ep_size - 1) // metadata.ep_size,
+                expert_max + companion_floor,
+            )
+            max_per_mean = group_max / mean if mean > 0 else 0.0
+            max_per_lower = group_max / lower_bound if lower_bound > 0 else 0.0
+            logger.info(
+                "EPLB group heat: layer=%d groups=%s min=%d max=%d "
+                "mean=%.1f max_per_mean=%.4f expert_max=%d lower_bound=%d "
+                "max_minus_lower=%d max_per_lower=%.4f",
+                layer_id,
+                values.tolist(),
+                values.min().item(),
+                group_max,
+                mean,
+                max_per_mean,
+                expert_max,
+                lower_bound,
+                group_max - lower_bound,
+                max_per_lower,
+            )
 
     def _copy_expert_weights(
         self,

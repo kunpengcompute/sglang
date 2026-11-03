@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
     get_attn_tp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.graph import ops as kunpeng
 from sglang.srt.hardware_backend.cpu_kunpeng.at_trace import (
     ensure_save_on_exit,
@@ -817,6 +818,22 @@ class KunpengMoE(FusedMoE):
                 dispatch_output.recv_experts_offset,
                 at_counter,
                 self.layer_id,
+                num_local_experts,
+            )
+        recorder_counter = (
+            get_global_expert_distribution_recorder().get_kunpeng_counter()
+        )
+        dispatcher_state = _KunpengDispatcherState.get()
+        if recorder_counter is not None and (
+            not dispatcher_state.etp_enabled or dispatcher_state.moe_tp_rank == 0
+        ):
+            kunpeng.record_expert_activation_kunpeng(
+                dispatch_output.recv_experts_offset,
+                recorder_counter,
+                # NextN (MTP draft) layers record into the target's last
+                # MoE-layer row via `record_layer_id` (see
+                # Glm4MoeSparseMoeBlock); all other layers use layer_id.
+                getattr(self, "record_layer_id", self.layer_id),
                 num_local_experts,
             )
         kunpeng.igemm_fusedmoe_gateup_kunpeng(

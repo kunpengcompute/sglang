@@ -3290,6 +3290,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             save_activate_tokens_trace()
 
+            from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+                _KunpengDispatcherState,
+            )
+
+            # Draft-worker (NextN) forwards dump too when MTP heat collection
+            # is on: with a size-1 recorder buffer each forward pass
+            # overwrites the previous step's counts, so a draft step's counts
+            # would otherwise never reach a dump (dumps only ran after target
+            # forwards). The draft layer records into the target's last
+            # MoE-layer row (record_layer_id), so merged snapshots see the
+            # full per-round serving heat.
+            record_mtp = (
+                os.environ.get("SGLANG_KUNPENG_EXPERT_DISTRIBUTION_INCLUDE_MTP", "0")
+                == "1"
+            )
+            if (
+                (not self.is_draft_worker or record_mtp)
+                and not forward_batch.forward_mode.is_idle()
+                and _KunpengDispatcherState.get().moe_tp_rank == 0
+                and os.environ.get("SGLANG_KUNPENG_EXPERT_DISTRIBUTION_AUTO_DUMP", "0")
+                == "1"
+            ):
+                recorder = get_global_expert_distribution_recorder()
+                if recorder.recording:
+                    recorder.dump_record(
+                        collective=False, forward_pass_id=self.forward_pass_id
+                    )
+
         return output
 
     def _forward_raw(

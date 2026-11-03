@@ -397,6 +397,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ):
         nn.Module.__init__(self)
         self.top_k = config.num_experts_per_tok
@@ -413,6 +414,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.is_nextn = is_nextn
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -440,6 +442,19 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
         )
+        if is_nextn:
+            # The NextN draft layer dispatches through the target's last
+            # MoE-layer EPLB mapping (ExpertLocationDispatchInfo.init_new
+            # remaps layer_id to num_layers - 1), so its recorded expert
+            # heat must land in that same recorder counter row:
+            # KunpengMoE.run_moe_core writes `record_layer_id` when set.
+            from sglang.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            metadata = get_global_expert_location_metadata()
+            if metadata is not None:
+                self.experts.record_layer_id = metadata.num_layers - 1
 
         self.topk = TopK(
             top_k=self.top_k + self.num_fused_shared_experts,
@@ -675,6 +690,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
+                    is_nextn=self.is_nextn,
                 ),
             )
         else:
@@ -729,6 +745,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
+                        is_nextn=self.is_nextn,
                     ),
                 )
         else:
@@ -847,6 +864,7 @@ class Glm4MoeDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
+                is_nextn=is_nextn,
             )
         else:
             if enable_moe_dense_fully_dp():
