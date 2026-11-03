@@ -33,7 +33,7 @@ conda activate sgl-cpu
 
 运行与编译还需依赖以下两个组件，具体安装步骤请前往对应仓库查看：
 
-- **kutacc**：鲲鹏CPU通信与算子库（RDMA集合通信、shm allreduce等），使用<https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang>分支（RDMA allgather/broadcast功能需使用sglang_930分支构建，见3.7.1第8条）。
+- **kutacc**：鲲鹏CPU通信与算子库（RDMA集合通信、shm allreduce等），使用<https://gitcode.com/zhengzhong722/kutacc/tree/sglang_930>分支。
 - **kupl**：鲲鹏加速运行时（kupl多线程后端、SHM/SDMA等），使用<https://gitcode.com/kunpengcompute/kupl/tree/sglang_830>分支。
 
 在PD（Prefill-Decode）分离部署模式下，需额外安装SGLang Model Gateway与Mooncake两个组件，以实现Prefill实例与Decode实例之间的请求分配以及KVCache数据传输：

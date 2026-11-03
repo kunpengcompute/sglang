@@ -33,7 +33,7 @@ In addition, compiling the SGLang kernel module requires the Bisheng Compiler. P
 
 Two more components are required for running and compilation; see the corresponding repositories for detailed installation steps:
 
-- **kutacc**: Kunpeng CPU communication and operator library (RDMA collectives, shm allreduce, etc.); use the branch at <https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang> (the RDMA allgather/broadcast features require a kutacc build from the sglang_930 branch, see Section 3.7.1 item 8).
+- **kutacc**: Kunpeng CPU communication and operator library (RDMA collectives, shm allreduce, etc.); use the branch at <https://gitcode.com/zhengzhong722/kutacc/tree/sglang_930>.
 - **kupl**: Kunpeng acceleration runtime (kupl multi-threading backend, SHM/SDMA, etc.); use the branch at <https://gitcode.com/kunpengcompute/kupl/tree/sglang_830>.
 
 In PD (Prefill-Decode) disaggregated deployment mode, two additional components, SGLang Model Gateway and Mooncake, are required to handle request distribution and KVCache data transfer between Prefill and Decode instances:
