@@ -250,7 +250,7 @@ from sglang.srt.utils.numa_utils import (
     zmq_context_core_binding,
     ZmqOffset,
 )
-from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler 
+from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import Kunpeng_PP_Profiler
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -521,6 +521,15 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        from sglang.srt.model_executor.model_capabilities import (
+            initial_policy_for_model_config,
+            validate_startup_capabilities,
+        )
+
+        self._runtime_capability_policy = initial_policy_for_model_config(
+            self.model_config
+        )
+        validate_startup_capabilities(self._runtime_capability_policy, self.server_args)
         if _is_npu:
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
@@ -3610,6 +3619,39 @@ class Scheduler(
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
+        # Existing control endpoint is called between batches, outside timing.
+        runner = self.tp_worker.model_runner.graph_runner
+        if hasattr(runner, "graph_coverage_snapshot"):
+            ret["kunpeng_graph_coverage"] = runner.graph_coverage_snapshot()
+        evidence_dir = os.environ.get("SGLANG_KUNPENG_STAGE_EVIDENCE_DIR")
+        if hasattr(runner, "memory_placement_snapshot") and (
+            evidence_dir
+            or os.environ.get("SGLANG_KUNPENG_HBW_LOG_PLACEMENT", "0") == "1"
+        ):
+            ret["kunpeng_memory_placement"] = runner.memory_placement_snapshot()
+        if evidence_dir and (
+            "kunpeng_graph_coverage" in ret or "kunpeng_memory_placement" in ret
+        ):
+            import json
+            from pathlib import Path
+
+            directory = Path(evidence_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            target = directory / f"rank{self.tp_rank}_latest.json"
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "rank": self.tp_rank,
+                        "graph": ret.get("kunpeng_graph_coverage"),
+                        "memory": ret.get("kunpeng_memory_placement"),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            os.replace(temporary, target)
+
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
@@ -4127,6 +4169,14 @@ def configure_scheduler_process(
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
             numa_bind_to_node(numa_node)
+
+    if (
+        _is_cpu_920f
+        and os.environ.get("SGLANG_KUNPENG_TORCH_NUM_THREADS")
+        and os.environ.get("TORCH_USE_KUPL") == "1"
+    ):
+        torch.set_num_threads(int(os.environ["SGLANG_KUNPENG_TORCH_NUM_THREADS"]))
+        logger.info("Kunpeng torch_num_threads=%s", torch.get_num_threads())
 
     return dp_rank
 

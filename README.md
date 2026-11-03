@@ -2,6 +2,7 @@
 
 ## Release Notes
 
+- \[2026/10] 新增GLM-5.3部署指南（权重预处理、配置、启动）；新增多级KV缓存（HiCache）与mooncake L3后端部署说明、mooncake/store部署角色。
 - \[2026/09] 更新部署文档：新增多实例部署、分离tokenizer的PD分离部署方式及相关环境变量说明。
 - \[2026/05] 本版本基于SGLang官方v0.5.11版本进行优化适配。
 
@@ -32,7 +33,7 @@ conda activate sgl-cpu
 
 运行与编译还需依赖以下两个组件，具体安装步骤请前往对应仓库查看：
 
-- **kutacc**：鲲鹏CPU通信与算子库（RDMA集合通信、shm allreduce等），使用<https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang>分支。
+- **kutacc**：鲲鹏CPU通信与算子库（RDMA集合通信、shm allreduce等），使用<https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang>分支（RDMA allgather/broadcast功能需使用sglang_930分支构建，见3.7.1第8条）。
 - **kupl**：鲲鹏加速运行时（kupl多线程后端、SHM/SDMA等），使用<https://gitcode.com/kunpengcompute/kupl/tree/sglang_830>分支。
 
 在PD（Prefill-Decode）分离部署模式下，需额外安装SGLang Model Gateway与Mooncake两个组件，以实现Prefill实例与Decode实例之间的请求分配以及KVCache数据传输：
@@ -93,14 +94,17 @@ git apply pytorch-v2.9.0-sglang-0830.patch
 | 文件                                          | 说明                                              |
 | ------------------------------------------- | ----------------------------------------------- |
 | `runtime/env_base.sh`                       | 共享默认配置：路径、`INSTANCES`实例列表、TP/DP/EP/PP并行度、各类功能开关 |
+| `runtime/env_native.sh`                     | native角色默认值：节点集、SHM/HBW池、chunked prefill等（取prefill侧默认值）   |
 | `runtime/env_prefill.sh`                    | prefill角色默认值：节点集、master地址、端口/NUMA自动推导           |
 | `runtime/env_decode.sh`                     | decode角色默认值：节点集、master地址、端口/NUMA自动推导            |
+| `runtime/env_mooncake.sh` / `runtime/env_store.sh` | HiCache mooncake后端角色默认值（store master / store service，见3.6节） |
 | `.user_env.sh`                              | 集群级用户覆盖文件（先加载），可按角色参数分支配置                       |
 | `runtime/.user_env_base.sh`                 | 可选的全角色共享覆盖文件（在`.user_env.sh`之后加载）               |
+| `runtime/.user_env_native[_<instance>].sh`  | native角色/实例覆盖文件                                |
 | `runtime/.user_env_prefill[_<instance>].sh` | prefill角色/实例覆盖文件                                |
 | `runtime/.user_env_decode[_<instance>].sh`  | decode角色/实例覆盖文件                                 |
 
-模型路径、conda环境名、native节点信息（`NATIVE_IP_SPEC`/`NATIVE_IP_FILE`、`NATIVE_MASTER_ADDR`）在`runtime/env_base.sh`中配置（或通过`.user_env.sh`覆盖）；prefill/decode节点集与并行度在对应角色文件中配置。完整配置加载顺序见3.3节。
+模型路径、conda环境名、native节点信息（`NATIVE_IP_SPEC`/`NATIVE_IP_FILE`、`NATIVE_MASTER_ADDR`）在`runtime/env_base.sh`中配置（或通过`.user_env.sh`覆盖）；prefill/decode节点集与并行度在对应角色文件中配置。完整配置加载顺序见3.4节。
 
 由于V3量化版本权重加载较慢，可在配置文件中设置`LOAD_FORMAT`启用分片加载加速启动，支持`sharded_state`与`kunpeng_state`两种格式。首次使用前，需要用`scripts/cpu_kunpeng/model_processing/split_weights_dsv3.py`脚本对原始权重进行预处理。
 
@@ -111,13 +115,75 @@ sh launch.sh native
 sh stop.sh server native
 ```
 
-PD分离模式的部署方式见3.4节。
+PD分离模式的部署方式见3.5节。
 
-### 3.2 非DeepSeek模型使用
+### 3.2 GLM-5.3模型使用
 
-使用非DeepSeek模型时，需要注释掉`srt/models/registry.py`中第98\~102行的条件判断，这段逻辑会跳过非DeepSeek模型依赖的加载，其目的是提升启动加载速度。也可以将条件判断的值改成具体所用模型对应的值，例如`sglang.srt.models.qwen3`。
+GLM-5.3（`GlmMoeDsaForCausalLM`）复用DeepseekV2模型栈（MLA注意力 + DSA稀疏注意力indexer + MoE），且`sglang.srt.models.glm4_moe`已在`srt/models/registry.py`的920F模型白名单中，无需修改代码。部署使用与DeepSeek V3相同的配置文件与启动命令（见3.1节），区别仅在于权重预处理脚本、模型路径以及chat template/parsers。
 
-### 3.3 部署模式
+**1. 权重预处理**
+
+首次使用前，需使用`scripts/cpu_kunpeng/model_processing/split_weights_glm5.py`（而非`split_weights_dsv3.py`）对原始量化GLM-5.3权重进行预处理，然后设置`LOAD_FORMAT=kunpeng_state`启用分片加载。该脚本自动识别GLM-5导出命名规范（`<module>` + `<module>.scale`）与DeepSeek流水线命名规范（`<module>.weight` + `<module>.weight_scale`），并同时支持融合式（`gateup_proj`/`gate_up_proj`）与分离式（`gate_proj` + `up_proj`）gate/up导出（分离式导出会在切分时在线融合为`[gate; up]`）。
+
+非MoE权重（单次运行，按attention-TP rank输出）：
+
+```shell
+cd scripts/cpu_kunpeng/model_processing
+python split_weights_glm5.py \
+    --model_dir /path-to-glm5.3-quantized \
+    --output_dir /path-to-glm5.3-split \
+    --attention_tp_size 16 \
+    --num_hidden_layers 78
+```
+
+MoE专家权重（单次运行；可加`--layer_range <start> <end>`多机并行，每台机器写入互不重叠的层区间）：
+
+```shell
+python split_weights_glm5.py --moe \
+    --model_dir /path-to-glm5.3-quantized \
+    --output_dir /path-to-glm5.3-split \
+    --num_hidden_layers 78
+```
+
+`--num_hidden_layers`为主层数（GLM-5.3为78，见其`config.json`）。MTP层（第78层）会被重定向到独立的`{output_dir}_mtp/`目录，以便作为草稿模型独立加载。
+
+脚本处理的GLM-5.3特有切分逻辑：
+
+- `q_a_proj` + `kv_a_proj_with_mqa`融合为`fused_qkv_a_proj_with_mqa`，并按`--socket_tp_size`（默认8）沿dim0切分。
+- DSA indexer投影默认跟随模型侧attention-TP切分（`indexer.wq_b`沿dim0切分；`indexer.wk` / `indexer.weights_proj`沿dim1切分）。如需改为在每个rank上复制，请传入`--replicate-indexer`并在服务侧设置`SGLANG_KUNPENG_DISABLE_INDEXER_TP_SPLIT=1`。
+- 无scale的bf16张量（`kv_b_proj`、`indexer.wk`、`weights_proj`、`lm_head`、embedding等）原样拷贝。
+- 源分片为标准safetensors时，MoE专家走字节级快速路径（sendfile）；专家输出布局与DeepSeek脚本一致（`experts/layer_L/expert_E.safetensors`，`w13_weight` = 融合后的`[gate; up]`）。
+
+**2. 配置**
+
+在`runtime/env_base.sh`（或`.user_env.sh`）中，将路径指向切分输出目录并启用分片加载：
+
+```shell
+MODEL_PATH="/path-to-glm5.3-split"
+SPECULATIVE_DRAFT_MODEL_PATH="/path-to-glm5.3-split_mtp"
+export LOAD_FORMAT="kunpeng_state"
+```
+
+按需在`.user_env.sh`中为GLM设置chat template与parsers（参见`runtime/env_base.sh`中`CHAT_TEMPLATE` / `TOOL_CALL_PARSER` / `REASONING_PARSER`的相关说明），例如`TOOL_CALL_PARSER=glm47`。
+
+并行度（TP/DP/EP/PP）、native/PD模式以及MTP投机解码（`SGLANG_ENABLE_MTP=1`、`SPECULATIVE_DRAFT_MODEL_PATH`指向`_mtp`目录）的配置方式与DeepSeek V3完全一致——见3.1节、3.5节与3.7.1节。
+
+**3. 启动**
+
+与DeepSeek V3完全相同：
+
+```shell
+sh launch.sh native          # native模式
+sh stop.sh server native
+# 或PD分离部署流程（见3.5节）：
+sh launch.sh all
+```
+
+### 3.3 非DeepSeek模型使用
+
+使用非DeepSeek模型时，需要注释掉`srt/models/registry.py`中第99\~114行的条件判断，这段逻辑会跳过白名单之外模型依赖的加载，其目的是提升启动加载速度。也可以将条件判断的值改成具体所用模型对应的值，例如`sglang.srt.models.qwen3`。当前白名单已包含DeepSeek系列与GLM-5.3（`sglang.srt.models.glm4_moe`，见3.2节，无需修改）；Qwen3.5系列（`qwen3_5`/`qwen3_5_mtp`）可通过设置`SGLANG_KUNPENG_QWEN=1`放行，Qwen3.8单节点部署请参考[Qwen3.8部署指南](docs/kunpeng/Qwen3.8_README.md)。
+
+### 3.4 部署模式
 
 通过`./launch.sh <role> [instance]`选择部署角色：
 
@@ -126,7 +192,9 @@ PD分离模式的部署方式见3.4节。
 - **decode**：PD分离的decode角色。节点从`DECODE_IP_SPEC`/`DECODE_IP_FILE`读取（默认值见`runtime/env_decode.sh`）。
 - **router**：PD分离的router节点，单节点运行SGLang Model Gateway（`sgl-model-gateway`，Rust二进制，默认取conda环境内的`bin/sgl-model-gateway`，可用`MODEL_GATEWAY_BIN`指定），默认策略`cache_aware`。
 - **tokenizer**：在router节点启动某一侧的tokenizer HTTP server，用法`./launch.sh tokenizer <prefill|decode> [instance]`，PD分离模式下使用。
-- **all**：一键部署，按`INSTANCES`列表依次拉起各实例server集群、各实例tokenizer、router。
+- **mooncake**：HiCache L3后端为mooncake时，在`MOONCAKE_MASTER_NODE`（默认`ROUTER_IP`）上运行mooncake store master（默认取conda环境内的`bin/mooncake_master`，可用`MOONCAKE_MASTER_BIN`指定）。
+- **store**：在`MOONCAKE_STORE_NODE`上运行mooncake store service（实际持有L3共享内存段的进程）。
+- **all**：一键部署，按`INSTANCES`列表依次拉起各实例server集群、各实例tokenizer、router；当任一prefill/native实例启用HiCache且L3后端为mooncake时，会先自动拉起mooncake store master与store service。
 - **update**：重新生成`.time_env.sh`并更新NUMA二进制副本。
 
 脚本调用关系（`launch.sh`为纯任务分发器，实际逻辑位于子脚本）：
@@ -137,6 +205,8 @@ launch.sh（任务分发器：./launch.sh <role> [instance]）
   │      └─→ server.sh（单节点进程启动）
   ├─→ runtime/launch_tokenizer.sh（tokenizer：SSH到router节点）
   │      └─→ runtime/server_tokenizer.sh（tokenizer HTTP server）
+  ├─→ runtime/launch_mooncake.sh（mooncake：store master）
+  ├─→ runtime/launch_store.sh（store：store service）
   └─→ runtime/launch_router.sh（router：等待全部后端就绪后启动Model Gateway）
          └─→ runtime/server_router.sh（SGLang Model Gateway）
 ```
@@ -145,27 +215,28 @@ launch.sh（任务分发器：./launch.sh <role> [instance]）
 
 ```
 runtime/env_base.sh（共享默认值；内部依次加载.user_env.sh与runtime/.user_env_base.sh）
-  └─ runtime/env_prefill.sh / runtime/env_decode.sh（角色默认值，${VAR:-...}回退，不覆盖已设置的值）
+  └─ runtime/env_native.sh / runtime/env_prefill.sh / runtime/env_decode.sh / runtime/env_mooncake.sh / runtime/env_store.sh（角色默认值，${VAR:-...}回退，不覆盖已设置的值）
        └─ runtime/.user_env_<role>_<instance>.sh（指定实例时仅加载该实例文件）
           或 runtime/.user_env_<role>.sh（未指定实例时加载角色默认覆盖文件）
 ```
 
-角色默认值：prefill侧`SGLANG_KUNPENG_MAX_SEQ_NUM=8`、`SGLANG_KUNPENG_MAX_CUR_LEN=576`；decode侧`SGLANG_KUNPENG_MAX_SEQ_NUM=64`、`SGLANG_KUNPENG_MAX_CUR_LEN=1`（开启MTP时自动取`SGLANG_SPECULATIVE_NUM_STEPS+1`）。
+角色默认值：prefill侧`SGLANG_KUNPENG_MAX_SEQ_NUM=8`、`SGLANG_KUNPENG_MAX_CUR_LEN=576`（native取同prefill侧值）；decode侧`SGLANG_KUNPENG_MAX_SEQ_NUM=64`、`SGLANG_KUNPENG_MAX_CUR_LEN=1`（开启MTP时自动取`SGLANG_SPECULATIVE_NUM_STEPS+1`）。
 
-### 3.4 PD分离部署
+### 3.5 PD分离部署
 
 PD分离模式下tokenizer默认与推理进程分离（`SGLANG_ENABLE_TOKENIZER_SEPERATE=1`，由`env_base.sh`按角色自动设置；native模式默认关闭）。请求路径为：客户端→SGLang Model Gateway（router节点）→各侧tokenizer HTTP server（router节点，prefill侧默认端口30001、decode侧默认30002）→prefill/decode集群。Model Gateway的后端地址是tokenizer端口而非推理master的30000端口，每个prefill后端同时携带该实例的bootstrap端口（默认9001）用于KV传输引导。
 
 部署步骤：
 
 1. 配置：在`runtime/env_base.sh`（或`.user_env.sh`）中设置`ROUTER_IP`、模型路径、conda环境等共享配置；在`runtime/.user_env_prefill.sh`与`runtime/.user_env_decode.sh`（或对应实例文件）中设置两侧节点集（`PREFILL_IP_SPEC`/`DECODE_IP_SPEC`）、master地址与并行度（`PREFILL_TP_SIZE`/`DECODE_TP_SIZE`等，未设置时回退到全局`TP_SIZE`/`DP_SIZE`）。
+
 2. 一键启动（推荐，在任一节点执行）：
 
 ```shell
-sh launch.sh all   # 按INSTANCES：各实例server集群→各实例tokenizer→router
+sh launch.sh all   # 按INSTANCES：各实例server集群→各实例tokenizer→router（mooncake后端时先自动拉起mooncake master与store）
 ```
 
-1. 分步启动（集群命令在各master节点执行；tokenizer/router自动SSH到`ROUTER_IP`）：
+3. 分步启动（集群命令在各master节点执行；tokenizer/router自动SSH到`ROUTER_IP`）：
 
 ```shell
 sh launch.sh prefill            # prefill集群
@@ -175,10 +246,10 @@ sh launch.sh tokenizer decode   # decode侧tokenizer HTTP server
 sh launch.sh router             # 等待全部后端就绪后启动Model Gateway
 ```
 
-1. 停止：
+4. 停止：
 
 ```shell
-sh stop.sh all                 # router+全部tokenizer+按INSTANCES停止各实例server
+sh stop.sh all                 # router+全部tokenizer+按INSTANCES停止各实例server（mooncake后端时最后停止store与mooncake master）
 sh stop.sh server prefill      # 支持实例名：sh stop.sh server decode 128p
 sh stop.sh router
 sh stop.sh tokenizer prefill   # 支持prefill|decode|all
@@ -186,9 +257,28 @@ sh stop.sh tokenizer prefill   # 支持prefill|decode|all
 
 多实例部署（同角色多实例、端口/NUMA自动错开、短长序列分组路由等）参见[多实例部署指南](scripts/cpu_kunpeng/runtime/README.md)。
 
-### 3.5 环境变量说明
+### 3.6 多级KV缓存（HiCache）部署
 
-#### 3.5.1 功能类
+HiCache将KV cache分为多级，层级越靠后容量越大、延迟越高。仅prefill/native角色参与（decode不参与），页粒度为64 token，L3中1个对象=1页：
+
+- **L1**：主KV cache池（DDR），即原有主池；
+- **L2**：额外DDR池（host pool），大小由`KUNPENG_HICACHE_RATIO`/`KUNPENG_HICACHE_SIZE`决定（仅三级模式）；
+- **L3**：外部存储后端，由`KUNPENG_HICACHE_BACKEND`选择，所有prefill节点共享。
+
+```
+export ENABLE_KUNPENG_HICACHE=1   # 总开关，默认0
+export KUNPENG_HICACHE_L1L3=1     # 默认1=两级模式（L1+L3，去掉L2 host池，改用固定大小扁平中转缓冲）；0=三级模式（L1+L2+L3）
+```
+
+- **mooncake后端（默认）**：`launch.sh all`会自动检测「prefill/native实例启用HiCache且后端为mooncake」，先拉起mooncake store master与store service；`stop.sh all`最后自动停止两者。主要变量：`MOONCAKE_MASTER_NODE`/`MOONCAKE_MASTER_PORT`（默认`ROUTER_IP:50061`）、`MOONCAKE_STORE_NODE`（默认同master节点）、`MOONCAKE_STORE_PORT`（默认8081）、`MOONCAKE_STORE_SEGMENT_SIZE`（默认64gb）、`MOONCAKE_DEVICE`（RDMA设备列表）、`MOONCAKE_ENABLE_SSD_OFFLOAD`（=1启用SSD offload，需设`MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`）。存储布局自动选择`page_first`。
+- **file后端**：设置`KUNPENG_HICACHE_BACKEND=file`，并指定所有prefill节点共享的目录`KUNPENG_HICACHE_L3_DIR`（留空=关闭L3，仅L1↔L2），存储布局为`layer_first`。
+- **其他设置**：`KUNPENG_HICACHE_WRITE_POLICY`（写策略，默认`write_through`）、`KUNPENG_HICACHE_PREFETCH_POLICY`（L3预取策略，默认`wait_complete`，即等待整页加载完成以避免重算；可选`timeout`/`best_effort`提前放弃）、`KUNPENG_HICACHE_RATIO`/`KUNPENG_HICACHE_SIZE`（L2大小，SIZE优先于RATIO）、`SGLANG_HICACHE_DEBUG`（=1输出详细传输日志）。
+
+各层级变量细节与调优说明参见[HiCache使用指南](docs/kunpeng/hicache.md)。
+
+### 3.7 环境变量说明
+
+#### 3.7.1 功能类
 
 **1. SGLANG\_ENABLE\_BINARY\_LAUNCH / SGLANG\_ENABLE\_NUMA\_DUPLICATION — 二进制启动模式**
 
@@ -264,7 +354,7 @@ export SGLANG_KUNPENG_RDMA_BCAST=1      # 默认开
 export SGLANG_KUNPENG_RDMA_PP_COMM=1    # 默认开
 ```
 
-- **作用**：scheduler间同步的allgather/broadcast走RDMA（kutacc实现），PP rank间的rid传输走RDMA。需使用br\_sglang分支的kutacc构建。
+- **作用**：scheduler间同步的allgather/broadcast走RDMA（kutacc实现），PP rank间的rid传输走RDMA。需使用sglang_930分支构建的kutacc。
 
 **9. SGLANG\_KUNPENG\_LC\_DP\_RANKS / LC\_MIN\_SEQ\_LEN — 长序列decode CP**
 
@@ -275,7 +365,15 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # 长序列判定阈值
 
 - **作用**：`input_len + max_new_tokens`大于等于阈值的请求路由到LC DP rank做上下文并行decode，其余请求走常规rank。两个变量在prefill与decode实例间必须配置一致。
 
-#### 3.5.2 其他开关类
+**10. ENABLE\_KUNPENG\_HICACHE — 多级KV缓存**
+
+```
+export ENABLE_KUNPENG_HICACHE=0  # 默认关
+```
+
+- **作用**：=1时启用HiCache多级KV缓存（仅prefill/native角色参与），L3后端由`KUNPENG_HICACHE_BACKEND`选择（mooncake/file）。详见3.6节与[HiCache使用指南](docs/kunpeng/hicache.md)。
+
+#### 3.7.2 其他开关类
 
 - **SGLANG\_USE\_CPU\_920F**：标识鲲鹏920F平台，触发fork启动、仅加载deepseek模型、CPU绑核等平台优化。
 - **SGLANG\_USE\_CPU\_ENGINE**：强制走CPU推理引擎。
@@ -295,8 +393,17 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # 长序列判定阈值
 - **KUTACC\_ASYNC\_LAUNCH**：kutacc异步launch，默认1；=0时`KUPL_EXECUTOR_COUNT`需设为32。
 - **KUPL\_SHM\_TYPE / KUPL\_SHM\_ON\_PACKAGE / KUPL\_SHM\_ENABLE\_HUGEPAGE**：kupl共享内存后端（sls）、package内存与大页开关。
 - **SGLANG\_SET\_ZMQ\_CPU\_AFFINITY\_OFFSET**：ZMQ线程CPU亲和起始核。
+- **SGLANG\_KUNPENG\_QWEN**：=1时放行Qwen3.5系列模型（`qwen3_5`/`qwen3_5_mtp`）的加载（见3.3节）。
+- **SGLANG\_KUNPENG\_DISABLE\_MLA\_ALL2ALL**：=1禁用MLA alltoall路径，默认0。
+- **SGLANG\_KUNPENG\_ALLTOALL\_FENCE**：=1在MLA shm alltoall后追加显式`kupl_shm_fence`，默认0。
+- **SGLANG\_KUNPENG\_ALLREDUCE\_NAIVE**：=1使用非kutacc的朴素shm allreduce，默认0。
+- **SGLANG\_KUNPENG\_ENABLE\_SHM\_FENCE**：SHM fence开关，默认0。
+- **SGLANG\_ENABLE\_OVERLAP**：调度overlap开关，默认0；`SGLANG_ENABLE_OVERLAP_TRACE`为对应trace开关。
+- **SGLANG\_KUNPENG\_HBW\_RESIDENT\_NON\_EXPERT\_WEIGHTS / \_EXPERT\_WEIGHTS / \_GRAPH**：非专家权重/专家权重/图权重HBW常驻开关。非专家与图默认1；专家权重全局默认0，decode侧默认1。
+- **SGLANG\_KUNPENG\_MOE\_PREFILL\_FORCE\_DDR**：=1时prefill MoE权重强制走DDR（长prompt prefill实例使用）。
+- **LONG\_PROMPT\_PREFILL\_INSTANCE**：=1启用长prompt prefill实例预设（TP=16/DP=1/PP=16、chunk 2048、MoE强制DDR）。
 
-#### 3.5.3 大小/阈值类
+#### 3.7.3 大小/阈值类
 
 **共享内存池**
 
@@ -335,16 +442,17 @@ export SGLANG_KUNPENG_LC_MIN_SEQ_LEN=4096   # 长序列判定阈值
 **多线程后端**
 
 - **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**：指定kupl多线程后端与线程数。常规PyTorch仅支持omp。`KUPL_EXECUTOR_COUNT`默认33（`KUTACC_ASYNC_LAUNCH=0`时需设为32）。
+- **KUTACC\_FUSEDMOE\_MULTIEXPT**：kutacc fusedmoe多专家并行分组数（decode侧）。默认0=串行逐专家（位精确）；设为G时worker池分为G组，每组负责一份本地专家。
 
 **其他**
 
 - **DROP\_CACHES**：=1时stop.sh清理节点OS页缓存。
-- **GEMM\_TILING\_PLAN\_FILE**：GEMM tiling计划文件路径。
+- **GEMM\_TILING\_PLAN\_FILE**：GEMM tiling计划文件路径，默认`scripts/cpu_kunpeng/configs/gemm_32_tiling.csv`。
 - **SDMA\_KO\_PATH**：SDMA驱动ko文件路径。
 - **KUCCL\_PATH**：kuccl安装路径（`SGLANG_ENABLE_KUCCL=1`时需要）。
 - **LIBPTHREAD\_HOOK\_PATH**：libpthread\_hook.so路径（分离tokenizer模式使用）。
 
-#### 3.5.4 路由策略类
+#### 3.7.4 路由策略类
 
 - **ROUTER\_PREFILL\_POLICY**：Model Gateway的prefill路由策略。留空使用主策略（cache\_aware）；设为`bucket`启用bucket策略（要求`INSTANCES`含至少2个prefill条目）。
 - **ROUTER\_BALANCE\_ABS\_THRESHOLD**：bucket策略下两实例累计字符数绝对差阈值，默认64。
@@ -366,6 +474,7 @@ sh curl.sh                       # 基础推理（默认prompts/128.txt，32 req
 sh curl.sh -s -m 50              # 流式，50 tokens
 sh curl.sh -n 10 -m 20           # 10个请求
 sh curl.sh -s -f prompts/1k.txt  # 长prompt
+sh curl.sh -J -f chat.jsonl      # chat模式：-f为JSONL请求体，直发/v1/chat/completions
 sh curl.sh -i                    # 多轮交互式对话
 ```
 
@@ -381,7 +490,8 @@ sh curl.sh -d 0-15 -n 10 -m 20
 ### 4.3 性能分析
 
 ```shell
-# 开启profile模式（自动调用 start_profile / stop_profile）
+# 开启profile模式（自动调用 start_profile / stop_profile；
+# PD分离部署下自动发往两侧tokenizer HTTP端口）
 sh curl.sh -p -s -f prompts/ragged.txt
 ```
 
@@ -389,19 +499,31 @@ sh curl.sh -p -s -f prompts/ragged.txt
 
 | 参数               | 说明                                                                | 默认值             |
 | ---------------- | ----------------------------------------------------------------- | --------------- |
-| `-p`             | 启用profile（start/stop）                                             | 关闭              |
+| `-p`             | 启用profile（start/stop；PD分离部署下发往两侧tokenizer HTTP端口）             | 关闭              |
 | `-s`             | 启用流式输出                                                            | 关闭              |
 | `-d RANK\|RANGE` | 固定路由到指定DP rank，或在rank集合内轮询（如`0-15`、`0,2,5`）                       | 服务端负载均衡         |
 | `-n NUM`         | 请求数量（超过文件行数时循环使用prompt）                                           | 文件所有行           |
 | `-m TOKENS`      | 每请求/每轮最大token数                                                    | 10（对话模式1024）    |
 | `-r RATE`        | 发送速率（req/s，需大于0）                                                  | 32              |
 | `-c CONC`        | 最大并发请求数                                                           | 等于请求数           |
-| `-f FILE`        | prompt文件（每行一个，支持gen\_st\_prompts.py输出的JSON行）                      | prompts/128.txt |
+| `-f FILE\|DIR`   | prompt来源：文件（每行一个prompt，支持gen\_st\_prompts.py输出的JSON行）或目录（每个\*.txt/\*.md文件作为一个整文件prompt，按文件名排序循环） | prompts/128.txt |
+| `-J`             | chat模式：`-f`文件为JSONL（每行一个含`model`/`messages`的chat请求体），直发`/v1/chat/completions`，由服务端渲染chat template | 关闭              |
 | `-v`             | 详细统计（请求数>1时生效）：decode吞吐表、接受率（配合`-s`）、每请求时延明细                      | 关闭              |
-| `-F`             | fake-transfer模式（注入bootstrap\_host=2.2.2.2，decode跳过KV传输，端口默认30002） | 关闭              |
+| `-F`             | fake-transfer模式（注入bootstrap\_host=2.2.2.2，decode跳过KV传输；端口从INSTANCES的decode条目自动推导，`CURL_PORT`可覆盖） | 关闭              |
 | `-i`             | 多轮交互式对话模式                                                         | 关闭              |
 
 通过`CURL_HOST`/`CURL_PORT`环境变量可指定目标地址与端口（默认本机网卡IP:30000）。根据请求的返回结果对正确性进行验证。
+
+### 4.5 基准测试
+
+`scripts/cpu_kunpeng/benchmark.sh`支持GSM8K、MMLU精度基准与aisbench性能测试（对gateway端口发起）：
+
+```shell
+bash benchmark.sh gsm8k --max-new-tokens 128 --num-questions 50
+bash benchmark.sh mmlu  --nsub 60 --parallel 32
+```
+
+各测试项的默认值可通过环境变量覆盖，详见脚本头部说明。
 
 ## 5. 多实例部署
 

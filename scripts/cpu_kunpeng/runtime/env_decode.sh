@@ -45,10 +45,22 @@ DECODE_MASTER_ADDR="${DECODE_MASTER_ADDR:-xxx.xxx.xxx.17}"
 #                     ZMQ port block is port_base..+37 (port_base =
 #                     master_port + 1, see server_args PortArgs), so
 #                     instances need disjoint blocks.
-# Entries not listed in INSTANCES fall back to the single-instance
-# defaults (30002 / 8 / 5010). Instance env files may still override.
+# A no-instance call (plain "decode", e.g. the launch_router.sh fallback)
+# falls back to the single-instance defaults (30002 / 8 / 5010); an EXPLICIT
+# instance that is not listed in INSTANCES is refused instead: its derived
+# ports would silently collapse onto side 0's block and collide with the real
+# side-0 instance (see runtime/README.md section 1). Instance env files may
+# still override any of these.
 # ------------------------------------------------------------
+# Drop inherited values first: these vars are exported, so a stale copy from
+# the calling shell would beat the derivation below (making two entries claim
+# the same router-node port). Instance env files, sourced below, still win.
+unset DECODE_TOK_PORT DECODE_BOOTSTRAP_PORT DECODE_NUMA_BASE DECODE_MASTER_PORT
 read -r _de_g _de_s <<< "$(_instance_indexes "decode${INSTANCE:+_$INSTANCE}")"
+if [[ "$_de_s" -lt 0 && -n "${INSTANCE:-}" ]]; then
+    echo "ERROR: decode instance '$INSTANCE' (entry 'decode_$INSTANCE') is not in INSTANCES='$INSTANCES'" >&2
+    return 1 2>/dev/null || exit 1
+fi
 [[ "$_de_s" -lt 0 ]] && _de_s=0
 [[ "$_de_g" -lt 0 ]] && _de_g=1
 export DECODE_TOK_PORT="${DECODE_TOK_PORT:-$((30001 + _de_g))}"

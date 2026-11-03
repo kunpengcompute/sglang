@@ -2460,6 +2460,13 @@ def launch_server(
             logger.info(
                 f"[pp-affinity] main process (http+tokenizer) cpus={p.cpu_affinity()}"
             )
+        elif os.environ.get("SGLANG_KUNPENG_HTTP_CPU_AFFINITY"):
+            p.cpu_affinity(
+                [
+                    int(cpu)
+                    for cpu in os.environ["SGLANG_KUNPENG_HTTP_CPU_AFFINITY"].split(",")
+                ]
+            )
         else:
             p.cpu_affinity(list(range(1, 33)))
 

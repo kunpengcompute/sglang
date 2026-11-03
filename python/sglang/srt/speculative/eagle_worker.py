@@ -223,6 +223,14 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_bridge import (
+            attached_target_for_draft,
+        )
+
+        borrowed_qwen_target_runner = attached_target_for_draft(
+            target_worker, server_args
+        )
+
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
@@ -245,6 +253,7 @@ class EAGLEWorker(TpModelWorker):
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
+                borrowed_qwen_target_runner=borrowed_qwen_target_runner,
             )
 
         if self.target_worker.pp_size > 1:
@@ -1080,7 +1089,10 @@ class EAGLEWorker(TpModelWorker):
             ):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add_(1)
+            if self.borrowed_qwen_target_runner is not None:
+                self.draft_attn_backend.prepare_step(i, forward_batch)
+            else:
+                forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
@@ -1136,6 +1148,24 @@ class EAGLEWorker(TpModelWorker):
         pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        # Recompute this private gate for every verify, including reused inputs.
+        spec_info._kunpeng_attached_qwen_greedy = False
+        target_runner = self.target_worker.model_runner
+        if (
+            not batch.forward_mode.is_idle()
+            and getattr(self.draft_model_runner, "borrowed_qwen_target_runner", None)
+            is target_runner
+            and target_runner.device == "cpu"
+            and target_runner.tp_size == 16
+            and target_runner.pp_size == 1
+            and spec_info.topk == 1
+            and spec_info.spec_steps in (2, 3)
+            and spec_info.draft_token_num == spec_info.spec_steps + 1
+        ):
+            capabilities = getattr(target_runner.model, "runtime_capabilities", None)
+            if capabilities is not None and capabilities.policy_enabled("mtp"):
+                capabilities.require("mtp")
+                spec_info._kunpeng_attached_qwen_greedy = True
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1

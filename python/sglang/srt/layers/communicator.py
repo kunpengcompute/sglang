@@ -642,20 +642,25 @@ class LayerCommunicator:
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
                         )
-                    elif (_is_cpu_920f and not get_attn_tp_context().is_nsa and
-                          (not getattr(self.input_layernorm, "_kunpeng_qwen", False) or
-                           getattr(self.input_layernorm, "_kunpeng_int8_consumer", False))):
+                    elif (
+                        _is_cpu_920f
+                        and not get_attn_tp_context().is_nsa
+                        and (
+                            not getattr(self.input_layernorm, "_kunpeng_qwen", False)
+                            or getattr(
+                                self.input_layernorm, "_kunpeng_int8_consumer", False
+                            )
+                        )
+                    ):
                         # Fused add + rmsnorm + int8 quantize. Returns
                         # (outs_int8, scales, residual) so the downstream
                         # int8 GEMM (fused_qkv_a_proj) consumes the quantized
                         # activation directly, skipping a separate quant pass.
-                        outs, scales, residual = (
-                            self.input_layernorm(
-                                hidden_states,
-                                residual,
-                                post_residual_addition,
-                                quantize=True,
-                            )
+                        outs, scales, residual = self.input_layernorm(
+                            hidden_states,
+                            residual,
+                            post_residual_addition,
+                            quantize=True,
                         )
                         hidden_states = (outs, scales)
                     elif _is_cpu_920f:

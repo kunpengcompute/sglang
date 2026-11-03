@@ -8,6 +8,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -19,6 +20,27 @@ class TorchNativeAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        self.kunpeng_qwen = None
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled
+
+        if enabled() and get_attention_tp_size() == 16:
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+                QwenAttention,
+            )
+
+            self.kunpeng_qwen = QwenAttention()
+
+    def get_kunpeng_graph_provider(self, runner):
+        if getattr(runner, "borrowed_qwen_target_runner", None) is not None:
+            # The 64-layer target provider does not describe the attached draft.
+            return None
+        if self.kunpeng_qwen is not None:
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.graph_provider import (
+                QwenHybridGraphProvider,
+            )
+
+            return QwenHybridGraphProvider(runner)
+        return None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -58,6 +80,26 @@ class TorchNativeAttnBackend(AttentionBackend):
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
+
+        if self.kunpeng_qwen is not None:
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.prefill import (
+                run_chunked_prefill,
+            )
+
+            return run_chunked_prefill(
+                query,
+                output,
+                k_cache,
+                v_cache,
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                extend_prefix_lens,
+                extend_seq_lens,
+                scaling=scaling,
+                enable_gqa=enable_gqa,
+                causal=causal,
+            )
 
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
@@ -198,6 +240,24 @@ class TorchNativeAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        if (
+            self.kunpeng_qwen is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            return self.kunpeng_qwen.forward_verify(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
+
+        if self.kunpeng_qwen is not None:
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen import prefill_graph
+
+            if prefill_graph.unsupported_reason(forward_batch) is None:
+                # This route owns the only two KV stores; do not also execute
+                # the ordinary pool.set_kv_buffer path below.
+                return prefill_graph.forward_attention(
+                    q, k, v, layer, forward_batch, save_kv_cache
+                )
+
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
@@ -220,6 +280,16 @@ class TorchNativeAttnBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
+        prefix_lens = forward_batch.extend_prefix_lens
+        if (
+            self.kunpeng_qwen is not None
+            and forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            # EAGLE updates the draft lengths after verification but keeps the
+            # original prefill prefixes in ScheduleBatch. The accepted tokens
+            # extend the sequence ending at the updated seq_lens instead.
+            prefix_lens = forward_batch.seq_lens - forward_batch.extend_seq_lens
+
         self._run_sdpa_forward_extend(
             q_,
             o_,
@@ -228,7 +298,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
-            forward_batch.extend_prefix_lens,
+            prefix_lens,
             forward_batch.extend_seq_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
@@ -245,6 +315,10 @@ class TorchNativeAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        if self.kunpeng_qwen is not None:
+            return self.kunpeng_qwen.forward_decode(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)

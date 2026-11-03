@@ -181,7 +181,7 @@ def create_intel_amx_backend(runner):
 
 @register_attention_backend("kunpeng_cpu")
 def create_kunpeng_backend(runner):
-    if runner.hybrid_gdn_config is not None:
+    if getattr(runner.model, "_kunpeng_explicit_graph", False):
         from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_hybrid_backend import KunpengGQABackend
         return KunpengGQABackend()
     from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_cpu_backend import KunpengCpuBackend
@@ -207,7 +207,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     ), "hybrid_gdn can only be used with non-MLA models."
 
     if cfg := runner.mambaish_config:
-        if runner.server_args.attention_backend == "kunpeng_cpu" and runner.hybrid_gdn_config is not None:
+        if runner.server_args.attention_backend == "kunpeng_cpu" and getattr(runner.model, "_kunpeng_explicit_graph", False):
             from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_hybrid_backend import KunpengHybridBackend
             return KunpengHybridBackend(runner, full_attn_backend)
         from sglang.srt.layers.attention.fla.utils import check_environments

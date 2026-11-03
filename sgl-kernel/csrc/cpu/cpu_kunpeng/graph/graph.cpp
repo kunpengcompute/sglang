@@ -195,6 +195,12 @@ void Graph::plan_memory(torch::Tensor external_pool, torch::Tensor external_shm_
             pool_size = std::max(pool_size, pe.offset + pe.size);
         pool_size = (pool_size + memory_alignment - 1) / memory_alignment * memory_alignment;
 
+        // Record the already-computed planner requirement for read-only diagnostics.
+        if (is_shm)
+            planned_shm_bytes_ = pool_size;
+        else
+            planned_regular_bytes_ = pool_size;
+
         if (external.defined()) {
             TORCH_CHECK(external.nbytes() >= static_cast<int64_t>(pool_size), "plan_memory: external ", tag,
                         " pool too small (", external.nbytes(), " bytes vs needed ", pool_size, " bytes)");

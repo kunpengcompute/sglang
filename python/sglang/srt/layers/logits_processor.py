@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as qwen_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,

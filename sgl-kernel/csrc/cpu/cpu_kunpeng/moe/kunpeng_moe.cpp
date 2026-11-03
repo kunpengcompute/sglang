@@ -184,6 +184,7 @@ void moe_comm_create_kunpeng(int64_t process_group_ptr)
 
 void ensure_ctrl_domain_kunpeng()
 {
+#if SGLANG_KUTACC_HAS_CTRL_DOMAIN
     if (g_ctrl_ds_conn_info != nullptr) return;
 
     // Lazy ctrl-plane domain for the scheduler sync allgather: same PG as the
@@ -202,6 +203,10 @@ void ensure_ctrl_domain_kunpeng()
     TORCH_CHECK(ret == KUTACC_OK, "kurmcl_comm_create_independent (ctrl) failed with code ", ret);
     std::cout << "[KuTACC] Init ctrl RDMA communication domain, comm_size= " << g_comm_size
               << ", comm_rank= " << g_comm_rank << std::endl;
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_CTRL_DOMAIN; install a matching KuTACC release to use ensure_ctrl_domain_kunpeng");
+#endif
 }
 
 void moe_comm_barrier_kunpeng()
@@ -281,6 +286,7 @@ void moe_combine_init_kunpeng(at::Tensor combine_send_buf, at::Tensor combined_x
                               int64_t hidden, int64_t local_rank, int64_t local_size, at::Tensor combine_recv_buf,
                               bool use_static_route, int64_t combine_reg_size)
 {
+#if SGLANG_KUTACC_HAS_MOE_COMBINE_REG_SIZE
     bfloat16_t *combine_send_buf_data = reinterpret_cast<bfloat16_t *>(combine_send_buf.data_ptr());
     bfloat16_t *combined_x_data = reinterpret_cast<bfloat16_t *>(combined_x.data_ptr());
     bfloat16_t *tmpx_for_sum = reinterpret_cast<bfloat16_t *>(combine_recv_buf.data_ptr());
@@ -311,6 +317,10 @@ void moe_combine_init_kunpeng(at::Tensor combine_send_buf, at::Tensor combined_x
     kutacc::moe_combine_init(combine_send_buf_data, num_tokens, num_experts, num_max_dispatch_tokens_per_rank, num_topk,
                              hidden, std::move(group_ptr), static_cast<int>(local_rank), std::move(recv_group),
                              g_moe_comm_h->local_ds_conn_info, combine_reg_size);
+
+#else
+    TORCH_CHECK(false, "Installed KuTACC lacks the MoE combine registration-size API; use a matching KuTACC release");
+#endif
 }
 
 void moe_combine_send_kunpeng(at::Tensor x, at::Tensor count, at::Tensor src_info, at::Tensor src_info_bak,

@@ -63,6 +63,10 @@
 
 #include <kutacc.h>
 
+#ifndef SGLANG_KUTACC_HAS_MLA_LONG_CONTEXT_READ
+#define SGLANG_KUTACC_HAS_MLA_LONG_CONTEXT_READ 1
+#endif
+
 #include "../memory/kunpeng_shm.h"
 
 static bool g_lc_initialized = false;
@@ -78,6 +82,7 @@ static std::vector<uint8_t *> g_lc_peer;  // per-peer views of g_lc_local (size 
 void shm_mla_alltoall_long_context_init_kunpeng(int64_t group_size, int64_t max_batch, int64_t kv_lora_rank,
                                                 int64_t num_local_heads, int64_t num_heads)
 {
+#if SGLANG_KUTACC_HAS_MLA_LONG_CONTEXT_READ
     TORCH_CHECK(is_shm_initialized(),
                 "shm_mla_alltoall_long_context_init_kunpeng called before shm_pool_create_kunpeng");
     TORCH_CHECK(group_size == 8,
@@ -116,6 +121,11 @@ void shm_mla_alltoall_long_context_init_kunpeng(int64_t group_size, int64_t max_
     g_lc_initialized = true;
     std::cout << "[KuTACC] MLA AlltoAll (long-context, zero-copy kutacc) initialized, rank=" << intra_rank
               << ", max_batch=" << max_batch << ", num_heads=" << num_heads << std::endl;
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_MLA_LONG_CONTEXT_READ; install a matching KuTACC release to use shm_mla_alltoall_long_context_init_kunpeng");
+
+#endif
 }
 
 /**
@@ -192,6 +202,7 @@ void lc_mark_empty_lse_kunpeng(at::Tensor lse, at::Tensor real_topk_length)
  */
 void shm_mla_o_alltoall_long_context_kunpeng(at::Tensor o_out, at::Tensor lse_out)
 {
+#if SGLANG_KUTACC_HAS_MLA_LONG_CONTEXT_READ
     TORCH_CHECK(g_lc_initialized, "shm_mla_o_alltoall_long_context_kunpeng called before init");
     TORCH_CHECK(o_out.scalar_type() == at::kBFloat16 && o_out.is_contiguous(), "o_out must be contiguous bf16");
     TORCH_CHECK(lse_out.scalar_type() == at::kFloat && lse_out.is_contiguous(), "lse_out must be contiguous fp32");
@@ -220,6 +231,11 @@ void shm_mla_o_alltoall_long_context_kunpeng(at::Tensor o_out, at::Tensor lse_ou
     // Barrier 2: keep the SHM regions valid until all ranks have read (the
     // next layer's flash MLA overwrites them).
     kupl_shm_fence(kupl_win_intra_socket);
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_MLA_LONG_CONTEXT_READ; install a matching KuTACC release to use shm_mla_o_alltoall_long_context_kunpeng");
+
+#endif
 }
 
 void shm_mla_alltoall_long_context_finalize_kunpeng()

@@ -2043,6 +2043,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 if _use_kunpeng_qwen:
     class Qwen3_5ForConditionalGeneration(nn.Module):
+        _kunpeng_explicit_graph = True
         packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
         supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
         def __init__(self, config, quant_config=None, prefix=""):

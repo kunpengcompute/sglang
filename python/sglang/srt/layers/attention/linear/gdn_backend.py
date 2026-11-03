@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_cpu_920f, rank0_log
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -255,6 +255,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        self.conv_prefill = causal_conv1d_fn
+        self.conv_decode = causal_conv1d_update
+        self.gating = fused_gdn_gating
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled
+
+        if enabled():
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+                QwenGDNKernel,
+                conv_decode,
+                conv_prefill,
+                gating,
+            )
+
+            self.kernel_dispatcher.decode_kernel = QwenGDNKernel()
+            self.kernel_dispatcher.extend_kernel = self.kernel_dispatcher.decode_kernel
+            self.kernel_dispatcher.verify_kernel = self.kernel_dispatcher.decode_kernel
+            self.kernel_dispatcher.supports_packed_decode = False
+            self.conv_prefill, self.conv_decode, self.gating = (
+                conv_prefill,
+                conv_decode,
+                gating,
+            )
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -287,7 +309,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = causal_conv1d_update(
+        mixed_qkv = self.conv_decode(
             mixed_qkv,
             conv_states,
             layer.conv_weights,
@@ -370,6 +392,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        if not is_target_verify and getattr(
+            self.kernel_dispatcher.extend_kernel,
+            "_kunpeng_validate_extend_metadata",
+            False,
+        ):
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.prefill_graph import (
+                validate_extend_metadata,
+            )
+
+            assert conv_states.shape[0] == ssm_states.shape[0]
+            validate_extend_metadata(
+                query_start_loc, cache_indices, seq_len, ssm_states.shape[0]
+            )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -386,7 +421,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
+            mixed_qkv_processed = self.conv_decode(
                 mixed_qkv_reshaped,
                 conv_states,
                 layer.conv_weights,
@@ -399,7 +434,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
@@ -410,7 +445,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
+            mixed_qkv = self.conv_prefill(
                 mixed_qkv,
                 layer.conv_weights,
                 layer.bias,
@@ -451,7 +486,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            g, beta = self.gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -463,7 +498,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
             )
 
-            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            if (
+                is_npu() or is_cpu() or is_cpu_920f()
+            ) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )

@@ -21,6 +21,13 @@
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <limits>
+#include <utility>
+#include <numa.h>
+#include <numaif.h>
+#include <sched.h>
 #include <cerrno>
 #include <fstream>
 #include <cstdint>
@@ -38,7 +45,84 @@
 
 // The shm size must be aligned to 2MB
 constexpr int64_t SHM_ALIGNMENT = 2 * 1024 * 1024;
-static int64_t g_shm_size = 0;
+static int64_t g_shm_size = 0;  // collective payload prefix only
+static int64_t g_window_size = 0;
+static bool g_shared_hbw = false;
+static bool g_split_hbw = false;
+static std::atomic<int64_t> g_shared_hbw_leases{0};
+static std::atomic<bool> g_shared_hbw_destroy_requested{false};
+
+static int64_t shared_hbw_mib(const char *name, int64_t fallback)
+{
+    const char *text = std::getenv(name);
+    if (!text) return fallback;
+    char *end = nullptr;
+    errno = 0;
+    const long long value = std::strtoll(text, &end, 10);
+    TORCH_CHECK(errno == 0 && end != text && *end == '\0' && value > 0,
+                name, " must be a positive integer");
+    TORCH_CHECK(value <= std::numeric_limits<int64_t>::max() / (1024 * 1024), name, " overflows");
+    return value;
+}
+
+
+// A narrow thread policy is necessary because the vendor POSIX allocation API
+// zero-fills the local window before returning. Its POSIX mmap has no HBM policy.
+// Fence windows remain outside this scope and retain their caller DDR policy.
+class ScopedShmHBWPolicy {
+    int old_mode_ = 0;
+    unsigned long bits_ = 0;
+    std::vector<unsigned long> old_mask_;
+    std::vector<unsigned long> verify_mask_;
+    bool active_ = false;
+
+    bool restore_noexcept() noexcept {
+        if (!active_) return true;
+        if (set_mempolicy(old_mode_, old_mask_.data(), bits_) != 0) return false;
+        int mode = 0;
+        std::fill(verify_mask_.begin(), verify_mask_.end(), 0);
+        if (get_mempolicy(&mode, verify_mask_.data(), bits_, nullptr, 0) != 0) return false;
+        if (mode != old_mode_ || verify_mask_ != old_mask_) return false;
+        active_ = false;
+        return true;
+    }
+public:
+    ScopedShmHBWPolicy() {
+        const int cpu = sched_getcpu();
+        TORCH_CHECK(cpu >= 0, "Cannot identify caller CPU for SHM HBM policy");
+        const int cpu_node = numa_node_of_cpu(cpu);
+        const int hbm_node = cpu_node + 16;
+        TORCH_CHECK(cpu_node >= 0 && hbm_node <= numa_max_node(), "Missing near HBM node for caller");
+        const unsigned long word_bits = sizeof(unsigned long) * 8;
+        bits_ = ((static_cast<unsigned long>(numa_max_node()) + 1 + word_bits - 1) / word_bits) * word_bits;
+        old_mask_.assign(bits_ / word_bits, 0);
+        verify_mask_.assign(old_mask_.size(), 0);
+        TORCH_CHECK(get_mempolicy(&old_mode_, old_mask_.data(), bits_, nullptr, 0) == 0,
+                    "Cannot read original SHM caller memory policy: ", strerror(errno));
+        std::vector<unsigned long> target(old_mask_.size(), 0);
+        target[hbm_node / word_bits] = 1UL << (hbm_node % word_bits);
+        TORCH_CHECK(set_mempolicy(MPOL_BIND, target.data(), bits_) == 0,
+                    "Cannot bind SHM first touch to near HBM: ", strerror(errno));
+        active_ = true;
+        try {
+            int mode = 0;
+            std::vector<unsigned long> check(target.size(), 0);
+            TORCH_CHECK(get_mempolicy(&mode, check.data(), bits_, nullptr, 0) == 0
+                        && mode == MPOL_BIND && check == target,
+                        "SHM HBM first-touch memory policy did not take effect");
+        } catch (...) {
+            restore_checked();
+            throw;
+        }
+    }
+    void restore_checked() {
+        TORCH_CHECK(restore_noexcept(), "SHM caller original memory policy restoration failed: ", strerror(errno));
+    }
+    ~ScopedShmHBWPolicy() noexcept {
+        if (!restore_noexcept())
+            std::cerr << "[KuTACC] ERROR: SHM caller memory policy restore failed" << std::endl;
+    }
+};
 
 kupl_shm_win_h kupl_win_intra_node;
 kupl_shm_win_h kupl_win_intra_socket;
@@ -93,11 +177,43 @@ u8span shm_available;
 
 void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int64_t intra_die_pg, int64_t shm_size_mb)
 {
-    if (g_shm_initialized) return;
+    if (g_shm_initialized) {
+        TORCH_CHECK(!g_shared_hbw_destroy_requested.load(), "Shared HBW window shutdown already requested");
+        return;
+    }
 
     TORCH_CHECK(shm_size_mb > 0, "shm_size_mb must be positive, got ", shm_size_mb);
     int64_t raw_size = static_cast<int64_t>(shm_size_mb) * 1024 * 1024;
     g_shm_size = (raw_size + SHM_ALIGNMENT - 1) / SHM_ALIGNMENT * SHM_ALIGNMENT;
+    const char *shared = std::getenv("SGLANG_KUNPENG_SHARED_HBW_BACKING");
+    g_split_hbw = shared && std::strcmp(shared, "split") == 0;
+    g_shared_hbw = g_split_hbw || (shared && std::strcmp(shared, "1") == 0);
+    if (g_shared_hbw) {
+        const int64_t total_mib = shared_hbw_mib("SGLANG_KUNPENG_SHARED_HBW_TOTAL_MIB", 4000);
+        TORCH_CHECK(total_mib == 4000, "Shared HBW total budget must be 4000 MiB");
+        const int64_t prefix_mib = shared_hbw_mib("SGLANG_KUNPENG_SHARED_HBW_SHM_PREFIX_MIB", 768);
+        TORCH_CHECK(prefix_mib < total_mib, "Shared HBW prefix must leave a nonempty tail");
+        g_shm_size = ((prefix_mib * 1024 * 1024 + SHM_ALIGNMENT - 1) / SHM_ALIGNMENT) * SHM_ALIGNMENT;
+        const int64_t total_budget = total_mib * 1024 * 1024;
+        TORCH_CHECK(g_shm_size < total_budget, "Aligned prefix exhausts total HBW budget");
+        // Split mode: this KuPL window is only the actual shared prefix. The
+        // remaining total budget is an independent original HBWPool mapping.
+        g_window_size = g_split_hbw ? g_shm_size : total_budget;
+        if (g_split_hbw) {
+            TORCH_CHECK(g_window_size < (int64_t{1} << 31), "KuPL node-window size must be <2^31 bytes");
+        }
+        // Use only the existing vendor entry point. Require explicit placement policy;
+        // physical placement still must be verified from the actual returned mapping.
+        for (auto setting : {std::pair<const char *, const char *>{"KUPL_SHM_TYPE", g_split_hbw ? "posix" : "sls"},
+                             {"KUPL_SHM_ON_PACKAGE", g_split_hbw ? "n" : "y"},
+                             {"KUPL_SHM_ENABLE_HUGEPAGE", g_split_hbw ? "n" : "y"}}) {
+            const char *value = std::getenv(setting.first);
+            TORCH_CHECK(value && std::strcmp(value, setting.second) == 0,
+                        "Shared HBW requires ", setting.first, "=", setting.second);
+        }
+    } else {
+        g_window_size = g_shm_size;
+    }
 
     g_intra_node_group = reinterpret_cast<c10d::ProcessGroup *>(intra_node_pg);
     TORCH_CHECK(g_intra_node_group != nullptr, "intra_node_pg pointer is null");
@@ -135,16 +251,30 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
     int success = kupl_shm_win_alloc(64, kupl_intra_socket_comm, (void **)&kupl_intra_socketfence_baseptr,
                                      &kupl_win_intra_socket);
     success = kupl_shm_win_alloc(64, kupl_intra_die_comm, (void **)&kupl_intra_diefence_baseptr, &kupl_win_intra_die);
-    success = kupl_shm_win_alloc(g_shm_size, kupl_intra_node_comm, (void **)&kupl_shm_baseptr, &kupl_win_intra_node);
+    if (g_split_hbw) {
+        ScopedShmHBWPolicy policy;
+        try {
+            // The vendor API's own memset performs the first touch under HBM.
+            success = kupl_shm_win_alloc(g_window_size, kupl_intra_node_comm,
+                                         (void **)&kupl_shm_baseptr, &kupl_win_intra_node);
+        } catch (...) {
+            policy.restore_checked();
+            throw;
+        }
+        policy.restore_checked();
+    } else {
+        success = kupl_shm_win_alloc(g_window_size, kupl_intra_node_comm,
+                                     (void **)&kupl_shm_baseptr, &kupl_win_intra_node);
+    }
 
     TORCH_CHECK(success == 0, "kupl_shm_win_alloc failed");
 
-    memset(kupl_shm_baseptr, 0, g_shm_size);
+    memset(kupl_shm_baseptr, 0, g_window_size);
 
     // Pre-mark the whole pool MADV_DONTFORK: later DONTFORK calls from
     // ibv_reg_mr then hit the kernel no-op path (vma flags unchanged)
     // instead of misaligned hugetlb VMA splits (EINVAL).
-    if (madvise(kupl_shm_baseptr, g_shm_size, MADV_DONTFORK) != 0) {
+    if (madvise(kupl_shm_baseptr, g_window_size, MADV_DONTFORK) != 0) {
         std::cout << "[KuTACC] WARNING: madvise(MADV_DONTFORK) on shm pool failed: " << strerror(errno)
                   << ", RDMA reg_mr on hugepage-backed shm buffers may need RDMAV_HUGEPAGES_SAFE=1" << std::endl;
     }
@@ -175,11 +305,28 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
     TORCH_CHECK(g_max_seq_num > 0, "SGLANG_KUNPENG_MAX_SEQ_NUM must be set to a positive value");
     TORCH_CHECK(g_max_cur_len > 0, "SGLANG_KUNPENG_MAX_CUR_LEN must be set to a positive value");
     g_max_tokens = g_max_seq_num * g_max_cur_len;
+    // Match the communicator's per-step token budget (chunked prefill).
+    // Keep the legacy capacity when no explicit budget is configured.
+    str = std::getenv("SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS");
+    if (str != nullptr) {
+        g_max_tokens = std::atoll(str);
+    }
+    TORCH_CHECK(g_max_tokens > 0, "Collective token capacity must be positive");
 }
 
 void shm_pool_destroy_kunpeng()
 {
     if (!g_shm_initialized) return;
+
+    if (g_shared_hbw) {
+        // Process-lifetime backing. Never issue collective window teardown from
+        // a communicator/Tensor destructor: live Storage aliases and rank-local
+        // lease counts can differ. The OS releases this mapping at worker exit.
+        g_shared_hbw_destroy_requested.store(true);
+        std::cerr << "[KuTACC] shared HBW window destroy deferred until process exit; leases="
+                  << g_shared_hbw_leases.load() << std::endl;
+        return;
+    }
 
     kupl_shm_win_free(kupl_win_intra_node);
     kupl_shm_win_free(kupl_win_intra_socket);
@@ -194,6 +341,7 @@ void shm_pool_destroy_kunpeng()
 
 bool is_shm(void *ptr)
 {
+    if (!g_shm_initialized) return false;
     return reinterpret_cast<size_t>(ptr) >= reinterpret_cast<size_t>(kupl_shm_group_baseptr[intra_node_rank]) &&
            reinterpret_cast<size_t>(ptr) <
                reinterpret_cast<size_t>(kupl_shm_group_baseptr[intra_node_rank]) + g_shm_size;
@@ -202,11 +350,16 @@ bool is_shm(void *ptr)
 bool is_shm_tensor(at::Tensor tensor)
 {
     void *ptr = tensor.data_ptr();
-    return is_shm(ptr);
+    if (!is_shm(ptr)) return false;
+    if (!g_shared_hbw) return true;
+    if (!tensor.is_contiguous()) return false;
+    const auto offset = reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(kupl_shm_group_baseptr[intra_node_rank]);
+    return tensor.nbytes() <= static_cast<uint64_t>(g_shm_size) - offset;
 }
 
 void get_peer_shm_baseptr(int64_t peer_rank, void *local_base_ptr, void **remote_base_ptr)
 {
+    TORCH_CHECK(peer_rank >= 0 && peer_rank < intra_node_size, "peer rank out of range");
     TORCH_CHECK(is_shm(local_base_ptr), "input pointer is not shared memory");
     *remote_base_ptr = (char *)kupl_shm_group_baseptr[peer_rank] +
                        ((char *)local_base_ptr - (char *)kupl_shm_group_baseptr[intra_node_rank]);
@@ -220,6 +373,7 @@ static inline uint8_t *alignup(uint8_t *ptr, int64_t alignment)
 at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t> shape)
 {
     TORCH_CHECK(g_shm_initialized, "create_shm_tensor_kunpeng called before shm_pool_create_kunpeng");
+    TORCH_CHECK(!g_shared_hbw_destroy_requested.load(), "Shared HBW shutdown requested");
 
     int64_t element_size = at::elementSize(dtype);
     int64_t numel = 1;
@@ -246,7 +400,14 @@ at::Tensor create_shm_tensor_kunpeng(at::ScalarType dtype, c10::ArrayRef<int64_t
     std::cout << "[KuTACC] Allocated " << total_bytes << " bytes from shared memory pool, remaining "
               << shm_available.size << std::endl;
 
-    auto torch_tensor = at::from_blob(allocated_ptr, shape, at::TensorOptions().dtype(dtype));
+    at::Tensor torch_tensor;
+    if (g_shared_hbw) {
+        torch_tensor = at::from_blob(allocated_ptr, shape, [](void *) { --g_shared_hbw_leases; },
+                                     at::TensorOptions().dtype(dtype));
+        ++g_shared_hbw_leases;
+    } else {
+        torch_tensor = at::from_blob(allocated_ptr, shape, at::TensorOptions().dtype(dtype));
+    }
     torch_tensor.set_requires_grad(false);
 
     return torch_tensor;
@@ -273,6 +434,8 @@ at::Tensor get_or_create_shm_tensor(int64_t dim, int64_t bs)
         return tensor;
     }
 
+    TORCH_CHECK(bs <= g_max_tokens, "Collective rows ", bs,
+                " exceed configured token capacity ", g_max_tokens);
     auto it = g_shm_tensor_cache_large.find(dim);
     if (it != g_shm_tensor_cache_large.end() && it->second.size(0) >= bs) {
         return it->second;
@@ -331,6 +494,7 @@ int64_t shm_remaining_bytes_kunpeng()
 void *alloc_shm_raw(size_t bytes)
 {
     TORCH_CHECK(g_shm_initialized, "alloc_shm_raw called before shm_pool_create_kunpeng");
+    TORCH_CHECK(!g_shared_hbw_destroy_requested.load(), "Shared HBW shutdown requested");
 
     int64_t alignment = 1;
     uint8_t *cur_ptr = reinterpret_cast<uint8_t *>(shm_available.ptr);
@@ -354,4 +518,45 @@ void shm_fence_kunpeng(int64_t attn_tp_size)
     TORCH_CHECK(attn_tp_size == 8 || attn_tp_size == 16,
                 "Unsupported attn_tp_size for shm_fence_kunpeng: ", attn_tp_size);
     kupl_shm_fence(kupl_win_intra_node);
+}
+std::vector<int64_t> shared_hbw_info_kunpeng()
+{
+    if (!g_shared_hbw || !g_shm_initialized) return {0,0,0,0,0,0,0,0,0};
+    const int64_t base = reinterpret_cast<int64_t>(kupl_shm_baseptr);
+    const int64_t remain = static_cast<int64_t>(shm_available.size);
+    return {1, base, g_window_size, g_shm_size, g_shm_size - remain, remain,
+            g_split_hbw ? 0 : base + g_shm_size,
+            g_split_hbw ? 0 : g_window_size - g_shm_size, intra_node_rank};
+}
+
+std::vector<int64_t> shared_hbw_lease_info_kunpeng()
+{
+    return {g_shared_hbw_leases.load(), g_shared_hbw_destroy_requested.load() ? 1 : 0};
+}
+
+static at::Tensor shared_hbw_view(int64_t offset, int64_t bytes)
+{
+    TORCH_CHECK(g_shared_hbw && g_shm_initialized, "Shared HBW window is not initialized");
+    TORCH_CHECK(!g_shared_hbw_destroy_requested.load(), "Shared HBW destruction already requested");
+    TORCH_CHECK(offset >= 0 && bytes > 0 && offset <= g_window_size && bytes <= g_window_size - offset,
+                "Shared HBW view exceeds window");
+    // Each logical allocation has independent Storage. Ordinary Tensor aliases
+    // share this DataPtr lease until the last alias releases the Storage.
+    auto tensor = at::from_blob(static_cast<uint8_t *>(kupl_shm_baseptr) + offset, {bytes},
+                          [](void *) { --g_shared_hbw_leases; }, at::TensorOptions().dtype(at::kByte));
+    ++g_shared_hbw_leases;
+    return tensor;
+}
+
+at::Tensor shared_hbw_backing_kunpeng(int64_t expected_bytes)
+{
+    TORCH_CHECK(expected_bytes == g_window_size, "Expected bytes must equal the actual KuPL window size");
+    return shared_hbw_view(0, expected_bytes);
+}
+
+at::Tensor shared_hbw_slice_kunpeng(int64_t offset, int64_t bytes)
+{
+    TORCH_CHECK(!g_split_hbw, "Split transport tail is an independent private HBW mapping");
+    TORCH_CHECK(offset >= g_shm_size, "HBW tail slice overlaps collective payload prefix");
+    return shared_hbw_view(offset, bytes);
 }

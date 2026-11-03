@@ -165,3 +165,22 @@ install(TARGETS kupl_async
     LIBRARY DESTINATION sgl_kernel
 )
 
+
+# Native Qwen primitives expose C entry points to the common GraphOpRegistry.
+# These use SVE512; they do not create a separate graph executor.
+file(GLOB QWEN_NATIVE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/cpu_kunpeng/qwen/*.cpp")
+set_source_files_properties(${QWEN_NATIVE_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu_kunpeng/graph/registered_graph_aten.cpp
+    PROPERTIES COMPILE_OPTIONS "-fvisibility=default;-msve-vector-bits=512")
+set_property(SOURCE
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu_kunpeng/qwen/qwen_conv_window_product.cpp
+    APPEND PROPERTY COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+
+# Separate DSO: installing the allocator is explicit and scoped to forward.
+add_library(scoped_hbw_allocator SHARED ../cpu_hbw/scoped_hbw_allocator.cpp)
+target_include_directories(scoped_hbw_allocator PRIVATE ${TORCH_INCLUDE_DIRS})
+target_link_libraries(scoped_hbw_allocator PRIVATE ${TORCH_LIBRARIES})
+set_target_properties(scoped_hbw_allocator PROPERTIES CXX_VISIBILITY_PRESET default)
+install(TARGETS scoped_hbw_allocator LIBRARY DESTINATION sgl_kernel)
+
+include(cmake/kunpeng_kutacc_compat.cmake)

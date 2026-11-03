@@ -151,7 +151,10 @@ scripts/cpu_kunpeng/
 |---|---|---|---|
 | `KUNPENG_HICACHE_BACKEND` | `mooncake` | 开关 | 选 L3 后端：`file` / `mooncake` |
 | `KUNPENG_HICACHE_WRITE_POLICY` | `write_through` | 行为 | **写透策略**：`write_through` 首次插入即写 L3；`write_through_selective` 命中 2 次后才写。`write_back` 在两级模式**不支持**（会报错） |
-| `KUNPENG_HICACHE_PREFETCH_POLICY` | `wait_complete` | 行为 | L3→L1 预取策略：`wait_complete` 阻塞到整个前缀加载完（不重算）；`timeout` / `best_effort` 提前放弃，可能部分重算 |
+| `KUNPENG_HICACHE_PREFETCH_POLICY` | `timeout` | 行为 | L3→L1 预取策略：`timeout` 超时即放弃、只保留已取到的连续前缀（默认 `1s + 页数 × 0.25s/Ki token`，16k 前缀约 5s）；`wait_complete` 阻塞到整个前缀加载完（丢页会永久等待，不建议配合不可靠的 L3）；`best_effort` 不等待 |
+| `KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE` | 空（=1） | 秒 | 仅 `timeout` 策略生效：超时公式的固定项。留空用代码默认 1s |
+| `KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN` | 空（=0.25） | 秒/Ki token | 仅 `timeout` 策略生效：每 1024 token 追加的预算。16k 前缀配 `0.6` 约为 `2 + 16×0.6 = 11.6s` |
+| `KUNPENG_HICACHE_EXTRA_CONFIG` | 空 | JSON | 直接透传 `--hicache-storage-backend-extra-config`，可设置 `prefetch_threshold` 等任意字段；非空时覆盖上面两个 timeout 变量 |
 
 #### 3.3.2 后端 A：`file`
 
@@ -226,6 +229,45 @@ scripts/cpu_kunpeng/
 解析优先级：`extra_config`（代码传入）> JSON 文件 > 环境变量。
 另有引擎侧默认值，一般不用改：`MOONCAKE_MASTER_METRICS_PORT`（`9003`）、`MOONCAKE_CHECK_SERVER`（`False`）、`MOONCAKE_STANDALONE_STORAGE`（`False`）、`MOONCAKE_CLIENT`（未设置）。
 
+**⑥ SSD offload（可选，默认关）**
+
+L3 默认全部驻留在 store 进程的 DRAM segment（`MOONCAKE_STORE_SEGMENT_SIZE`）。打开后，内存压力下对象由 master 指示落盘，读取未命中时再从本地磁盘回读；offloaded 对象在 master 中记为 `LOCAL_DISK` 副本，对客户端透明。
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `MOONCAKE_ENABLE_SSD_OFFLOAD` | `0` | **总开关**。`1` 时 master 与 store service 都带 `--enable_offload=true` |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | **必须显式设置** | store 节点的磁盘目录（绝对路径，`server_store.sh` 会 `mkdir -p`）。开关打开但未设置时启动直接报错 |
+| `MOONCAKE_OFFLOAD_ON_EVICT` | `0` | `1` = 只在实际淘汰时落盘（`--offload_on_evict=true`）；`0` = put 完成即异步落盘 |
+| `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | 磁盘布局：`bucket_storage_backend` / `file_per_key_storage_backend` / `offset_allocator_storage_backend` |
+| `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `1099511627776`（1TB） | 磁盘用量上限 |
+| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `lru` | bucket 后端的淘汰策略：`none` / `fifo` / `lru` |
+
+开启方式：在 `.user_env_base.sh` 写总开关和磁盘目录，然后重启 mooncake：
+
+```bash
+export MOONCAKE_ENABLE_SSD_OFFLOAD=1
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
+
+sh stop.sh store
+sh stop.sh mooncake
+sh launch.sh mooncake
+sh launch.sh store
+```
+
+加载 store 角色环境时会打印实际落盘位置：
+
+```
+[store] SSD offload enabled -> /nvme/mooncake_offload
+```
+
+要点：
+
+- offload 只配在 **store 进程**（唯一持有 segment 的 real client）；prefill/native 客户端不需要改。
+- **一个磁盘目录只能被一个 live client 占用**，不要多个 rank 共享同一路径。
+- 磁盘读写由 store 节点承担，读延迟明显高于 DRAM：换到的是容量上限，不是热路径性能。
+- 开启前确认版本支持：`python -m mooncake.mooncake_store_service --help | grep -i offload`。
+- 成功时 store 日志中不再出现 `Storage root directory is not set. persisting data is disabled.`
+
 ---
 
 ## 4. 常见问题
@@ -234,6 +276,9 @@ scripts/cpu_kunpeng/
 |---|---|
 | 日志出现 `L3 disabled, running L1<->L2 only` | `KUNPENG_HICACHE_BACKEND=file` 且 `KUNPENG_HICACHE_L3_DIR` 为空 → 填目录 |
 | warmup 报 `invalid rpc arg` / `RPC_FAIL` | master 与客户端 mooncake 版本不一致（如一个来自源码构建、一个来自 wheel）。确认 `MOONCAKE_MASTER_BIN` 与客户端同源 |
+| store 环境报 `requires MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | 开了 `MOONCAKE_ENABLE_SSD_OFFLOAD=1` 但没设磁盘目录 → 显式设置绝对路径 |
+| store 启动报 `unknown argument '--enable_offload'` | 当前 mooncake 版本不支持 SSD offload：把 `MOONCAKE_ENABLE_SSD_OFFLOAD` 设回 `0`，或升级 mooncake |
+| store 日志持续出现 `persisting data is disabled` | `MOONCAKE_ENABLE_SSD_OFFLOAD=1` 未生效，或 `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` 不可写 |
 | 节点 DDR 被吃满 | 三级模式下 `RATIO`/`SIZE` 过大；改用两级模式 `KUNPENG_HICACHE_L1L3=1`（默认） |
 | `--hicache-ratio` 看起来没生效 | 两级模式下该参数**不传**，属预期；要调 L2 需先 `KUNPENG_HICACHE_L1L3=0` |
 | 启动时报 `NotImplementedError: ... MLA pools only` | 两级模式只支持 MLA 池 |

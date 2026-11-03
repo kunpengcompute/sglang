@@ -37,6 +37,17 @@ class DraftBackendFactory:
         return backend_map[backend_type]()
 
     def create_decode_backend(self):
+        if (
+            getattr(self.draft_model_runner, "borrowed_qwen_target_runner", None)
+            is not None
+        ):
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_bridge import (
+                AttachedQwenMultiStepDraftBackend,
+            )
+
+            return AttachedQwenMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
         if self.speculative_num_steps == 1:
             return None
 
@@ -66,6 +77,15 @@ class DraftBackendFactory:
         )
 
     def create_draft_extend_backend(self):
+        if (
+            getattr(self.draft_model_runner, "borrowed_qwen_target_runner", None)
+            is not None
+        ):
+            from sglang.srt.layers.attention.torch_native_backend import (
+                TorchNativeAttnBackend,
+            )
+
+            return TorchNativeAttnBackend(self.draft_model_runner)
         backend_map = {
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
@@ -84,6 +104,16 @@ class DraftBackendFactory:
             "fa4": self._create_fa4_prefill_backend,
             "kunpeng_cpu": self._create_kunpeng_cpu_prefill_backend,
         }
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled
+
+        if enabled():
+            from sglang.srt.layers.attention.torch_native_backend import (
+                TorchNativeAttnBackend,
+            )
+
+            backend_map["torch_native"] = lambda: TorchNativeAttnBackend(
+                self.draft_model_runner
+            )
         backend_name = (
             "decode_attention_backend"
             if self.server_args.speculative_attention_mode == "decode"

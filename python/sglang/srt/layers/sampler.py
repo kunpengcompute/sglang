@@ -387,6 +387,19 @@ class Sampler(nn.Module):
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
+        if (
+            _is_cpu_920f
+            and not sampling_info.is_all_greedy
+            and sampling_info.sampling_seed is None
+        ):
+            # The native CPU sampler uses independent random generators.
+            # Keep rank zero's draw so every TP rank decodes the same token.
+            torch.distributed.broadcast(
+                batch_next_token_ids,
+                src=dist.get_global_rank(self.tp_sync_group, 0),
+                group=self.tp_sync_group,
+            )
+            return
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:

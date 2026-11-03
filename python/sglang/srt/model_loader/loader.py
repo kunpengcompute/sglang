@@ -702,6 +702,9 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            observer = getattr(model, "_unified_checkpoint_loader", None)
+            if observer is not None:
+                observer.bind(model_config, self.load_config)
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
@@ -713,9 +716,13 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights_and_postprocess(model, weights, target_device):
         model.load_weights(weights)
 
-        for _, module in model.named_modules():
+        observer = getattr(model, "_unified_checkpoint_loader", None)
+        for name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
+                if observer is not None and observer.defer_postprocess(module):
+                    observer.after_postprocess(name, module)
+                    continue
                 # When quant methods need to process weights after loading
                 # (for repacking, quantizing, etc), they expect parameters
                 # to be on the global target device. This scope is for the
@@ -723,6 +730,11 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+                if observer is not None:
+                    observer.after_postprocess(name, module)
+        if observer is not None:
+            observer.finish()
+
 
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a

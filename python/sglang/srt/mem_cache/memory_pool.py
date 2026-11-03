@@ -306,7 +306,7 @@ class MambaPool:
                         temporal_state_shape[2],
                     ),
                     dtype=ssm_dtype,
-                    device="cuda",
+                    device=device,
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
@@ -320,7 +320,7 @@ class MambaPool:
                             conv_shape[1],
                         ),
                         dtype=conv_dtype,
-                        device="cuda",
+                        device=device,
                     )
                     for conv_shape in conv_state_shape
                 ]
@@ -730,6 +730,15 @@ class KVCache(abc.ABC):
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+
+    @property
+    def num_kv_layers(self) -> int:
+        """Number of layers this pool holds KV for.
+
+        Every layer of a plain pool owns KV, so the count is the layer-id span.
+        A hybrid pool overrides this.
+        """
+        return self.end_layer - self.start_layer
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -1296,6 +1305,7 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1303,6 +1313,13 @@ class HybridLinearKVPool(KVCache):
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
         self.start_layer = start_layer if start_layer is not None else 0
+        # `end_layer` is the exclusive bound of this PP rank's layer range, as in
+        # KVCache, and not the number of KV-owning layers.
+        self.end_layer = (
+            end_layer
+            if end_layer is not None
+            else self.start_layer + self.full_layer_nums
+        )
         self.layer_transfer_counter = None
         self.head_num = head_num
         self.head_dim = head_dim
@@ -1383,6 +1400,11 @@ class HybridLinearKVPool(KVCache):
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
+
+    @property
+    def num_kv_layers(self) -> int:
+        # Only the full-attention layers own KV in a hybrid pool.
+        return self.full_layer_nums
 
     def _transfer_full_attention_id(self, layer_id: int):
         if layer_id not in self.full_attention_layer_id_mapping:

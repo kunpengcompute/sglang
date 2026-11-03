@@ -553,6 +553,15 @@ class VocabParallelEmbedding(torch.nn.Module):
                     added_vocab_start=0,
                     added_vocab_end=0,
                 )
+        if input_.dim() > 1:
+            # The fused CPU920F embedding kernel and its adapter always emit a
+            # flat [numel, hidden] output, while F.embedding preserves the
+            # indices' batch dims. Restore that contract here so multi-dim
+            # callers (e.g. the vision tower's [4, patches] bilinear corner
+            # table) see the same shapes as on GPU. The collectives above
+            # already ran on the flat 2D view; 1D language indices are
+            # unaffected.
+            output_parallel = output_parallel.view(*input_.shape, -1)
         return output_parallel
 
     def extra_repr(self) -> str:

@@ -19,6 +19,7 @@
 #include <torch/extension.h>
 
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -41,6 +42,14 @@ public:
         hold_fixed(fixed);
     }
     std::vector<torch::Tensor> run(const std::vector<torch::Tensor> &inputs);
+
+    // Read-only planner snapshot; never called from replay's hot path.
+    auto describe_plan() const
+    {
+        return std::make_tuple(storages_, views_, op_records_, num_inputs_,
+                               planned_regular_bytes_, pool_.size(),
+                               planned_shm_bytes_, shm_pool_.size());
+    }
 
     void enable_profile(bool enable);
     std::vector<uint64_t> get_profile_row() const
@@ -70,6 +79,8 @@ private:
     std::vector<StorageBuf> storages_;
     std::vector<TensorView> views_;
     std::vector<OpRecord> op_records_;
+    size_t planned_regular_bytes_ = 0;
+    size_t planned_shm_bytes_ = 0;
     MemoryPool pool_;
     MemoryPool shm_pool_;
     std::vector<int> input_view_ids_;  // = input_storage_ids_ (primary view == storage_id)

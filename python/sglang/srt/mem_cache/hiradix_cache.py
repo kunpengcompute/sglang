@@ -1025,6 +1025,8 @@ class HiRadixCache(RadixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
+        evicted_to_l3 = 0
+        evicted_dropped = 0
         write_back_nodes = []
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
@@ -1038,9 +1040,31 @@ class HiRadixCache(RadixCache):
                     # budget (see _trim_storage_index), not by L1 eviction.
                     continue
                 if x.storage_backed:
-                    num_evicted += self._evict_storage_backed(x)
+                    if _hicache_debug():
+                        logger.info(
+                            "[hicache] L1 evict node=%d, %d token(s), "
+                            "device[%d..%d] -> L3-only",
+                            x.id,
+                            len(x.value),
+                            int(x.value[0]),
+                            int(x.value[-1]),
+                        )
+                    n = self._evict_storage_backed(x)
+                    num_evicted += n
+                    evicted_to_l3 += n
                 else:
-                    num_evicted += self._evict_regular(x)
+                    if _hicache_debug():
+                        logger.info(
+                            "[hicache] L1 evict node=%d, %d token(s), "
+                            "device[%d..%d] -> dropped (not in L3)",
+                            x.id,
+                            len(x.value),
+                            int(x.value[0]),
+                            int(x.value[-1]),
+                        )
+                    n = self._evict_regular(x)
+                    num_evicted += n
+                    evicted_dropped += n
             elif not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
@@ -1068,6 +1092,31 @@ class HiRadixCache(RadixCache):
             for node in write_back_nodes:
                 assert node.backuped
                 self._evict_backuped(node)
+
+        if _hicache_debug() and self.l1l3_only and num_tokens > 0:
+            if evicted_to_l3 or evicted_dropped:
+                logger.info(
+                    "[hicache] L1 evict summary: need=%d, evicted=%d "
+                    "(l3_only=%d, dropped=%d), l3_index=%d, "
+                    "evictable=%d, protected=%d",
+                    num_tokens,
+                    num_evicted,
+                    evicted_to_l3,
+                    evicted_dropped,
+                    self.storage_only_tokens,
+                    self.evictable_size(),
+                    self.protected_size(),
+                )
+            if num_evicted < num_tokens:
+                logger.warning(
+                    "[hicache] L1 evict shortfall: need=%d, got=%d, "
+                    "l3_index=%d, evictable=%d, protected=%d (leaves locked?)",
+                    num_tokens,
+                    num_evicted,
+                    self.storage_only_tokens,
+                    self.evictable_size(),
+                    self.protected_size(),
+                )
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -1437,7 +1486,35 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        total_tokens = len(prefetch_key)
+        elapsed = time.monotonic() - operation.start_time
+        # terminate_prefetch() marks the operation terminated unconditionally, so
+        # classify by how much actually landed instead.
+        if completed_tokens >= total_tokens:
+            stop_reason = "complete"
+        elif self.prefetch_stop_policy == "timeout" and self.is_prefetch_timeout(
+            operation
+        ):
+            stop_reason = "timeout"
+        elif self.prefetch_stop_policy == "best_effort":
+            stop_reason = "best_effort"
+        elif completed_tokens == 0:
+            stop_reason = "no-page"
+        else:
+            stop_reason = "partial"
+        if _hicache_debug():
+            emit = logger.info if stop_reason == "complete" else logger.warning
+            emit(
+                "[hicache] prefetch %s: req=%s, %d/%d token(s), %d/%d page(s), "
+                "elapsed=%.3fs",
+                stop_reason,
+                req_id,
+                completed_tokens,
+                total_tokens,
+                completed_tokens // self.page_size,
+                total_tokens // self.page_size,
+                elapsed,
+            )
 
         min_completed_tokens = completed_tokens
         # Synchronize workers before mutating host cache tree state.
@@ -1446,6 +1523,28 @@ class HiRadixCache(RadixCache):
             completed_tokens_tensor, torch.distributed.ReduceOp.MIN
         )
         min_completed_tokens = completed_tokens_tensor.item()
+        if min_completed_tokens == 0:
+            # No token prefix is common to every TP rank, so nothing can be
+            # published and the scheduler will recompute the whole request
+            # anyway. Release this rank's slots now instead of walking the
+            # insert path with an empty prefix.
+            self.cache_controller.append_host_mem_release(
+                host_indices[:completed_tokens]
+            )
+            last_host_node.release_host()
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            if _hicache_debug():
+                logger.info(
+                    "[hicache] prefetch discarded: req=%s, 0 token(s) reusable "
+                    "across TP ranks (this rank completed %d/%d), all tokens "
+                    "will be recomputed",
+                    req_id,
+                    completed_tokens,
+                    total_tokens,
+                )
+            return True
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         if self.l1l3_only:
@@ -1488,6 +1587,16 @@ class HiRadixCache(RadixCache):
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        if _hicache_debug():
+            logger.info(
+                "[hicache] prefetch published: req=%s, %d/%d token(s) into L1 "
+                "(%d already resident), %d token(s) will be recomputed",
+                req_id,
+                loaded_from_storage,
+                total_tokens,
+                matched_length,
+                total_tokens - min_completed_tokens,
+            )
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)

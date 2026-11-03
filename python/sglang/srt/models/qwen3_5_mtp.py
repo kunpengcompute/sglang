@@ -46,9 +46,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         config: PretrainedConfig,
         quant_config=None,
         prefix: str = "",
+        shared_embed_tokens=None,
+        shared_lm_head=None,
     ) -> None:
         nn.Module.__init__(self)
 
+        from copy import deepcopy
+
+        config = deepcopy(config)
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
             config = config.text_config
@@ -80,10 +85,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
+            shared_embed_tokens=shared_embed_tokens,
         )
 
         if get_pp_group().is_last_rank:
-            if config.tie_word_embeddings:
+            if shared_lm_head is not None:
+                self.lm_head = shared_lm_head
+            elif config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
@@ -108,14 +116,23 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        if hasattr(self, "_runtime_capabilities"):
+            self._runtime_capabilities.require("mtp")
+            if self.model.embed_tokens.weight is embed and self.lm_head.weight is head:
+                # Borrow the owning target modules, including packed-head buffers.
+                return
+            raise RuntimeError(
+                "Attached MTP must retain the owning target embed/head modules"
+            )
         del self.model.embed_tokens.weight
         if not self.config.tie_word_embeddings:
             del self.lm_head.weight
 
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if embed.is_cuda:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     @torch.no_grad()
     def forward(
@@ -126,6 +143,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        if hasattr(self, "_runtime_capabilities"):
+            self._runtime_capabilities.require("mtp")
         exit_stack = ExitStack()
         if (
             is_npu()
@@ -155,12 +174,34 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
 
-        if not forward_batch.forward_mode.is_idle():
-            input_embeds = self.pre_fc_norm_embedding(input_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-        hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+        bounded_cpu_pre_fc = (
+            getattr(self, "_runtime_component", None) == "mtp"
+            and getattr(self, "_runtime_capabilities", None) is not None
+            and input_embeds.device.type == hidden_states.device.type == "cpu"
+            and input_embeds.dtype
+            == hidden_states.dtype
+            == self.fc.weight.dtype
+            == torch.bfloat16
+            and input_embeds.ndim == hidden_states.ndim == 2
+            and input_embeds.shape == hidden_states.shape
+            and input_embeds.shape[0] > 128
+        )
+        if not forward_batch.forward_mode.is_idle() and bounded_cpu_pre_fc:
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import pre_fc
 
-        hidden_states = self.fc(hidden_states)
+            hidden_states = pre_fc(
+                input_embeds,
+                hidden_states,
+                self.pre_fc_norm_embedding,
+                self.pre_fc_norm_hidden,
+                self.fc,
+            )
+        else:
+            if not forward_batch.forward_mode.is_idle():
+                input_embeds = self.pre_fc_norm_embedding(input_embeds)
+                hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+            hidden_states = self.fc(hidden_states)
 
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states = self.model(
@@ -179,6 +220,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        if hasattr(self, "_runtime_capabilities"):
+            raise RuntimeError(
+                "Attached MTP weights must use the enclosing whole checkpoint loader"
+            )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

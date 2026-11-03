@@ -198,9 +198,14 @@ class KunpengCommunicator:
         self.comm_size = group.size()
         self.comm_rank = group.rank()
         self.shm_tensors: dict = {}
-        self.max_tokens = int(os.environ['SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS']) if 'SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS' in os.environ else (
-            int(os.environ.get('SGLANG_KUNPENG_MAX_SEQ_NUM', '4')) *
-            int(os.environ.get('SGLANG_KUNPENG_MAX_CUR_LEN', '1024')))
+        legacy_token_capacity = int(
+            os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "4")
+        ) * int(os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1024"))
+        self.max_tokens = int(
+            os.environ.get(
+                "SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS", str(legacy_token_capacity)
+            )
+        )
 
         # TODO(kunpeng): 7168 is the hidden size of DeepSeek V3, used to
         # pre-allocate SHM buffer for allreduce. This is hardcoded
@@ -214,9 +219,16 @@ class KunpengCommunicator:
         kernel.shm_allgather_init_kunpeng()
         kernel.shm_allreduce_init_kunpeng(self.max_elements)
 
+        # Honor an explicit collective token budget; otherwise preserve the
+        # upstream batched-AllGather defaults, including their distinct fallback.
         _max_seq_num = int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "32"))
         _max_cur_len = int(os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "2"))
-        dim_size = self.max_elements // self.comm_size if "SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS" in os.environ else _max_seq_num * _max_cur_len * SHM_ALIGN_SIZE // self.comm_size
+        _batched_tokens = int(
+            os.environ.get(
+                "SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS", str(_max_seq_num * _max_cur_len)
+            )
+        )
+        dim_size = _batched_tokens * SHM_ALIGN_SIZE // self.comm_size
         if is_kunpeng_graph_capture():
             kernel.shm_batched_allgather_init_kunpeng(dim_size)
             logger.info(

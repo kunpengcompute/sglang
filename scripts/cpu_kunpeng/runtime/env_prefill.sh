@@ -47,6 +47,7 @@ if [[ $LONG_PROMPT_PREFILL_INSTANCE == "1" ]]; then
     export PREFILL_EP_SIZE="${PREFILL_TP_SIZE}"
     export PREFILL_PP_SIZE=16
     export CHUNKED_PREFILL_SIZE_PER_DP=2048
+    export SGLANG_PP_LAYER_PARTITION="7,5,5,5,5,4,5,4,6,4,4,5,4,5,6,4"
     export SGLANG_KUNPENG_MOE_PREFILL_FORCE_DDR=1
 fi
 
@@ -60,11 +61,22 @@ fi
 #                          tokenizer's ZMQ port block is port_base..+37
 #                          (port_base = master_port + 1, see server_args
 #                          PortArgs), so instances need disjoint blocks.
-# Entries not listed in INSTANCES fall back to the single-instance
-# defaults (30001 / 9001 / 0 / 5000). Instance env files may still
-# override any of these.
+# A no-instance call (plain "prefill", e.g. the launch_router.sh fallback)
+# falls back to the single-instance defaults (30001 / 9001 / 0 / 5000); an
+# EXPLICIT instance that is not listed in INSTANCES is refused instead: its
+# derived ports would silently collapse onto side 0's block and collide with
+# the real side-0 instance (see runtime/README.md section 1). Instance env
+# files may still override any of these.
 # ------------------------------------------------------------
+# Drop inherited values first: these vars are exported, so a stale copy from
+# the calling shell would beat the derivation below (making two entries claim
+# the same router-node port). Instance env files, sourced below, still win.
+unset PREFILL_TOK_PORT PREFILL_BOOTSTRAP_PORT PREFILL_NUMA_BASE PREFILL_MASTER_PORT
 read -r _pf_g _pf_s <<< "$(_instance_indexes "prefill${INSTANCE:+_$INSTANCE}")"
+if [[ "$_pf_s" -lt 0 && -n "${INSTANCE:-}" ]]; then
+    echo "ERROR: prefill instance '$INSTANCE' (entry 'prefill_$INSTANCE') is not in INSTANCES='$INSTANCES'" >&2
+    return 1 2>/dev/null || exit 1
+fi
 [[ "$_pf_s" -lt 0 ]] && _pf_s=0
 [[ "$_pf_g" -lt 0 ]] && _pf_g=0
 export PREFILL_TOK_PORT="${PREFILL_TOK_PORT:-$((30001 + _pf_g))}"
@@ -88,9 +100,12 @@ export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB="${SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB:
 #   mooncake mooncake store master (runtime/env_mooncake.sh), needs
 #            MOONCAKE_MASTER* and the RDMA settings in .user_env.sh; the store
 #            is page_first-only, so server.sh selects that layout.
-# PREFETCH_POLICY: wait_complete blocks the request until the whole L3->L2 load
-# is done (so no recompute); timeout/best_effort give up early. DEBUG = verbose
-# per-transfer "[hicache]" logs. Off by default; server.sh wires it for prefill.
+# PREFETCH_POLICY (default timeout): wait_complete blocks the request until the
+# whole L3->L2 load is done (so no recompute); timeout/best_effort give up early.
+# The timeout budget is base + pages x per_ki_token (code defaults 1s / 0.25s);
+# EXTRA_CONFIG passes the whole --hicache-storage-backend-extra-config JSON
+# through and wins over the two timeout knobs. DEBUG = verbose per-transfer
+# "[hicache]" logs. Off by default; server.sh wires it for prefill.
 # ------------------------------------------------------------
 export ENABLE_KUNPENG_HICACHE="${ENABLE_KUNPENG_HICACHE:-0}"
 export KUNPENG_HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-mooncake}"
@@ -99,7 +114,10 @@ export KUNPENG_HICACHE_L3_DIR="${KUNPENG_HICACHE_L3_DIR:-}"
 export KUNPENG_HICACHE_RATIO="${KUNPENG_HICACHE_RATIO:-1.0}"
 export KUNPENG_HICACHE_SIZE="${KUNPENG_HICACHE_SIZE:-}"
 export KUNPENG_HICACHE_WRITE_POLICY="${KUNPENG_HICACHE_WRITE_POLICY:-write_through}"
-export KUNPENG_HICACHE_PREFETCH_POLICY="${KUNPENG_HICACHE_PREFETCH_POLICY:-wait_complete}"
+export KUNPENG_HICACHE_PREFETCH_POLICY="${KUNPENG_HICACHE_PREFETCH_POLICY:-timeout}"
+export KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-}"
+export KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-}"
+export KUNPENG_HICACHE_EXTRA_CONFIG="${KUNPENG_HICACHE_EXTRA_CONFIG:-}"
 export SGLANG_HICACHE_DEBUG="${SGLANG_HICACHE_DEBUG:-0}"
 export MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-rdma}"
 export MOONCAKE_TE_META_DATA_SERVER="${MOONCAKE_TE_META_DATA_SERVER:-P2PHANDSHAKE}"

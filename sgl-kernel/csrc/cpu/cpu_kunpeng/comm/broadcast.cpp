@@ -27,6 +27,10 @@
 #include <sgl_kernel_ops.h>
 #include <arm_bf16.h>
 #include <kutacc.h>
+
+#ifndef SGLANG_KUTACC_HAS_BROADCAST
+#define SGLANG_KUTACC_HAS_BROADCAST 1
+#endif
 #include "../utils/kunpeng_oob.h"
 #include "../moe/moe_comm.h"
 
@@ -53,6 +57,7 @@ static bcast_comm_t *get_bcast_comm(int64_t pg_ptr)
 
 void broadcast_kunpeng_create(int64_t pg_ptr, int64_t max_buf_bytes)
 {
+#if SGLANG_KUTACC_HAS_BROADCAST
     if (pg_ptr == 0 || g_bcast_comms.count(pg_ptr) > 0) {
         return;
     }
@@ -91,10 +96,16 @@ void broadcast_kunpeng_create(int64_t pg_ptr, int64_t max_buf_bytes)
     // cached per comm afterwards).
     ret = kutacc::kurmcl_broadcast(bc.buf, (int)max_buf_bytes, pg->getRank(), 0, bc.conn);
     TORCH_CHECK(ret == KUTACC_OK, "broadcast buffer registration failed with code ", ret);
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_BROADCAST; install a matching KuTACC release to use broadcast_kunpeng_create");
+
+#endif
 }
 
 at::Tensor broadcast_kunpeng_pyobj(at::Tensor payload, int64_t rank, int64_t root, int64_t pg_ptr)
 {
+#if SGLANG_KUTACC_HAS_BROADCAST
     TORCH_CHECK(payload.dtype() == torch::kUInt8 && payload.is_contiguous(),
                 "broadcast payload must be a contiguous uint8 tensor");
     bcast_comm_t *bc = get_bcast_comm(pg_ptr);
@@ -148,10 +159,16 @@ at::Tensor broadcast_kunpeng_pyobj(at::Tensor payload, int64_t rank, int64_t roo
     auto out = torch::empty({size}, torch::TensorOptions().dtype(torch::kUInt8));
     memcpy(out.data_ptr(), bc->buf + BCAST_HEADER, (size_t)size);
     return out;
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_BROADCAST; install a matching KuTACC release to use broadcast_kunpeng_pyobj");
+
+#endif
 }
 
 void broadcast_kunpeng_finalize()
 {
+#if SGLANG_KUTACC_HAS_BROADCAST
     for (auto &kv : g_bcast_comms) {
         free(kv.second.raw);
         kv.second.raw = nullptr;
@@ -164,4 +181,7 @@ void broadcast_kunpeng_finalize()
         // exit.
     }
     g_bcast_comms.clear();
+
+#else
+#endif
 }

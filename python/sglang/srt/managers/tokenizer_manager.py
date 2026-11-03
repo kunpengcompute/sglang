@@ -297,6 +297,15 @@ class TokenizerManager(
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
+        from sglang.srt.model_executor.model_capabilities import (
+            initial_policy_for_model_config,
+            validate_startup_capabilities,
+        )
+
+        self._runtime_capability_policy = initial_policy_for_model_config(
+            self.model_config
+        )
+        validate_startup_capabilities(self._runtime_capability_policy, server_args)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
@@ -322,6 +331,25 @@ class TokenizerManager(
 
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
+            if (
+                _is_cpu_920f
+                and not server_args.disable_fast_image_processor
+                and os.environ.get("SGLANG_KUNPENG_KEEP_FAST_IMAGE_PROCESSOR", "0")
+                != "1"
+            ):
+                # The fast (torchvision) image processor runs resize/normalize
+                # through kupl-managed torch parallel ops, which silently skip
+                # work when the thread count does not fit this frontend
+                # process's single-core affinity (problem #3) - the ops then
+                # leave their output buffers uninitialized. The classic
+                # PIL/numpy processor is torch-free and immune to the kupl
+                # thread/affinity rules. _get_processor_wrapper falls back to
+                # the fast one automatically if no slow version exists.
+                server_args.disable_fast_image_processor = True
+                logger.info(
+                    "Kunpeng 920F: fast image processor disabled "
+                    "(PIL/numpy preprocessing, kupl-free)"
+                )
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
@@ -560,6 +588,13 @@ class TokenizerManager(
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        from sglang.srt.model_executor.model_capabilities import (
+            validate_request_capabilities,
+        )
+
+        validate_request_capabilities(
+            getattr(self, "_runtime_capability_policy", None), obj
+        )
         self._set_default_priority(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
@@ -741,6 +776,13 @@ class TokenizerManager(
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        from sglang.srt.model_executor.model_capabilities import (
+            validate_request_capabilities,
+        )
+
+        validate_request_capabilities(
+            getattr(self, "_runtime_capability_policy", None), obj
+        )
         # Tokenize
         input_embeds = None
         input_text = obj.text

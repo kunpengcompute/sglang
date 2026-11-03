@@ -27,4 +27,8 @@ LOG_DIR="${LOG_DIR_ARG:-$LOG_DIR}"
 mkdir -p "$LOG_DIR"
 echo "[$(date +%T)] mooncake store service on $MOONCAKE_STORE_NODE:$MOONCAKE_STORE_PORT, segment $MOONCAKE_GLOBAL_SEGMENT_SIZE, master $MOONCAKE_MASTER"
 
+if [[ "${MOONCAKE_ENABLE_SSD_OFFLOAD:-0}" == "1" ]]; then
+    mkdir -p "$MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"
+fi
+
 exec python -m mooncake.mooncake_store_service --port="$MOONCAKE_STORE_PORT"

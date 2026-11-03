@@ -294,6 +294,49 @@ def _setup_bf16_packed_gemm_kunpeng():
     register_op('bf16_packed_gemm_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_bf16_small_output_gemm_kunpeng():
+    def shape_infer(input, weight):
+        assert input.dtype == weight.dtype == torch.bfloat16
+        assert input.device.type == weight.device.type == "cpu"
+        assert input.ndim == weight.ndim == 2
+        assert input.is_contiguous() and weight.is_contiguous()
+        assert 1 <= input.shape[0] <= 32 and input.shape[1] == 5120
+        assert tuple(weight.shape) == (6, 5120)
+        return [((input.shape[0], weight.shape[0]), input.dtype)]
+
+    def eager_fn(input, weight):
+        output = torch.empty((input.shape[0], weight.shape[0]), dtype=input.dtype)
+        torch.ops.sgl_kernel.bf16_small_output_gemm_kunpeng(input, weight, output)
+        return output
+
+    register_op("bf16_small_output_gemm_kunpeng", shape_infer, eager_fn)
+
+
+def _setup_bf16_small_output_gemm_workspace_kunpeng():
+    def shape_infer(input, weight, workspace):
+        assert input.dtype == weight.dtype == workspace.dtype == torch.bfloat16
+        assert input.device.type == weight.device.type == workspace.device.type == "cpu"
+        assert input.ndim == weight.ndim == 2 and workspace.ndim == 1
+        assert (
+            input.is_contiguous()
+            and weight.is_contiguous()
+            and workspace.is_contiguous()
+        )
+        assert 1 <= input.shape[0] <= 4096 and input.shape[1] == 5120
+        assert tuple(weight.shape) == (6, 5120)
+        assert workspace.numel() >= input.shape[0] * 32
+        return [((input.shape[0], 6), input.dtype)]
+
+    def eager_fn(input, weight, workspace):
+        output = torch.empty((input.shape[0], 6), dtype=input.dtype)
+        torch.ops.sgl_kernel.bf16_small_output_gemm_kunpeng.workspace(
+            input, weight, workspace, output
+        )
+        return output
+
+    register_op("bf16_small_output_gemm_workspace_kunpeng", shape_infer, eager_fn)
+
+
 def _setup_bf16_packed_gemm_f32_kunpeng():
     # fp32-output split-K GEMM: bf16 inputs, fp32 partials + fp32 store.
     # Used by the MoE gate so router logits skip the two bf16 rounding
@@ -1439,20 +1482,45 @@ def _setup_batched_bgemm_kunpeng():
     # SME bf16 batched GEMM for the bf16 kv_b_proj MLA absorb path (e.g.
     # GLM-5): out = input @ weight^T per batch item. weight is the
     # batched_bgemm_prepack_kunpeng SME-packed output ([B, N, K]); input [B, M, K]
-    # (outer dims may be strided views).
-    def shape_infer(input, weight):
+    # (outer dims may be strided views). workspace is a caller-allocated,
+    # contiguous [B*M*K] bf16 buffer that receives the per-call act SME pack:
+    # passing it in keeps the temporary in HBW (eager) / in a graph-owned
+    # buffer (capture+replay) instead of allocating DDR inside the kernel.
+    def shape_infer(input, weight, workspace):
         B, M, K = input.shape
         N = weight.shape[1]
         return [((B, M, N), input.dtype)]
 
-    def eager_fn(input, weight):
+    def eager_fn(input, weight, workspace):
         B, M, K = input.shape
         N = weight.shape[1]
         out = torch.empty((B, M, N), dtype=input.dtype, device=input.device)
-        torch.ops.sgl_kernel.batched_bgemm_kunpeng(input, weight, out)
+        torch.ops.sgl_kernel.batched_bgemm_kunpeng(
+            input, weight, out, workspace)
         return out
 
     register_op('batched_bgemm_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_batched_bgemm_inplace_kunpeng():
+    # In-place variant of batched_bgemm_kunpeng: the caller provides the
+    # output tensor, typically a strided (B, M, N) view over a (M, B, N)
+    # buffer or a column slice of a wider row (e.g. the latent nope prefix
+    # of q_combined). The GEMM then writes the value's final resting layout
+    # directly (the C++ side already honors output.stride(0/1); only the
+    # last dim must be contiguous), so the post-GEMM transpose+contiguous
+    # /cat passes disappear. Same calling convention as
+    # batched_gemm_woqs8_allthreads_inplace_kunpeng. workspace is the
+    # caller-allocated act SME pack buffer (see above).
+    def shape_infer(input, weight, workspace, out):
+        return []
+
+    def eager_fn(input, weight, workspace, out):
+        torch.ops.sgl_kernel.batched_bgemm_kunpeng(
+            input, weight, out, workspace)
+        return None
+
+    register_op('batched_bgemm_inplace_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_shm_mla_o_alltoall_long_context_kunpeng():
@@ -1685,6 +1753,8 @@ def setup():
     _setup_s8_s8_gemm_bf16_dq_kunpeng()
     _setup_bf16_gemm_pack_kunpeng()
     _setup_bf16_packed_gemm_kunpeng()
+    _setup_bf16_small_output_gemm_kunpeng()
+    _setup_bf16_small_output_gemm_workspace_kunpeng()
     _setup_bf16_packed_gemm_f32_kunpeng()
     _setup_grouped_topk_kunpeng()
     _setup_grouped_topk_inplace_kunpeng()
@@ -1734,6 +1804,7 @@ def setup():
     _setup_fake_indexer_topk_mtp_kunpeng()
     _setup_paged_mqa_logits_topk_kunpeng()
     _setup_batched_bgemm_kunpeng()
+    _setup_batched_bgemm_inplace_kunpeng()
     _setup_shm_mla_o_alltoall_long_context_kunpeng()
     _setup_lc_mark_empty_lse_kunpeng()
     _setup_flash_mla_reduce_kunpeng()
@@ -1758,6 +1829,7 @@ def setup():
     _setup_moe_etp_dispatch_share_kunpeng()
     _setup_moe_etp_reduce_kunpeng()
     _setup_etp_remap_topk_ids_kunpeng()
+
 
 setup()
 

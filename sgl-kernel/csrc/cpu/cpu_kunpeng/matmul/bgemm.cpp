@@ -16,6 +16,14 @@
 
 #include <arm_bf16.h>
 #include <kutacc.h>
+
+#ifndef SGLANG_KUTACC_HAS_BF16_PACKED_GEMM_F32
+#define SGLANG_KUTACC_HAS_BF16_PACKED_GEMM_F32 1
+#endif
+
+#ifndef SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM
+#define SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM 1
+#endif
 #include <torch/extension.h>
 
 #include "common.h"
@@ -112,10 +120,11 @@ void batched_gemm_pack_allthreads_kunpeng(at::Tensor input, at::Tensor out)
 
 at::Tensor batched_bgemm_prepack_kunpeng(const at::Tensor &weight)
 {
-    // [B, K, N] -> [B, N, K] 转置 + SME 打包 (dtype=2 B 矩阵微块布局),
-    // 供 batched_bgemm_kunpeng 的 batch_bf16_bf16_packed_gemm_bf16 消费.
-    // loader 侧: w_kc [H, qk_nope, kv_lora] / w_vc [H, kv_lora, v_head]
-    // (BMM 语义 [B, K, N]).
+    // [B, K, N] -> [B, N, K] transpose + SME pack (dtype=2 B-matrix micro-tile
+    // layout) for batch_bf16_bf16_packed_gemm_bf16 consumed by
+    // batched_bgemm_kunpeng.
+    // Loader side: w_kc [H, qk_nope, kv_lora] / w_vc [H, kv_lora, v_head]
+    // (BMM semantics [B, K, N]).
     TORCH_CHECK(weight.dim() == 3, "weight must be 3D [B, K, N]");
     TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
     const int64_t K = weight.size(1);
@@ -131,22 +140,33 @@ at::Tensor batched_bgemm_prepack_kunpeng(const at::Tensor &weight)
     return packed;
 }
 
-void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output)
+void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace)
 {
-    //   input  [B, M, K] bf16 (外维可 strided, 如 transpose 视图; 末维连续)
-    //   weight [B, N, K] bf16 (batched_bgemm_prepack_kunpeng 的 SME 打包输出)
-    //   output [B, M, N] bf16 (直接写入; 外维可 strided)
-    // act 逐次 SME 打包后走 batch_bf16_bf16_packed_gemm_bf16 (MOPA 外积,
-    // m 任意, k/n 需 %32==0), 布局契约见 kutacc.h.
+#if SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM
+    //   input     [B, M, K] bf16 (outer dims may be strided, e.g. a transpose
+    //             view; last dim contiguous)
+    //   weight    [B, N, K] bf16 (SME-packed output of
+    //             batched_bgemm_prepack_kunpeng)
+    //   output    [B, M, N] bf16 (written directly; outer dims may be strided)
+    //   workspace [B*M*K] bf16 (caller-provided act SME pack scratch;
+    //             contiguous)
+    // The act is SME-packed into workspace per call, then consumed by
+    // batch_bf16_bf16_packed_gemm_bf16 (MOPA outer product, arbitrary m,
+    // k/n must be %32==0); see kutacc.h for the layout contract. workspace is
+    // preallocated by the caller (eager: HBW; graph: alloc_buffer freezes it
+    // into a graph-owned buffer) to avoid allocating a DDR scratch buffer on
+    // every forward.
     TORCH_CHECK(input.dim() == 3, "input must be 3D [B, M, K]");
     TORCH_CHECK(weight.dim() == 3, "weight must be 3D [B, N, K]");
     TORCH_CHECK(output.dim() == 3, "output must be 3D [B, M, N]");
     TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be BF16");
     TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be BF16");
     TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output must be BF16");
+    TORCH_CHECK(workspace.scalar_type() == at::kBFloat16, "workspace must be BF16");
     TORCH_CHECK(input.stride(2) == 1, "input last dim must be contiguous");
     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous (prepacked)");
     TORCH_CHECK(output.stride(2) == 1, "output last dim must be contiguous");
+    TORCH_CHECK(workspace.is_contiguous(), "workspace must be contiguous");
 
     const int64_t B = input.size(0);
     const int64_t M = input.size(1);
@@ -163,14 +183,19 @@ void batched_bgemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor outpu
     if (B == 0 || M == 0 || N == 0 || K == 0)
         return;
 
-    auto act_packed = at::empty({B, M, K}, input.options());
+    TORCH_CHECK(workspace.numel() >= B * M * K, "workspace too small: need at least ", B * M * K,
+                " bf16 elements for act pack, got ", workspace.numel());
     kutacc::batch_bf16_gemm_pack(B, M, K, input.stride(0), input.stride(1),
-                                 input.data_ptr(), act_packed.data_ptr(), 2);
+                                 input.data_ptr(), workspace.data_ptr(), 2);
     kutacc::batch_bf16_bf16_packed_gemm_bf16(
         B, M, N, K, output.stride(0), output.stride(1),
-        reinterpret_cast<bfloat16_t *>(act_packed.data_ptr()),
+        reinterpret_cast<bfloat16_t *>(workspace.data_ptr()),
         reinterpret_cast<bfloat16_t *>(weight.data_ptr()),
         reinterpret_cast<bfloat16_t *>(output.data_ptr()));
+
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_BATCHED_BF16_GEMM; install a matching KuTACC release to use batched_bgemm_kunpeng");
+#endif
 }
 
 void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
@@ -215,6 +240,7 @@ void bf16_packed_gemm_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor ou
 void bf16_packed_gemm_f32_kunpeng(at::Tensor input, at::Tensor weight, at::Tensor output, at::Tensor workspace,
                                   int64_t num_threads)
 {
+#if SGLANG_KUTACC_HAS_BF16_PACKED_GEMM_F32
     TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
     TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be bfloat16");
     TORCH_CHECK(output.scalar_type() == at::kFloat, "output must be float32");
@@ -249,6 +275,9 @@ void bf16_packed_gemm_f32_kunpeng(at::Tensor input, at::Tensor weight, at::Tenso
     kutacc::bf16_packed_gemm_f32(m, n, k, t, reinterpret_cast<bfloat16_t *>(input.data_ptr()),
                                  reinterpret_cast<bfloat16_t *>(weight.data_ptr()),
                                  reinterpret_cast<float *>(output.data_ptr()), tmpc);
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide bf16_packed_gemm_f32; install a matching KuTACC release to use the FP32 router GEMM");
+#endif
 }
 
 void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size)
