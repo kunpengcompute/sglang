@@ -6,9 +6,23 @@
 #include <kutacc.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 
 namespace {
+
+// Private candidate selection; no Graph/Ku API or startup default changes.
+static std::atomic<int> p3_ordered_exp_override{-1};
+
+bool p3_ordered_exp_enabled() {
+    const int mode = p3_ordered_exp_override.load(std::memory_order_relaxed);
+    if (mode >= 0) return mode != 0;
+    static const bool from_environment = [] {
+        const char *value = std::getenv("SGLANG_KUNPENG_QWEN_GQA_ORDERED_EXP");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return from_environment;
+}
 
 inline int64_t pv_column_grain(int64_t workers, int64_t sequence_length) {
     const int64_t original = std::max<int64_t>(1, (kHeadDim + workers - 1) / workers);
@@ -35,6 +49,13 @@ inline float qwen36_qk_dot_bf16(const uint16_t *__restrict query, const uint16_t
 #endif
 
 } // namespace
+
+// Set only between complete runs; nonzero explicitly enables and zero disables.
+// Without this private override only the startup environment selects the route.
+extern "C" __attribute__((visibility("default"))) void
+qwen36_gqa_ordered_exp_enable(int64_t enabled) {
+    p3_ordered_exp_override.store(enabled != 0, std::memory_order_relaxed);
+}
 
 extern "C" __attribute__((visibility("default"))) int
 qwen36_gqa_decode_bf16_parallel_with_workspace(
@@ -79,7 +100,70 @@ qwen36_gqa_decode_bf16_parallel_with_workspace(
 
     // Independent long-context Q2 heads share the existing pool. Each head
     // keeps the original token order and FP32 max/exp/denominator/normalization.
-    if (query_heads == 2 && sequence_length >= 16384) {
+    if (query_heads == 2 && sequence_length >= 16384 && p3_ordered_exp_enabled()) {
+        // Preserve each head's token-ascending max fold. The existing PV
+        // workspace is not live until PV; use one separate head-base slot per
+        // maximum and finish every consumer before PV overwrites these slots.
+        kutacc::parallel_for(0, query_heads, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t head = begin; head < end; ++head) {
+                float *scores = score_scratch + head * sequence_length;
+                float maximum = scores[0];
+                for (int64_t token = 1; token < sequence_length; ++token) {
+                    maximum = std::max(maximum, scores[token]);
+                }
+                pv_workspace[head * kHeadDim] = maximum;
+            }
+        });
+
+        // Exactly `workers` logical tasks (32 at the frozen runtime setting).
+        // Partition the physical score cache lines, not each head separately:
+        // an odd-L head boundary inside one line stays with a single task.
+        const int64_t line_floats = 64 / sizeof(float);
+        const int64_t line_offset =
+            (reinterpret_cast<uintptr_t>(score_scratch) % 64) / sizeof(float);
+        const int64_t score_count = query_heads * sequence_length;
+        const int64_t line_count = (line_offset + score_count + line_floats - 1) / line_floats;
+        kutacc::parallel_for(0, workers, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t task = begin; task < end; ++task) {
+                const int64_t first_line = task * line_count / workers;
+                const int64_t last_line = (task + 1) * line_count / workers;
+                const int64_t first = std::min<int64_t>(score_count,
+                    std::max<int64_t>(0, first_line * line_floats - line_offset));
+                const int64_t last = std::min<int64_t>(score_count,
+                    std::max<int64_t>(0, last_line * line_floats - line_offset));
+                for (int64_t head = 0; head < query_heads; ++head) {
+                    const int64_t head_start = head * sequence_length;
+                    const int64_t left = std::max<int64_t>(first, head_start);
+                    const int64_t right = std::min<int64_t>(last, head_start + sequence_length);
+                    if (left >= right) continue;
+                    float *scores = score_scratch + head_start;
+                    const float maximum = pv_workspace[head * kHeadDim];
+                    for (int64_t token = left - head_start; token < right - head_start; ++token) {
+                        const float probability = std::exp(scores[token] - maximum);
+                        scores[token] = probability;
+                    }
+                }
+            }
+        });
+
+        // Keep a single FP32 dependent denominator chain per head. No partial
+        // sums, tree reduction or probability approximation is introduced.
+        kutacc::parallel_for(0, query_heads, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t head = begin; head < end; ++head) {
+                float *scores = score_scratch + head * sequence_length;
+                float denominator = 0.0f;
+                for (int64_t token = 0; token < sequence_length; ++token) {
+                    const float probability = scores[token];
+                    denominator += probability;
+                }
+                const float reciprocal = 1.0f / denominator;
+#pragma clang loop vectorize(enable) interleave(enable)
+                for (int64_t token = 0; token < sequence_length; ++token) {
+                    scores[token] *= reciprocal;
+                }
+            }
+        });
+    } else if (query_heads == 2 && sequence_length >= 16384) {
         kutacc::parallel_for(0, query_heads, 1, [&](int64_t begin, int64_t end) {
             for (int64_t head = begin; head < end; ++head) {
                 float *scores = score_scratch + head * sequence_length;

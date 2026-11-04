@@ -167,9 +167,11 @@ install(TARGETS kupl_async
 
 
 # Native Qwen primitives expose C entry points to the common GraphOpRegistry.
-# These use SVE512; they do not create a separate graph executor.
+# Keep the validated vector-length-agnostic Qwen kernels; no separate graph executor.
 file(GLOB QWEN_NATIVE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/cpu_kunpeng/qwen/*.cpp")
 set_source_files_properties(${QWEN_NATIVE_SOURCES}
+    PROPERTIES COMPILE_OPTIONS "-fvisibility=default")
+set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu_kunpeng/graph/registered_graph_aten.cpp
     PROPERTIES COMPILE_OPTIONS "-fvisibility=default;-msve-vector-bits=512")
 set_property(SOURCE

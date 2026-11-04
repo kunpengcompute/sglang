@@ -930,6 +930,9 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            # todo xjw: 检查下他们是不是自己做了一版优化lm_head的cpu算子，如果是，那我们的改动就不需要了
+            elif _is_cpu_920f and getattr(lm_head, '_cpu_lm_head_apply', None) is not None:
+                logits = lm_head._cpu_lm_head_apply(hidden_states, lm_head, embedding_bias)
             elif _is_cpu_920f and getattr(lm_head, "_kunpeng_lm_head_role", False):
                 from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import (
                     try_linear,

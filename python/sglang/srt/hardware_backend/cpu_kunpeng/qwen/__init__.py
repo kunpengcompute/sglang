@@ -1,58 +1,31 @@
-"""Opt-in Kunpeng backend for the Qwen3.6 27B text decoder."""
-
+"""Kunpeng Qwen operator selection; graph execution stays in the common runner."""
 import os
 
-
 def enabled():
-    return (
-        os.environ.get("SGLANG_USE_CPU_920F") == "1"
-        and os.environ.get("SGLANG_KUNPENG_QWEN") == "1"
-    )
+    return os.environ.get('SGLANG_USE_CPU_920F') == '1' and os.environ.get('SGLANG_KUNPENG_QWEN') == '1'
 
 
-def validate_config(runner):
-    if getattr(runner, "borrowed_qwen_target_runner", None) is not None:
-        from .mtp_bridge import validate_borrowed_config
-
-        validate_borrowed_config(runner)
+def configure_hbw_shm():
+    """Select the existing split HBM budget before communication creates SHM."""
+    if not (enabled() and os.environ.get("SGLANG_ENABLE_HBW_POOL") == "1"
+            and os.environ.get("KUPL_SHM_TYPE") == "posix"):
         return
-    config = runner.model_config.hf_text_config
-    if (
-        runner.server_args.speculative_algorithm is not None
-        and runner.server_args.speculative_eagle_topk != 1
-    ):
-        raise ValueError("Kunpeng Qwen MTP currently requires speculative top-k 1")
-    common = (
-        runner.device == "cpu"
-        and runner.pp_size == 1
-        and runner.server_args.nnodes == 1
-        and config.model_type == "qwen3_5_text"
-        and config.hidden_size == 5120
-        and config.num_hidden_layers == 64
-        and (config.num_attention_heads, config.num_key_value_heads, config.head_dim)
-        == (24, 4, 256)
-        and (runner.server_args.max_running_requests or 32) <= 32
-        and runner.server_args.dtype == "bfloat16"
+    budget = os.environ.get("SGLANG_KUNPENG_WEIGHTS_HBW_POOL_SIZE_MB", "4000")
+    if budget != "4000" and "SGLANG_KUNPENG_SHARED_HBW_BACKING" not in os.environ:
+        return  # The existing split implementation supports a 4000MiB total.
+    mode = os.environ.setdefault("SGLANG_KUNPENG_SHARED_HBW_BACKING", "split")
+    if mode != "split":
+        return
+    os.environ.setdefault("KUPL_SHM_ON_PACKAGE", "n")
+    os.environ.setdefault("KUPL_SHM_ENABLE_HUGEPAGE", "n")
+    os.environ.setdefault(
+        "SGLANG_KUNPENG_SHARED_HBW_TOTAL_MIB",
+        budget,
     )
-    unified_w8a8 = (
-        runner.server_args.quantization == "modelslim" and runner.tp_size == 16
+    prefill = os.environ.get("IS_PREFILL", "1") == "1"
+    size_env = ("SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB" if prefill
+                else "SGLANG_KUNPENG_DECODE_SHM_SIZE_MB")
+    os.environ.setdefault(
+        "SGLANG_KUNPENG_SHARED_HBW_SHM_PREFIX_MIB",
+        os.environ.get(size_env, "476" if prefill else "24"),
     )
-    if unified_w8a8:
-        # Validate execution capabilities before allocating components. The
-        # checkpoint loader subsequently checks names, geometry and shards.
-        # MTP follows the speculative runtime configuration; no deployment
-        # manifest is required.
-        from sglang.srt.model_executor.model_capabilities import (
-            default_kunpeng_qwen_policy,
-            validate_startup_capabilities,
-        )
-
-        policy = default_kunpeng_qwen_policy()
-        validate_startup_capabilities(policy, runner.server_args)
-
-    bf16_tp16 = runner.server_args.quantization is None and runner.tp_size == 16
-    if not (common and (bf16_tp16 or unified_w8a8)):
-        raise ValueError(
-            "Kunpeng Qwen backend requires Qwen3.6 27B CPU PP1 with either "
-            "BF16 TP16 or a ModelSlim W8A8 TP16 checkpoint"
-        )

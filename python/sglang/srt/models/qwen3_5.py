@@ -99,7 +99,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
-
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -111,15 +110,18 @@ from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as qwen_kunpeng
 
 _use_kunpeng_qwen = qwen_kunpeng_enabled()
 if _use_kunpeng_qwen:
+    from sglang.srt.graph import ops
     from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
         QwenGemmaRMSNorm as GemmaRMSNorm,
         QwenGatedRMSNorm as RMSNormGated,
+        apply_gqa_output_gate,
         compact_weight_loaders,
-        configure_modules,
         qkv_layout,
         qknorm_rope,
     )
-    from sglang.srt.graph.torch_capture import native_call
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import configure_modules
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.linear import declare_projection
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.layout import split_gdn_projection
 
 
 cached_get_processor = lru_cache(get_processor)
@@ -265,6 +267,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
+        if _use_kunpeng_qwen:
+            declare_projection(self.in_proj_qkvz, "gdn.qkvz")
+            declare_projection(self.in_proj_ba, "gdn.ba")
+            declare_projection(self.out_proj, "gdn.out")
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -496,98 +502,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_v_dim,
             )
         elif _use_kunpeng_qwen and 1 <= projected_states_qkvz.shape[0] <= 4096:
-            num_k_heads = self.num_k_heads // self.attn_tp_size
-            num_v_heads = self.num_v_heads // self.attn_tp_size
-            k_width = num_k_heads * self.head_k_dim
-            v_width = num_v_heads * self.head_v_dim
-            qkv_width = 2 * k_width + v_width
-            rows = projected_states_qkvz.shape[0]
-            if not (
-                projected_states_qkvz.ndim == projected_states_ba.ndim == 2
-                and projected_states_qkvz.shape == (rows, qkv_width + v_width)
-                and projected_states_ba.shape == (rows, 2 * num_v_heads)
-                and projected_states_qkvz.device.type
-                == projected_states_ba.device.type
-                == "cpu"
-                and projected_states_qkvz.dtype == projected_states_ba.dtype
-                and projected_states_qkvz.dtype in (torch.float16, torch.bfloat16)
-                and projected_states_qkvz.is_contiguous()
-                and projected_states_ba.is_contiguous()
-            ):
-                raise ValueError("Kunpeng QKVZ/BA contiguous layout contract mismatch")
-            if rows == 1:
-                # Consumers only read these disjoint partitions. The graph must
-                # retain each producer storage through its last alias consumer.
-                qkvz_offset = projected_states_qkvz.storage_offset()
-                ba_offset = projected_states_ba.storage_offset()
-                mixed_qkv = projected_states_qkvz.as_strided(
-                    (1, qkv_width), (qkv_width, 1), qkvz_offset
-                )
-                z = projected_states_qkvz.as_strided(
-                    (1, num_v_heads, self.head_v_dim),
-                    (v_width, self.head_v_dim, 1),
-                    qkvz_offset + qkv_width,
-                )
-                b = projected_states_ba.as_strided(
-                    (1, num_v_heads), (num_v_heads, 1), ba_offset
-                )
-                a = projected_states_ba.as_strided(
-                    (1, num_v_heads), (num_v_heads, 1), ba_offset + num_v_heads
-                )
-            else:
-                from sglang.srt.graph import ops as kunpeng_graph_ops
-
-                # Native conv/GDN/norm consumers require dense rows. Read each
-                # strided producer partition once into graph-owned storage;
-                # replace the parent cat/contiguous/reshape temporaries and boxed copy-out.
-                qkvz_stride = projected_states_qkvz.stride(0)
-                ba_stride = projected_states_ba.stride(0)
-                qkvz_offset = projected_states_qkvz.storage_offset()
-                ba_offset = projected_states_ba.storage_offset()
-                mixed_qkv_src = projected_states_qkvz.as_strided(
-                    (rows, qkv_width), (qkvz_stride, 1), qkvz_offset
-                )
-                z_src = projected_states_qkvz.as_strided(
-                    (rows, num_v_heads, self.head_v_dim),
-                    (qkvz_stride, self.head_v_dim, 1),
-                    qkvz_offset + qkv_width,
-                )
-                b_src = projected_states_ba.as_strided(
-                    (rows, num_v_heads), (ba_stride, 1), ba_offset
-                )
-                a_src = projected_states_ba.as_strided(
-                    (rows, num_v_heads), (ba_stride, 1), ba_offset + num_v_heads
-                )
-                # Four disjoint dense regions share one allocation. Its real
-                # storage survives through the last region's consumer.
-                qkv_numel = rows * qkv_width
-                z_numel = rows * v_width
-                ba_numel = rows * num_v_heads
-                packed = kunpeng_graph_ops.alloc_buffer(
-                    qkv_numel + z_numel + 2 * ba_numel,
-                    dtype=projected_states_qkvz.dtype,
-                )
-                mixed_qkv = packed.narrow(0, 0, qkv_numel).view(rows, qkv_width)
-                z = packed.narrow(0, qkv_numel, z_numel).view(
-                    rows, num_v_heads, self.head_v_dim
-                )
-                b = packed.narrow(0, qkv_numel + z_numel, ba_numel).view(
-                    rows, num_v_heads
-                )
-                a = packed.narrow(0, qkv_numel + z_numel + ba_numel, ba_numel).view(
-                    rows, num_v_heads
-                )
-                z.copy_(z_src)
-                if forward_batch.forward_mode.is_target_verify():
-                    # Verify kernels address rows with explicit token
-                    # strides, so the QKV/BA partitions stay strided; only
-                    # z is repacked because the gated-norm consumes dense
-                    # rows.
-                    mixed_qkv, b, a = mixed_qkv_src, b_src, a_src
-                else:
-                    mixed_qkv.copy_(mixed_qkv_src)
-                    b.copy_(b_src)
-                    a.copy_(a_src)
+            mixed_qkv, z, b, a = split_gdn_projection(
+                projected_states_qkvz,
+                projected_states_ba,
+                self.num_k_heads // self.attn_tp_size,
+                self.num_v_heads // self.attn_tp_size,
+                self.head_k_dim,
+                self.head_v_dim,
+                forward_batch=forward_batch,
+            )
         elif _is_cpu and _is_amx_available:
             mixed_qkv, z, b, a = (
                 torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
@@ -855,6 +778,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        if _use_kunpeng_qwen:
+            declare_projection(self.qkv_proj, "gqa.qkv")
+            declare_projection(self.o_proj, "gqa.out")
         if _use_kunpeng_qwen and self.attn_tp_size == 16:
             compact_weight_loaders(self)
 
@@ -990,8 +916,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if use_native_batch and forward_batch.forward_mode.is_decode():
+                attn_output = apply_gqa_output_gate(attn_output, gate, forward_batch)
+            else:
+                gate = ops.tensor_unary(gate, 4) if _use_kunpeng_qwen else torch.sigmoid(gate)
+                attn_output = ops.tensor_binary(attn_output, gate, 1) if _use_kunpeng_qwen else attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -1587,118 +1516,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         prefix: str = "",
         language_model_cls=Qwen3_5ForCausalLM,
     ):
-        unified = (
-            quant_config is not None
-            and getattr(quant_config, "_cpu920f", False)
-            and quant_config.get_name() == "modelslim"
-        )
-        if unified:
-            from sglang.srt.model_executor.model_capabilities import (
-                default_kunpeng_qwen_policy,
-                validate_startup_capabilities,
-            )
-
-            policy = default_kunpeng_qwen_policy()
-            validate_startup_capabilities(policy, get_global_server_args())
-        if unified:
-            from sglang.srt.distributed import (
-                get_tensor_model_parallel_world_size,
-                get_pp_group,
-            )
-            from sglang.srt.layers.dp_attention import get_attention_tp_size
-
-            actual_tp = get_tensor_model_parallel_world_size()
-            if policy["mtp"] and actual_tp != 16:
-                raise ValueError("Attached MTP-on currently requires actual TP16")
-            if (
-                actual_tp not in (1, 16)
-                or get_pp_group().world_size != 1
-                or get_attention_tp_size() != actual_tp
-            ):
-                raise ValueError(
-                    "Unified constructor requires actual matching TP1 or TP16/attentionTP/PP1 before allocation"
-                )
-            text = config.text_config
-            expected_heads = (24, 4) if actual_tp == 1 else (32, 16)
-            if (
-                text.num_attention_heads,
-                text.num_key_value_heads,
-                text.head_dim,
-                text.num_hidden_layers,
-            ) != (*expected_heads, 256, 64) or (
-                getattr(text, "original_num_attention_heads", None),
-                getattr(text, "original_total_num_kv_heads", None),
-            ) != (
-                24,
-                4,
-            ):
-                raise ValueError(
-                    "Original geometry provenance/matching actual topology adjustment must precede allocation"
-                )
-            if (
-                getattr(text, "linear_num_key_heads_cpu", None),
-                getattr(text, "linear_num_value_heads_cpu", None),
-            ) != (16, 48):
-                raise ValueError("Original GDN16K/48V CPU geometry must be preserved")
-            if (
-                get_global_server_args().mm_enable_dp_encoder
-                or is_dp_attention_enabled()
-            ):
-                raise ValueError(
-                    "Unified checkpoint plan requires matching TP16, DP encoder/attention off"
-                )
-        visual_quant_config = None
-        if unified:
-            visual_quant_config = quant_config.for_component(
-                "vision", execution_enabled=policy["vision"]
-            )
-        super().__init__(
-            config,
-            quant_config,
-            prefix,
-            language_model_cls,
-            visual_quant_config=visual_quant_config,
-        )
-        if unified:
-            from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
-            from sglang.srt.model_executor.model_capabilities import (
-                ModelCapabilities,
-            )
-            from sglang.srt.model_loader.unified_checkpoint import (
-                UnifiedCheckpointLoader,
-            )
-
-            if self.pp_group.world_size != 1 or self.config.tie_word_embeddings:
-                raise ValueError(
-                    "Unified checkpoint currently requires PP1 and separate embed/head"
-                )
-            self.runtime_capabilities = ModelCapabilities(policy)
-            self.mtp = Qwen3_5ForCausalLMMTP(
-                config,
-                quant_config.for_component("mtp", execution_enabled=policy["mtp"]),
-                shared_embed_tokens=self.model.embed_tokens,
-                shared_lm_head=self.lm_head,
-            )
-            # Cached/stateless modules such as RoPE may be physically shared
-            # with the executable language tree. Never attach a disabled
-            # component hook to any such module identity.
-            shared = {
-                id(m) for root in (self.model, self.lm_head) for m in root.modules()
-            }
-            if policy["vision"]:
-                # Executable vision component: no disabled hook. The loader's
-                # loaded_validated("vision") marks it executable, and
-                # get_image_feature asserts require("vision") at runtime.
-                pass
-            else:
-                self.runtime_capabilities.attach_disabled(self.visual, "vision", shared)
-            attach_mtp = (
-                self.runtime_capabilities.attach_enabled
-                if policy["mtp"]
-                else self.runtime_capabilities.attach_disabled
-            )
-            attach_mtp(self.mtp, "mtp", shared)
-            self._unified_checkpoint_loader = UnifiedCheckpointLoader(self)
+        super().__init__(config, quant_config, prefix, language_model_cls)
 
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -1742,8 +1560,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        if hasattr(self, "_unified_checkpoint_loader"):
-            return self._unified_checkpoint_loader.load(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -2224,5 +2040,43 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_groups=None,
         )
 
+
+if _use_kunpeng_qwen:
+    class Qwen3_5ForConditionalGeneration(nn.Module):
+        _kunpeng_explicit_graph = True
+        packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+        supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
+        def __init__(self, config, quant_config=None, prefix=""):
+            super().__init__()
+            from sglang.srt.layers.logits_processor import LogitsProcessor
+            from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+            self.config = config
+            text = config.text_config
+            self.model = Qwen3_5ForCausalLM(text, quant_config, prefix=add_prefix('model', prefix))
+            self.lm_head = ParallelLMHead(text.vocab_size, text.hidden_size, org_num_embeddings=text.vocab_size,
+                                          quant_config=None, prefix=add_prefix('lm_head', prefix))
+            from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import linear
+            self.lm_head._cpu_lm_head_apply = linear
+            self.logits_processor = LogitsProcessor(text)
+            self.pp_group = get_pp_group()
+            self.is_mrope_enabled = False
+        def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
+            if forward_batch.contains_image_inputs():
+                raise ValueError('This explicit Kunpeng build supports text forward only')
+            hidden = self.model(input_ids, positions, forward_batch, input_embeds=input_embeds)
+            return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
+        def load_weights(self, weights):
+            loaded = Qwen3_5ForCausalLM.load_weights(self, weights)
+            return loaded
+        def get_input_embeddings(self):
+            return self.model.embed_tokens
+        @property
+        def start_layer(self):
+            return self.model.start_layer
+        @property
+        def end_layer(self):
+            return self.model.end_layer
+        def pad_input_ids(self, input_ids, mm_inputs):
+            return input_ids
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

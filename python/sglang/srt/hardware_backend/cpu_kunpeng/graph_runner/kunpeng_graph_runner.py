@@ -497,59 +497,8 @@ class KunpengGraphRunner:
             return  # No second move/pack/reservation of target-owned weights.
         if _is_kunpeng_hbw_pool:
             self.move_weights_to_hbw()
-            from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
-                enabled as qwen_enabled,
-            )
-
-            if qwen_enabled() and not self.model_runner.is_draft_worker:
-                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
-                    prepare_model_lm_head,
-                )
-
-                self._packed_lm_head_enabled = prepare_model_lm_head(
-                    self.model_runner.model, self.weight_hbw_pool
-                )
             initial_backing = self.weight_hbw_pool.backing_snapshot()
             self._shm_native_init_used_bytes = initial_backing.get("shm_used_bytes")
-            arena_mib = int(os.environ.get("SGLANG_KUNPENG_FORWARD_HBW_ARENA_MB", "0"))
-            if qwen_enabled() and arena_mib:
-                from sglang.srt.hardware_backend.cpu_kunpeng.allocator.forward_hbw import (
-                    ForwardHBWArena,
-                )
-
-                # Ordinary ATen and native tensor outputs need their own reusable
-                # reservation before the common graph claims the remaining pool.
-                # Gemma effective weights are buffers rather than Parameters.
-                # Preserve the existing placement policy for embedding/vision/MTP.
-                seen = {}
-                for module in self.model_runner.model.modules():
-                    if not getattr(module, "_kunpeng_qwen", False):
-                        continue
-                    buffer = getattr(module, "gemma_weight", None)
-                    if buffer is not None:
-                        key = buffer.untyped_storage().data_ptr()
-                        if key not in seen:
-                            seen[key] = self.weight_hbw_pool.move_to_hbw(buffer)
-                        module.gemma_weight = seen[key]
-                self._static_hbw_bytes = self.weight_hbw_pool.used_bytes - getattr(
-                    self.weight_hbw_pool, "_payload_reserved_bytes", 0
-                )
-                self._forward_hbw = ForwardHBWArena(
-                    self.weight_hbw_pool,
-                    os.environ.get(
-                        "SGLANG_KUNPENG_FORWARD_HBW_LIBRARY",
-                        str(
-                            Path(__import__("sgl_kernel").__file__).parent
-                            / "libscoped_hbw_allocator.so"
-                        ),
-                    ),
-                    arena_mib * 1024 * 1024,
-                )
-                logger.info(
-                    "[ForwardHBWArena] capacity_bytes=%d graph_remaining_bytes=%d",
-                    arena_mib * 1024 * 1024,
-                    self.weight_hbw_pool.free_bytes,
-                )
         if _is_kunpeng_graph_capture:
             self.init_graph_capture()
 
@@ -1029,6 +978,8 @@ class KunpengGraphRunner:
         )
 
     def _provider_for_forward(self):
+        if getattr(self.model_runner.attn_backend, "_kunpeng_explicit_graph", False):
+            return None
         if not self._graph_provider_resolved:
             from sglang.srt.graph.bindings import resolve_graph_provider
 
@@ -1253,6 +1204,10 @@ class KunpengGraphRunner:
         The input set differs per forward mode; PP proxy tensors are appended
         when pipeline parallelism is active, and None entries are filtered out.
         """
+        backend = self._resolve_attn_backend(self.model_runner, forward_batch)
+        if hasattr(backend, "get_graph_inputs"):
+            self._graph_bindings = None
+            return backend.get_graph_inputs(forward_batch)
         provider = self._provider_for_forward()
         if provider is not None:
             with self._forward_hbw_scope():
@@ -1513,6 +1468,11 @@ class KunpengGraphRunner:
         if self._graph_bindings is not None:
             return list(self._graph_bindings.all_fixed_tensors())
         fixed = self.graph_fixed_weights[:]
+        backend = self._resolve_attn_backend(self.model_runner, forward_batch)
+        if hasattr(backend, "get_graph_fixed_tensors"):
+            fixed.extend(backend.get_graph_fixed_tensors(forward_batch))
+            seen = set()
+            return [t for t in fixed if not (t.untyped_storage().data_ptr() in seen or seen.add(t.untyped_storage().data_ptr()))]
         for kv in self.model_runner.token_to_kv_pool.kv_buffer:
             fixed.append(kv)
         # DSA real indexer: the index-K pool buffers (allocated separately
