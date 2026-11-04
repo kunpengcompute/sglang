@@ -124,6 +124,12 @@ class QwenHybridGraphProvider:
             "extend_start_loc",
         ):
             dynamic(name, getattr(fb, name, None))
+        ragged = getattr(fb, "_draft_extend_ragged", None)
+        if ragged is not None:
+            # Data-dependent row mapping of the ragged draft-extend; rebuilt
+            # per forward and replayed as an ordinary graph input.
+            dynamic("draft_extend.requests", ragged[0])
+            dynamic("draft_extend.lengths", ragged[1])
         if fb.spec_info is not None:
             dynamic("spec.hidden_states", getattr(fb.spec_info, "hidden_states", None))
         linear = getattr(self.backend, "linear_attn_backend", None)
@@ -295,3 +301,90 @@ class QwenHybridGraphProvider:
             print(
                 f"[QwenRegisteredGraph] planned_contiguous_clones={count}", flush=True
             )
+
+
+def draft_graph_capture_enabled() -> bool:
+    """Whether the attached MTP draft decode chain may be captured."""
+    return os.environ.get("SGLANG_KUNPENG_DRAFT_GRAPH_CAPTURE", "0") == "1"
+
+
+class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
+    """Capture provider for the attached one-layer MTP draft.
+
+    Unlike the target provider this only declares the chained draft *decode*
+    steps (one token per sequence, per-step attention backend) plus the
+    draft-extend pass that seeds them. Draft-extend is ragged -- each request
+    contributes 1..N accepted rows -- so its row mapping is built eagerly and
+    bound as an ordinary graph input.
+
+    Enabled by ``SGLANG_KUNPENG_DRAFT_GRAPH_CAPTURE=1``.
+    """
+
+    def bind(self, runner, fb, kwargs):
+        if self.decompose_dense and not any(
+            getattr(module, "_kunpeng_bf16_weight_packed", False)
+            for module in runner.model.modules()
+        ):
+            # The borrowed MTP component keeps its dense projections on the
+            # plain F.linear path (never prepacked), so there is nothing to
+            # decompose. ATen capture records those linear/matmul ops
+            # directly instead.
+            self.decompose_dense = False
+            print(
+                "[QwenAttachedMTPGraph] dense decomposition disabled: "
+                "no packed dense weights in the draft component",
+                flush=True,
+            )
+        if fb.forward_mode.is_draft_extend():
+            from .backend import draft_extend_ragged
+
+            fb._draft_extend_ragged = draft_extend_ragged(fb)
+        return super().bind(runner, fb, kwargs)
+
+    def unsupported_reason(self, fb, kwargs):
+        if fb.forward_mode.is_draft_extend():
+            return self._draft_extend_unsupported_reason(fb, kwargs)
+        if not fb.forward_mode.is_decode():
+            return "forward_mode"
+        if not 1 <= fb.batch_size <= 32:
+            return "batch_outside_1_32"
+        if fb.input_ids.numel() != fb.batch_size:
+            return "draft_decode_token_batch_mismatch"
+        spec_info = fb.spec_info
+        if spec_info is None or getattr(spec_info, "hidden_states", None) is None:
+            return "draft_hidden_states_missing"
+        if fb.contains_image_inputs():
+            return "image_inputs"
+        if fb.return_logprob:
+            return "return_logprob"
+        if kwargs.get("pp_proxy_tensors") is not None:
+            return "pp_proxy_tensors"
+        if kwargs.get("get_embedding", False):
+            return "get_embedding"
+        return None
+
+    def _draft_extend_unsupported_reason(self, fb, kwargs):
+        tokens = fb.input_ids.numel()
+        counts = fb.extend_seq_lens
+        if not 1 <= fb.batch_size <= 32:
+            return "batch_outside_1_32"
+        # Row-wise native attention replays at most 128 query rows.
+        if not 1 <= tokens <= 128:
+            return "draft_extend_tokens_outside_1_128"
+        if counts is None or counts.numel() != fb.batch_size:
+            return "draft_extend_lengths_missing"
+        if int(counts.sum()) != tokens or int(counts.min()) < 1:
+            return "draft_extend_lengths_mismatch"
+        spec_info = fb.spec_info
+        hidden = getattr(spec_info, "hidden_states", None) if spec_info else None
+        if hidden is None or hidden.shape[0] != tokens:
+            return "draft_extend_hidden_states_missing"
+        if fb.contains_image_inputs():
+            return "image_inputs"
+        if fb.return_logprob:
+            return "return_logprob"
+        if kwargs.get("pp_proxy_tensors") is not None:
+            return "pp_proxy_tensors"
+        if kwargs.get("get_embedding", False):
+            return "get_embedding"
+        return None

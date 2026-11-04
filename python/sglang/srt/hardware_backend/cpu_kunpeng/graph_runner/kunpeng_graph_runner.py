@@ -1023,12 +1023,13 @@ class KunpengGraphRunner:
         return self._graph_provider
 
     def _graph_supports_forward(self, forward_batch, kwargs):
-        if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
-            # Generic inputs/fixed tensors are DeepSeek-specific; no draft provider yet.
-            return False
         if not self.is_graph_active():
             return False
         provider = self._provider_for_forward()
+        if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
+            # Attached MTP draft: only the dedicated draft provider may capture
+            # it (chained decode steps); everything else stays eager.
+            return provider is not None and provider.supports(forward_batch, kwargs)
         return provider is None or provider.supports(forward_batch, kwargs)
 
     def graph_coverage_snapshot(self):
@@ -1073,13 +1074,16 @@ class KunpengGraphRunner:
         provider = self._provider_for_forward()
         reason = "supported"
         if not supported:
-            if (
+            if not self.is_graph_active():
+                reason = "graph_disabled"
+            elif (
                 getattr(self.model_runner, "borrowed_qwen_target_runner", None)
                 is not None
+                and not (
+                    provider is not None and hasattr(provider, "unsupported_reason")
+                )
             ):
                 reason = "attached_draft_provider_unavailable"
-            elif not self.is_graph_active():
-                reason = "graph_disabled"
             elif provider is not None and hasattr(provider, "unsupported_reason"):
                 reason = provider.unsupported_reason(forward_batch, kwargs)
             else:
@@ -1106,7 +1110,13 @@ class KunpengGraphRunner:
         with pp_span("build_graph_inputs"):
             inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
         return self._graph_forward(
-            forward_batch, inputs, "decode", use_hbw=True, **kwargs
+            forward_batch,
+            inputs,
+            "decode",
+            # The attached draft keeps its KV in DDR; keep its graph buffers
+            # there as well instead of competing for the target HBW pool.
+            use_hbw=not self.model_runner.is_draft_worker,
+            **kwargs,
         )
 
     def _forward_extend(
@@ -1143,16 +1153,18 @@ class KunpengGraphRunner:
         supported = self._graph_supports_forward(forward_batch, kwargs)
         if not supported:
             reason = (
-                "attached_draft_provider_unavailable"
-                if getattr(self.model_runner, "borrowed_qwen_target_runner", None)
-                is not None
+                "graph_disabled"
+                if not self.is_graph_active()
                 else (
-                    "graph_disabled"
-                    if not self.is_graph_active()
+                    provider.unsupported_reason(forward_batch, kwargs)
+                    if provider is not None
+                    and hasattr(provider, "unsupported_reason")
                     else (
-                        provider.unsupported_reason(forward_batch, kwargs)
-                        if provider is not None
-                        and hasattr(provider, "unsupported_reason")
+                        "attached_draft_provider_unavailable"
+                        if getattr(
+                            self.model_runner, "borrowed_qwen_target_runner", None
+                        )
+                        is not None
                         else "provider_unsupported"
                     )
                 )

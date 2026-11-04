@@ -347,9 +347,62 @@ def conv_decode(x, state, weight, bias, activation, conv_state_indices, **kwargs
     return ops.qwen_causal_conv(x.contiguous(), state, weight, conv_state_indices)
 
 
+def draft_extend_ragged(fb):
+    """Per-row request id and KV length of the ragged EAGLE draft-extend.
+
+    Each request contributes `num_accepted_tokens` rows (1..N), so the row to
+    request mapping is data dependent and cannot be rebuilt inside a captured
+    graph. Build it here, outside the graph, and let the graph provider bind
+    the result as a dynamic input.
+    """
+    counts = fb.extend_seq_lens
+    prefix = fb.seq_lens - counts
+    starts = torch.cumsum(counts, 0) - counts
+    rows = torch.arange(fb.input_ids.numel(), dtype=counts.dtype) - (
+        starts.repeat_interleave(counts)
+    )
+    return (
+        fb.req_pool_indices.repeat_interleave(counts),
+        prefix.repeat_interleave(counts) + rows + 1,
+    )
+
+
 class QwenAttention:
     def __init__(self):
         initialize()
+
+    def forward_draft_extend(self, q, k, v, layer, fb, save_kv_cache=True):
+        kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if save_kv_cache:
+            ops.set_kv_buffer_kunpeng(
+                kb.view(-1, 256), fb.out_cache_loc, k.reshape(-1, 256).contiguous()
+            )
+            ops.set_kv_buffer_kunpeng(
+                vb.view(-1, 256), fb.out_cache_loc, v.reshape(-1, 256).contiguous()
+            )
+        # The provider precomputes the ragged mapping; the ordinary eager path
+        # has no binding and derives it here.
+        ragged = getattr(fb, "_draft_extend_ragged", None)
+        requests, lengths = (
+            draft_extend_ragged(fb) if ragged is None else ragged
+        )
+        query = q.reshape(-1, layer.tp_q_head_num, 256).contiguous()
+        op = (
+            ops.qwen_gqa_rows
+            if is_capturing() and query.shape[0] >= 8
+            else ops.qwen_gqa_decode
+        )
+        output, _ = op(
+            query,
+            kb,
+            vb,
+            fb.req_to_token_pool.req_to_token,
+            requests,
+            lengths,
+            float(layer.scaling),
+        )
+        return output.reshape(-1, layer.tp_q_head_num * 256)
 
     def forward_verify(self, q, k, v, layer, fb, save_kv_cache=True):
         kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
