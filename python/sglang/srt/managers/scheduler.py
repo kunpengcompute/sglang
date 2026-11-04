@@ -237,7 +237,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu, is_cpu_920f, is_skip_http
+from sglang.srt.utils.common import is_cpu, is_npu, is_cpu_920f, is_skip_http
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -957,6 +957,46 @@ class Scheduler(
                     f"{self.max_req_input_len + 1} or give regular ranks more "
                     f"KV memory."
                 )
+        # On CPU the decode KV pool is the entire sequence store: there is no
+        # device->host offload and no retract-resume, so a request that grows
+        # past the pool ends in retract_decode's OOM abort. On PD decode that
+        # abort also happens outside the normal request-finish path, and the
+        # request's peer/prefill state can be left behind, which shows up as
+        # the *next* request hanging in the bootstrap handshake until
+        # SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT/WAITING_TIMEOUT (1200s here).
+        # Clamp the admitted sequence length to what the pool can hold, keeping
+        # the per-request decode reserve for speculative verify pages, so the
+        # request finishes by length instead of OOM-ing.
+        if is_cpu() and server_args.disaggregation_mode == "decode":
+            cp_size = self.attn_tp_size if is_lc_cp_enabled() else 1
+            # At least two pages: a speculative verify allocates a
+            # page-aligned draft block on top of the last committed length.
+            decode_reserve = max(
+                server_args.num_reserved_decode_tokens, 2 * self.page_size
+            )
+            cpu_decode_budget = (
+                self.max_total_num_tokens * cp_size - decode_reserve - 1
+            )
+            if cpu_decode_budget <= 0:
+                logger.warning(
+                    "CPU decode KV pool is too small for the decode reserve: "
+                    f"max_total_num_tokens={self.max_total_num_tokens}, "
+                    f"decode_reserve={decode_reserve}. "
+                    "Every request will be rejected; increase --max-total-tokens."
+                )
+            if cpu_decode_budget < self.max_req_len:
+                old_max_req_len = self.max_req_len
+                self.max_req_len = max(cpu_decode_budget, 0)
+                self.max_req_input_len = max(self.max_req_len - 5, 0)
+                logger.info(
+                    "CPU PD decode: clamped max request length from "
+                    f"{old_max_req_len} to {self.max_req_len} "
+                    f"(max_total_num_tokens={self.max_total_num_tokens}, "
+                    f"decode_reserve={decode_reserve}); requests that need more "
+                    "will finish with finish_reason=length or be rejected at "
+                    "admission instead of OOM-aborting."
+                )
+
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
