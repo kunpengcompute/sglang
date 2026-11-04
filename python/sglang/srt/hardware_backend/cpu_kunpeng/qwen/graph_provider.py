@@ -291,6 +291,23 @@ class QwenHybridGraphProvider:
                 return ops.bf16_packed_gemm_kunpeng(packed, weight, workspace, 32)
 
             decompositions[("sgl_kernel::bf16_linear_kunpeng", "")] = dense
+
+        # The BF16 projection hooks (qwen/linear.py apply_dense, wired via
+        # unquant.py's _cpu_linear_apply) query the host-side tiling planner
+        # and then parameterize the registered packed-GEMM graph ops with the
+        # returned tile sizes. The planner is a scalar-only custom op (int
+        # M/N/K -> int tiles, no tensors), and the capture mode intercepts
+        # every op entering torch dispatch - scalar-only calls included - so
+        # capture aborts with "Native op needs a registered graph adapter".
+        # Decompose it to eager execution: the callback already runs under
+        # _DisableTorchDispatch (torch_capture.py), the plan depends only on
+        # the static GEMM shape (fixed per captured graph), and the explicit
+        # runtime calls the same planner outside any dispatch mode while
+        # capturing.
+        def tiling_plan(M, N, K):
+            return torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+
+        decompositions[("sgl_kernel::bgemm_find_optimal_tiling_plan", "")] = tiling_plan
         self.context = AutomaticTorchCapture(decompositions)
         with self.context:
             yield self.context

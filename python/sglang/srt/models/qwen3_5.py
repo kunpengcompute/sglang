@@ -1533,7 +1533,139 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         prefix: str = "",
         language_model_cls=Qwen3_5ForCausalLM,
     ):
-        super().__init__(config, quant_config, prefix, language_model_cls)
+        # The v0.5.11 merge dropped this whole unified-checkpoint block from
+        # the !293-era constructor. Without it the vision tower is built with
+        # the raw language quant config: its linear layers get no
+        # _runtime_component tag, so the vision RowParallel reductions take
+        # the SHM all-reduce path instead of the reserved-width gloo path
+        # (linear.py) and exhaust the SHM pool ("Not enough shared memory"),
+        # and they run unquantized on raw INT8-cast weights instead of the
+        # dequantize-once BF16 vision scheme. The custom fused W8A8
+        # checkpoint mapping (weight_mapping.json: fused qkv/z and gate/up
+        # sections with explicit chunk shards, F32 vision bias preservation,
+        # full coverage validation) is never engaged either. Restore the
+        # block; the wrapper's visual_quant_config plumbing (qwen3_vl.py)
+        # and the loader-side observer hooks (model_loader/loader.py) were
+        # both kept upstream, so this plugs straight back in.
+        unified = (
+            quant_config is not None
+            and getattr(quant_config, "_cpu920f", False)
+            and quant_config.get_name() == "modelslim"
+        )
+        spec = getattr(config, "checkpoint_loader_spec", None)
+        if unified:
+            from sglang.srt.model_executor.model_capabilities import (
+                default_kunpeng_qwen_policy,
+                initial_policy_from_spec,
+                validate_startup_capabilities,
+            )
+
+            policy = (
+                initial_policy_from_spec(spec)
+                if spec is not None
+                else default_kunpeng_qwen_policy()
+            )
+            validate_startup_capabilities(policy, get_global_server_args())
+
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_world_size,
+                get_pp_group,
+            )
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+            actual_tp = get_tensor_model_parallel_world_size()
+            if policy["mtp"] and actual_tp != 16:
+                raise ValueError("Attached MTP-on currently requires actual TP16")
+            if (
+                actual_tp not in (1, 16)
+                or get_pp_group().world_size != 1
+                or get_attention_tp_size() != actual_tp
+            ):
+                raise ValueError(
+                    "Unified constructor requires actual matching TP1 or TP16/attentionTP/PP1 before allocation"
+                )
+            text = config.text_config
+            expected_heads = (24, 4) if actual_tp == 1 else (32, 16)
+            if (
+                text.num_attention_heads,
+                text.num_key_value_heads,
+                text.head_dim,
+                text.num_hidden_layers,
+            ) != (*expected_heads, 256, 64) or (
+                getattr(text, "original_num_attention_heads", None),
+                getattr(text, "original_total_num_kv_heads", None),
+            ) != (
+                24,
+                4,
+            ):
+                raise ValueError(
+                    "Original geometry provenance/matching actual topology adjustment must precede allocation"
+                )
+            if (
+                getattr(text, "linear_num_key_heads_cpu", None),
+                getattr(text, "linear_num_value_heads_cpu", None),
+            ) != (16, 48):
+                raise ValueError("Original GDN16K/48V CPU geometry must be preserved")
+            if (
+                get_global_server_args().mm_enable_dp_encoder
+                or is_dp_attention_enabled()
+            ):
+                raise ValueError(
+                    "Unified checkpoint plan requires matching TP16, DP encoder/attention off"
+                )
+        visual_quant_config = None
+        if unified:
+            visual_quant_config = quant_config.for_component(
+                "vision", execution_enabled=policy["vision"]
+            )
+        super().__init__(
+            config,
+            quant_config,
+            prefix,
+            language_model_cls,
+            visual_quant_config=visual_quant_config,
+        )
+        if unified:
+            from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+            from sglang.srt.model_executor.model_capabilities import (
+                ModelCapabilities,
+                initial_policy_from_spec,
+            )
+            from sglang.srt.model_loader.unified_checkpoint import (
+                UnifiedCheckpointLoader,
+            )
+
+            if self.pp_group.world_size != 1 or self.config.tie_word_embeddings:
+                raise ValueError(
+                    "Unified checkpoint currently requires PP1 and separate embed/head"
+                )
+            self.runtime_capabilities = ModelCapabilities(policy)
+            self.mtp = Qwen3_5ForCausalLMMTP(
+                config,
+                quant_config.for_component("mtp", execution_enabled=policy["mtp"]),
+                shared_embed_tokens=self.model.embed_tokens,
+                shared_lm_head=self.lm_head,
+            )
+            # Cached/stateless modules such as RoPE may be physically shared
+            # with the executable language tree. Never attach a disabled
+            # component hook to any such module identity.
+            shared = {
+                id(m) for root in (self.model, self.lm_head) for m in root.modules()
+            }
+            if policy["vision"]:
+                # Executable vision component: no disabled hook. The loader's
+                # loaded_validated("vision") marks it executable, and
+                # get_image_feature asserts require("vision") at runtime.
+                pass
+            else:
+                self.runtime_capabilities.attach_disabled(self.visual, "vision", shared)
+            attach_mtp = (
+                self.runtime_capabilities.attach_enabled
+                if policy["mtp"]
+                else self.runtime_capabilities.attach_disabled
+            )
+            attach_mtp(self.mtp, "mtp", shared)
+            self._unified_checkpoint_loader = UnifiedCheckpointLoader(self, spec)
 
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -1577,6 +1709,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if hasattr(self, "_unified_checkpoint_loader"):
+            return self._unified_checkpoint_loader.load(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
