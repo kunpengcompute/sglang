@@ -233,24 +233,36 @@ class QwenHybridGraphProvider:
                 persistent("prefill.shared." + name, tensor)
         persistent("request_table", runner.req_to_token_pool.req_to_token)
         persistent("logits_buffer", fb.next_token_logits_buffer)
-        # Standard TP logits gathering stages through communicator-owned SHM.
-        # Allocate its known width before capture/pool finalization and bind
-        # the complete backing buffers, including the dual-gather barrier.
+        # TP collectives: the eager embedding all-reduce caches and any
+        # communicator-owned SHM buffer the kernels may read must be fixed
+        # storages of the captured graph.
         from sglang.srt.distributed import get_tp_group
 
         communicator = get_tp_group().kunpeng_communicator
         if self.eager_collective_buffers is None:
             # Embedding all-reduce uses the native eager cache between decode
-            # graphs. Reserve both row buckets before the graph claims SHM.
+            # graphs. The same buckets are pre-reserved by the target backend
+            # before the first capture, so this is a cache hit; ask for the
+            # identical capacity to never resize one after a graph exists.
+            capacity = int(
+                os.environ.get(
+                    "SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS",
+                    int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "1"))
+                    * int(os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1")),
+                )
+            )
             width = runner.model_config.hidden_size
             reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
             self.eager_collective_buffers = (
                 reserve(width, 1),
-                reserve(width, communicator.max_tokens),
+                reserve(width, max(1, min(communicator.max_tokens, capacity))),
             )
-        communicator.get_shm_tensor(runner.model.lm_head.weight.shape[0])
-        for width, tensor in sorted(communicator.shm_tensors.items()):
-            persistent(f"collective.shm.{width}", tensor)
+        # The explicit Qwen collectives read graph-owned SHM, so the legacy
+        # communicator buckets are optional here: bind the ones that exist, but
+        # never allocate. By now the already captured graphs have claimed the
+        # remaining pool, so a fresh create would fail with "remain 0".
+        for shm_width, tensor in sorted(communicator.shm_tensors.items()):
+            persistent(f"collective.shm.{shm_width}", tensor)
         persistent("collective.dummy", communicator.dummy_tensor)
         return GraphBindings(
             inputs,

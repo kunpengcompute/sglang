@@ -88,26 +88,6 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
         """
 
-        if self.kunpeng_qwen is not None:
-            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.prefill import (
-                run_chunked_prefill,
-            )
-
-            return run_chunked_prefill(
-                query,
-                output,
-                k_cache,
-                v_cache,
-                req_to_token,
-                req_pool_indices,
-                seq_lens,
-                extend_prefix_lens,
-                extend_seq_lens,
-                scaling=scaling,
-                enable_gqa=enable_gqa,
-                causal=causal,
-            )
-
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
 
@@ -257,18 +237,12 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         if self.kunpeng_qwen is not None:
             from sglang.srt.hardware_backend.cpu_kunpeng.qwen import prefill_graph
-            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.graph_provider import (
-                draft_graph_capture_enabled,
-            )
 
-            if (
-                forward_batch.forward_mode.is_draft_extend()
-                and draft_graph_capture_enabled()
-            ):
+            if forward_batch.forward_mode.is_draft_extend():
                 # EAGLE draft-extend is ragged (1..N accepted tokens per
-                # request). Row-wise native attention replaces the per-row
-                # host loop of the chunked-prefill path, which cannot be
-                # captured in a graph.
+                # request) and its out_cache_loc can be longer than the
+                # surviving token rows. The row-wise native path owns that KV
+                # write, eagerly or inside a graph.
                 draft_extend_out = self.kunpeng_qwen.forward_draft_extend(
                     q, k, v, layer, forward_batch, save_kv_cache
                 )

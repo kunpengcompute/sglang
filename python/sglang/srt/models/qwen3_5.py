@@ -2060,16 +2060,75 @@ if _use_kunpeng_qwen:
             self.logits_processor = LogitsProcessor(text)
             self.pp_group = get_pp_group()
             self.is_mrope_enabled = False
+            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+            unified = (
+                quant_config is not None
+                and getattr(quant_config, "_cpu920f", False)
+                and quant_config.get_name() == "modelslim"
+                and get_tensor_model_parallel_world_size() == 16
+                and self.pp_group.world_size == 1
+            )
+            if unified:
+                from sglang.srt.model_executor.model_capabilities import (
+                    ModelCapabilities,
+                    default_kunpeng_qwen_policy,
+                    initial_policy_from_spec,
+                )
+                from sglang.srt.model_loader.unified_checkpoint import (
+                    UnifiedCheckpointLoader,
+                )
+                from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+
+                spec = getattr(config, "checkpoint_loader_spec", None)
+                policy = (
+                    initial_policy_from_spec(spec)
+                    if spec is not None
+                    else default_kunpeng_qwen_policy()
+                )
+                self.runtime_capabilities = ModelCapabilities(policy)
+                # The attached MTP keeps the target-owned embed/head modules so
+                # the EAGLE draft worker can borrow both the component and the
+                # runner instead of loading a second checkpoint.
+                self.mtp = Qwen3_5ForCausalLMMTP(
+                    config,
+                    quant_config.for_component(
+                        "mtp", execution_enabled=policy["mtp"]
+                    ),
+                    shared_embed_tokens=self.model.embed_tokens,
+                    shared_lm_head=self.lm_head,
+                )
+                shared = {
+                    id(module)
+                    for root in (self.model, self.lm_head)
+                    for module in root.modules()
+                }
+                attach_mtp = (
+                    self.runtime_capabilities.attach_enabled
+                    if policy["mtp"]
+                    else self.runtime_capabilities.attach_disabled
+                )
+                attach_mtp(self.mtp, "mtp", shared)
+                self._unified_checkpoint_loader = UnifiedCheckpointLoader(self, spec)
         def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
             if forward_batch.contains_image_inputs():
                 raise ValueError('This explicit Kunpeng build supports text forward only')
             hidden = self.model(input_ids, positions, forward_batch, input_embeds=input_embeds)
             return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
         def load_weights(self, weights):
+            checker = getattr(self, "_unified_checkpoint_loader", None)
+            if checker is not None:
+                # The attached MTP component shares the enclosing checkpoint,
+                # so one whole-model loader owns every parameter.
+                return checker.load(weights)
             loaded = Qwen3_5ForCausalLM.load_weights(self, weights)
             return loaded
         def get_input_embeddings(self):
             return self.model.embed_tokens
+        def get_embed_and_head(self):
+            # The EAGLE draft shares these modules with the target; the attached
+            # MTP keeps the very same objects, so returning them is enough.
+            return self.model.embed_tokens.weight, self.lm_head.weight
         @property
         def start_layer(self):
             return self.model.start_layer

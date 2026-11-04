@@ -930,25 +930,8 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
-            # todo xjw: 检查下他们是不是自己做了一版优化lm_head的cpu算子，如果是，那我们的改动就不需要了
             elif _is_cpu_920f and getattr(lm_head, '_cpu_lm_head_apply', None) is not None:
                 logits = lm_head._cpu_lm_head_apply(hidden_states, lm_head, embedding_bias)
-            elif _is_cpu_920f and getattr(lm_head, "_kunpeng_lm_head_role", False):
-                from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import (
-                    try_linear,
-                    try_linear_splitk,
-                )
-
-                hs = hidden_states.to(lm_head.weight.dtype)
-                logits = try_linear(hs, lm_head, embedding_bias)
-                if logits is None:
-                    # Heads whose optimal plan splits K (and every M1 call,
-                    # which the MTP draft always hits) never satisfy the
-                    # full-K contract above.
-                    logits = try_linear_splitk(hs, lm_head, embedding_bias)
-                if logits is None:
-                    # Always use the original logical weight for M1/other paths.
-                    logits = torch.matmul(hs, lm_head.weight.T)
             elif _is_cpu_920f:
                 M, K = hidden_states.shape
                 # The optimal kernel of BGEMM requires M to be a multiple of 64, so we need to align M to 64.

@@ -5,6 +5,7 @@ from functools import lru_cache
 import torch
 from sgl_kernel import common_ops
 from sglang.srt.graph import ops, is_capturing
+from sglang.srt.graph.torch_capture import install_boxed_bridge
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
@@ -31,6 +32,17 @@ def scatter(x, indices, source):
 def initialize():
     lib = primitives.register_primitives()
     primitives.register_rows()
+    # The attached MTP draft is captured through the automatic ATen adapter,
+    # whose records replay as the boxed bridge op, so the bridge must exist
+    # before the first capture. The explicit target path records no boxed ops;
+    # a build without the export keeps working for it.
+    try:
+        install_boxed_bridge(common_ops.__file__)
+    except (AttributeError, OSError) as exc:
+        print(
+            f"[QwenRegisteredGraph] boxed ATen bridge unavailable: {exc}",
+            flush=True,
+        )
     from ..activation_ops import register_sigmoid_mul_bf16
     register_sigmoid_mul_bf16()
     from .layout import register_projection_split
@@ -38,25 +50,6 @@ def initialize():
     return lib
 
 from .prefill import conv_prefill, gating
-
-
-def prepare_model_lm_head(model, pool):
-    # The architecture backend supplies a semantic role, not a shape whitelist.
-    # Shared MTP references retain this same module and its logical weight.
-    head = getattr(model, "lm_head", None)
-    if head is None or not hasattr(head, "weight"):
-        return False
-    head._kunpeng_lm_head_role = True
-    from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import (
-        prepare_weight,
-        prepare_weight_splitk,
-    )
-
-    prepared = prepare_weight(head, pool)
-    # Wide-vocabulary heads whose optimal plan splits K never satisfy the
-    # full-K contract; pack them separately so M1 (every MTP draft call) also
-    # leaves aten::mm.
-    return prepare_weight_splitk(head, pool) or prepared
 
 
 def prepare_mtp_fc(model, pool=None, max_rows=128):

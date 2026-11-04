@@ -146,13 +146,11 @@ class KunpengGraphRunner:
         if target is not None:
             runner._borrowed_target_runner = target  # Strong owner/lifetime reference.
             owner = target.kunpeng_runner
-            if (
-                owner is None
-                or owner.weight_hbw_pool is None
-                or owner._forward_hbw is None
-            ):
+            # The explicit Qwen path has no forward arena, so a borrowed draft
+            # shares the target pool and inherits its (possibly None) arena.
+            if owner is None or owner.weight_hbw_pool is None:
                 raise ValueError(
-                    "Attached MTP requires the initialized target pool and arena"
+                    "Attached MTP requires the initialized target pool"
                 )
             runner.weight_hbw_pool = owner.weight_hbw_pool
             runner._forward_hbw = owner._forward_hbw
@@ -1779,7 +1777,15 @@ class KunpengGraphRunner:
                 if provider is not None and hasattr(provider, "capture_context")
                 else nullcontext()
             )
-            capture_options = getattr(provider, "capture_options", {})
+            capture_options = getattr(provider, "capture_options", None)
+            if capture_options is None:
+                # The explicit Qwen backend consumes partial views of its
+                # registered inputs (the verify index tables are sliced to the
+                # verify batch), so it opts into the same alias registration the
+                # graph provider uses.
+                capture_options = getattr(
+                    self.model_runner.attn_backend, "capture_options", {}
+                )
             with capture(inputs=inputs, fixed=fixed, **capture_options), context:
                 # pp_proxy_tensors must be passed to model.forward() even in
                 # non-decode modes (e.g. PP1 idle), otherwise the model's
