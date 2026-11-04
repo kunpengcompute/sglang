@@ -142,6 +142,17 @@ class QwenHybridGraphProvider:
                     "linear.checkpoint_indices",
                     linear.verify_intermediate_state_indices,
                 )
+                # Verify row metadata is built once in prepare_for_verify and
+                # shared by every layer, so it must be bound like any other
+                # dynamic input instead of being rebuilt per layer in-graph.
+                dynamic(
+                    "attn.verify_requests",
+                    getattr(fb.spec_info, "_kunpeng_verify_requests", None),
+                )
+                dynamic(
+                    "attn.verify_lengths",
+                    getattr(fb.spec_info, "_kunpeng_verify_lengths", None),
+                )
         fixed = {}
         fixed_seen = (
             set(self.static_weights.storage_bases) if self.static_weights else set()

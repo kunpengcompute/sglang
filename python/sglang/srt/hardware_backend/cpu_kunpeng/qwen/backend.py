@@ -502,13 +502,17 @@ class QwenAttention:
                 vb.view(-1, 256), fb.out_cache_loc, v.reshape(-1, 256).contiguous()
             )
         steps = fb.spec_info.draft_token_num
-        lengths = (
-            fb.seq_lens[:, None]
-            + torch.arange(1, steps + 1, dtype=fb.seq_lens.dtype, device=q.device)[
-                None, :
-            ]
-        ).reshape(-1)
-        requests = fb.req_pool_indices.repeat_interleave(steps)
+        requests = getattr(fb.spec_info, "_kunpeng_verify_requests", None)
+        lengths = getattr(fb.spec_info, "_kunpeng_verify_lengths", None)
+        if requests is None or lengths is None:
+            # Eager / non-attached paths still build the row metadata here.
+            lengths = (
+                fb.seq_lens[:, None]
+                + torch.arange(
+                    1, steps + 1, dtype=fb.seq_lens.dtype, device=q.device
+                )[None, :]
+            ).reshape(-1)
+            requests = fb.req_pool_indices.repeat_interleave(steps)
         query = q.reshape(-1, layer.tp_q_head_num, 256).contiguous()
         op = (
             ops.qwen_gqa_rows

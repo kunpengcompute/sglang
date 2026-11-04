@@ -103,6 +103,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     # Worker-owned eligibility; excluded from the public constructor.
     _kunpeng_attached_qwen_greedy: bool = field(default=False, init=False, repr=False)
 
+    # Layer-independent verify-row metadata for the Kunpeng native attention:
+    # built once per verify (in prepare_for_verify) so the per-layer call does
+    # not rebuild an arange/repeat_interleave 16+ times inside the graph.
+    _kunpeng_verify_requests: torch.Tensor = field(
+        default=None, init=False, repr=False
+    )
+    _kunpeng_verify_lengths: torch.Tensor = field(
+        default=None, init=False, repr=False
+    )
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
@@ -211,6 +221,24 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.out_cache_loc,
             bs,
         )
+
+        # Layer-independent row metadata for the Kunpeng native verify
+        # attention: one (request, kv length) pair per verify row. Building it
+        # once here keeps an arange + repeat_interleave out of every layer's
+        # captured attention call.
+        if self._kunpeng_attached_qwen_greedy:
+            self._kunpeng_verify_requests = batch.req_pool_indices.repeat_interleave(
+                self.draft_token_num
+            )
+            self._kunpeng_verify_lengths = (
+                batch.seq_lens[:, None]
+                + torch.arange(
+                    1,
+                    self.draft_token_num + 1,
+                    dtype=batch.seq_lens.dtype,
+                    device=batch.seq_lens.device,
+                )[None, :]
+            ).reshape(-1)
 
         if get_global_server_args().enable_mamba_extra_buffer():
             batch.mamba_track_indices = torch.tensor(
