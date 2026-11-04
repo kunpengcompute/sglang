@@ -606,16 +606,15 @@ class KunpengCpuBackend(AttentionBackend):
                     f"to use the real indexer"
                 )
 
-        # Round up to the a2a multiple (the a2all splits the stream into
-        # equal per-rank chunks); >= a2a so an all-padding batch still
-        # presents dummy rows.
+        # One bucket per 64-token HiCache page: tail chunks of different real
+        # lengths then share one captured shape. Keep it derived from the real
+        # rows (not the padded q rows) so the indexer stream stays consistent.
         real_rows = int(ext.sum())
         a2a = 1
         if get_attention_tp_size() > 1 and not _DISABLE_MLA_ALL2ALL:
             a2a = get_socket_tp_group().world_size
-            flat_rows = max(((real_rows + a2a - 1) // a2a) * a2a, a2a)
-        else:
-            flat_rows = max(real_rows, 1)
+        align = math.lcm(64, a2a)
+        flat_rows = max(((real_rows + align - 1) // align) * align, align)
         metadata.absorbed_flat_rows = flat_rows
 
         # The a2all is model-side, so the seq bookkeeping stays
@@ -758,12 +757,15 @@ class KunpengCpuBackend(AttentionBackend):
                 # request, so a baked length goes stale on replay. Bake only the start
                 # (a pure function of the key's absorbed_flat_rows) and pass -1 ("to the
                 # end of the stream") so kutacc derives the length from live cur_lens.
-                # The effective stream is never shorter than flat_rows - (a2a - 1).
-                if row_start + rows <= flat_rows - (a2a - 1):
+                # The effective stream is never shorter than flat_rows - 64.
+                if row_start + rows <= flat_rows - 64:
+                    # Below the 64-token bucket margin: inside the live stream
+                    # for every replay of this key (real > flat_rows - 64).
                     metadata.indexer_score_row_start = row_start
                     metadata.indexer_score_row_rows = rows
-                elif flat_rows >= a2a * a2a:
-                    # Block start always inside the stream: exactly this rank's live rows.
+                elif flat_rows >= 64 * a2a:
+                    # Window start is still inside the live stream (each rank
+                    # owns >= 64 rows); kutacc derives the length from cur_lens.
                     metadata.indexer_score_row_start = row_start
                     metadata.indexer_score_row_rows = -1
                 else:

@@ -198,15 +198,16 @@ esac
 #   (b) two tiers L1 DDR -> L3 storage, no L2 pool at all
 #       (KUNPENG_HICACHE_L1L3=1): the L2 pool and all of its machinery are gone,
 #       only a fixed flat I/O buffer is kept as the L3 bounce target.
-# Only the prefill and native roles participate. KUNPENG_HICACHE_BACKEND picks the L3 store:
+# Only the prefill and native roles participate. KUNPENG_HICACHE_BACKEND picks
+# the L3 store (default: file, which then requires KUNPENG_HICACHE_L3_DIR):
 #   file     per-page files under KUNPENG_HICACHE_L3_DIR (a directory shared by
-#            all prefill nodes); leave it empty to run L1<->L2 only. layer_first.
+#            all prefill nodes). layer_first.
 #   mooncake mooncake store master (launch.sh mooncake / launch.sh all); in the
 #            three-tier layout the store is page_first-only, so the host pool
 #            switches layout; the two-tier layout has no host pool to lay out.
 # Disabled unless ENABLE_KUNPENG_HICACHE=1.
 if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
-    HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-mooncake}"
+    HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
     BASE_ARGS+=(
         --enable-hierarchical-cache
         --hicache-io-backend kunpeng
@@ -236,7 +237,7 @@ if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICAC
     HICACHE_EXTRA_CONFIG_JSON=""
     if [[ -n "${KUNPENG_HICACHE_EXTRA_CONFIG:-}" ]]; then
         HICACHE_EXTRA_CONFIG_JSON="$KUNPENG_HICACHE_EXTRA_CONFIG"
-    elif [[ -n "${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-}" || -n "${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-}" ]]; then
+    elif [[ "${KUNPENG_HICACHE_PREFETCH_POLICY:-timeout}" == "timeout" ]]; then
         t_base="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-2}"
         t_per_k="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-0.5}"
         for v in "$t_base" "$t_per_k"; do
@@ -259,16 +260,17 @@ if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICAC
             )
             ;;
         file)
-            if [[ -n "${KUNPENG_HICACHE_L3_DIR:-}" ]]; then
-                mkdir -p "$KUNPENG_HICACHE_L3_DIR"
-                export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$KUNPENG_HICACHE_L3_DIR"
-                BASE_ARGS+=(
-                    --hicache-storage-backend file
-                    --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-timeout}"
-                )
-            else
-                echo "KUNPENG_HICACHE_L3_DIR is empty: HiCache L3 disabled, running L1<->L2 only" >&2
+            if [[ -z "${KUNPENG_HICACHE_L3_DIR:-}" ]]; then
+                echo "Error: KUNPENG_HICACHE_L3_DIR must be set when" >&2
+                echo "       ENABLE_KUNPENG_HICACHE=1 and KUNPENG_HICACHE_BACKEND=file" >&2
+                exit 1
             fi
+            mkdir -p "$KUNPENG_HICACHE_L3_DIR"
+            export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$KUNPENG_HICACHE_L3_DIR"
+            BASE_ARGS+=(
+                --hicache-storage-backend file
+                --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-timeout}"
+            )
             ;;
         *)
             echo "Error: unknown KUNPENG_HICACHE_BACKEND '$HICACHE_BACKEND' (expected file or mooncake)" >&2

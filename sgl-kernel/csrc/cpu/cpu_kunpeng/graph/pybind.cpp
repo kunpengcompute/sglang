@@ -217,7 +217,10 @@ void init_graph_cpp(py::module& m)
             py::arg("fixed"), py::arg("external_pool") = py::none(),
             py::arg("external_shm_pool") = py::none(), py::arg("memory_alignment") = 4096)
         .def_readwrite("has_hidden_states", &Graph::has_hidden_states)
-        .def("run", &Graph::run)
+        .def("run", [](Graph &self, const std::vector<torch::Tensor> &inputs) {
+            py::gil_scoped_release release;
+            return self.run(inputs);
+        }, py::arg("inputs"))
         .def("set_fixed", &Graph::set_fixed)
         .def("describe_plan", &Graph::describe_plan)
         .def("enable_profile", &Graph::enable_profile)
