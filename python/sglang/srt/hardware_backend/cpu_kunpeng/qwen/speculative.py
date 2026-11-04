@@ -13,7 +13,18 @@ _FUSED_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_FUSED", "1") == "1"
 
 
 def verify_conv(x, state, weight, cache_indices, checkpoints, checkpoint_indices):
-    batch, _, steps = x.shape
+    batch, dim, steps = x.shape
+    if _FUSED_VERIFY:
+        # x is a [batch, dim, steps] view of the token-major mixed_qkv, so the
+        # flat form is free. The kernel walks the steps itself and writes each
+        # window snapshot straight into the checkpoint block: no per-step
+        # gather/slice/stack/fancy-index node is captured.
+        flat = x.transpose(1, 2).reshape(batch * steps, dim)
+        output = ops.qwen_conv_verify(
+            flat, state, weight, cache_indices, checkpoints, checkpoint_indices
+        )
+        return output.reshape(batch, steps, dim).transpose(1, 2)
+
     local_state = state[cache_indices].contiguous()
     local_indices = torch.arange(batch, dtype=torch.int32, device=x.device)
     outputs = []

@@ -77,6 +77,10 @@ def register_primitives():
         ctypes.c_int64
     ] * 3
     conv.qwen36_gdn_causal_conv_bf16_row_major.restype = ctypes.c_int
+    conv.qwen36_gdn_conv_verify_bf16_row_major.argtypes = (
+        [ctypes.c_void_p] * 7 + [ctypes.c_int64] * 5
+    )
+    conv.qwen36_gdn_conv_verify_bf16_row_major.restype = ctypes.c_int
     for name in (
         "qwen36_gqa_decode_bf16_serial_with_workspace",
         "qwen36_gqa_decode_bf16_parallel_with_workspace",
@@ -94,6 +98,7 @@ def register_primitives():
         ("qwen_gdn_verify", "qwen_graph_gdn_verify_dispatch"),
         ("qwen_gated_norm", "qwen_graph_norm_dispatch"),
         ("qwen_causal_conv", "qwen_graph_conv_dispatch"),
+        ("qwen_conv_verify", "qwen_graph_conv_verify_dispatch"),
         ("qwen_gqa_decode", "qwen_graph_gqa_dispatch"),
         ("qwen_qkv_layout", "qwen_graph_qkv_dispatch"),
         ("qwen_qknorm_rope", "qwen_graph_rope_dispatch"),
@@ -243,6 +248,35 @@ def register_primitives():
         if rc:
             raise RuntimeError(f"Conv eager failed {rc}")
         return output
+
+    def conv_verify_shape(x, state, weight, indices, checkpoints, ckpt_indices):
+        assert x.ndim == 2 and state.ndim == 3 and checkpoints.ndim == 4
+        assert x.shape[0] % checkpoints.shape[1] == 0
+        return [(tuple(x.shape), x.dtype)]
+
+    def conv_verify_eager(x, state, weight, indices, checkpoints, ckpt_indices):
+        steps = checkpoints.shape[1]
+        batch = x.shape[0] // steps
+        output = torch.empty_like(x)
+        rc = conv.qwen36_gdn_conv_verify_bf16_row_major(
+            x.data_ptr(),
+            state.data_ptr(),
+            weight.data_ptr(),
+            indices.data_ptr(),
+            checkpoints.data_ptr(),
+            ckpt_indices.data_ptr(),
+            output.data_ptr(),
+            state.shape[0],
+            checkpoints.shape[0],
+            batch,
+            steps,
+            x.shape[1],
+        )
+        if rc:
+            raise RuntimeError(f"Conv verify eager failed {rc}")
+        return output
+
+    register_op("qwen_conv_verify", conv_verify_shape, conv_verify_eager)
 
     def gqa_shape(q, k, v, table, requests, lengths, scale):
         return [

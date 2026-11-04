@@ -236,7 +236,7 @@ qwen36_gdn_decode_with_workspace(const float *A_log, const uint16_t *dt_bias, co
 // writes its snapshot into the layer's checkpoint block, so step s > 0 reads
 // the snapshot of step s-1 instead of re-gathering the persistent state.
 // Arithmetic is identical to qwen36_gdn_decode_serial_with_workspace per token.
-extern "C" int qwen36_gdn_verify_with_workspace(
+extern "C" __attribute__((visibility("default"))) int qwen36_gdn_verify_with_workspace(
     const float *A_log, const uint16_t *dt_bias, const uint16_t *q, const uint16_t *k,
     const uint16_t *v, const uint16_t *a, const uint16_t *b, const float *state,
     const int32_t *state_indices, float *checkpoints, const int32_t *checkpoint_indices,

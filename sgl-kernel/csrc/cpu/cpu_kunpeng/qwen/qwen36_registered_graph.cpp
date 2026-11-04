@@ -302,3 +302,47 @@ extern "C" void qwen_graph_gqa_dispatch(std::vector<at::Tensor> &t,
 }
 extern "C" uint64_t qwen_graph_conv_calls() { return conv_calls.load(); }
 extern "C" uint64_t qwen_graph_gqa_calls() { return gqa_calls.load(); }
+
+extern "C" int qwen36_gdn_conv_verify_bf16_row_major(
+    const uint16_t *, const uint16_t *, const uint16_t *, const int32_t *, uint16_t *,
+    const int32_t *, uint16_t *, int64_t, int64_t, int64_t, int64_t, int64_t);
+
+extern "C" void qwen_graph_conv_verify_dispatch(std::vector<at::Tensor> &t,
+                                                const std::vector<ScalarArg> &s) {
+    // input, persistent conv state, weights, dynamic slots,
+    // checkpoints, dynamic checkpoint slots; output.
+    TORCH_CHECK(t.size() == 7 && s.empty(), "Conv verify graph dispatch ABI mismatch");
+    for (int i : {0, 1, 2, 4, 6})
+        check(t[i], at::kBFloat16);
+    check(t[3], at::kInt);
+    check(t[5], at::kInt);
+    TORCH_CHECK(t[0].dim() == 2 && t[1].dim() == 3 && t[2].dim() == 2 && t[4].dim() == 4,
+                "Conv verify graph ranks");
+    const auto tokens = t[0].size(0), dim = t[0].size(1), steps = t[4].size(1);
+    const auto state_slots = t[1].size(0), checkpoint_slots = t[4].size(0);
+    TORCH_CHECK(tokens > 0 && steps > 0 && tokens % steps == 0, "Conv verify token/step layout");
+    const auto batch = tokens / steps;
+    TORCH_CHECK(batch > 0 && batch <= 32 && t[1].size(1) == dim && t[1].size(2) == 3 &&
+                    t[2].size(0) == dim && t[2].size(1) == 4 && t[4].size(2) == dim &&
+                    t[4].size(3) == 3 && t[3].numel() == batch && t[5].numel() == batch &&
+                    t[6].sizes() == t[0].sizes(),
+                "Conv verify graph shape contract");
+    const auto *state_idx = static_cast<const int32_t *>(t[3].data_ptr());
+    const auto *checkpoint_idx = static_cast<const int32_t *>(t[5].data_ptr());
+    for (int64_t i = 0; i < batch; ++i) {
+        TORCH_CHECK(state_idx[i] >= 0 && state_idx[i] < state_slots,
+                    "Conv verify state slot out of bounds");
+        TORCH_CHECK(checkpoint_idx[i] >= 0 && checkpoint_idx[i] < checkpoint_slots,
+                    "Conv verify checkpoint slot out of bounds");
+        for (int64_t j = 0; j < i; ++j) {
+            TORCH_CHECK(state_idx[i] != state_idx[j], "Duplicate conv verify state slot");
+            TORCH_CHECK(checkpoint_idx[i] != checkpoint_idx[j],
+                        "Duplicate conv verify checkpoint slot");
+        }
+    }
+    int rc = qwen36_gdn_conv_verify_bf16_row_major(
+        bf(t[0]), bf(t[1]), bf(t[2]), state_idx, bf_out(t[4]), checkpoint_idx, bf_out(t[6]),
+        state_slots, checkpoint_slots, batch, steps, dim);
+    TORCH_CHECK(rc == 0, "Conv verify graph native failure: ", rc);
+}
+
