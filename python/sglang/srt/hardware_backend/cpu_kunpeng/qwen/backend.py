@@ -424,19 +424,49 @@ def draft_extend_ragged(fb):
     )
 
 
+_draft_extend_declined = set()
+
+
+def _note_draft_extend_decline(tokens, loc, counts):
+    """Report each declined draft-extend shape once, with the raw numbers."""
+    key = (
+        tokens,
+        None if loc is None else loc.numel(),
+        None if counts is None else tuple(counts.tolist()),
+    )
+    if key in _draft_extend_declined:
+        return
+    _draft_extend_declined.add(key)
+    print(
+        f"[KunpengDraftExtend] fallback tokens={key[0]} "
+        f"out_cache_loc={key[1]} counts={key[2]}",
+        flush=True,
+    )
+
+
 class QwenAttention:
     def __init__(self):
         initialize()
 
     def forward_draft_extend(self, q, k, v, layer, fb, save_kv_cache=True):
+        # out_cache_loc is allocated before finished requests are filtered, so
+        # it can be longer than the surviving token count. Only the leading
+        # `tokens` slots belong to the rows we write; this is the same prefix
+        # assumption as the chunked-prefill path this replaces. Clipping here
+        # keeps the captured KV write at a fixed `tokens` rows.
+        tokens = fb.input_ids.numel()
+        loc = fb.out_cache_loc
+        if loc is not None and loc.numel() > tokens:
+            _note_draft_extend_decline(tokens, loc, fb.extend_seq_lens)
+            loc = loc[:tokens]
         kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
         vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if save_kv_cache:
             ops.set_kv_buffer_kunpeng(
-                kb.view(-1, 256), fb.out_cache_loc, k.reshape(-1, 256).contiguous()
+                kb.view(-1, 256), loc, k.reshape(-1, 256).contiguous()
             )
             ops.set_kv_buffer_kunpeng(
-                vb.view(-1, 256), fb.out_cache_loc, v.reshape(-1, 256).contiguous()
+                vb.view(-1, 256), loc, v.reshape(-1, 256).contiguous()
             )
         # The provider precomputes the ragged mapping; the ordinary eager path
         # has no binding and derives it here.

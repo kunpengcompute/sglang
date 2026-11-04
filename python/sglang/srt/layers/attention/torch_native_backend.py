@@ -269,9 +269,11 @@ class TorchNativeAttnBackend(AttentionBackend):
                 # request). Row-wise native attention replaces the per-row
                 # host loop of the chunked-prefill path, which cannot be
                 # captured in a graph.
-                return self.kunpeng_qwen.forward_draft_extend(
+                draft_extend_out = self.kunpeng_qwen.forward_draft_extend(
                     q, k, v, layer, forward_batch, save_kv_cache
                 )
+                if draft_extend_out is not None:
+                    return draft_extend_out
 
             if prefill_graph.unsupported_reason(forward_batch) is None:
                 # This route owns the only two KV stores; do not also execute
