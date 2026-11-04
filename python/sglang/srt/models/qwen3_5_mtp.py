@@ -16,7 +16,7 @@
 
 import logging
 from contextlib import ExitStack
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
 
     def __init__(
         self,
@@ -74,6 +75,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
+            enabled as qwen_kunpeng_enabled,
+        )
+
+        if qwen_kunpeng_enabled():
+            # Same native Gemma-RMSNorm kernels as the target: the generic
+            # CPU path reaches forward_native, whose `variance + eps` scalar
+            # coercion cannot be captured in a graph.
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+                QwenGemmaRMSNorm as RMSNorm_cls,
+            )
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
         )
@@ -133,6 +145,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if embed.is_cuda:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """MTP 草稿层不做 aux hidden 捕获：EAGLE3 的辅助隐状态只在 target 侧产生。"""
+        return
 
     @torch.no_grad()
     def forward(
