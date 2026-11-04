@@ -132,6 +132,75 @@ extern "C" void qwen_graph_gdn_dispatch(std::vector<at::Tensor> &t,
     ++recurrence_calls;
 }
 
+extern "C" int qwen36_gdn_verify_with_workspace(
+    const float *, const uint16_t *, const uint16_t *, const uint16_t *, const uint16_t *,
+    const uint16_t *, const uint16_t *, const float *, const int32_t *, float *, const int32_t *,
+    uint16_t *, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, float *,
+    int64_t);
+
+extern "C" void qwen_graph_gdn_verify_dispatch(std::vector<at::Tensor> &t,
+                                               const std::vector<ScalarArg> &s) {
+    // A, bias, q, k, v, a, b, persistent_state, state_indices,
+    // checkpoints, checkpoint_indices, workspace; output.
+    TORCH_CHECK(t.size() == 13 && s.empty(), "GDN verify graph dispatch ABI mismatch");
+    check(t[0], at::kFloat);
+    check(t[7], at::kFloat);
+    check(t[8], at::kInt);
+    check(t[9], at::kFloat);
+    check(t[10], at::kInt);
+    check(t[11], at::kFloat);
+    TORCH_CHECK(t[11].dim() == 1, "GDN verify workspace must be 1D");
+    for (int i : {1, 2, 3, 4, 5, 6, 12})
+        check(t[i], at::kBFloat16);
+    TORCH_CHECK(t[2].dim() == 3 && t[3].sizes() == t[2].sizes() && t[4].dim() == 3 &&
+                    t[5].dim() == 2 && t[6].sizes() == t[5].sizes() && t[7].dim() == 4 &&
+                    t[9].dim() == 5,
+                "GDN verify graph ranks/shapes mismatch");
+    const auto tokens = t[2].size(0), hq = t[2].size(1), dk = t[2].size(2);
+    const auto hv = t[4].size(1), dv = t[4].size(2), steps = t[9].size(1);
+    const auto state_slots = t[7].size(0), checkpoint_slots = t[9].size(0);
+    TORCH_CHECK(steps > 0 && tokens > 0 && tokens % steps == 0, "GDN verify token/step layout");
+    const auto batch = tokens / steps;
+    TORCH_CHECK(batch > 0 && batch <= 32 && hq > 0 && hv % hq == 0 &&
+                    t[4].size(0) == tokens && t[5].size(0) == tokens && t[5].size(1) == hv &&
+                    t[6].size(1) == hv && t[0].numel() == hv && t[1].numel() == hv &&
+                    t[7].size(1) == hv && t[7].size(2) == dk && t[7].size(3) == dv &&
+                    t[9].size(2) == hv &&
+                    t[9].size(3) == dk && t[9].size(4) == dv && t[8].numel() == batch &&
+                    t[10].numel() == batch && t[12].sizes() == t[4].sizes() &&
+                    t[11].numel() >= batch * (2 * hq + 3 * dv),
+                "GDN verify graph shape contract");
+    const uintptr_t ws_begin = reinterpret_cast<uintptr_t>(t[11].data_ptr());
+    const uintptr_t ws_end = ws_begin + t[11].numel() * t[11].element_size();
+    for (size_t i = 0; i < t.size(); ++i)
+        if (i != 11) {
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(t[i].data_ptr());
+            const uintptr_t end = begin + t[i].numel() * t[i].element_size();
+            TORCH_CHECK(ws_end <= begin || end <= ws_begin,
+                        "GDN verify workspace must not alias tensors");
+        }
+    const auto *state_idx = static_cast<const int32_t *>(t[8].data_ptr());
+    const auto *checkpoint_idx = static_cast<const int32_t *>(t[10].data_ptr());
+    for (int64_t i = 0; i < batch; ++i) {
+        TORCH_CHECK(state_idx[i] >= 0 && state_idx[i] < state_slots,
+                    "GDN verify state slot out of bounds");
+        TORCH_CHECK(checkpoint_idx[i] >= 0 && checkpoint_idx[i] < checkpoint_slots,
+                    "GDN verify checkpoint slot out of bounds");
+        for (int64_t j = 0; j < i; ++j) {
+            TORCH_CHECK(state_idx[i] != state_idx[j], "Duplicate GDN verify state slot");
+            TORCH_CHECK(checkpoint_idx[i] != checkpoint_idx[j],
+                        "Duplicate GDN verify checkpoint slot");
+        }
+    }
+    int rc = qwen36_gdn_verify_with_workspace(
+        static_cast<const float *>(t[0].data_ptr()), bf(t[1]), bf(t[2]), bf(t[3]), bf(t[4]),
+        bf(t[5]), bf(t[6]), static_cast<const float *>(t[7].data_ptr()), state_idx,
+        static_cast<float *>(t[9].data_ptr()), checkpoint_idx, bf_out(t[12]), state_slots,
+        checkpoint_slots, batch, steps, hq, hv, dk, dv, static_cast<float *>(t[11].data_ptr()),
+        t[11].numel());
+    TORCH_CHECK(rc == 0, "GDN verify graph native failure: ", rc);
+}
+
 extern "C" void qwen_graph_norm_dispatch(std::vector<at::Tensor> &t,
                                          const std::vector<ScalarArg> &s) {
     TORCH_CHECK(t.size() == 4 && s.size() == 1, "Norm graph dispatch ABI mismatch");

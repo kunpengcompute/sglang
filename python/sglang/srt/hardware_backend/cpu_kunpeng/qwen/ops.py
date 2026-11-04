@@ -63,6 +63,12 @@ def register_primitives():
         + [ctypes.c_void_p, ctypes.c_int64]
     )
     gdn.qwen36_gdn_decode_with_workspace.restype = ctypes.c_int
+    gdn.qwen36_gdn_verify_with_workspace.argtypes = (
+        [ctypes.c_void_p] * 12
+        + [ctypes.c_int64] * 8
+        + [ctypes.c_void_p, ctypes.c_int64]
+    )
+    gdn.qwen36_gdn_verify_with_workspace.restype = ctypes.c_int
     norm.qwen36_gdn_rmsnorm_gated_bf16_serial.argtypes = (
         [ctypes.c_void_p] * 4 + [ctypes.c_int64] * 2 + [ctypes.c_float]
     )
@@ -85,6 +91,7 @@ def register_primitives():
     registry = graph_cpp.GraphOpRegistry.instance()
     for name, symbol in [
         ("qwen_gdn_decode", "qwen_graph_gdn_dispatch"),
+        ("qwen_gdn_verify", "qwen_graph_gdn_verify_dispatch"),
         ("qwen_gated_norm", "qwen_graph_norm_dispatch"),
         ("qwen_causal_conv", "qwen_graph_conv_dispatch"),
         ("qwen_gqa_decode", "qwen_graph_gqa_dispatch"),
@@ -181,6 +188,42 @@ def register_primitives():
         return output
 
     register_op("qwen_gdn_decode", gdn_shape, gdn_eager)
+
+    def gdn_verify_shape(A, bias, q, k, v, a, b, state, indices, checkpoints, ckpt_indices, w):
+        validate_workspace(w, (A, bias, q, k, v, a, b, state, indices, checkpoints, ckpt_indices))
+        assert q.ndim == k.ndim == v.ndim == 3 and state.ndim == 4
+        assert checkpoints.ndim == 5 and q.shape[0] % checkpoints.shape[1] == 0
+        return [(tuple(v.shape), v.dtype)]
+
+    def gdn_verify_eager(A, bias, q, k, v, a, b, state, indices, checkpoints, ckpt_indices, w):
+        steps = checkpoints.shape[1]
+        batch = q.shape[0] // steps
+        assert w.numel() >= batch * (2 * q.shape[1] + 3 * v.shape[2])
+        output = torch.empty_like(v)
+        tensors = [A, bias, q, k, v, a, b, state, indices, checkpoints, ckpt_indices, output]
+        validate_workspace(w, tensors)
+        assert all(t.is_contiguous() and t.device.type == "cpu" for t in tensors)
+        assert A.dtype == state.dtype == checkpoints.dtype == torch.float32
+        assert indices.dtype == ckpt_indices.dtype == torch.int32
+        assert all(t.dtype == torch.bfloat16 for t in (bias, q, k, v, a, b, output))
+        rc = gdn.qwen36_gdn_verify_with_workspace(
+            *(t.data_ptr() for t in tensors),
+            state.shape[0],
+            checkpoints.shape[0],
+            batch,
+            steps,
+            q.shape[1],
+            v.shape[1],
+            q.shape[2],
+            v.shape[2],
+            w.data_ptr(),
+            w.numel(),
+        )
+        if rc:
+            raise RuntimeError(f"GDN verify eager failed {rc}")
+        return output
+
+    register_op("qwen_gdn_verify", gdn_verify_shape, gdn_verify_eager)
     register_op(
         "qwen_gated_norm", lambda x, w, g, e: [(tuple(x.shape), x.dtype)], norm_eager
     )
