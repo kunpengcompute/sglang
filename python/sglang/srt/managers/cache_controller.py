@@ -53,15 +53,16 @@ def _hicache_debug() -> bool:
     return envs.SGLANG_HICACHE_DEBUG.get()
 
 
-# CPU added to SGLANG_KUNPENG_HICACHE_CPU_OFFSET per storage thread, so the three
-# threads of one rank never share a core.
+# CPU added to SGLANG_KUNPENG_HICACHE_CPU_OFFSET per storage thread.
+# prefetch / backup / read-ahead share the base+1 core, leaving the base core
+# (+0) to the scheduler main thread; the I/O aux thread keeps the next one (+2).
 _STORAGE_THREAD_CPU_DELTA = {
-    "prefetch": 0,
+    "prefetch": 1,
     "backup": 1,
     "prefetch_io_aux": 2,
     # Read-ahead shares the prefetch core: it is NAS-bound and the prefetch
     # thread is idle while the aux thread gathers a batch.
-    "tp_shard_ahead": 0,
+    "tp_shard_ahead": 1,
 }
 
 
