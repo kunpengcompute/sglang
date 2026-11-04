@@ -96,9 +96,16 @@ def prepare_model_lm_head(model, pool):
     if head is None or not hasattr(head, "weight"):
         return False
     head._kunpeng_lm_head_role = True
-    from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import prepare_weight
+    from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import (
+        prepare_weight,
+        prepare_weight_splitk,
+    )
 
-    return prepare_weight(head, pool)
+    prepared = prepare_weight(head, pool)
+    # Wide-vocabulary heads whose optimal plan splits K never satisfy the
+    # full-K contract; pack them separately so M1 (every MTP draft call) also
+    # leaves aten::mm.
+    return prepare_weight_splitk(head, pool) or prepared
 
 
 def prepare_mtp_fc(model, pool=None, max_rows=128):

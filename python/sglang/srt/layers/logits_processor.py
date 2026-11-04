@@ -933,10 +933,16 @@ class LogitsProcessor(nn.Module):
             elif _is_cpu_920f and getattr(lm_head, "_kunpeng_lm_head_role", False):
                 from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import (
                     try_linear,
+                    try_linear_splitk,
                 )
 
                 hs = hidden_states.to(lm_head.weight.dtype)
                 logits = try_linear(hs, lm_head, embedding_bias)
+                if logits is None:
+                    # Heads whose optimal plan splits K (and every M1 call,
+                    # which the MTP draft always hits) never satisfy the
+                    # full-K contract above.
+                    logits = try_linear_splitk(hs, lm_head, embedding_bias)
                 if logits is None:
                     # Always use the original logical weight for M1/other paths.
                     logits = torch.matmul(hs, lm_head.weight.T)
