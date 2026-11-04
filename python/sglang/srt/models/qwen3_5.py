@@ -1592,19 +1592,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             and getattr(quant_config, "_cpu920f", False)
             and quant_config.get_name() == "modelslim"
         )
-        spec = getattr(config, "checkpoint_loader_spec", None)
         if unified:
             from sglang.srt.model_executor.model_capabilities import (
                 default_kunpeng_qwen_policy,
-                initial_policy_from_spec,
                 validate_startup_capabilities,
             )
 
-            policy = (
-                initial_policy_from_spec(spec)
-                if spec is not None
-                else default_kunpeng_qwen_policy()
-            )
+            policy = default_kunpeng_qwen_policy()
             validate_startup_capabilities(policy, get_global_server_args())
         if unified:
             from sglang.srt.distributed import (
@@ -1669,7 +1663,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
             from sglang.srt.model_executor.model_capabilities import (
                 ModelCapabilities,
-                initial_policy_from_spec,
             )
             from sglang.srt.model_loader.unified_checkpoint import (
                 UnifiedCheckpointLoader,
@@ -1705,7 +1698,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 else self.runtime_capabilities.attach_disabled
             )
             attach_mtp(self.mtp, "mtp", shared)
-            self._unified_checkpoint_loader = UnifiedCheckpointLoader(self, spec)
+            self._unified_checkpoint_loader = UnifiedCheckpointLoader(self)
 
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}

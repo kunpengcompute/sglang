@@ -34,24 +34,20 @@ def validate_config(runner):
         and (runner.server_args.max_running_requests or 32) <= 32
         and runner.server_args.dtype == "bfloat16"
     )
-    spec = getattr(runner.model_config.hf_config, "checkpoint_loader_spec", None)
     unified_w8a8 = (
         runner.server_args.quantization == "modelslim" and runner.tp_size == 16
     )
     if unified_w8a8:
         # Validate execution capabilities before allocating components. The
         # checkpoint loader subsequently checks names, geometry and shards.
+        # MTP follows the speculative runtime configuration; no deployment
+        # manifest is required.
         from sglang.srt.model_executor.model_capabilities import (
             default_kunpeng_qwen_policy,
-            initial_policy_from_spec,
             validate_startup_capabilities,
         )
 
-        policy = (
-            initial_policy_from_spec(spec)
-            if spec is not None
-            else default_kunpeng_qwen_policy()
-        )
+        policy = default_kunpeng_qwen_policy()
         validate_startup_capabilities(policy, runner.server_args)
 
     bf16_tp16 = runner.server_args.quantization is None and runner.tp_size == 16
