@@ -150,6 +150,20 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         """MTP 草稿层不做 aux hidden 捕获：EAGLE3 的辅助隐状态只在 target 侧产生。"""
         return
 
+    def _pre_fc_linear(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project [tokens, 2*hidden] -> [tokens, hidden].
+
+        Uses the prepacked native BF16 dense GEMM when the weight was packed at
+        load time (prepare_mtp_fc); otherwise the generic F.linear stays.
+        """
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import (
+            fc_linear,
+        )
+
+        shape = hidden_states.shape
+        output = fc_linear(hidden_states.reshape(-1, shape[-1]), self.fc)
+        return output.reshape(*shape[:-1], output.shape[-1])
+
     @torch.no_grad()
     def forward(
         self,
@@ -217,7 +231,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
+            hidden_states = self._pre_fc_linear(hidden_states)
 
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states = self.model(

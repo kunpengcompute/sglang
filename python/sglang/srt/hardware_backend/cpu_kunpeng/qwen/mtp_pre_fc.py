@@ -5,6 +5,37 @@ import torch
 ROW_BLOCK = 128
 
 
+def fc_linear(x, fc):
+    """out = x @ fc.weight^T on the registered kunpeng BF16 GEMM ops.
+
+    The MTP pre-FC weight is prepacked for these ops by prepare_mtp_fc, so
+    every consumer must go through them; plain F.linear would read the packed
+    layout. Falls back to F.linear when the weight was never prepared.
+    """
+    weight = fc.weight
+    if not getattr(weight, "_kunpeng_mtp_fc_packed", False):
+        return fc(x)
+    from sglang.srt.environ import envs
+    from sglang.srt.graph import ops as kunpeng
+
+    rows, k = x.shape
+    n = weight.shape[0]
+    # Pure scalar capability lookup: it has no tensor contract, so it must not
+    # enter the capture dispatch (which would demand a graph adapter).
+    with torch._C._DisableTorchDispatch():
+        tile_m, _, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(
+            rows, n, k
+        )
+    blocks_in_k = k // tile_k
+    workspace = kunpeng.alloc_buffer(
+        blocks_in_k * n * rows + 1024 if blocks_in_k > 1 else 0,
+        dtype=torch.bfloat16,
+        alignment=envs.SGLANG_KUNPENG_MEMORY_ALIGNMENT.get(),
+    )
+    packed = kunpeng.bf16_gemm_pack_kunpeng(x, tile_m, tile_k)
+    return kunpeng.bf16_packed_gemm_kunpeng(packed, weight, workspace, 32)
+
+
 def pre_fc(input_embeds, hidden_states, norm_embedding, norm_hidden, fc):
     """Two original row-wise norms -> cat -> original FC, into one dense BF16 output.
 
@@ -25,7 +56,7 @@ def pre_fc(input_embeds, hidden_states, norm_embedding, norm_hidden, fc):
         embedding = norm_embedding(input_embeds[start:stop])
         previous_hidden = norm_hidden(hidden_states[start:stop])
         joined = torch.cat([embedding, previous_hidden], dim=-1)
-        block = fc(joined)
+        block = fc_linear(joined, fc)
         assert block.dtype == output.dtype and tuple(block.shape) == (
             stop - start,
             hidden,

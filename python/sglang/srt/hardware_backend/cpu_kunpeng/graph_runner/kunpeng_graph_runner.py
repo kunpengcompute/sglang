@@ -478,6 +478,20 @@ class KunpengGraphRunner:
                 or self._forward_hbw is not owner._forward_hbw
             ):
                 raise RuntimeError("Borrowed target pool/arena identity changed")
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
+                enabled as qwen_enabled,
+            )
+
+            if qwen_enabled():
+                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+                    prepare_mtp_fc,
+                )
+
+                # Only the draft-owned projections are touched here: the
+                # borrowed embed/head storages belong to the target. Without
+                # this the MTP pre-fc stays a plain aten::mm on every draft
+                # step, which dominates draft decode and draft-extend.
+                prepare_mtp_fc(self.model_runner.model, self.weight_hbw_pool)
             if _is_kunpeng_graph_capture:
                 self.init_graph_capture()
             return  # No second move/pack/reservation of target-owned weights.
