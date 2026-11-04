@@ -333,7 +333,9 @@ class QwenGDNKernel(LinearAttnKernelBase):
 
 def conv_decode(x, state, weight, bias, activation, conv_state_indices, **kwargs):
     assert bias is None and activation in ("silu", "swish")
-    if x.ndim == 3:
+    if kwargs.get("intermediate_conv_window") is not None:
+        # Target verify owns the per-step window checkpoints; it takes the
+        # token-major [tokens, dim] rows and returns the same layout.
         from .speculative import verify_conv
 
         return verify_conv(
@@ -554,9 +556,13 @@ def allreduce(tensor):
         if tensor.ndim == 2 and tensor.shape[1] == 5120 and 1 < rows <= 4096:
             packed = None
             blocked = False
+            # Any row count uses the native blocked traversal. The partition
+            # layout itself comes from the collective's ownership contract, so
+            # every row count pays a repack; doing it natively keeps the small
+            # MTP verify batches (rows = draft tokens) off the strided torch
+            # transpose + copy-out path.
             eligible_blocked = (
-                rows > 128
-                and tensor.device.type == "cpu"
+                tensor.device.type == "cpu"
                 and tensor.dtype == torch.bfloat16
                 and tensor.is_contiguous()
             )

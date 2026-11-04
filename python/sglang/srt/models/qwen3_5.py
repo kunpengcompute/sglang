@@ -577,10 +577,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 a = packed.narrow(0, qkv_numel + z_numel + ba_numel, ba_numel).view(
                     rows, num_v_heads
                 )
-                mixed_qkv.copy_(mixed_qkv_src)
                 z.copy_(z_src)
-                b.copy_(b_src)
-                a.copy_(a_src)
+                if forward_batch.forward_mode.is_target_verify():
+                    # Verify kernels address rows with explicit token
+                    # strides, so the QKV/BA partitions stay strided; only
+                    # z is repacked because the gated-norm consumes dense
+                    # rows.
+                    mixed_qkv, b, a = mixed_qkv_src, b_src, a_src
+                else:
+                    mixed_qkv.copy_(mixed_qkv_src)
+                    b.copy_(b_src)
+                    a.copy_(a_src)
         elif _is_cpu and _is_amx_available:
             mixed_qkv, z, b, a = (
                 torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(

@@ -88,7 +88,8 @@ qwen36_gdn_causal_conv_bf16_serial(const uint16_t *__restrict input, uint16_t *_
 // arithmetic exactly (FP32 product sum -> BF16 round -> SiLU).
 //
 // Logical contracts:
-//   input        [batch * steps, dim] BF16, contiguous, token b*steps + s
+//   input        [batch * steps, dim] BF16, dense rows with input_stride
+//                elements between tokens (the strided projection partition)
 //   states       [slots, dim, 3] BF16, channel-contiguous [channel*3 + t]
 //   weight       [dim, 4] BF16, contiguous
 //   checkpoints  [checkpoint_slots, steps, dim, 3] BF16, same channel layout
@@ -98,7 +99,7 @@ extern "C" __attribute__((visibility("default"))) int qwen36_gdn_conv_verify_bf1
     const uint16_t *__restrict raw_weight, const int32_t *__restrict state_indices,
     uint16_t *__restrict checkpoints, const int32_t *__restrict checkpoint_indices,
     uint16_t *__restrict output, int64_t state_slots, int64_t checkpoint_slots, int64_t batch,
-    int64_t steps, int64_t dim) {
+    int64_t steps, int64_t dim, int64_t input_stride) {
     if (input == nullptr || states == nullptr || raw_weight == nullptr ||
         state_indices == nullptr || checkpoints == nullptr || checkpoint_indices == nullptr ||
         output == nullptr || state_slots <= 0 || checkpoint_slots <= 0 || batch <= 0 || steps <= 0 ||
@@ -121,7 +122,7 @@ extern "C" __attribute__((visibility("default"))) int qwen36_gdn_conv_verify_bf1
             const uint16_t *source = step == 0 ? initial : block + (step - 1) * window;
             uint16_t *target = block + step * window;
             const int64_t token = batch_index * steps + step;
-            const uint16_t *input_row = input + token * dim;
+            const uint16_t *input_row = input + token * input_stride;
             uint16_t *output_row = output + token * dim;
 #pragma clang loop vectorize(enable) interleave(enable)
             for (int64_t channel = 0; channel < dim; ++channel) {

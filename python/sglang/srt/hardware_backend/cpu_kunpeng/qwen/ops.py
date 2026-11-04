@@ -65,7 +65,7 @@ def register_primitives():
     gdn.qwen36_gdn_decode_with_workspace.restype = ctypes.c_int
     gdn.qwen36_gdn_verify_with_workspace.argtypes = (
         [ctypes.c_void_p] * 12
-        + [ctypes.c_int64] * 8
+        + [ctypes.c_int64] * 13
         + [ctypes.c_void_p, ctypes.c_int64]
     )
     gdn.qwen36_gdn_verify_with_workspace.restype = ctypes.c_int
@@ -78,7 +78,7 @@ def register_primitives():
     ] * 3
     conv.qwen36_gdn_causal_conv_bf16_row_major.restype = ctypes.c_int
     conv.qwen36_gdn_conv_verify_bf16_row_major.argtypes = (
-        [ctypes.c_void_p] * 7 + [ctypes.c_int64] * 5
+        [ctypes.c_void_p] * 7 + [ctypes.c_int64] * 6
     )
     conv.qwen36_gdn_conv_verify_bf16_row_major.restype = ctypes.c_int
     for name in (
@@ -112,7 +112,7 @@ def register_primitives():
     def ar_pack_block_shape(x, partitions):
         if not (
             x.ndim == 2
-            and 128 < x.shape[0] <= 4096
+            and 0 < x.shape[0] <= 4096
             and x.shape[1] > 0
             and partitions > 0
             and x.shape[1] % partitions == 0
@@ -120,7 +120,7 @@ def register_primitives():
             and x.device.type == "cpu"
             and x.is_contiguous()
         ):
-            raise ValueError("Blocked AR Pack requires dense CPU BF16 large token rows")
+            raise ValueError("Blocked AR Pack requires dense CPU BF16 token rows")
         return [(tuple(x.shape), x.dtype)]
 
     register_op(
@@ -204,10 +204,12 @@ def register_primitives():
         steps = checkpoints.shape[1]
         batch = q.shape[0] // steps
         assert w.numel() >= batch * (2 * q.shape[1] + 3 * v.shape[2])
-        output = torch.empty_like(v)
+        output = torch.empty(v.shape, dtype=v.dtype)
         tensors = [A, bias, q, k, v, a, b, state, indices, checkpoints, ckpt_indices, output]
         validate_workspace(w, tensors)
-        assert all(t.is_contiguous() and t.device.type == "cpu" for t in tensors)
+        # q/k/v/a/b may be strided projection partitions (dense rows only).
+        assert all(t.device.type == "cpu" and t.stride(-1) == 1 for t in tensors)
+        assert all(t.is_contiguous() for t in (bias, state, indices, checkpoints, ckpt_indices))
         assert A.dtype == state.dtype == checkpoints.dtype == torch.float32
         assert indices.dtype == ckpt_indices.dtype == torch.int32
         assert all(t.dtype == torch.bfloat16 for t in (bias, q, k, v, a, b, output))
@@ -221,6 +223,11 @@ def register_primitives():
             v.shape[1],
             q.shape[2],
             v.shape[2],
+            q.stride(0),
+            k.stride(0),
+            v.stride(0),
+            a.stride(0),
+            b.stride(0),
             w.data_ptr(),
             w.numel(),
         )
@@ -257,7 +264,7 @@ def register_primitives():
     def conv_verify_eager(x, state, weight, indices, checkpoints, ckpt_indices):
         steps = checkpoints.shape[1]
         batch = x.shape[0] // steps
-        output = torch.empty_like(x)
+        output = torch.empty(x.shape, dtype=x.dtype)
         rc = conv.qwen36_gdn_conv_verify_bf16_row_major(
             x.data_ptr(),
             state.data_ptr(),
@@ -271,6 +278,7 @@ def register_primitives():
             batch,
             steps,
             x.shape[1],
+            x.stride(0),
         )
         if rc:
             raise RuntimeError(f"Conv verify eager failed {rc}")

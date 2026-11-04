@@ -235,6 +235,8 @@ qwen36_gdn_decode_with_workspace(const float *A_log, const uint16_t *dt_bias, co
 // request in one call. The persistent state slot is read-only; every step
 // writes its snapshot into the layer's checkpoint block, so step s > 0 reads
 // the snapshot of step s-1 instead of re-gathering the persistent state.
+// q/k/v/a/b are addressed with explicit token strides: the caller keeps the
+// strided projection partitions instead of repacking them into dense rows.
 // Arithmetic is identical to qwen36_gdn_decode_serial_with_workspace per token.
 extern "C" __attribute__((visibility("default"))) int qwen36_gdn_verify_with_workspace(
     const float *A_log, const uint16_t *dt_bias, const uint16_t *q, const uint16_t *k,
@@ -242,6 +244,7 @@ extern "C" __attribute__((visibility("default"))) int qwen36_gdn_verify_with_wor
     const int32_t *state_indices, float *checkpoints, const int32_t *checkpoint_indices,
     uint16_t *output, int64_t state_slots, int64_t checkpoint_slots, int64_t batch_size,
     int64_t steps, int64_t q_heads, int64_t v_heads, int64_t key_dim, int64_t value_dim,
+    int64_t q_stride, int64_t k_stride, int64_t v_stride, int64_t a_stride, int64_t b_stride,
     float *workspace, int64_t workspace_numel) {
     if (batch_size <= 0 || steps <= 0 || q_heads <= 0 || v_heads <= 0 || key_dim <= 0 ||
         value_dim <= 0 || v_heads % q_heads != 0)
@@ -273,13 +276,18 @@ extern "C" __attribute__((visibility("default"))) int qwen36_gdn_verify_with_wor
             const int64_t token = batch * steps + step;
             const float *source = step == 0 ? initial : block + (step - 1) * state_numel;
             float *target = block + step * state_numel;
+            const uint16_t *q_row = q + token * q_stride;
+            const uint16_t *k_row = k + token * k_stride;
+            const uint16_t *v_row = v + token * v_stride;
+            const uint16_t *a_row = a + token * a_stride;
+            const uint16_t *b_row = b + token * b_stride;
             for (int64_t head = 0; head < q_heads; ++head) {
-                const int64_t q_base = (token * q_heads + head) * key_dim;
+                const int64_t q_base = head * key_dim;
                 float q_sum = 0.0f;
                 float k_sum = 0.0f;
                 for (int64_t d = 0; d < key_dim; ++d) {
-                    const float q_value = bf16_to_float(q[q_base + d]);
-                    const float k_value = bf16_to_float(k[q_base + d]);
+                    const float q_value = bf16_to_float(q_row[q_base + d]);
+                    const float k_value = bf16_to_float(k_row[q_base + d]);
                     q_sum += q_value * q_value;
                     k_sum += k_value * k_value;
                 }
@@ -291,17 +299,16 @@ extern "C" __attribute__((visibility("default"))) int qwen36_gdn_verify_with_wor
                 std::fill_n(memory, value_dim, 0.0f);
                 std::fill_n(out_acc, value_dim, 0.0f);
                 const int64_t q_head = v_head / group_size;
-                const int64_t q_base = (token * q_heads + q_head) * key_dim;
+                const int64_t q_base = q_head * key_dim;
                 const int64_t state_base = (v_head * key_dim) * value_dim;
-                const float gate =
-                    -std::exp(A_log[v_head]) *
-                    softplus(bf16_to_float(a[token * v_heads + v_head]) +
-                             bf16_to_float(dt_bias[v_head]));
+                const float gate = -std::exp(A_log[v_head]) *
+                                   softplus(bf16_to_float(a_row[v_head]) +
+                                            bf16_to_float(dt_bias[v_head]));
                 const float decay = std::exp(gate);
-                const float beta = 1.0f / (1.0f + std::exp(-bf16_to_float(b[token * v_heads + v_head])));
+                const float beta = 1.0f / (1.0f + std::exp(-bf16_to_float(b_row[v_head])));
 
                 for (int64_t kd = 0; kd < key_dim; ++kd) {
-                    const float key_value = bf16_to_float(k[q_base + kd]) * k_scales[q_head];
+                    const float key_value = bf16_to_float(k_row[q_base + kd]) * k_scales[q_head];
                     const float *state_row = source + state_base + kd * value_dim;
 #pragma clang loop vectorize(enable)
                     for (int64_t vd = 0; vd < value_dim; ++vd) {
@@ -309,13 +316,14 @@ extern "C" __attribute__((visibility("default"))) int qwen36_gdn_verify_with_wor
                     }
                 }
                 const int64_t value_base = (token * v_heads + v_head) * value_dim;
+                const uint16_t *v_row_head = v_row + v_head * value_dim;
 #pragma clang loop vectorize(enable)
                 for (int64_t vd = 0; vd < value_dim; ++vd) {
-                    delta[vd] = (bf16_to_float(v[value_base + vd]) - memory[vd]) * beta;
+                    delta[vd] = (bf16_to_float(v_row_head[vd]) - memory[vd]) * beta;
                 }
                 for (int64_t kd = 0; kd < key_dim; ++kd) {
-                    const float key_value = bf16_to_float(k[q_base + kd]) * k_scales[q_head];
-                    const float query_value = bf16_to_float(q[q_base + kd]) * q_scales[q_head];
+                    const float key_value = bf16_to_float(k_row[q_base + kd]) * k_scales[q_head];
+                    const float query_value = bf16_to_float(q_row[q_base + kd]) * q_scales[q_head];
                     const float *source_row = source + state_base + kd * value_dim;
                     float *target_row = target + state_base + kd * value_dim;
 #pragma clang loop vectorize(enable)

@@ -19,7 +19,8 @@ void layout(std::vector<at::Tensor> &t, int64_t partitions, bool unpack) {
                     "AR blocked layout requires dense CPU BF16 tensors");
     TORCH_CHECK(t[0].dim() == 2 && t[1].sizes() == t[0].sizes(), "AR blocked layout shapes");
     const auto rows = t[0].size(0), cols = t[0].size(1);
-    TORCH_CHECK(rows > 128 && rows <= 4096 && cols > 0 && partitions > 0 && cols % partitions == 0,
+    TORCH_CHECK(rows > 0 && rows <= 4096 && cols > 0 && partitions > 0 &&
+                    cols % partitions == 0,
                 "AR blocked layout geometry");
     const auto a = reinterpret_cast<uintptr_t>(t[0].data_ptr());
     const auto b = reinterpret_cast<uintptr_t>(t[1].data_ptr());

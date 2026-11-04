@@ -13,18 +13,20 @@ _FUSED_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_FUSED", "1") == "1"
 
 
 def verify_conv(x, state, weight, cache_indices, checkpoints, checkpoint_indices):
-    batch, dim, steps = x.shape
+    # x is the token-major [tokens, dim] qkv partition (dense rows, possibly a
+    # strided projection partition); the result keeps that layout.
+    steps = checkpoints.shape[1]
+    dim = x.shape[-1]
+    batch = x.shape[0] // steps
     if _FUSED_VERIFY:
-        # x is a [batch, dim, steps] view of the token-major mixed_qkv, so the
-        # flat form is free. The kernel walks the steps itself and writes each
-        # window snapshot straight into the checkpoint block: no per-step
-        # gather/slice/stack/fancy-index node is captured.
-        flat = x.transpose(1, 2).reshape(batch * steps, dim)
-        output = ops.qwen_conv_verify(
-            flat, state, weight, cache_indices, checkpoints, checkpoint_indices
+        # The kernel walks the steps itself and writes each window snapshot
+        # straight into the checkpoint block: no per-step gather/slice/stack/
+        # fancy-index node is captured, and no repack is required.
+        return ops.qwen_conv_verify(
+            x, state, weight, cache_indices, checkpoints, checkpoint_indices
         )
-        return output.reshape(batch, steps, dim).transpose(1, 2)
 
+    x = x.contiguous().view(batch, steps, dim).transpose(1, 2)
     local_state = state[cache_indices].contiguous()
     local_indices = torch.arange(batch, dtype=torch.int32, device=x.device)
     outputs = []
@@ -35,7 +37,7 @@ def verify_conv(x, state, weight, cache_indices, checkpoints, checkpoint_indices
             )
         )
         checkpoints[checkpoint_indices, step] = local_state
-    return torch.stack(outputs, dim=2)
+    return torch.stack(outputs, dim=2).transpose(1, 2).reshape(batch * steps, dim)
 
 
 def verify_gdn(
@@ -58,11 +60,14 @@ def verify_gdn(
         # into the next checkpoint block, so the live state stays untouched
         # and no per-step gather/stack happens inside the captured graph.
         assert checkpoints.shape[1] == steps, "checkpoint block must match steps"
-        q = q.reshape(-1, q.shape[-2], q.shape[-1]).contiguous()
-        k = k.reshape(-1, k.shape[-2], k.shape[-1]).contiguous()
-        v = v.reshape(-1, v.shape[-2], v.shape[-1]).contiguous()
-        a = a.reshape(-1, a.shape[-1]).contiguous()
-        b = b.reshape(-1, b.shape[-1]).contiguous()
+        # q/k/v are slices of the fused qkv row and a/b keep their strided
+        # projection partitions; the kernel addresses rows with explicit token
+        # strides, so nothing is repacked or cloned here.
+        q = q.reshape(-1, q.shape[-2], q.shape[-1])
+        k = k.reshape(-1, k.shape[-2], k.shape[-1])
+        v = v.reshape(-1, v.shape[-2], v.shape[-1])
+        a = a.reshape(-1, a.shape[-1])
+        b = b.reshape(-1, b.shape[-1])
         workspace = ops.alloc_buffer(
             batch * (2 * q.shape[1] + 3 * v.shape[2]), dtype=torch.float32
         )
