@@ -1360,6 +1360,31 @@ def _kunpeng_allreduce_role(module: LinearBase) -> str:
     return _ALLREDUCE_LAYER_RE.sub("", prefix).removeprefix("model.")
 
 
+# Vision component reduce staging, reserved by the Kunpeng graph provider at
+# bind time (before graph capture claims the SHM pool): reduce width ->
+# reserved row capacity in the dim-keyed SHM tensor cache that
+# torch.ops.sgl_kernel.shm_allreduce_kunpeng stages eager payloads through.
+_vision_shm_rows = {}
+
+
+def _vision_reduce_via_shm(t: torch.Tensor) -> bool:
+    """Whether a vision-component TP reduce can use the reserved SHM collective.
+
+    Guards every contract the SHM path relies on: the width must have a
+    reservation, the payload must be bf16 (the staging buffer is bf16), it
+    must be contiguous (the 3D rows reduce as a storage-sharing 2D view),
+    and the row count must fit the reserved capacity so the kernel's
+    get-or-create never has to grow an entry after capture claimed the pool.
+    """
+    if not _vision_shm_rows or t.dtype != torch.bfloat16 or not t.is_contiguous():
+        return False
+    width = int(t.shape[-1])
+    budget = _vision_shm_rows.get(width)
+    if budget is None:
+        return False
+    return t.numel() // width <= budget
+
+
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
 
@@ -1574,19 +1599,33 @@ class RowParallelLinear(LinearBase):
                         get_attn_tensor_model_parallel_world_size()
                     )
                 if getattr(self, "_runtime_component", None) == "vision":
-                    # Vision component TP reduction. The Kunpeng SHM all-reduce
-                    # contract is a 2D [tokens, dim] payload whose eager buffer
-                    # for a given width must be reserved before graph capture
-                    # claims the whole pool. The vision tower instead feeds 3D
-                    # rows ([tokens, 1, hidden] from the MLP, [1, tokens,
-                    # hidden] from attention) at widths nothing reserved, which
-                    # would both mis-size the SHM buffer and exhaust the pool.
-                    # The vision traffic is negligible next to the text
-                    # decoder, so reduce it over the shape-agnostic gloo group.
-                    # gloo's bf16 allreduce is unvalidated on the Bisheng build,
-                    # so round-trip through fp32 - whose gloo support is
-                    # guaranteed - and cast back.
-                    if output_parallel.dtype == torch.bfloat16:
+                    # Vision component TP reduction. The graph provider
+                    # reserves both row buckets for every vision reduce width
+                    # in the dim-keyed SHM tensor cache before graph capture
+                    # claims the pool, so the native bf16 collective the text
+                    # decoder uses also serves the vision tower: its 3D rows
+                    # ([tokens, 1, hidden] from the MLP, [1, tokens, hidden]
+                    # from attention) reshape to the 2D [tokens, dim] staging
+                    # contract as a storage-sharing view, and the reduced
+                    # result lands back in the caller's tensor in place.
+                    # Anything the reservation does not cover - the first
+                    # request before bind, an unreserved width, non-bf16 or
+                    # non-contiguous payloads, or an image beyond the reserved
+                    # row capacity - falls back to the shape-agnostic gloo
+                    # group, so an oversized request degrades to slow instead
+                    # of exhausting the pool (#4). gloo's bf16 allreduce is
+                    # unvalidated on the Bisheng build, so round-trip through
+                    # fp32 - whose gloo support is guaranteed - and cast back.
+                    if _vision_reduce_via_shm(output_parallel):
+                        flat = output_parallel.view(-1, output_parallel.shape[-1])
+                        kunpeng.shm_allreduce_kunpeng(
+                            flat,
+                            profile_name=(
+                                f"shm_allreduce_kunpeng@vision."
+                                f"{_kunpeng_allreduce_role(self) or 'row_parallel_linear'}"
+                            ),
+                        )
+                    elif output_parallel.dtype == torch.bfloat16:
                         reduce_fp32 = output_parallel.to(torch.float32)
                         torch.distributed.all_reduce(
                             reduce_fp32, group=get_tp_group().cpu_group

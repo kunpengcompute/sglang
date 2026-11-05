@@ -248,6 +248,52 @@ class QwenHybridGraphProvider:
                 reserve(width, 1),
                 reserve(width, communicator.max_tokens),
             )
+            # Vision tower TP reductions stage through the same dim-keyed SHM
+            # cache, but their widths only first appear at the initial image
+            # request - long after capture claimed the pool, which is exactly
+            # the exhaustion that used to crash image batches. Mirror the
+            # embedding reserve for every vision reduce width: both row
+            # buckets up front, and publish the reserved capacity so
+            # RowParallelLinear's vision branch can fall back to gloo beyond
+            # it instead of asking the pool to grow an entry post-capture.
+            visual = getattr(runner.model, "visual", None)
+            if visual is not None:
+                from sglang.srt.layers.linear import (
+                    RowParallelLinear,
+                    _vision_shm_rows as vision_registry,
+                )
+
+                vision_widths = sorted(
+                    {
+                        int(module.output_size)
+                        for module in visual.modules()
+                        if isinstance(module, RowParallelLinear)
+                        and getattr(module, "_runtime_component", None) == "vision"
+                    }
+                )
+                if vision_widths:
+                    vision_budget = min(
+                        int(
+                            os.environ.get(
+                                "SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "2304"
+                            )
+                        ),
+                        int(communicator.max_tokens),
+                    )
+                    for vision_width in vision_widths:
+                        # The kernel's cache keys by dim: the small call pins
+                        # the [batch_size, dim] entry, the large call pins a
+                        # bucket-rounded [budget, dim] entry. Row counts up to
+                        # the returned capacity then always hit a reservation.
+                        small = reserve(vision_width, 1)
+                        large = reserve(vision_width, vision_budget)
+                        capacity = max(int(small.size(0)), int(large.size(0)))
+                        vision_registry[vision_width] = capacity
+                    print(
+                        f"[QwenRegisteredGraph] vision_shm_rows={vision_registry} "
+                        f"budget={vision_budget}",
+                        flush=True,
+                    )
         communicator.get_shm_tensor(runner.model.lm_head.weight.shape[0])
         for width, tensor in sorted(communicator.shm_tensors.items()):
             persistent(f"collective.shm.{width}", tensor)
