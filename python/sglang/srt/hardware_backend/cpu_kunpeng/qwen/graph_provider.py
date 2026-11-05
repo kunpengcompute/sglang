@@ -327,12 +327,24 @@ class QwenHybridGraphProvider:
 
 
 def draft_graph_capture_enabled() -> bool:
-    """Whether the attached MTP draft decode chain may be captured."""
-    return os.environ.get("SGLANG_KUNPENG_DRAFT_GRAPH_CAPTURE", "0") == "1"
+    """Whether the attached MTP draft decode chain and draft-extend are captured.
+
+    Off keeps every draft forward of the borrowed runner eager and never
+    creates the draft provider, so ``draft_extend_pad_enabled`` is not read.
+    """
+    return os.environ.get("SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE", "1") == "1"
 
 
 def draft_extend_pad_enabled() -> bool:
-    return os.environ.get("SGLANG_KUNPENG_DRAFT_EXTEND_PAD", "1") == "1"
+    """Whether the ragged draft-extend batch is padded to a canonical row count.
+
+    Only read by ``QwenAttachedMTPGraphProvider``, i.e. this is a sub-switch of
+    ``SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE``: with capture off nothing is
+    padded (eager attention handles ragged rows directly) and the value has no
+    effect. With capture on but padding off, draft-extend is only captured for
+    `tokens <= draft_extend_max_rows()` and falls back to eager otherwise.
+    """
+    return os.environ.get("SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD", "1") == "1"
 
 
 def draft_extend_max_rows() -> int:
@@ -433,7 +445,8 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
     contributes 1..N accepted rows -- so its row mapping is built eagerly and
     bound as an ordinary graph input.
 
-    Enabled by ``SGLANG_KUNPENG_DRAFT_GRAPH_CAPTURE=1``.
+    Capture is on by default; set
+    ``SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE=0`` to keep the draft eager.
     """
 
     def bind(self, runner, fb, kwargs):
@@ -465,6 +478,9 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
             return self._draft_extend_unsupported_reason(fb, kwargs)
         if not fb.forward_mode.is_decode():
             return "forward_mode"
+        return self._draft_unsupported_reason(fb, kwargs)
+
+    def _draft_unsupported_reason(self, fb, kwargs):
         if not 1 <= fb.batch_size <= 32:
             return "batch_outside_1_32"
         if fb.input_ids.numel() != fb.batch_size:

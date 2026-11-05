@@ -52,54 +52,6 @@ def initialize():
 from .prefill import conv_prefill, gating
 
 
-def prepare_mtp_fc(model, pool=None, max_rows=128):
-    """Prepack the MTP pre-fc projection for the native BF16 dense GEMM.
-
-    The MTP component concatenates the token embedding with the target hidden
-    state and projects 2*hidden -> hidden. That is a plain nn.Linear, so it
-    never reaches UnquantizedLinearMethod and stays on the generic aten::mm
-    path, which dominates the draft decode/draft-extend step.
-
-    bf16_packed_gemm re-derives its tiling from the runtime row count and reads
-    the weight packed for that tiling, so the weight is only packed when every
-    row count the component can see keeps the same tile_n/tile_k.
-    """
-    fc = getattr(model, "fc", None)
-    weight = getattr(fc, "weight", None)
-    if (
-        weight is None
-        or weight.dtype != torch.bfloat16
-        or weight.dim() != 2
-        or not weight.is_contiguous()
-        or weight.shape[1] % 2
-    ):
-        return False
-    n, k = weight.shape
-    base = tuple(torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(1, n, k))
-    for rows in range(2, max_rows + 1):
-        tiling = tuple(torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(rows, n, k))
-        if tiling[1:] != base[1:]:
-            print(
-                f"[QwenMTP] fc stays aten::mm: tiling at rows={rows} is {tiling}, "
-                f"rows=1 tile is {base}",
-                flush=True,
-            )
-            return False
-    location = "DDR"
-    if pool is not None:
-        base_addr, size = pool._base_addr, pool.pool_size
-        if base_addr <= weight.data_ptr() < base_addr + size:
-            location = "HBW"
-    if not getattr(weight, "_kunpeng_mtp_fc_packed", False):
-        torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(weight, 1)
-        weight._kunpeng_mtp_fc_packed = True
-    print(
-        f"[QwenMTP] fc packed shape=({n}, {k}) location={location}",
-        flush=True,
-    )
-    return True
-
-
 class QwenGemmaRMSNorm(GemmaRMSNorm):
     _kunpeng_qwen = True
 

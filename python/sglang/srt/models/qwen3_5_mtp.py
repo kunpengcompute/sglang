@@ -147,22 +147,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             torch.cuda.synchronize()
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        """MTP 草稿层不做 aux hidden 捕获：EAGLE3 的辅助隐状态只在 target 侧产生。"""
-        return
+        """The MTP draft captures no aux hidden states.
 
-    def _pre_fc_linear(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project [tokens, 2*hidden] -> [tokens, hidden].
-
-        Uses the prepacked native BF16 dense GEMM when the weight was packed at
-        load time (prepare_mtp_fc); otherwise the generic F.linear stays.
+        EAGLE3 auxiliary hidden states are produced on the target side only.
         """
-        from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import (
-            fc_linear,
-        )
-
-        shape = hidden_states.shape
-        output = fc_linear(hidden_states.reshape(-1, shape[-1]), self.fc)
-        return output.reshape(*shape[:-1], output.shape[-1])
+        return
 
     @torch.no_grad()
     def forward(
@@ -216,9 +205,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             and input_embeds.shape == hidden_states.shape
             and input_embeds.shape[0] > 128
         )
-        if not forward_batch.forward_mode.is_idle() and bounded_cpu_pre_fc:
-            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import pre_fc
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import (
+            fc_linear,
+            pre_fc,
+        )
 
+        if not forward_batch.forward_mode.is_idle() and bounded_cpu_pre_fc:
             hidden_states = pre_fc(
                 input_embeds,
                 hidden_states,
@@ -231,7 +223,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
-            hidden_states = self._pre_fc_linear(hidden_states)
+            hidden_states = fc_linear(hidden_states, self.fc)
 
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states = self.model(

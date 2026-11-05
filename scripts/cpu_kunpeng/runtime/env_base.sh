@@ -155,8 +155,6 @@ export SGLANG_USE_CPU_920F=1
 export TOKENIZER_WORKER_NUM=1
 export SGLANG_KUNPENG_PROFILE=0
 export SGLANG_KUNPENG_PP_PROFILE=0  # 1 = enable decode pipeline profiling
-export SGLANG_KUNPENG_DRAFT_GRAPH_CAPTURE=0  # 1 = capture the attached MTP draft decode chain and draft-extend
-export SGLANG_KUNPENG_GDN_VERIFY_FUSED=1  # 1 = one fused GDN recurrence for all MTP verify steps (0 = per-step decode)
 export SGLANG_ENABLE_BINARY_LAUNCH=1
 export SGLANG_ENABLE_NUMA_DUPLICATION=1
 export SGLANG_KUNPENG_DISABLE_MLA_ALL2ALL=0

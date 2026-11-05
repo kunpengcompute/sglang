@@ -1,5 +1,62 @@
 # Kunpeng Qwen 适配的合入边界
 
+> **2026-11-06，PR #301 attached MTP 与 draft 图捕获**：在 #299 的显式图路径之上，
+> MTP 层改为 target-owned 的 attached 组件：EAGLE draft 借用 target 的 runner、
+> `embed_tokens` 与 `lm_head`，不再加载第二份 checkpoint；draft decode 与
+> draft-extend 首次纳入图捕获；verify 的 GDN 递推与 causal conv 融合为单次调用。
+> #299 中“不启用 Provider／boxed 桥接”的边界只对 target 文本路径继续成立，attached
+> draft 单独使用 `QwenAttachedMTPGraphProvider`、`AutomaticTorchCapture` 与
+> `aten_boxed` 重放；下文相关段落属于旧实现记录，不能作为本版启动要求。
+
+本次适配内容（相对 #299）：
+
+- **模型挂载**：`models/qwen3_5.py` 的显式类在 modelslim + TP16 + PP1 时创建
+  `self.mtp`（`Qwen3_5ForCausalLMMTP`，共享 target 的 `embed_tokens` / `lm_head`），
+  经 `ModelCapabilities` 与 `mtp_bridge.attach_mtp` 登记为 target-owned 组件；
+  `UnifiedCheckpointLoader` 用一份整模型 loader 加载含 `mtp.*` 的 checkpoint。
+  MTP 是否启用由 `--speculative-*` 参数决定，不再依赖 config.json 的能力清单。
+- **draft 借用 target**：`mtp_bridge.attached_target_for_draft` /
+  `configure_borrowed_draft` / `bind_borrowed_model` / `validate_borrowed_pools`
+  校验并复用 target 的 req pool、allocator 与 HBW 池；draft 只有 1 层独立 KV。
+- **draft 图捕获**：`qwen/graph_provider.py` 新增 `QwenAttachedMTPGraphProvider`。
+  draft decode 按每步 attention backend 各捕获一张图（bs 1..32）；draft-extend 覆盖
+  ≤128 行，`SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD=1`（默认）把 ragged 行数规整为
+  `bs × speculative_num_draft_tokens`，行映射 `requests/lengths` 作为普通动态输入，
+  KV 写入按存活 token 前缀裁剪。总开关 `SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE`。
+- **verify 融合**：`qwen/ops.py` 新增 `qwen_gdn_verify` / `qwen_conv_verify`，
+  `SGLANG_KUNPENG_GDN_VERIFY_FUSED=1`（默认）把全部 MTP verify 步压成一次 GDN 递推与
+  一次 causal conv；verify 行元数据在 `prepare_for_verify` 里只构建一次。
+- **MTP 权重路径**：`qwen/mtp_pre_fc.py::prepare_mtp_fc` 在权重落位后预打包 pre-fc，
+  `fc_linear` 走 native BF16 dense GEMM；`bf16_lm_head` 增加 `prepare_weight` /
+  `try_linear`，在 `KUTACC_BF16_SMALL_M_FULL_K=1` 且 tiling 一致时把 M1..128 的
+  lm_head 留在 packed GEMM（draft 每步是 M1），否则回落到原 M1 ATen mm / M≥2 packed。
+- **公共图能力**：`install_boxed_bridge` 注册 `aten_boxed`（仅 draft 的自动捕获需要）；
+  `capture_options` 可从 attention backend 回落；borrowed runner 只接受 draft provider
+  支持的形状，其余仍 eager 回落并记录原因。
+- **加载边界**：checkpoint 不含 `visual.*` 时不加载视觉张量，也不计入覆盖度校验。
+
+本 PR 新增的环境变量：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE` | `1` | `0` = draft 保持 eager（默认捕获 attached MTP 的 draft decode 链与 draft-extend） |
+| `SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD` | `1` | `1` = 把 ragged draft-extend 规整为 `bs × speculative_num_draft_tokens` 行 |
+| `SGLANG_KUNPENG_GDN_VERIFY_FUSED` | `1` | `1` = 全部 MTP verify 步合并为一次 GDN 递推；`0` = 逐步 decode，此时 verify 不捕获图、整段 eager |
+
+`SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD` 是 `SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE`
+的子开关，只在 draft 图捕获开启时被 provider 读取：捕获关闭时 draft decode 与
+draft-extend 全程 eager，ragged 行数由 row-wise attention 与 `loc[:tokens]` 裁剪直接
+处理，不做 padding；捕获开启但 padding 关闭时，draft-extend 只在
+`tokens ≤ speculative_num_draft_tokens` 的形状上捕获，其余回落 eager
+（reason `draft_extend_tokens_outside_1_N`），且单请求的 tokens 随接受数变化会产生
+多张图。
+
+另有 `KUTACC_BF16_SMALL_M_FULL_K`（已有 KuTACC 开关，默认 `0`）：本版在 lm_head 的
+`try_linear` 上追加读取，用于 M1..128 的 full-K packed GEMM。
+
+验证范围为 CPU 920F / TP16 / PP1、modelslim W8A8 权重、EAGLE topk1 且 steps 2~3；
+视觉路径与其他模型未回归。具体验证结论以 PR #301 描述为准。
+
 > **2026-11-03，PR #299 显式图整合版**：当前 Kunpeng Qwen 文本路径使用
 > `qwen/backend.py` 与公共显式 GraphOp，经 backend 的 `get_graph_inputs` /
 > `get_graph_fixed_tensors` 接入原 runner / finalize，不解析 Qwen Provider，

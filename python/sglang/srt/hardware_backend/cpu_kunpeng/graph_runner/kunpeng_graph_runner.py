@@ -481,7 +481,7 @@ class KunpengGraphRunner:
             )
 
             if qwen_enabled():
-                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import (
                     prepare_mtp_fc,
                 )
 
@@ -985,6 +985,13 @@ class KunpengGraphRunner:
             self._graph_provider_resolved = True
         return self._graph_provider
 
+    def _explicit_backend_unsupported_reason(self, forward_batch, kwargs):
+        """Limits the explicit (provider-less) backend declares per forward."""
+        decline = getattr(
+            self.model_runner.attn_backend, "graph_unsupported_reason", None
+        )
+        return decline(forward_batch, kwargs) if decline is not None else None
+
     def _graph_supports_forward(self, forward_batch, kwargs):
         if not self.is_graph_active():
             return False
@@ -993,7 +1000,12 @@ class KunpengGraphRunner:
             # Attached MTP draft: only the dedicated draft provider may capture
             # it (chained decode steps); everything else stays eager.
             return provider is not None and provider.supports(forward_batch, kwargs)
-        return provider is None or provider.supports(forward_batch, kwargs)
+        if provider is None:
+            return (
+                self._explicit_backend_unsupported_reason(forward_batch, kwargs)
+                is None
+            )
+        return provider.supports(forward_batch, kwargs)
 
     def graph_coverage_snapshot(self):
         """Cumulative metadata only; safe to collect once after a test batch."""
@@ -1115,23 +1127,24 @@ class KunpengGraphRunner:
                 )
         supported = self._graph_supports_forward(forward_batch, kwargs)
         if not supported:
-            reason = (
-                "graph_disabled"
-                if not self.is_graph_active()
-                else (
-                    provider.unsupported_reason(forward_batch, kwargs)
-                    if provider is not None
-                    and hasattr(provider, "unsupported_reason")
-                    else (
-                        "attached_draft_provider_unavailable"
-                        if getattr(
-                            self.model_runner, "borrowed_qwen_target_runner", None
-                        )
-                        is not None
-                        else "provider_unsupported"
+            if not self.is_graph_active():
+                reason = "graph_disabled"
+            elif provider is not None and hasattr(provider, "unsupported_reason"):
+                reason = provider.unsupported_reason(forward_batch, kwargs)
+            elif provider is None:
+                reason = (
+                    self._explicit_backend_unsupported_reason(
+                        forward_batch, kwargs
                     )
+                    or "provider_unsupported"
                 )
-            )
+            elif (
+                getattr(self.model_runner, "borrowed_qwen_target_runner", None)
+                is not None
+            ):
+                reason = "attached_draft_provider_unavailable"
+            else:
+                reason = "provider_unsupported"
             if row is not None:
                 row["eager"] += 1
                 row["reasons"][reason] = row["reasons"].get(reason, 0) + 1

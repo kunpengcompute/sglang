@@ -11,6 +11,21 @@ from sglang.srt.graph import ops
 # step). SGLANG_KUNPENG_GDN_VERIFY_FUSED=0 restores the per-step path.
 _FUSED_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_FUSED", "1") == "1"
 
+if not _FUSED_VERIFY:
+    # The per-step fallback gathers/snapshots the recurrent state with plain
+    # ATen, which the explicit graph cannot record, so TARGET_VERIFY is kept
+    # eager. Say it once, up front, instead of only in the coverage counters.
+    print(
+        "[QwenVerify] SGLANG_KUNPENG_GDN_VERIFY_FUSED=0: target verify runs the "
+        "per-step eager path and is NOT graph-captured; decode throughput will "
+        "be lower than the fused verify.",
+        flush=True,
+    )
+
+
+def verify_fused_enabled() -> bool:
+    return _FUSED_VERIFY
+
 
 def verify_conv(x, state, weight, cache_indices, checkpoints, checkpoint_indices):
     # x is the token-major [tokens, dim] qkv partition (dense rows, possibly a
