@@ -194,7 +194,7 @@ def linear(x, head, bias=None):
     if x.shape[0] == 1:
         # Preserve the existing logical-weight ATen M1 contract, as a typed out op.
         return ops.tensor_mm(x, head.weight)
-    # Both preparation paths record the packed tiling in the shared plan.
+    # General path: same packed buffer and tiling that prepare() recorded.
     k = head._kunpeng_lm_head_plan["tile_k"]
     packed = ops.bf16_gemm_pack_kunpeng(x, x.shape[0], k)
     workspace = ops.alloc_buffer(1, dtype=x.dtype)

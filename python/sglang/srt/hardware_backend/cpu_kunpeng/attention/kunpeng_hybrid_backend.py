@@ -78,20 +78,8 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
         self.runner=runner
         super().__init__(full, KunpengGDNBackend(runner), runner.mambaish_config.full_attention_layer_ids)
         self.workspace = prefill_graph.resources()
-        from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import (
-            prepare,
-            prepare_weight,
-        )
-
-        head = runner.model.lm_head
-        pool = runner.kunpeng_runner.weight_hbw_pool
-        # Prefer the full-K packed capability: it also covers M1, so the MTP
-        # draft chain leaves aten::mm. When it declines (head not resident in
-        # HBW, or the small-M full-K plan is off), keep the established
-        # pack-once path used by the explicit model.
-        head._kunpeng_lm_head_role = True
-        if not prepare_weight(head, pool):
-            prepare(head, pool)
+        from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import prepare
+        prepare(runner.model.lm_head, runner.kunpeng_runner.weight_hbw_pool)
         for module in runner.model.modules():
             conv = getattr(module, 'conv1d', None)
             attention = getattr(module, 'attn', None)

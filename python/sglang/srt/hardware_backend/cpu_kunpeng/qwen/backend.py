@@ -299,21 +299,21 @@ def draft_extend_ragged(fb):
     )
 
 
-_draft_extend_declined = set()
+_draft_extend_clipped = set()
 
 
-def _note_draft_extend_decline(tokens, loc, counts):
-    """Report each declined draft-extend shape once, with the raw numbers."""
+def _note_draft_extend_clip(tokens, loc, counts):
+    """Report each clipped draft-extend shape once, with the raw numbers."""
     key = (
         tokens,
         None if loc is None else loc.numel(),
         None if counts is None else tuple(counts.tolist()),
     )
-    if key in _draft_extend_declined:
+    if key in _draft_extend_clipped:
         return
-    _draft_extend_declined.add(key)
+    _draft_extend_clipped.add(key)
     print(
-        f"[KunpengDraftExtend] fallback tokens={key[0]} "
+        f"[KunpengDraftExtend] clip tokens={key[0]} "
         f"out_cache_loc={key[1]} counts={key[2]}",
         flush=True,
     )
@@ -332,7 +332,7 @@ class QwenAttention:
         tokens = fb.input_ids.numel()
         loc = fb.out_cache_loc
         if loc is not None and loc.numel() > tokens:
-            _note_draft_extend_decline(tokens, loc, fb.extend_seq_lens)
+            _note_draft_extend_clip(tokens, loc, fb.extend_seq_lens)
             loc = loc[:tokens]
         kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
         vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
