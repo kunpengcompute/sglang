@@ -1099,13 +1099,7 @@ class KunpengGraphRunner:
         with pp_span("build_graph_inputs"):
             inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
         return self._graph_forward(
-            forward_batch,
-            inputs,
-            "decode",
-            # The attached draft keeps its KV in DDR; keep its graph buffers
-            # there as well instead of competing for the target HBW pool.
-            use_hbw=not self.model_runner.is_draft_worker,
-            **kwargs,
+            forward_batch, inputs, "decode", use_hbw=True, **kwargs,
         )
 
     def _forward_extend(
