@@ -5,6 +5,7 @@ from functools import lru_cache
 import torch
 from sgl_kernel import common_ops
 from sglang.srt.graph import ops, is_capturing
+from sglang.srt.graph.torch_capture import install_boxed_bridge
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
@@ -31,6 +32,17 @@ def scatter(x, indices, source):
 def initialize():
     lib = primitives.register_primitives()
     primitives.register_rows()
+    # The attached MTP draft is captured through the automatic ATen adapter,
+    # whose records replay as the boxed bridge op, so the bridge must exist
+    # before the first capture. The explicit target path records no boxed ops;
+    # a build without the export keeps working for it.
+    try:
+        install_boxed_bridge(common_ops.__file__)
+    except (AttributeError, OSError) as exc:
+        print(
+            f"[QwenRegisteredGraph] boxed ATen bridge unavailable: {exc}",
+            flush=True,
+        )
     from ..activation_ops import register_sigmoid_mul_bf16
     register_sigmoid_mul_bf16()
     from .layout import register_projection_split
@@ -38,6 +50,7 @@ def initialize():
     return lib
 
 from .prefill import conv_prefill, gating
+
 
 class QwenGemmaRMSNorm(GemmaRMSNorm):
     _kunpeng_qwen = True
@@ -247,7 +260,9 @@ class QwenGDNKernel(LinearAttnKernelBase):
 
 def conv_decode(x, state, weight, bias, activation, conv_state_indices, **kwargs):
     assert bias is None and activation in ("silu", "swish")
-    if x.ndim == 3:
+    if kwargs.get("intermediate_conv_window") is not None:
+        # Target verify owns the per-step window checkpoints; it takes the
+        # token-major [tokens, dim] rows and returns the same layout.
         from .speculative import verify_conv
 
         return verify_conv(
@@ -264,9 +279,92 @@ def conv_decode(x, state, weight, bias, activation, conv_state_indices, **kwargs
     return ops.qwen_causal_conv(contiguous(x), state, weight, conv_state_indices)
 
 
+def draft_extend_ragged(fb):
+    """Per-row request id and KV length of the ragged EAGLE draft-extend.
+
+    Each request contributes `num_accepted_tokens` rows (1..N), so the row to
+    request mapping is data dependent and cannot be rebuilt inside a captured
+    graph. Build it here, outside the graph, and let the graph provider bind
+    the result as a dynamic input.
+    """
+    counts = fb.extend_seq_lens
+    prefix = fb.seq_lens - counts
+    starts = torch.cumsum(counts, 0) - counts
+    rows = torch.arange(fb.input_ids.numel(), dtype=counts.dtype) - (
+        starts.repeat_interleave(counts)
+    )
+    return (
+        fb.req_pool_indices.repeat_interleave(counts),
+        prefix.repeat_interleave(counts) + rows + 1,
+    )
+
+
+_draft_extend_clipped = set()
+
+
+def _note_draft_extend_clip(tokens, loc, counts):
+    """Report each clipped draft-extend shape once, with the raw numbers."""
+    key = (
+        tokens,
+        None if loc is None else loc.numel(),
+        None if counts is None else tuple(counts.tolist()),
+    )
+    if key in _draft_extend_clipped:
+        return
+    _draft_extend_clipped.add(key)
+    print(
+        f"[KunpengDraftExtend] clip tokens={key[0]} "
+        f"out_cache_loc={key[1]} counts={key[2]}",
+        flush=True,
+    )
+
+
 class QwenAttention:
     def __init__(self):
         initialize()
+
+    def forward_draft_extend(self, q, k, v, layer, fb, save_kv_cache=True):
+        # out_cache_loc is allocated before finished requests are filtered, so
+        # it can be longer than the surviving token count. Only the leading
+        # `tokens` slots belong to the rows we write; this is the same prefix
+        # assumption as the chunked-prefill path this replaces. Clipping here
+        # keeps the captured KV write at a fixed `tokens` rows.
+        tokens = fb.input_ids.numel()
+        loc = fb.out_cache_loc
+        if loc is not None and loc.numel() > tokens:
+            _note_draft_extend_clip(tokens, loc, fb.extend_seq_lens)
+            loc = loc[:tokens]
+        kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if save_kv_cache:
+            ops.set_kv_buffer_kunpeng(
+                kb.view(-1, 256), loc, k.reshape(-1, 256).contiguous()
+            )
+            ops.set_kv_buffer_kunpeng(
+                vb.view(-1, 256), loc, v.reshape(-1, 256).contiguous()
+            )
+        # The provider precomputes the ragged mapping; the ordinary eager path
+        # has no binding and derives it here.
+        ragged = getattr(fb, "_draft_extend_ragged", None)
+        requests, lengths = (
+            draft_extend_ragged(fb) if ragged is None else ragged
+        )
+        query = q.reshape(-1, layer.tp_q_head_num, 256).contiguous()
+        op = (
+            ops.qwen_gqa_rows
+            if is_capturing() and query.shape[0] >= 8
+            else ops.qwen_gqa_decode
+        )
+        output, _ = op(
+            query,
+            kb,
+            vb,
+            fb.req_to_token_pool.req_to_token,
+            requests,
+            lengths,
+            float(layer.scaling),
+        )
+        return output.reshape(-1, layer.tp_q_head_num * 256)
 
     def forward_verify(self, q, k, v, layer, fb, save_kv_cache=True):
         kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -279,13 +377,17 @@ class QwenAttention:
                 vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256))
             )
         steps = fb.spec_info.draft_token_num
-        lengths = (
-            fb.seq_lens[:, None]
-            + torch.arange(1, steps + 1, dtype=fb.seq_lens.dtype, device=q.device)[
-                None, :
-            ]
-        ).reshape(-1)
-        requests = fb.req_pool_indices.repeat_interleave(steps)
+        requests = getattr(fb.spec_info, "_kunpeng_verify_requests", None)
+        lengths = getattr(fb.spec_info, "_kunpeng_verify_lengths", None)
+        if requests is None or lengths is None:
+            # Eager / non-attached paths still build the row metadata here.
+            lengths = (
+                fb.seq_lens[:, None]
+                + torch.arange(
+                    1, steps + 1, dtype=fb.seq_lens.dtype, device=q.device
+                )[None, :]
+            ).reshape(-1)
+            requests = fb.req_pool_indices.repeat_interleave(steps)
         query = contiguous(q.reshape(-1, layer.tp_q_head_num, 256))
         op = (
             ops.qwen_gqa_rows

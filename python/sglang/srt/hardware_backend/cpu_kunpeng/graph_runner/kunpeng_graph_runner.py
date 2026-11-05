@@ -146,13 +146,11 @@ class KunpengGraphRunner:
         if target is not None:
             runner._borrowed_target_runner = target  # Strong owner/lifetime reference.
             owner = target.kunpeng_runner
-            if (
-                owner is None
-                or owner.weight_hbw_pool is None
-                or owner._forward_hbw is None
-            ):
+            # The explicit Qwen path has no forward arena, so a borrowed draft
+            # shares the target pool and inherits its (possibly None) arena.
+            if owner is None or owner.weight_hbw_pool is None:
                 raise ValueError(
-                    "Attached MTP requires the initialized target pool and arena"
+                    "Attached MTP requires the initialized target pool"
                 )
             runner.weight_hbw_pool = owner.weight_hbw_pool
             runner._forward_hbw = owner._forward_hbw
@@ -478,6 +476,25 @@ class KunpengGraphRunner:
                 or self._forward_hbw is not owner._forward_hbw
             ):
                 raise RuntimeError("Borrowed target pool/arena identity changed")
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
+                enabled as qwen_enabled,
+            )
+
+            if qwen_enabled():
+                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import (
+                    prepare_mtp_fc,
+                )
+
+                # Draft-owned prep: it stays on the borrowing side, right before
+                # this runner's init_graph_capture(), rather than in the target
+                # backend's __init__ (which prepares target-owned resources such
+                # as lm_head). The target never runs the MTP forward, so packing
+                # there would rewrite a draft weight for runs without a draft.
+                # Only the draft-owned projections are touched here: the
+                # borrowed embed/head storages belong to the target. Without
+                # this the MTP pre-fc stays a plain aten::mm on every draft
+                # step, which dominates draft decode and draft-extend.
+                prepare_mtp_fc(self.model_runner.model, self.weight_hbw_pool)
             if _is_kunpeng_graph_capture:
                 self.init_graph_capture()
             return  # No second move/pack/reservation of target-owned weights.
@@ -973,14 +990,49 @@ class KunpengGraphRunner:
             self._graph_provider_resolved = True
         return self._graph_provider
 
+    def _explicit_backend_unsupported_reason(self, forward_batch, kwargs):
+        """Limits the explicit (provider-less) backend declares per forward."""
+        decline = getattr(
+            self.model_runner.attn_backend, "graph_unsupported_reason", None
+        )
+        return decline(forward_batch, kwargs) if decline is not None else None
+
+    def _graph_unsupported_reason(self, forward_batch, kwargs):
+        provider = self._provider_for_forward()
+        if not self.is_graph_active():
+            reason = "graph_disabled"
+        elif provider is not None and hasattr(provider, "unsupported_reason"):
+            reason = provider.unsupported_reason(forward_batch, kwargs)
+        elif provider is None:
+            reason = (
+                self._explicit_backend_unsupported_reason(
+                    forward_batch, kwargs
+                )
+                or "provider_unsupported"
+            )
+        elif (
+            getattr(self.model_runner, "borrowed_qwen_target_runner", None)
+            is not None
+        ):
+            reason = "attached_draft_provider_unavailable"
+        else:
+            reason = "provider_unsupported"
+        return reason
+
     def _graph_supports_forward(self, forward_batch, kwargs):
-        if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
-            # Generic inputs/fixed tensors are DeepSeek-specific; no draft provider yet.
-            return False
         if not self.is_graph_active():
             return False
         provider = self._provider_for_forward()
-        return provider is None or provider.supports(forward_batch, kwargs)
+        if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
+            # Attached MTP draft: only the dedicated draft provider may capture
+            # it (chained decode steps); everything else stays eager.
+            return provider is not None and provider.supports(forward_batch, kwargs)
+        if provider is None:
+            return (
+                self._explicit_backend_unsupported_reason(forward_batch, kwargs)
+                is None
+            )
+        return provider.supports(forward_batch, kwargs)
 
     def graph_coverage_snapshot(self):
         """Cumulative metadata only; safe to collect once after a test batch."""
@@ -1024,17 +1076,7 @@ class KunpengGraphRunner:
         provider = self._provider_for_forward()
         reason = "supported"
         if not supported:
-            if (
-                getattr(self.model_runner, "borrowed_qwen_target_runner", None)
-                is not None
-            ):
-                reason = "attached_draft_provider_unavailable"
-            elif not self.is_graph_active():
-                reason = "graph_disabled"
-            elif provider is not None and hasattr(provider, "unsupported_reason"):
-                reason = provider.unsupported_reason(forward_batch, kwargs)
-            else:
-                reason = "provider_unsupported"
+            reason = self._graph_unsupported_reason(forward_batch, kwargs)
         coverage = (
             self._decode_coverage_row(forward_batch, supported, reason)
             if provider is not None
@@ -1057,7 +1099,7 @@ class KunpengGraphRunner:
         with pp_span("build_graph_inputs"):
             inputs = self._build_kunpeng_graph_inputs(forward_batch, kwargs)
         return self._graph_forward(
-            forward_batch, inputs, "decode", use_hbw=True, **kwargs
+            forward_batch, inputs, "decode", use_hbw=True, **kwargs,
         )
 
     def _forward_extend(
@@ -1093,21 +1135,7 @@ class KunpengGraphRunner:
                 )
         supported = self._graph_supports_forward(forward_batch, kwargs)
         if not supported:
-            reason = (
-                "attached_draft_provider_unavailable"
-                if getattr(self.model_runner, "borrowed_qwen_target_runner", None)
-                is not None
-                else (
-                    "graph_disabled"
-                    if not self.is_graph_active()
-                    else (
-                        provider.unsupported_reason(forward_batch, kwargs)
-                        if provider is not None
-                        and hasattr(provider, "unsupported_reason")
-                        else "provider_unsupported"
-                    )
-                )
-            )
+            reason = self._graph_unsupported_reason(forward_batch, kwargs)
             if row is not None:
                 row["eager"] += 1
                 row["reasons"][reason] = row["reasons"].get(reason, 0) + 1
@@ -1765,7 +1793,19 @@ class KunpengGraphRunner:
                 if provider is not None and hasattr(provider, "capture_context")
                 else nullcontext()
             )
-            capture_options = getattr(provider, "capture_options", {})
+            capture_options = getattr(provider, "capture_options", None)
+            if capture_options is None:
+                # _provider_for_forward() returns None for any backend carrying
+                # _kunpeng_explicit_graph, i.e. the Qwen target never gets a
+                # provider (it declares its inputs through get_graph_inputs
+                # instead), so the provider has no capture contract to inherit
+                # here and the backend must supply one. It opts into the same
+                # alias registration the provider uses because it consumes
+                # partial views of its registered inputs (the verify index
+                # tables are sliced to the verify batch).
+                capture_options = getattr(
+                    self.model_runner.attn_backend, "capture_options", {}
+                )
             with capture(inputs=inputs, fixed=fixed, **capture_options), context:
                 # pp_proxy_tensors must be passed to model.forward() even in
                 # non-decode modes (e.g. PP1 idle), otherwise the model's

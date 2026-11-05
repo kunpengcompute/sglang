@@ -44,6 +44,13 @@ static void check(const at::Tensor &t, at::ScalarType dtype) {
     TORCH_CHECK(t.device().is_cpu() && t.scalar_type() == dtype && t.is_contiguous(),
                 "Qwen registered op requires contiguous CPU tensors with exact dtype");
 }
+// Rowwise-dense but non-contiguous rows: the caller keeps a strided producer
+// partition (token stride > row width) instead of repacking it.
+static void check_rows(const at::Tensor &t, at::ScalarType dtype) {
+    TORCH_CHECK(t.device().is_cpu() && t.scalar_type() == dtype && t.dim() >= 1 &&
+                    t.stride(-1) == 1 && (t.dim() < 3 || t.stride(1) == t.size(-1)),
+                "Qwen registered op requires CPU tensors with dense rows");
+}
 static const uint16_t *bf(const at::Tensor &t) {
     return reinterpret_cast<const uint16_t *>(t.data_ptr());
 }
@@ -131,6 +138,80 @@ extern "C" void qwen_graph_gdn_dispatch(std::vector<at::Tensor> &t,
         hv, dk, dv, static_cast<float *>(t[9].data_ptr()), t[9].numel());
     TORCH_CHECK(rc == 0, "GDN graph native failure: ", rc);
     ++recurrence_calls;
+}
+
+extern "C" int qwen36_gdn_verify_with_workspace(
+    const float *, const uint16_t *, const uint16_t *, const uint16_t *, const uint16_t *,
+    const uint16_t *, const uint16_t *, const float *, const int32_t *, float *, const int32_t *,
+    uint16_t *, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int64_t, int64_t, int64_t, int64_t, float *, int64_t);
+
+extern "C" void qwen_graph_gdn_verify_dispatch(std::vector<at::Tensor> &t,
+                                               const std::vector<ScalarArg> &s) {
+    // A, bias, q, k, v, a, b, persistent_state, state_indices,
+    // checkpoints, checkpoint_indices, workspace; output.
+    TORCH_CHECK(t.size() == 13 && s.empty(), "GDN verify graph dispatch ABI mismatch");
+    check(t[0], at::kFloat);
+    check(t[7], at::kFloat);
+    check(t[8], at::kInt);
+    check(t[9], at::kFloat);
+    check(t[10], at::kInt);
+    check(t[11], at::kFloat);
+    TORCH_CHECK(t[11].dim() == 1, "GDN verify workspace must be 1D");
+    // a/b keep the strided projection partition; q/k/v keep the fused qkv row
+    // slice. All four are rowwise dense, so no repack is required.
+    check(t[1], at::kBFloat16);
+    for (int i : {2, 3, 4, 5, 6})
+        check_rows(t[i], at::kBFloat16);
+    check(t[12], at::kBFloat16);
+    TORCH_CHECK(t[2].dim() == 3 && t[3].sizes() == t[2].sizes() && t[4].dim() == 3 &&
+                    t[5].dim() == 2 && t[6].sizes() == t[5].sizes() && t[7].dim() == 4 &&
+                    t[9].dim() == 5,
+                "GDN verify graph ranks/shapes mismatch");
+    const auto tokens = t[2].size(0), hq = t[2].size(1), dk = t[2].size(2);
+    const auto hv = t[4].size(1), dv = t[4].size(2), steps = t[9].size(1);
+    const auto state_slots = t[7].size(0), checkpoint_slots = t[9].size(0);
+    TORCH_CHECK(steps > 0 && tokens > 0 && tokens % steps == 0, "GDN verify token/step layout");
+    const auto batch = tokens / steps;
+    TORCH_CHECK(batch > 0 && batch <= 32 && hq > 0 && hv % hq == 0 &&
+                    t[4].size(0) == tokens && t[5].size(0) == tokens && t[5].size(1) == hv &&
+                    t[6].size(1) == hv && t[0].numel() == hv && t[1].numel() == hv &&
+                    t[7].size(1) == hv && t[7].size(2) == dk && t[7].size(3) == dv &&
+                    t[9].size(2) == hv &&
+                    t[9].size(3) == dk && t[9].size(4) == dv && t[8].numel() == batch &&
+                    t[10].numel() == batch && t[12].sizes() == t[4].sizes() &&
+                    t[11].numel() >= batch * (2 * hq + 3 * dv),
+                "GDN verify graph shape contract");
+    const uintptr_t ws_begin = reinterpret_cast<uintptr_t>(t[11].data_ptr());
+    const uintptr_t ws_end = ws_begin + t[11].numel() * t[11].element_size();
+    for (size_t i = 0; i < t.size(); ++i)
+        if (i != 11) {
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(t[i].data_ptr());
+            const uintptr_t end = begin + t[i].numel() * t[i].element_size();
+            TORCH_CHECK(ws_end <= begin || end <= ws_begin,
+                        "GDN verify workspace must not alias tensors");
+        }
+    const auto *state_idx = static_cast<const int32_t *>(t[8].data_ptr());
+    const auto *checkpoint_idx = static_cast<const int32_t *>(t[10].data_ptr());
+    for (int64_t i = 0; i < batch; ++i) {
+        TORCH_CHECK(state_idx[i] >= 0 && state_idx[i] < state_slots,
+                    "GDN verify state slot out of bounds");
+        TORCH_CHECK(checkpoint_idx[i] >= 0 && checkpoint_idx[i] < checkpoint_slots,
+                    "GDN verify checkpoint slot out of bounds");
+        for (int64_t j = 0; j < i; ++j) {
+            TORCH_CHECK(state_idx[i] != state_idx[j], "Duplicate GDN verify state slot");
+            TORCH_CHECK(checkpoint_idx[i] != checkpoint_idx[j],
+                        "Duplicate GDN verify checkpoint slot");
+        }
+    }
+    int rc = qwen36_gdn_verify_with_workspace(
+        static_cast<const float *>(t[0].data_ptr()), bf(t[1]), bf(t[2]), bf(t[3]), bf(t[4]),
+        bf(t[5]), bf(t[6]), static_cast<const float *>(t[7].data_ptr()), state_idx,
+        static_cast<float *>(t[9].data_ptr()), checkpoint_idx, bf_out(t[12]), state_slots,
+        checkpoint_slots, batch, steps, hq, hv, dk, dv, t[2].stride(0), t[3].stride(0),
+        t[4].stride(0), t[5].stride(0), t[6].stride(0),
+        static_cast<float *>(t[11].data_ptr()), t[11].numel());
+    TORCH_CHECK(rc == 0, "GDN verify graph native failure: ", rc);
 }
 
 extern "C" void qwen_graph_norm_dispatch(std::vector<at::Tensor> &t,
@@ -235,3 +316,50 @@ extern "C" void qwen_graph_gqa_dispatch(std::vector<at::Tensor> &t,
 }
 extern "C" uint64_t qwen_graph_conv_calls() { return conv_calls.load(); }
 extern "C" uint64_t qwen_graph_gqa_calls() { return gqa_calls.load(); }
+
+extern "C" int qwen36_gdn_conv_verify_bf16_row_major(
+    const uint16_t *, const uint16_t *, const uint16_t *, const int32_t *, uint16_t *,
+    const int32_t *, uint16_t *, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+
+extern "C" void qwen_graph_conv_verify_dispatch(std::vector<at::Tensor> &t,
+                                                const std::vector<ScalarArg> &s) {
+    // input, persistent conv state, weights, dynamic slots,
+    // checkpoints, dynamic checkpoint slots; output.
+    TORCH_CHECK(t.size() == 7 && s.empty(), "Conv verify graph dispatch ABI mismatch");
+    // The input keeps the strided qkv partition: rows are dense, the token
+    // stride comes from the producer.
+    check_rows(t[0], at::kBFloat16);
+    for (int i : {1, 2, 4, 6})
+        check(t[i], at::kBFloat16);
+    check(t[3], at::kInt);
+    check(t[5], at::kInt);
+    TORCH_CHECK(t[0].dim() == 2 && t[1].dim() == 3 && t[2].dim() == 2 && t[4].dim() == 4,
+                "Conv verify graph ranks");
+    const auto tokens = t[0].size(0), dim = t[0].size(1), steps = t[4].size(1);
+    const auto state_slots = t[1].size(0), checkpoint_slots = t[4].size(0);
+    TORCH_CHECK(tokens > 0 && steps > 0 && tokens % steps == 0, "Conv verify token/step layout");
+    const auto batch = tokens / steps;
+    TORCH_CHECK(batch > 0 && batch <= 32 && t[1].size(1) == dim && t[1].size(2) == 3 &&
+                    t[2].size(0) == dim && t[2].size(1) == 4 && t[4].size(2) == dim &&
+                    t[4].size(3) == 3 && t[3].numel() == batch && t[5].numel() == batch &&
+                    t[6].sizes() == t[0].sizes(),
+                "Conv verify graph shape contract");
+    const auto *state_idx = static_cast<const int32_t *>(t[3].data_ptr());
+    const auto *checkpoint_idx = static_cast<const int32_t *>(t[5].data_ptr());
+    for (int64_t i = 0; i < batch; ++i) {
+        TORCH_CHECK(state_idx[i] >= 0 && state_idx[i] < state_slots,
+                    "Conv verify state slot out of bounds");
+        TORCH_CHECK(checkpoint_idx[i] >= 0 && checkpoint_idx[i] < checkpoint_slots,
+                    "Conv verify checkpoint slot out of bounds");
+        for (int64_t j = 0; j < i; ++j) {
+            TORCH_CHECK(state_idx[i] != state_idx[j], "Duplicate conv verify state slot");
+            TORCH_CHECK(checkpoint_idx[i] != checkpoint_idx[j],
+                        "Duplicate conv verify checkpoint slot");
+        }
+    }
+    int rc = qwen36_gdn_conv_verify_bf16_row_major(
+        bf(t[0]), bf(t[1]), bf(t[2]), state_idx, bf_out(t[4]), checkpoint_idx, bf_out(t[6]),
+        state_slots, checkpoint_slots, batch, steps, dim, t[0].stride(0));
+    TORCH_CHECK(rc == 0, "Conv verify graph native failure: ", rc);
+}
+

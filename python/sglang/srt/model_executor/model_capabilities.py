@@ -3,9 +3,9 @@
 STAGE_COMPONENT_POLICY = {
     "language": {"execution_enabled": True, "pack_policy": "once"},
     "vision": {"execution_enabled": False, "pack_policy": "deferred"},
-    "mtp": {"execution_enabled": False, "pack_policy": "deferred"},
+    "mtp": {"execution_enabled": True, "pack_policy": "deferred"},
 }
-# Only an explicitly pinned child plan can select attached Qwen MTP execution.
+# Same as the default stage, but with MTP packed eagerly at load time.
 ATTACHED_MTP_COMPONENT_POLICY = {
     "language": {"execution_enabled": True, "pack_policy": "once"},
     "vision": {"execution_enabled": False, "pack_policy": "deferred"},
@@ -19,7 +19,7 @@ ATTACHED_MTP_COMPONENT_POLICY = {
 VISION_STAGE_COMPONENT_POLICY = {
     "language": {"execution_enabled": True, "pack_policy": "once"},
     "vision": {"execution_enabled": True, "pack_policy": "once"},
-    "mtp": {"execution_enabled": False, "pack_policy": "deferred"},
+    "mtp": {"execution_enabled": True, "pack_policy": "deferred"},
 }
 VISION_ATTACHED_MTP_COMPONENT_POLICY = {
     "language": {"execution_enabled": True, "pack_policy": "once"},
@@ -45,11 +45,12 @@ def default_kunpeng_qwen_policy():
     """Component policy used when no pinned checkpoint plan is present.
 
     Shared by the model constructor and the Kunpeng backend validator so the
-    scheduler, tokenizer manager and model all agree on one default.
+    scheduler, tokenizer manager and model all agree on one default. MTP is
+    enabled by default; no deployment manifest in config.json is required.
     """
     if _vision_execution_enabled():
-        return {"language": True, "vision": True, "mtp": False}
-    return {"language": True, "vision": False, "mtp": False}
+        return {"language": True, "vision": True, "mtp": True}
+    return {"language": True, "vision": False, "mtp": True}
 
 
 class ModelCapabilityError(ValueError):
@@ -176,14 +177,16 @@ def validate_startup_capabilities(policy, server_args):
         raise ModelCapabilityError(
             "Unified checkpoint requires all component modules; partial architecture flags disabled"
         )
-    if (
-        not policy["mtp"]
-        and getattr(server_args, "speculative_algorithm", None) is not None
-    ):
+    speculative_enabled = (
+        getattr(server_args, "speculative_algorithm", None) is not None
+    )
+    if not policy["mtp"] and speculative_enabled:
         raise ModelCapabilityError(
             "mtp execution disabled: speculative runtime configuration unavailable"
         )
-    if policy["mtp"]:
+    # MTP is enabled by policy, but its runtime contract only matters when
+    # speculative decoding is actually requested.
+    if policy["mtp"] and speculative_enabled:
         algorithm = getattr(server_args, "speculative_algorithm", None)
         algorithm = getattr(algorithm, "value", algorithm)
         steps = getattr(server_args, "speculative_num_steps", None)
@@ -219,11 +222,8 @@ def validate_request_capabilities(policy, request):
 def initial_policy_for_model_config(model_config):
     import os
 
-    spec = getattr(model_config.hf_config, "checkpoint_loader_spec", None)
-    if spec is not None:
-        return initial_policy_from_spec(spec)
     # Normal text serving uses the architecture policy without a deployment
-    # manifest. Reject disabled speculative startup before allocating workers.
+    # manifest; MTP is enabled by the policy itself.
     if (
         getattr(model_config, "quantization", None) != "modelslim"
         or os.environ.get("SGLANG_USE_CPU_920F") != "1"

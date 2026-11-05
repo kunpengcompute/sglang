@@ -31,16 +31,23 @@ class TorchNativeAttnBackend(AttentionBackend):
             self.kunpeng_qwen = QwenAttention()
 
     def get_kunpeng_graph_provider(self, runner):
-        if getattr(runner, "borrowed_qwen_target_runner", None) is not None:
-            # The 64-layer target provider does not describe the attached draft.
-            return None
-        if self.kunpeng_qwen is not None:
-            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.graph_provider import (
-                QwenHybridGraphProvider,
-            )
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled
 
-            return QwenHybridGraphProvider(runner)
-        return None
+        if not enabled() or self.kunpeng_qwen is None:
+            return None
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen.graph_provider import (
+            QwenAttachedMTPGraphProvider,
+            QwenHybridGraphProvider,
+            draft_graph_capture_enabled,
+        )
+
+        if getattr(runner, "borrowed_qwen_target_runner", None) is not None:
+            # The 64-layer target provider does not describe the attached
+            # draft; a decode-chain-only provider does (opt-in).
+            if not draft_graph_capture_enabled():
+                return None
+            return QwenAttachedMTPGraphProvider(runner)
+        return QwenHybridGraphProvider(runner)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -80,26 +87,6 @@ class TorchNativeAttnBackend(AttentionBackend):
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
-
-        if self.kunpeng_qwen is not None:
-            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.prefill import (
-                run_chunked_prefill,
-            )
-
-            return run_chunked_prefill(
-                query,
-                output,
-                k_cache,
-                v_cache,
-                req_to_token,
-                req_pool_indices,
-                seq_lens,
-                extend_prefix_lens,
-                extend_seq_lens,
-                scaling=scaling,
-                enable_gqa=enable_gqa,
-                causal=causal,
-            )
 
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
@@ -250,6 +237,17 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         if self.kunpeng_qwen is not None:
             from sglang.srt.hardware_backend.cpu_kunpeng.qwen import prefill_graph
+
+            if forward_batch.forward_mode.is_draft_extend():
+                # EAGLE draft-extend is ragged (1..N accepted tokens per
+                # request) and its out_cache_loc can be longer than the
+                # surviving token rows. The row-wise native path owns that KV
+                # write, eagerly or inside a graph.
+                draft_extend_out = self.kunpeng_qwen.forward_draft_extend(
+                    q, k, v, layer, forward_batch, save_kv_cache
+                )
+                if draft_extend_out is not None:
+                    return draft_extend_out
 
             if prefill_graph.unsupported_reason(forward_batch) is None:
                 # This route owns the only two KV stores; do not also execute

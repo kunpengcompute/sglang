@@ -301,19 +301,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
             shape = x.shape
             flat = x.reshape(-1, shape[-1])
-            if flat.shape[0] >= 1024:
-                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.prefill import (
-                    dense_prefill,
-                )
-
-                output = dense_prefill(flat, layer.weight, bias)
-            else:
-                output = native_call(
-                    torch.ops.sgl_kernel.bf16_linear_kunpeng.default,
-                    flat,
-                    layer.weight,
-                    bias,
-                )
+            output = native_call(
+                torch.ops.sgl_kernel.bf16_linear_kunpeng.default,
+                flat,
+                layer.weight,
+                bias,
+            )
             return output.reshape(*shape[:-1], layer.weight.shape[0])
         return F.linear(x, layer.weight, bias)
 

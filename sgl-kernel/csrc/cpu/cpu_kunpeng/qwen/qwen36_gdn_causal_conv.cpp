@@ -90,10 +90,75 @@ qwen36_gdn_causal_conv_bf16_serial(const uint16_t *__restrict input, uint16_t *_
     return 0;
 }
 
-// Same computation while preserving SGLang's ordinary contiguous logical
-// state layout [slots, dim, 3] and checkpoint weight layout [dim, 4].  This is
-// the safer serving ABI because it does not mutate Tensor stride metadata or
-// require a separate cache representation.
+// MTP target verify: run the depthwise causal convolution for `steps`
+// speculative tokens of each request in one call and snapshot the window into
+// the layer's checkpoint block. The persistent state slot is read-only; step
+// s > 0 rolls the window from checkpoint s-1, matching the per-step decode
+// arithmetic exactly (FP32 product sum -> BF16 round -> SiLU).
+//
+// Logical contracts:
+//   input        [batch * steps, dim] BF16, dense rows with input_stride
+//                elements between tokens (the strided projection partition)
+//   states       [slots, dim, 3] BF16, channel-contiguous [channel*3 + t]
+//   weight       [dim, 4] BF16, contiguous
+//   checkpoints  [checkpoint_slots, steps, dim, 3] BF16, same channel layout
+//   output       [batch * steps, dim] BF16, contiguous
+extern "C" __attribute__((visibility("default"))) int qwen36_gdn_conv_verify_bf16_row_major(
+    const uint16_t *__restrict input, const uint16_t *__restrict states,
+    const uint16_t *__restrict raw_weight, const int32_t *__restrict state_indices,
+    uint16_t *__restrict checkpoints, const int32_t *__restrict checkpoint_indices,
+    uint16_t *__restrict output, int64_t state_slots, int64_t checkpoint_slots, int64_t batch,
+    int64_t steps, int64_t dim, int64_t input_stride) {
+    if (input == nullptr || states == nullptr || raw_weight == nullptr ||
+        state_indices == nullptr || checkpoints == nullptr || checkpoint_indices == nullptr ||
+        output == nullptr || state_slots <= 0 || checkpoint_slots <= 0 || batch <= 0 || steps <= 0 ||
+        dim <= 0) {
+        return 1;
+    }
+    const int64_t window = dim * 3;
+    for (int64_t batch_index = 0; batch_index < batch; ++batch_index) {
+        const int64_t slot = static_cast<int64_t>(state_indices[batch_index]);
+        const int64_t checkpoint_slot = static_cast<int64_t>(checkpoint_indices[batch_index]);
+        if (slot < 0 || slot >= state_slots) {
+            return 2;
+        }
+        if (checkpoint_slot < 0 || checkpoint_slot >= checkpoint_slots) {
+            return 2;
+        }
+        const uint16_t *initial = states + slot * window;
+        uint16_t *block = checkpoints + checkpoint_slot * steps * window;
+        for (int64_t step = 0; step < steps; ++step) {
+            const uint16_t *source = step == 0 ? initial : block + (step - 1) * window;
+            uint16_t *target = block + step * window;
+            const int64_t token = batch_index * steps + step;
+            const uint16_t *input_row = input + token * input_stride;
+            uint16_t *output_row = output + token * dim;
+#pragma clang loop vectorize(enable) interleave(enable)
+            for (int64_t channel = 0; channel < dim; ++channel) {
+                const uint16_t *channel_state = source + channel * 3;
+                const uint16_t *channel_weight = raw_weight + channel * 4;
+                uint16_t *channel_target = target + channel * 3;
+                const float product0 =
+                    bf16_to_float(channel_state[0]) * bf16_to_float(channel_weight[0]);
+                const float product1 =
+                    bf16_to_float(channel_state[1]) * bf16_to_float(channel_weight[1]);
+                const float product2 =
+                    bf16_to_float(channel_state[2]) * bf16_to_float(channel_weight[2]);
+                const float product3 =
+                    bf16_to_float(input_row[channel]) * bf16_to_float(channel_weight[3]);
+                const float convolution = (product0 + product1) + (product2 + product3);
+                const uint16_t rounded = float_to_bf16(convolution);
+                output_row[channel] = float_to_bf16(silu(bf16_to_float(rounded)));
+
+                channel_target[0] = channel_state[1];
+                channel_target[1] = channel_state[2];
+                channel_target[2] = input_row[channel];
+            }
+        }
+    }
+    return 0;
+}
+
 extern "C" __attribute__((visibility("default"))) int qwen36_gdn_causal_conv_bf16_row_major(
     const uint16_t *__restrict input, uint16_t *__restrict states,
     const uint16_t *__restrict raw_weight, const int32_t *__restrict indices,

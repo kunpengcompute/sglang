@@ -16,7 +16,7 @@
 
 import logging
 from contextlib import ExitStack
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
 
     def __init__(
         self,
@@ -74,6 +75,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
+            enabled as qwen_kunpeng_enabled,
+        )
+
+        if qwen_kunpeng_enabled():
+            # Same native Gemma-RMSNorm kernels as the target: the generic
+            # CPU path reaches forward_native, whose `variance + eps` scalar
+            # coercion cannot be captured in a graph.
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
+                QwenGemmaRMSNorm as RMSNorm_cls,
+            )
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
         )
@@ -134,6 +146,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """The MTP draft captures no aux hidden states.
+
+        EAGLE3 auxiliary hidden states are produced on the target side only.
+        """
+        return
+
     @torch.no_grad()
     def forward(
         self,
@@ -186,9 +205,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             and input_embeds.shape == hidden_states.shape
             and input_embeds.shape[0] > 128
         )
-        if not forward_batch.forward_mode.is_idle() and bounded_cpu_pre_fc:
-            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import pre_fc
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import (
+            fc_linear,
+            pre_fc,
+        )
 
+        if not forward_batch.forward_mode.is_idle() and bounded_cpu_pre_fc:
             hidden_states = pre_fc(
                 input_embeds,
                 hidden_states,
@@ -201,7 +223,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
+            hidden_states = fc_linear(hidden_states, self.fc)
 
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states = self.model(
