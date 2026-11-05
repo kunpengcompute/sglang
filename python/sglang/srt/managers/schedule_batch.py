@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import ceil_align, is_cpu, is_pin_memory_available
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -2174,6 +2174,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
+        # Retract-resume parks a request with a host-side KV snapshot and
+        # reloads it later. On CPU the KV cache already lives in host memory
+        # and there is no spare RAM for the snapshot, so retracted requests
+        # can never resume and must be aborted instead.
+        retract_resume_supported = not (
+            is_cpu() and server_args.disaggregation_mode == "decode"
+        )
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2185,11 +2193,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
+            if retract_resume_supported:
+                retracted_reqs.append(req)
+            else:
+                req.to_finish = FINISH_ABORT(
+                    "Out of memory in the decode engine. Retract-resume is "
+                    "not supported on CPU (the KV cache already lives in "
+                    "host memory with no spare RAM for a snapshot). "
+                    "Aborting the request.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                reqs_to_abort.append(req)
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2230,7 +2247,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.retract_req(req)
 
-        if server_args.disaggregation_mode == "decode":
+        if (
+            server_args.disaggregation_mode == "decode"
+            # The CPU KV cache already lives in host memory; there is no
+            # spare RAM for a retract snapshot, so skip the offload entirely.
+            and not is_cpu()
+        ):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
