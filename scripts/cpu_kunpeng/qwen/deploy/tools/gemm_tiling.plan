@@ -1,0 +1,19 @@
+# is_prefill,gemm_type,N,K,tile_n,tile_k
+0,1,2176,5120,136,2560
+1,1,2176,5120,136,2560
+
+# Generic transposed BF16 small-output: nativeM<=16, nativeN=logicalM.
+0,1,1024,5120,32,5120
+0,1,4096,5120,128,5120
+1,1,1024,5120,32,5120
+1,1,4096,5120,128,5120
+
+# Same full-K arithmetic for observed eager B2/B3 transposed BF16 shapes.
+0,1,2048,5120,64,5120
+0,1,3072,5120,96,5120
+1,1,2048,5120,64,5120
+1,1,3072,5120,96,5120
+
+# Full-K BF16 LM head: exact 32N tasks, original vocabulary/stride.
+0,1,15520,5120,485,5120
+1,1,15520,5120,485,5120
