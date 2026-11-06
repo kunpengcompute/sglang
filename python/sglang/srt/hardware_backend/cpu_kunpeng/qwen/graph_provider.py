@@ -37,7 +37,6 @@ class QwenHybridGraphProvider:
         self.decompose_clone = True
         self.dense_plans = {}
         self.dense_context = None
-        self.eager_collective_buffers = None
 
     def unsupported_reason(self, fb, kwargs):
         if fb.forward_mode.name == "EXTEND":
@@ -233,34 +232,13 @@ class QwenHybridGraphProvider:
                 persistent("prefill.shared." + name, tensor)
         persistent("request_table", runner.req_to_token_pool.req_to_token)
         persistent("logits_buffer", fb.next_token_logits_buffer)
-        # TP collectives: the eager embedding all-reduce caches and any
-        # communicator-owned SHM buffer the kernels may read must be fixed
-        # storages of the captured graph.
-        from sglang.srt.distributed import get_tp_group
-
-        communicator = get_tp_group().kunpeng_communicator
-        if self.eager_collective_buffers is None:
-            # Embedding all-reduce uses the native eager cache between decode
-            # graphs. The same buckets are pre-reserved by the target backend
-            # before the first capture, so this is a cache hit; ask for the
-            # identical capacity to never resize one after a graph exists.
-            capacity = int(
-                os.environ.get(
-                    "SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS",
-                    int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "1"))
-                    * int(os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1")),
-                )
-            )
-            width = runner.model_config.hidden_size
-            reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
-            self.eager_collective_buffers = (
-                reserve(width, 1),
-                reserve(width, max(1, min(communicator.max_tokens, capacity))),
-            )
         # The explicit Qwen collectives read graph-owned SHM, so the legacy
         # communicator buckets are optional here: bind the ones that exist, but
         # never allocate. By now the already captured graphs have claimed the
         # remaining pool, so a fresh create would fail with "remain 0".
+        from sglang.srt.distributed import get_tp_group
+
+        communicator = get_tp_group().kunpeng_communicator
         for shm_width, tensor in sorted(communicator.shm_tensors.items()):
             persistent(f"collective.shm.{shm_width}", tensor)
         persistent("collective.dummy", communicator.dummy_tensor)
@@ -441,9 +419,11 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
 
     Unlike the target provider this only declares the chained draft *decode*
     steps (one token per sequence, per-step attention backend) plus the
-    draft-extend pass that seeds them. Draft-extend is ragged -- each request
+    draft-extend pass that seeds them, and the prefill-extend that seeds the
+    chain for a freshly prefilled batch. Draft-extend is ragged -- each request
     contributes 1..N accepted rows -- so its row mapping is built eagerly and
-    bound as an ordinary graph input.
+    bound as an ordinary graph input. Prefill-extend is a plain EXTEND batch and
+    reuses the segmented prefill attention.
 
     Capture is on by default; set
     ``SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE=0`` to keep the draft eager.
@@ -476,6 +456,8 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
     def unsupported_reason(self, fb, kwargs):
         if fb.forward_mode.is_draft_extend():
             return self._draft_extend_unsupported_reason(fb, kwargs)
+        if fb.forward_mode.name == "EXTEND":
+            return self._draft_prefill_extend_unsupported_reason(fb, kwargs)
         if not fb.forward_mode.is_decode():
             return "forward_mode"
         return self._draft_unsupported_reason(fb, kwargs)
@@ -492,6 +474,27 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
             return "image_inputs"
         if fb.return_logprob:
             return "return_logprob"
+        if kwargs.get("pp_proxy_tensors") is not None:
+            return "pp_proxy_tensors"
+        if kwargs.get("get_embedding", False):
+            return "get_embedding"
+        return None
+
+    def _draft_prefill_extend_unsupported_reason(self, fb, kwargs):
+        """The attached MTP prefill-extend is an ordinary EXTEND batch.
+
+        It inherits EXTEND (never DRAFT_EXTEND) and uses spec_info only to carry
+        the target's full hidden states, so the segmented prefill attention that
+        covers the target prefill covers it as well.
+        """
+        reason = prefill_graph.unsupported_reason(fb)
+        if reason is not None:
+            return reason
+        tokens = fb.input_ids.numel()
+        spec_info = fb.spec_info
+        hidden = getattr(spec_info, "hidden_states", None) if spec_info else None
+        if hidden is None or hidden.shape[0] != tokens:
+            return "draft_prefill_extend_hidden_states_missing"
         if kwargs.get("pp_proxy_tensors") is not None:
             return "pp_proxy_tensors"
         if kwargs.get("get_embedding", False):
