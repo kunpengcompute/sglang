@@ -1899,7 +1899,7 @@ class Scheduler(
                     and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
                 ):
                     # Unified RDMA channel: pyobj demux, acks auto-consumed.
-                    recv_reqs = self._pp_recv_message("pyobj")["data"]
+                    recv_reqs = self._pp_recv_input_reqs_from_prev_stage()
                 else:
                     dp_offset = self.attn_dp_rank * self.attn_tp_size
                     recv_reqs = point_to_point_pyobj(
