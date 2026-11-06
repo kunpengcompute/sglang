@@ -9,6 +9,7 @@ import os
 import torch
 from sglang.srt.graph import ops
 from . import prefill_graph
+from .capabilities import get_capabilities
 from sglang.srt.graph.bindings import (
     GraphBindings,
     StaticTensorBindings,
@@ -18,6 +19,45 @@ from sglang.srt.graph.torch_capture import (
     AutomaticTorchCapture,
     contiguous_clone,
 )
+
+
+_EAGER_COLLECTIVE_BUCKETS = {}
+
+
+def reserve_eager_collective_buffers(runner):
+    """Create the shared-memory buckets an eager all-reduce can still request.
+
+    ``KunpengGraphRunner`` claims every remaining shared-memory byte for the
+    graph pool at the first capture, so a bucket first requested afterwards
+    fails with "Not enough shared memory, remain 0". Attached MTP forwards stay
+    eager when draft graph capture is off, so their buckets must exist before
+    that claim.
+
+    The native cache is keyed by ``dim`` (one bucket per width, reused by every
+    batch that fits its row capacity), so one reservation per width covers the
+    eager path. Rows are clamped to the communicator's declared token capacity,
+    which is also the native clamp: raising
+    ``SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS`` (or ``MAX_SEQ_NUM * MAX_CUR_LEN``)
+    is what allows a larger eager batch.
+    """
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.utils import is_kunpeng_graph_capture
+
+    if not is_kunpeng_graph_capture():
+        # No graph pool claim, so the buckets can still be created lazily.
+        return
+    communicator = getattr(get_tp_group(), "kunpeng_communicator", None)
+    config = getattr(runner, "model_config", None)
+    if communicator is None or config is None:
+        return
+    width = int(config.hidden_size)
+    capacity = max(1, int(communicator.max_tokens))
+    rows = max(1, min(get_capabilities().decode_max_requests, capacity))
+    key = (width, rows)
+    if key in _EAGER_COLLECTIVE_BUCKETS:
+        return
+    reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
+    _EAGER_COLLECTIVE_BUCKETS[key] = (reserve(width, 1), reserve(width, rows))
 
 
 class QwenHybridGraphProvider:
@@ -50,13 +90,22 @@ class QwenHybridGraphProvider:
             return None
         if not (fb.forward_mode.is_decode() or fb.forward_mode.is_target_verify()):
             return "forward_mode"
-        if not 1 <= fb.batch_size <= 32:
-            return "batch_outside_1_32"
         tokens = fb.input_ids.numel()
-        if not 1 <= tokens <= 32:
-            return "tokens_outside_1_32"
-        if not fb.forward_mode.is_target_verify() and tokens != fb.batch_size:
-            return "decode_token_batch_mismatch"
+        if fb.forward_mode.is_target_verify():
+            # Verify rows are batch_size * draft_token_num; `rowwise_gqa`
+            # chunks them, so only the declared batch and total row capacity
+            # bound the graph.
+            requests = get_capabilities().decode_max_requests
+            if not 1 <= fb.batch_size <= requests:
+                return f"batch_outside_1_{requests}"
+            if not prefill_graph.tokens_supported(tokens):
+                return "verify_tokens_outside_prefill_limit"
+        else:
+            reason = get_capabilities().decode_unsupported_reason(
+                fb.batch_size, tokens
+            )
+            if reason is not None:
+                return reason
         if fb.contains_image_inputs():
             return "image_inputs"
         if fb.mamba_track_mask is not None:
@@ -75,6 +124,9 @@ class QwenHybridGraphProvider:
     def bind(self, runner, fb, kwargs):
         from sglang.srt.graph.collect_weights import collect_model_weights
 
+        # Bind runs before this shape is captured, so the eager buckets must be
+        # reserved here while the shared-memory pool still has room.
+        reserve_eager_collective_buffers(runner)
         # Sampling returns int32 IDs; the embedding graph uses int64 for both
         # greedy and sampled decode steps. Normalize before binding inputs.
         fb.input_ids = fb.input_ids.to(torch.int64)
@@ -319,8 +371,8 @@ def draft_extend_pad_enabled() -> bool:
     Only read by ``QwenAttachedMTPGraphProvider``, i.e. this is a sub-switch of
     ``SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE``: with capture off nothing is
     padded (eager attention handles ragged rows directly) and the value has no
-    effect. With capture on but padding off, draft-extend is only captured for
-    `tokens <= draft_extend_max_rows()` and falls back to eager otherwise.
+    effect. Padding only stabilizes the graph-cache key; the row-wise attention
+    chunks rows, so padding off still captures every draft-extend shape.
     """
     return os.environ.get("SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD", "1") == "1"
 
@@ -463,10 +515,13 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
         return self._draft_unsupported_reason(fb, kwargs)
 
     def _draft_unsupported_reason(self, fb, kwargs):
-        if not 1 <= fb.batch_size <= 32:
-            return "batch_outside_1_32"
-        if fb.input_ids.numel() != fb.batch_size:
-            return "draft_decode_token_batch_mismatch"
+        # Ordinary decode admission comes from the declared execution
+        # capacity (1..decode_max_requests rows), not a fixed 32-row bound.
+        reason = get_capabilities().decode_unsupported_reason(
+            fb.batch_size, fb.input_ids.numel()
+        )
+        if reason is not None:
+            return reason
         spec_info = fb.spec_info
         if spec_info is None or getattr(spec_info, "hidden_states", None) is None:
             return "draft_hidden_states_missing"
@@ -504,19 +559,12 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
     def _draft_extend_unsupported_reason(self, fb, kwargs):
         tokens = fb.input_ids.numel()
         counts = fb.extend_seq_lens
-        if not 1 <= fb.batch_size <= 32:
-            return "batch_outside_1_32"
-        # Row-wise native attention replays at most 128 query rows.
-        if not 1 <= tokens <= 128:
-            return "draft_extend_tokens_outside_1_128"
-        # Row count is sum(num_accepted_tokens), i.e. data dependent: at bs>1
-        # almost every step is a new shape, which makes the per-shape graph
-        # cache thrash (capture, evict, capture). Padding canonicalizes the
-        # batch to `batch_size * max_rows` rows; without it only the
-        # single-request shapes are a small stable set.
-        max_rows = draft_extend_max_rows()
-        if not draft_extend_pad_enabled() and tokens > max_rows:
-            return f"draft_extend_tokens_outside_1_{max_rows}"
+        # Row count is sum(num_accepted_tokens), i.e. data dependent. Padding
+        # (`SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD`) canonicalizes it so nearby
+        # steps share one graph; the graph itself has no row-count bound beyond
+        # the prefill token capacity because `rowwise_gqa` chunks rows.
+        if not prefill_graph.tokens_supported(tokens):
+            return "draft_extend_tokens_outside_prefill_limit"
         if counts is None or counts.numel() != fb.batch_size:
             return "draft_extend_lengths_missing"
         if int(counts.sum()) != tokens or int(counts.min()) < 1:

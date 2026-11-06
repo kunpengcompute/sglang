@@ -173,7 +173,7 @@ extern "C" void qwen_graph_gdn_verify_dispatch(std::vector<at::Tensor> &t,
     const auto state_slots = t[7].size(0), checkpoint_slots = t[9].size(0);
     TORCH_CHECK(steps > 0 && tokens > 0 && tokens % steps == 0, "GDN verify token/step layout");
     const auto batch = tokens / steps;
-    TORCH_CHECK(batch > 0 && batch <= 32 && hq > 0 && hv % hq == 0 &&
+    TORCH_CHECK(batch > 0 && batch <= qwen_graph_limits::decode_tokens && hq > 0 && hv % hq == 0 &&
                     t[4].size(0) == tokens && t[5].size(0) == tokens && t[5].size(1) == hv &&
                     t[6].size(1) == hv && t[0].numel() == hv && t[1].numel() == hv &&
                     t[7].size(1) == hv && t[7].size(2) == dk && t[7].size(3) == dv &&
@@ -339,7 +339,7 @@ extern "C" void qwen_graph_conv_verify_dispatch(std::vector<at::Tensor> &t,
     const auto state_slots = t[1].size(0), checkpoint_slots = t[4].size(0);
     TORCH_CHECK(tokens > 0 && steps > 0 && tokens % steps == 0, "Conv verify token/step layout");
     const auto batch = tokens / steps;
-    TORCH_CHECK(batch > 0 && batch <= 32 && t[1].size(1) == dim && t[1].size(2) == 3 &&
+    TORCH_CHECK(batch > 0 && batch <= qwen_graph_limits::decode_tokens && t[1].size(1) == dim && t[1].size(2) == 3 &&
                     t[2].size(0) == dim && t[2].size(1) == 4 && t[4].size(2) == dim &&
                     t[4].size(3) == 3 && t[3].numel() == batch && t[5].numel() == batch &&
                     t[6].sizes() == t[0].sizes(),
