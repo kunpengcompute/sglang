@@ -7,9 +7,6 @@ from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
     QwenAttention, QwenGDNKernel, conv_decode, conv_prefill, gating, scatter, native_rope_cache,
 )
 from sglang.srt.hardware_backend.cpu_kunpeng.qwen import prefill_graph
-from sglang.srt.hardware_backend.cpu_kunpeng.qwen.graph_provider import (
-    reserve_eager_collective_buffers,
-)
 
 class KunpengGQABackend(QwenAttention):
     def init_forward_metadata(self, fb):
@@ -88,11 +85,6 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
                 attention.conv_weights = conv.weight.view(attention.conv_weights.shape)
             if hasattr(module,'q_norm') and getattr(module,'rotary_emb',None) is not None:
                 native_rope_cache(module)
-        # Eager collectives (draft graph capture off) still need their SHM
-        # buckets, and they can only be created before the first graph capture
-        # claims the remaining pool. This backend is built during model load,
-        # so it is the earliest provider-independent hook.
-        reserve_eager_collective_buffers(runner)
         # New backend resources exist before the first capture; refresh the common collector once.
         runner.kunpeng_runner.init_graph_capture()
 

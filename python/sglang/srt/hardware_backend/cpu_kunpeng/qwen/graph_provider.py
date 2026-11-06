@@ -21,45 +21,6 @@ from sglang.srt.graph.torch_capture import (
 )
 
 
-_EAGER_COLLECTIVE_BUCKETS = {}
-
-
-def reserve_eager_collective_buffers(runner):
-    """Create the shared-memory buckets an eager all-reduce can still request.
-
-    ``KunpengGraphRunner`` claims every remaining shared-memory byte for the
-    graph pool at the first capture, so a bucket first requested afterwards
-    fails with "Not enough shared memory, remain 0". Attached MTP forwards stay
-    eager when draft graph capture is off, so their buckets must exist before
-    that claim.
-
-    The native cache is keyed by ``dim`` (one bucket per width, reused by every
-    batch that fits its row capacity), so one reservation per width covers the
-    eager path. Rows are clamped to the communicator's declared token capacity,
-    which is also the native clamp: raising
-    ``SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS`` (or ``MAX_SEQ_NUM * MAX_CUR_LEN``)
-    is what allows a larger eager batch.
-    """
-    from sglang.srt.distributed import get_tp_group
-    from sglang.srt.utils import is_kunpeng_graph_capture
-
-    if not is_kunpeng_graph_capture():
-        # No graph pool claim, so the buckets can still be created lazily.
-        return
-    communicator = getattr(get_tp_group(), "kunpeng_communicator", None)
-    config = getattr(runner, "model_config", None)
-    if communicator is None or config is None:
-        return
-    width = int(config.hidden_size)
-    capacity = max(1, int(communicator.max_tokens))
-    rows = max(1, min(get_capabilities().decode_max_requests, capacity))
-    key = (width, rows)
-    if key in _EAGER_COLLECTIVE_BUCKETS:
-        return
-    reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
-    _EAGER_COLLECTIVE_BUCKETS[key] = (reserve(width, 1), reserve(width, rows))
-
-
 class QwenHybridGraphProvider:
     # Explicit capabilities: the common runner's default capture contract is unchanged.
     capture_options = {
@@ -124,9 +85,6 @@ class QwenHybridGraphProvider:
     def bind(self, runner, fb, kwargs):
         from sglang.srt.graph.collect_weights import collect_model_weights
 
-        # Bind runs before this shape is captured, so the eager buckets must be
-        # reserved here while the shared-memory pool still has room.
-        reserve_eager_collective_buffers(runner)
         # Sampling returns int32 IDs; the embedding graph uses int64 for both
         # greedy and sampled decode steps. Normalize before binding inputs.
         fb.input_ids = fb.input_ids.to(torch.int64)
@@ -356,23 +314,11 @@ class QwenHybridGraphProvider:
             )
 
 
-def draft_graph_capture_enabled() -> bool:
-    """Whether the attached MTP draft decode chain and draft-extend are captured.
-
-    Off keeps every draft forward of the borrowed runner eager and never
-    creates the draft provider, so ``draft_extend_pad_enabled`` is not read.
-    """
-    return os.environ.get("SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE", "1") == "1"
-
-
 def draft_extend_pad_enabled() -> bool:
     """Whether the ragged draft-extend batch is padded to a canonical row count.
 
-    Only read by ``QwenAttachedMTPGraphProvider``, i.e. this is a sub-switch of
-    ``SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE``: with capture off nothing is
-    padded (eager attention handles ragged rows directly) and the value has no
-    effect. Padding only stabilizes the graph-cache key; the row-wise attention
-    chunks rows, so padding off still captures every draft-extend shape.
+    Padding only stabilizes the graph-cache key; the row-wise attention chunks
+    rows, so padding off still captures every draft-extend shape.
     """
     return os.environ.get("SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD", "1") == "1"
 
@@ -477,8 +423,12 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
     bound as an ordinary graph input. Prefill-extend is a plain EXTEND batch and
     reuses the segmented prefill attention.
 
-    Capture is on by default; set
-    ``SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE=0`` to keep the draft eager.
+    Like the provider-less Kunpeng backends, the draft declares no shape
+    admission: row counts are absorbed by ``rowwise_gqa`` and the segmented
+    prefill kernel, so every draft forward is captured. Only a missing chain
+    input (the previous hidden states) or a ragged length mapping that cannot
+    be built makes a batch unboundable; those are input-contract violations,
+    not a batch-size policy.
     """
 
     def bind(self, runner, fb, kwargs):
@@ -515,24 +465,15 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
         return self._draft_unsupported_reason(fb, kwargs)
 
     def _draft_unsupported_reason(self, fb, kwargs):
-        # Ordinary decode admission comes from the declared execution
-        # capacity (1..decode_max_requests rows), not a fixed 32-row bound.
-        reason = get_capabilities().decode_unsupported_reason(
-            fb.batch_size, fb.input_ids.numel()
-        )
-        if reason is not None:
-            return reason
+        # The chained decode step must carry the previous step's hidden states;
+        # nothing else can make it unboundable. Batch/token rows are covered by
+        # the declared capacity and the native row kernels, so they are not an
+        # admission gate (an over-capacity shape fails in the kernel instead of
+        # silently falling back to eager, which cannot allocate SHM after the
+        # first capture).
         spec_info = fb.spec_info
         if spec_info is None or getattr(spec_info, "hidden_states", None) is None:
             return "draft_hidden_states_missing"
-        if fb.contains_image_inputs():
-            return "image_inputs"
-        if fb.return_logprob:
-            return "return_logprob"
-        if kwargs.get("pp_proxy_tensors") is not None:
-            return "pp_proxy_tensors"
-        if kwargs.get("get_embedding", False):
-            return "get_embedding"
         return None
 
     def _draft_prefill_extend_unsupported_reason(self, fb, kwargs):
@@ -540,31 +481,22 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
 
         It inherits EXTEND (never DRAFT_EXTEND) and uses spec_info only to carry
         the target's full hidden states, so the segmented prefill attention that
-        covers the target prefill covers it as well.
+        covers the target prefill covers it as well. Prefill limits are enforced
+        by ``prefill_graph`` itself, exactly as for the target prefill.
         """
-        reason = prefill_graph.unsupported_reason(fb)
-        if reason is not None:
-            return reason
         tokens = fb.input_ids.numel()
         spec_info = fb.spec_info
         hidden = getattr(spec_info, "hidden_states", None) if spec_info else None
         if hidden is None or hidden.shape[0] != tokens:
             return "draft_prefill_extend_hidden_states_missing"
-        if kwargs.get("pp_proxy_tensors") is not None:
-            return "pp_proxy_tensors"
-        if kwargs.get("get_embedding", False):
-            return "get_embedding"
         return None
 
     def _draft_extend_unsupported_reason(self, fb, kwargs):
         tokens = fb.input_ids.numel()
         counts = fb.extend_seq_lens
-        # Row count is sum(num_accepted_tokens), i.e. data dependent. Padding
-        # (`SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD`) canonicalizes it so nearby
-        # steps share one graph; the graph itself has no row-count bound beyond
-        # the prefill token capacity because `rowwise_gqa` chunks rows.
-        if not prefill_graph.tokens_supported(tokens):
-            return "draft_extend_tokens_outside_prefill_limit"
+        # The row mapping is data dependent and is built eagerly for the graph
+        # input; padding only stabilizes the graph-cache key. Row counts are not
+        # an admission gate because `rowwise_gqa` chunks them.
         if counts is None or counts.numel() != fb.batch_size:
             return "draft_extend_lengths_missing"
         if int(counts.sum()) != tokens or int(counts.min()) < 1:
@@ -579,12 +511,4 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
         hidden = getattr(spec_info, "hidden_states", None) if spec_info else None
         if hidden is None or hidden.shape[0] != tokens:
             return "draft_extend_hidden_states_missing"
-        if fb.contains_image_inputs():
-            return "image_inputs"
-        if fb.return_logprob:
-            return "return_logprob"
-        if kwargs.get("pp_proxy_tensors") is not None:
-            return "pp_proxy_tensors"
-        if kwargs.get("get_embedding", False):
-            return "get_embedding"
         return None

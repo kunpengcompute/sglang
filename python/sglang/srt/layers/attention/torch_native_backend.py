@@ -38,14 +38,11 @@ class TorchNativeAttnBackend(AttentionBackend):
         from sglang.srt.hardware_backend.cpu_kunpeng.qwen.graph_provider import (
             QwenAttachedMTPGraphProvider,
             QwenHybridGraphProvider,
-            draft_graph_capture_enabled,
         )
 
         if getattr(runner, "borrowed_qwen_target_runner", None) is not None:
             # The 64-layer target provider does not describe the attached
-            # draft; a decode-chain-only provider does (opt-in).
-            if not draft_graph_capture_enabled():
-                return None
+            # draft; the decode-chain provider does.
             return QwenAttachedMTPGraphProvider(runner)
         return QwenHybridGraphProvider(runner)
 

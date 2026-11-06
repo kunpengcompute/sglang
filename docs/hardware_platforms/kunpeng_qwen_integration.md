@@ -19,10 +19,11 @@
   `configure_borrowed_draft` / `bind_borrowed_model` / `validate_borrowed_pools`
   校验并复用 target 的 req pool、allocator 与 HBW 池；draft 只有 1 层独立 KV。
 - **draft 图捕获**：`qwen/graph_provider.py` 新增 `QwenAttachedMTPGraphProvider`。
-  draft decode 按每步 attention backend 各捕获一张图，batch 上限取
-  `QwenExecutionCapabilities.decode_max_requests`（默认 1..128，不再是固定 32；native
-  行数容量为 `qwen_graph_limits::decode_tokens=256`，需重建 sgl-kernel 才能放开到 256）；
-  draft-extend 的行数 = Σaccepted，`rowwise_gqa` 把任意行数按 128 行分块调用
+  draft decode 按每步 attention backend 各捕获一张图，**不再有 batch/token 准入**（与
+  GLM/DeepSeek 的 provider-less 路径一致）：实际行数上限由 `require_decode`
+  （`QwenExecutionCapabilities.decode_max_tokens`，默认 128、可用环境变量放到 256）和
+  native 行数容量 `qwen_graph_limits::decode_tokens=256` 决定，超出时是内核断言而不是
+  静默 eager；draft-extend 的行数 = Σaccepted，`rowwise_gqa` 把任意行数按 256 行分块调用
   row-wise attention 内核（每行独立，分块不改变数值），因此不再有 128 行上限；
   `SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD=1`（默认）把 ragged 行数规整为
   `bs × speculative_num_draft_tokens`，只用于让相邻 step 复用同一张图，行映射
@@ -48,19 +49,20 @@
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE` | `1` | `0` = draft 全程 eager；首次 capture 前已按 `min(decode_max_requests, collective max_tokens)` 预留 all-reduce SHM 桶，因此可跑到预留行数，超出仍需调大 `SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS` |
 | `SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD` | `1` | `1` = 把 ragged draft-extend 规整为 `bs × speculative_num_draft_tokens` 行，便于图复用；`0` 仍可捕获，只是形状更多 |
-| `SGLANG_KUNPENG_GDN_VERIFY_FUSED` | `1` | `1` = 全部 MTP verify 步合并为一次 GDN 递推；`0` = 逐步 decode，此时 verify 不捕获图、整段 eager（仍受预留行数约束） |
+| `SGLANG_KUNPENG_GDN_VERIFY_FUSED` | `1` | `1` = 全部 MTP verify 步合并为一次 GDN 递推；`0` = 逐步 decode，此时 verify 不捕获图、整段 eager（非融合 verify 用普通 ATen gather/scatter，无法入图；仅供对照调试） |
 
-`SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD` 只在 draft 图捕获开启时被 provider 读取。首次 capture
-会一次性占满剩余 SHM 池（`_graph_shm_tensor` 取 `shm_remaining_bytes_kunpeng()` 的全部剩余），
-之后 eager 前向里的 TP all-reduce 走 `ops.shm_allreduce_kunpeng` →
-`get_or_create_shm_tensor(dim, rows)` 懒创建，必然失败（`Not enough shared memory ... remain 0`）。
-`graph_provider.reserve_eager_collective_buffers` 在首次 capture 之前按
-`min(QwenExecutionCapabilities.decode_max_requests, communicator.max_tokens)` 行预留
-`hidden_size` 宽度的桶，覆盖 “关闭 draft 图捕获 / 关闭 fused verify” 的常见 eager 形状；
-超出预留行数（例如 draft-extend 的 `bs × accepted`）时仍需调大
-`SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS`，因为 native 侧同样按该容量截断。
+attached MTP draft 没有独立的“图捕获开关”，也没有 batch/token 准入：draft decode /
+draft-extend / prefill-extend 和 target 一样“一律尝试入图”，行数由 `rowwise_gqa` 分块与
+分段 prefill 内核吸收，形状数量靠 `SGLANG_KUNPENG_GRAPH_CACHE_SIZE` 调节。provider 只在
+链输入缺失（`spec_info.hidden_states`）或 ragged 长度映射无法构建时拒绝，这类拒绝属于输入
+契约错误，正常调度不会出现。
+
+因此首个 capture 独占剩余 SHM 池（`_graph_shm_tensor` 取
+`shm_remaining_bytes_kunpeng()` 的全部剩余）之后，**不再存在依赖 eager 集合通信的常规
+路径**，也就不需要在公共代码里预分配 SHM 桶：唯一的整体 eager 场景是关闭
+`SGLANG_ENABLE_GRAPH_CAPTURE`，此时池子不会被划走，`get_or_create_shm_tensor(dim, rows)`
+按需分配即可。`GDN_VERIFY_FUSED=0` 是唯一残留的 eager 回退，属于调试开关。
 
 另有 `KUTACC_BF16_SMALL_M_FULL_K`（已有 KuTACC 开关，默认 `0`）：本版在 lm_head 的
 `try_linear` 上追加读取，用于 M1..128 的 full-K packed GEMM。
