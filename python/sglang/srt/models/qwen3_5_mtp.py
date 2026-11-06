@@ -222,7 +222,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+            if getattr(self.pre_fc_norm_embedding, "_kunpeng_qwen", False):
+                from sglang.srt.graph import ops as kunpeng
+
+                hidden_states = kunpeng.cat_kunpeng(input_embeds, hidden_states, -1)
+            else:
+                hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
             hidden_states = fc_linear(hidden_states, self.fc)
 
         with get_global_expert_distribution_recorder().disable_this_region():

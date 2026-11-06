@@ -2,6 +2,8 @@
 
 import torch
 
+from sglang.srt.graph import ops
+
 ROW_BLOCK = 128
 
 
@@ -98,12 +100,12 @@ def pre_fc(input_embeds, hidden_states, norm_embedding, norm_hidden, fc):
     assert input_embeds.shape == hidden_states.shape
     rows, hidden = input_embeds.shape
     assert fc.bias is None and tuple(fc.weight.shape) == (hidden, 2 * hidden)
-    output = input_embeds.new_empty((rows, hidden))
+    output = ops.alloc_buffer(rows * hidden, dtype=input_embeds.dtype).view(rows, hidden)
     for start in range(0, rows, ROW_BLOCK):
         stop = min(start + ROW_BLOCK, rows)
         embedding = norm_embedding(input_embeds[start:stop])
         previous_hidden = norm_hidden(hidden_states[start:stop])
-        joined = torch.cat([embedding, previous_hidden], dim=-1)
+        joined = ops.cat_kunpeng(embedding, previous_hidden, -1)
         block = fc_linear(joined, fc)
         assert block.dtype == output.dtype and tuple(block.shape) == (
             stop - start,
