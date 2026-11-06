@@ -34,8 +34,6 @@ def unsupported_reason(fb):
         return "prefill_total_tokens_outside_1_4096"
     if not 1 <= fb.batch_size <= fb.input_ids.numel():
         return "prefill_invalid_request_count"
-    if fb.spec_info is not None:
-        return "prefill_speculative"
     if fb.contains_image_inputs():
         return "image_inputs"
     if fb.mamba_track_mask is not None:

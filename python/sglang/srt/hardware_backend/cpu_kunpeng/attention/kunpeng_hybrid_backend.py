@@ -1,6 +1,4 @@
 """Kunpeng GQA/GDN metadata and persistent resources for the common graph runner."""
-import os
-
 import torch
 from sglang.srt.graph import ops
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import HybridLinearAttnBackend
@@ -87,25 +85,6 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
                 attention.conv_weights = conv.weight.view(attention.conv_weights.shape)
             if hasattr(module,'q_norm') and getattr(module,'rotary_emb',None) is not None:
                 native_rope_cache(module)
-        # The attached MTP draft embeds eagerly (outside every graph), so its
-        # all-reduce needs the eager SHM caches to exist before the first
-        # capture claims the remaining pool: the small bucket covers decode
-        # rows, the large one covers draft-extend rows. Same reservation the
-        # graph provider performs for eager collectives.
-        from sglang.srt.distributed import get_tp_group
-
-        communicator = get_tp_group().kunpeng_communicator
-        capacity = int(
-            os.environ.get(
-                "SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS",
-                int(os.environ.get("SGLANG_KUNPENG_MAX_SEQ_NUM", "1"))
-                * int(os.environ.get("SGLANG_KUNPENG_MAX_CUR_LEN", "1")),
-            )
-        )
-        width = runner.model_config.hidden_size
-        reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
-        reserve(width, 1)
-        reserve(width, max(1, min(communicator.max_tokens, capacity)))
         # New backend resources exist before the first capture; refresh the common collector once.
         runner.kunpeng_runner.init_graph_capture()
 

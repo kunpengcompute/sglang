@@ -22,7 +22,13 @@
   draft decode 按每步 attention backend 各捕获一张图（bs 1..32）；draft-extend 覆盖
   ≤128 行，`SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD=1`（默认）把 ragged 行数规整为
   `bs × speculative_num_draft_tokens`，行映射 `requests/lengths` 作为普通动态输入，
-  KV 写入按存活 token 前缀裁剪。总开关 `SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE`。
+  KV 写入按存活 token 前缀裁剪。prefill-extend（`forward_draft_extend`，模式仍是
+  EXTEND、`spec_info` 只用来携带 target 的全量 hidden states）复用 target 的分段
+  prefill attention 入图：`prefill_graph.unsupported_reason` 不再因 `spec_info`
+  非空拒绝 EXTEND，provider 按 1..4096 tokens 与 extend metadata 契约放行，其余
+  形状仍 eager 回落。总开关 `SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE`。由于
+  capture 后不再有 eager 集合通信，target backend / provider 里为 eager all-reduce
+  预留的 SHM bucket 已删除。
 - **verify 融合**：`qwen/ops.py` 新增 `qwen_gdn_verify` / `qwen_conv_verify`，
   `SGLANG_KUNPENG_GDN_VERIFY_FUSED=1`（默认）把全部 MTP verify 步压成一次 GDN 递推与
   一次 causal conv；verify 行元数据在 `prepare_for_verify` 里只构建一次。
@@ -39,17 +45,19 @@
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE` | `1` | `0` = draft 保持 eager（默认捕获 attached MTP 的 draft decode 链与 draft-extend） |
+| `SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE` | `1` | `0` = draft 保持 eager（默认捕获 attached MTP 的 draft decode 链、draft-extend 与 prefill-extend） |
 | `SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD` | `1` | `1` = 把 ragged draft-extend 规整为 `bs × speculative_num_draft_tokens` 行 |
 | `SGLANG_KUNPENG_GDN_VERIFY_FUSED` | `1` | `1` = 全部 MTP verify 步合并为一次 GDN 递推；`0` = 逐步 decode，此时 verify 不捕获图、整段 eager |
 
 `SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD` 是 `SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE`
-的子开关，只在 draft 图捕获开启时被 provider 读取：捕获关闭时 draft decode 与
-draft-extend 全程 eager，ragged 行数由 row-wise attention 与 `loc[:tokens]` 裁剪直接
-处理，不做 padding；捕获开启但 padding 关闭时，draft-extend 只在
-`tokens ≤ speculative_num_draft_tokens` 的形状上捕获，其余回落 eager
+的子开关，只在 draft 图捕获开启时被 provider 读取：捕获关闭时 draft decode、
+draft-extend 与 prefill-extend 全程 eager，ragged 行数由 row-wise attention 与
+`loc[:tokens]` 裁剪直接处理，不做 padding；捕获开启但 padding 关闭时，draft-extend
+只在 `tokens ≤ speculative_num_draft_tokens` 的形状上捕获，其余回落 eager
 （reason `draft_extend_tokens_outside_1_N`），且单请求的 tokens 随接受数变化会产生
-多张图。
+多张图。prefill-extend 按 `(tokens, batch)` 形状各一张图，走与 target prefill 相同的
+分段内核（tokens ≤ prefill 上限 4096）；关闭 `SGLANG_KUNPENG_GDN_VERIFY_FUSED`、
+关闭 prefill 图所需的环境变量，或 `< 1`/`> 4096` tokens 等未覆盖形状仍会走 eager 集合通信。
 
 另有 `KUTACC_BF16_SMALL_M_FULL_K`（已有 KuTACC 开关，默认 `0`）：本版在 lm_head 的
 `try_linear` 上追加读取，用于 M1..128 的 full-K packed GEMM。
@@ -105,7 +113,7 @@ DeepSeek 已有的图执行器、allocator、分布式接口及公共量化/GEMM
 
 公共图代码确有新增能力：输入别名/固定存储绑定、boxed ATen 捕获与重放、图缓存和 profile 支持。输入别名及GraphOp占位分配的TorchDispatch屏蔽均默认关闭，只由provider的`capture_options`显式开启；Qwen provider开启这两项，没有provider时保持原契约。它们应作为公共改动审查，不能全部归为 Qwen 私有算子。boxed ATen 重放有时仍产生临时结果后写入固定输出，并不等于每个 ATen 都已融合。
 
-本次基线 decode 为最多32个请求；native 算子更大的行数支持不自动等于整模型/MTP 图覆盖。多请求 prefill 仍存在 eager 回落，视觉/MTP执行未验收。
+本次基线 decode 为最多32个请求；native 算子更大的行数支持不自动等于整模型/MTP 图覆盖。attached MTP 的 prefill-extend 已复用 target prefill 的分段内核入图（tokens ≤ 4096），超出该范围或关闭 draft 捕获/verify 融合时仍有 eager 回落；视觉路径未验收。
 
 ## 3. 例一：GDN QKVZ/BA 布局
 
