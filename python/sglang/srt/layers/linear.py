@@ -28,7 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
     is_symmetric_memory_enabled,
 )
-from sglang.srt.graph import ops as kunpeng
+from sglang.srt.graph import is_capturing, ops as kunpeng
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_allocation_symmetric,
@@ -1624,6 +1624,22 @@ class RowParallelLinear(LinearBase):
                                 f"shm_allreduce_kunpeng@vision."
                                 f"{_kunpeng_allreduce_role(self) or 'row_parallel_linear'}"
                             ),
+                        )
+                    elif is_capturing():
+                        # A gloo fallback executes fine during capture
+                        # tracing, but c10d collectives bypass torch dispatch
+                        # and are NOT recorded - the replay would silently
+                        # skip this reduction and return partial sums.
+                        # Refuse loudly instead; the ViT graph runner's
+                        # ready_to_capture() should have prevented reaching
+                        # this point.
+                        raise RuntimeError(
+                            "Vision TP reduce fell back to gloo during graph "
+                            "capture; the replay would silently skip it. "
+                            "Capture after the text graph provider bind has "
+                            "published the vision SHM reservation and within "
+                            "SGLANG_KUNPENG_VISION_SHM_MAX_ROWS, or disable "
+                            "SGLANG_KUNPENG_VIT_GRAPH."
                         )
                     elif output_parallel.dtype == torch.bfloat16:
                         reduce_fp32 = output_parallel.to(torch.float32)
