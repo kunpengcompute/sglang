@@ -11,11 +11,26 @@ import os
 import torch
 from sgl_kernel import common_ops
 from sglang.srt.graph import ops, register_op
+from sglang.srt.utils.common import is_cpu_920f
 from .capabilities import get_capabilities
 
 
 def tokens_supported(tokens):
     return 1 <= tokens <= get_capabilities().prefill_max_tokens
+
+
+def padding_enabled():
+    return is_cpu_920f() and os.environ.get(
+        "SGLANG_KUNPENG_EXTEND_POWER_2_PADDING", "0"
+    ) == "1"
+
+
+def padded_tokens(tokens):
+
+    if not padding_enabled() or tokens <= 0:
+        return tokens
+    padded = 1 << (tokens - 1).bit_length()
+    return padded if tokens_supported(padded) else tokens
 
 
 _libraries = []
@@ -151,8 +166,7 @@ def register():
         lambda *args: torch.ops.sgl_kernel.qwen_registered_validate_prefill_kv(*args),
     )
 
-    def conv_shape(x, weight, state, initial, indices, qsl, joined, product, reduced,
-                   metadata_validated=False):
+    def conv_shape(x, weight, state, initial, indices, qsl, joined, product, reduced):
         assert x.ndim == 2 and x.dtype == torch.bfloat16
         channels, tokens = x.shape
         assert tokens_supported(tokens) and weight.shape == (channels, 4)
@@ -168,7 +182,7 @@ def register():
     register_op(
         "qwen_conv_prefill",
         conv_shape,
-        lambda x, w, s, initial, ids, qsl, joined, product, reduced, metadata_validated=False:
+        lambda x, w, s, initial, ids, qsl, joined, product, reduced:
             torch.ops.sgl_kernel.qwen_registered_conv_prefill(
                 x, w, s, initial, ids, qsl, joined, product, reduced),
     )
@@ -225,10 +239,15 @@ def gdn_workspace_numel(tokens, sequences):
     return 386 if tokens <= 32 else 2 * tokens + sequences * 1152
 
 
-def validate_extend_metadata(qsl, indices, tokens, slots):
-    """Record a read-only runtime check before conv/gather/global state writes."""
+def validate_extend_metadata(qsl, indices, slots):
+    """Record a read-only runtime check before conv/gather/global state writes.
+
+    The token boundary is not a parameter: it would become a capture-time
+    scalar while ``qsl`` is replayed live, and the native check reads the
+    boundary from ``qsl`` itself instead.
+    """
     register()
-    ops.qwen_validate_extend_metadata(qsl, indices, tokens, slots)
+    ops.qwen_validate_extend_metadata(qsl, indices, slots)
 
 
 def resources():
@@ -297,8 +316,7 @@ def conv_c1(x, weight, bias, activation, state, has_initial_state, indices):
     return output
 
 
-def conv_segmented(x, weight, bias, activation, state, has_initial_state, indices, qsl,
-                   *, metadata_validated=False):
+def conv_segmented(x, weight, bias, activation, state, has_initial_state, indices, qsl):
     """Consume live segment boundaries at replay, retaining the C1 arithmetic."""
     assert bias is None and activation in ("silu", "swish")
     assert weight.shape == (x.shape[0], 4) and tokens_supported(x.shape[1])
@@ -308,11 +326,9 @@ def conv_segmented(x, weight, bias, activation, state, has_initial_state, indice
     joined = ops.alloc_buffer(channels * (tokens + 3), dtype=x.dtype)
     product = ops.alloc_buffer(channels * tokens * 4, dtype=torch.float32)
     reduced = ops.alloc_buffer(channels * tokens, dtype=torch.float32)
-    from sglang.srt.graph import is_capturing
-
     value = ops.qwen_conv_prefill(
         x, contiguous(cast(weight, torch.float32)), state, has_initial_state, indices, qsl,
-        joined, product, reduced, bool(metadata_validated and is_capturing()),
+        joined, product, reduced,
     )
     output = ops.alloc_buffer(x.numel(), dtype=x.dtype).view(x.shape)
     ops.copy_kunpeng(output, value)
@@ -365,4 +381,7 @@ def forward_attention(q, k, v, layer, fb, save_kv_cache):
         float(layer.scaling),
         True,  # Same live metadata was validated before the two KV stores above.
     )
+    # The padding tail of `output` is zeroed by the shared kernel itself: it
+    # recomputes the live coverage from the replayed metadata, while a slice
+    # taken here would freeze the capture batch's boundary into the graph.
     return output.reshape(-1, heads * dim)

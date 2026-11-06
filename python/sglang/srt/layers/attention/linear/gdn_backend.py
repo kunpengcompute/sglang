@@ -402,9 +402,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
             assert conv_states.shape[0] == ssm_states.shape[0]
-            validate_extend_metadata(
-                query_start_loc, cache_indices, seq_len, ssm_states.shape[0]
-            )
+            validate_extend_metadata(query_start_loc, cache_indices, ssm_states.shape[0])
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm

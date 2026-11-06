@@ -64,9 +64,11 @@ int64_t validate_cu(const at::Tensor &qsl, int64_t m) {
                     "GDN extend invalid interval");
     return sequences;
 }
-void validate_extend_metadata(const at::Tensor &qsl, const at::Tensor &indices, int64_t m,
-                              int64_t slots) {
-    const auto sequences = validate_cu(qsl, m);
+void validate_extend_metadata(const at::Tensor &qsl, const at::Tensor &indices, int64_t slots) {
+    check(qsl, at::kInt);
+    TORCH_CHECK(qsl.dim() == 1 && qsl.numel() >= 2, "GDN extend live token/sequence metadata");
+    const auto live = integer(qsl, qsl.numel() - 1);
+    const auto sequences = validate_cu(qsl, live);
     TORCH_CHECK(slots > 0 && indices.device().is_cpu() && indices.is_contiguous() &&
                     (indices.scalar_type() == at::kInt || indices.scalar_type() == at::kLong) &&
                     indices.dim() == 1 && indices.numel() == sequences,
@@ -79,7 +81,7 @@ void validate_extend_metadata(const at::Tensor &qsl, const at::Tensor &indices, 
     }
 }
 
-void conv(std::vector<at::Tensor> &t, bool metadata_validated = false) {
+void conv(std::vector<at::Tensor> &t) {
     TORCH_CHECK(t.size() == 10, "Segmented conv prefill graph ABI");
     for (int i : {2, 6, 9}) check(t[i], at::kBFloat16);
     for (int i : {1, 7, 8}) check(t[i], at::kFloat);
@@ -93,18 +95,24 @@ void conv(std::vector<at::Tensor> &t, bool metadata_validated = false) {
                     t[1].sizes() == at::IntArrayRef({channels, 4}) && t[2].dim() == 3 &&
                     t[2].size(1) == channels && t[2].size(2) == 3 &&
                     t[9].sizes() == t[0].sizes(), "Segmented conv shapes");
-    if (!metadata_validated)
-        validate_extend_metadata(t[5], t[4], m, t[2].size(0));
+    const auto live_end = integer(t[5], t[5].numel() - 1);
+    TORCH_CHECK(live_end > 0 && live_end <= m, "Segmented conv live tokens exceed the rows");
     const auto sequences = t[5].numel() - 1;
-    TORCH_CHECK(t[3].dim() == 1 && t[3].numel() == sequences &&
+    TORCH_CHECK(t[3].dim() == 1 && t[3].numel() == sequences && t[4].dim() == 1 &&
+                    t[4].numel() == sequences &&
                     t[6].dim() == 1 && t[6].numel() >= channels * (m + 3) &&
                     t[7].dim() == 1 && t[7].numel() >= channels * m * 4 &&
                     t[8].dim() == 1 && t[8].numel() >= channels * m,
                 "Segmented conv explicit workspace/initial-state metadata");
     // Every live boundary/slot/alias is checked before the first state write.
-    for (int64_t seq = 0; seq < sequences; ++seq)
+    std::unordered_set<int64_t> slots;
+    for (int64_t seq = 0; seq < sequences; ++seq) {
         TORCH_CHECK(integer(t[5], seq + 1) > integer(t[5], seq),
                     "Segmented conv requires nonempty requests");
+        const auto slot = integer(t[4], seq);
+        TORCH_CHECK(slot > 0 && slot < t[2].size(0) && slots.insert(slot).second,
+                    "Segmented conv state slot out of range or duplicated");
+    }
     isolated(t, {2, 6, 7, 8, 9});
     const auto weight = t[1].view({1, channels, 1, 4});
     for (int64_t seq = 0; seq < sequences; ++seq) {
@@ -163,7 +171,8 @@ int64_t attention_segments(const at::Tensor &table, const at::Tensor &req,
                         "Shared prefill KV index out of range");
         covered += n;
     }
-    TORCH_CHECK(covered == m, "Shared prefill segments must cover all new tokens");
+    TORCH_CHECK(covered <= m, "Shared prefill segments overflow the token count");
+    TORCH_CHECK(m - covered <= 4096, "Shared prefill padding tail is unbounded");
     return batches;
 }
 
@@ -174,8 +183,14 @@ void validate_prefill_kv(std::vector<at::Tensor> &t, int64_t m, int64_t slots,
     TORCH_CHECK(t[6].dim() == 1 && t[6].numel() == m, "Prefill KV output locations");
     (void)integer(t[6]);
     if (!write_cache) return;
+    // Only the live prefix is stored; the padding tail carries the -1 skip
+    // sentinel that set_kv_buffer_kunpeng never writes.
+    int64_t live = 0;
+    for (int64_t batch = 0; batch < batches; ++batch)
+        live += integer(t[4], batch);
+    TORCH_CHECK(live <= m, "Prefill KV live coverage exceeds the token count");
     std::unordered_set<int64_t> written;
-    for (int64_t row = 0; row < m; ++row) {
+    for (int64_t row = 0; row < live; ++row) {
         const auto slot = integer(t[6], row);
         TORCH_CHECK(slot >= 0 && slot < slots && written.insert(slot).second,
                     "Prefill KV writes require unique valid output locations");
@@ -204,14 +219,16 @@ void gdn(std::vector<at::Tensor> &t, int64_t grain) {
                     t[1].sizes() == t[0].sizes() && t[2].dim() == 4 && t[2].size(0) == 1 &&
                     t[2].size(1) == t[0].size(1) && t[8].sizes() == t[2].sizes(),
                 "GDN prefill graph token shapes");
-    const auto m = t[0].size(1), hk = t[0].size(2), dk = t[0].size(3);
+    const auto m = integer(t[6], t[6].numel() - 1);
+    TORCH_CHECK(m > 0 && m <= t[0].size(1), "GDN prefill live tokens exceed the row count");
+    const auto hk = t[0].size(2), dk = t[0].size(3);
     const auto hv = t[2].size(2), dv = t[2].size(3);
     const auto sequences = validate_cu(t[6], m);
     const auto required =
         (m <= 32 ? 2 * hk + 3 * dv
                  : 2 * m * hk + sequences * hv * ((dv + grain - 1) / grain) * 3 * grain);
-    TORCH_CHECK(hk == 1 && hv == 3 && dk == 128 && dv == 128 && t[3].numel() == m * hv &&
-                    t[4].numel() == m * hv &&
+    TORCH_CHECK(hk == 1 && hv == 3 && dk == 128 && dv == 128 &&
+                    t[3].numel() == t[0].size(1) * hv && t[4].numel() == t[3].numel() &&
                     t[5].sizes() == at::IntArrayRef({sequences, hv, dk, dv}) && t[7].dim() == 1 &&
                     t[7].numel() >= required,
                 "GDN prefill graph state/metadata/workspace shapes");
@@ -225,16 +242,23 @@ void gdn(std::vector<at::Tensor> &t, int64_t grain) {
             reinterpret_cast<uint16_t *>(t[8].data_ptr()), sequences, m, hk, hv, dk, dv,
             t[7].data_ptr<float>(), t[7].numel());
         TORCH_CHECK(rc == 0, "GDN serial prefill graph kernel error ", rc);
-        return;
+    } else {
+        const auto rc = qwen36_gdn_prefill_parallel_with_workspace(
+            reinterpret_cast<const uint16_t *>(t[0].data_ptr()),
+            reinterpret_cast<const uint16_t *>(t[1].data_ptr()),
+            reinterpret_cast<const uint16_t *>(t[2].data_ptr()), t[3].data_ptr<float>(),
+            t[4].data_ptr<float>(), t[5].data_ptr<float>(), t[6].data_ptr<int32_t>(),
+            reinterpret_cast<uint16_t *>(t[8].data_ptr()), sequences, m, hk, hv, dk, dv, grain,
+            t[7].data_ptr<float>(), t[7].numel());
+        TORCH_CHECK(rc == 0, "GDN prefill graph kernel error ", rc);
     }
-    const auto rc = qwen36_gdn_prefill_parallel_with_workspace(
-        reinterpret_cast<const uint16_t *>(t[0].data_ptr()),
-        reinterpret_cast<const uint16_t *>(t[1].data_ptr()),
-        reinterpret_cast<const uint16_t *>(t[2].data_ptr()), t[3].data_ptr<float>(),
-        t[4].data_ptr<float>(), t[5].data_ptr<float>(), t[6].data_ptr<int32_t>(),
-        reinterpret_cast<uint16_t *>(t[8].data_ptr()), sequences, m, hk, hv, dk, dv, grain,
-        t[7].data_ptr<float>(), t[7].numel());
-    TORCH_CHECK(rc == 0, "GDN prefill graph kernel error ", rc);
+    // Padding tail: the kernels only produce the live rows; zero the rest so
+    // uninitialized pool bytes (possibly NaN/Inf) never reach the residual
+    // stream and the finiteness-checked rmsnorm/quant kernels downstream.
+    // The boundary is recomputed from qsl on every execution, like the
+    // shared() tail.
+    if (m < t[8].size(1))
+        t[8].narrow(1, m, t[8].size(1) - m).zero_();
 }
 void shared(std::vector<at::Tensor> &t, double scale, bool metadata_validated = false) {
     TORCH_CHECK(t.size() == 15, "Shared prefill graph ABI");
@@ -274,6 +298,7 @@ void shared(std::vector<at::Tensor> &t, double scale, bool metadata_validated = 
     const auto batches = metadata_validated ? t[4].numel() :
         attention_segments(t[3], t[4], t[5], t[6], t[7], t[8], m, t[1].size(0), capacity);
     isolated(t, {9, 10, 11, 12, 13, 14});
+    int64_t covered = 0;
     for (int64_t batch = 0; batch < batches; ++batch) {
         const auto req = integer(t[4], batch), length = integer(t[5], batch);
         const auto count = integer(t[7], batch), start = integer(t[8], batch);
@@ -283,14 +308,22 @@ void shared(std::vector<at::Tensor> &t, double scale, bool metadata_validated = 
         qwen_prefill_flash_shared_gather(t[10], t[1], t[2],
             t[3].select(0, req).narrow(0, 0, length), t[13], t[11], t[12], t[14], count, scale);
         std::memcpy(t[9].select(0, start).data_ptr(), t[13].data_ptr(), count * heads * dim * 2);
+        covered += count;
     }
+    // Only the live prefix [0, covered) was produced by the segments; zero
+    // the padding tail so stale graph-pool bytes never leak downstream. The
+    // boundary is recomputed from the live metadata on every execution, so a
+    // captured graph replays correctly for any live count in its bucket (a
+    // Python-side slice here would freeze the capture batch's boundary).
+    if (covered < m)
+        t[9].narrow(0, covered, m - covered).zero_();
 }
 } // namespace
 
 extern "C" void qwen_graph_validate_extend_metadata_dispatch(std::vector<at::Tensor> &t,
                                                              const std::vector<ScalarArg> &s) {
-    TORCH_CHECK(t.size() == 2 && s.size() == 2, "GDN extend validation graph ABI");
-    validate_extend_metadata(t[0], t[1], std::get<int64_t>(s[0]), std::get<int64_t>(s[1]));
+    TORCH_CHECK(t.size() == 2 && s.size() == 1, "GDN extend validation graph ABI");
+    validate_extend_metadata(t[0], t[1], std::get<int64_t>(s[0]));
 }
 extern "C" void qwen_graph_gdn_prefill_dispatch(std::vector<at::Tensor> &t,
                                                 const std::vector<ScalarArg> &s) {
@@ -304,10 +337,19 @@ extern "C" void qwen_graph_prefill_shared_dispatch(std::vector<at::Tensor> &t,
     shared(t, std::get<double>(s[0]), s.size() == 2 && std::get<bool>(s[1]));
 }
 extern "C" void qwen_graph_conv_prefill_dispatch(std::vector<at::Tensor> &t,
-                                                const std::vector<ScalarArg> &s) {
-    TORCH_CHECK(s.empty() || (s.size() == 1 && std::holds_alternative<bool>(s[0])),
-                "Segmented conv prefill scalar ABI");
-    conv(t, !s.empty() && std::get<bool>(s[0]));
+                                                 const std::vector<ScalarArg> &s) {
+    // The legacy metadata_validated flag is intentionally NOT accepted: a
+    // recorded bool here proves the running Python predates the power-of-2
+    // padding fix, and silently ignoring it would re-enable the pre-fix
+    // bugs (KV slot pollution, conv_c1 state tail, baked live boundary).
+    TORCH_CHECK(s.empty(),
+                "Segmented conv prefill scalar ABI: the captured op still "
+                "records the legacy metadata_validated flag, so the running "
+                "Python side predates the power-of-2 padding fix. Redeploy "
+                "the sglang Python package (NUMA images) and relaunch; "
+                "running the old Python with the new kernel would silently "
+                "produce corrupted outputs.");
+    conv(t);
 }
 extern "C" void qwen_graph_validate_prefill_kv_dispatch(std::vector<at::Tensor> &t,
                                                       const std::vector<ScalarArg> &s) {
@@ -351,8 +393,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
     m.def("qwen_registered_validate_prefill_kv(Tensor table, Tensor req, Tensor seq, Tensor prefix, "
           "Tensor count, Tensor start, Tensor locations, int tokens, int slots, int capacity, "
           "bool write_cache) -> ()", &eager_validate_kv);
-    m.def("qwen_registered_validate_extend_metadata(Tensor qsl, Tensor indices, int tokens, int "
-          "slots) -> ()",
+    m.def("qwen_registered_validate_extend_metadata(Tensor qsl, Tensor indices, int slots) -> ()",
           &validate_extend_metadata);
     m.def("qwen_registered_gdn_prefill(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
           "Tensor(a!) state, Tensor qsl, Tensor(b!) workspace, int grain) -> Tensor",
