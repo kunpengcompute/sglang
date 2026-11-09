@@ -117,13 +117,10 @@ for j in "${!endpoints[@]}"; do
 done
 echo "[$(date +%T)] ===== Prefill and decode servers ready ====="
 
+# "<base>/latest/router" -> this run's router dir
 mkdir -p "$LOG_DIR"
-# Refresh "latest" symlink to this run's time dir (e.g. latest -> 214700)
-ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/router/latest"
-
-# Refresh unified "$LOG_BASE_DIR/latest/router" -> this run's time dir
 mkdir -p "$LOG_BASE_DIR/latest"
-ln -sfn "$LOG_BASE_DIR/$LOG_DATE/router/$LOG_TIME" "$LOG_BASE_DIR/latest/router"
+ln -sfn "$LOG_DIR" "$LOG_BASE_DIR/latest/router"
 
 
 echo "[$(date +%T)] Launching gateway on $ROUTER_IP"
