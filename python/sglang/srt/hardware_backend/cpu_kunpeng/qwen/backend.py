@@ -10,7 +10,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
 from . import ops as primitives
-from .capabilities import get_capabilities
+from .capabilities import NATIVE_DECODE_MAX_TOKENS, get_capabilities
 
 def contiguous(x):
     return x if x.is_contiguous() else ops.contiguous_kunpeng(x)
@@ -319,6 +319,43 @@ def _note_draft_extend_clip(tokens, loc, counts):
     )
 
 
+# The row-wise cache-attention kernel admits at most this many rows per call
+# (`qwen_graph_limits::decode_tokens`, mirrored by the Python shape adapter).
+GQA_ROW_BLOCK = NATIVE_DECODE_MAX_TOKENS
+
+
+def rowwise_gqa(query, kb, vb, table, requests, lengths, scale):
+    """Row-wise cache attention for an arbitrary number of rows.
+
+    Every row is an independent (query row, request, length) triple, so the
+    batch can be cut into <= `GQA_ROW_BLOCK` row groups without changing any
+    row's arithmetic. Decode/verify/draft-extend rows grow with the decode
+    batch and the accepted token count, so chunking keeps the captured graph
+    free of a row-count limit above the kernel's single-call capacity.
+    """
+    rows = query.shape[0]
+    if not is_capturing() or rows <= GQA_ROW_BLOCK:
+        op = ops.qwen_gqa_rows if is_capturing() and rows >= 8 else ops.qwen_gqa_decode
+        output, _ = op(query, kb, vb, table, requests, lengths, scale)
+        return output
+    output = ops.alloc_buffer(
+        rows * query.shape[1] * query.shape[2], dtype=query.dtype
+    ).view(query.shape)
+    for begin in range(0, rows, GQA_ROW_BLOCK):
+        stop = min(begin + GQA_ROW_BLOCK, rows)
+        piece, _ = ops.qwen_gqa_rows(
+            query[begin:stop],
+            kb,
+            vb,
+            table,
+            requests[begin:stop],
+            lengths[begin:stop],
+            scale,
+        )
+        ops.copy_kunpeng(output[begin:stop], piece)
+    return output
+
+
 class QwenAttention:
     def __init__(self):
         initialize()
@@ -350,12 +387,7 @@ class QwenAttention:
             draft_extend_ragged(fb) if ragged is None else ragged
         )
         query = q.reshape(-1, layer.tp_q_head_num, 256).contiguous()
-        op = (
-            ops.qwen_gqa_rows
-            if is_capturing() and query.shape[0] >= 8
-            else ops.qwen_gqa_decode
-        )
-        output, _ = op(
+        output = rowwise_gqa(
             query,
             kb,
             vb,
@@ -389,12 +421,7 @@ class QwenAttention:
             ).reshape(-1)
             requests = fb.req_pool_indices.repeat_interleave(steps)
         query = contiguous(q.reshape(-1, layer.tp_q_head_num, 256))
-        op = (
-            ops.qwen_gqa_rows
-            if is_capturing() and query.shape[0] >= 8
-            else ops.qwen_gqa_decode
-        )
-        output, _ = op(
+        output = rowwise_gqa(
             query,
             kb,
             vb,
@@ -418,12 +445,7 @@ class QwenAttention:
                 vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256))
             )
         query = contiguous(q.reshape(-1, layer.tp_q_head_num, 256))
-        op = (
-            ops.qwen_gqa_rows
-            if is_capturing() and query.shape[0] >= 8
-            else ops.qwen_gqa_decode
-        )
-        output, _ = op(
+        output = rowwise_gqa(
             query,
             kb,
             vb,

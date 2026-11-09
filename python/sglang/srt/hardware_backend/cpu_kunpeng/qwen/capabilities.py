@@ -9,7 +9,10 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 
-NATIVE_DECODE_MAX_TOKENS = 128
+# Compiled wrapper capacity (`qwen_graph_limits::decode_tokens`). The native
+# row kernels admit this many rows per call; the env-selectable defaults below
+# stay lower until a shape has been validated at the larger size.
+NATIVE_DECODE_MAX_TOKENS = 256
 NATIVE_PREFILL_MAX_TOKENS = 4096
 _ENV_NAMES = (
     "SGLANG_KUNPENG_QWEN_DECODE_MAX_REQUESTS",
@@ -49,16 +52,12 @@ class QwenExecutionCapabilities:
     def signature(self):
         return (self.decode_max_requests, self.decode_max_tokens, self.prefill_max_tokens)
 
-    def decode_unsupported_reason(self, batch, tokens, *, target_verify=False):
-        # Preserve the previous speculative admission range. Enlarging normal
-        # decode does not qualify or enable MTP/verify as a side effect.
-        requests = min(self.decode_max_requests, 32) if target_verify else self.decode_max_requests
-        rows = min(self.decode_max_tokens, 32) if target_verify else self.decode_max_tokens
-        if not 1 <= batch <= requests:
-            return f"batch_outside_1_{requests}"
-        if not 1 <= tokens <= rows:
-            return f"tokens_outside_1_{rows}"
-        if not target_verify and tokens != batch:
+    def decode_unsupported_reason(self, batch, tokens):
+        if not 1 <= batch <= self.decode_max_requests:
+            return f"batch_outside_1_{self.decode_max_requests}"
+        if not 1 <= tokens <= self.decode_max_tokens:
+            return f"tokens_outside_1_{self.decode_max_tokens}"
+        if tokens != batch:
             return "decode_token_batch_mismatch"
         return None
 
