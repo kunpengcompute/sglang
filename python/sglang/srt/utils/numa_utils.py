@@ -116,6 +116,12 @@ else:
     libnuma.numa_bitmask_isbitset.argtypes = [POINTER(bitmask_t), c_uint]
     libnuma.numa_bitmask_isbitset.restype = c_int
 
+    libnuma.numa_allocate_nodemask.argtypes = []
+    libnuma.numa_allocate_nodemask.restype = POINTER(bitmask_t)
+
+    libnuma.numa_set_membind.argtypes = [POINTER(bitmask_t)]
+    libnuma.numa_set_membind.restype = c_int
+
 
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
@@ -245,6 +251,72 @@ def set_local_memory_policy() -> bool:
         return True
     except Exception:
         return False
+
+
+def get_current_numa_node() -> Optional[int]:
+    """NUMA node this process is confined to, or ``None`` when unknown.
+
+    ``None`` means either libnuma is unavailable or the CPU affinity spans more
+    than one node. Callers that need a definite node must treat it as an error
+    rather than guessing one.
+    """
+    if libnuma is None or libnuma.numa_available() < 0:
+        return None
+    try:
+        nodes = _current_affinity_numa_nodes()
+    except Exception:
+        logger.debug("cannot map the CPU affinity to NUMA nodes", exc_info=True)
+        return None
+    if len(nodes) == 1:
+        return next(iter(nodes))
+    return None
+
+
+def set_membind_memory_policy(node: int) -> bool:
+    """Strictly bind this thread's future page allocations to ``node``.
+
+    ``MPOL_BIND``: pages are taken from ``node`` only (no fallback to other
+    nodes). Returns True when the policy was applied.
+    """
+    if not _can_set_mempolicy():
+        return False
+    mask = None
+    try:
+        mask = libnuma.numa_allocate_nodemask()
+        if not mask:
+            return False
+        # ``numa_bitmask_setbit`` is a header inline rather than an exported
+        # symbol, so set the bit through the struct fields.
+        word, bit = divmod(int(node), 64)
+        if word >= mask.contents.size:
+            return False
+        mask.contents.maskp[word] = mask.contents.maskp[word] | (1 << bit)
+        return libnuma.numa_set_membind(mask) == 0
+    except Exception:
+        logger.warning("numa_set_membind(node=%s) failed", node, exc_info=True)
+        return False
+    finally:
+        if mask is not None:
+            try:
+                libnuma.numa_bitmask_free(mask)
+            except Exception:
+                pass
+
+
+def get_node_free_bytes(node: int) -> Optional[int]:
+    """Free memory of one NUMA node in bytes, or ``None`` when unreadable."""
+    path = f"/sys/devices/system/node/node{int(node)}/meminfo"
+    try:
+        with open(path, "r") as handle:
+            for line in handle:
+                # e.g. "Node 0 MemFree:       123456789 kB"
+                if "MemFree:" not in line:
+                    continue
+                value = line.split("MemFree:")[1].split()[0]
+                return int(value) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 def _is_numa_available() -> bool:

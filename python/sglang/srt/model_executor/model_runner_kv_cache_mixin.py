@@ -480,6 +480,22 @@ class ModelRunnerKVCacheMixin:
                         self.start_layer + self.num_effective_layers,
                     )
                 ]
+
+                # --- shared KV pool (920F GLM-5) ---------------------------
+                # One switch, off by default. When it is ON the pool is built
+                # DIRECTLY on the group's POSIX shm segment: the group leader
+                # creates it on its own NUMA node, the other ranks attach, and
+                # NO rank allocates a private KV / index-K buffer. Any failure
+                # raises SharedKvPoolError and aborts startup -- there is
+                # deliberately NO fallback to per-rank pools.
+                # With the switch off this block is a no-op.
+                if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0:
+                    from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
+                        shared_kv_request,
+                    )
+
+                    kunpeng_kwargs["shared_kv_request"] = shared_kv_request(self)
+
                 self.token_to_kv_pool = KunpengNSATokenToKVPool(**kunpeng_kwargs)
             else:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
