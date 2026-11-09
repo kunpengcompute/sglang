@@ -51,6 +51,12 @@ PP_KIND_TENSOR = 1
 PP_KIND_ACK = 2
 PP_KIND_BUNDLE = 3  # must match PP_KIND_BUNDLE in pp_comm.cpp
 PP_MSG_SLOTS = 10  # must match PP_MSG_SLOTS in pp_comm.cpp
+# Mirrors PP_MSG_SLOT_SIZE / PP_MSG_HEADER in comm/pp_comm.cpp.  Each frame is
+# [magic][kind][len][payload], so the largest pickled pyobj that fits in one
+# slot is PP_MSG_SLOT_SIZE - PP_MSG_HEADER bytes (1048564).
+PP_MSG_SLOT_SIZE = 1 * 1024 * 1024
+PP_MSG_HEADER = 12
+PP_MSG_MAX_PAYLOAD = PP_MSG_SLOT_SIZE - PP_MSG_HEADER
 # Proxy (non-output) frames use a slot ring inside the single 64MB proxy region
 # (PP_PROXY_REGION_SIZE in pp_comm.cpp): the slot advances on every send, so a
 # sender never overwrites the segment a peer may still be reading from.
@@ -74,6 +80,23 @@ def _msg_type_from_metadata(metadata_list):
         if key == "__msg_type__":
             return value
     return "default"
+
+
+def _check_msg_size(size: int, where: str) -> None:
+    """Reject an oversized control frame with an actionable Python error.
+
+    Without this the C++ kernel throws a bare
+    "PP send msg payload exceeds one message slot" with no clue about which
+    object overflowed.  Oversized pyobjs must be fragmented by the caller
+    (see _pp_send_input_reqs_to_next_stage in scheduler_pp_mixin.py).
+    """
+    if size > PP_MSG_MAX_PAYLOAD:
+        raise RuntimeError(
+            f"PP {where}: payload is {size} bytes, exceeds the "
+            f"{PP_MSG_MAX_PAYLOAD}-byte message slot "
+            f"(PP_MSG_SLOT_SIZE - PP_MSG_HEADER). Fragment oversized control "
+            f"objects before sending."
+        )
 
 _INTRA_SOCKET: Optional[dist.ProcessGroup] = None
 _INTRA_DIE: Optional[dist.ProcessGroup] = None
@@ -510,9 +533,11 @@ class KunpengPPCommunicator:
             f"PP send_pyobjs_bundle: {kernel.pp_inflight_kunpeng(dst_rank)} inflight "
             f"msgs to rank {dst_rank} exceed {PP_MSG_SLOTS} ring slots"
         )
+        raw = [pickle.dumps(p) for p in payloads]
+        # C++ bundle framing is [len][payload] per sub-frame.
+        _check_msg_size(sum(4 + len(b) for b in raw), "send_pyobjs_bundle")
         payload_tensors = [
-            torch.frombuffer(bytearray(pickle.dumps(p)), dtype=torch.uint8)
-            for p in payloads
+            torch.frombuffer(bytearray(b), dtype=torch.uint8) for b in raw
         ]
         kernel.pp_send_pyobjs_bundle_kunpeng(dst_rank, payload_tensors, sub_kind)
 
@@ -522,6 +547,7 @@ class KunpengPPCommunicator:
         """Asynchronously send a python object to dst_rank (PP local rank)."""
         self.pp_comm_init()
         data = pickle.dumps(payload)
+        _check_msg_size(len(data), "send_pyobj")
         assert kernel.pp_inflight_kunpeng(dst_rank) < PP_MSG_SLOTS, (
             f"PP send_pyobj: {kernel.pp_inflight_kunpeng(dst_rank)} inflight msgs "
             f"to rank {dst_rank} exceed {PP_MSG_SLOTS} ring slots; acks not consumed "
@@ -541,6 +567,7 @@ class KunpengPPCommunicator:
         payloads staged in the batch region (single fused pp_put)."""
         self.pp_comm_init()
         meta = pickle.dumps(metadata_list)
+        _check_msg_size(len(meta), "send_tensor_message")
         assert kernel.pp_inflight_kunpeng(dst_rank) < PP_MSG_SLOTS, (
             f"PP send_tensor_message: {kernel.pp_inflight_kunpeng(dst_rank)} inflight "
             f"msgs to rank {dst_rank} exceed {PP_MSG_SLOTS} ring slots; acks not "
