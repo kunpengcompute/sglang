@@ -27,9 +27,10 @@ What happens with the switch on:
 
 * The leader creates ONE POSIX shm segment holding the whole KV pool (main
   ``kv_buffer`` + DSA ``index_k_buffer``), INTERLEAVES every page over the
-  group's NUMA nodes (``MPOL_INTERLEAVE``), pre-faults all pages and verifies
-  the split via ``/proc/self/numa_maps`` before publishing the header's
-  ``ready`` flag.
+  group's NUMA nodes (``MPOL_INTERLEAVE``), pre-faults all pages and checks via
+  ``/proc/self/numa_maps`` that no page escaped the group -- balance is not
+  enforced, a node that runs short simply spills to its neighbours -- before
+  publishing the header's ``ready`` flag.
   Rank and NUMA node are 1:1 on 920F and the leader is the lowest rank of the
   group, so the group owns ``leader_node .. leader_node + group_size - 1``:
   rank0 / group=4 -> nodes 0-3, group=16 -> nodes 0-15. Each rank re-checks
@@ -172,10 +173,6 @@ if _HEADER_USED_BYTES > _HEADER_SIZE:
 #: How long a follower waits for the leader to publish ``ready``.
 _ATTACH_TIMEOUT_S: float = 300.0
 _ATTACH_POLL_S: float = 0.5
-
-#: Pages on the leader's node must be at least this share of the segment;
-#: anything lower means the memory policy did not take effect.
-_PLACEMENT_MIN_RATIO: float = 0.99
 
 #: Only "not published yet" is retryable; everything else is a hard mismatch.
 _RETRYABLE_ERROR_PREFIXES = ("not_ready",)
@@ -396,6 +393,15 @@ class KvShareLayout:
         )
         self.kv_buffer_bytes = self.layer_num * self.kv_layer_stride
         self.index_k_bytes = self.num_full_layers * self.index_layer_stride
+
+        #: Bytes added per token slot (one page slot is used as scratch/padding,
+        #: hence ``max_total_num_tokens == num_slots - page_size``). Used to turn
+        #: a free-memory figure back into a ``--max-total-tokens`` hint.
+        self.per_slot_bytes = (
+            self.layer_num * self.kv_cache_dim * self.store_dtype.itemsize
+            + self.num_full_layers * self.index_head_dim * self.index_k_dtype.itemsize
+        )
+        self.max_total_tokens = self.num_slots - self.page_size
 
         self.kv_offset = _HEADER_SIZE
         self.index_k_offset = _align_up(self.kv_offset + self.kv_buffer_bytes)
@@ -640,23 +646,14 @@ def open_shared_kv_storage(
         _CREATED_SEGMENTS.append(shm)
         _LIVE_SEGMENTS.append(shm)
         try:
-            _place_on_group_nodes(shm, layout, nodes)
+            pages = _place_on_group_nodes(shm, layout, nodes)
             _publish_header(shm, layout, request.numa_node)
         except BaseException:
             _release_segment(shm, created=True)
             raise
         numa_node = request.numa_node
-        logger.info(
-            "[kv-share] leader created %s (%s pool): %.2f GiB, %d layers "
-            "(%d full), %d slots, interleaved over NUMA nodes %s "
-            "(prefaulted, verified)",
-            layout.name,
-            role,
-            layout.total_bytes / 2**30,
-            layout.layer_num,
-            layout.num_full_layers,
-            layout.num_slots,
-            nodes,
+        _log_rank(
+            model_runner, request, layout, role, True, numa_node, nodes, pages
         )
     else:
         shm = _attach_segment(layout)
@@ -664,15 +661,20 @@ def open_shared_kv_storage(
         numa_node = _read_header(shm)["numa_node"]
         nodes = resolve_group_nodes(numa_node, request.group_size)
         # rank <-> node is 1:1: this rank must own nodes[intra].
-        _assert_own_node(nodes[request.intra_group_rank], request.intra_group_rank)
-        logger.info(
-            "[kv-share] follower tp_rank=%s attached %s (%s pool, %.2f GiB, "
-            "nodes %s)",
-            getattr(model_runner, "tp_rank", "?"),
-            layout.name,
+        own_node = _assert_own_node(
+            nodes[request.intra_group_rank], request.intra_group_rank
+        )
+        _log_rank(
+            model_runner,
+            request,
+            layout,
             role,
-            layout.total_bytes / 2**30,
+            False,
+            numa_node if own_node is None else own_node,
             nodes,
+            # A follower has not faulted the pages itself, so this is usually
+            # empty; it is still worth a try for the ranks that did touch some.
+            _numa_maps_pages(shm.name) or None,
         )
 
     try:
@@ -814,6 +816,58 @@ def _is_920f_host() -> bool:
         return False
 
 
+#: Fraction of the group's free memory the shared pool may occupy. The rest is
+#: left for activations, page cache and fragmentation.
+_POOL_BUDGET_SAFETY = 0.95
+
+
+def group_pool_budget_bytes(model_runner: Any) -> Optional[int]:
+    """Bytes this group's shared pool may use, or ``None`` when sharing is off.
+
+    Called from ``_profile_available_bytes`` to REPLACE the per-rank profiled
+    value: one segment serves the whole group, so the ceiling is the free
+    memory of the group's own NUMA nodes, not what a single rank could take.
+    Without this, ``--max-total-tokens`` is silently clamped to the per-rank
+    figure and the sharing gain never materializes.
+
+    Every failure raises: a silently smaller pool would look like a config
+    problem instead of the bug it is.
+    """
+    group_size = get_kv_share_group()
+    if group_size == KV_SHARE_GROUP_DISABLED:
+        return None
+    if group_size not in KV_SHARE_GROUP_CHOICES:
+        raise SharedKvPoolError(
+            f"SGLANG_KUNPENG_KV_SHARE_GROUP={group_size} is not supported; "
+            f"valid values are 0 and {list(KV_SHARE_GROUP_CHOICES)}"
+        )
+    if not _is_920f_host():
+        return None
+
+    tp_rank = int(getattr(model_runner, "tp_rank", 0))
+    intra_group_rank = tp_rank - (tp_rank // group_size) * group_size
+    # ``resolve_leader_numa_node`` is really "the NUMA node of THIS process";
+    # rank <-> node is 1:1, so the leader of the group sits ``intra`` nodes
+    # below us.
+    own_node = resolve_leader_numa_node()
+    leader_node = own_node - intra_group_rank
+    if leader_node < 0:
+        raise SharedKvPoolError(
+            f"tp_rank={tp_rank} resolves its NUMA node to {own_node}, but a "
+            f"group of {group_size} ranks would start at node {leader_node}; "
+            "rank and NUMA node must be 1:1"
+        )
+    nodes = resolve_group_nodes(leader_node, group_size)
+    values = [_node_available_bytes(node) for node in nodes]
+    missing = [node for node, value in zip(nodes, values) if value is None]
+    if missing:
+        raise SharedKvPoolError(
+            f"cannot read the memory of NUMA nodes {missing}; refusing to "
+            "guess the shared KV pool budget"
+        )
+    return int(sum(values) * _POOL_BUDGET_SAFETY)
+
+
 def _instance_key() -> str:
     """Identifier of THIS run; isolates co-located instances on one host."""
     raw = "_".join(
@@ -864,36 +918,49 @@ def resolve_leader_numa_node() -> int:
 
 
 def _check_capacity(layout: KvShareLayout, nodes: List[int]) -> None:
-    """Fail before touching memory: the group's nodes and /dev/shm must fit."""
+    """Fail before touching memory: the group's nodes and /dev/shm must fit.
+
+    The check runs against AVAILABLE memory (free + reclaimable page cache):
+    the model weights are page-cache resident, so judging on ``MemFree`` alone
+    would reject pools that the kernel can actually satisfy by dropping clean
+    file pages. tmpfs pages are excluded from "available" -- they are ours and
+    cannot be reclaimed.
+    """
     logger.info(
-        "[kv-share] NUMA free memory: %s | group total=%s | host available=%s "
-        "| segment needs=%s",
-        _numa_free_summary(nodes),
-        _gib(_sum_free(nodes)),
+        "[kv-share] NUMA memory free+reclaimable: %s | group available=%s | "
+        "host available=%s | segment needs=%s for %d tokens (%s/token)",
+        _numa_memory_summary(nodes),
+        _gib(_sum_available(nodes)),
         _gib(_host_available_bytes()),
         _gib(layout.total_bytes),
+        layout.max_total_tokens,
+        _kib(layout.per_slot_bytes),
     )
-    frees = [(node, _node_free_bytes(node)) for node in nodes]
-    if all(free is not None for _, free in frees):
-        total_free = sum(free for _, free in frees)
-        if layout.total_bytes > total_free:
+    avails = [(node, _node_available_bytes(node)) for node in nodes]
+    if all(value is not None for _, value in avails):
+        total_available = sum(value for _, value in avails)
+        if layout.total_bytes > total_available:
             detail = ", ".join(
-                f"node{node}={_gib(free)}" for node, free in frees
+                f"node{node}={_gib(value)}" for node, value in avails
             )
             raise SharedKvPoolError(
-                f"the shared KV segment needs {layout.total_bytes / 2**30:.1f} "
-                f"GiB but the group's NUMA nodes have only "
-                f"{total_free / 2**30:.1f} GiB free ({detail}). Lower "
-                f"--mem-fraction-static / --max-total-tokens, or disable "
-                f"SGLANG_KUNPENG_KV_SHARE_GROUP"
+                f"the shared KV segment needs {_gib(layout.total_bytes)} for "
+                f"--max-total-tokens={layout.max_total_tokens} "
+                f"({_kib(layout.per_slot_bytes)}/token), but NUMA nodes "
+                f"{_node_span(nodes)} of this group have only "
+                f"{_gib(total_available)} free+reclaimable ({detail})."
+                f"{_suggest_max_tokens(layout, total_available)}"
+                " Restart with SGLANG_KUNPENG_KV_SHARE_GROUP=0 to use "
+                "per-rank pools."
             )
     shm_free = _dev_shm_free_bytes()
     if shm_free is not None and layout.total_bytes > shm_free:
         raise SharedKvPoolError(
-            f"the shared KV segment needs {layout.total_bytes / 2**30:.1f} GiB "
-            f"but /dev/shm has only {shm_free / 2**30:.1f} GiB free; remount "
-            f"/dev/shm larger, remove leaked sgkv* segments, or disable "
-            f"SGLANG_KUNPENG_KV_SHARE_GROUP"
+            f"the shared KV segment needs {_gib(layout.total_bytes)} for "
+            f"--max-total-tokens={layout.max_total_tokens}, but /dev/shm has "
+            f"only {_gib(shm_free)} free."
+            f"{_suggest_max_tokens(layout, shm_free)}"
+            " Remove leaked sgkv* segments, or remount /dev/shm larger."
         )
 
 
@@ -910,19 +977,69 @@ def _gib(value: Optional[int]) -> str:
     return "?" if value is None else f"{value / 2**30:.1f}GiB"
 
 
-def _sum_free(nodes: List[int]) -> Optional[int]:
-    """Total free memory of ``nodes``; ``None`` if any node is unreadable."""
-    frees = [_node_free_bytes(node) for node in nodes]
-    if any(free is None for free in frees):
-        return None
-    return sum(frees)
+def _kib(value: int) -> str:
+    return f"{value / 1024:.1f}KiB"
 
 
-def _numa_free_summary(nodes: List[int]) -> str:
-    """``node0=4.8GiB, node1=4.9GiB, ...`` -- free memory of each node."""
-    return ", ".join(
-        f"node{node}={_gib(_node_free_bytes(node))}" for node in nodes
+def _node_span(nodes: List[int]) -> str:
+    """``0-3`` for a contiguous range, else ``0,2,5``."""
+    if len(nodes) > 1 and nodes == list(range(nodes[0], nodes[0] + len(nodes))):
+        return f"{nodes[0]}-{nodes[-1]}"
+    return ",".join(str(node) for node in nodes)
+
+
+def _suggest_max_tokens(
+    layout: "KvShareLayout", free_bytes: Optional[int]
+) -> str:
+    """Turn a free-memory figure into an actionable ``--max-total-tokens`` hint.
+
+    The user picks ``--max-total-tokens`` by hand, so a bare GiB number means
+    they have to divide by the per-token cost themselves. Round down to a
+    multiple of ``page_size`` because the pool asserts page alignment.
+    """
+    if not free_bytes or layout.per_slot_bytes <= 0:
+        return ""
+    slots = int(free_bytes) // layout.per_slot_bytes
+    if slots <= layout.page_size:
+        return " Not even a single token fits there."
+    tokens = (slots - layout.page_size) // layout.page_size * layout.page_size
+    return (
+        f" At most {tokens} tokens fit there; set --max-total-tokens to "
+        f"<= {tokens} (page_size={layout.page_size})."
     )
+
+
+def _node_available_bytes(node: int) -> Optional[int]:
+    try:
+        from sglang.srt.utils.numa_utils import get_node_available_bytes
+
+        return get_node_available_bytes(node)
+    except Exception:
+        return None
+
+
+def _sum_available(nodes: List[int]) -> Optional[int]:
+    """Free + reclaimable memory of ``nodes``; ``None`` if unreadable."""
+    values = [_node_available_bytes(node) for node in nodes]
+    if any(value is None for value in values):
+        return None
+    return sum(values)
+
+
+def _numa_memory_summary(nodes: List[int]) -> str:
+    """``node0=10.4+5.2GiB`` -- free plus reclaimable page cache per node."""
+    parts = []
+    for node in nodes:
+        free = _node_free_bytes(node)
+        available = _node_available_bytes(node)
+        if free is None or available is None:
+            parts.append(f"node{node}=?")
+        else:
+            parts.append(
+                f"node{node}={free / 2**30:.1f}+"
+                f"{max(0, available - free) / 2**30:.1f}GiB"
+            )
+    return ", ".join(parts)
 
 
 def _host_available_bytes() -> Optional[int]:
@@ -968,8 +1085,11 @@ def _max_node() -> Optional[int]:
         return None
 
 
-def _assert_own_node(expected: int, intra_group_rank: int) -> None:
-    """This rank must run on ``expected`` (rank <-> node is 1:1)."""
+def _assert_own_node(expected: int, intra_group_rank: int) -> Optional[int]:
+    """This rank must run on ``expected`` (rank <-> node is 1:1).
+
+    Returns the node read from the CPU affinity, so callers can log it.
+    """
     try:
         from sglang.srt.utils.numa_utils import get_current_numa_node
 
@@ -983,13 +1103,49 @@ def _assert_own_node(expected: int, intra_group_rank: int) -> None:
             intra_group_rank,
             expected,
         )
-        return
+        return None
     if own != expected:
         raise SharedKvPoolError(
             f"rank intra={intra_group_rank} runs on NUMA node {own} but the "
             f"group expects node {expected}; rank and NUMA node must be 1:1 "
             "with the leader owning the lowest node"
         )
+    return own
+
+
+def _log_rank(
+    model_runner: Any,
+    request: "SharedKvRequest",
+    layout: KvShareLayout,
+    role: str,
+    is_leader: bool,
+    numa_node: int,
+    nodes: List[int],
+    pages: Optional[Dict[int, int]] = None,
+) -> None:
+    """One line per rank, so a 16-rank launch can be read rank by rank."""
+    logger.info(
+        "[kv-share] rank=%s intra=%d node=%d role=%s %s: %s %s (%.2f GiB, %d "
+        "layers/%d with index-K, %d tokens, group nodes %s%s)",
+        getattr(model_runner, "tp_rank", "?"),
+        request.intra_group_rank,
+        numa_node,
+        role,
+        "leader" if is_leader else "follower",
+        "created" if is_leader else "attached",
+        layout.name,
+        layout.total_bytes / 2**30,
+        layout.layer_num,
+        layout.num_full_layers,
+        layout.max_total_tokens,
+        nodes,
+        (
+            ", pages per node "
+            f"{ {n: c for n, c in sorted(pages.items())} }"
+            if pages is not None
+            else ""
+        ),
+    )
 
 
 def _place_on_group_nodes(
@@ -1024,13 +1180,12 @@ def _place_on_group_nodes(
     elapsed = time.monotonic() - started
     pages = _verify_placement(shm, layout, nodes)
     logger.info(
-        "[kv-share] prefaulted %.2f GiB in %.1fs over nodes %s; numa_maps per "
-        "node: %s",
+        "[kv-share] prefaulted %.2f GiB in %.1fs over nodes %s",
         layout.total_bytes / 2**30,
         elapsed,
         nodes,
-        {node: count * 4096 for node, count in sorted(pages.items())},
     )
+    return pages
 
 
 def _prefault_region(shm: shared_memory.SharedMemory, total_bytes: int) -> None:
@@ -1047,12 +1202,16 @@ def _prefault_region(shm: shared_memory.SharedMemory, total_bytes: int) -> None:
 def _verify_placement(
     shm: shared_memory.SharedMemory, layout: KvShareLayout, nodes: List[int]
 ) -> Dict[int, int]:
-    """Assert the pages landed on the group's nodes; raise otherwise.
+    """Every page of the segment must live on one of the group's nodes.
 
     ``/proc/self/numa_maps`` is the only reliable way to confirm that a memory
-    policy actually took effect for the pages of an mmap'ed tmpfs file. With
-    interleave the split must be close to even: every node of the group gets
-    ~1/group of the pages, and nothing lands elsewhere.
+    policy actually took effect for the pages of an mmap'ed tmpfs file.
+
+    Balance is deliberately NOT validated: when a node runs short the kernel
+    spills to its neighbours, so the split is naturally uneven. All that
+    matters is that no page escapes the group -- a page on someone else's node
+    is remote bandwidth for every rank of this group. The per-node split is
+    logged instead, so an operator can see what actually happened.
     """
     pages = _numa_maps_pages(shm.name)
     total = sum(pages.values())
@@ -1063,19 +1222,12 @@ def _verify_placement(
             "Refusing to start unverified"
         )
     outside = sum(count for node, count in pages.items() if node not in nodes)
-    expected = total / len(nodes)
-    starved = {
-        node: pages.get(node, 0)
-        for node in nodes
-        if pages.get(node, 0) < expected * _PLACEMENT_MIN_RATIO
-    }
-    if outside > total * (1 - _PLACEMENT_MIN_RATIO) or starved:
+    if outside:
         raise SharedKvPoolError(
-            f"the shared KV pages are not spread over nodes {nodes}: pages per "
-            f"node { {n: c for n, c in sorted(pages.items())} } (expected ~"
-            f"{expected:.0f} pages per node, outside={outside}, "
-            f"starved={starved}). The interleave policy did not take effect -- "
-            "refusing to start"
+            f"{outside} of {total} shared KV pages landed OUTSIDE the group's "
+            f"nodes {nodes}: pages per node "
+            f"{ {n: c for n, c in sorted(pages.items())} }. Every page must be "
+            "on one of the group's nodes -- refusing to start"
         )
     return pages
 
@@ -1103,7 +1255,8 @@ def _numa_maps_pages(shm_name: str) -> Dict[int, int]:
 def _dev_shm_free_bytes() -> Optional[int]:
     try:
         stat = os.statvfs("/dev/shm")
-    except OSError:
+    except (OSError, AttributeError):
+        # AttributeError: os.statvfs does not exist off POSIX (QA stubs).
         return None
     return stat.f_bavail * stat.f_frsize
 

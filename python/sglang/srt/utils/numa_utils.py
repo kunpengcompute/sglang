@@ -355,20 +355,49 @@ def set_membind_memory_policy(node: int) -> bool:
                 pass
 
 
-def get_node_free_bytes(node: int) -> Optional[int]:
-    """Free memory of one NUMA node in bytes, or ``None`` when unreadable."""
+def _read_node_meminfo(node: int) -> Optional[dict]:
+    """Parse the fields of ``/sys/devices/system/node/nodeN/meminfo`` (kB)."""
     path = f"/sys/devices/system/node/node{int(node)}/meminfo"
+    values = {}
     try:
         with open(path, "r") as handle:
             for line in handle:
                 # e.g. "Node 0 MemFree:       123456789 kB"
-                if "MemFree:" not in line:
+                field, _, rest = line.partition(":")
+                if not rest:
                     continue
-                value = line.split("MemFree:")[1].split()[0]
-                return int(value) * 1024
-    except (OSError, ValueError, IndexError):
+                name = field.split()[-1]
+                try:
+                    values[name] = int(rest.split()[0]) * 1024
+                except (ValueError, IndexError):
+                    continue
+    except OSError:
         return None
-    return None
+    return values or None
+
+
+def get_node_free_bytes(node: int) -> Optional[int]:
+    """Free memory of one NUMA node in bytes, or ``None`` when unreadable."""
+    values = _read_node_meminfo(node)
+    return None if values is None else values.get("MemFree")
+
+
+def get_node_available_bytes(node: int) -> Optional[int]:
+    """Memory a new allocation can still get on one NUMA node, in bytes.
+
+    ``MemFree`` alone under-reports badly while the page cache holds the model
+    weights: those pages are reclaimable and the kernel hands them back during
+    a large allocation. Mirror the host-level ``MemAvailable`` formula per
+    node, minus ``Shmem`` -- tmpfs pages (our own sgkv/psm segments) are NOT
+    reclaimable and must not be counted as available.
+    """
+    values = _read_node_meminfo(node)
+    if values is None or "MemFree" not in values:
+        return None
+    available = values["MemFree"]
+    available += max(0, values.get("FilePages", 0) - values.get("Shmem", 0))
+    available += values.get("SReclaimable", 0)
+    return available
 
 
 def _is_numa_available() -> bool:

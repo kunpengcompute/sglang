@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -96,7 +96,80 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
-        return int(rest_memory * (1 << 30))  # return in bytes
+        rest_bytes = int(rest_memory * (1 << 30))  # return in bytes
+        shared_bytes = self._shared_pool_available_bytes()
+        if shared_bytes is None:
+            return rest_bytes
+        self._log_profile(pre_model_load_memory, post_model_load_memory, rest_bytes)
+        logger.info(
+            "[kv-share] KV pool budget %.2f GiB from the group's NUMA nodes "
+            "(the per-rank profiled value was %.2f GiB); --max-total-tokens "
+            "still caps it",
+            shared_bytes / 2**30,
+            rest_bytes / 2**30,
+        )
+        return shared_bytes
+
+    def _log_profile(
+        self: ModelRunner,
+        pre_model_load_memory: float,
+        post_model_load_memory: float,
+        rest_bytes: int,
+    ) -> None:
+        """Print every term of the per-rank profile (shared mode only).
+
+        ``get_available_gpu_memory`` describes "device memory free after the
+        weights are loaded" and, on the CPU platform, that figure already
+        counts tmpfs pages (our own /dev/shm segments included) as used. With
+        no visibility into the arithmetic, a small ``rest`` looks like a bug,
+        so log the formula and each input.
+        """
+        formula = (
+            f"post({post_model_load_memory:.2f}) * mem_fraction_static"
+            f"({self.mem_fraction_static:.2f})"
+            if self.pp_size > 1
+            else f"post({post_model_load_memory:.2f}) - "
+            f"pre({pre_model_load_memory:.2f}) * "
+            f"(1 - {self.mem_fraction_static:.2f})"
+        )
+        logger.info(
+            "[kv-share] profile: %s = %.2f GiB%s; device free after load is "
+            "total-minus-used, so tmpfs (/dev/shm) segments already count as "
+            "used",
+            formula,
+            rest_bytes / 2**30,
+            " (mamba cache already subtracted)" if self.mambaish_config else "",
+        )
+
+    def _shared_pool_available_bytes(self: ModelRunner) -> Optional[int]:
+        """Budget for the group-shared KV pool, or ``None`` when disabled.
+
+        One segment serves the whole group, so the ceiling is the free memory
+        of the group's NUMA nodes -- not the per-rank figure profiled above,
+        which would otherwise clamp ``--max-total-tokens`` back to a single
+        rank's share and cancel the benefit of sharing.
+
+        All ranks must agree (the pools are built with identical geometry and
+        the header check compares them), so take a MIN over the same tp group
+        ``get_available_gpu_memory`` uses: every rank ends up with the tightest
+        group on the host instead of its own number.
+        """
+        from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
+            group_pool_budget_bytes,
+        )
+
+        budget = group_pool_budget_bytes(self)
+        if budget is None:
+            return None
+        if get_tp_group().world_size > 1:
+            tensor = torch.tensor(budget, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_tp_group().cpu_group,
+            )
+            budget = int(tensor.item())
+        return budget
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
@@ -832,12 +905,24 @@ class ModelRunnerKVCacheMixin:
 
         configurator = create_memory_pool_configurator(self)
         config = configurator.calculate_pool_sizes(available_bytes, page_size)
+        profiled_tokens = config.max_total_num_tokens
 
         # Apply external constraints (user cap, page alignment, PP sync)
         constrained = self._apply_token_constraints(config.max_total_num_tokens)
         if constrained != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 constrained, page_size
+            )
+        if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0:
+            cell_size = int(getattr(configurator, "_cell_size", 0))
+            logger.info(
+                "[kv-share] pool sizing: available=%.2f GiB // cell_size=%s "
+                "= %d tokens (page_size=%d); after user cap: %d tokens",
+                available_bytes / 2**30,
+                f"{cell_size / 1024:.1f}KiB/token" if cell_size else "?",
+                profiled_tokens,
+                page_size,
+                config.max_total_num_tokens,
             )
 
         config.max_running_requests = self._resolve_max_num_reqs(
