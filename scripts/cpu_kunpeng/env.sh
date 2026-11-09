@@ -120,7 +120,7 @@ fi
 source "${SCRIPT_DIR}/.time_env.sh"
 # Instance-qualified log subdir ("prefill", "prefill_128p", ...) so
 # same-role instances launched in one `launch.sh all` run never share a
-# log directory (ssh logs, rank logs and "latest" symlinks stay per-instance).
+# log directory (ssh logs and rank logs stay per-instance).
 # Exception: tokenizer — all its log files already carry the side/instance
 # in their names, so one shared "tokenizer/" dir is enough.
 if [[ "$ACTION" == "tokenizer" ]]; then
@@ -128,7 +128,12 @@ if [[ "$ACTION" == "tokenizer" ]]; then
 else
     export LOG_SUBDIR="$ACTION${INSTANCE:+_$INSTANCE}"
 fi
-export LOG_DIR="${LOG_BASE_DIR}/${LOG_DATE}/${LOG_SUBDIR}/${LOG_TIME}"
+# Layout: <base>/<date>/<time>/<role>[_<instance>]/ — the run timestamp sits
+# BEFORE the role dir, so one launch (one .time_env.sh, shared by every node
+# and every role of a `launch.sh all` run) groups all its roles under a single
+# time dir instead of scattering "prefill_glm/<time>" and "decode/<time>".
+export LOG_RUN_DIR="${LOG_BASE_DIR}/${LOG_DATE}/${LOG_TIME}"
+export LOG_DIR="${LOG_RUN_DIR}/${LOG_SUBDIR}"
 export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 
 if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]] || [[ "$ACTION" == "tokenizer" ]] || [[ "$ACTION" == "mooncake" ]] || [[ "$ACTION" == "store" ]] || [[ "$ACTION" == "build" ]]; then

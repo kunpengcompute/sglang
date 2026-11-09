@@ -14,6 +14,8 @@
 # ==============================================================================
 # tokenize.py - send prompts to the gateway's /v1/tokenize and report token
 # counts. Useful for checking how many tokens a prompt file actually holds.
+# The raw response embeds the whole token-id sequence; it is printed only for
+# short prompts (<= MAX_PRINT_TOKENS), longer ones get just the summary.
 #
 # Usage:
 #   python3 client/tokenize.py -f FILE[,FILE...]|DIR
@@ -42,6 +44,13 @@ import sys
 import time
 
 import requests
+
+
+# Above this many tokens, printing the raw response floods the terminal with
+# token ids, so only the summary line is shown.
+MAX_PRINT_TOKENS = 32
+# Error responses may carry the whole id list too; cap how much we echo back.
+MAX_ERROR_CHARS = 512
 
 
 def collect_prompts(spec: str) -> list:
@@ -122,13 +131,22 @@ def main() -> None:
         m = re.findall(r'"count":\s*(\d+)', resp.text)
         if not m:
             failed += 1
-            print(f"#{i}: FAILED ({resp.text})", file=sys.stderr)
+            # 解析失败的响应也可能内嵌整串 token id，截断后再回显
+            snippet = resp.text
+            if len(snippet) > MAX_ERROR_CHARS:
+                snippet = (f"{snippet[:MAX_ERROR_CHARS]}... "
+                           f"[+{len(snippet) - MAX_ERROR_CHARS} chars truncated]")
+            print(f"#{i}: FAILED ({snippet})", file=sys.stderr)
             continue
         count = int(m[-1])
         total_tokens += count
 
         if len(prompts) == 1:
-            print(resp.text)
+            if count <= MAX_PRINT_TOKENS:
+                print(resp.text)
+            else:
+                print(f"Token id list omitted ({count} > {MAX_PRINT_TOKENS} "
+                      f"tokens); showing summary only.")
             mml_m = re.findall(r'"max_model_len":\s*(\d+)', resp.text)
             mml = f" | Max model len: {mml_m[-1]}" if mml_m else ""
             print(f"\nTokens: {count}{mml} | Latency: {dur:.3f}s")

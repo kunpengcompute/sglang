@@ -47,16 +47,13 @@ source "$SCRIPT_DIR/env.sh" tokenizer "${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE
 # compute side binds, and the bootstrap server (port 9001) only listens
 # for inbound registrations.
 
+# "<base>/latest/<role>[_<instance>]" -> this run's role dir. All tokenizer
+# instances share the "tokenizer/" LOG_SUBDIR: their log files
+# (ssh_tokenizer_*, env_tokenizer_*, tokenizer_*_http.log) already carry the
+# side/instance in their names.
 mkdir -p "$LOG_DIR"
-# Refresh "latest" symlink to this run's time dir (e.g. latest -> 214700).
-# All tokenizer instances share the "tokenizer/" LOG_SUBDIR: their log
-# files (ssh_tokenizer_*, env_tokenizer_*, tokenizer_*_http.log) already
-# carry the side/instance in their names.
-ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/$LOG_SUBDIR/latest"
-
-# Refresh unified "$LOG_BASE_DIR/latest/$LOG_SUBDIR" -> this run's time dir
 mkdir -p "$LOG_BASE_DIR/latest"
-ln -sfn "$LOG_BASE_DIR/$LOG_DATE/$LOG_SUBDIR/$LOG_TIME" "$LOG_BASE_DIR/latest/$LOG_SUBDIR"
+ln -sfn "$LOG_DIR" "$LOG_BASE_DIR/latest/$LOG_SUBDIR"
 sh "$SCRIPT_DIR/stop.sh" tokenizer "${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}"
 
 echo "[$(date +%T)] Launching $TOK_SIDE${TOK_INSTANCE:+ ($TOK_INSTANCE)} tokenizer HTTP server on $ROUTER_IP"

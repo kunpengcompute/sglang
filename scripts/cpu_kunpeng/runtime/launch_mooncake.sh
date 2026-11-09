@@ -27,11 +27,10 @@ SKIP_CONDA=1 source "$SCRIPT_DIR/env.sh" mooncake || exit 1
 
 sh "$SCRIPT_DIR/stop.sh" mooncake
 
+# "<base>/latest/mooncake" -> this run's mooncake dir
 mkdir -p "$LOG_DIR"
-# Refresh "latest" symlink to this run's time dir (e.g. latest -> 214700)
-ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/mooncake/latest"
 mkdir -p "$LOG_BASE_DIR/latest"
-ln -sfn "$LOG_BASE_DIR/$LOG_DATE/mooncake/$LOG_TIME" "$LOG_BASE_DIR/latest/mooncake"
+ln -sfn "$LOG_DIR" "$LOG_BASE_DIR/latest/mooncake"
 
 _mc_offload_args=""
 if [[ "${MOONCAKE_ENABLE_SSD_OFFLOAD:-0}" == "1" ]]; then

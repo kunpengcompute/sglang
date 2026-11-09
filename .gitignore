@@ -284,6 +284,7 @@ artifacts/
 
 # TRAE
 .trae
+.workbuddy
 
 # Local Kunpeng CPU builds
 dist-cpu/
