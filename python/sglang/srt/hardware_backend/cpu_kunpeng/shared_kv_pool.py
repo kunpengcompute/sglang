@@ -26,11 +26,14 @@ Group layout::
 What happens with the switch on:
 
 * The leader creates ONE POSIX shm segment holding the whole KV pool (main
-  ``kv_buffer`` + DSA ``index_k_buffer``), places every page STRICTLY on its own
-  NUMA node (``MPOL_BIND``), pre-faults all pages and verifies the placement via
-  ``/proc/self/numa_maps`` before publishing the header's ``ready`` flag.
-  Rank and NUMA node are 1:1 on 920F, so "the leader's node" is unambiguously
-  the CPU-affinity node of that process -- there is no env override for it.
+  ``kv_buffer`` + DSA ``index_k_buffer``), INTERLEAVES every page over the
+  group's NUMA nodes (``MPOL_INTERLEAVE``), pre-faults all pages and verifies
+  the split via ``/proc/self/numa_maps`` before publishing the header's
+  ``ready`` flag.
+  Rank and NUMA node are 1:1 on 920F and the leader is the lowest rank of the
+  group, so the group owns ``leader_node .. leader_node + group_size - 1``:
+  rank0 / group=4 -> nodes 0-3, group=16 -> nodes 0-15. Each rank re-checks
+  that its own affinity node is the expected one.
 * The other ``group_size - 1`` ranks attach to that segment and build the exact
   same tensor views over it. They allocate nothing.
 * A process may hold TWO pools -- the target model's and the MTP / draft
@@ -51,10 +54,12 @@ Not done yet (next steps, do NOT assume):
    each rank reads what it wrote itself -- this step does not depend on
    cross-process write->read visibility. Leader-only writes require a
    group-level fence/drain and must land together.
-2. Placement is single-node (the leader's). The next placement step is to
-   spread the segment over ALL NUMA nodes of the group, one slice per rank
-   (rank <-> node is 1:1); that needs a per-rank "done" handshake in the header
-   before ``ready`` is published.
+2. Placement is INTERLEAVED over the group's nodes by the leader (one
+   ``MPOL_INTERLEAVE`` policy + one full pre-fault), not sliced per rank. That
+   keeps placement free of any new handshake, at the cost of every rank
+   reading ``(group-1)/group`` of the segment remotely. A per-rank sliced
+   variant (each rank faulting its own 1/group under a strict bind) would make
+   access fully local but needs a per-rank "done" flag before ``ready``.
 3. Attach uses polling + the ``ready`` flag, not a group barrier; there is no
    failure agreement (if the leader dies, followers wait until the timeout).
 4. Memory budget / cell_size (D6), HiCache (D7), PD single-receiver (D9) and
@@ -212,6 +217,7 @@ _GROUP_SIZE: int = KV_SHARE_GROUP_DISABLED
 _GROUP_BASE: int = 0
 _INTRA_GROUP_RANK: int = 0
 _NUMA_NODE: int = -1
+_NUMA_NODES: List[int] = []
 _SEGMENT_BYTES: int = 0
 
 # Keeps ``shm.buf`` (and therefore every tensor built on it) alive for the whole
@@ -255,6 +261,7 @@ def get_kv_share_state() -> Dict[str, Any]:
         "intra_group_rank": _INTRA_GROUP_RANK,
         "is_leader": _IS_LEADER,
         "numa_node": _NUMA_NODE,
+        "numa_nodes": list(_NUMA_NODES),
         "segment_bytes": _SEGMENT_BYTES,
         "roles": dict(_OPENED_ROLES),
     }
@@ -584,7 +591,7 @@ def open_shared_kv_storage(
     downgraded to a per-rank pool.
     """
     global _ENABLED, _INITIALIZED, _IS_LEADER, _GROUP_SIZE
-    global _GROUP_BASE, _INTRA_GROUP_RANK, _NUMA_NODE, _SEGMENT_BYTES
+    global _GROUP_BASE, _INTRA_GROUP_RANK, _NUMA_NODE, _NUMA_NODES, _SEGMENT_BYTES
 
     if request is None:
         raise SharedKvPoolError("open_shared_kv_storage() called without a request")
@@ -626,13 +633,14 @@ def open_shared_kv_storage(
     shm: Optional[shared_memory.SharedMemory] = None
 
     if is_leader:
-        _check_capacity(layout, request.numa_node)
+        nodes = resolve_group_nodes(request.numa_node, request.group_size)
+        _check_capacity(layout, nodes)
         created = True
         shm = _create_segment(layout)
         _CREATED_SEGMENTS.append(shm)
         _LIVE_SEGMENTS.append(shm)
         try:
-            _place_on_node(shm, layout, request.numa_node)
+            _place_on_group_nodes(shm, layout, nodes)
             _publish_header(shm, layout, request.numa_node)
         except BaseException:
             _release_segment(shm, created=True)
@@ -640,28 +648,31 @@ def open_shared_kv_storage(
         numa_node = request.numa_node
         logger.info(
             "[kv-share] leader created %s (%s pool): %.2f GiB, %d layers "
-            "(%d full), %d slots, numa_node=%d (strict membind, prefaulted, "
-            "verified)",
+            "(%d full), %d slots, interleaved over NUMA nodes %s "
+            "(prefaulted, verified)",
             layout.name,
             role,
             layout.total_bytes / 2**30,
             layout.layer_num,
             layout.num_full_layers,
             layout.num_slots,
-            numa_node,
+            nodes,
         )
     else:
         shm = _attach_segment(layout)
         _LIVE_SEGMENTS.append(shm)
         numa_node = _read_header(shm)["numa_node"]
+        nodes = resolve_group_nodes(numa_node, request.group_size)
+        # rank <-> node is 1:1: this rank must own nodes[intra].
+        _assert_own_node(nodes[request.intra_group_rank], request.intra_group_rank)
         logger.info(
             "[kv-share] follower tp_rank=%s attached %s (%s pool, %.2f GiB, "
-            "leader numa_node=%d)",
+            "nodes %s)",
             getattr(model_runner, "tp_rank", "?"),
             layout.name,
             role,
             layout.total_bytes / 2**30,
-            numa_node,
+            nodes,
         )
 
     try:
@@ -676,6 +687,7 @@ def open_shared_kv_storage(
     _GROUP_BASE = request.group_base
     _INTRA_GROUP_RANK = request.intra_group_rank
     _NUMA_NODE = int(numa_node)
+    _NUMA_NODES = list(nodes)
     _SEGMENT_BYTES += layout.total_bytes
     _OPENED_ROLES[role] = layout.name
     _INITIALIZED = True
@@ -851,16 +863,30 @@ def resolve_leader_numa_node() -> int:
     return node
 
 
-def _check_capacity(layout: KvShareLayout, numa_node: int) -> None:
-    """Fail before touching memory: neither the node nor /dev/shm may be small."""
-    node_free = _node_free_bytes(numa_node)
-    if node_free is not None and layout.total_bytes > node_free:
-        raise SharedKvPoolError(
-            f"the shared KV segment needs {layout.total_bytes / 2**30:.1f} GiB "
-            f"but NUMA node {numa_node} has only {node_free / 2**30:.1f} GiB "
-            f"free. Lower --mem-fraction-static / --max-total-tokens, or "
-            f"disable SGLANG_KUNPENG_KV_SHARE_GROUP"
-        )
+def _check_capacity(layout: KvShareLayout, nodes: List[int]) -> None:
+    """Fail before touching memory: the group's nodes and /dev/shm must fit."""
+    logger.info(
+        "[kv-share] NUMA free memory: %s | group total=%s | host available=%s "
+        "| segment needs=%s",
+        _numa_free_summary(nodes),
+        _gib(_sum_free(nodes)),
+        _gib(_host_available_bytes()),
+        _gib(layout.total_bytes),
+    )
+    frees = [(node, _node_free_bytes(node)) for node in nodes]
+    if all(free is not None for _, free in frees):
+        total_free = sum(free for _, free in frees)
+        if layout.total_bytes > total_free:
+            detail = ", ".join(
+                f"node{node}={_gib(free)}" for node, free in frees
+            )
+            raise SharedKvPoolError(
+                f"the shared KV segment needs {layout.total_bytes / 2**30:.1f} "
+                f"GiB but the group's NUMA nodes have only "
+                f"{total_free / 2**30:.1f} GiB free ({detail}). Lower "
+                f"--mem-fraction-static / --max-total-tokens, or disable "
+                f"SGLANG_KUNPENG_KV_SHARE_GROUP"
+            )
     shm_free = _dev_shm_free_bytes()
     if shm_free is not None and layout.total_bytes > shm_free:
         raise SharedKvPoolError(
@@ -880,26 +906,114 @@ def _node_free_bytes(node: int) -> Optional[int]:
         return None
 
 
-def _place_on_node(
-    shm: shared_memory.SharedMemory, layout: KvShareLayout, numa_node: int
-) -> None:
-    """Bind the calling thread to ``numa_node``, fault every page, restore.
+def _gib(value: Optional[int]) -> str:
+    return "?" if value is None else f"{value / 2**30:.1f}GiB"
 
-    The bind is STRICT (``MPOL_BIND``) and its failure is fatal: a segment that
-    silently landed on another node would look correct but read remotely.
+
+def _sum_free(nodes: List[int]) -> Optional[int]:
+    """Total free memory of ``nodes``; ``None`` if any node is unreadable."""
+    frees = [_node_free_bytes(node) for node in nodes]
+    if any(free is None for free in frees):
+        return None
+    return sum(frees)
+
+
+def _numa_free_summary(nodes: List[int]) -> str:
+    """``node0=4.8GiB, node1=4.9GiB, ...`` -- free memory of each node."""
+    return ", ".join(
+        f"node{node}={_gib(_node_free_bytes(node))}" for node in nodes
+    )
+
+
+def _host_available_bytes() -> Optional[int]:
+    """``MemAvailable`` of the whole host (all nodes), from /proc/meminfo."""
+    try:
+        with open("/proc/meminfo", "r") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def resolve_group_nodes(leader_node: int, group_size: int) -> List[int]:
+    """NUMA nodes of a share group: ``leader_node .. leader_node + group - 1``.
+
+    Rank and NUMA node are 1:1 on 920F and the leader is the LOWEST rank of the
+    group, so the group's nodes are contiguous from the leader's node:
+    rank0/group=4 -> nodes 0-3, group=16 -> nodes 0-15. Every rank verifies that
+    its own affinity node is the expected one (see ``_assert_own_node``), so a
+    launch that binds ranks differently fails loudly instead of placing pages
+    on the wrong nodes.
+    """
+    if leader_node < 0:
+        raise SharedKvPoolError(f"invalid NUMA node {leader_node}")
+    nodes = [int(leader_node) + i for i in range(int(group_size))]
+    max_node = _max_node()
+    if max_node is not None and nodes[-1] > max_node:
+        raise SharedKvPoolError(
+            f"group_size={group_size} starting at NUMA node {leader_node} needs "
+            f"nodes up to {nodes[-1]}, but this host has only {max_node + 1}"
+        )
+    return nodes
+
+
+def _max_node() -> Optional[int]:
+    try:
+        from sglang.srt.utils.numa_utils import get_max_numa_node
+
+        return get_max_numa_node()
+    except Exception:
+        return None
+
+
+def _assert_own_node(expected: int, intra_group_rank: int) -> None:
+    """This rank must run on ``expected`` (rank <-> node is 1:1)."""
+    try:
+        from sglang.srt.utils.numa_utils import get_current_numa_node
+
+        own = get_current_numa_node()
+    except Exception:
+        own = None
+    if own is None:
+        logger.warning(
+            "[kv-share] rank intra=%d: cannot read its own NUMA node; cannot "
+            "verify it is node %d",
+            intra_group_rank,
+            expected,
+        )
+        return
+    if own != expected:
+        raise SharedKvPoolError(
+            f"rank intra={intra_group_rank} runs on NUMA node {own} but the "
+            f"group expects node {expected}; rank and NUMA node must be 1:1 "
+            "with the leader owning the lowest node"
+        )
+
+
+def _place_on_group_nodes(
+    shm: shared_memory.SharedMemory, layout: KvShareLayout, nodes: List[int]
+) -> None:
+    """Interleave every page over the group's nodes, fault them, restore.
+
+    ``MPOL_INTERLEAVE`` over the group's node set: each page is placed
+    round-robin, so every rank of the group reads ~1/group of the segment
+    locally. The policy applies at fault time, which is why the leader
+    pre-faults the whole segment before publishing ``ready``.
     """
     try:
         from sglang.srt.utils.numa_utils import (
+            set_interleave_memory_policy_for_nodes,
             set_local_memory_policy,
-            set_membind_memory_policy,
         )
     except Exception as exc:
         raise SharedKvPoolError(f"cannot import the NUMA helpers: {exc}") from exc
 
-    if not set_membind_memory_policy(numa_node):
+    if not set_interleave_memory_policy_for_nodes(nodes):
         raise SharedKvPoolError(
-            f"numa_set_membind(node={numa_node}) failed; the leader cannot "
-            "guarantee that the shared KV pages live on its own NUMA node"
+            f"numa_set_interleave_mask(nodes={nodes}) failed; cannot spread the "
+            "shared KV pages over the group's NUMA nodes"
         )
     started = time.monotonic()
     try:
@@ -908,15 +1022,14 @@ def _place_on_node(
         # Back to first-touch for everything this thread allocates later.
         set_local_memory_policy()
     elapsed = time.monotonic() - started
-    pages = _verify_placement(shm, layout, numa_node)
+    pages = _verify_placement(shm, layout, nodes)
     logger.info(
-        "[kv-share] prefaulted %.2f GiB in %.1fs; numa_maps: %s (target node "
-        "%d, ratio %.4f)",
+        "[kv-share] prefaulted %.2f GiB in %.1fs over nodes %s; numa_maps per "
+        "node: %s",
         layout.total_bytes / 2**30,
         elapsed,
+        nodes,
         {node: count * 4096 for node, count in sorted(pages.items())},
-        numa_node,
-        _placement_ratio(pages, numa_node),
     )
 
 
@@ -932,36 +1045,39 @@ def _prefault_region(shm: shared_memory.SharedMemory, total_bytes: int) -> None:
 
 
 def _verify_placement(
-    shm: shared_memory.SharedMemory, layout: KvShareLayout, numa_node: int
+    shm: shared_memory.SharedMemory, layout: KvShareLayout, nodes: List[int]
 ) -> Dict[int, int]:
-    """Assert the pages landed on ``numa_node``; raise otherwise.
+    """Assert the pages landed on the group's nodes; raise otherwise.
 
     ``/proc/self/numa_maps`` is the only reliable way to confirm that a memory
-    policy actually took effect for the pages of an mmap'ed tmpfs file.
+    policy actually took effect for the pages of an mmap'ed tmpfs file. With
+    interleave the split must be close to even: every node of the group gets
+    ~1/group of the pages, and nothing lands elsewhere.
     """
     pages = _numa_maps_pages(shm.name)
-    if not pages:
-        raise SharedKvPoolError(
-            f"cannot find the numa_maps entry of /dev/shm/{shm.name}; cannot "
-            f"verify that the shared KV pages were placed on NUMA node "
-            f"{numa_node}. Refusing to start unverified"
-        )
-    ratio = _placement_ratio(pages, numa_node)
-    if ratio < _PLACEMENT_MIN_RATIO:
-        raise SharedKvPoolError(
-            f"only {ratio:.2%} of the shared KV pages are on NUMA node "
-            f"{numa_node} (expected >= {_PLACEMENT_MIN_RATIO:.0%}); pages per "
-            f"node: { {n: c for n, c in sorted(pages.items())} }. The memory "
-            "policy did not take effect -- refusing to start"
-        )
-    return pages
-
-
-def _placement_ratio(pages: Dict[int, int], numa_node: int) -> float:
     total = sum(pages.values())
     if total <= 0:
-        return 0.0
-    return pages.get(numa_node, 0) / total
+        raise SharedKvPoolError(
+            f"cannot find the numa_maps entry of /dev/shm/{shm.name}; cannot "
+            f"verify that the shared KV pages were placed on nodes {nodes}. "
+            "Refusing to start unverified"
+        )
+    outside = sum(count for node, count in pages.items() if node not in nodes)
+    expected = total / len(nodes)
+    starved = {
+        node: pages.get(node, 0)
+        for node in nodes
+        if pages.get(node, 0) < expected * _PLACEMENT_MIN_RATIO
+    }
+    if outside > total * (1 - _PLACEMENT_MIN_RATIO) or starved:
+        raise SharedKvPoolError(
+            f"the shared KV pages are not spread over nodes {nodes}: pages per "
+            f"node { {n: c for n, c in sorted(pages.items())} } (expected ~"
+            f"{expected:.0f} pages per node, outside={outside}, "
+            f"starved={starved}). The interleave policy did not take effect -- "
+            "refusing to start"
+        )
+    return pages
 
 
 def _numa_maps_pages(shm_name: str) -> Dict[int, int]:

@@ -237,6 +237,58 @@ def set_interleave_memory_policy() -> bool:
         return False
 
 
+def get_max_numa_node() -> Optional[int]:
+    """Highest NUMA node id on this host, or ``None`` when libnuma is missing."""
+    if libnuma is None:
+        return None
+    try:
+        if libnuma.numa_available() < 0:
+            return None
+        return int(_get_max_node())
+    except Exception:
+        return None
+
+
+def set_interleave_memory_policy_for_nodes(nodes) -> bool:
+    """Round-robin this thread's future pages over exactly ``nodes``.
+
+    ``MPOL_INTERLEAVE`` restricted to a node set: used by the shared KV pool so
+    the segment is spread over the whole share group (each rank then reads
+    ~1/group of it locally) instead of being parked on one node.
+    """
+    if not _can_set_mempolicy():
+        return False
+    node_list = [int(node) for node in nodes]
+    if not node_list:
+        return False
+    mask = None
+    try:
+        mask = libnuma.numa_allocate_nodemask()
+        if not mask:
+            return False
+        # ``numa_bitmask_setbit`` is a header inline rather than an exported
+        # symbol, so set the bits through the struct fields.
+        for node in node_list:
+            if node < 0:
+                return False
+            word, bit = divmod(node, 64)
+            if word >= mask.contents.size:
+                return False
+            mask.contents.maskp[word] = mask.contents.maskp[word] | (1 << bit)
+        return libnuma.numa_set_interleave_mask(mask) == 0
+    except Exception:
+        logger.warning(
+            "numa_set_interleave_mask(nodes=%s) failed", node_list, exc_info=True
+        )
+        return False
+    finally:
+        if mask is not None:
+            try:
+                libnuma.numa_bitmask_free(mask)
+            except Exception:
+                pass
+
+
 def set_local_memory_policy() -> bool:
     """Restore the default first-touch (local) allocation policy.
 
