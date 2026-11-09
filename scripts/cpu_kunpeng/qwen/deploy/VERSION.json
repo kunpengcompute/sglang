@@ -1,0 +1,9 @@
+{
+  "name": "Qwen920F source build and deployment",
+  "base_commit": "bbdb4a698ef7851b134e37182326eb21398e4812",
+  "mode": "non-MTP or NEXTN/EAGLE MTP",
+  "tool_revision": "20261106_upstream_mtp_startup",
+  "launcher_revision": "20261106_upstream_mtp_startup",
+  "validation": "static and local mocked lifecycle/launcher checks passed; current upstream native build and model runtime unverified",
+  "validated_parent_commit": "7c548f9a7692d31b15b665ad68ef2001f836130a"
+}
