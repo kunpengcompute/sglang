@@ -39,6 +39,11 @@ if(SGLANG_KUNPENG_ALLOW_MISSING_OPTIONAL_KUTACC_APIS)
          kutacc::kurmcl_allgather_full_init(nullptr,0,nullptr,0,c);
          kutacc::kurmcl_allgather_full(nullptr,0,nullptr,0,c);
          kutacc::kurmcl_allgather_full_finalize();")
+    kunpeng_optional_kutacc_api(SGLANG_KUTACC_HAS_SHM_ALLGATHER
+        cpu_kunpeng/comm/allgather.cpp
+        "kutacc::shm_allgather_request_h r=nullptr;
+         kutacc::shm_allgather(nullptr,0,nullptr,0,nullptr,nullptr,
+             kutacc::SHM_DATATYPE_UINT8,[](){},r);")
     kunpeng_optional_kutacc_api(SGLANG_KUTACC_HAS_BROADCAST
         cpu_kunpeng/comm/broadcast.cpp
         "kutacc::kurmcl_conn_info_h c=nullptr; kutacc::kurmcl_broadcast(nullptr,0,0,0,c);")

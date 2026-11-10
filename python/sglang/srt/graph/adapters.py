@@ -359,12 +359,14 @@ def _setup_bf16_packed_gemm_f32_kunpeng():
 
 def _setup_grouped_topk_kunpeng():
     def shape_infer(router_logits, bias, topk, num_expert_group, topk_group,
-                    renormalize, scoring_func_sigmoid, moe_balance, v2):
+                    renormalize, scoring_func_sigmoid, moe_balance, v2,
+                    num_fused_shared_experts, routed_scaling_factor):
         bs = router_logits.shape[0]
         return [((bs, topk), torch.float32), ((bs, topk), torch.int16)]
 
     def eager_fn(router_logits, bias, topk, num_expert_group, topk_group,
-                 renormalize, scoring_func_sigmoid, moe_balance, v2):
+                 renormalize, scoring_func_sigmoid, moe_balance, v2,
+                 num_fused_shared_experts, routed_scaling_factor):
         bs = router_logits.shape[0]
         tw = torch.empty((bs, topk), dtype=torch.float32)
         ti = torch.empty((bs, topk), dtype=torch.int16)
@@ -374,7 +376,9 @@ def _setup_grouped_topk_kunpeng():
             bias=bias, experts_offset=None,
             renormalize=bool(renormalize),
             scoring_func_sigmoid=bool(scoring_func_sigmoid),
-            moe_balance=bool(moe_balance), v2=v2)
+            moe_balance=bool(moe_balance), v2=v2,
+            num_fused_shared_experts=int(num_fused_shared_experts),
+            routed_scaling_factor=float(routed_scaling_factor))
         return tw, ti
 
     register_op('grouped_topk_kunpeng', shape_infer, eager_fn)
@@ -383,32 +387,38 @@ def _setup_grouped_topk_kunpeng():
 def _setup_grouped_topk_inplace_kunpeng():
     def shape_infer(router_logits, token_weights_out, token_ids_out, bias,
                     topk, num_expert_group, topk_group,
-                    renormalize, scoring_func_sigmoid, moe_balance, v2):
+                    renormalize, scoring_func_sigmoid, moe_balance, v2,
+                    num_fused_shared_experts, routed_scaling_factor):
         return []
 
     def eager_fn(router_logits, token_weights_out, token_ids_out, bias,
                  topk, num_expert_group, topk_group,
-                 renormalize, scoring_func_sigmoid, moe_balance, v2):
+                 renormalize, scoring_func_sigmoid, moe_balance, v2,
+                 num_fused_shared_experts, routed_scaling_factor):
         torch.ops.sgl_kernel.grouped_topk_kunpeng(
             router_logits, token_weights_out, token_ids_out,
             topk, num_expert_group, topk_group,
             bias=bias, experts_offset=None,
             renormalize=bool(renormalize),
             scoring_func_sigmoid=bool(scoring_func_sigmoid),
-            moe_balance=bool(moe_balance), v2=v2)
+            moe_balance=bool(moe_balance), v2=v2,
+            num_fused_shared_experts=int(num_fused_shared_experts),
+            routed_scaling_factor=float(routed_scaling_factor))
         return None
 
     register_op('grouped_topk_inplace_kunpeng', shape_infer, eager_fn)
 
 
 def _setup_load_balance_padded_tokens_kunpeng():
-    def shape_infer(topk_ids, topk_weights, num_token_non_padded, num_experts, topk, force_balance, expert_offset):
+    def shape_infer(topk_ids, topk_weights, num_token_non_padded, num_experts, topk, force_balance, expert_offset,
+                    slice_offset):
         return []
 
-    def eager_fn(topk_ids, topk_weights, num_token_non_padded, num_experts, topk, force_balance, expert_offset):
+    def eager_fn(topk_ids, topk_weights, num_token_non_padded, num_experts, topk, force_balance, expert_offset,
+                 slice_offset):
         torch.ops.sgl_kernel.load_balance_padded_tokens_kunpeng(
             topk_ids, topk_weights, num_token_non_padded, num_experts, topk,
-            bool(force_balance), int(expert_offset))
+            bool(force_balance), int(expert_offset), int(slice_offset))
         return None
 
     register_op('load_balance_padded_tokens_kunpeng', shape_infer, eager_fn)
@@ -497,6 +507,20 @@ def _setup_shm_dual_allgather_kunpeng():
     register_op('shm_dual_allgather_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_shm_allgather_kunpeng():
+    def shape_infer(input, output):
+        return []  # in-place on output
+
+    def eager_fn(input, output):
+        torch.ops.sgl_kernel.shm_allgather_kunpeng(input, output)
+        return None
+
+    # shm_fn marks BOTH input and output: capture upgrades both storages to
+    # SHM, so replay gathers directly between peer buffers.
+    register_op('shm_allgather_kunpeng', shape_infer, eager_fn,
+                shm_fn=lambda input, output: [input, output])
+
+
 def _setup_shm_mla_q_alltoall_kunpeng():
     def shape_infer(q, tp_size):
         B, Nl, D = q.shape
@@ -566,7 +590,12 @@ def _setup_shm_reduce_scatter_kunpeng():
         torch.ops.sgl_kernel.shm_reduce_scatter_kunpeng(input)
         return None
 
-    register_op('shm_reduce_scatter_kunpeng', shape_infer, eager_fn)
+    # In-place op: capture must upgrade the input to SHM so the kernel takes
+    # the in-place zero-alloc path. With a non-SHM input the C++ eager branch
+    # lazily carves a send buffer from the pool, which OOMs during capture:
+    # graph storages already claimed the pool by then.
+    register_op('shm_reduce_scatter_kunpeng', shape_infer, eager_fn,
+                shm_fn=lambda input: [input])
 
 
 def _setup_bmm_kunpeng():
@@ -1779,6 +1808,7 @@ def setup():
     _setup_shm_fence_kunpeng()
     _setup_shm_reduce_scatter_kunpeng()
     _setup_shm_dual_allgather_kunpeng()
+    _setup_shm_allgather_kunpeng()
     _setup_bmm_kunpeng()
     _setup_embedding_kunpeng()
     _setup_silu_mul_quant_kunpeng()
