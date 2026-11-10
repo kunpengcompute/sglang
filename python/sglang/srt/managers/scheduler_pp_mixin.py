@@ -68,8 +68,17 @@ _PP_ROW_OWNER_KEYS = frozenset({"topk_indices"})
 # cap is enforced at the send site (_pp_ensure_send_slot), keeping one slot
 # spare for the message being posted. Proxy data frames are <= 1 per iteration,
 # so at most 2 of them stay in flight, well under PP_PROXY_SLOTS = 4.
-_PP_MSG_SLOTS = 8
+_PP_MSG_SLOTS = 10
 _PP_MAX_INFLIGHT_MSG = _PP_MSG_SLOTS - 1
+
+# Per-pyobj size cap for forwarding recv_reqs down the PP ring. A single message
+# slot holds 1MB (PP_MSG_SLOT_SIZE in pp_comm.cpp), so long inputs (e.g. 64k)
+# whose request list exceeds it after pickling must be split. We use a 768KB
+# threshold: an oversized recv_reqs is sent as one fragment header plus N
+# fragment sub-lists, and the receiver reassembles them by header, so multiple
+# batches flow through the PP ring as a pipeline instead of one-at-a-time.
+_PP_INPUT_FRAG_MAX_BYTES = 768 * 1024
+_PP_INPUT_FRAG_TAG = "__kunpeng_pp_input_frag__"
 
 # When "1", delay the prefill loop's send ack commits until after
 # _pp_launch_batch so the downstream ack wait overlaps with graph_run compute
@@ -186,9 +195,8 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
+                        self.send_req_work = self._pp_send_input_reqs_to_next_stage(
+                            recv_reqs
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
@@ -423,8 +431,8 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                    self.send_req_work = self._pp_send_input_reqs_to_next_stage(
+                        recv_reqs
                     )
                     send_prefill_consensus_work = (
                         self._pp_send_consensus_bundle_to_next_stage(
@@ -608,8 +616,8 @@ class SchedulerPPMixin:
                 # 9.mb tail: batch completion bookkeeping + transition to the
                 # next micro-batch iteration (spans send_pyobj / send_proxy).
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                    self.send_req_work = self._pp_send_input_reqs_to_next_stage(
+                        recv_reqs
                     )
                     send_consensus_work = (
                         self._pp_send_consensus_bundle_to_next_stage(
@@ -1383,6 +1391,65 @@ class SchedulerPPMixin:
                     async_send=async_send,
                 )
         return p2p_work
+
+    def _split_input_reqs_by_bytes(self: Scheduler, reqs, max_bytes: int):
+        """Greedily split requests by pickle size so each fragment stays <= max_bytes."""
+        frags = []
+        cur = []
+        cur_bytes = 0
+        for r in reqs:
+            b = len(pickle.dumps(r))
+            if cur and cur_bytes + b > max_bytes:
+                frags.append(cur)
+                cur = []
+                cur_bytes = 0
+            cur.append(r)
+            cur_bytes += b
+        if cur:
+            frags.append(cur)
+        return frags
+
+    def _pp_send_input_reqs_to_next_stage(self: Scheduler, recv_reqs):
+        """Forward recv_reqs to the next PP stage, splitting long lists to fit the 1MB slot.
+
+        The normal (including empty) case takes the single-pyobj fast path, matching the
+        old behavior. Only when the serialized size exceeds _PP_INPUT_FRAG_MAX_BYTES do we
+        split into "one fragment header + N sub-lists" sent one by one; the receiver
+        reassembles them in _pp_recv_input_reqs_from_prev_stage. Fragments preserve FIFO
+        order and do not affect the subsequent consensus / proxy send-recv pairing.
+        """
+        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
+            return []
+        payload = pickle.dumps(recv_reqs)
+        if len(payload) <= _PP_INPUT_FRAG_MAX_BYTES:
+            return self._pp_send_pyobj_to_next_stage(recv_reqs, async_send=True)
+        frags = self._split_input_reqs_by_bytes(recv_reqs, _PP_INPUT_FRAG_MAX_BYTES)
+        if len(frags) <= 1:
+            # A single request already exceeds the cap and cannot be split further;
+            # keep the old behavior (it still errors out) but log a hint to help
+            # locate the more extreme long-input case.
+            logger.warning(
+                "PP input reqs: single pyobj still exceeds %d bytes, sending as-is",
+                _PP_INPUT_FRAG_MAX_BYTES,
+            )
+            return self._pp_send_pyobj_to_next_stage(recv_reqs, async_send=True)
+        p2p_work = self._pp_send_pyobj_to_next_stage(
+            {_PP_INPUT_FRAG_TAG: True, "n": len(frags)}, async_send=True
+        )
+        for f in frags:
+            p2p_work = self._pp_send_pyobj_to_next_stage(f, async_send=True)
+        return p2p_work
+
+    def _pp_recv_input_reqs_from_prev_stage(self: Scheduler):
+        """Receive recv_reqs from the previous PP stage, reassembling fragmented lists."""
+        first = self._pp_recv_message("pyobj")["data"]
+        if isinstance(first, dict) and first.get(_PP_INPUT_FRAG_TAG):
+            n = first["n"]
+            reqs = []
+            for _ in range(n):
+                reqs.extend(self._pp_recv_message("pyobj")["data"])
+            return reqs
+        return first
 
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):

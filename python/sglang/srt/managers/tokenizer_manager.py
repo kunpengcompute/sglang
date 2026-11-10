@@ -2449,7 +2449,18 @@ class TokenizerManager(
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        # Aborts are idempotent: under PP every stage runs update_running_batch
+        # and can emit the same AbortReq, and an abort can also race with the
+        # request's own final output. A stale/duplicate abort must not raise
+        # KeyError here: it runs inside handle_loop, so an exception would stop
+        # all subsequent output delivery and make the server look hung.
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            logger.debug(
+                "Ignoring stale abort for rid=%s (already finished/cleaned up)",
+                recv_obj.rid,
+            )
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 

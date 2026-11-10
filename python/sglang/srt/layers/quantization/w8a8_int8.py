@@ -269,7 +269,9 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             output = kunpeng.s8_s8_gemm_bf16_dq_kunpeng(
                 norm_int8, input_ptr.view(batch_size, k), layer.weight,
                 norm_scale.view(-1), layer.weight_scale.view(-1),
-                workspace, tile_m, tile_n, tile_k)
+                workspace, tile_m, tile_n, tile_k,
+                profile_name=f"s8_s8_gemm_bf16_dq_kunpeng@M{batch_size}xN{n}xK{k}"
+                                f"T{tile_m}x{tile_n}x{tile_k}")
 
             return output
 

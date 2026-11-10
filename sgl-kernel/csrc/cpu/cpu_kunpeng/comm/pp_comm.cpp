@@ -56,11 +56,11 @@ extern bool g_global_comm_initialized;
 #define PP_BUNDLE_SUB_FORWARD 0
 #define PP_BUNDLE_SUB_RINGBACK 1
 #define PP_MSG_HEADER 12
-#define PP_MSG_SLOTS 8
+#define PP_MSG_SLOTS 10
 #define PP_MSG_SLOT_SIZE (1 * 1024 * 1024)
 #define PP_MSG_PER_PEER (PP_MSG_SLOTS * PP_MSG_SLOT_SIZE)
 // 1MB per slot: enough for pyobj (req/consensus) and tensor metadata pickles.
-// At world_size=16 the message region is 16*8*1MB=128MB. The tensor batch
+// At world_size=16 the message region is 16*10*1MB=160MB. The tensor batch
 // region occupies everything below the message region:
 //   proxy  : [0, PP_PROXY_REGION_SIZE)                          -- single segment
 //   output : [PP_PROXY_REGION_SIZE, + pp_size * PP_OUTPUT_PER_SENDER) -- per-sender ring

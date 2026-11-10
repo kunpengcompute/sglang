@@ -106,14 +106,19 @@ def prepare_weight(head, pool):
 
 
 def try_linear(x, head, bias=None):
-    """Return dense BF16 logits for continuous M2..128, or None for ATen."""
+    """Return dense BF16 logits for continuous M1..128, or None for ATen.
+
+    M1 (every MTP draft step) is admitted as well: `_plan` requires the M1
+    tiling to keep the prepared (tile_n, tile_k), so the same packed weight
+    stays valid for a single row.
+    """
     packed = getattr(head, _BUFFER, None)
     prepared = getattr(head, "_kunpeng_lm_head_plan", None)
     logical = getattr(head, "weight", None)
     if (
         bias is not None
         or not _dense_bf16(x)
-        or not 2 <= x.shape[0] <= 128
+        or not 1 <= x.shape[0] <= 128
         or prepared is None
         or not _dense_bf16(logical)
         or not _dense_bf16(packed)
@@ -173,7 +178,6 @@ def prepare(head, pool):
     packed = pool.alloc(tuple(head.weight.shape), head.weight.dtype, label='lm_head_packed')
     torch.ops.sgl_kernel.bf16_gemm_pack_kunpeng(head.weight, packed, tn, tk)
     head.register_buffer('_kunpeng_packed_lm_head_weight', packed, persistent=False)
-    head._kunpeng_lm_head_tiling = (tn, tk)
     head._kunpeng_lm_head_plan = dict(tile_n=tn, tile_k=tk, blocks_n=n // tn,
         blocks_k=k // tk, workers=32, n=n, k=k, logical_data_ptr=head.weight.data_ptr())
 
@@ -181,10 +185,17 @@ def prepare(head, pool):
 def linear(x, head, bias=None):
     if bias is not None:
         raise ValueError('Explicit LM head expects bias=False')
+    # The prepared full-K packed plan is valid for every M whose optimal
+    # tiling keeps the prepared (tile_n, tile_k); try it first so small M,
+    # including the M1 of every MTP draft step, stays on the native GEMM.
+    packed_logits = try_linear(x, head, bias)
+    if packed_logits is not None:
+        return packed_logits
     if x.shape[0] == 1:
         # Preserve the existing logical-weight ATen M1 contract, as a typed out op.
         return ops.tensor_mm(x, head.weight)
-    _, k = head._kunpeng_lm_head_tiling
+    # General path: same packed buffer and tiling that prepare() recorded.
+    k = head._kunpeng_lm_head_plan["tile_k"]
     packed = ops.bf16_gemm_pack_kunpeng(x, x.shape[0], k)
     workspace = ops.alloc_buffer(1, dtype=x.dtype)
-    return ops.bf16_packed_gemm_kunpeng(packed, head._kunpeng_packed_lm_head_weight, workspace, 32)
+    return ops.bf16_packed_gemm_kunpeng(packed, getattr(head, _BUFFER), workspace, 32)

@@ -134,11 +134,15 @@ class ExpertLocationMetadata:
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
+            moe_ep_rank=moe_ep_rank,
         )
 
     @staticmethod
     def init_by_eplb(
-        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        logical_count: torch.Tensor,
+        moe_ep_rank: int = None,
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
@@ -180,6 +184,7 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map.to(
                 server_args.device
             ),
+            moe_ep_rank=moe_ep_rank,
         )
 
     @staticmethod
@@ -212,6 +217,7 @@ class ExpertLocationMetadata:
         ep_size: int,
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
+        moe_ep_rank: int = None,
     ):
         _, num_physical_experts = physical_to_logical_map.shape
 
@@ -237,8 +243,11 @@ class ExpertLocationMetadata:
                     logical_to_all_physical_map=logical_to_all_physical_map,
                     ep_size=ep_size,
                     num_physical_experts=num_physical_experts,
-                    # TODO improve when we have real EP rank
-                    ep_rank=torch.distributed.get_rank() % ep_size,
+                    ep_rank=(
+                        moe_ep_rank
+                        if moe_ep_rank is not None
+                        else torch.distributed.get_rank() % ep_size
+                    ),
                 )
                 if server_args.ep_dispatch_algorithm == "static"
                 else None
@@ -592,7 +601,7 @@ def compute_initial_expert_location_metadata(
 
     # TODO unify with the utils function
     if data.endswith(".pt"):
-        data_dict = torch.load(data, weights_only=True)
+        data_dict = torch.load(data, weights_only=True, map_location="cpu")
     elif data.endswith(".json"):
         data_dict = json.loads(Path(data).read_text())
     else:
@@ -613,7 +622,10 @@ def compute_initial_expert_location_metadata(
             "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
         )
         return ExpertLocationMetadata.init_by_eplb(
-            server_args, model_config, logical_count=data_dict["logical_count"]
+            server_args,
+            model_config,
+            logical_count=data_dict["logical_count"],
+            moe_ep_rank=moe_ep_rank,
         )
     else:
         raise NotImplementedError(

@@ -47,7 +47,7 @@ template <typename MapT>
 void remap_topk_ids_to_rank_slot_impl(const int16_t *ids, int64_t ids_stride0, int64_t ids_stride1,
                                       int16_t *buf, int64_t buf_stride0, int64_t buf_stride1, int64_t num_tokens,
                                       int64_t topk, const MapT *dispatch_map, int64_t num_logical_experts,
-                                      int64_t num_local_physical_experts)
+                                      int64_t num_local_physical_experts, int64_t moe_tp_size)
 {
     for (int64_t i = 0; i < num_tokens; ++i) {
         for (int64_t j = 0; j < topk; ++j) {
@@ -56,7 +56,7 @@ void remap_topk_ids_to_rank_slot_impl(const int16_t *ids, int64_t ids_stride0, i
                         "remap_topk_ids_to_rank_slot_kunpeng: logical expert id ", logical,
                         " out of range [0, ", num_logical_experts, ")");
             int64_t physical = dispatch_map[logical];
-            int64_t rank = physical / num_local_physical_experts;
+            int64_t rank = (physical / num_local_physical_experts) * moe_tp_size;
             int64_t local = physical % num_local_physical_experts;
             buf[i * buf_stride0 + (2 * j) * buf_stride1] = static_cast<int16_t>(rank);
             buf[i * buf_stride0 + (2 * j + 1) * buf_stride1] = static_cast<int16_t>(local);
@@ -67,7 +67,7 @@ void remap_topk_ids_to_rank_slot_impl(const int16_t *ids, int64_t ids_stride0, i
 }  // namespace
 
 void remap_topk_ids_to_rank_slot_kunpeng(at::Tensor topk_ids, at::Tensor full_buf, at::Tensor dispatch_map,
-                                         int64_t num_physical_experts, int64_t ep_size)
+                                         int64_t num_physical_experts, int64_t ep_size, int64_t moe_tp_size)
 {
     TORCH_CHECK(topk_ids.scalar_type() == at::kShort, "remap_topk_ids_to_rank_slot_kunpeng: topk_ids must be int16");
     TORCH_CHECK(full_buf.scalar_type() == at::kShort, "remap_topk_ids_to_rank_slot_kunpeng: full_buf must be int16");
@@ -80,7 +80,8 @@ void remap_topk_ids_to_rank_slot_kunpeng(at::Tensor topk_ids, at::Tensor full_bu
     TORCH_CHECK(dispatch_map.dim() == 1, "remap_topk_ids_to_rank_slot_kunpeng: dispatch_map must be 1D");
     TORCH_CHECK(dispatch_map.scalar_type() == at::kLong || dispatch_map.scalar_type() == at::kInt,
                 "remap_topk_ids_to_rank_slot_kunpeng: dispatch_map must be int64 or int32");
-    TORCH_CHECK(num_physical_experts > 0 && ep_size > 0, "remap_topk_ids_to_rank_slot_kunpeng: sizes must be positive");
+    TORCH_CHECK(num_physical_experts > 0 && ep_size > 0 && moe_tp_size > 0,
+                "remap_topk_ids_to_rank_slot_kunpeng: sizes must be positive");
     TORCH_CHECK(num_physical_experts % ep_size == 0,
                 "remap_topk_ids_to_rank_slot_kunpeng: num_physical_experts must be divisible by ep_size");
 
@@ -98,11 +99,11 @@ void remap_topk_ids_to_rank_slot_kunpeng(at::Tensor topk_ids, at::Tensor full_bu
     if (dispatch_map.scalar_type() == at::kLong) {
         remap_topk_ids_to_rank_slot_impl(ids, topk_ids.stride(0), topk_ids.stride(1), buf, full_buf.stride(0),
                                          full_buf.stride(1), num_tokens, topk, dispatch_map.data_ptr<int64_t>(),
-                                         num_logical_experts, num_local_physical_experts);
+                                         num_logical_experts, num_local_physical_experts, moe_tp_size);
     } else {
         remap_topk_ids_to_rank_slot_impl(ids, topk_ids.stride(0), topk_ids.stride(1), buf, full_buf.stride(0),
                                          full_buf.stride(1), num_tokens, topk, dispatch_map.data_ptr<int32_t>(),
-                                         num_logical_experts, num_local_physical_experts);
+                                         num_logical_experts, num_local_physical_experts, moe_tp_size);
     }
 }
 
@@ -115,7 +116,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.def(
         "remap_topk_ids_to_rank_slot_kunpeng("
         "Tensor topk_ids, Tensor(a!) full_buf, Tensor dispatch_map, "
-        "int num_physical_experts, int ep_size) -> ()");
+        "int num_physical_experts, int ep_size, int moe_tp_size) -> ()");
     m.impl("remap_topk_ids_to_rank_slot_kunpeng", remap_topk_ids_to_rank_slot_kunpeng);
 }
 

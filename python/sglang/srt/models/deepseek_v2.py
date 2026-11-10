@@ -912,6 +912,7 @@ class DeepseekV2MoE(nn.Module):
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
+                    is_nextn=self.is_nextn,
                 ),
             )
         else:
@@ -1168,6 +1169,7 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
+                        is_nextn=self.is_nextn,
                     ),
                 )
         else:
@@ -1742,7 +1744,11 @@ class DeepseekV2AttentionMLA(
             # Sharded computation within socket TP group via sgl_kernel GEMM:
             # each rank computes its weight shard, then all-gather the result.
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            qkv_latent = get_socket_tp_group().batch_all_gather(qkv_latent, dim=-1)
+            qkv_latent = get_socket_tp_group().batch_all_gather(
+                qkv_latent,
+                dim=-1,
+                profile_name="shm_batched_allgather_kunpeng@qkv_latent",
+            )
             return qkv_latent
         if (
             (not isinstance(hidden_states, tuple))

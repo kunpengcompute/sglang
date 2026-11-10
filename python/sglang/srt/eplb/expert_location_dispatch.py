@@ -33,13 +33,17 @@ class ExpertLocationDispatchInfo:
     num_physical_experts: int
 
     @classmethod
-    def init_new(cls, layer_id: int):
-        ep_dispatch_algorithm = get_global_server_args().ep_dispatch_algorithm
+    def init_new(cls, layer_id: int, is_nextn: bool = False):
+        server_args = get_global_server_args()
+        ep_dispatch_algorithm = server_args.ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
 
         if ep_dispatch_algorithm is None:
             return None
+
+        if is_nextn and server_args.moe_a2a_backend == "kunpeng_cpu":
+            layer_id = expert_location_metadata.num_layers - 1
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,

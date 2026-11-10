@@ -100,9 +100,14 @@ void init_tiling_impl()
                 std::string line;
                 while (std::getline(file, line)) {
                     ++line_no;
-                    while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                    // Strip inline comments: '#' and everything after it,
+                    // then trim trailing whitespace.
+                    auto comment = line.find('#');
+                    if (comment != std::string::npos) line.resize(comment);
+                    while (!line.empty() &&
+                           (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
                         line.pop_back();
-                    if (line.empty() || line[0] == '#') continue;
+                    if (line.empty()) continue;
 
                     std::stringstream ss(line);
                     std::string token;

@@ -3182,12 +3182,7 @@ class ServerArgs:
         assert (
             self.moe_dp_size == 1
         ), "Kunpeng ETP v1 only supports moe_dp_size == 1"
-        assert (
-            not self.enable_eplb
-        ), "Kunpeng ETP v1 does not support EPLB (expert location must be trivial)"
-        assert (
-            self.init_expert_location == "trivial"
-        ), "Kunpeng ETP v1 requires init_expert_location == 'trivial'"
+        assert not self.enable_eplb, "Kunpeng ETP v1 does not support online EPLB"
         assert (
             self.ep_num_redundant_experts == 0
         ), "Kunpeng ETP v1 does not support redundant experts"
@@ -3203,12 +3198,20 @@ class ServerArgs:
         assert (
             os.environ.get("ENABLE_STATIC_ROUTING", "0") != "1"
         ), "Kunpeng ETP v1 does not support static routing (ENABLE_STATIC_ROUTING must be 0)"
-        if os.environ.get(
+        force_load_balance = os.environ.get(
             "SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE", "false"
         ).lower() in (
             "1",
             "true",
-        ):
+        )
+        assert not (
+            force_load_balance
+            and (
+                self.expert_distribution_recorder_mode is not None
+                or self.init_expert_location != "trivial"
+            )
+        ), "Kunpeng ETP static EPLB requires SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE=0"
+        if force_load_balance:
             # Perf-test only: force balance rewrites logical topk ids before
             # the ETP group-slot mapping, so it runs through the shared topk
             # postprocess. Routing correctness is not preserved (same caveat
@@ -3235,6 +3238,15 @@ class ServerArgs:
             self.ep_dispatch_algorithm is None
         ):
             self.ep_dispatch_algorithm = "static"
+
+        if (
+            self.moe_a2a_backend == "kunpeng_cpu"
+            and self.ep_size < self.tp_size
+            and self.init_expert_location != "trivial"
+        ):
+            assert (
+                self.ep_dispatch_algorithm == "static"
+            ), "Kunpeng ETP only supports ep_dispatch_algorithm='static' for expert-location import"
 
         if self.enable_eplb:
             assert self.ep_size > 1

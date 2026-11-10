@@ -33,7 +33,7 @@ conda activate sgl-cpu
 
 运行与编译还需依赖以下两个组件，具体安装步骤请前往对应仓库查看：
 
-- **kutacc**：鲲鹏CPU通信与算子库（RDMA集合通信、shm allreduce等），使用<https://gitcode.com/zhengzhong722/kutacc/tree/br_sglang>分支（RDMA allgather/broadcast功能需使用sglang_930分支构建，见3.7.1第8条）。
+- **kutacc**：鲲鹏CPU通信与算子库（RDMA集合通信、shm allreduce等），使用<https://gitcode.com/zhengzhong722/kutacc/tree/sglang_930>分支。
 - **kupl**：鲲鹏加速运行时（kupl多线程后端、SHM/SDMA等），使用<https://gitcode.com/kunpengcompute/kupl/tree/sglang_830>分支。
 
 在PD（Prefill-Decode）分离部署模式下，需额外安装SGLang Model Gateway与Mooncake两个组件，以实现Prefill实例与Decode实例之间的请求分配以及KVCache数据传输：
@@ -442,7 +442,7 @@ export ENABLE_KUNPENG_HICACHE=0  # 默认关
 **多线程后端**
 
 - **KUPL\_EXECUTOR\_BACKEND** / **KUPL\_EXECUTOR\_COUNT**：指定kupl多线程后端与线程数。常规PyTorch仅支持omp。`KUPL_EXECUTOR_COUNT`默认33（`KUTACC_ASYNC_LAUNCH=0`时需设为32）。
-- **KUTACC\_FUSEDMOE\_MULTIEXPT**：kutacc fusedmoe多专家并行分组数（decode侧）。默认0=串行逐专家（位精确）；设为G时worker池分为G组，每组负责一份本地专家。
+- **KUTACC\_FUSEDMOE\_MULTI\_OPERAND\_GEMM**：kutacc fusedmoe gateup 多操作数 GEMM（decode 侧）。默认 1 = 8 个本地专家的 streaming/ZA 入口合并为一次内核调用；0 = 逐专家调用（回退）。
 
 **其他**
 
@@ -465,7 +465,7 @@ export ENABLE_KUNPENG_HICACHE=0  # 默认关
 
 ## 4. 正确性验证
 
-验证脚本`scripts/cpu_kunpeng/curl.sh`支持多种功能，以下为常用用法。
+验证脚本`scripts/cpu_kunpeng/curl.sh`支持多种功能，以下为常用用法；`scripts/cpu_kunpeng/client/tokenize.py`用于统计prompt的实际token数。
 
 ### 4.1 基本用法
 
@@ -476,7 +476,10 @@ sh curl.sh -n 10 -m 20           # 10个请求
 sh curl.sh -s -f prompts/1k.txt  # 长prompt
 sh curl.sh -J -f chat.jsonl      # chat模式：-f为JSONL请求体，直发/v1/chat/completions
 sh curl.sh -i                    # 多轮交互式对话
+python3 client/tokenize.py -f prompts/1k.txt  # 统计prompt的token数（发往/v1/tokenize）
 ```
+
+`client/tokenize.py`用法：`-f FILE[,FILE...]|DIR`指定prompt来源（每个文件整体作为一个prompt，支持多行；多个文件用逗号分隔；目录取其中`*.txt`/`*.md`按文件名排序逐个作为prompt）。目标地址可用`HOST`/`PORT`环境变量覆盖（默认`ROUTER_IP`或`127.0.0.1`的30000端口）。
 
 ### 4.2 路由测试
 

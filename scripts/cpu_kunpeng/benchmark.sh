@@ -70,6 +70,15 @@ DEFAULT_SHAREGPT_NUM_PROMPTS=1000   # (sharegpt) number of requests
 # runtime/.user_env_base.sh to point at the pre-downloaded file; bench_serving
 # downloads from HuggingFace only when this is empty, which offline nodes can't.
 DEFAULT_SHAREGPT_DATASET_PATH=/data/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json
+# (sharegpt) dataset mode: sharegpt (real conversations) or random (fixed-length
+# prompts built from ShareGPT tokens). "random*" is passed through to
+# bench_serving, so random-ids (pure integer tokens, no ShareGPT file) works too.
+DEFAULT_SHAREGPT_DATASET_NAME=sharegpt
+DEFAULT_SHAREGPT_RANDOM_INPUT_LEN=1024
+DEFAULT_SHAREGPT_RANDOM_OUTPUT_LEN=1024
+# 1 = strictly fixed in/out lengths; 0 = uniform in [1, full_len]
+DEFAULT_SHAREGPT_RANDOM_RANGE_RATIO=1
+DEFAULT_SHAREGPT_MAX_CONCURRENCY=256
 # (sharegpt) client core binding. Default reuses the aisbench client range
 # (DEFAULT_AIS_TASKSET_CPUS, tuned in runtime/.user_env_base.sh, e.g.
 # 532-568 = NUMA 14) — a NUMA that is idle on the router node. Override with
@@ -101,7 +110,9 @@ Available test suites (4):
   sharegpt Perf run via the official sglang bench_serving on the local
            ShareGPT JSON (offline: never downloads from HuggingFace).
            Requires SHAREGPT_DATASET_PATH in runtime/.user_env_base.sh.
-           defaults: backend sglang, model glm-5.3, 1000 prompts
+           defaults: backend sglang, model glm-5.3, dataset-name sharegpt,
+           1000 prompts (SHAREGPT_DATASET_NAME=random switches to fixed-length
+           random prompts built from ShareGPT tokens)
   aisbench Throughput/perf run via ais_bench (in a dedicated conda env).
            Patches the two ais_bench config files in place, switches to the
            ais_bench conda env, then runs "ais_bench --mode perf".
@@ -111,6 +122,10 @@ Env overrides (runtime): HOST PORT PARALLEL
   gsm8k:    NUM_QUESTIONS NUM_SHOTS MAX_NEW_TOKENS TEMPERATURE DATA_PATH
   mmlu:     NTRAIN NSUB BACKEND RESULT_FILE RAW_RESULT_FILE DATA_DIR
   sharegpt: SHAREGPT_BACKEND SHAREGPT_MODEL SHAREGPT_NUM_PROMPTS
+            SHAREGPT_DATASET_NAME (sharegpt / random / random-ids)
+            SHAREGPT_RANDOM_INPUT_LEN SHAREGPT_RANDOM_OUTPUT_LEN
+            SHAREGPT_RANDOM_RANGE_RATIO (1=fixed, 0=uniform 1..len)
+            SHAREGPT_MAX_CONCURRENCY
             SHAREGPT_DATASET_PATH (dataset path default is in this script;
             tokenizer reuses ST_TOKENIZER, i.e. $MODEL_PATH; port defaults to
             the gateway's 30000 and is overridden by PORT)
@@ -134,6 +149,8 @@ Examples:
   bash benchmark.sh mmlu  --nsub 60 --parallel 32
   bash benchmark.sh mmlu -h    # show the mmlu python script's own args
   SHAREGPT_NUM_PROMPTS=2000 bash benchmark.sh sharegpt
+  SHAREGPT_DATASET_NAME=random bash benchmark.sh sharegpt \
+      --output-file /tmp/collect.jsonl
   AIS_REQUESTS=512 AIS_IN_LEN=1024 AIS_OUT_LEN=256 bash benchmark.sh aisbench
 EOF
 }
@@ -298,15 +315,26 @@ case "$SUITE" in
         fi
         export HF_HUB_OFFLINE=1
         export TRANSFORMERS_OFFLINE=1
+        SHAREGPT_DATASET_NAME="${SHAREGPT_DATASET_NAME:-$DEFAULT_SHAREGPT_DATASET_NAME}"
+        random_args=()
+        if [[ "$SHAREGPT_DATASET_NAME" == random* ]]; then
+            random_args=(
+                --random-input-len "${SHAREGPT_RANDOM_INPUT_LEN:-$DEFAULT_SHAREGPT_RANDOM_INPUT_LEN}"
+                --random-output-len "${SHAREGPT_RANDOM_OUTPUT_LEN:-$DEFAULT_SHAREGPT_RANDOM_OUTPUT_LEN}"
+                --random-range-ratio "${SHAREGPT_RANDOM_RANGE_RATIO:-$DEFAULT_SHAREGPT_RANDOM_RANGE_RATIO}"
+                --max-concurrency "${SHAREGPT_MAX_CONCURRENCY:-$DEFAULT_SHAREGPT_MAX_CONCURRENCY}"
+            )
+        fi
         exec "${launch_prefix[@]}" python3 -m sglang.bench_serving \
             --backend "${SHAREGPT_BACKEND:-$DEFAULT_SHAREGPT_BACKEND}" \
             --host "$GATEWAY_HOST" \
             --port "${PORT:-$DEFAULT_SHAREGPT_PORT}" \
             --model "${SHAREGPT_MODEL:-$DEFAULT_SHAREGPT_MODEL}" \
             --tokenizer "${ST_TOKENIZER:-$MODEL_PATH}" \
-            --dataset-name sharegpt \
+            --dataset-name "$SHAREGPT_DATASET_NAME" \
             --dataset-path "${SHAREGPT_DATASET_PATH:-$DEFAULT_SHAREGPT_DATASET_PATH}" \
             --num-prompts "${SHAREGPT_NUM_PROMPTS:-$DEFAULT_SHAREGPT_NUM_PROMPTS}" \
+            "${random_args[@]}" \
             "$@"
         ;;
     *)

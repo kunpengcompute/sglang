@@ -863,12 +863,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if _is_kunpeng_extend_pad and self.forward_mode == ForwardMode.EXTEND:
             for i in range(sync_group_size):
-                # make sure that the padded length is a power of 2.
-                global_num_tokens[i] = (
-                    1 << (global_num_tokens[i] - 1).bit_length()
-                    if global_num_tokens[i] > 0
-                    else 0
-                )
+                n = global_num_tokens[i]
+                if n <= 0:
+                    global_num_tokens[i] = 0
+                elif n <= 64:
+                    # One HiCache page: every short tail chunk shares one graph.
+                    global_num_tokens[i] = 64
+                else:
+                    # Power of two: bounds the number of prefill graph shapes
+                    # for the long tail chunks.
+                    global_num_tokens[i] = 1 << (n - 1).bit_length()
 
         # On 920F, spec batches (TARGET_VERIFY / DRAFT_EXTEND) derive their
         # batch size as `num_tokens // spec_info.num_tokens_per_req`, and the

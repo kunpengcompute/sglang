@@ -108,7 +108,7 @@ export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB="${SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB:
 # "[hicache]" logs. Off by default; server.sh wires it for prefill.
 # ------------------------------------------------------------
 export ENABLE_KUNPENG_HICACHE="${ENABLE_KUNPENG_HICACHE:-0}"
-export KUNPENG_HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-mooncake}"
+export KUNPENG_HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
 export KUNPENG_HICACHE_L1L3="${KUNPENG_HICACHE_L1L3:-1}"
 export KUNPENG_HICACHE_L3_DIR="${KUNPENG_HICACHE_L3_DIR:-}"
 export KUNPENG_HICACHE_RATIO="${KUNPENG_HICACHE_RATIO:-1.0}"
@@ -130,6 +130,8 @@ export SGLANG_KUNPENG_SWAP_EXPERT="${SGLANG_KUNPENG_SWAP_EXPERT:-1}"
 export SGLANG_KUNPENG_MAX_SEQ_NUM="${SGLANG_KUNPENG_MAX_SEQ_NUM:-8}"
 export SGLANG_KUNPENG_MAX_CUR_LEN="${SGLANG_KUNPENG_MAX_CUR_LEN:-576}"
 export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-65536}"
+# Fused MoE GEMM inner tile (rows); 2048 = prefill reference. Sync with ep_moe/layer.py.
+export KUTACC_FUSEDMOE_TILEBUF="${KUTACC_FUSEDMOE_TILEBUF:-2048}"
 
 # Per-server overrides (sourced after role defaults so they take priority).
 # With an instance (env.sh prefill 128p -> INSTANCE=128p), ONLY the instance

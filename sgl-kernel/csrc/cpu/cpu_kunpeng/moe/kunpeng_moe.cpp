@@ -60,6 +60,23 @@ static bool _read_is_prefill_default_true()
 }
 static bool g_is_prefill = _read_is_prefill_default_true();
 
+// Fused MoE GEMM inner tile (rows), overridable via KUTACC_FUSEDMOE_TILEBUF;
+// must match fusedmoe_fixed_size in python/sglang/srt/layers/moe/ep_moe/layer.py.
+static int64_t get_fusedmoe_tilebuf_size()
+{
+    static const int64_t size = []() {
+        int64_t fallback = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
+        int64_t v = fallback;
+        const char *env = std::getenv("KUTACC_FUSEDMOE_TILEBUF");
+        if (env != nullptr && env[0] != '\0') {
+            int64_t parsed = std::atoll(env);
+            if (parsed > 0) v = parsed;
+        }
+        return v;
+    }();
+    return size;
+}
+
 #ifdef SGLANG_KUNPENG_DEBUG_EXPERT_LOAD
 namespace {
 
@@ -753,7 +770,7 @@ void igemm_fusedmoe_gateup_kunpeng(at::Tensor act,                // [recv_size,
     if (bs == 0) return;
 
     auto t = igemm_find_optimal_tiling_plan(bs, N, K);
-    int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
+    int64_t fusedmoe_tilebuf_size = get_fusedmoe_tilebuf_size();
 
     // 2-local-expert case: n_slice from the (m0, m1) table, same as
     // DeepSeek-V3-Sample; consumed by kutacc only on the bs <= tilebuf
@@ -812,7 +829,7 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
     float *pby_data = tmpy.data_ptr<float>();
 
     auto t = igemm_find_optimal_tiling_plan(bs, N, K);
-    int64_t fusedmoe_tilebuf_size = g_is_prefill ? PREFILL_FUSEDMOE_TILEBUF : DECODE_FUSEDMOE_TILEBUF;
+    int64_t fusedmoe_tilebuf_size = get_fusedmoe_tilebuf_size();
 
     // 2-local-expert case: n_slice from the (m0, m1) table, same as
     // DeepSeek-V3-Sample; consumed by kutacc only on the bs <= tilebuf
@@ -1480,7 +1497,7 @@ void moe_etp_reduce_kunpeng(at::Tensor moe_down, at::Tensor etp_total, at::Tenso
     // which is ordered behind the leader's next bcast, i.e. behind this
     // reduce completing on all ranks.  SVE pattern mirrors kutacc's combine
     // reduction; pool-parallel over rows, summation order (p ascending) is
-    // bit-identical to the previous leader-only implementation.
+    // fixed, so the result is reproducible run to run.
     const int64_t chunk = (total + moe_tp_size - 1) / moe_tp_size;
     int64_t seg_begin = gid * chunk;
     int64_t seg_end = seg_begin + chunk;
@@ -1488,7 +1505,7 @@ void moe_etp_reduce_kunpeng(at::Tensor moe_down, at::Tensor etp_total, at::Tenso
     if (seg_end > total) seg_end = total;
 
     kutacc::parallel_for(seg_begin, seg_end, 1, [&](int64_t row_begin, int64_t row_end) {
-        const int64_t vec_bf16 = svcntb();
+        const int64_t vec_bf16 = svcnth();  // bf16 elements, not svcntb() bytes
         const svbool_t ptrue32 = svptrue_b16();
         const svbfloat16_t sve_zero = svdup_bf16(0.0f);
         for (int64_t i = row_begin; i < row_end; ++i) {

@@ -77,6 +77,12 @@ def register_primitives():
         + [ctypes.c_void_p, ctypes.c_int64]
     )
     gdn.qwen36_gdn_decode_with_workspace.restype = ctypes.c_int
+    gdn.qwen36_gdn_verify_with_workspace.argtypes = (
+        [ctypes.c_void_p] * 12
+        + [ctypes.c_int64] * 13
+        + [ctypes.c_void_p, ctypes.c_int64]
+    )
+    gdn.qwen36_gdn_verify_with_workspace.restype = ctypes.c_int
     norm.qwen36_gdn_rmsnorm_gated_bf16_serial.argtypes = (
         [ctypes.c_void_p] * 4 + [ctypes.c_int64] * 2 + [ctypes.c_float]
     )
@@ -85,6 +91,10 @@ def register_primitives():
         ctypes.c_int64
     ] * 3
     conv.qwen36_gdn_causal_conv_bf16_row_major.restype = ctypes.c_int
+    conv.qwen36_gdn_conv_verify_bf16_row_major.argtypes = (
+        [ctypes.c_void_p] * 7 + [ctypes.c_int64] * 6
+    )
+    conv.qwen36_gdn_conv_verify_bf16_row_major.restype = ctypes.c_int
     if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
         request_conv = conv.qwen36_gdn_causal_conv_bf16_row_major_requests
         request_conv.argtypes = conv.qwen36_gdn_causal_conv_bf16_row_major.argtypes
@@ -102,8 +112,10 @@ def register_primitives():
         fn.restype = ctypes.c_int
     for name, symbol in [
         ("qwen_gdn_decode", "qwen_graph_gdn_dispatch"),
+        ("qwen_gdn_verify", "qwen_graph_gdn_verify_dispatch"),
         ("qwen_gated_norm", "qwen_graph_norm_dispatch"),
         ("qwen_causal_conv", "qwen_graph_conv_dispatch"),
+        ("qwen_conv_verify", "qwen_graph_conv_verify_dispatch"),
         ("qwen_gqa_decode", "qwen_graph_gqa_dispatch"),
         ("qwen_qkv_layout", "qwen_graph_qkv_dispatch"),
         ("qwen_qknorm_rope", "qwen_graph_rope_dispatch"),
@@ -118,7 +130,7 @@ def register_primitives():
     def ar_pack_block_shape(x, partitions):
         if not (
             x.ndim == 2
-            and 128 < x.shape[0] <= 4096
+            and 0 < x.shape[0] <= 4096
             and x.shape[1] > 0
             and partitions > 0
             and x.shape[1] % partitions == 0
@@ -126,7 +138,7 @@ def register_primitives():
             and x.device.type == "cpu"
             and x.is_contiguous()
         ):
-            raise ValueError("Blocked AR Pack requires dense CPU BF16 large token rows")
+            raise ValueError("Blocked AR Pack requires dense CPU BF16 token rows")
         return [(tuple(x.shape), x.dtype)]
 
     register_op(
@@ -233,6 +245,49 @@ def register_primitives():
         return output
 
     register_op("qwen_gdn_decode", gdn_shape, gdn_eager)
+
+    def gdn_verify_shape(A, bias, q, k, v, a, b, state, indices, checkpoints, ckpt_indices, w):
+        validate_workspace(w, (A, bias, q, k, v, a, b, state, indices, checkpoints, ckpt_indices))
+        assert q.ndim == k.ndim == v.ndim == 3 and state.ndim == 4
+        assert checkpoints.ndim == 5 and q.shape[0] % checkpoints.shape[1] == 0
+        return [(tuple(v.shape), v.dtype)]
+
+    def gdn_verify_eager(A, bias, q, k, v, a, b, state, indices, checkpoints, ckpt_indices, w):
+        steps = checkpoints.shape[1]
+        batch = q.shape[0] // steps
+        assert w.numel() >= batch * (2 * q.shape[1] + 3 * v.shape[2])
+        output = torch.empty(v.shape, dtype=v.dtype)
+        tensors = [A, bias, q, k, v, a, b, state, indices, checkpoints, ckpt_indices, output]
+        validate_workspace(w, tensors)
+        # q/k/v/a/b may be strided projection partitions (dense rows only).
+        assert all(t.device.type == "cpu" and t.stride(-1) == 1 for t in tensors)
+        assert all(t.is_contiguous() for t in (bias, state, indices, checkpoints, ckpt_indices))
+        assert A.dtype == state.dtype == checkpoints.dtype == torch.float32
+        assert indices.dtype == ckpt_indices.dtype == torch.int32
+        assert all(t.dtype == torch.bfloat16 for t in (bias, q, k, v, a, b, output))
+        rc = gdn.qwen36_gdn_verify_with_workspace(
+            *(t.data_ptr() for t in tensors),
+            state.shape[0],
+            checkpoints.shape[0],
+            batch,
+            steps,
+            q.shape[1],
+            v.shape[1],
+            q.shape[2],
+            v.shape[2],
+            q.stride(0),
+            k.stride(0),
+            v.stride(0),
+            a.stride(0),
+            b.stride(0),
+            w.data_ptr(),
+            w.numel(),
+        )
+        if rc:
+            raise RuntimeError(f"GDN verify eager failed {rc}")
+        return output
+
+    register_op("qwen_gdn_verify", gdn_verify_shape, gdn_verify_eager)
     if os.getenv("SGLANG_KUNPENG_P20_GDN_POSTCONV_STRIDED", "0") == "1":
         _register_p20(bridge)
     if os.getenv("SGLANG_KUNPENG_P2_GDN_HEAD_PARALLEL", "0") == "1":
@@ -278,6 +333,36 @@ def register_primitives():
                 raise RuntimeError(f"Conv requests eager failed {rc}")
             return output
         register_op("qwen_p2_decode_conv_requests", lambda x, state, weight, indices: [(tuple(x.shape), x.dtype)], request_conv_eager)
+
+    def conv_verify_shape(x, state, weight, indices, checkpoints, ckpt_indices):
+        assert x.ndim == 2 and state.ndim == 3 and checkpoints.ndim == 4
+        assert x.shape[0] % checkpoints.shape[1] == 0
+        return [(tuple(x.shape), x.dtype)]
+
+    def conv_verify_eager(x, state, weight, indices, checkpoints, ckpt_indices):
+        steps = checkpoints.shape[1]
+        batch = x.shape[0] // steps
+        output = torch.empty(x.shape, dtype=x.dtype)
+        rc = conv.qwen36_gdn_conv_verify_bf16_row_major(
+            x.data_ptr(),
+            state.data_ptr(),
+            weight.data_ptr(),
+            indices.data_ptr(),
+            checkpoints.data_ptr(),
+            ckpt_indices.data_ptr(),
+            output.data_ptr(),
+            state.shape[0],
+            checkpoints.shape[0],
+            batch,
+            steps,
+            x.shape[1],
+            x.stride(0),
+        )
+        if rc:
+            raise RuntimeError(f"Conv verify eager failed {rc}")
+        return output
+
+    register_op("qwen_conv_verify", conv_verify_shape, conv_verify_eager)
 
     def gqa_shape(q, k, v, table, requests, lengths, scale):
         return [

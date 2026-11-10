@@ -377,6 +377,12 @@ class HiCacheStorage(ABC):
                 return i
         return len(keys)
 
+    def batch_exists_bits(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> List[bool]:
+        """Per-page existence for the sharded L3 hit query."""
+        return [self.batch_exists([key], extra_info) == 1 for key in keys]
+
     def clear(self) -> None:
         pass
 
@@ -607,6 +613,12 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
+
+    def batch_exists_bits(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> List[bool]:
+        """One `stat` per page; the sharded hit query splits these across ranks."""
+        return [self.exists(key) for key in keys]
 
     def supports_flat_io(self) -> bool:
         # Only the kunpeng two-tier HiCache path uses the flat interface; same

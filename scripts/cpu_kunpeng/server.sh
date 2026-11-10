@@ -99,6 +99,20 @@ if [[ -n "${INIT_EXPERT_LOCATION:-}" ]]; then
     BASE_ARGS+=(--init-expert-location "$INIT_EXPERT_LOCATION")
 fi
 
+# Static EPLB heat recording and import options
+if [[ -n "${EXPERT_DISTRIBUTION_RECORDER_MODE:-}" ]]; then
+    BASE_ARGS+=(--expert-distribution-recorder-mode "$EXPERT_DISTRIBUTION_RECORDER_MODE")
+fi
+if [[ -n "${EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE:-}" ]]; then
+    BASE_ARGS+=(--expert-distribution-recorder-buffer-size "$EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE")
+fi
+if [[ -n "${EPLB_REBALANCE_NUM_ITERATIONS:-}" ]]; then
+    BASE_ARGS+=(--eplb-rebalance-num-iterations "$EPLB_REBALANCE_NUM_ITERATIONS")
+fi
+if [[ -n "${EPLB_ALGORITHM:-}" ]]; then
+    BASE_ARGS+=(--eplb-algorithm "$EPLB_ALGORITHM")
+fi
+
 # Disable radix cache
 if [[ "$SGLANG_DISABLE_RADIX_CACHE" == "1" ]]; then
     BASE_ARGS+=(--disable-radix-cache)
@@ -130,7 +144,7 @@ case "$ROLE" in
         SPECIFIC_ARGS=(
             --disaggregation-mode prefill
             --max-prefill-tokens $((SGLANG_KUNPENG_MAX_SEQ_NUM * SGLANG_KUNPENG_MAX_CUR_LEN))
-            --max-total-tokens 65536
+            --max-total-tokens "${PREFILL_MAX_TOTAL_TOKENS:-131072}"
             --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
             --max-running-requests $((8 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
             --load-balance-method round_robin
@@ -141,7 +155,7 @@ case "$ROLE" in
     decode)
         SPECIFIC_ARGS=(
             --disaggregation-mode decode
-            --max-total-tokens 180000
+            --max-total-tokens "${DECODE_MAX_TOTAL_TOKENS:-180000}"
             --load-balance-method round_robin
             --decode-log-interval 1
             --num-reserved-decode-tokens 1024
@@ -184,15 +198,16 @@ esac
 #   (b) two tiers L1 DDR -> L3 storage, no L2 pool at all
 #       (KUNPENG_HICACHE_L1L3=1): the L2 pool and all of its machinery are gone,
 #       only a fixed flat I/O buffer is kept as the L3 bounce target.
-# Only the prefill and native roles participate. KUNPENG_HICACHE_BACKEND picks the L3 store:
+# Only the prefill and native roles participate. KUNPENG_HICACHE_BACKEND picks
+# the L3 store (default: file, which then requires KUNPENG_HICACHE_L3_DIR):
 #   file     per-page files under KUNPENG_HICACHE_L3_DIR (a directory shared by
-#            all prefill nodes); leave it empty to run L1<->L2 only. layer_first.
+#            all prefill nodes). layer_first.
 #   mooncake mooncake store master (launch.sh mooncake / launch.sh all); in the
 #            three-tier layout the store is page_first-only, so the host pool
 #            switches layout; the two-tier layout has no host pool to lay out.
 # Disabled unless ENABLE_KUNPENG_HICACHE=1.
 if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]]; then
-    HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-mooncake}"
+    HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
     BASE_ARGS+=(
         --enable-hierarchical-cache
         --hicache-io-backend kunpeng
@@ -222,7 +237,7 @@ if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICAC
     HICACHE_EXTRA_CONFIG_JSON=""
     if [[ -n "${KUNPENG_HICACHE_EXTRA_CONFIG:-}" ]]; then
         HICACHE_EXTRA_CONFIG_JSON="$KUNPENG_HICACHE_EXTRA_CONFIG"
-    elif [[ -n "${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-}" || -n "${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-}" ]]; then
+    elif [[ "${KUNPENG_HICACHE_PREFETCH_POLICY:-timeout}" == "timeout" ]]; then
         t_base="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE:-2}"
         t_per_k="${KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-0.5}"
         for v in "$t_base" "$t_per_k"; do
@@ -245,16 +260,17 @@ if [[ ( "$ROLE" == "prefill" || "$ROLE" == "native" ) && "${ENABLE_KUNPENG_HICAC
             )
             ;;
         file)
-            if [[ -n "${KUNPENG_HICACHE_L3_DIR:-}" ]]; then
-                mkdir -p "$KUNPENG_HICACHE_L3_DIR"
-                export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$KUNPENG_HICACHE_L3_DIR"
-                BASE_ARGS+=(
-                    --hicache-storage-backend file
-                    --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-timeout}"
-                )
-            else
-                echo "KUNPENG_HICACHE_L3_DIR is empty: HiCache L3 disabled, running L1<->L2 only" >&2
+            if [[ -z "${KUNPENG_HICACHE_L3_DIR:-}" ]]; then
+                echo "Error: KUNPENG_HICACHE_L3_DIR must be set when" >&2
+                echo "       ENABLE_KUNPENG_HICACHE=1 and KUNPENG_HICACHE_BACKEND=file" >&2
+                exit 1
             fi
+            mkdir -p "$KUNPENG_HICACHE_L3_DIR"
+            export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$KUNPENG_HICACHE_L3_DIR"
+            BASE_ARGS+=(
+                --hicache-storage-backend file
+                --hicache-storage-prefetch-policy "${KUNPENG_HICACHE_PREFETCH_POLICY:-timeout}"
+            )
             ;;
         *)
             echo "Error: unknown KUNPENG_HICACHE_BACKEND '$HICACHE_BACKEND' (expected file or mooncake)" >&2

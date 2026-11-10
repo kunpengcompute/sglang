@@ -33,18 +33,16 @@ cd "$SCRIPT_DIR"
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
 SKIP_CONDA=1 source ./env.sh "$ROLE" "$INSTANCE"
 
-# HiCache tp0-bcast leaves a POSIX shm segment (sgk_hicache_bcast_*) on each
+# HiCache tp-shard leaves a POSIX shm segment (sgk_hicache_shard_*) on each
 # node. It is created lazily at the first prefetch and never unlinked, so it
-# outlives the server. A later run with a different
-# KUNPENG_HICACHE_IO_BATCH_PAGES would attach the stale segment, index past
-# its end and kill the prefetch I/O thread (ValueError in tp0's publish,
-# struct.error in the other ranks' receive). Wipe it on stop whenever this
-# role/instance actually runs HiCache with tp0-bcast.
-CLEAN_HICACHE_BCAST=0
+# outlives the server. A later run with a different geometry would attach the
+# stale segment and index past its end. Wipe it on stop whenever this
+# role/instance actually runs HiCache with the tp-shard segment.
+CLEAN_HICACHE_SHARD=0
 if [[ "$ROLE" == "prefill" || "$ROLE" == "native" ]] &&
    [[ "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]] &&
-   [[ "${SGLANG_KUNPENG_HICACHE_TP0_BCAST:-0}" == "1" ]]; then
-    CLEAN_HICACHE_BCAST=1
+   [[ "${SGLANG_KUNPENG_HICACHE_TP_SHARD:-1}" == "1" ]]; then
+    CLEAN_HICACHE_SHARD=1
 fi
 
 # Convert space-separated IP list to array
@@ -94,9 +92,9 @@ for i in "${!NODES[@]}"; do
         fi
 
         rm -rf /dev/shm/shm_mmap_*
-        if [ "'"${CLEAN_HICACHE_BCAST}"'" = "1" ]; then
-            echo "Removing stale HiCache tp0-bcast shm on '"$node"'"
-            rm -f /dev/shm/sgk_hicache_bcast_*
+        if [ "'"${CLEAN_HICACHE_SHARD}"'" = "1" ]; then
+            echo "Removing stale HiCache TP shard shm on '"$node"'"
+            rm -f /dev/shm/sgk_hicache_shard_*
         fi
         for i in $(seq 0 31); do
             echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages

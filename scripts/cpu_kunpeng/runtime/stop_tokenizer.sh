@@ -90,6 +90,17 @@ fi
 ports=($(printf '%s\n' "${ports[@]}" | sort -u))
 masters=($(printf '%s\n' "${masters[@]}" | sort -u))
 
+# Deterministic port block per instance: HTTP port + MASTER_PORT..+6
+# (dist_init/tokenizer/detokenizer/rpc/metrics/tokenizer_worker/
+# scheduler_input). Swept after the cmdline-based kill so a leftover whose
+# argv moved after an INSTANCES change cannot hold the block.
+block_ports="${ports[*]}"
+for m in "${masters[@]}"; do
+    for ((o = 0; o <= 6; o++)); do
+        block_ports+=" $((m + o))"
+    done
+done
+
 # --port <p>/--dist-init-addr <host>:<p> with p in ports|masters, followed by
 # a space or end of line (so a port is never matched as a prefix of a longer
 # number). `\$` keeps the end anchor literal once embedded in the ssh command.
@@ -118,8 +129,41 @@ ssh "root@$ROUTER_IP" "
             echo \"Force killing:\$REMAINING\"
             kill -9 \$REMAINING 2>/dev/null
         fi
-        echo 'Tokenizer stopped.'
     else
         echo 'No tokenizer process found.'
     fi
+
+    # Port-block sweep: terminate (then force-kill) whatever still LISTENs
+    # on this instance's port block, regardless of its cmdline.
+    BLOCK_HELD=''
+    for p in $block_ports; do
+        HPIDS=\$(ss -lntp sport = :\$p 2>/dev/null | grep -oP 'pid=\K[0-9]+' | sort -u)
+        if [ -n \"\$HPIDS\" ]; then
+            echo \"Port \$p still held by pid(s):\$HPIDS; terminating\"
+            kill -15 \$HPIDS 2>/dev/null
+            BLOCK_HELD=\"\$BLOCK_HELD \$HPIDS\"
+        fi
+    done
+    if [ -n \"\$BLOCK_HELD\" ]; then
+        sleep 5
+        for p in $block_ports; do
+            HPIDS=\$(ss -lntp sport = :\$p 2>/dev/null | grep -oP 'pid=\K[0-9]+' | sort -u)
+            if [ -n \"\$HPIDS\" ]; then
+                echo \"Force killing holder(s) of port \$p:\$HPIDS\"
+                kill -9 \$HPIDS 2>/dev/null
+            fi
+        done
+        sleep 1
+    fi
+    LEFT=''
+    for p in $block_ports; do
+        HPIDS=\$(ss -lntp sport = :\$p 2>/dev/null | grep -oP 'pid=\K[0-9]+' | sort -u)
+        [ -n \"\$HPIDS\" ] && LEFT=\"\$LEFT \$p\"
+    done
+    if [ -n \"\$LEFT\" ]; then
+        echo \"WARNING: port(s)\$LEFT still held after stop\"
+    else
+        echo 'Port block clear.'
+    fi
+    echo 'Tokenizer stopped.'
 "

@@ -2,7 +2,8 @@
 
 The name/shard map contains model geometry, not data hashes or deployment paths.
 All components are loaded; unsupported vision/MTP execution remains gated by the
-model capability policy. Packing is still performed by DefaultModelLoader.
+model capability policy. Vision tensors are skipped when the target build has no
+vision tower. Packing is still performed by DefaultModelLoader.
 """
 
 import json
@@ -62,9 +63,14 @@ class UnifiedCheckpointLoader:
                         source.format(index=match[1] if match.groups() else "")
                     )
         dtypes = {"I8": torch.int8, "BF16": torch.bfloat16, "F32": torch.float32}
+        has_vision = any(name.startswith("visual.") for name in params)
         for name, tensor in weights:
             if name in seen:
                 raise ValueError(f"Duplicate checkpoint tensor: {name}")
+            if not has_vision and name.startswith("model.visual."):
+                # Text-only build: the checkpoint's vision tower has no target
+                # parameter, so its tensors stay out of loading and coverage.
+                continue
             seen.add(name)
             match = re.search(r"\.(?:layers|blocks)\.(\d+)\.", name)
             key = re.sub(r"\.(layers|blocks)\.\d+\.", r".\1.{index}.", name)

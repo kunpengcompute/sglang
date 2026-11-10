@@ -1577,75 +1577,104 @@ class MooncakeKVManager(CommonKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[0].decode("ascii")
-                # Staging: decode reports consumption watermark back to prefill
-                if room == "WATERMARK":
-                    wm_round = int(waiting_req_bytes[1].decode("ascii"))
-                    wm_tail = int(waiting_req_bytes[2].decode("ascii"))
-                    wm_session = (
-                        waiting_req_bytes[3].decode("ascii")
-                        if len(waiting_req_bytes) > 3
-                        else ""
-                    )
-                    with self._staging_ctx.watermark_cv:
-                        prev = self._staging_ctx.remote_watermarks.get(
-                            wm_session, (0, 0)
+                # Do NOT let this thread die: it is the ONLY consumer of the
+                # decode-side metadata (send_metadata) and KVArgs registrations.
+                # A dead thread leaves every later request stuck in
+                # KVPoll.Bootstrapping on the prefill side until
+                # SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT (observed as bootstrap
+                # timeouts + "Aborted by AbortReq" wedges).
+                room_repr = None
+                try:
+                    room = waiting_req_bytes[0].decode("ascii")
+                    room_repr = room
+                    # Staging: decode reports consumption watermark back to prefill
+                    if room == "WATERMARK":
+                        wm_round = int(waiting_req_bytes[1].decode("ascii"))
+                        wm_tail = int(waiting_req_bytes[2].decode("ascii"))
+                        wm_session = (
+                            waiting_req_bytes[3].decode("ascii")
+                            if len(waiting_req_bytes) > 3
+                            else ""
                         )
-                        if (wm_round, wm_tail) > prev:
-                            self._staging_ctx.remote_watermarks[wm_session] = (
-                                wm_round,
-                                wm_tail,
+                        with self._staging_ctx.watermark_cv:
+                            prev = self._staging_ctx.remote_watermarks.get(
+                                wm_session, (0, 0)
                             )
-                            self._staging_ctx.watermark_cv.notify_all()
-                    continue
-                # Staging: decode replies with allocated staging offset
-                if room == "STAGING_RSP":
-                    stg_room = int(waiting_req_bytes[1].decode("ascii"))
-                    stg_chunk_idx = int(waiting_req_bytes[2].decode("ascii"))
-                    stg_offset = int(waiting_req_bytes[3].decode("ascii"))
-                    stg_round = int(waiting_req_bytes[4].decode("ascii"))
-                    stg_end = int(waiting_req_bytes[5].decode("ascii"))
-                    stg_session = waiting_req_bytes[6].decode("ascii")
-                    room_infos = self.transfer_infos.get(stg_room, {})
-                    tinfo = room_infos.get(stg_session)
-                    if tinfo is not None:
-                        if tinfo.staging is None:
-                            tinfo.staging = StagingTransferInfo()
-                        tinfo.staging.set_chunk(
-                            stg_chunk_idx, stg_offset, stg_round, stg_end
+                            if (wm_round, wm_tail) > prev:
+                                self._staging_ctx.remote_watermarks[wm_session] = (
+                                    wm_round,
+                                    wm_tail,
+                                )
+                                self._staging_ctx.watermark_cv.notify_all()
+                        continue
+                    # Staging: decode replies with allocated staging offset
+                    if room == "STAGING_RSP":
+                        stg_room = int(waiting_req_bytes[1].decode("ascii"))
+                        stg_chunk_idx = int(waiting_req_bytes[2].decode("ascii"))
+                        stg_offset = int(waiting_req_bytes[3].decode("ascii"))
+                        stg_round = int(waiting_req_bytes[4].decode("ascii"))
+                        stg_end = int(waiting_req_bytes[5].decode("ascii"))
+                        stg_session = waiting_req_bytes[6].decode("ascii")
+                        room_infos = self.transfer_infos.get(stg_room, {})
+                        tinfo = room_infos.get(stg_session)
+                        if tinfo is not None:
+                            if tinfo.staging is None:
+                                tinfo.staging = StagingTransferInfo()
+                            tinfo.staging.set_chunk(
+                                stg_chunk_idx, stg_offset, stg_round, stg_end
+                            )
+                        else:
+                            logger.warning(
+                                "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
+                                stg_room,
+                                stg_chunk_idx,
+                                stg_session,
+                            )
+                        continue
+                    mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                    if room == "None":
+                        reg_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                        self.decode_kv_args_table[mooncake_session_id] = reg_info
+                        with self.session_lock:
+                            if mooncake_session_id in self.failed_sessions:
+                                self.failed_sessions.remove(mooncake_session_id)
+                            if mooncake_session_id in self.session_failures:
+                                del self.session_failures[mooncake_session_id]
+                        logger.debug(
+                            f"Register KVArgs from {mooncake_session_id} successfully"
                         )
+                        continue
                     else:
-                        logger.warning(
-                            "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
-                            stg_room,
-                            stg_chunk_idx,
-                            stg_session,
+                        required_dst_info_num = int(
+                            waiting_req_bytes[7].decode("ascii")
                         )
-                    continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    reg_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    self.decode_kv_args_table[mooncake_session_id] = reg_info
-                    with self.session_lock:
-                        if mooncake_session_id in self.failed_sessions:
-                            self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_failures:
-                            del self.session_failures[mooncake_session_id]
-                    logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
-                    )
-                    continue
-                else:
-                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
-                    room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
+                        room = int(room)
+                        room_repr = str(room)
+                        if room not in self.transfer_infos:
+                            self.transfer_infos[room] = {}
 
-                    tinfo = TransferInfo.from_zmq(waiting_req_bytes)
-                    self.transfer_infos[room][mooncake_session_id] = tinfo
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.update_status(room, KVPoll.WaitingForInput)
+                        tinfo = TransferInfo.from_zmq(waiting_req_bytes)
+                        self.transfer_infos[room][mooncake_session_id] = tinfo
+                        # NOTE: after bootstrapping we can mark the req as waiting for input
+                        if len(self.transfer_infos[room]) == required_dst_info_num:
+                            self.update_status(room, KVPoll.WaitingForInput)
+                except Exception as e:
+                    logger.error(
+                        f"Prefill bootstrap thread exception (bootstrap_port={self.bootstrap_port}, "
+                        f"room={room_repr}): {e!r}",
+                        exc_info=True,
+                    )
+                    # Fail the affected room fast (when identifiable) so its
+                    # request errors out immediately instead of waiting for
+                    # SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.
+                    try:
+                        room_int = int(room_repr)
+                        self.record_failure(
+                            room_int, f"Prefill bootstrap thread exception: {e!r}"
+                        )
+                        self.update_status(room_int, KVPoll.Failed)
+                    except (TypeError, ValueError):
+                        pass
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -1657,75 +1686,99 @@ class MooncakeKVManager(CommonKVManager):
 
             while True:
                 msg = self.server_socket.recv_multipart()
-                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
-                    self._handle_aux_data(msg)
-                    continue
-
-                # Staging: prefill notifies a chunk written to staging buffer
-                if msg[0] == b"CHUNK_READY":
-                    room = int(msg[1].decode("ascii"))
-                    chunk_idx = int(msg[2].decode("ascii"))
-                    page_start = int(msg[3].decode("ascii"))
-                    num_pages = int(msg[4].decode("ascii"))
-                    session_id = msg[5].decode("ascii")
-                    self._chunk_writer_counts[room][chunk_idx].append(
-                        (page_start, num_pages, session_id)
-                    )
-                    handler = self._staging_handler
-                    assert (
-                        handler is not None
-                    ), "CHUNK_READY received before staging handler initialized"
-                    writers_arrived = len(self._chunk_writer_counts[room][chunk_idx])
-                    decode_req = handler._room_to_decode_req.get(room)
-                    if decode_req is None:
-                        logger.warning(
-                            "CHUNK_READY received for unregistered room=%s chunk=%d, skipping",
-                            room,
-                            chunk_idx,
-                        )
+                # Do NOT let this thread die: it is the ONLY consumer of the
+                # prefill transfer-status notifications. A dead thread leaves
+                # every later request stuck in KVPoll.WaitingForInput until
+                # SGLANG_DISAGGREGATION_WAITING_TIMEOUT.
+                room_repr = None
+                try:
+                    if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
+                        self._handle_aux_data(msg)
                         continue
-                    num_writers = handler.num_writers_for(decode_req)
-                    if writers_arrived >= num_writers:
-                        handler.submit_chunk_scatter(
-                            room, chunk_idx, page_start, num_pages
+
+                    # Staging: prefill notifies a chunk written to staging buffer
+                    if msg[0] == b"CHUNK_READY":
+                        room = int(msg[1].decode("ascii"))
+                        room_repr = str(room)
+                        chunk_idx = int(msg[2].decode("ascii"))
+                        page_start = int(msg[3].decode("ascii"))
+                        num_pages = int(msg[4].decode("ascii"))
+                        session_id = msg[5].decode("ascii")
+                        self._chunk_writer_counts[room][chunk_idx].append(
+                            (page_start, num_pages, session_id)
                         )
-                        del self._chunk_writer_counts[room][chunk_idx]
-                    continue
-
-                # Staging: prefill pre-requests staging allocation before forward
-                if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
-                    continue
-
-                bootstrap_room, status, prefill_rank = msg
-                status = int(status.decode("ascii"))
-                bootstrap_room = int(bootstrap_room.decode("ascii"))
-                prefill_rank = int(prefill_rank.decode("ascii"))
-
-                if status == KVPoll.Success:
-                    if bootstrap_room in self.request_status:
-                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
-                        expected_response_num = (
-                            self.required_prefill_response_num_table.get(
-                                bootstrap_room, -1
+                        handler = self._staging_handler
+                        assert (
+                            handler is not None
+                        ), "CHUNK_READY received before staging handler initialized"
+                        writers_arrived = len(self._chunk_writer_counts[room][chunk_idx])
+                        decode_req = handler._room_to_decode_req.get(room)
+                        if decode_req is None:
+                            logger.warning(
+                                "CHUNK_READY received for unregistered room=%s chunk=%d, skipping",
+                                room,
+                                chunk_idx,
                             )
+                            continue
+                        num_writers = handler.num_writers_for(decode_req)
+                        if writers_arrived >= num_writers:
+                            handler.submit_chunk_scatter(
+                                room, chunk_idx, page_start, num_pages
+                            )
+                            del self._chunk_writer_counts[room][chunk_idx]
+                        continue
+
+                    # Staging: prefill pre-requests staging allocation before forward
+                    if msg[0] == b"STAGING_REQ":
+                        self._handle_staging_req(msg)
+                        continue
+
+                    bootstrap_room, status, prefill_rank = msg
+                    status = int(status.decode("ascii"))
+                    bootstrap_room = int(bootstrap_room.decode("ascii"))
+                    room_repr = str(bootstrap_room)
+                    prefill_rank = int(prefill_rank.decode("ascii"))
+
+                    if status == KVPoll.Success:
+                        if bootstrap_room in self.request_status:
+                            self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+                            expected_response_num = (
+                                self.required_prefill_response_num_table.get(
+                                    bootstrap_room, -1
+                                )
+                            )
+                            arrived_response_num = len(
+                                self.prefill_response_tracker[bootstrap_room]
+                            )
+                            if arrived_response_num == expected_response_num:
+                                if self.enable_staging:
+                                    handler = self._staging_handler
+                                    if handler.is_staging_room(bootstrap_room):
+                                        handler.submit_last_scatter_async(bootstrap_room)
+                                    self._chunk_writer_counts.pop(bootstrap_room, None)
+                                self.update_status(bootstrap_room, KVPoll.Success)
+                    elif status == KVPoll.Failed:
+                        self.record_failure(
+                            bootstrap_room,
+                            "Failed to get kvcache from prefill instance, it might be dead",
                         )
-                        arrived_response_num = len(
-                            self.prefill_response_tracker[bootstrap_room]
-                        )
-                        if arrived_response_num == expected_response_num:
-                            if self.enable_staging:
-                                handler = self._staging_handler
-                                if handler.is_staging_room(bootstrap_room):
-                                    handler.submit_last_scatter_async(bootstrap_room)
-                                self._chunk_writer_counts.pop(bootstrap_room, None)
-                            self.update_status(bootstrap_room, KVPoll.Success)
-                elif status == KVPoll.Failed:
-                    self.record_failure(
-                        bootstrap_room,
-                        "Failed to get kvcache from prefill instance, it might be dead",
+                        self.update_status(bootstrap_room, status)
+                except Exception as e:
+                    logger.error(
+                        f"Decode status thread exception (room={room_repr}): {e!r}",
+                        exc_info=True,
                     )
-                    self.update_status(bootstrap_room, status)
+                    # Fail the affected room fast (when identifiable) so its
+                    # request errors out immediately instead of waiting for
+                    # SGLANG_DISAGGREGATION_WAITING_TIMEOUT.
+                    try:
+                        room_int = int(room_repr)
+                        self.record_failure(
+                            room_int, f"Decode status thread exception: {e!r}"
+                        )
+                        self.update_status(room_int, KVPoll.Failed)
+                    except (TypeError, ValueError):
+                        pass
 
         def heartbeat_checker():
             # Bind to dedicated CPU (attn_tp_rank * 38 + 19) to avoid CPU 0 contention.
@@ -1939,9 +1992,19 @@ class MooncakeKVSender(CommonKVSender):
                             "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
                             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
                         )
+                        # Report how many decode sessions registered: under
+                        # prefill pp=1 + decode pp>1 each decode PP stage sends
+                        # one session, and prefill only leaves Bootstrapping
+                        # after all of them arrive. A partial count (1 of 2)
+                        # points at a stalled decode stage, not at prefill.
+                        registered = len(
+                            self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
+                        )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
-                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
+                            f"Request {self.bootstrap_room} timed out after "
+                            f"{elapsed:.1f}s in KVPoll.Bootstrapping with "
+                            f"{registered} decode session(s) registered",
                         )
                         self.conclude_state = KVPoll.Failed
                         return KVPoll.Failed

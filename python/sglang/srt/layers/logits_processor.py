@@ -997,7 +997,9 @@ class LogitsProcessor(nn.Module):
                 if _enable_shm_fence:
                     kunpeng.shm_fence_kunpeng(self.attn_tp_size)
                 global_logits = kunpeng.shm_batched_allgather_kunpeng(
-                    logits, self.attn_tp_size
+                    logits,
+                    self.attn_tp_size,
+                    profile_name="shm_batched_allgather_kunpeng@attn_tp_logits",
                 )
             else:
                 global_logits = torch.empty(

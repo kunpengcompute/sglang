@@ -952,7 +952,9 @@ class GroupCoordinator:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
     @KunpengProfiler(depth=2)
-    def batch_all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def batch_all_gather(
+        self, input_: torch.Tensor, dim: int = -1, profile_name: str = ""
+    ) -> torch.Tensor:
         """Batch all-gather that concatenates along *dim* (default last dim).
 
         Uses the kutacc shm_batched_allgather kernel which gathers on the
@@ -976,7 +978,9 @@ class GroupCoordinator:
             try:
                 if _enable_shm_fence:
                     kunpeng.shm_fence_kunpeng(self.world_size)
-                output = kunpeng.shm_batched_allgather_kunpeng(input_, self.world_size)
+                output = kunpeng.shm_batched_allgather_kunpeng(
+                    input_, self.world_size, profile_name=profile_name
+                )
             except RuntimeError:
                 # Fall back to Gloo when SHM pool is exhausted.
                 # all_gather_into_tensor concatenates on dim=0, so we gather

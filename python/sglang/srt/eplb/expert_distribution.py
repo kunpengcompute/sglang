@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from abc import ABC
 from collections import deque
@@ -92,6 +93,9 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
+    def get_kunpeng_counter(self) -> Optional[torch.Tensor]:
+        return None
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -112,7 +116,12 @@ class ExpertDistributionRecorder(ABC):
     def stop_record(self):
         self._on_not_implemented()
 
-    def dump_record(self, output_mode: _OutputMode = "file"):
+    def dump_record(
+        self,
+        output_mode: _OutputMode = "file",
+        collective: bool = True,
+        forward_pass_id: Optional[int] = None,
+    ):
         self._on_not_implemented()
 
     @property
@@ -152,9 +161,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
-        if server_args.enable_expert_distribution_metrics:
+        auto_dump = (
+            server_args.moe_a2a_backend == "kunpeng_cpu"
+            and os.environ.get("SGLANG_KUNPENG_EXPERT_DISTRIBUTION_AUTO_DUMP", "0")
+            == "1"
+        )
+        if server_args.enable_expert_distribution_metrics or auto_dump:
             logger.info(
-                "ExpertDistributionRecorder auto start record since enable_expert_distribution_metrics"
+                "ExpertDistributionRecorder auto start record "
+                "(metrics=%s, kunpeng_auto_dump=%s)",
+                server_args.enable_expert_distribution_metrics,
+                auto_dump,
             )
             self.start_record()
 
@@ -203,6 +220,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
+    def get_kunpeng_counter(self) -> Optional[torch.Tensor]:
+        if self._disable_all:
+            return None
+        gatherer = self._single_pass_gatherers[_SINGLE_PASS_GATHERER_KEY_PRIMARY]
+        return getattr(gatherer, "get_kunpeng_counter", lambda: None)()
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -229,10 +252,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
-        if not (
-            self._recording or torch.get_device_module().is_current_stream_capturing()
-        ):
-            return
+        if not self._recording:
+            if (
+                self._server_args.device == "cpu"
+                or not torch.get_device_module().is_current_stream_capturing()
+            ):
+                return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
                 self._current_debug_name.value
@@ -256,6 +281,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             logger.warning(
                 "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
             )
+        if hasattr(self._accumulator, "reset_local_dump"):
+            self._accumulator.reset_local_dump()
         self._reset()
         self._recording = True
 
@@ -267,9 +294,19 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
         self._recording = False
 
-    def dump_record(self, output_mode: _OutputMode = "file"):
+    def dump_record(
+        self,
+        output_mode: _OutputMode = "file",
+        collective: bool = True,
+        forward_pass_id: Optional[int] = None,
+    ):
         """Dump the expert distribution record and reset the recorder after dumping."""
-        output = self._accumulator.dump(output_mode=output_mode)
+        if collective:
+            output = self._accumulator.dump(output_mode=output_mode)
+        else:
+            output = self._accumulator.dump_local(
+                output_mode=output_mode, forward_pass_id=forward_pass_id
+            )
         self._reset()
         return output
 
@@ -302,6 +339,13 @@ class _SinglePassGatherer(ABC):
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> "_SinglePassGatherer":
+        if server_args.moe_a2a_backend == "kunpeng_cpu":
+            if server_args.expert_distribution_recorder_mode == "stat":
+                return _KunpengSinglePassGatherer(expert_location_metadata, rank)
+            raise NotImplementedError(
+                "Kunpeng only supports expert_distribution_recorder_mode='stat'"
+            )
+
         if server_args.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(
                 server_args, expert_location_metadata, rank
@@ -605,6 +649,44 @@ def _convert_local_to_global_physical_count(
     return ans
 
 
+class _KunpengSinglePassGatherer(_SinglePassGatherer):
+    """Collect local physical counts from a graph-replay-safe C++ counter."""
+
+    def __init__(self, expert_location_metadata, rank: int):
+        super().__init__(expert_location_metadata, rank)
+        from sglang.srt.distributed import get_moe_expert_parallel_rank
+
+        self._moe_ep_rank = get_moe_expert_parallel_rank()
+        num_layers = expert_location_metadata.num_layers
+        num_local = expert_location_metadata.num_local_physical_experts
+        self._num_layers = num_layers
+        self._num_local = num_local
+        self._counter = torch.zeros(num_layers * num_local, dtype=torch.int64)
+        self._forward_start = self._counter.clone()
+
+    def get_kunpeng_counter(self):
+        return self._counter
+
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        self._forward_start.copy_(self._counter)
+
+    def reset(self):
+        self._counter.zero_()
+        self._forward_start.zero_()
+
+    def collect(self) -> Dict:
+        local_count = (self._counter - self._forward_start).view(
+            self._num_layers, self._num_local
+        )
+        global_count = _convert_local_to_global_physical_count(
+            local_count,
+            rank=self._moe_ep_rank,
+            num_local_physical_experts=self._num_local,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+        )
+        return dict(global_physical_count=global_count)
+
+
 # --------------------------------------- Accumulator -----------------------------------------
 
 _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
@@ -849,6 +931,10 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             device=self._server_args.device,
         )
         self._first_dump = True
+        self._local_logical_count = None
+
+    def reset_local_dump(self):
+        self._local_logical_count = None
 
     def append(
         self,
@@ -868,6 +954,21 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
+        return self._dump_impl(output_mode, collective=True)
+
+    def dump_local(self, output_mode: _OutputMode, forward_pass_id: int):
+        if forward_pass_id is None:
+            raise ValueError("forward_pass_id is required for local dump")
+        return self._dump_impl(
+            output_mode, collective=False, forward_pass_id=forward_pass_id
+        )
+
+    def _dump_impl(
+        self,
+        output_mode: _OutputMode,
+        collective: bool,
+        forward_pass_id: Optional[int] = None,
+    ):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
             self._global_physical_count_of_buffered_step.get_all(),
             num_layers=self._expert_location_metadata.num_layers,
@@ -875,23 +976,50 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
 
+        if not collective:
+            logical_count_of_buffered_step = logical_count_of_buffered_step.sum(
+                dim=0, keepdim=True
+            )
+            if self._local_logical_count is None:
+                self._local_logical_count = logical_count_of_buffered_step.clone()
+            else:
+                self._local_logical_count += logical_count_of_buffered_step
+            logical_count_of_buffered_step = self._local_logical_count
+
         if self._first_dump:
             self._first_dump = False
-            torch.get_device_module().empty_cache()
+            if self._server_args.device != "cpu":
+                torch.get_device_module().empty_cache()
 
-        torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
-        )
+        if collective:
+            torch.distributed.all_reduce(
+                logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            )
+            average_utilization = self._get_global_average_utilization_rate()
+        else:
+            average_utilization = None
 
+        world_rank = torch.distributed.get_rank()
         output = dict(
             rank=self._rank,
+            world_rank=world_rank,
+            forward_pass_id=forward_pass_id,
             logical_count=logical_count_of_buffered_step,
-            average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
+            average_utilization_rate_over_window=average_utilization,
         )
 
         if output_mode == "file":
-            if self._rank == 0:
-                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
+            if collective:
+                if world_rank == 0:
+                    _dump_to_file(
+                        f"expert_distribution_recorder_{time.time()}.pt", output
+                    )
+            else:
+                _dump_to_file(
+                    f"expert_distribution_recorder_rank_{world_rank:05d}.pt",
+                    output,
+                    log=False,
+                )
         elif output_mode == "object":
             return output
         else:
@@ -915,18 +1043,21 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=self._server_args.device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+            avg_rate_tensor = torch.empty(
+                1, dtype=torch.float32, device=self._server_args.device
+            )
         torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 
 
-def _dump_to_file(name, data):
+def _dump_to_file(name, data, log: bool = True):
     save_dir = Path(envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get())
     path_output = save_dir / name
-    logger.info(f"Write expert distribution to {path_output}")
+    if log:
+        logger.info(f"Write expert distribution to {path_output}")
     if not save_dir.exists():
         save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(data, str(path_output))
@@ -956,16 +1087,20 @@ class _CircularBuffer(_Buffer):
             (buffer_size, *item_shape), dtype=dtype, device=device
         )
         self._curr_index = 0
+        self._size = 0
 
     def append(self, value: torch.Tensor):
         self._buffer[self._curr_index] = value
         self._curr_index = (self._curr_index + 1) % len(self._buffer)
+        self._size = min(self._size + 1, len(self._buffer))
 
     def get_all(self) -> torch.Tensor:
-        return self._buffer
+        return self._buffer[: self._size]
 
     def reset(self):
         self._buffer[...] = 0
+        self._curr_index = 0
+        self._size = 0
 
 
 class _InfiniteBuffer(_Buffer):

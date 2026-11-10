@@ -417,12 +417,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            mixed_qkv_processed = self.conv_decode(
-                mixed_qkv_reshaped,
+            # The verify conv consumes and returns the token-major
+            # [seq_len, dim] layout, so no reshape/transpose pair is needed and
+            # the producer's strided rows survive to the native kernel.
+            mixed_qkv = self.conv_decode(
+                mixed_qkv,
                 conv_states,
                 layer.conv_weights,
                 layer.bias,
@@ -434,7 +433,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:

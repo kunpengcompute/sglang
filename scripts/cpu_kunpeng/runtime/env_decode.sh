@@ -114,12 +114,13 @@ if [[ -z "${SGLANG_KUNPENG_MAX_CUR_LEN:-}" ]]; then
     fi
 fi
 
-# Kutacc fusedmoe multi-expert parallelism: value = group count G (worker
-# pool split into G groups of 32/G threads, each group owning a share of the
-# local experts; per-group tile derived in-kernel, CSV plan untouched).
-# Default 0 = serial per-expert path, bit-exact. Set AFTER the instance file
-# so an instance may enable it explicitly.
-export KUTACC_FUSEDMOE_MULTIEXPT="${KUTACC_FUSEDMOE_MULTIEXPT:-0}"
+# ---- kutacc fused-MoE switches --------------------------------------------
+# Defaults match a non-ETP decode (1 local expert per rank, ~55 rows/rank at
+# bs16): small scratch. ETP instances (8 local experts, ~8x the rows) must
+# override TILEBUF to 1024.
+export KUTACC_FUSEDMOE_TILEBUF="${KUTACC_FUSEDMOE_TILEBUF:-256}"      # single-wave capacity
+export KUTACC_FUSEDMOE_MULTI_OPERAND_GEMM="${KUTACC_FUSEDMOE_MULTI_OPERAND_GEMM:-1}"  # 1 = all experts in one kernel call (ETP only), 0 = per-expert loop
+
 # ------------------------------------------------------------
 # Resolve the prefixed DECODE_* overrides against the globals. This MUST
 # run after the user env file above so both config styles take effect:

@@ -50,7 +50,7 @@ PP_KIND_PYOBJ = 0
 PP_KIND_TENSOR = 1
 PP_KIND_ACK = 2
 PP_KIND_BUNDLE = 3  # must match PP_KIND_BUNDLE in pp_comm.cpp
-PP_MSG_SLOTS = 8  # must match PP_MSG_SLOTS in pp_comm.cpp
+PP_MSG_SLOTS = 10  # must match PP_MSG_SLOTS in pp_comm.cpp
 # Proxy (non-output) frames use a slot ring inside the single 64MB proxy region
 # (PP_PROXY_REGION_SIZE in pp_comm.cpp): the slot advances on every send, so a
 # sender never overwrites the segment a peer may still be reading from.

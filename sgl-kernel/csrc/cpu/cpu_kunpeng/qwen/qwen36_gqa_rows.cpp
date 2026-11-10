@@ -10,6 +10,8 @@
 #include <string>
 #include <variant>
 
+#include "qwen36_graph_limits.h"
+
 using ScalarArg = std::variant<bool, int64_t, double, std::string>;
 
 // Isolated batched GQA scheduling candidate. Every row calls an existing
@@ -114,7 +116,7 @@ extern "C" void qwen_graph_gqa_rows_dispatch(std::vector<at::Tensor> &t,
                 "GQA rows ranks");
     auto b = t[0].size(0), h = t[0].size(1), cap = t[3].size(1);
     const auto scratch_rows = std::min<int64_t>(b, 32);
-    TORCH_CHECK(b >= 1 && b <= 128 && (h == 2 || h == 6) && t[0].size(2) == 256 &&
+    TORCH_CHECK(b >= 1 && b <= qwen_graph_limits::decode_tokens && (h == 2 || h == 6) && t[0].size(2) == 256 &&
                     t[1].size(1) == 1 && t[1].size(2) == 256 && t[4].numel() == b &&
                     t[5].numel() == b && t[6].sizes() == t[0].sizes() && cap > 0 &&
                     t[1].size(0) > 0 && t[3].size(0) > 0 && t[7].dim() == 1 &&
@@ -129,7 +131,7 @@ extern "C" void qwen_graph_gqa_rows_dispatch(std::vector<at::Tensor> &t,
             TORCH_CHECK(scratch_end <= begin || end <= scratch_begin,
                         "GQA scratch must not alias tensors");
         }
-    int32_t req[128], len[128];
+    int32_t req[qwen_graph_limits::decode_tokens], len[qwen_graph_limits::decode_tokens];
     bool parallel = b >= 8;
     for (int64_t j = 0; j < b; ++j) {
         for (int i : {4, 5}) {

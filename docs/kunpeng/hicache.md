@@ -1,6 +1,6 @@
 # Kunpeng 多级 KV 缓存（HiCache）使用指南
 
-面向 920F（Kunpeng CPU）路径的 HiCache 配置说明：怎么打开、各层级有哪些环境变量、每个变量控制什么、`file` 与 `mooncake` 两个 L3 后端分别需要什么。
+面向 920F（Kunpeng CPU）路径的 HiCache 配置说明：怎么打开、各层级有哪些环境变量、每个变量控制什么、`file`（默认）与 `mooncake`（可选）两个 L3 后端分别需要什么。
 
 ---
 
@@ -12,7 +12,7 @@ HiCache 把 KV cache 分成若干层级，越靠后容量越大、延迟越高�
 |---|---|---|
 | **L1** | 设备侧主 KV 池（DDR） | 原来的主 KV cache 池，占满后按淘汰策略回收 |
 | **L2** | 额外的 DDR 池（host pool） | **仅三级模式有**；大小由 `RATIO`/`SIZE` 决定 |
-| **L3** | 外部存储后端 | 所有 prefill 节点共享；由 `KUNPENG_HICACHE_BACKEND` 选择 `file` 或 `mooncake` |
+| **L3** | 外部存储后端 | 所有 prefill 节点共享；由 `KUNPENG_HICACHE_BACKEND` 选择 `file`（默认）或 `mooncake` |
 
 整体结构（仅 `prefill` / `native` 参与，`decode` 不参与）：
 
@@ -29,8 +29,8 @@ flowchart LR
 
     subgraph L3G["L3 存储后端"]
         direction TB
-        FILE["file"]
-        MC["mooncake"]
+        FILE["file（默认）"]
+        MC["mooncake（可选）"]
     end
 
     L1 <-->|"预取 / 写透"| L2G
@@ -56,28 +56,17 @@ flowchart LR
 export ENABLE_KUNPENG_HICACHE=1
 ```
 
-两种后端的配置方式：
-
-**mooncake（默认，无需额外配置）**
+**file（默认，推荐）**
 
 ```bash
 if [[ "$1" == "prefill" || "$1" == "native" ]]; then
     export ENABLE_KUNPENG_HICACHE=1
+    export KUNPENG_HICACHE_BACKEND=file          # 默认值，可省略
+    export KUNPENG_HICACHE_L3_DIR="/path-to-hicache_pool"
 fi
 ```
 
-**file（改后端 + 给一个共享目录）**
-
-```bash
-if [[ "$1" == "prefill" || "$1" == "native" ]]; then
-    export ENABLE_KUNPENG_HICACHE=1
-    export KUNPENG_HICACHE_BACKEND=file
-    export KUNPENG_HICACHE_L3_DIR="/home/share/xxx/hicache_pool"
-fi
-```
-
-- `./launch.sh all` 会**自动**检测「`ENABLE_KUNPENG_HICACHE=1` + `BACKEND=mooncake`」，一并拉起/停止 mooncake 的 master 与 store，无需手动启动。
-- 注意：`ENABLE_KUNPENG_HICACHE` 默认 `0`，**总开关必须显式打开**；「有默认值」指的是后端、层级形态这些子参数。
+> `KUNPENG_HICACHE_BACKEND` 默认 `file`。打开总开关后**必须**设置 `KUNPENG_HICACHE_L3_DIR`，否则 `server.sh` 启动时直接报错退出。
 
 ---
 
@@ -136,7 +125,7 @@ scripts/cpu_kunpeng/
 | `SGLANG_KUNPENG_HICACHE_L1L3_PREFETCH_RATIO` | `0.25` | 限流 | 在途预取 token 最多占 L1 池的比例，超过即限流，避免预取挤爆 L1 |
 | `SGLANG_KUNPENG_HICACHE_L3_INDEX_RATIO` | `4.0` | 上界 | 「只剩 L3 有副本」的树上界（这类节点不占内存、只占元数据），上限 = `L1 池 × 该比例` |
 
-> 单页字节数 = `层数 × 64 × kv_dim × 2B`；例如 61 层 MLA、`kv_dim=576` 时约 **4.29 MiB/页**。
+> 单页字节数 = `层数 × 64 × kv_dim × 2B`；例如 78 层 MLA、`kv_dim=576` 时约 **5.49 MiB/页**。
 > flat 缓冲每个 TP rank 各注册一份，内存开销随 TP 数线性增长。
 >
 > 两级模式的约束：只支持 **MLA** 池（MHA/NSA 直接 `NotImplementedError`）；写策略不支持 `write_back`。
@@ -149,25 +138,25 @@ scripts/cpu_kunpeng/
 
 | 变量 | 默认 | 类型 | 作用 |
 |---|---|---|---|
-| `KUNPENG_HICACHE_BACKEND` | `mooncake` | 开关 | 选 L3 后端：`file` / `mooncake` |
+| `KUNPENG_HICACHE_BACKEND` | `file` | 开关 | 选 L3 后端：`file` / `mooncake` |
 | `KUNPENG_HICACHE_WRITE_POLICY` | `write_through` | 行为 | **写透策略**：`write_through` 首次插入即写 L3；`write_through_selective` 命中 2 次后才写。`write_back` 在两级模式**不支持**（会报错） |
-| `KUNPENG_HICACHE_PREFETCH_POLICY` | `timeout` | 行为 | L3→L1 预取策略：`timeout` 超时即放弃、只保留已取到的连续前缀（默认 `1s + 页数 × 0.25s/Ki token`，16k 前缀约 5s）；`wait_complete` 阻塞到整个前缀加载完（丢页会永久等待，不建议配合不可靠的 L3）；`best_effort` 不等待 |
-| `KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE` | 空（=1） | 秒 | 仅 `timeout` 策略生效：超时公式的固定项。留空用代码默认 1s |
-| `KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN` | 空（=0.25） | 秒/Ki token | 仅 `timeout` 策略生效：每 1024 token 追加的预算。16k 前缀配 `0.6` 约为 `2 + 16×0.6 = 11.6s` |
+| `KUNPENG_HICACHE_PREFETCH_POLICY` | `timeout` | 行为 | L3→L1 预取策略：`timeout` 超时即放弃、只保留已取到的连续前缀（默认 `2s + 0.5×Ki token`，16k 前缀约 10s）；`wait_complete` 阻塞到整个前缀加载完（丢页会永久等待，不建议配合不可靠的 L3）；`best_effort` 不等待 |
+| `KUNPENG_HICACHE_PREFETCH_TIMEOUT_BASE` | 空（=2） | 秒 | 仅 `timeout` 策略生效：超时公式的固定项。留空用代码默认 2s |
+| `KUNPENG_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN` | 空（=0.5） | 秒/Ki token | 仅 `timeout` 策略生效：每 1024 token 追加的预算。16k 前缀配 `0.6` 约为 `2 + 16×0.6 = 11.6s` |
 | `KUNPENG_HICACHE_EXTRA_CONFIG` | 空 | JSON | 直接透传 `--hicache-storage-backend-extra-config`，可设置 `prefetch_threshold` 等任意字段；非空时覆盖上面两个 timeout 变量 |
 
-#### 3.3.2 后端 A：`file`
+#### 3.3.2 后端 A：`file`（默认）
 
 每页一个文件，放在所有 prefill 节点共享的目录里。
 
 | 变量 | 默认 | 类型 | 作用 |
 |---|---|---|---|
-| `KUNPENG_HICACHE_L3_DIR` | 空 | 路径 | 页文件目录（需被所有 prefill 节点共享）。**留空 = L3 关闭**（`server.sh` 会打印 `L3 disabled, running L1<->L2 only`） |
+| `KUNPENG_HICACHE_L3_DIR` | 空 | 路径 | 页文件目录（需被所有 prefill 节点共享）。**在 `ENABLE_KUNPENG_HICACHE=1 && BACKEND=file` 下留空会让 `server.sh` 启动直接报错退出** |
 
 `server.sh` 会 `mkdir -p` 该目录，并导出 `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR`。
 适用：单机/小规模验证、无 RDMA 环境。缺点：无淘汰、无容量上限、依赖共享文件系统。
 
-#### 3.3.3 后端 B：`mooncake`
+#### 3.3.3 后端 B：`mooncake`（可选）
 
 分布式共享内存 store，L3 的 KV 实际存在 store 服务的 segment 里。涉及**四个视角的角色**：
 
@@ -274,7 +263,7 @@ sh launch.sh store
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| 日志出现 `L3 disabled, running L1<->L2 only` | `KUNPENG_HICACHE_BACKEND=file` 且 `KUNPENG_HICACHE_L3_DIR` 为空 → 填目录 |
+| 启动报 `KUNPENG_HICACHE_L3_DIR must be set` | `ENABLE_KUNPENG_HICACHE=1` 且后端为 `file`（默认）但 `KUNPENG_HICACHE_L3_DIR` 为空 → 填共享目录 |
 | warmup 报 `invalid rpc arg` / `RPC_FAIL` | master 与客户端 mooncake 版本不一致（如一个来自源码构建、一个来自 wheel）。确认 `MOONCAKE_MASTER_BIN` 与客户端同源 |
 | store 环境报 `requires MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | 开了 `MOONCAKE_ENABLE_SSD_OFFLOAD=1` 但没设磁盘目录 → 显式设置绝对路径 |
 | store 启动报 `unknown argument '--enable_offload'` | 当前 mooncake 版本不支持 SSD offload：把 `MOONCAKE_ENABLE_SSD_OFFLOAD` 设回 `0`，或升级 mooncake |
