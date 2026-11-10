@@ -382,7 +382,8 @@ void moe_combine_finalize_kunpeng()
 void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at::Tensor token_ids, int64_t topk,
                           int64_t num_expert_group, int64_t topk_group, const c10::optional<at::Tensor> bias,
                           const c10::optional<at::Tensor> experts_offset, bool renormalize, bool scoring_func_sigmoid,
-                          bool moe_balance, int64_t v2)
+                          bool moe_balance, int64_t v2, int64_t num_fused_shared_experts,
+                          double routed_scaling_factor)
 {
     TORCH_CHECK(router_logits.scalar_type() == at::kBFloat16 || router_logits.scalar_type() == at::kFloat,
                 "router_logits must be BF16 or Float");
@@ -397,6 +398,14 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
     const __bf16 *logits_bf16_data = logits_is_f32 ? nullptr : (const __bf16 *)router_logits.data_ptr();
     int64_t router_logits_stride = router_logits.stride(0);
     bool sort_by_experts = experts_offset.has_value() && experts_offset->defined();
+    TORCH_CHECK(num_fused_shared_experts == 0 || !sort_by_experts,
+                "fused shared experts (ids >= num_expert) are not supported on the "
+                "sort-by-experts (experts_offset) path");
+    // The fused-shared path unconditionally normalizes the routed weights
+    // ((score / sum) * rsf, shared fixed at 1.0), which is only equivalent
+    // to the reference semantics with norm_topk_prob (renormalize=true).
+    TORCH_CHECK(num_fused_shared_experts == 0 || renormalize,
+                "fused shared experts require renormalize (norm_topk_prob=true)");
     int64_t num_token = router_logits.size(0);
     int64_t num_expert = router_logits.size(1);
     int64_t group_size = num_expert / num_expert_group;
@@ -480,16 +489,64 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
                     int *dst = sorted_expert + i * topk;
                     memmove(dst, src, topk * sizeof(int));
                 }
-                std::nth_element(sorted_expert, sorted_expert + topk, sorted_expert + topk_group * topk, cmp_expert);
+                // Fused shared experts (Kunpeng flash-comm): select only
+                // (topk - num_fused_shared_experts) routed experts BY SCORE
+                // (matching grouped_topk_gpu, which drops the lowest-scored
+                // selected expert when the shared column replaces it). Final
+                // weights apply the routed scaling factor "on output" (GPU
+                // semantics with apply_routed_scaling_factor_on_output=True):
+                //   routed_i = (score_i / sum_scores) * rsf   (sum over selected)
+                //   shared_f = 1.0
+                // so the model forward SKIPS the python
+                // `final_hidden_states *= routed_scaling_factor` — that plain
+                // tensor op would not be recorded into / replayed by the
+                // Kunpeng compute graph. Net effect after combine:
+                //   rsf * sum(w_i E_i) + 1.0 * shared(x)  == reference semantics.
+                // Requires norm_topk_prob (renormalize=true), which holds for
+                // the DeepSeek V3/R1/GLM configs that fuse shared experts.
+                const int64_t num_routed_select = topk - num_fused_shared_experts;
+                std::nth_element(sorted_expert, sorted_expert + num_routed_select,
+                                 sorted_expert + topk_group * topk, cmp_expert);
                 if constexpr (!SORT_BY_EXPERTS) {
-                    std::sort(sorted_expert, sorted_expert + topk);
+                    std::sort(sorted_expert, sorted_expert + num_routed_select);
                 }
 
                 float sum = 0;
-                for (int64_t i = 0; i < topk; i++) {
+                for (int64_t i = 0; i < num_routed_select; i++) {
                     sum += origin_score[sorted_expert[i]];
                 }
-                if constexpr (SORT_BY_EXPERTS) {
+                if (num_fused_shared_experts > 0) {
+                    const float scale =
+                        static_cast<float>(routed_scaling_factor != 0.0 ? routed_scaling_factor : 1.0);
+                    const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+                    if constexpr (SORT_BY_EXPERTS) {
+                        for (int64_t i = 0; i < num_routed_select; i++) {
+                            active_expert[bi * topk + i].index = sorted_expert[i];
+                            active_expert[bi * topk + i].origin_score =
+                                origin_score[sorted_expert[i]] * inv_sum * scale;
+                        }
+                    } else {
+                        for (int64_t i = 0; i < num_routed_select; i++) {
+                            token_weights_data[bi * token_weights_stride + i * token_weights_stride1] =
+                                origin_score[sorted_expert[i]] * inv_sum * scale;
+                            token_ids_data[bi * token_ids_stride + i * token_ids_stride1] =
+                                static_cast<int16_t>(sorted_expert[i]);
+                        }
+                    }
+                    for (int64_t f = 0; f < num_fused_shared_experts; f++) {
+                        const int64_t slot = bi * topk + num_routed_select + f;
+                        if constexpr (SORT_BY_EXPERTS) {
+                            active_expert[slot].index = static_cast<int>(num_expert + f);
+                            active_expert[slot].origin_score = 1.0f;
+                        } else {
+                            token_weights_data[bi * token_weights_stride +
+                                               (num_routed_select + f) * token_weights_stride1] = 1.0f;
+                            token_ids_data[bi * token_ids_stride +
+                                           (num_routed_select + f) * token_ids_stride1] =
+                                static_cast<int16_t>(num_expert + f);
+                        }
+                    }
+                } else if constexpr (SORT_BY_EXPERTS) {
                     for (int64_t i = 0; i < topk; i++) {
                         active_expert[bi * topk + i].index = sorted_expert[i];
                         active_expert[bi * topk + i].origin_score =
@@ -534,7 +591,8 @@ void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at
 }
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
-                                        int64_t num_experts, int64_t topk, bool force_balance, int64_t expert_offset)
+                                        int64_t num_experts, int64_t topk, bool force_balance, int64_t expert_offset,
+                                        int64_t slice_offset)
 {
     TORCH_CHECK(topk_ids.scalar_type() == at::kShort, "topk_ids must be int16");
     TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D");
@@ -549,6 +607,17 @@ void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_wei
     int64_t weights_stride1 = topk_weights.stride(1);
     int64_t num_total = topk_ids.size(0);
     int64_t pad_start = num_token_non_padded.data_ptr<int32_t>()[0];
+    // SP mode: topk_ids holds only this rank's token slice (rows
+    // [slice_offset, slice_offset + num_total) of the global table) while
+    // num_token_non_padded is the GLOBAL real-token count.  Translate it
+    // into the slice-local boundary; non-SP passes slice_offset == 0, so
+    // the clamps are no-ops there.  Clamping unconditionally (including
+    // slice_offset == 0, i.e. SP rank 0 whose global real-token count may
+    // exceed the slice size) keeps the histogram loop below inside the
+    // slice instead of over-reading peer rows in forced mode.
+    pad_start -= slice_offset;
+    if (pad_start < 0) pad_start = 0;
+    if (pad_start > num_total) pad_start = num_total;
     int64_t num_pad = num_total - pad_start;
 
     if (num_pad <= 0 && !force_balance) return;

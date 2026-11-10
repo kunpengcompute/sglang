@@ -326,6 +326,13 @@ class KunpengCommunicator:
 
     @KunpengProfiler(depth=3)
     def shm_all_gather_into_tensor(self, input: torch.Tensor, output: torch.Tensor):
+        """Token-slice allgather: [local_batch, dim] -> [global_batch, dim].
+
+        Dtype-generic (the kernel moves raw bytes); row blocks are
+        rank-major, matching tensor_split semantics. Under graph capture
+        both storages are SHM-upgraded and the kernel gathers directly
+        between peer buffers; eager calls copy through SHM buffers.
+        """
         if input.dim() == 1:
             dim = self.max_elements // self.max_tokens
             assert input.size(0) % dim == 0 and output.size(0) % dim == 0, {
@@ -343,40 +350,18 @@ class KunpengCommunicator:
             input_2d = input
             output_2d = output
 
-        shm_tensor = self.get_shm_tensor(dim)
-        src0 = shm_tensor[
-            self.comm_rank * local_batch : (self.comm_rank + 1) * local_batch, :
-        ]
-        dst0 = shm_tensor[:global_batch, :]
+        assert (
+            output_2d.dtype == input_2d.dtype
+        ), f"shm_all_gather_into_tensor dtype mismatch: {input_2d.dtype} vs {output_2d.dtype}"
 
-        t_copy_in_start = time.perf_counter()
-        src0.copy_(input_2d)
-        t_copy_in_end = time.perf_counter()
-
-        t_ag_start = time.perf_counter()
-        # TODO(kunpeng): use dual allgather for alternative implementation
-        kunpeng.shm_dual_allgather_kunpeng(
-            src0, dst0, self.src_dummy_tensor, self.dummy_tensor
-        )
-        t_ag_end = time.perf_counter()
-
-        t_copy_out_start = time.perf_counter()
-        output_2d.copy_(dst0)
-        t_copy_out_end = time.perf_counter()
-
-        # ``output`` is allocated by the caller (all_gather's torch.empty), not
-        # by any captured op, so during graph capture its storage must be
-        # registered explicitly or finalize() will fail to resolve the output.
+        # ``output`` is caller-allocated, so under graph capture its storage
+        # must be registered BEFORE the op records its views. The op's
+        # shm_fn upgrades input and output to SHM storages; the gather runs
+        # directly between peer buffers.
         if is_capturing():
             register_output_storage_only(output)
 
-        if envs.SGLANG_KUNPENG_PROFILE.get():
-            logger.info(
-                f"[KunpengCommunicator rank {dist.get_rank()}] shm_all_gather_into_tensor timing (ms): "
-                f"copy_in={1000*(t_copy_in_end - t_copy_in_start):.2f}, "
-                f"allgather={1000*(t_ag_end - t_ag_start):.2f}, "
-                f"copy_out={1000*(t_copy_out_end - t_copy_out_start):.2f}"
-            )
+        kunpeng.shm_allgather_kunpeng(input_2d, output_2d)
 
     def __del__(self):
         kernel.shm_reduce_scatter_finalize_kunpeng()

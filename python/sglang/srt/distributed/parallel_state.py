@@ -870,6 +870,10 @@ class GroupCoordinator:
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
+        elif self.use_kunpeng_communicator and input.shape[0] == 0:
+            # Idle DP ranks: uniform no-op (the reg/SHM kernels reject
+            # zero tokens).
+            return
         elif (
             self.use_kunpeng_communicator
             and input.shape[0] > 0
@@ -946,8 +950,25 @@ class GroupCoordinator:
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu or _is_xpu:
             self._all_gather_into_tensor(output, input)
-        elif self.use_kunpeng_communicator and input.shape[0] > 0:
+        elif self.use_kunpeng_communicator and input.shape[0] == 0:
+            # Idle DP ranks: uniform no-op (the reg/SHM kernels reject
+            # zero tokens).
+            return
+        elif (
+            self.use_kunpeng_communicator
+            and input.shape[0] > 0
+            and output.shape[0] <= self.kunpeng_communicator.max_tokens
+        ):
+            # Mirrors all_reduce's dispatch: the SHM path serves both capture
+            # (zero-copy peer gather between the SHM-upgraded storages) and
+            # eager (the C++ kernel copies the input slice into an SHM send
+            # buffer, bracketed by kupl_shm_fence window barriers). Oversized
+            # gathers fall through to the process group below.
             self.kunpeng_communicator.shm_all_gather_into_tensor(input, output)
+        elif self.use_kunpeng_communicator:
+            # Oversized gathers go through the process group (gloo), like
+            # all_reduce's fallback.
+            self._all_gather_into_tensor(output, input)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 

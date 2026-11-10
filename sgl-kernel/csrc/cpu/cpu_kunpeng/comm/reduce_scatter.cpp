@@ -75,13 +75,21 @@ void shm_reduce_scatter_kunpeng(at::Tensor input)
     int64_t batch = input.size(0);
     int64_t dim = input.size(1);
     size_t total_bytes = static_cast<size_t>(input.numel()) * sizeof(bfloat16_t);
-    at::Tensor shm_tensor = get_or_create_shm_tensor(dim, batch);
 
-    // copy in: user input -> SHM buffer
-    std::memcpy(shm_tensor.data_ptr(), input.data_ptr(), total_bytes);
+    // If the input already lives in shared memory (e.g. graph SHM pool),
+    // operate on it in-place directly: no copy in/out, no temp buffer.
+    bool input_in_shm = is_shm_tensor(input);
+    bfloat16_t *local_buffer_ptr;
+    if (input_in_shm) {
+        local_buffer_ptr = reinterpret_cast<bfloat16_t *>(input.data_ptr());
+    } else {
+        // copy in: user input -> SHM buffer (eager fallback)
+        at::Tensor shm_tensor = get_or_create_shm_tensor(dim, batch);
+        std::memcpy(shm_tensor.data_ptr(), input.data_ptr(), total_bytes);
+        local_buffer_ptr = reinterpret_cast<bfloat16_t *>(shm_tensor.data_ptr());
+    }
 
     // build remote peer pointers for the SHM buffer
-    bfloat16_t *local_buffer_ptr = reinterpret_cast<bfloat16_t *>(shm_tensor.data_ptr());
     bfloat16_t *remote_buffers_ptr[intra_node_size];
 
     for (int i = 0; i < intra_node_size; ++i) {
@@ -94,8 +102,13 @@ void shm_reduce_scatter_kunpeng(at::Tensor input)
     // reduce_scatter in-place on the SHM buffer
     kutacc::shm_reduce_scatter((void **)remote_buffers_ptr, batch, dim, g_rs_request);
 
-    // copy out: SHM buffer -> user input
-    std::memcpy(input.data_ptr(), shm_tensor.data_ptr(), total_bytes);
+    // fence: every rank's reads are done before ANY rank's next call
+    // copy-in overwrites its buffer.
+    kupl_shm_fence(kupl_win_intra_node);
+
+    // copy out: SHM buffer -> user input (only for the eager fallback path)
+    if (!input_in_shm)
+        std::memcpy(input.data_ptr(), local_buffer_ptr, total_bytes);
 }
 
 void shm_reduce_scatter_finalize_kunpeng()

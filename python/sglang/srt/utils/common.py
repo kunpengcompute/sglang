@@ -309,6 +309,22 @@ def is_kunpeng_extend_pad() -> bool:
     )
 
 
+def is_kunpeng_flash_comm() -> bool:
+    # Opt-in per serving role: IS_PREFILL=1 (env.sh prefill_config) AND
+    # SGLANG_KUNPENG_FLASH_COMM=1; decode/native roles keep the plain path.
+    # Gates two sub-features: (1) token-sliced sequence-parallel prefill MoE
+    # (requires attn-TP > 1; per-rank topk tables merged by one
+    # shm_dual_allgather, combine writes only the home slice) and
+    # (2) shared-expert co-location as logical expert n_routed in the EPLB
+    # map (requires a non-trivial --init-expert-location with n_routed+1
+    # logical experts).
+    return (
+        is_cpu_920f()
+        and os.environ.get("IS_PREFILL", "0") == "1"
+        and os.environ.get("SGLANG_KUNPENG_FLASH_COMM") == "1"
+    )
+
+
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
     is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()

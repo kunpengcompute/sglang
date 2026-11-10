@@ -44,6 +44,8 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_socket_tp_group,
@@ -69,12 +71,14 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_dp_mlp_mode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_tp_group,
@@ -157,6 +161,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
+    _is_kunpeng_flash_comm,
     _is_musa,
     _is_npu,
     _is_xpu,
@@ -169,6 +174,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    is_kunpeng_flash_comm,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -205,6 +211,30 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _kunpeng_sp_gather_full(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Allgather a flash-comm SP token slice back to full rows (attn-TP).
+
+    Rank r holds rows [r*n, (r+1)*n); the output is rank-major, matching
+    tensor_split semantics.
+    """
+    attn_tp_size = get_attn_tensor_model_parallel_world_size()
+    output = torch.empty(
+        (hidden_states.shape[0] * attn_tp_size, *hidden_states.shape[1:]),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    attn_tp_all_gather_into_tensor(output, hidden_states)
+    return output
+
+
+def _kunpeng_sp_is_sliced(hidden_states: torch.Tensor, forward_batch) -> bool:
+    """True when hidden_states is this rank's SP token slice (not full rows)."""
+    return (
+        forward_batch.input_ids is not None
+        and hidden_states.shape[0] != forward_batch.input_ids.shape[0]
+    )
 
 
 class DeepseekV2MLP(nn.Module):
@@ -268,6 +298,18 @@ class DeepseekV2MLP(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ):
+        if _is_kunpeng_flash_comm and isinstance(x, tuple):
+            # SP dense layer: x = (int8_full, scale_full) — pre-quantized
+            # full rows, so the W8A8 GEMM path skips the internal quant and
+            # the down allreduce (caller reduce-scatters the partial sums).
+            gate_up, _ = self.gate_up_proj(x)
+            gateup_int8, gateup_scale = kunpeng.silu_mul_quant_kunpeng(gate_up)
+            x, _ = self.down_proj(
+                (gateup_int8, gateup_scale),
+                skip_all_reduce=True,
+            )
+            return x
+
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
@@ -484,21 +526,33 @@ class DeepseekV2MoE(nn.Module):
         # scaling factor for fused shared experts on AMD-platform.
         # DeepEP doesn't need this: shared expert is only computed on home rank
         # (not all-reduced), so no 1/ep_size correction is needed.
+        # Kunpeng flash-comm: shared expert is a full-weight physical expert
+        # dispatched once per token, so no 1/ep_size correction either.
         fused_shared_experts_scaling_factor = None
         if (
             self.moe_ep_size > 1
             and self.num_fused_shared_experts > 0
             and not _is_deepep_fusion
+            and not _is_kunpeng_flash_comm
         ):
             # if enable_ep_moe tp_szie == ep_size, every gpu get shared experts gemm output
             # so we scale with 1 / self.moe_ep_size in ep mode which will make it equalation as in tp mode
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
+        # Kunpeng flash-comm: the shared expert is a regular physical expert
+        # in the EPLB map, so FusedMoE gets num_fused_shared_experts=0 (no
+        # per-rank extra local slot) while TopK below keeps 1 (appends the
+        # shared column; the weights land in every shared slot via
+        # logical_to_all_physical).
+        num_fused_shared_experts_for_moe = (
+            0 if _is_kunpeng_flash_comm else self.num_fused_shared_experts
+        )
+
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=num_experts_for_moe
             + get_global_server_args().ep_num_redundant_experts,
-            num_fused_shared_experts=self.num_fused_shared_experts,
+            num_fused_shared_experts=num_fused_shared_experts_for_moe,
             top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -510,6 +564,12 @@ class DeepseekV2MoE(nn.Module):
             ),
             prefix=add_prefix("experts", prefix),
         )
+
+        # Kunpeng flash-comm: the grouped_topk kernel bakes rsf into the
+        # weights (routed = rsf * w, shared = 1.0), so forward skips the
+        # plain-tensor rsf scaling (not replayed by the Kunpeng graph).
+        if _is_kunpeng_flash_comm:
+            self.experts.should_fuse_routed_scaling_factor_in_topk = True
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -881,6 +941,17 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # The dispatcher state singleton is shared by the target model and
+        # the MTP draft (nextn); SP applies only to the target.  Refresh the
+        # flag here so slicing follows the model that is actually forwarding.
+        if get_moe_a2a_backend().is_kunpeng_cpu():
+            from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+                _KunpengDispatcherState,
+            )
+
+            _KunpengDispatcherState.get().use_sp = (
+                is_kunpeng_flash_comm() and not self.is_nextn
+            )
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
@@ -1849,7 +1920,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        if _is_cpu_920f:
+        # Flash-comm SP: use the real per-layer scatter modes so sparse (MoE)
+        # layers run scattered end-to-end (the topk tables are merged by
+        # dual_allgather); the last layer keeps SCATTERED so the model
+        # forward gathers once before the final norm / logits.
+        _sp = is_kunpeng_flash_comm() and get_moe_a2a_backend().is_kunpeng_cpu() and not is_nextn
+        if _is_cpu_920f and not _sp:
             self.layer_scatter_modes = LayerScatterModes.init_new(
                 layer_id=layer_id,
                 num_layers=1 if is_nextn else config.num_hidden_layers,
@@ -1865,6 +1941,13 @@ class DeepseekV2DecoderLayer(nn.Module):
                 is_previous_layer_sparse=is_previous_layer_sparse,
                 is_next_layer_sparse=is_next_layer_sparse,
             )
+            if _sp and layer_id == config.num_hidden_layers - 1:
+                self.layer_scatter_modes.layer_output_mode = ScatterMode.SCATTERED
+        if _sp and layer_id > 0 and not is_previous_layer_sparse:
+            # The previous DENSE layer's output is the reduce-scattered slice
+            # (see _forward_dense_sp_mlp), not TP_ATTN_FULL as the static
+            # computation assumes — patch so prepare_attn gathers full rows.
+            self.layer_scatter_modes.layer_input_mode = ScatterMode.SCATTERED
 
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
@@ -1990,9 +2073,23 @@ class DeepseekV2DecoderLayer(nn.Module):
         if _is_cpu_920f and (not self.is_nextn):
             self._swap_mgr.swap_next_kv_layer(self.layer_id, forward_batch)
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+        # Flash-comm SP dense layers: reduce-scatter instead of allreduce
+        # around the MLP (see _forward_dense_sp_prepare_mlp /
+        # _forward_dense_sp_mlp).
+        _dense_sp = (
+            _is_cpu_920f
+            and is_kunpeng_flash_comm()
+            and not self.is_nextn
+            and not self.is_layer_sparse
         )
+        if _dense_sp:
+            hidden_states, residual = self._forward_dense_sp_prepare_mlp(
+                hidden_states, residual
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2008,13 +2105,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-            gemm_output_zero_allocator,
-        )
+        if _dense_sp:
+            hidden_states = self._forward_dense_sp_mlp(hidden_states)
+        else:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
 
         if _is_cpu_920f and not self.is_nextn:
             # The NextN draft layer reuses this code path; its layer_id (0)
@@ -2034,6 +2134,58 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         return hidden_states, residual, topk_indices
+
+    def _forward_dense_sp_prepare_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Flash-comm SP dense layer: RS the attention partial sums, LN slice.
+
+        Reduce-scatters the o_proj partial sums (attention-TP domain) so the
+        post-attention LN runs on this rank's token slice instead of the
+        full batch.
+        """
+        attn_tp_size = get_attn_tensor_model_parallel_world_size()
+        attn_tp_rank = get_attn_tensor_model_parallel_rank()
+        if hidden_states.shape[0] > 0:
+            kunpeng.shm_reduce_scatter_kunpeng(hidden_states)
+            hidden_states = hidden_states.tensor_split(attn_tp_size)[attn_tp_rank]
+            if residual is not None:
+                # Layer 0 (or any layer with full-row input) still holds the
+                # full-batch residual; later layers already hold the slice.
+                if residual.shape[0] == hidden_states.shape[0] * attn_tp_size:
+                    residual = residual.tensor_split(attn_tp_size)[attn_tp_rank]
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+        return hidden_states, residual
+
+    def _forward_dense_sp_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Flash-comm SP dense layer: quant slice, AG full rows, MLP, RS back.
+
+        Quantizes the LN token slice, allgathers the ``(int8, scale)`` back
+        to full rows, runs the int8 MLP with the down allreduce skipped,
+        then reduce-scatters the partial sums to the local token slice.
+        """
+        attn_tp_size = get_attn_tensor_model_parallel_world_size()
+        attn_tp_rank = get_attn_tensor_model_parallel_rank()
+        if hidden_states.shape[0] > 0:
+            int8_slice, scale_slice = kunpeng.quant_kunpeng(hidden_states)
+            n, h = int8_slice.shape
+            int8_full = torch.empty(
+                (n * attn_tp_size, h), dtype=int8_slice.dtype
+            )
+            attn_tp_all_gather_into_tensor(int8_full, int8_slice)
+            scale_full = torch.empty(
+                (n * attn_tp_size, 1), dtype=scale_slice.dtype
+            )
+            attn_tp_all_gather_into_tensor(scale_full, scale_slice.view(n, 1))
+            scale_full = scale_full.view(-1)
+            hidden_states = self.mlp((int8_full, scale_full), None, False, False)
+            kunpeng.shm_reduce_scatter_kunpeng(hidden_states)
+            hidden_states = hidden_states.tensor_split(attn_tp_size)[attn_tp_rank]
+        return hidden_states
 
     def op_comm_prepare_attn(
         self,
@@ -2313,6 +2465,26 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        if (
+            self.pp_group.is_first_rank
+            and is_kunpeng_flash_comm()
+            and get_moe_a2a_backend().is_kunpeng_cpu()
+            and hidden_states.shape[0] % get_attn_tensor_model_parallel_world_size()
+            != 0
+        ):
+            # Flash-comm SP slices the batch with tensor_split and lays out
+            # the dispatcher send buffer / topk tables as
+            # rank * (batch / attn_tp_size) — equal per-rank slices are
+            # required, otherwise the slicing silently interleaves tokens
+            # across ranks. Later PP stages receive the already-sliced rows
+            # and inherit this invariant from the first stage.
+            raise ValueError(
+                f"Kunpeng flash-comm SP requires batch ({hidden_states.shape[0]}) "
+                f"to be divisible by attn_tp_size "
+                f"({get_attn_tensor_model_parallel_world_size()}). Enable "
+                f"power-of-2 extend padding "
+                f"(SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1) or pad the batch."
+            )
         # DSA topk carry: this stage starts on a skip-topk (shared) layer, so the
         # predecessor must have shipped its top-k. Idle/empty batches compute
         # nothing and carry none by design.
@@ -2398,6 +2570,14 @@ class DeepseekV2Model(nn.Module):
                             hidden_states + residual, dim=0
                         )
                         aux_hidden_states.append(aux_hidden_state)
+                    elif is_kunpeng_flash_comm() and _kunpeng_sp_is_sliced(
+                        hidden_states, forward_batch
+                    ):
+                        # Flash-comm SP: hidden/residual are token slices;
+                        # the captured aux hidden states must be full rows.
+                        aux_hidden_states.append(
+                            _kunpeng_sp_gather_full(hidden_states + residual)
+                        )
                     else:
                         aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
@@ -2411,7 +2591,6 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
                 )
-
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers[normal_end_layer : self.end_layer],
@@ -2443,6 +2622,13 @@ class DeepseekV2Model(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
+                elif is_kunpeng_flash_comm() and _kunpeng_sp_is_sliced(
+                    hidden_states, forward_batch
+                ):
+                    # Flash-comm SP: the last layer's output is the token
+                    # slice — norm it and gather back to full rows.
+                    hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states = _kunpeng_sp_gather_full(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
@@ -2536,6 +2722,21 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     ):
         self.num_fused_shared_experts = 0
         server_args = get_global_server_args()
+
+        # Kunpeng flash-comm: co-locate the shared expert as a physical
+        # expert in the EPLB map (requires --init-expert-location covering
+        # n_routed + 1 logical experts). Independent of
+        # disable_shared_experts_fusion, which the CPU capability check
+        # below force-sets.
+        if _is_kunpeng_flash_comm:
+            if self.config.n_shared_experts != 1:
+                raise ValueError(
+                    "Kunpeng flash-comm shared-expert co-location requires "
+                    "n_shared_experts == 1, got "
+                    f"{self.config.n_shared_experts}"
+                )
+            self.num_fused_shared_experts = 1
+            return
 
         if server_args.disable_shared_experts_fusion:
             return
@@ -2656,9 +2857,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
+        num_logical_experts = config.n_routed_experts
+        if _is_kunpeng_flash_comm:
+            # Kunpeng flash-comm: the fused shared expert is an extra LOGICAL
+            # expert (id n_routed_experts) in the EPLB physical map.
+            num_logical_experts = config.n_routed_experts + 1
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
-            num_logical_experts=config.n_routed_experts,
+            num_logical_experts=num_logical_experts,
             num_groups=config.n_group,
         )
 

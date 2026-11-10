@@ -35,6 +35,10 @@
 #define SGLANG_KUTACC_HAS_FULL_ALLGATHER 1
 #endif
 
+#ifndef SGLANG_KUTACC_HAS_SHM_ALLGATHER
+#define SGLANG_KUTACC_HAS_SHM_ALLGATHER 1
+#endif
+
 static kutacc::shm_allgather_request_h g_ag_request = nullptr;        // comm16
 static kutacc::shm_allgather_request_h g_ag_request_comm8 = nullptr;  // comm8
 static bool g_ag_initialized = false;
@@ -227,6 +231,111 @@ void shm_dual_allgather_kunpeng(at::Tensor src0_tensor, at::Tensor dst0_tensor, 
 
     kutacc::shm_dual_allgather(src0, src0_size, dst0, src0_size, src1, src1_size, dst1, src1_size, remote_buffers0,
                                remote_buffers1, kutacc::SHM_DATATYPE_UINT8, barrier, g_ag_request);
+}
+
+// ── shm_allgather ────────────────────────────────────────────────────────
+// kutacc::shm_allgather (one-phase mirror-pair write dissemination) wrapper.
+// Dtype-generic: raw bytes.
+//
+// SHM path (graph capture/replay): both storages are SHM, so the kernel
+// gathers directly between peer buffers -- zero extra copies. Replay keeps
+// the ranks in lockstep, which the remote-write dissemination requires.
+//
+// Eager fallback: pull-based peer gather through the dim-keyed send cache.
+// Peers' send blocks are read and only the LOCAL output is written: no
+// receive-side SHM buffer is carved (the pool is fully claimed once the
+// static graph is captured, so a lazy recv allocation OOMs -- and it is
+// 8x the send width), and eager ranks are not lockstep, so remote writes
+// into a shared receive buffer are unsafe.
+void shm_allgather_kunpeng(at::Tensor input, at::Tensor output)
+{
+    TORCH_CHECK(g_ag_initialized, "shm_allgather_kunpeng called before shm_allgather_init_kunpeng");
+    TORCH_CHECK(input.is_contiguous() && output.is_contiguous(),
+                "shm_allgather_kunpeng requires contiguous tensors");
+    TORCH_CHECK(output.scalar_type() == input.scalar_type(),
+                "shm_allgather_kunpeng: dtype mismatch ", input.scalar_type(),
+                " vs ", output.scalar_type());
+    TORCH_CHECK(input.dim() >= 1 && input.dim() == output.dim(),
+                "shm_allgather_kunpeng: rank mismatch ", input.dim(),
+                " vs ", output.dim());
+
+    const int64_t local_batch = input.size(0);
+    TORCH_CHECK(local_batch > 0 && output.size(0) % local_batch == 0,
+                "shm_allgather_kunpeng: output rows ", output.size(0),
+                " not a multiple of input rows ", local_batch);
+    const int64_t comm_size = output.size(0) / local_batch;
+    TORCH_CHECK(comm_size == intra_node_size,
+                "shm_allgather_kunpeng: comm_size ", comm_size,
+                " != intra_node_size ", intra_node_size,
+                " (sub-group gathers unsupported: layout is intra-node rank-major)");
+
+    const size_t block_bytes =
+        static_cast<size_t>(input.numel()) * input.element_size();
+    if (block_bytes == 0) return;
+
+    if (is_shm_tensor(input) && is_shm_tensor(output)) {
+#if SGLANG_KUTACC_HAS_SHM_ALLGATHER
+        uint8_t *sendbuf = reinterpret_cast<uint8_t *>(input.data_ptr());
+        uint8_t *recvbuf = reinterpret_cast<uint8_t *>(output.data_ptr());
+
+        // peer translations: remote_sendbuf[i] is peer i's send block (read by
+        // the kernel from the mirror peer), remote_recvbuf[i] is peer i's
+        // receive buffer (this rank's writes land in the peer's dst slot).
+        void *remote_sendbuf[intra_node_size];
+        void *remote_recvbuf[intra_node_size];
+        for (int i = 0; i < intra_node_size; ++i) {
+            get_peer_shm_baseptr(i, sendbuf, &remote_sendbuf[i]);
+            get_peer_shm_baseptr(i, recvbuf, &remote_recvbuf[i]);
+        }
+
+        auto barrier = []() { kupl_shm_fence(kupl_win_intra_node); };
+
+        kutacc::shm_allgather(sendbuf, static_cast<int64_t>(block_bytes),
+                              recvbuf, static_cast<int64_t>(block_bytes) * comm_size,
+                              remote_sendbuf, remote_recvbuf,
+                              kutacc::SHM_DATATYPE_UINT8, barrier, g_ag_request);
+#else
+        TORCH_CHECK(false, "This KuTACC build does not provide kutacc::shm_allgather; install a matching KuTACC release to use shm_allgather_kunpeng");
+#endif
+        return;
+    }
+
+    // Eager fallback: copy the local block into an SHM send buffer, then
+    // pull the peers' blocks into the local output. The cached buffers are
+    // bf16 ([rows, width] elements), so the row width must be requested in
+    // 2-byte units; wider dtypes (fp32 per-token quant scales) then gather
+    // as raw bytes like every other dtype.
+    const int64_t row_bytes =
+        input.numel() / local_batch * input.element_size();
+    const int64_t width_2b = (row_bytes + 1) / 2;  // row width in 2-byte units
+    at::Tensor send_tensor = get_or_create_shm_tensor(width_2b, local_batch);
+    TORCH_CHECK(static_cast<int64_t>(block_bytes) <=
+                    send_tensor.numel() * send_tensor.element_size(),
+                "shm_allgather_kunpeng: SHM buffer too small for ",
+                block_bytes, " bytes");
+    std::memcpy(send_tensor.data_ptr(), input.data_ptr(), block_bytes);
+    uint8_t *in = reinterpret_cast<uint8_t *>(send_tensor.data_ptr());
+
+    // peer r's send block via KUPL translation (symmetric pool layout)
+    uint8_t *peer_in[intra_node_size];
+    for (int i = 0; i < intra_node_size; ++i) {
+        get_peer_shm_baseptr(i, in, reinterpret_cast<void **>(&peer_in[i]));
+    }
+
+    // all producer writes to the send buffers visible before reads
+    kupl_shm_fence(kupl_win_intra_node);
+
+    const int my_rank = intra_node_rank;
+    uint8_t *out = reinterpret_cast<uint8_t *>(output.data_ptr());
+    kutacc::parallel_for(0, intra_node_size, 1, [&](int64_t start, int64_t end) {
+        for (int64_t r = start; r < end; ++r) {
+            const uint8_t *src = (r == my_rank) ? in : peer_in[r];
+            std::memcpy(out + r * block_bytes, src, block_bytes);
+        }
+    });
+
+    // all reads done before any producer overwrites the send buffers
+    kupl_shm_fence(kupl_win_intra_node);
 }
 
 void shm_allgather_finalize_kunpeng()

@@ -595,6 +595,10 @@ class Envs:
     KUTACC_ASYNC_LAUNCH = EnvBool(True)
     SGLANG_KUNPENG_ENABLE_SHM_FENCE = EnvBool(False)
     SGLANG_KUNPENG_RDMA_BCAST = EnvBool(False)
+    # Kunpeng flash-comm: prefill sequence-parallel (token-sliced) MoE path
+    # plus shared-expert co-location into the MoE dispatch/combine pipeline.
+    # Active only when IS_PREFILL=1 as well (see is_kunpeng_flash_comm).
+    SGLANG_KUNPENG_FLASH_COMM = EnvBool(False)
     SGLANG_ENABLE_KUCCL = EnvBool(False)
     # PP layout for the Kunpeng CPU path (consumed by
     # sglang.srt.distributed.rank_layout):
