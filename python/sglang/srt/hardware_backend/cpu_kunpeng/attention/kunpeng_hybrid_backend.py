@@ -3,15 +3,107 @@ import torch
 from sglang.srt.graph import ops
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import HybridLinearAttnBackend
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
     QwenAttention, QwenGDNKernel, conv_decode, conv_prefill, gating, scatter, native_rope_cache,
 )
 from sglang.srt.hardware_backend.cpu_kunpeng.qwen import prefill_graph
+from sglang.srt.hardware_backend.cpu_kunpeng.qwen.capabilities import get_capabilities
+from sglang.srt.utils.common import is_kunpeng_extend_pad
+
+
+def padding_enabled() -> bool:
+    return is_kunpeng_extend_pad()
+
+
+def padded_tokens(tokens: int, cap: int = None) -> int:
+    """Next power-of-2 bucket for ``tokens``, unchanged if it exceeds ``cap``."""
+    if not padding_enabled() or tokens <= 0:
+        return tokens
+    padded = 1 << (tokens - 1).bit_length()
+    if cap is not None and padded > cap:
+        return tokens
+    return padded
+
+
+def extend_pad_cap() -> int:
+    """Largest token count a prefill graph of this backend can capture.
+
+    The padding mechanism itself is model agnostic; only this ceiling is
+    supplied by the model's declared prefill capability.
+    """
+    return get_capabilities().prefill_max_tokens
+
+
+def pad_extend_tokens(fb, cap: int = None) -> None:
+    """Grow an EXTEND batch's token rows to their power-of-2 bucket.
+
+    The prefill graph is keyed by the exact token-row count, so without this
+    every distinct prefill length captures its own graph. This is the shared
+    mechanism for CPU 920F EXTEND batches; the bucket cap is model specific and
+    supplied by the caller.
+
+    Only the token-shaped inputs are extended; request metadata
+    (req_pool_indices/seq_lens/extend_*, mamba query_start_loc) keeps the real
+    request count and the live token count travels in num_token_non_padded.
+
+    Must be idempotent: every EXTEND metadata init calls it (an eager retry, a
+    spec pass consuming the same batch, a graph replay after the eager entry),
+    and an already-padded batch reports a row count above the live count.
+
+    ForwardBatch.prepare_mlp_sync_batch also grows EXTEND token lists
+    (power-of-2/tp-aligned), but the CPU prefill graph is gated off whenever
+    that method runs. Should the two ever coexist, the live-count check below
+    keeps this pass a no-op on an upstream-padded batch instead of padding
+    twice and overwriting num_token_non_padded with the larger upstream count.
+    """
+    if fb.forward_mode.name != "EXTEND":
+        return
+    counts = fb.extend_seq_lens
+    if counts is None or counts.numel() == 0:
+        return
+    real = int(fb.input_ids.shape[0])
+    live = int(counts.sum())
+    # sum(extend_seq_lens) is the live token count; input_ids carries it
+    # exactly until someone pads the rows. A row count above the live count
+    # means an upstream pass already padded this batch to a fixed shape, and a
+    # count below it means inconsistent metadata; either way, do not bucket
+    # again.
+    if real != live:
+        return
+    padded = padded_tokens(real, cap=cap)
+    if padded <= real:
+        return
+    extra = padded - real
+
+    # Pure graph inputs; no kernel reads them for the padding rows.
+    fb.input_ids = torch.cat([fb.input_ids, fb.input_ids.new_zeros(extra)])
+    fb.positions = torch.cat([fb.positions, fb.positions.new_zeros(extra)])
+
+    # Padding rows carry the -1 skip sentinel: set_kv_buffer_kunpeng stores
+    # every row whose slot is non-negative, so repeating the last live slot
+    # would let the padding rows' k/v overwrite that token's cache entry. -1
+    # stays invisible to the validators (only the live prefix of
+    # out_cache_loc is range/uniqueness-checked) and to the request's KV
+    # release path, which reads the schedule batch's original tensor, never
+    # this padded copy.
+    fb.out_cache_loc = torch.cat(
+        [fb.out_cache_loc, fb.out_cache_loc.new_full((extra,), -1)]
+    )
+
+    fb.num_token_non_padded_cpu = live
+    fb.num_token_non_padded = torch.tensor([live], dtype=torch.int32)
+    fb.extend_num_tokens = padded
+
 
 class KunpengGQABackend(QwenAttention):
     def init_forward_metadata(self, fb):
         self.forward_metadata = None
+        # Runs before the GDN half builds its metadata (HybridLinearAttnBackend
+        # inits full then linear) and is also the whole backend for Qwen models
+        # without linear layers. The attached MTP draft's EXTEND batch runs on
+        # TorchNativeAttnBackend, which calls the same pad_extend_tokens, so the
+        # target prefill and the draft prefill-extend land in one bucket.
+        pad_extend_tokens(fb, cap=extend_pad_cap())
     def forward_extend(self, q, k, v, layer, fb, save_kv_cache=True, **kwargs):
         if fb.forward_mode.is_target_verify():
             # Verify reuses the extend entry point; the Qwen verify attention
@@ -93,62 +185,9 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
         super().init_forward_metadata(fb)
         metadata = self.linear_attn_backend.forward_metadata
         metadata.mamba_cache_indices = metadata.mamba_cache_indices.to(torch.int32)
-        self._apply_prefill_padding(fb)
-
-    def _apply_prefill_padding(self, fb):
-        """Bucket-align the prefill token list.
-
-        ForwardBatch.prepare_mlp_sync_batch also grows EXTEND token lists
-        (power-of-2/tp-aligned), but the Kunpeng prefill graph is gated off
-        whenever that method runs (prefill_graph.unsupported_reason requires
-        the shared-KV backend, which needs dp_size == 1 and no gathered
-        buffer). Should the two ever coexist, the live-count check below
-        keeps this pass a no-op on an upstream-padded batch instead of
-        padding twice and overwriting num_token_non_padded with the larger
-        upstream count.
-        Only the token-shaped inputs are extended; request metadata
-        (req_pool_indices/seq_lens/extend_*, mamba query_start_loc) keeps the
-        real request count and the live token count travels in
-        num_token_non_padded.
-        """
-        if fb.forward_mode != ForwardMode.EXTEND:
-            return
-        counts = fb.extend_seq_lens
-        if counts is None or counts.numel() == 0:
-            return
-        real = int(fb.input_ids.shape[0])
-        live = int(counts.sum())
-        # sum(extend_seq_lens) is the live token count; input_ids carries it
-        # exactly until someone pads the rows. A row count above the live
-        # count means an upstream pass (prepare_mlp_sync_batch) already
-        # padded this batch to a fixed shape, and a count below it means
-        # inconsistent metadata; either way, do not bucket again. (This also
-        # makes a repeated init a no-op once this method padded the batch.)
-        if real != live:
-            return
-        padded = prefill_graph.padded_tokens(real)
-        if padded <= real:
-            return
-        extra = padded - real
-
-        # Pure graph inputs; no kernel reads them for the padding rows.
-        fb.input_ids = torch.cat([fb.input_ids, fb.input_ids.new_zeros(extra)])
-        fb.positions = torch.cat([fb.positions, fb.positions.new_zeros(extra)])
-
-        # Padding rows carry the -1 skip sentinel: set_kv_buffer_kunpeng
-        # stores every row whose slot is non-negative, so repeating the last
-        # live slot would let the padding rows' k/v overwrite that token's
-        # cache entry. -1 stays invisible to the validators (only the live
-        # prefix of out_cache_loc is range/uniqueness-checked) and to the
-        # request's KV release path, which reads the schedule batch's
-        # original tensor, never this padded copy.
-        fb.out_cache_loc = torch.cat(
-            [fb.out_cache_loc, fb.out_cache_loc.new_full((extra,), -1)]
-        )
-
-        fb.num_token_non_padded_cpu = live
-        fb.num_token_non_padded = torch.tensor([live], dtype=torch.int32)
-        fb.extend_num_tokens = padded
+        # The full-attention half already padded the batch; this pass is a no-op
+        # there and only matters when the full backend is not a Kunpeng one.
+        pad_extend_tokens(fb, cap=extend_pad_cap())
 
     def graph_unsupported_reason(self, fb, kwargs):
         # The per-step (non-fused) MTP verify fallback gathers and scatters the

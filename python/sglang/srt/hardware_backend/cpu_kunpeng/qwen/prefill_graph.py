@@ -11,26 +11,11 @@ import os
 import torch
 from sgl_kernel import common_ops
 from sglang.srt.graph import ops, register_op
-from sglang.srt.utils.common import is_cpu_920f
 from .capabilities import get_capabilities
 
 
 def tokens_supported(tokens):
     return 1 <= tokens <= get_capabilities().prefill_max_tokens
-
-
-def padding_enabled():
-    return is_cpu_920f() and os.environ.get(
-        "SGLANG_KUNPENG_EXTEND_POWER_2_PADDING", "0"
-    ) == "1"
-
-
-def padded_tokens(tokens):
-
-    if not padding_enabled() or tokens <= 0:
-        return tokens
-    padded = 1 << (tokens - 1).bit_length()
-    return padded if tokens_supported(padded) else tokens
 
 
 _libraries = []
