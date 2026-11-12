@@ -114,24 +114,6 @@ _instance_indexes() {
 
 
 # ------------------------------------------------------------
-# Helper: NUMA duplication implies binary launch.
-# SGLANG_ENABLE_NUMA_DUPLICATION ships one pyinstall binary per node-local rank
-# slot (inside the binary-launch loop, server.sh picks
-# dist/sglang_server_tp<N>/sglang_server), and because those binaries carry
-# their own libs env.sh skips the toolchain LD_LIBRARY_PATH for it. Without
-# binary launch a node runs a single `python -m sglang.launch_server`, so there
-# is nothing to duplicate — and skipping the toolchain would break that python
-# process. Keep the two flags consistent: binary launch off => duplication off.
-# ------------------------------------------------------------
-_normalize_numa_dup() {
-    if [[ "${SGLANG_ENABLE_BINARY_LAUNCH:-1}" != "1" && "${SGLANG_ENABLE_NUMA_DUPLICATION:-1}" == "1" ]]; then
-        echo "[env] SGLANG_ENABLE_BINARY_LAUNCH='${SGLANG_ENABLE_BINARY_LAUNCH:-unset}' requires no NUMA duplication; forcing SGLANG_ENABLE_NUMA_DUPLICATION=0" >&2
-        export SGLANG_ENABLE_NUMA_DUPLICATION=0
-    fi
-}
-
-
-# ------------------------------------------------------------
 # Helpers: resolve variables by role prefix (PREFILL / DECODE / NATIVE)
 # ------------------------------------------------------------
 _export_node_config() {
