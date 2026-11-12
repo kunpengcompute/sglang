@@ -79,6 +79,28 @@ def pad_extend_tokens(fb, cap: int = None) -> None:
     fb.input_ids = torch.cat([fb.input_ids, fb.input_ids.new_zeros(extra)])
     fb.positions = torch.cat([fb.positions, fb.positions.new_zeros(extra)])
 
+    # Other per-token tensors are read by row (RoPE tables, multimodal
+    # embeddings) or bound as dynamic graph inputs, so they must carry the same
+    # row count as input_ids. Only live-sized ones grow: an upstream pass (the
+    # target prefill handing its already-padded mm embeddings to the draft) may
+    # have grown them to this bucket already.
+    if fb.mrope_positions is not None and fb.mrope_positions.shape[1] == real:
+        fb.mrope_positions = torch.cat(
+            [
+                fb.mrope_positions,
+                fb.mrope_positions.new_zeros((fb.mrope_positions.shape[0], extra)),
+            ],
+            dim=1,
+        )
+    for name in ("input_embeds", "mm_input_embeds"):
+        embeds = getattr(fb, name, None)
+        if embeds is not None and embeds.shape[0] == real:
+            setattr(
+                fb,
+                name,
+                torch.cat([embeds, embeds.new_zeros((extra, embeds.shape[1]))]),
+            )
+
     # Padding rows carry the -1 skip sentinel: set_kv_buffer_kunpeng stores
     # every row whose slot is non-negative, so repeating the last live slot
     # would let the padding rows' k/v overwrite that token's cache entry. -1
