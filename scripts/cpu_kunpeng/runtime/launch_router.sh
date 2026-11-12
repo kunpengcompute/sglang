@@ -27,6 +27,31 @@ SKIP_CONDA=1 source "$SCRIPT_DIR/env.sh" router
 
 sh "$SCRIPT_DIR/stop.sh" router
 
+mkdir -p "$LOG_DIR"
+
+# Resolve a role's master address in its own env.sh subshell (the role /
+# instance env may override the base value). The subshell's stderr is kept in
+# <log>/router_env_<role>[_<inst>].log instead of being dropped: a broken or
+# incomplete role env then fails here with a readable error, instead of
+# surfacing 20 minutes later as ":30000 failed to start".
+_resolve_master_addr() {
+    local _role="$1" _inst="${2:-}" _var _log _addr
+    case "$_role" in
+        prefill) _var="PREFILL_MASTER_ADDR" ;;
+        decode)  _var="DECODE_MASTER_ADDR" ;;
+    esac
+    _log="$LOG_DIR/router_env_${_role}${_inst:+_$_inst}.log"
+    _addr="$(SKIP_CONDA=1 bash -c "
+        source '$SCRIPT_DIR/env.sh' '$_role' '$_inst' >/dev/null
+        echo \"\$$_var\"" 2>"$_log")"
+    _addr="${_addr//[[:space:]]/}"
+    if [[ -z "$_addr" ]]; then
+        echo "ERROR: ${_role} master address not resolved (entry '${_role}${_inst:+_$_inst}', \$${_var} is empty); see $_log" >&2
+        return 1
+    fi
+    echo "$_addr"
+}
+
 # Wait for ALL gateway backends to be ready (up to 20 minutes): one master
 # per INSTANCES entry (e.g. "prefill,decode_128p" -> prefill master +
 # decode 128p master; each entry's role env is sourced in a subshell to
@@ -43,9 +68,7 @@ for _entry in ${INSTANCES//,/ }; do
     [[ "$_entry" == *_* ]] && _inst="${_entry#*_}"
     case "$_role" in
         prefill)
-            _addr="$(SKIP_CONDA=1 bash -c "
-                source '$SCRIPT_DIR/env.sh' prefill '$_inst' >/dev/null 2>&1
-                echo \"\$PREFILL_MASTER_ADDR\"")"
+            _addr="$(_resolve_master_addr prefill "$_inst")" || exit 1
             endpoints+=("prefill${_inst:+-$_inst}|${_addr}:30000")
             if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
                 _tok_port="$(SKIP_CONDA=1 bash -c "
@@ -56,9 +79,7 @@ for _entry in ${INSTANCES//,/ }; do
             fi
             ;;
         decode)
-            _addr="$(SKIP_CONDA=1 bash -c "
-                source '$SCRIPT_DIR/env.sh' decode '$_inst' >/dev/null 2>&1
-                echo \"\$DECODE_MASTER_ADDR\"")"
+            _addr="$(_resolve_master_addr decode "$_inst")" || exit 1
             endpoints+=("decode${_inst:+-$_inst}|${_addr}:30000")
             if [[ "$SGLANG_ENABLE_TOKENIZER_SEPERATE" == "1" ]]; then
                 _tok_port="$(SKIP_CONDA=1 bash -c "
@@ -73,12 +94,8 @@ done
 # Fallback: INSTANCES empty/unparsed -> resolve one backend per side via
 # the default (no-instance) role env in subshells.
 if [[ ${#endpoints[@]} -eq 0 ]]; then
-    _pf_addr="$(SKIP_CONDA=1 bash -c "
-        source '$SCRIPT_DIR/env.sh' prefill >/dev/null 2>&1
-        echo \"\$PREFILL_MASTER_ADDR\"")"
-    _de_addr="$(SKIP_CONDA=1 bash -c "
-        source '$SCRIPT_DIR/env.sh' decode >/dev/null 2>&1
-        echo \"\$DECODE_MASTER_ADDR\"")"
+    _pf_addr="$(_resolve_master_addr prefill '')" || exit 1
+    _de_addr="$(_resolve_master_addr decode '')" || exit 1
     endpoints=(
         "prefill|${_pf_addr}:30000"
         "decode|${_de_addr}:30000"
