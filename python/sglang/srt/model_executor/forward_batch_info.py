@@ -316,6 +316,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    # Kunpeng-only packed checkpoints within one prefill.
+    mamba_checkpoint_offsets: Optional[torch.Tensor] = None  # shape: [b + 1], int32
+    mamba_checkpoint_tokens: Optional[torch.Tensor] = None  # shape: [m], int32
+    mamba_checkpoint_indices: Optional[torch.Tensor] = None  # shape: [m], int64
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -469,6 +473,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_checkpoint_offsets=batch.mamba_checkpoint_offsets,
+            mamba_checkpoint_tokens=batch.mamba_checkpoint_tokens,
+            mamba_checkpoint_indices=batch.mamba_checkpoint_indices,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
@@ -1015,6 +1022,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+        if self.mamba_checkpoint_offsets is not None:
+            padding = bs - (self.mamba_checkpoint_offsets.numel() - 1)
+            assert padding >= 0
+            if padding:
+                self.mamba_checkpoint_offsets = torch.cat(
+                    [
+                        self.mamba_checkpoint_offsets,
+                        self.mamba_checkpoint_offsets[-1:].repeat(padding),
+                    ]
+                )
         if self.mamba_track_indices is not None:
             self.mamba_track_indices = self._pad_tensor_to_size(
                 self.mamba_track_indices, bs

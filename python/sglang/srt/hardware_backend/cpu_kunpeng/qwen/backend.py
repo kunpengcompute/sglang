@@ -4,8 +4,9 @@ import os
 from functools import lru_cache
 import torch
 from sgl_kernel import common_ops
-from sglang.srt.graph import ops, is_capturing
+from sglang.srt.graph import is_capturing, ops
 from sglang.srt.graph.torch_capture import install_boxed_bridge
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
@@ -47,7 +48,55 @@ def initialize():
     register_sigmoid_mul_bf16()
     from .layout import register_projection_split
     register_projection_split(common_ops.__file__)
+    lib.qwen36_gdn_prefill_with_workspace.restype = ctypes.c_int
+    lib.qwen36_gdn_prefill_with_workspace.argtypes = (
+        [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 6 + [ctypes.c_void_p, ctypes.c_int64]
+    )
+    lib.qwen36_gdn_prefill_parallel_with_workspace.restype = ctypes.c_int
+    lib.qwen36_gdn_prefill_parallel_with_workspace.argtypes = (
+        [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 7 + [ctypes.c_void_p, ctypes.c_int64]
+    )
+    # Keep no_buffer usable with an sgl-kernel that predates state tracking.
+    track_prefill = getattr(
+        lib, "qwen36_gdn_prefill_parallel_with_track_workspace", None
+    )
+    if track_prefill is not None:
+        track_prefill.restype = ctypes.c_int
+        track_prefill.argtypes = (
+            [ctypes.c_void_p] * 8
+            + [ctypes.c_int64] * 7
+            + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64]
+            + [ctypes.c_void_p, ctypes.c_int64]
+        )
+    multi_track_prefill = getattr(
+        lib, "qwen36_gdn_prefill_parallel_with_multi_track_workspace", None
+    )
+    if multi_track_prefill is not None:
+        multi_track_prefill.restype = ctypes.c_int
+        multi_track_prefill.argtypes = (
+            [ctypes.c_void_p] * 8
+            + [ctypes.c_int64] * 7
+            + [ctypes.c_void_p] * 3
+            + [ctypes.c_void_p, ctypes.c_int64]
+        )
     return lib
+
+@lru_cache()
+def supports_state_tracking():
+    """Whether the loaded sgl-kernel can emit GDN chunk-boundary states."""
+    return hasattr(
+        ctypes.CDLL(common_ops.__file__),
+        "qwen36_gdn_prefill_parallel_with_track_workspace",
+    )
+
+
+@lru_cache()
+def supports_multi_state_tracking():
+    return hasattr(
+        ctypes.CDLL(common_ops.__file__),
+        "qwen36_gdn_prefill_parallel_with_multi_track_workspace",
+    )
+
 
 from .prefill import conv_prefill, gating
 
@@ -98,6 +147,7 @@ class QwenGemmaRMSNorm(GemmaRMSNorm):
 class QwenGDNKernel(LinearAttnKernelBase):
     _kunpeng_validate_extend_metadata = True
     _kunpeng_accepts_postconv_base = True
+    supports_track_state_snapshot = True
 
     def decode(
         self,
@@ -158,14 +208,33 @@ class QwenGDNKernel(LinearAttnKernelBase):
         ).unsqueeze(1)
 
     def extend(
-        self, q, k, v, g, beta, *, ssm_states, cache_indices, query_start_loc, **kwargs
+        self,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        *,
+        ssm_states,
+        cache_indices,
+        query_start_loc,
+        track_state=None,
+        track_chunk_idx=None,
+        track_offsets=None,
+        track_tokens=None,
+        **kwargs,
     ):
         q, k, v = contiguous(q), contiguous(k), contiguous(v)
         g, beta = contiguous(cast(g, torch.float32)), contiguous(cast(beta, torch.float32))
         state = select(ssm_states, cache_indices)
         from . import prefill_graph
 
-        if prefill_graph.enabled() and prefill_graph.gdn_supported(q, k, v):
+        if (
+            prefill_graph.enabled()
+            and track_state is None
+            and track_offsets is None
+            and prefill_graph.gdn_supported(q, k, v)
+        ):
             prefill_graph.register()
             grain = 32
             size = prefill_graph.gdn_workspace_numel(
@@ -203,25 +272,101 @@ class QwenGDNKernel(LinearAttnKernelBase):
         else:
             size = 2 * q.shape[2] + 3 * v.shape[3]
         workspace = ops.alloc_buffer(size, dtype=torch.float32)
-        kernel = (
-            library.qwen36_gdn_prefill_parallel_with_workspace
-            if parallel
-            else library.qwen36_gdn_prefill_with_workspace
+        pointers = tuple(
+            t.data_ptr()
+            for t in (q, k, v, g, beta, state, query_start_loc, output)
         )
-        # Keep short tails serial. Larger chunks reuse each worker's state
-        # slice across the token recurrence, with one pool launch per layer.
-        rc = kernel(
-            *(t.data_ptr() for t in (q, k, v, g, beta, state, query_start_loc, output)),
-            sequences,
-            m,
-            q.shape[2],
-            v.shape[2],
-            q.shape[3],
-            v.shape[3],
-            *([grain] if parallel else []),
-            workspace.data_ptr(),
-            workspace.numel(),
-        )
+        if parallel:
+            if track_offsets is not None:
+                assert track_state is not None and track_tokens is not None
+                assert track_chunk_idx is None, (
+                    "Single and multi checkpoint tracking cannot be combined"
+                )
+                kernel = getattr(
+                    library,
+                    "qwen36_gdn_prefill_parallel_with_multi_track_workspace",
+                    None,
+                )
+                if kernel is None:
+                    raise RuntimeError(
+                        "Mamba multi-checkpoint tracking needs a rebuilt sgl-kernel: "
+                        "missing qwen36_gdn_prefill_parallel_with_multi_track_workspace"
+                    )
+                rc = kernel(
+                    *pointers,
+                    sequences,
+                    q.shape[1],
+                    q.shape[2],
+                    v.shape[2],
+                    q.shape[3],
+                    v.shape[3],
+                    grain,
+                    track_state.data_ptr(),
+                    track_offsets.data_ptr(),
+                    track_tokens.data_ptr(),
+                    workspace.data_ptr(),
+                    workspace.numel(),
+                )
+            elif track_state is None:
+                kernel = library.qwen36_gdn_prefill_parallel_with_workspace
+                rc = kernel(
+                    *pointers,
+                    sequences,
+                    m,
+                    q.shape[2],
+                    v.shape[2],
+                    q.shape[3],
+                    v.shape[3],
+                    grain,
+                    workspace.data_ptr(),
+                    workspace.numel(),
+                )
+            else:
+                assert (
+                    track_chunk_idx is not None
+                ), "track_state requires the per-sequence chunk indices"
+                kernel = getattr(
+                    library, "qwen36_gdn_prefill_parallel_with_track_workspace", None
+                )
+                if kernel is None:
+                    raise RuntimeError(
+                        "Mamba extra_buffer needs a rebuilt sgl-kernel: missing "
+                        "qwen36_gdn_prefill_parallel_with_track_workspace"
+                    )
+                # Keep short tails serial. Larger chunks reuse each worker's
+                # state slice across the token recurrence, with one pool launch
+                # per layer.
+                rc = kernel(
+                    *pointers,
+                    sequences,
+                    m,
+                    q.shape[2],
+                    v.shape[2],
+                    q.shape[3],
+                    v.shape[3],
+                    grain,
+                    track_state.data_ptr(),
+                    track_chunk_idx.data_ptr(),
+                    FLA_CHUNK_SIZE,
+                    workspace.data_ptr(),
+                    workspace.numel(),
+                )
+        else:
+            assert track_state is None and track_offsets is None, (
+                "GDN state tracking requires the parallel prefill kernel"
+            )
+            kernel = library.qwen36_gdn_prefill_with_workspace
+            rc = kernel(
+                *pointers,
+                sequences,
+                m,
+                q.shape[2],
+                v.shape[2],
+                q.shape[3],
+                v.shape[3],
+                workspace.data_ptr(),
+                workspace.numel(),
+            )
         if rc:
             raise RuntimeError(f"Qwen GDN prefill failed: {rc}")
         # The kernel only writes the live rows; zero the padding tail so
@@ -539,6 +684,25 @@ def qknorm_rope(module, positions, q, k):
 
 def configure_modules(model):
     initialize()
+    from sglang.srt.server_args import get_global_server_args
+
+    if (
+        get_global_server_args().enable_mamba_extra_buffer()
+        and not supports_state_tracking()
+    ):
+        raise ValueError(
+            "Mamba extra_buffer needs a rebuilt sgl-kernel with "
+            "qwen36_gdn_prefill_parallel_with_track_workspace; rebuild "
+            "sgl-kernel or use --mamba-scheduler-strategy no_buffer."
+        )
+    if (
+        get_global_server_args().mamba_checkpoint_stride_pages is not None
+        and not supports_multi_state_tracking()
+    ):
+        raise ValueError(
+            "Mamba multi-checkpoint tracking needs a rebuilt sgl-kernel with "
+            "qwen36_gdn_prefill_parallel_with_multi_track_workspace"
+        )
     torch.set_num_threads(int(os.environ.get("SGLANG_KUNPENG_TORCH_NUM_THREADS", "32")))
     from .linear import apply_dense, declare_projection, prepare_dense
     from sglang.srt.layers.quantization.modelslim.schemes.cpu920f_w8a8_dynamic import CPU920FModelSlimW8A8Dynamic

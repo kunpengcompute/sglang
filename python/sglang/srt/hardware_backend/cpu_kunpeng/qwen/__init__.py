@@ -4,7 +4,6 @@ import os
 def enabled():
     return os.environ.get('SGLANG_USE_CPU_920F') == '1' and os.environ.get('SGLANG_KUNPENG_QWEN') == '1'
 
-
 def configure_hbw_shm():
     """Select the existing split HBM budget before communication creates SHM."""
     if not (enabled() and os.environ.get("SGLANG_ENABLE_HBW_POOL") == "1"

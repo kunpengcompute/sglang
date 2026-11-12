@@ -1329,11 +1329,18 @@ class EAGLEWorker(TpModelWorker):
                 batch.seq_lens // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+            if res.accepted_indices is None:
+                # The fused Kunpeng topk=1 verify returns compact results without
+                # accept_index. Accepted tokens are a prefix of each draft chain,
+                # so the relative checkpoint step is directly available here.
+                candidate_track_steps = to_track_ith
+            else:
+                candidate_track_steps = (
+                    res.accepted_indices[to_track_ith + accepted_indices_start]
+                    - accepted_indices_offset
+                )
             mamba_steps_to_track = torch.where(
-                to_track_mask,
-                res.accepted_indices[to_track_ith + accepted_indices_start]
-                - accepted_indices_offset,
-                -1,
+                to_track_mask, candidate_track_steps, -1
             )
         else:
             mamba_steps_to_track = None
@@ -1372,6 +1379,19 @@ class EAGLEWorker(TpModelWorker):
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
         )
+        # The target's sparse mamba checkpoints describe GDN layers the dense
+        # MTP draft does not have. Left on the draft batch they make every
+        # draft-extend decline graph capture, and the eager fallback then asks
+        # for a fresh SHM slice after capture has already consumed the pool.
+        model_worker_batch.mamba_checkpoint_offsets = None
+        model_worker_batch.mamba_checkpoint_tokens = None
+        model_worker_batch.mamba_checkpoint_indices = None
+        # Same for the target's tracking metadata: the draft has no recurrent
+        # layers to track, and a live mask makes prefill_graph decline the
+        # draft-extend as well.
+        model_worker_batch.mamba_track_mask = None
+        model_worker_batch.mamba_track_indices = None
+        model_worker_batch.mamba_track_seqlens = None
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )

@@ -594,6 +594,7 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    mamba_checkpoint_stride_pages: Optional[int] = None
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
@@ -2413,9 +2414,25 @@ class ServerArgs:
                     "Please use --mamba-scheduler-strategy no_buffer instead."
                 )
 
-            assert (
-                is_cuda() or is_musa()
-            ), "Mamba extra_buffer is only supported on CUDA and MUSA devices with FLA backend"
+            if is_cpu_920f():
+                assert (
+                    self.device == "cpu"
+                    and os.environ.get("SGLANG_KUNPENG_QWEN") == "1"
+                ), (
+                    "Mamba extra_buffer on Kunpeng 920F requires the Qwen CPU backend; "
+                    "set SGLANG_KUNPENG_QWEN=1 or use "
+                    "--mamba-scheduler-strategy no_buffer."
+                )
+                # The Kunpeng GDN prefill kernel emits the per-chunk state
+                # snapshots and decode copies state rows on the host, so the
+                # FLA/Triton-only restriction does not apply.
+                logger.info(
+                    "Mamba extra_buffer is enabled on the Kunpeng 920F CPU backend."
+                )
+            else:
+                assert (
+                    is_cuda() or is_musa()
+                ), "Mamba extra_buffer is only supported on CUDA, MUSA and Kunpeng 920F CPU devices"
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -5942,6 +5959,13 @@ class ServerArgs:
             help="The interval to track the mamba state during decode.",
         )
         parser.add_argument(
+            "--mamba-checkpoint-stride-pages",
+            type=int,
+            default=ServerArgs.mamba_checkpoint_stride_pages,
+            help="Save multiple Mamba checkpoints every N pages within each "
+            "Kunpeng Qwen prefill. Requires extra_buffer.",
+        )
+        parser.add_argument(
             "--mamba-backend",
             type=str,
             choices=MAMBA_BACKEND_CHOICES,
@@ -6965,6 +6989,47 @@ class ServerArgs:
         # It is used to determine the caching point in a sequence during prefill.
         return max(FLA_CHUNK_SIZE, self.page_size)
 
+    def _validate_mamba_checkpoint_stride(self):
+        if self.mamba_checkpoint_stride_pages is None:
+            return
+
+        assert self.mamba_checkpoint_stride_pages >= 1, (
+            "--mamba-checkpoint-stride-pages must be greater than or equal to 1"
+        )
+        assert self.enable_mamba_extra_buffer(), (
+            "--mamba-checkpoint-stride-pages requires "
+            "--mamba-scheduler-strategy extra_buffer"
+        )
+        assert (
+            is_cpu_920f()
+            and self.device == "cpu"
+            and os.environ.get("SGLANG_KUNPENG_QWEN") == "1"
+        ), (
+            "--mamba-checkpoint-stride-pages is only supported on the "
+            "Kunpeng 920F Qwen CPU backend"
+        )
+        stride_tokens = self.mamba_checkpoint_stride_pages * self.page_size
+        assert stride_tokens % self.mamba_cache_chunk_size == 0, (
+            f"Mamba checkpoint stride {stride_tokens} must be divisible by "
+            f"mamba_cache_chunk_size {self.mamba_cache_chunk_size}"
+        )
+        assert not self.enable_dynamic_chunking, (
+            "--mamba-checkpoint-stride-pages is incompatible with "
+            "--enable-dynamic-chunking"
+        )
+        assert not self.enable_mixed_chunk, (
+            "--mamba-checkpoint-stride-pages is incompatible with "
+            "--enable-mixed-chunk"
+        )
+        assert not self.enable_streaming_session, (
+            "--mamba-checkpoint-stride-pages is incompatible with "
+            "--enable-streaming-session"
+        )
+        assert not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get(), (
+            "--mamba-checkpoint-stride-pages is incompatible with "
+            "SGLANG_ENABLE_UNIFIED_RADIX_TREE"
+        )
+
     def check_server_args(self):
         # Check parallel size constraints
         assert (
@@ -7019,6 +7084,7 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+        self._validate_mamba_checkpoint_stride()
 
         # Check pdmux
         if self.enable_pdmux:
