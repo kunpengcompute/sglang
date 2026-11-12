@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 import math
+import os
 import warnings
 from functools import lru_cache, partial
 from typing import Any, Callable, Optional, Tuple
@@ -20,6 +22,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
     is_blackwell_supported,
+    is_cpu_920f,
     is_cuda,
     is_hip,
     is_musa,
@@ -31,6 +34,8 @@ from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
     with_multi_stream,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -147,6 +152,106 @@ def resolve_seqlens(
     return resolved_seqlens
 
 
+# ---------------------------------------------------------------------------
+# Kunpeng 920F CPU flash attention for vision towers.
+#
+# F.scaled_dot_product_attention has no CPU flash backend, so it decomposes
+# into the math chain (bmm / mask / softmax / bmm) of tiny per-rank GEMMs:
+# at TP16 the Qwen3-VL tower runs [S, 1, head_dim] operands, and per-op
+# thread-pool barriers dominate - a profiled S=256 graph replay spent 60%
+# of its 547 ms in 81 aten::bmm calls averaging ~4 ms each. The Kunpeng C++
+# kernel behind flash_attention_with_workspace_kunpeng (the same registered
+# graph op the text prefill uses) computes the whole attention in ONE op:
+# native bf16 loads, fp32 online softmax, no S-matrix materialization, and
+# no mask at all - per-image bidirectional attention comes from varlen
+# boundaries. It records natively inside the Kunpeng ViT graph.
+# ---------------------------------------------------------------------------
+
+_is_cpu_920f = is_cpu_920f()
+
+
+def kunpeng_vit_flash_enabled() -> bool:
+    """Gate for the Kunpeng vision flash attention: default ON on the 920F
+    CPU backend; opt out with SGLANG_KUNPENG_VIT_FLASH_ATTN=0. Applies to
+    eager tower forwards and the Kunpeng ViT graph alike - both run the
+    same kernel, so graph replays stay identical to eager."""
+    return _is_cpu_920f and os.environ.get(
+        "SGLANG_KUNPENG_VIT_FLASH_ATTN", "1"
+    ) not in ("", "0")
+
+
+def kunpeng_vision_flash_max_rows() -> int:
+    """Largest total token count the shared flash workspace can serve.
+    Reuses the vision SHM row budget's env and default, since the graph
+    runner already refuses to capture beyond that budget."""
+    return int(os.environ.get("SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "2304"))
+
+
+@lru_cache(maxsize=1)
+def _kunpeng_flash_geometry() -> Tuple[int, int, int]:
+    """(BR, BC, thread_num) tile/thread geometry of the Kunpeng flash
+    attention kernel, queried once from C++."""
+    br, bc = torch.ops.sgl_kernel.get_flash_attention_block_kunpeng()
+    threads = torch.ops.sgl_kernel.get_flash_attention_thread_num()
+    return int(br), int(bc), int(threads)
+
+
+_KUNPENG_VISION_FLASH_WORKSPACE: Optional[torch.Tensor] = None
+
+
+def kunpeng_vision_flash_workspace(
+    qk_head_dim: int, vo_head_dim: int
+) -> Optional[torch.Tensor]:
+    """Shared scratch tensor for the Kunpeng vision flash attention.
+
+    Sized once for the vision row budget (every capturable image shape and
+    any per-image split of it fits), because the kernel bump-allocates its
+    per-thread pack buffers from this tensor exactly like the text
+    prefill's workspace (kunpeng_attention.cpp flash_attention_with_
+    workspace: pack_attn_k/v sized threads * pack_len * head_dim, plus the
+    q/attn_s/out_block/max/base tiles). One buffer per process; graph
+    captures register it as a fixed storage, so its identity never changes
+    under any captured graph.
+
+    Head dims are rounded up to 64 multiples internally: the kernel's pack
+    stages step the head dimension in 64-column groups (1VL trans pack) /
+    32-column groups (2VL pack) with full-width SVE loads, so
+    _forward_kunpeng_flash zero-pads its operands to the same grid and the
+    workspace must cover the padded dims (D=72 -> 128)."""
+    global _KUNPENG_VISION_FLASH_WORKSPACE
+    if not kunpeng_vit_flash_enabled():
+        return None
+    qk_head_dim = (qk_head_dim + 63) // 64 * 64
+    vo_head_dim = (vo_head_dim + 63) // 64 * 64
+    br, bc, threads = _kunpeng_flash_geometry()
+    # 2x: non-causal calls hand the kernel seq_lens = 2 * cur_lens (the
+    # fake per-sequence prefix that disables its causal mask), and the
+    # wrapper sizes the per-thread K/V pack buffers from those doubled
+    # lengths - so the workspace must cover twice the row budget.
+    pack_len = (2 * kunpeng_vision_flash_max_rows() + bc - 1) // bc * bc
+
+    def align64(n: int) -> int:
+        return (n + 63) // 64 * 64
+
+    bf16, f32 = 2, 4
+    ws_bytes = (
+        align64(threads * pack_len * qk_head_dim * bf16)  # pack_attn_k
+        + align64(threads * pack_len * vo_head_dim * bf16)  # pack_attn_v
+        + align64(threads * br * qk_head_dim * bf16)  # pack_attn_q
+        + align64(threads * bc * br * f32)  # attn_s
+        + align64(threads * br * vo_head_dim * f32) * 2  # out_block old/new
+        + align64(threads * br * f32) * 4  # max/base old/new
+    )
+    if (
+        _KUNPENG_VISION_FLASH_WORKSPACE is None
+        or _KUNPENG_VISION_FLASH_WORKSPACE.numel() < ws_bytes
+    ):
+        _KUNPENG_VISION_FLASH_WORKSPACE = torch.empty(
+            ws_bytes, dtype=torch.uint8
+        )
+    return _KUNPENG_VISION_FLASH_WORKSPACE
+
+
 class VisionSdpaAttention(nn.Module):
     r"""
     Scaled Dot Product Attention inner product
@@ -241,6 +346,7 @@ class VisionSdpaAttention(nn.Module):
         bsz: int,
         cu_seqlens: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        flash_seq_lens: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -254,6 +360,21 @@ class VisionSdpaAttention(nn.Module):
             assert bsz == 1, "flatten_batch is True, bsz must be 1"
 
         assert q.dim() == 3, q.shape
+
+        # Kunpeng 920F: one fused kernel replaces the CPU SDPA math chain.
+        # Eager forwards and the Kunpeng ViT graph capture body both run
+        # this same branch, so graph replays stay identical to eager.
+        # flash_seq_lens carries the graph input's per-image token counts;
+        # when absent (every eager path) it is derived from cu_seqlens.
+        if (
+            self.flatten_batch
+            and bsz == 1
+            and q.dtype == torch.bfloat16
+            and kunpeng_vit_flash_enabled()
+        ):
+            out = self._forward_kunpeng_flash(q, k, v, cu_seqlens, flash_seq_lens)
+            if out is not None:
+                return out
 
         s = q.shape[0] // bsz
 
@@ -305,6 +426,121 @@ class VisionSdpaAttention(nn.Module):
         output = rearrange(output, "b h s d -> (b s) h d")
 
         return output
+
+    def _forward_kunpeng_flash(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        flash_seq_lens: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Fused varlen attention via the Kunpeng flash kernel; returns
+        None to fall back to the SDPA path below.
+
+        q/k/v are the flattened contiguous [S, heads, head_dim] operands of
+        a flatten_batch tower; the kernel is bf16-only and attends within
+        each cu_seqlens-delimited image bidirectionally (causal=False) -
+        exactly the block-diagonal semantics of the SDPA mask path. The
+        padded buffers mirror the text prefill's usage: the kernel loads Q
+        and writes O in BR-row tiles and reads K/V in BC-row tiles, so each
+        operand is padded past S and zeroed to keep tile over-reads inside
+        allocated memory. Head dims are zero-padded to a 64-column grid for
+        the same reason (the kernel's pack stages over-run otherwise), which
+        is exact for attention and only widens the gemms."""
+        s = q.shape[0]
+        if s == 0 or s > kunpeng_vision_flash_max_rows():
+            # Empty or beyond the shared workspace's capacity; the SDPA
+            # path handles any size.
+            return None
+        # The kernel zero-pads each image's K to 16-row tiles and, with
+        # causal=False, nothing masks those padding rows: zero rows carry
+        # logit 0 and bias the softmax denominator unless the row max is
+        # large. Require 16-aligned token counts and fall back to SDPA
+        # otherwise. On the captured single-image path (flash_seq_lens)
+        # no data-dependent host read may run inside the capture, but
+        # there s is exactly the one image's token count, so this shape
+        # check is exact; the eager branch re-checks every image below.
+        if s % 16 != 0:
+            return None
+        if flash_seq_lens is not None:
+            if flash_seq_lens.dtype != torch.int32:
+                return None
+            seq_lens = flash_seq_lens
+            # Captured single-image path: the constant counts are [S], so
+            # the true max sequence length is S itself - no data-dependent
+            # host read may run inside the capture.
+            chunked_prefill_size = s
+        else:
+            if cu_seqlens is None:
+                return None
+            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+            if seq_lens.numel() == 0:
+                return None
+            if bool((seq_lens % 16 != 0).any()):
+                # Multi-image eager: a 16-aligned total token count does
+                # not imply aligned images (100 + 124 = 224); each image
+                # must align on its own or its K padding rows bias the
+                # softmax denominator.
+                return None
+            chunked_prefill_size = int(seq_lens.max())
+
+        num_heads = q.shape[1]
+        qk_head_dim = q.shape[2]
+        vo_head_dim = v.shape[2]
+        # The kernel's pack stages require head dims on a 64-column grid
+        # (1VL trans pack for Q/K; the 2VL V pack needs 32) - full-width
+        # SVE loads and an n-based store layout both over-run otherwise
+        # (D=72 reads the next row's data into the packed tail and writes
+        # past the pack block extent). Zero-padding the head dimension is
+        # mathematically exact for attention - q/k zeros add nothing to
+        # the dot products, v zeros produce zero output columns that get
+        # sliced off - and only widens the gemms (72 -> 128 also lands on
+        # the production text-path geometry). The scale stays 1/sqrt(real
+        # head_dim).
+        pad_qk = (qk_head_dim + 63) // 64 * 64
+        pad_vo = (vo_head_dim + 63) // 64 * 64
+        if pad_qk > 256 or pad_vo > 256:
+            # Beyond the shared workspace's intended footprint; SDPA
+            # handles any head dim.
+            return None
+        workspace = kunpeng_vision_flash_workspace(qk_head_dim, vo_head_dim)
+        if workspace is None:
+            return None
+
+        from sglang.srt.graph import ops as kunpeng
+
+        br, bc, _threads = _kunpeng_flash_geometry()
+
+        def padded_rows(t: torch.Tensor, rows: int, pad_dim: int) -> torch.Tensor:
+            buf = kunpeng.alloc_buffer(
+                rows * num_heads * pad_dim, dtype=t.dtype
+            )
+            buf = buf.view(rows, num_heads, pad_dim)
+            kunpeng.zero_(buf)
+            # Strided destination: copy_kunpeng is aten copy_, which
+            # handles the [:, :, :d] head-dim slice fine (and records
+            # identically under graph capture).
+            kunpeng.copy_kunpeng(buf[: t.shape[0], :, : t.shape[2]], t)
+            return buf
+
+        padded_q = padded_rows(q, s + br, pad_qk)
+        padded_k = padded_rows(k, s + bc, pad_qk)
+        padded_v = padded_rows(v, s + bc, pad_vo)
+        out = kunpeng.flash_attention_with_workspace_kunpeng(
+            padded_q,
+            padded_k,
+            padded_v,
+            workspace,
+            seq_lens,
+            False,  # causal: each image attends bidirectionally
+            self.scale,
+            chunked_prefill_size,
+        )
+        # Drop the row and head-dim padding; contiguous so downstream
+        # projections get a plain dense operand.
+        out = out[:s, :, :vo_head_dim].contiguous()
+        return out
 
 
 class VisionTritonAttention(nn.Module):
@@ -1030,6 +1266,7 @@ class VisionAttention(nn.Module):
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        flash_seq_lens: Optional[torch.Tensor] = None,
         full_attn: bool = True,
         **kwargs,
     ) -> torch.Tensor:
@@ -1178,6 +1415,7 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            flash_seq_lens=flash_seq_lens,
             sequence_lengths=sequence_lengths,
             max_seqlen=max_seqlen,
             output_ws=attn_output_ws,

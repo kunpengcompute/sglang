@@ -18,8 +18,9 @@ Captures the vision tower's "blocks + deepstack mergers + merger" forward
 into the Kunpeng C++ graph (``sglang.srt.graph`` capture/finalize) - the
 same mechanism the text decoder's prefill/decode graphs use. Replay rebinds
 the per-request inputs positionally (patch embeddings, rotary cos/sin
-tables, attention mask) and executes the recorded op sequence from C++
-without re-entering Python.
+tables, and the mode-dependent attention input: the hoisted SDPA mask or
+the flash path's token counts) and executes the recorded op sequence from
+C++ without re-entering Python.
 
 Two properties differ from the CUDA/NPU ViT runners (which replay
 fixed-address workspaces through torch.cuda/torch_npu graphs):
@@ -31,6 +32,10 @@ fixed-address workspaces through torch.cuda/torch_npu graphs):
    per (s, flatten_batch, cu_seqlens values)) and passed in as a graph
    input whose values refresh on every replay. The graph key can then stay
    "token count S", because the mask shape [1, S, S] only depends on S.
+   With the Kunpeng flash attention enabled (default on 920F) no mask
+   exists at all: the fourth input is instead the constant per-image
+   token counts [S], and each block's attention records as the single
+   registered flash_attention_with_workspace_kunpeng op.
 2. The tower's RowParallelLinear TP reductions must take the reserved SHM
    collective (a registered graph op that self-records during capture). A
    gloo fallback also executes during capture tracing, but c10d bypasses
@@ -60,6 +65,10 @@ import torch.nn as nn
 from sglang.srt.graph import capture, finalize
 from sglang.srt.graph.collect_weights import collect_model_weights
 from sglang.srt.graph.torch_capture import AutomaticTorchCapture, contiguous_clone
+from sglang.srt.layers.attention.vision import (
+    kunpeng_vit_flash_enabled,
+    kunpeng_vision_flash_workspace,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 
 logger = logging.getLogger(__name__)
@@ -183,6 +192,9 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
         # Reasons already logged by ready_to_capture, to avoid per-request
         # log spam while the tower runs its eager fallback.
         self.logged_not_ready_reasons: set = set()
+        # Constant int32 [S] per-image token counts per graph key, for the
+        # flash-attention path's fourth graph input.
+        self._flash_seq_lens_cache: dict = {}
 
     # ------------------------------------------------------------------
     # Capture readiness
@@ -204,7 +216,9 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
             )
         return self._vision_reduce_widths
 
-    def ready_to_capture(self, num_tokens: int) -> Tuple[bool, str]:
+    def ready_to_capture(
+        self, num_tokens: int, num_images: int = 1
+    ) -> Tuple[bool, str]:
         """Whether the tower forward for ``num_tokens`` tokens can be
         captured safely.
 
@@ -222,10 +236,39 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
            reserved budget, the reduce falls back to gloo, which is not
            recordable - a captured gloo reduce would be silently skipped on
            replay.
+        3. Under the flash-attention path the request must carry exactly
+           one image: the graph bakes the constant per-image token counts
+           [S], so a multi-image request of the same total S would replay
+           with wrong (single-image) attention boundaries. Such requests
+           run the eager tail, whose flash path derives the true counts
+           from cu_seqlens per request.
+        4. Under the flash-attention path S must be a multiple of 16: the
+           kernel zero-pads each image's K to 16-row tiles and a
+           bidirectional (non-causal) call cannot mask the padding rows,
+           so a misaligned S must run the eager SDPA path instead. This
+           also keeps the capture body on the flash branch: entering a
+           capture with misaligned S would make the flash guard inside
+           VisionSdpaAttention fall through to its cu_seqlens-dependent
+           SDPA mask generation, which the flash-mode capture does not
+           hoist as a graph input.
 
         Token counts above the reservation run the eager tail instead,
         matching the degrade-to-slow semantics of the SHM routing itself.
         """
+        if kunpeng_vit_flash_enabled() and num_images != 1:
+            return (
+                False,
+                f"{num_images} images in one request - the captured graph "
+                "bakes single-image token counts; running the eager flash "
+                "path",
+            )
+        if kunpeng_vit_flash_enabled() and num_tokens % 16 != 0:
+            return (
+                False,
+                f"{num_tokens} tokens are not 16-aligned - the flash kernel "
+                "zero-pads K to 16-row tiles and a bidirectional call "
+                "cannot mask the padding rows; running the eager SDPA path",
+            )
         if self._attn_backend is None or not hasattr(
             self._attn_backend, "generate_patch_attention_mask"
         ):
@@ -255,7 +298,7 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
         return True, ""
 
     # ------------------------------------------------------------------
-    # Mask hoisting
+    # Graph-side attention inputs (hoisted mask / flash token counts)
     # ------------------------------------------------------------------
 
     def make_attention_mask(self, s: int, cu_seqlens: torch.Tensor):
@@ -270,6 +313,23 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
             s, cu_seqlens, flatten_batch=self._attn_backend.flatten_batch
         )
 
+    def _flash_seq_lens(self, s: int) -> torch.Tensor:
+        """Constant int32 [s] per-image token counts: the flash path's
+        fourth graph input.
+
+        Flash-path graphs are single-image by construction
+        (ready_to_capture rejects multi-image requests while flash is
+        enabled), so every replay of the S-keyed graph carries the counts
+        [S]. The tensor is cached per S so its identity never changes, and
+        unlike the SDPA mask input its values are constant - nothing
+        refreshes per replay.
+        """
+        seq_lens = self._flash_seq_lens_cache.get(s)
+        if seq_lens is None:
+            seq_lens = torch.tensor([s], dtype=torch.int32)
+            self._flash_seq_lens_cache[s] = seq_lens
+        return seq_lens
+
     # ------------------------------------------------------------------
     # Capture / replay
     # ------------------------------------------------------------------
@@ -281,7 +341,6 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
-        attention_mask: torch.Tensor,
     ):
         vit = self.vit
         # Plain ATen ops record as "aten_boxed" graph ops; the C++ replay
@@ -291,10 +350,40 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
         # Explicit output contracts for native ops whose meta kernels lie
         # about the CPU implementation's real returns (first call is free).
         _register_native_contracts()
+
+        # Fourth graph input, per attention mode. Flash: the constant [S]
+        # token counts, with the shared flash workspace pinned as a fixed
+        # storage so every replay's kernel bump-allocates scratch from the
+        # same process-lifetime buffer. SDPA: the hoisted block-diagonal
+        # mask, whose values refresh per replay. The mode choice mirrors
+        # VisionSdpaAttention.forward's flash guard - on this tower
+        # (flatten_batch, bsz=1, bf16, head size within the flash pad cap -
+        # any head dim gets zero-padded to a 64 multiple by the flash
+        # helper, 16-aligned S within the row budget; the alignment is
+        # ready_to_capture condition 4)
+        # the flash branch is always taken when enabled, so the capture
+        # body never falls through to its Python-side,
+        # cu_seqlens-value-dependent mask generation.
+        if kunpeng_vit_flash_enabled():
+            fourth_input = self._flash_seq_lens(graph_key)
+            extra = {"flash_seq_lens": fourth_input}
+            head_dim = self._attn_backend.head_size
+            workspace = kunpeng_vision_flash_workspace(head_dim, head_dim)
+            # Never None while the gate is on; guarded anyway so a future
+            # gating change cannot push a None into fixed.
+            extra_fixed = [workspace] if workspace is not None else []
+        else:
+            fourth_input = self.make_attention_mask(graph_key, cu_seqlens)
+            extra = {"attention_mask": fourth_input}
+            extra_fixed = []
+
         # Positional graph inputs; replay rebinds fresh tensors here.
-        inputs = [x_3d, rotary_pos_emb_cos, rotary_pos_emb_sin, attention_mask]
-        # Tower parameters/buffers as fixed (non-input) storages.
-        fixed = collect_model_weights(vit)
+        inputs = [x_3d, rotary_pos_emb_cos, rotary_pos_emb_sin, fourth_input]
+        # Tower parameters/buffers as fixed (non-input) storages, plus the
+        # shared flash workspace under the flash path: the flash op's
+        # capture-time lookup must resolve the workspace to a pinned
+        # storage, not register it as a new graph input.
+        fixed = collect_model_weights(vit) + extra_fixed
 
         context = AutomaticTorchCapture(_vit_decompositions())
         t0 = time.perf_counter()
@@ -305,10 +394,12 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
             suppress_adapter_dispatch=True,
         ), context:
             # The shared eager tail (blocks + deepstack mergers + merger),
-            # run verbatim as the capture body. The hoisted mask is passed
-            # through so the CPU SDPA backend never runs its Python-side,
-            # cu_seqlens-value-dependent mask generation inside the graph;
-            # cu_seqlens itself stays a plain (unconsumed) Python argument.
+            # run verbatim as the capture body. The fourth attention input
+            # (the hoisted mask, or the flash path's token counts) is
+            # passed through so the CPU attention backend never runs its
+            # Python-side, cu_seqlens-value-dependent mask generation
+            # inside the graph; cu_seqlens itself stays a plain
+            # (unconsumed) Python argument.
             outputs = vit._forward_blocks(
                 x_3d,
                 cu_seqlens=cu_seqlens,
@@ -316,7 +407,7 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=None,
                 sequence_lengths=None,
-                attention_mask=attention_mask,
+                **extra,
             )
         # The vision SHM staging entries are dim-keyed and were reserved by
         # the text graph provider's bind; hand the graph the same shared SHM
@@ -346,7 +437,6 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
-        attention_mask: torch.Tensor,
         output_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """x: [S, H] patchified + position-embedded tokens; returns the
@@ -361,13 +451,21 @@ class ViTKunpengGraphRunner(ViTCudaGraphRunner):
                 cu_seqlens,
                 rotary_pos_emb_cos,
                 rotary_pos_emb_sin,
-                attention_mask,
             )
+
+        # Fourth graph input, rebuilt exactly the way _create_graph built
+        # it: the flash path's constant [S] counts (a dict hit), or the
+        # lru-cached SDPA mask whose values differ per image split of the
+        # same S.
+        if kunpeng_vit_flash_enabled():
+            fourth_input = self._flash_seq_lens(graph_key)
+        else:
+            fourth_input = self.make_attention_mask(graph_key, cu_seqlens)
 
         graph = self.block_graphs[graph_key]
         t0 = time.perf_counter()
         outputs = graph.run(
-            [x_3d, rotary_pos_emb_cos, rotary_pos_emb_sin, attention_mask]
+            [x_3d, rotary_pos_emb_cos, rotary_pos_emb_sin, fourth_input]
         )
         logger.info(
             "[vit-graph] run S=%d %.3f ms",

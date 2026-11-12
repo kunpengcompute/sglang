@@ -106,12 +106,14 @@ logger = logging.getLogger(__name__)
 
 
 def _kunpeng_vit_graph_enabled() -> bool:
-    """Gate for the Kunpeng ViT C++ graph: default ON on 920F; opt out
-    with SGLANG_KUNPENG_VIT_GRAPH=0. Each distinct token count S pays a
-    one-time ~2 s capture on the request critical path (amortized away for
-    long-lived servers with repeated image shapes); requests that are not
-    capture-ready fall back to the eager tail automatically."""
-    return _is_cpu_920f and os.environ.get("SGLANG_KUNPENG_VIT_GRAPH", "1") not in (
+    """Gate for the Kunpeng ViT C++ graph: default OFF on 920F; opt in
+    with SGLANG_KUNPENG_VIT_GRAPH=1. On single-image serving the graph
+    replay only matches eager steady-state latency (4.38 s vs 4.37 s
+    measured) while the first request pays a one-time per-shape capture
+    (~1.4 s) on the critical path, so the eager tower is the better
+    default; the graph stays a verified-correct opt-in. Requests that
+    are not capture-ready fall back to the eager tail automatically."""
+    return _is_cpu_920f and os.environ.get("SGLANG_KUNPENG_VIT_GRAPH", "0") not in (
         "",
         "0",
     )
@@ -249,6 +251,7 @@ class Qwen3_VisionBlock(nn.Module):
         max_seqlen: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        flash_seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -261,6 +264,7 @@ class Qwen3_VisionBlock(nn.Module):
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
             attention_mask=attention_mask,
+            flash_seq_lens=flash_seq_lens,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
@@ -898,12 +902,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         max_seqlen: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        flash_seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Eager "blocks + deepstack mergers + merger" tail, shared by the
         eager forward, the Kunpeng graph runner's capture body, and its eager
         fallback. With attention_mask=None every block generates its own
         block-diagonal mask from cu_seqlens (the pre-existing behavior); a
-        hoisted mask is passed only by the graph path."""
+        hoisted mask is passed only by the SDPA graph path, and
+        flash_seq_lens (per-image token counts) only by the flash graph
+        path - when both are None the attention backend derives whatever it
+        needs from cu_seqlens itself."""
         deepstack_feature_lists = []
         num_deepstack_captured = 0
 
@@ -916,6 +924,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
                 attention_mask=attention_mask,
+                flash_seq_lens=flash_seq_lens,
             )
 
             if layer_num in self.deepstack_visual_indexes:
@@ -945,13 +954,15 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         ) = self._prepare_graph_inputs(x, grid_thw)
 
         s = x.shape[0]
-        ready, reason = self.graph_runners.ready_to_capture(s)
+        num_images = int(cu_seqlens.shape[0]) - 1
+        ready, reason = self.graph_runners.ready_to_capture(s, num_images)
         if not ready:
             # The tower's TP reductions would fall back to gloo (which graph
             # capture cannot record - the replay would silently skip them),
-            # or the mask cannot be hoisted. Run the eager tail for this
-            # request; once the text graph provider's bind publishes the
-            # vision SHM reservation, later requests capture.
+            # or the request is not captureable as-is (e.g. multiple images
+            # in one request under the flash path, whose graphs bake
+            # single-image token counts). Run the eager tail for this
+            # request; later requests capture.
             if reason not in self.graph_runners.logged_not_ready_reasons:
                 self.graph_runners.logged_not_ready_reasons.add(reason)
                 logger.info(
@@ -975,13 +986,14 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             )
             return hidden_states
 
-        attention_mask = self.graph_runners.make_attention_mask(s, cu_seqlens)
+        # The runner builds its own fourth graph input: the hoisted
+        # block-diagonal mask for the SDPA path, or the (constant)
+        # per-image token counts for the flash path.
         return self.graph_runners.run(
             x,
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
-            attention_mask=attention_mask,
             output_indices=None,
         )
 
