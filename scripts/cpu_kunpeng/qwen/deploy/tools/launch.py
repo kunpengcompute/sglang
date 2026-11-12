@@ -94,7 +94,7 @@ def main():
         "--model-loader-extra-config",
         '{"enable_multithread_load":false}',
         "--attention-backend",
-        "kunpeng_cpu",
+        os.environ.get("QWEN_ATTENTION_BACKEND", "kunpeng_cpu"),
         "--trust-remote-code",
         "--host",
         args.host,
