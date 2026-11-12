@@ -11,36 +11,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared KV-cache pool for Kunpeng 920F (step 1: allocation + attach).
+"""Shared KV / index-K pools for Kunpeng 920F.
 
-Switch: ``SGLANG_KUNPENG_KV_SHARE_GROUP``
+Two independent switches, both default 0 (off):
+
+``SGLANG_KUNPENG_KV_SHARE_GROUP``
     0  (default) = every rank allocates its own KV pool (baseline)
     4 / 8 / 16   = that many consecutive TP ranks share ONE KV pool
 
-Group layout::
+``SGLANG_KUNPENG_INDEXER_SHARE_GROUP``
+    0  (default) = every rank allocates its own DSA index-K cache (baseline)
+    4 / 8 / 16   = that many consecutive TP ranks share ONE index-K pool
 
-    group_size = SGLANG_KUNPENG_KV_SHARE_GROUP
+The two pools live in SEPARATE segments, so they may use DIFFERENT group
+sizes: the index-K rows are identical on every attn-TP rank, which lets the
+index-K pool be shared over a narrower (e.g. per-die) or wider group than the
+KV pool without touching the other.
+
+Group layout (``group_size`` of that pool's own switch)::
+
     group_base = tp_rank // group_size * group_size
     intra      = tp_rank - group_base        # 0 = leader, rest = followers
 
-What happens with the switch on:
+What happens with a switch on:
 
-* The leader creates ONE POSIX shm segment holding the whole KV pool (main
-  ``kv_buffer`` + DSA ``index_k_buffer``), INTERLEAVES every page over the
-  group's NUMA nodes (``MPOL_INTERLEAVE``), pre-faults all pages and checks via
-  ``/proc/self/numa_maps`` that no page escaped the group -- balance is not
-  enforced, a node that runs short simply spills to its neighbours -- before
-  publishing the header's ``ready`` flag.
+* The leader creates ONE POSIX shm segment for that pool, INTERLEAVES every
+  page over the group's NUMA nodes (``MPOL_INTERLEAVE``), pre-faults all pages
+  and checks via ``/proc/self/numa_maps`` that no page escaped the group --
+  balance is not enforced, a node that runs short simply spills to its
+  neighbours -- before publishing the header's ``ready`` flag.
   Rank and NUMA node are 1:1 on 920F and the leader is the lowest rank of the
   group, so the group owns ``leader_node .. leader_node + group_size - 1``:
   rank0 / group=4 -> nodes 0-3, group=16 -> nodes 0-15. Each rank re-checks
   that its own affinity node is the expected one.
 * The other ``group_size - 1`` ranks attach to that segment and build the exact
   same tensor views over it. They allocate nothing.
-* A process may hold TWO pools -- the target model's and the MTP / draft
-  model's. They have different layer ranges, so each gets its OWN segment and
-  the ``role`` (``target`` / ``draft``) is part of the segment name; opening the
-  same role twice is rejected.
+* A process may hold FOUR pools: the KV and index-K pools of the target model
+  and of the MTP / draft model. They have different geometry (different layer
+  ranges), so each gets its OWN segment; ``kind`` (``kv`` / ``indexer``) and
+  ``role`` (``target`` / ``draft``) are both part of the segment name.
 
 The segment is the SAME SIZE as the private pool each rank used to allocate, so
 per-node demand never grows; only ``/dev/shm`` is new (checked up front).
@@ -51,10 +60,10 @@ shared one would serve stale KV, which is worse than not starting.
 
 Not done yet (next steps, do NOT assume):
 1. No write gating: every rank still writes the segment. The ranks of a group
-   compute byte-identical KV for the same slot, so the bytes are correct and
-   each rank reads what it wrote itself -- this step does not depend on
-   cross-process write->read visibility. Leader-only writes require a
-   group-level fence/drain and must land together.
+   compute byte-identical KV / index-K for the same slot, so the bytes are
+   correct and each rank reads what it wrote itself -- this step does not
+   depend on cross-process write->read visibility. Leader-only writes require
+   a group-level fence/drain and must land together.
 2. Placement is INTERLEAVED over the group's nodes by the leader (one
    ``MPOL_INTERLEAVE`` policy + one full pre-fault), not sliced per rank. That
    keeps placement free of any new handshake, at the cost of every rank
@@ -63,9 +72,14 @@ Not done yet (next steps, do NOT assume):
    access fully local but needs a per-rank "done" flag before ``ready``.
 3. Attach uses polling + the ``ready`` flag, not a group barrier; there is no
    failure agreement (if the leader dies, followers wait until the timeout).
-4. Memory budget / cell_size (D6), HiCache (D7), PD single-receiver (D9) and
-   runtime invariant checks are untouched: every rank still sizes its pool as
-   if it were going to allocate the whole thing.
+4. Memory budget / cell_size (D6), HiCache (D7) and runtime invariant checks
+   are untouched: every rank still sizes its pools as if it were going to
+   allocate the whole thing.
+5. PD disaggregation (D9): one RDMA copy of each shared pool is enough, split
+   into two disjoint layer shards received by intra-group rank 0 and rank
+   ``group_size // 2`` (opposite NUMA halves). KV and index-K are sharded by
+   their OWN group; see ``pd_kv_shard_spec()`` / ``pd_indexer_shard_spec()``;
+   the wire protocol lives in ``disaggregation/mooncake/conn.py``.
 """
 
 from __future__ import annotations
@@ -91,18 +105,26 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 KV_SHARE_GROUP_DISABLED: int = 0
-#: Legal ``SGLANG_KUNPENG_KV_SHARE_GROUP`` values (besides 0).
+#: Legal ``SGLANG_KUNPENG_KV_SHARE_GROUP`` / ``..._INDEXER_SHARE_GROUP`` values
+#: (besides 0).
 KV_SHARE_GROUP_CHOICES: Tuple[int, ...] = (4, 8, 16)
 
-#: One process can hold TWO pools: the target model's and the MTP/draft
-#: model's. They have different geometry (different layer ranges), so each gets
-#: its own segment and the role is part of the segment name.
+#: The two pools a rank can share. Each kind has its own switch, its own group
+#: (they may differ), its own POSIX shm segment and its own PD shard.
+POOL_KIND_KV: str = "kv"
+POOL_KIND_INDEXER: str = "indexer"
+POOL_KINDS: Tuple[str, ...] = (POOL_KIND_KV, POOL_KIND_INDEXER)
+
+#: One process can hold FOUR pools: the KV and index-K pools of the target
+#: model and of the MTP/draft model. They have different geometry (different
+#: layer ranges), so each gets its own segment; ``kind`` and ``role`` are both
+#: part of the segment name.
 POOL_ROLE_TARGET: str = "target"
 POOL_ROLE_DRAFT: str = "draft"
 
 #: Bumped whenever the byte layout changes; part of the shm name AND the header,
 #: so a stale segment from an older build is never attached.
-_LAYOUT_VERSION: int = 1
+_LAYOUT_VERSION: int = 2
 
 #: Reserved header area at the start of the segment; data starts after it.
 _HEADER_SIZE: int = 4096
@@ -203,19 +225,12 @@ _HEADER_COMPARE_ORDER: Tuple[str, ...] = (
 # Process-local state
 # ---------------------------------------------------------------------------
 
-_ENABLED: bool = False
-_INITIALIZED: bool = False
-#: role -> segment name, for every pool opened in this process. A second pool
-#: with a DIFFERENT role (target + MTP draft) is expected; the same role twice
-#: is a bug.
-_OPENED_ROLES: Dict[str, str] = {}
-_IS_LEADER: bool = True
-_GROUP_SIZE: int = KV_SHARE_GROUP_DISABLED
-_GROUP_BASE: int = 0
-_INTRA_GROUP_RANK: int = 0
-_NUMA_NODE: int = -1
-_NUMA_NODES: List[int] = []
-_SEGMENT_BYTES: int = 0
+#: kind -> published state of that pool in THIS process (see ``get_share_state``).
+_STATES: Dict[str, Dict[str, Any]] = {}
+#: (kind, role) -> segment name, for every pool opened in this process. A second
+#: pool with a DIFFERENT role (target + MTP draft) is expected; the same
+#: (kind, role) twice is a bug.
+_OPENED_ROLES: Dict[Tuple[str, str], str] = {}
 
 # Keeps ``shm.buf`` (and therefore every tensor built on it) alive for the whole
 # process, so ``data_ptr()`` / ``untyped_storage()`` stay stable across graph
@@ -233,47 +248,147 @@ class SharedKvPoolError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def get_kv_share_group() -> int:
-    """Read ``SGLANG_KUNPENG_KV_SHARE_GROUP`` (0 = disabled)."""
+def get_share_group(kind: str = POOL_KIND_KV) -> int:
+    """Group size of ``kind``; 0 means "this pool is not shared".
+
+    ``kv`` reads ``SGLANG_KUNPENG_KV_SHARE_GROUP``, ``indexer`` reads
+    ``SGLANG_KUNPENG_INDEXER_SHARE_GROUP``. The two switches are independent.
+    """
     try:
         from sglang.srt.environ import envs
 
+        if kind == POOL_KIND_INDEXER:
+            return int(envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get())
         return int(envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get())
     except Exception:
         return KV_SHARE_GROUP_DISABLED
 
 
+def get_kv_share_group() -> int:
+    """Read ``SGLANG_KUNPENG_KV_SHARE_GROUP`` (0 = disabled)."""
+    return get_share_group(POOL_KIND_KV)
+
+
+def is_share_enabled(kind: str = POOL_KIND_KV) -> bool:
+    """True iff this process' ``kind`` pool lives in a shared segment."""
+    return bool(_STATES.get(kind, {}).get("enabled", False))
+
+
 def is_kv_share_enabled() -> bool:
     """True iff this process' KV pool lives in the shared segment."""
-    return _ENABLED
+    return is_share_enabled(POOL_KIND_KV)
 
 
-def get_kv_share_state() -> Dict[str, Any]:
+def get_share_state(kind: str = POOL_KIND_KV) -> Dict[str, Any]:
     """Introspection helper for startup logging / QA."""
+    state = _STATES.get(kind, {})
     return {
-        "enabled": _ENABLED,
-        "initialized": _INITIALIZED,
-        "group_size": _GROUP_SIZE,
-        "group_base": _GROUP_BASE,
-        "intra_group_rank": _INTRA_GROUP_RANK,
-        "is_leader": _IS_LEADER,
-        "numa_node": _NUMA_NODE,
-        "numa_nodes": list(_NUMA_NODES),
-        "segment_bytes": _SEGMENT_BYTES,
-        "roles": dict(_OPENED_ROLES),
+        "kind": kind,
+        "enabled": bool(state.get("enabled", False)),
+        "initialized": bool(state.get("initialized", False)),
+        "group_size": int(state.get("group_size", KV_SHARE_GROUP_DISABLED)),
+        "group_base": int(state.get("group_base", 0)),
+        "intra_group_rank": int(state.get("intra_group_rank", 0)),
+        "is_leader": bool(state.get("is_leader", True)),
+        "numa_node": int(state.get("numa_node", -1)),
+        "numa_nodes": list(state.get("numa_nodes", [])),
+        "segment_bytes": int(state.get("segment_bytes", 0)),
+        "roles": {
+            role: name
+            for (state_kind, role), name in _OPENED_ROLES.items()
+            if state_kind == kind
+        },
     }
 
 
-class SharedKvRequest:
-    """Everything needed to open the segment, resolved once per rank.
+def get_kv_share_state() -> Dict[str, Any]:
+    """KV-pool state (kept for callers that only care about the KV switch)."""
+    return get_share_state(POOL_KIND_KV)
 
-    Built by :func:`shared_kv_request` from the ``ModelRunner`` before the pool
-    is constructed, consumed by :func:`open_shared_kv_storage` while the pool
-    builds its buffers.
+
+#: PD disaggregation: with a shared pool enabled on decode, the pool's layers
+#: are split into this many disjoint contiguous shards, each received by a
+#: different rank over RDMA. Fixed at two; see ``pd_shard_spec``.
+PD_SHARD_COUNT: int = 2
+PD_KV_SHARD_COUNT: int = PD_SHARD_COUNT
+
+
+def pd_shard_spec(kind: str = POOL_KIND_KV) -> Optional[Tuple[int, int]]:
+    """``(shard_id, PD_SHARD_COUNT)`` for this rank's PD transfer of ``kind``.
+
+    With a shared pool enabled, one RDMA copy of that pool is enough because
+    every rank maps the same POSIX shm segment. Splitting that copy by layer
+    across two ranks raises the available transfer bandwidth and keeps the two
+    writers on opposite NUMA halves of the group: rank 0 owns the first half of
+    the layers, rank ``group_size // 2`` owns the second half.
+
+    ``shard_id == 0`` means this rank receives NO data of that kind (it still
+    receives its private aux metadata). ``None`` means the pool is not shared
+    and every rank needs a full copy.
+
+    Each kind is sharded by its OWN group, so KV sharding and index-K sharding
+    are decided independently. Shards are disjoint and their union covers every
+    layer by construction of :func:`pd_layer_shard_range`.
+    """
+    state = get_share_state(kind)
+    if not state["enabled"]:
+        return None
+    group_size = int(state["group_size"])
+    if group_size <= 0 or group_size % PD_SHARD_COUNT != 0:
+        raise SharedKvPoolError(
+            f"PD {kind} sharding needs an even share group, got "
+            f"group_size={group_size}"
+        )
+    intra = int(state["intra_group_rank"])
+    if intra == 0:
+        return (1, PD_SHARD_COUNT)
+    if intra == group_size // PD_SHARD_COUNT:
+        return (2, PD_SHARD_COUNT)
+    return (0, PD_SHARD_COUNT)
+
+
+def pd_kv_shard_spec() -> Optional[Tuple[int, int]]:
+    """PD KV shard of this rank (``None`` when the KV pool is private)."""
+    return pd_shard_spec(POOL_KIND_KV)
+
+
+def pd_indexer_shard_spec() -> Optional[Tuple[int, int]]:
+    """PD index-K/state shard of this rank (``None`` when index-K is private)."""
+    return pd_shard_spec(POOL_KIND_INDEXER)
+
+
+def pd_layer_shard_range(
+    n_layers: int, shard_id: int, shard_count: int
+) -> Tuple[int, int]:
+    """Half-open ``[lo, hi)`` layer range owned by one PD KV shard.
+
+    Pure function of the post-PP-mapping layer list length, so the caller
+    slices the *position* in ``layers_params`` rather than absolute layer ids.
+    Integer division on both bounds guarantees the shards are disjoint and
+    their union is exactly ``[0, n_layers)``; a shard may legitimately be empty
+    when ``n_layers < shard_count``.
+    """
+    if shard_count < 1 or not (1 <= shard_id <= shard_count):
+        raise SharedKvPoolError(f"invalid PD KV shard {shard_id}/{shard_count}")
+    if n_layers < 0:
+        raise SharedKvPoolError(f"invalid layer count {n_layers}")
+    return (
+        n_layers * (shard_id - 1) // shard_count,
+        n_layers * shard_id // shard_count,
+    )
+
+
+class SharedKvRequest:
+    """Everything needed to open one segment, resolved once per rank.
+
+    Built by :func:`shared_pool_requests` from the ``ModelRunner`` before the
+    pools are constructed, consumed by :func:`open_shared_kv_storage` while a
+    pool builds its buffers.
     """
 
     __slots__ = (
         "model_runner",
+        "kind",
         "role",
         "group_size",
         "group_base",
@@ -289,6 +404,7 @@ class SharedKvRequest:
     def __init__(
         self,
         model_runner: Any,
+        kind: str,
         role: str,
         group_size: int,
         group_base: int,
@@ -301,6 +417,7 @@ class SharedKvRequest:
         instance_key: str,
     ) -> None:
         self.model_runner = model_runner
+        self.kind = kind
         self.role = role
         self.group_size = int(group_size)
         self.group_base = int(group_base)
@@ -319,16 +436,40 @@ class SharedKvRequest:
     def __repr__(self) -> str:
         return (
             "SharedKvRequest("
-            f"role={self.role}, group={self.group_size}, base={self.group_base}, "
-            f"intra={self.intra_group_rank}, dp_rank={self.dp_rank}, "
-            f"pp_rank={self.pp_rank}, pp_size={self.pp_size}, "
-            f"start_layer={self.start_layer}, numa_node={self.numa_node}, "
-            f"instance={self.instance_key})"
+            f"kind={self.kind}, role={self.role}, group={self.group_size}, "
+            f"base={self.group_base}, intra={self.intra_group_rank}, "
+            f"dp_rank={self.dp_rank}, pp_rank={self.pp_rank}, "
+            f"pp_size={self.pp_size}, start_layer={self.start_layer}, "
+            f"numa_node={self.numa_node}, instance={self.instance_key})"
         )
 
 
+class SharedPoolRequests:
+    """The per-kind requests of ONE process (either or both may be ``None``)."""
+
+    __slots__ = ("kv", "indexer")
+
+    def __init__(
+        self, kv: Optional[SharedKvRequest], indexer: Optional[SharedKvRequest]
+    ) -> None:
+        self.kv = kv
+        self.indexer = indexer
+
+    @property
+    def any(self) -> bool:
+        return self.kv is not None or self.indexer is not None
+
+    def __repr__(self) -> str:
+        return f"SharedPoolRequests(kv={self.kv}, indexer={self.indexer})"
+
+
 class KvShareLayout:
-    """Byte layout of ONE group's segment, derived from the pool geometry.
+    """Byte layout of ONE segment, derived from the pool geometry.
+
+    A segment holds exactly ONE kind: the main KV buffers (``kind="kv"``) or
+    the DSA index-K buffers (``kind="indexer"``). The two kinds are separate
+    segments with independent groups, so the size of each depends only on its
+    own geometry.
 
     Everything here is a pure function of the (shared) pool geometry, so the
     leader and the followers compute the same layout and the header check is an
@@ -347,7 +488,9 @@ class KvShareLayout:
         pp_size: int = 1,
         start_layer: int = 0,
         role: str = POOL_ROLE_TARGET,
+        kind: str = POOL_KIND_KV,
     ) -> None:
+        self.kind = kind
         self.role = role
         self.group_size = int(group_size)
         self.group_base = int(group_base)
@@ -391,15 +534,27 @@ class KvShareLayout:
         self.index_layer_stride = (
             self.num_slots * self.index_head_dim * self.index_k_dtype.itemsize
         )
-        self.kv_buffer_bytes = self.layer_num * self.kv_layer_stride
-        self.index_k_bytes = self.num_full_layers * self.index_layer_stride
+        # A segment carries ONE kind only; the other byte count stays 0 so the
+        # header keeps one fixed format for both kinds.
+        self.kv_buffer_bytes = (
+            self.layer_num * self.kv_layer_stride if kind == POOL_KIND_KV else 0
+        )
+        self.index_k_bytes = (
+            self.num_full_layers * self.index_layer_stride
+            if kind == POOL_KIND_INDEXER
+            else 0
+        )
 
-        #: Bytes added per token slot (one page slot is used as scratch/padding,
-        #: hence ``max_total_num_tokens == num_slots - page_size``). Used to turn
-        #: a free-memory figure back into a ``--max-total-tokens`` hint.
+        #: Bytes added per token slot of THIS kind (one page slot is used as
+        #: scratch/padding, hence ``max_total_num_tokens == num_slots -
+        #: page_size``). Used to turn a free-memory figure back into a
+        #: ``--max-total-tokens`` hint for this segment.
         self.per_slot_bytes = (
             self.layer_num * self.kv_cache_dim * self.store_dtype.itemsize
-            + self.num_full_layers * self.index_head_dim * self.index_k_dtype.itemsize
+            if kind == POOL_KIND_KV
+            else self.num_full_layers
+            * self.index_head_dim
+            * self.index_k_dtype.itemsize
         )
         self.max_total_tokens = self.num_slots - self.page_size
 
@@ -407,8 +562,11 @@ class KvShareLayout:
         self.index_k_offset = _align_up(self.kv_offset + self.kv_buffer_bytes)
         self.total_bytes = _align_up(self.index_k_offset + self.index_k_bytes)
 
+        # ``sgkv`` / ``sgix`` keeps a stale segment of the other kind (or of the
+        # old single-segment layout) from ever being attached.
+        prefix = "sgkv" if kind == POOL_KIND_KV else "sgix"
         self.name = (
-            f"sgkv{self.group_size}_{instance_key}"
+            f"{prefix}{self.group_size}_{instance_key}"
             f"_p{self.pp_rank}_{self.dp_rank}_{self.group_base}_{self.role}"
             f"_v{self.layout_version}"
         )
@@ -509,31 +667,33 @@ def pool_role(model_runner: Any) -> str:
     )
 
 
-def shared_kv_request(model_runner: Any) -> Optional[SharedKvRequest]:
-    """Return a request when sharing is on, else ``None``.
+def _env_name(kind: str) -> str:
+    return (
+        "SGLANG_KUNPENG_INDEXER_SHARE_GROUP"
+        if kind == POOL_KIND_INDEXER
+        else "SGLANG_KUNPENG_KV_SHARE_GROUP"
+    )
 
-    Called from ``_init_pools`` before the 920F pool is constructed. With the
-    switch off this returns ``None`` and nothing at all changes.
 
-    The process can hold TWO pools -- the target model's and the MTP / draft
-    model's. They have different geometry (different layer ranges), so each gets
-    its OWN segment: ``role`` is part of the segment name and of the process
-    state. Opening the same role twice is a bug and is rejected.
-    """
-    group_size = get_kv_share_group()
+def _build_request(
+    model_runner: Any, kind: str
+) -> Optional[SharedKvRequest]:
+    """Resolve ONE kind's request, or ``None`` when that switch is off."""
+    group_size = get_share_group(kind)
     if group_size == KV_SHARE_GROUP_DISABLED:
         return None
     if group_size not in KV_SHARE_GROUP_CHOICES:
         raise SharedKvPoolError(
-            f"SGLANG_KUNPENG_KV_SHARE_GROUP={group_size} is not supported; "
+            f"{_env_name(kind)}={group_size} is not supported; "
             f"valid values are 0 and {list(KV_SHARE_GROUP_CHOICES)}"
         )
     role = pool_role(model_runner)
-    if role in _OPENED_ROLES:
+    key = (kind, role)
+    if key in _OPENED_ROLES:
         raise SharedKvPoolError(
-            f"the {role} KV pool is already shared in this process "
-            f"(segment {_OPENED_ROLES[role]}); a second pool with the same "
-            "role would need the same segment"
+            f"the {role} {kind} pool is already shared in this process "
+            f"(segment {_OPENED_ROLES[key]}); a second pool with the same "
+            "kind and role would need the same segment"
         )
 
     tp_rank = int(getattr(model_runner, "tp_rank", 0))
@@ -542,10 +702,11 @@ def shared_kv_request(model_runner: Any) -> Optional[SharedKvRequest]:
     ok, reasons = validate_share_preconditions(model_runner, group_size)
     if not ok:
         raise SharedKvPoolError(
-            "SGLANG_KUNPENG_KV_SHARE_GROUP=%d preconditions failed "
+            "%s=%d preconditions failed "
             "(tp_rank=%s tp_size=%s dp_rank=%s pp_rank=%s pp_size=%s "
             "start_layer=%s attn_tp_size=%s): %s"
             % (
+                _env_name(kind),
                 group_size,
                 tp_rank,
                 getattr(model_runner, "tp_size", 0),
@@ -566,6 +727,7 @@ def shared_kv_request(model_runner: Any) -> Optional[SharedKvRequest]:
 
     return SharedKvRequest(
         model_runner=model_runner,
+        kind=kind,
         role=role,
         group_size=group_size,
         group_base=group_base,
@@ -579,14 +741,37 @@ def shared_kv_request(model_runner: Any) -> Optional[SharedKvRequest]:
     )
 
 
+def shared_pool_requests(model_runner: Any) -> Optional[SharedPoolRequests]:
+    """Requests of every enabled kind, or ``None`` when both switches are off.
+
+    Called from ``_init_pools`` before the 920F pool is constructed. The two
+    switches are independent: either kind alone is enough to enter this path,
+    and the other kind then keeps its per-rank allocation.
+
+    The process can hold FOUR pools -- the KV and index-K pools of the target
+    model and of the MTP / draft model. They have different geometry (different
+    layer ranges), so each gets its OWN segment: ``kind`` and ``role`` are both
+    part of the segment name and of the process state. Opening the same
+    (kind, role) twice is a bug and is rejected.
+    """
+    requests = SharedPoolRequests(
+        kv=_build_request(model_runner, POOL_KIND_KV),
+        indexer=_build_request(model_runner, POOL_KIND_INDEXER),
+    )
+    if not requests.any:
+        return None
+    return requests
+
+
 def open_shared_kv_storage(
     request: Optional[SharedKvRequest], pool_geometry: Any
 ) -> SharedKvStorage:
-    """Create (leader) or attach to (follower) the group segment.
+    """Create (leader) or attach to (follower) the segment of ``request.kind``.
 
-    Called from ``KunpengNSATokenToKVPool._create_buffers`` INSTEAD of
-    allocating the rank's private ``torch.zeros`` buffers, so with the switch on
-    the process never holds a private pool at all.
+    Called from ``KunpengNSATokenToKVPool`` INSTEAD of allocating the rank's
+    private ``torch.zeros`` buffers for that kind, so with the switch on the
+    process never holds a private pool of that kind at all. The other kind is
+    unaffected (it has its own switch and its own segment).
 
     ``pool_geometry`` is the pool being constructed; only geometry attributes
     are read from it (``size`` / ``page_size`` / ``layer_num`` / ``kv_cache_dim``
@@ -596,20 +781,21 @@ def open_shared_kv_storage(
     Every failure raises :class:`SharedKvPoolError`; nothing is ever silently
     downgraded to a per-rank pool.
     """
-    global _ENABLED, _INITIALIZED, _IS_LEADER, _GROUP_SIZE
-    global _GROUP_BASE, _INTRA_GROUP_RANK, _NUMA_NODE, _NUMA_NODES, _SEGMENT_BYTES
-
     if request is None:
         raise SharedKvPoolError("open_shared_kv_storage() called without a request")
+    kind = request.kind
     role = request.role
-    if role in _OPENED_ROLES:
+    key = (kind, role)
+    if key in _OPENED_ROLES:
         raise SharedKvPoolError(
-            f"the {role} KV pool is already open in this process "
-            f"(segment {_OPENED_ROLES[role]}); a pool has one segment per role"
+            f"the {role} {kind} pool is already open in this process "
+            f"(segment {_OPENED_ROLES[key]}); a pool has one segment per "
+            "kind and role"
         )
 
     model_runner = request.model_runner
     ok, reasons = validate_share_preconditions(model_runner, request.group_size)
+
     if not ok:
         raise SharedKvPoolError(
             "preconditions failed at pool creation: " + ", ".join(reasons)
@@ -618,8 +804,8 @@ def open_shared_kv_storage(
     server_args = getattr(model_runner, "server_args", None)
     if server_args is not None and getattr(server_args, "enable_memory_saver", False):
         raise SharedKvPoolError(
-            "SGLANG_KUNPENG_KV_SHARE_GROUP cannot be combined with "
-            "--enable-memory-saver: the shm segment is not reclaimable per rank"
+            f"{_env_name(kind)} cannot be combined with --enable-memory-saver: "
+            "the shm segment is not reclaimable per rank"
         )
 
     layout = KvShareLayout(
@@ -632,6 +818,7 @@ def open_shared_kv_storage(
         pp_size=request.pp_size,
         start_layer=request.start_layer,
         role=role,
+        kind=kind,
     )
 
     is_leader = request.is_leader
@@ -653,7 +840,7 @@ def open_shared_kv_storage(
             raise
         numa_node = request.numa_node
         _log_rank(
-            model_runner, request, layout, role, True, numa_node, nodes, pages
+            model_runner, request, layout, kind, role, True, numa_node, nodes, pages
         )
     else:
         shm = _attach_segment(layout)
@@ -668,6 +855,7 @@ def open_shared_kv_storage(
             model_runner,
             request,
             layout,
+            kind,
             role,
             False,
             numa_node if own_node is None else own_node,
@@ -683,16 +871,21 @@ def open_shared_kv_storage(
         _release_segment(shm, created=created)
         raise
 
-    _ENABLED = True
-    _IS_LEADER = is_leader
-    _GROUP_SIZE = request.group_size
-    _GROUP_BASE = request.group_base
-    _INTRA_GROUP_RANK = request.intra_group_rank
-    _NUMA_NODE = int(numa_node)
-    _NUMA_NODES = list(nodes)
-    _SEGMENT_BYTES += layout.total_bytes
-    _OPENED_ROLES[role] = layout.name
-    _INITIALIZED = True
+    state = _STATES.setdefault(kind, {})
+    state.update(
+        {
+            "enabled": True,
+            "initialized": True,
+            "is_leader": is_leader,
+            "group_size": request.group_size,
+            "group_base": request.group_base,
+            "intra_group_rank": request.intra_group_rank,
+            "numa_node": int(numa_node),
+            "numa_nodes": list(nodes),
+        }
+    )
+    state["segment_bytes"] = int(state.get("segment_bytes", 0)) + layout.total_bytes
+    _OPENED_ROLES[key] = layout.name
 
     return SharedKvStorage(
         layout=layout,
@@ -822,13 +1015,18 @@ _POOL_BUDGET_SAFETY = 0.95
 
 
 def group_pool_budget_bytes(model_runner: Any) -> Optional[int]:
-    """Bytes this group's shared pool may use, or ``None`` when sharing is off.
+    """Bytes this group's shared KV pool may use, or ``None`` when KV is private.
 
     Called from ``_profile_available_bytes`` to REPLACE the per-rank profiled
     value: one segment serves the whole group, so the ceiling is the free
     memory of the group's own NUMA nodes, not what a single rank could take.
     Without this, ``--max-total-tokens`` is silently clamped to the per-rank
     figure and the sharing gain never materializes.
+
+    Deliberately keyed on the KV switch only: it sizes ``--max-total-tokens``,
+    which is bounded by the KV pool. When only the index-K pool is shared, the
+    private KV pools still each fit into one rank's memory, so the per-rank
+    figure is the right ceiling.
 
     Every failure raises: a silently smaller pool would look like a config
     problem instead of the bug it is.
@@ -1117,6 +1315,7 @@ def _log_rank(
     model_runner: Any,
     request: "SharedKvRequest",
     layout: KvShareLayout,
+    kind: str,
     role: str,
     is_leader: bool,
     numa_node: int,
@@ -1125,11 +1324,12 @@ def _log_rank(
 ) -> None:
     """One line per rank, so a 16-rank launch can be read rank by rank."""
     logger.info(
-        "[kv-share] rank=%s intra=%d node=%d role=%s %s: %s %s (%.2f GiB, %d "
-        "layers/%d with index-K, %d tokens, group nodes %s%s)",
+        "[kv-share] rank=%s intra=%d node=%d kind=%s role=%s %s: %s %s "
+        "(%.2f GiB, %d layers/%d with %s, %d tokens, group nodes %s%s)",
         getattr(model_runner, "tp_rank", "?"),
         request.intra_group_rank,
         numa_node,
+        kind,
         role,
         "leader" if is_leader else "follower",
         "created" if is_leader else "attached",
@@ -1137,6 +1337,7 @@ def _log_rank(
         layout.total_bytes / 2**30,
         layout.layer_num,
         layout.num_full_layers,
+        "index-K" if kind == POOL_KIND_INDEXER else "KV",
         layout.max_total_tokens,
         nodes,
         (
@@ -1479,15 +1680,22 @@ def _validate_header(
 def _build_shared_views(
     shm: shared_memory.SharedMemory, layout: KvShareLayout
 ) -> Tuple[List[torch.Tensor], List[Optional[torch.Tensor]]]:
-    kv_views: List[torch.Tensor] = []
-    for layer_idx in range(layout.layer_num):
-        shape = (layout.num_slots, 1, layout.kv_cache_dim)
-        offset = layout.kv_offset + layer_idx * layout.kv_layer_stride
-        view = _make_view(shm, offset, shape, layout.store_dtype)
-        _assert_view_geometry(
-            view, shape, layout.store_dtype, layout.device, f"kv_buffer[{layer_idx}]"
-        )
-        kv_views.append(view)
+    if layout.kind == POOL_KIND_KV:
+        kv_views: List[torch.Tensor] = []
+        for layer_idx in range(layout.layer_num):
+            shape = (layout.num_slots, 1, layout.kv_cache_dim)
+            offset = layout.kv_offset + layer_idx * layout.kv_layer_stride
+            view = _make_view(shm, offset, shape, layout.store_dtype)
+            _assert_view_geometry(
+                view,
+                shape,
+                layout.store_dtype,
+                layout.device,
+                f"kv_buffer[{layer_idx}]",
+            )
+            kv_views.append(view)
+        # One segment carries ONE kind; the other kind has its own segment.
+        return kv_views, []
 
     index_views: List[Optional[torch.Tensor]] = []
     full_idx = 0
@@ -1510,7 +1718,7 @@ def _build_shared_views(
         )
         index_views.append(view)
         full_idx += 1
-    return kv_views, index_views
+    return [], index_views
 
 
 def _make_view(

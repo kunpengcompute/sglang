@@ -38,13 +38,19 @@ def _shared_flat_index_k_layers(mr: ModelRunner, num_layers: int) -> Optional[in
     below charges every layer and adds the quant scale per token, which
     over-estimates by ~5% and silently costs the shared pool ~2 GiB of tokens.
 
-    Only applies when the KV sharing switch is on: the baseline keeps the
-    conservative generic figure so existing deployments do not change size.
+    Only applies when one of the two sharing switches is on: the baseline keeps
+    the conservative generic figure so existing deployments do not change size.
+    The index-K cost is charged per token either way -- a shared index-K segment
+    and a private per-rank index-K cache both make one rank's user cap cost the
+    same bytes.
     """
     try:
         from sglang.srt.environ import envs
 
-        if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() <= 0:
+        if (
+            envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() <= 0
+            and envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() <= 0
+        ):
             return None
         from sglang.srt.utils.common import is_cpu_920f
 
@@ -154,12 +160,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_attention_tp_size()
+        terms = []
 
         if mr.use_mla_backend:
             cell_size = (
                 (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                 * num_layers
                 * kv_size
+            )
+            terms.append(
+                f"(kv_lora_rank {model_config.kv_lora_rank} + qk_rope_head_dim "
+                f"{model_config.qk_rope_head_dim}) * {num_layers} layers * "
+                f"{kv_size}B"
             )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
@@ -172,6 +184,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * num_layers
                     * kv_size
                 )
+                terms.append("fp4 kv_scale_buffer overhead")
 
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(model_config.hf_config):
@@ -182,6 +195,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # there is no per-token quant scale, so charge exactly what
                     # the segment will contain.
                     cell_size += index_head_dim * flat_layers * kv_size
+                    terms.append(
+                        f"index_k (shared flat): {index_head_dim} index_head_dim "
+                        f"* {flat_layers} non-skip-topk layers * {kv_size}B"
+                    )
                 else:
                     indexer_size_per_token = (
                         index_head_dim
@@ -191,12 +208,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         NSATokenToKVPool.index_k_with_scale_buffer_dtype
                     )
                     cell_size += indexer_size_per_token * num_layers * element_size
+                    terms.append(
+                        f"index_k+scale: ({index_head_dim} + {index_head_dim} // "
+                        f"{NSATokenToKVPool.quant_block_size} * 4) * {num_layers} "
+                        f"layers * {element_size}B"
+                    )
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
                 * num_layers
                 * kv_size
+            )
+            terms.append(
+                f"{model_config.get_num_kv_heads(tp_size)} kv_heads (tp_size "
+                f"{tp_size}) * (head_dim {model_config.head_dim} + v_head_dim "
+                f"{model_config.v_head_dim}) * {num_layers} layers * {kv_size}B"
             )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
@@ -207,7 +234,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size = (cell_size // 2) + (
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
+                terms.append("fp4 kv_scale_buffer overhead")
 
+        logger.info(
+            "KV cache cell_size = %d B/token (%.1f KiB/token) = %s",
+            cell_size,
+            cell_size / 1024,
+            " + ".join(terms),
+        )
         return cell_size
 
     def calculate_pool_sizes(

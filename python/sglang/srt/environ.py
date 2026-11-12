@@ -669,6 +669,11 @@ class Envs:
     # Only 0 / 4 / 8 / 16 are valid; the consumer rejects anything else at
     # startup instead of silently ignoring it.
     SGLANG_KUNPENG_KV_SHARE_GROUP = EnvInt(0)
+    # Same semantics for the DSA index-K cache (same 0 / 4 / 8 / 16 values),
+    # but independent of the KV switch above: the two pools live in separate
+    # shm segments and may use different group sizes (the index-K rows are
+    # identical on every attn-TP rank).
+    SGLANG_KUNPENG_INDEXER_SHARE_GROUP = EnvInt(0)
 
 envs = Envs()
 EnvField._allow_set_name = False

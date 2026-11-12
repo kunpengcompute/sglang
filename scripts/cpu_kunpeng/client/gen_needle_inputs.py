@@ -267,7 +267,7 @@ def parse_args():
         type=float,
         default=TOLERANCE,
         help=f"允许低于目标的最大比例（默认 {TOLERANCE}，即 "
-             f"{TOLERANCE * 100:.1f}%，实际下限为一对的 token 数）；"
+             f"{TOLERANCE * 100:.1f} percent，实际下限为一对的 token 数）；"
              f"token 数永不超过目标",
     )
     return parser.parse_args()

@@ -204,9 +204,10 @@ parse_ranks() {
   echo "${ranks[*]}"
 }
 
-# Target host/port: defaults to the local NIC (in-cluster router/instance).
-# Override to hit a standalone decode master directly, e.g. fake-transfer
-# decode-throughput tests:
+# Target host/port: defaults to ROUTER_IP (the gateway node), read from the
+# base env via `source env.sh none` (see the IP resolution below). CURL_HOST
+# still overrides it, e.g. to hit a standalone decode master directly for
+# fake-transfer decode-throughput tests:
 #   CURL_HOST=<decode master IP> ./curl.sh -d 0-15 -n 512 -m 384
 # With -F (fake transfer), the port auto-derives from the runtime layout
 # (same rule as runtime/env_decode.sh): 30001 + the decode entry's position
@@ -322,7 +323,18 @@ tokenizer_separate() {
   echo "${v:-1}"
 }
 
-IP=${CURL_HOST:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}
+# ROUTER_IP (the gateway node) lives in the base env: env.sh none loads
+# runtime/env_base.sh defaults plus .user_env.sh / .user_env_base.sh
+# overrides, then returns before any role config / conda activation. Source
+# it in a subshell so its INSTANCES / tokenizer defaults cannot clobber the
+# caller's exported overrides used by _side_entry / tokenizer_separate above.
+# CURL_HOST keeps the highest priority; localhost is only a last-resort
+# fallback when the base env defines no ROUTER_IP at all.
+CURL_BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROUTER_IP=$(SKIP_CONDA=1 bash -c '
+  source "$1/env.sh" none >/dev/null 2>&1
+  printf "%s" "${ROUTER_IP:-}"' _ "$CURL_BASE_DIR")
+IP=${CURL_HOST:-${ROUTER_IP:-127.0.0.1}}
 if [ "$FAKE" = true ]; then
   PORT=${CURL_PORT:-$(resolve_decode_tok_port 0)}
 else

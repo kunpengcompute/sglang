@@ -39,16 +39,21 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         end_layer: int = None,
         index_head_dim: int = 128,
         skip_topk_layers=None,
-        shared_kv_request=None,
+        shared_pool_requests=None,
     ):
-        # --- shared KV pool (SGLANG_KUNPENG_KV_SHARE_GROUP=4/8/16) -----------
+        # --- shared pools (SGLANG_KUNPENG_KV_SHARE_GROUP /
+        #     SGLANG_KUNPENG_INDEXER_SHARE_GROUP = 4/8/16) -------------------
+        # The two switches are independent and each pool has its OWN shm
+        # segment: KV may be shared while index-K stays private, or the other
+        # way round, and the two group sizes may differ.
         # Everything ``_create_buffers()`` needs must be set BEFORE
         # ``super().__init__()``, because the base class allocates through it.
-        # With a request the pool never allocates its own KV buffers: it is
-        # built directly on the group's POSIX shm segment, and any failure
-        # raises SharedKvPoolError (no fallback to a per-rank pool).
-        self._shared_kv_request = shared_kv_request
+        # With a request for a kind the pool never allocates its own buffers of
+        # that kind: it is built directly on that kind's POSIX shm segment, and
+        # any failure raises SharedKvPoolError (no fallback to a private pool).
+        self._shared_pool_requests = shared_pool_requests
         self._shared_kv_storage = None
+        self._shared_indexer_storage = None
         self.index_head_dim = index_head_dim
         if skip_topk_layers is None:
             skip_topk_layers = [False] * layer_num
@@ -76,9 +81,20 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         self._state_scratch = None
 
         # Flat token-slot index-K buffers; None for shared (skip-topk) layers.
-        if self._shared_kv_storage is not None:
-            # Same segment, same slot numbering: no private allocation either.
-            self.index_k_buffer = list(self._shared_kv_storage.index_k_views)
+        indexer_request = (
+            self._shared_pool_requests.indexer
+            if self._shared_pool_requests is not None
+            else None
+        )
+        if indexer_request is not None:
+            # Own segment, independent of the KV pool: no private allocation.
+            from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
+                open_shared_kv_storage,
+            )
+
+            storage = open_shared_kv_storage(indexer_request, self)
+            self._shared_indexer_storage = storage
+            self.index_k_buffer = list(storage.index_k_views)
         else:
             with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 self.index_k_buffer = [
@@ -102,20 +118,26 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         )
 
     def _create_buffers(self) -> None:
-        """Allocate the main KV buffers -- or alias the group's shared segment.
+        """Allocate the main KV buffers -- or alias the KV segment.
 
         Called by ``MLATokenToKVPool.__init__`` once ``kv_cache_dim`` is known.
-        With a ``shared_kv_request`` NO private ``torch.zeros`` pool is created:
-        the tensors come straight from the POSIX shm segment shared by this
-        group of ranks, and any failure raises ``SharedKvPoolError`` (startup
-        aborts, nothing falls back).
+        With a KV request NO private ``torch.zeros`` pool is created: the
+        tensors come straight from the POSIX shm segment shared by this group of
+        ranks, and any failure raises ``SharedKvPoolError`` (startup aborts,
+        nothing falls back). The index-K pool is opened separately in
+        ``__init__``; either kind can be shared without the other.
         """
-        if self._shared_kv_request is not None:
+        request = (
+            self._shared_pool_requests.kv
+            if self._shared_pool_requests is not None
+            else None
+        )
+        if request is not None:
             from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
                 open_shared_kv_storage,
             )
 
-            storage = open_shared_kv_storage(self._shared_kv_request, self)
+            storage = open_shared_kv_storage(request, self)
             self._shared_kv_storage = storage
             self.kv_buffer = list(storage.kv_views)
         else:
@@ -123,26 +145,34 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
             super()._create_buffers()
 
     def _clear_buffers(self) -> None:
-        """Release this rank's KV buffers -- never the shared segment itself.
+        """Release this rank's KV buffers -- never the shared segments.
 
         Private pool: baseline behaviour (``del self.kv_buffer``).
 
         Shared pool: the pages belong to the whole group, so only THIS rank's
         views are dropped. The segment stays mapped (and valid for the other
         ranks) until the process exits -- unlinking it here would yank the KV
-        out from under them. Nothing is freed per rank on purpose.
+        out of under them. Nothing is freed per rank on purpose. The two kinds
+        are cleared independently: index-K-only sharing still releases the
+        private KV buffers normally.
         """
-        if self._shared_kv_request is not None:
+        if self._shared_kv_storage is not None:
             self.kv_buffer = []
-            self.index_k_buffer = [None] * self.layer_num
-            self._state_scratch = None
             logger.info(
-                "[kv-share] dropped this rank's views of %s; the segment stays "
-                "alive for the rest of the group",
+                "[kv-share] dropped this rank's KV views of %s; the segment "
+                "stays alive for the rest of the group",
                 self._shared_kv_storage.layout.name,
             )
         else:
             super()._clear_buffers()
+        if self._shared_indexer_storage is not None:
+            self.index_k_buffer = [None] * self.layer_num
+            logger.info(
+                "[kv-share] dropped this rank's index-K views of %s; the "
+                "segment stays alive for the rest of the group",
+                self._shared_indexer_storage.layout.name,
+            )
+        self._state_scratch = None
 
     def _index_k_buf(self, layer_id: int) -> torch.Tensor:
         buf = self.index_k_buffer[layer_id - self.start_layer]
