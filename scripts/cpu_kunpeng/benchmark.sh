@@ -59,6 +59,20 @@ DEFAULT_AIS_MAX_OUT_LEN=384         # (aisbench) model-side max_out_len
 DEFAULT_AIS_REQUEST_RATE=32         # (aisbench) request_rate (0 = burst, >0 = req/s)
 DEFAULT_AIS_TASKSET_CPUS=266-302    # (aisbench) CPU range for taskset (empty = no binding)
 
+# gpqa / aime26 (accuracy runs via ais_bench, same conda env as aisbench)
+DEFAULT_AIS_GPQA_TASK=gpqa_gen_0_shot_cot_chat_prompt   # 198 questions (gpqa_diamond.csv)
+DEFAULT_AIS_AIME26_TASK=aime2026_gen_0_shot_chat_prompt # 30 questions (aime2026.jsonl)
+DEFAULT_AIS_ACC_BATCH=16            # (accuracy) client concurrency
+DEFAULT_AIS_ACC_MAX_OUT_LEN=8192    # (accuracy) model-side max_out_len (upstream uses 131072)
+DEFAULT_AIS_ACC_TEMPERATURE=0.0     # (accuracy) sampling temperature
+DEFAULT_AIS_ACC_RETRY=0             # (accuracy) per-request retry
+DEFAULT_AIS_ACC_MODEL=              # (accuracy) served model name (empty = keep config)
+DEFAULT_AIS_ACC_MODEL_PATH=         # (accuracy) tokenizer dir (empty = $MODEL_PATH)
+DEFAULT_AIS_ACC_IGNORE_EOS=0        # (accuracy) 0 = stop at EOS (perf uses 1)
+DEFAULT_AIS_ACC_NUM_PROMPTS=        # (accuracy) first N questions (empty = all)
+DEFAULT_AIS_ACC_TOP_P=1.0          # (accuracy) nucleus sampling (upstream uses 0.95)
+DEFAULT_AIS_ACC_REPETITION_PENALTY=1.05  # (accuracy) 1.0 = off; >1 curbs loops
+
 # sharegpt (perf run via the official sglang bench_serving, offline)
 DEFAULT_SHAREGPT_PORT=30000         # (sharegpt) gateway port (not $DEFAULT_PORT:
                                     #  .user_env_base.sh overrides that to 30002
@@ -89,6 +103,12 @@ source "$SCRIPT_DIR/env.sh" native
 # MODEL_PATH is a plain shell var in env.sh; export it so the python subprocess sees it
 export MODEL_PATH="${MODEL_PATH:-}"
 
+# ais_bench overrides (DEFAULT_AIS_* such as the conda env name) live in their
+# own snippet; load it here so the perf and accuracy suites share them.
+if [[ -f "$SCRIPT_DIR/runtime/.user_env_aisbench.sh" ]]; then
+    source "$SCRIPT_DIR/runtime/.user_env_aisbench.sh"
+fi
+
 SUITE="${1:-}"
 shift || true
 
@@ -101,12 +121,19 @@ show_help() {
     cat <<'EOF'
 Usage: bash benchmark.sh <suite> [extra python args...]
 
-Available test suites (4):
+Available test suites (6):
   gsm8k    Few-shot GSM8K evaluation
            defaults: --num-questions 100 --num-shots 5 --max-new-tokens 256
                      --temperature 0 --parallel 10
   mmlu     MMLU evaluation
            defaults: --ntrain 2 --nsub 3 --parallel 10 --backend srt
+  gpqa     GPQA accuracy via ais_bench (gpqa_diamond, 198 questions).
+           Needs gpqa_diamond.csv under $DATASET_PATH (see runtime/.user_env_aisbench.sh).
+           defaults: batch 16, max_out_len 8192, temperature 0.0,
+                     top_p 0.95, repetition_penalty 1.05
+  aime26   AIME2026 accuracy via ais_bench (30 questions).
+           Needs aime2026.jsonl (fields problem/answer) under $DATASET_PATH.
+           defaults: same as gpqa
   sharegpt Perf run via the official sglang bench_serving on the local
            ShareGPT JSON (offline: never downloads from HuggingFace).
            Requires SHAREGPT_DATASET_PATH in runtime/.user_env_base.sh.
@@ -121,6 +148,19 @@ Available test suites (4):
 Env overrides (runtime): HOST PORT PARALLEL
   gsm8k:    NUM_QUESTIONS NUM_SHOTS MAX_NEW_TOKENS TEMPERATURE DATA_PATH
   mmlu:     NTRAIN NSUB BACKEND RESULT_FILE RAW_RESULT_FILE DATA_DIR
+  gpqa/aime26: AIS_CONDA_ENV AIS_BASE AIS_HOST AIS_PORT AIS_MODEL_CFG
+            AIS_ACC_DATA_DIR (dataset dir; default
+            $DATASET_PATH/aisbench/<gpqa|aime2026>)
+            AIS_TASKSET_CPUS (default 266-302, empty = no binding)
+            AIS_ACC_BATCH AIS_ACC_MAX_OUT_LEN AIS_ACC_TEMPERATURE
+            AIS_ACC_TOP_P AIS_ACC_REPETITION_PENALTY (1.0 = off)
+            AIS_ACC_RETRY AIS_ACC_IGNORE_EOS (0 = stop at EOS)
+            AIS_ACC_MODEL AIS_ACC_MODEL_PATH
+            AIS_ACC_NUM_PROMPTS (first N questions; injected as
+            reader_cfg.test_range, empty = whole dataset)
+            plus AIS_GPQA_TASK / AIS_AIME26_TASK to point at a different
+            ais_bench dataset task name
+
   sharegpt: SHAREGPT_BACKEND SHAREGPT_MODEL SHAREGPT_NUM_PROMPTS
             SHAREGPT_DATASET_NAME (sharegpt / random / random-ids)
             SHAREGPT_RANDOM_INPUT_LEN SHAREGPT_RANDOM_OUTPUT_LEN
@@ -152,6 +192,9 @@ Examples:
   SHAREGPT_DATASET_NAME=random bash benchmark.sh sharegpt \
       --output-file /tmp/collect.jsonl
   AIS_REQUESTS=512 AIS_IN_LEN=1024 AIS_OUT_LEN=256 bash benchmark.sh aisbench
+  bash benchmark.sh gpqa                    # GPQA diamond, 198 questions
+  bash benchmark.sh aime26                   # AIME2026, 30 questions
+  AIS_ACC_MAX_OUT_LEN=131072 bash benchmark.sh gpqa
 EOF
 }
 
@@ -245,7 +288,7 @@ case "$SUITE" in
         sed -i -E "s/(max_out_len=).*/\1$AIS_MAX_OUT_LEN,/" "$AIS_MODEL_CFG_PATH"
         sed -i -E "s/(request_rate=).*/\1$AIS_REQUEST_RATE,/" "$AIS_MODEL_CFG_PATH"
         if [[ -n "${AIS_TEMPERATURE:-}" ]]; then
-            sed -i -E "s/(temperature=).*/\1$AIS_TEMPERATURE,/" "$AIS_MODEL_CFG_PATH"
+            sed -i -E "s/(temperature[[:space:]]*=[[:space:]]*)[0-9.]+/\1$AIS_TEMPERATURE/" "$AIS_MODEL_CFG_PATH"
         fi
         if [[ -n "${AIS_IGNORE_EOS:-}" ]]; then
             if [[ "$AIS_IGNORE_EOS" == "1" ]]; then t=True; else t=False; fi
@@ -293,6 +336,150 @@ case "$SUITE" in
             --mode perf --debug \
             "${work_dir_args[@]}" \
             "$@"
+        ;;
+    gpqa|aime26)
+        # Accuracy run: only model + dataset configs are patched; this build
+        # has no "--mode accuracy" (default "all" runs infer + eval).
+        AIS_CONDA_ENV="${AIS_CONDA_ENV:-$DEFAULT_AIS_CONDA_ENV}"
+        if [[ "$SUITE" == "gpqa" ]]; then
+            AIS_TASK="${AIS_GPQA_TASK:-$DEFAULT_AIS_GPQA_TASK}"
+        else
+            AIS_TASK="${AIS_AIME26_TASK:-$DEFAULT_AIS_AIME26_TASK}"
+        fi
+        AIS_BATCH="${AIS_ACC_BATCH:-$DEFAULT_AIS_ACC_BATCH}"
+        AIS_MAX_OUT_LEN="${AIS_ACC_MAX_OUT_LEN:-$DEFAULT_AIS_ACC_MAX_OUT_LEN}"
+        AIS_TEMPERATURE="${AIS_ACC_TEMPERATURE:-$DEFAULT_AIS_ACC_TEMPERATURE}"
+        AIS_RETRY="${AIS_ACC_RETRY:-$DEFAULT_AIS_ACC_RETRY}"
+        AIS_ACC_MODEL="${AIS_ACC_MODEL:-${DEFAULT_AIS_ACC_MODEL:-}}"
+        AIS_ACC_MODEL_PATH="${AIS_ACC_MODEL_PATH:-${DEFAULT_AIS_ACC_MODEL_PATH:-$MODEL_PATH}}"
+        AIS_ACC_IGNORE_EOS="${AIS_ACC_IGNORE_EOS:-$DEFAULT_AIS_ACC_IGNORE_EOS}"
+        AIS_TOP_P="${AIS_ACC_TOP_P:-$DEFAULT_AIS_ACC_TOP_P}"
+        AIS_REP_PENALTY="${AIS_ACC_REPETITION_PENALTY:-$DEFAULT_AIS_ACC_REPETITION_PENALTY}"
+        # Question cap: this build ignores --num-prompts for accuracy, so it is
+        # injected as reader_cfg.test_range below.
+        AIS_NUM_PROMPTS="${AIS_ACC_NUM_PROMPTS:-$DEFAULT_AIS_ACC_NUM_PROMPTS}"
+        if [[ -n "$AIS_NUM_PROMPTS" && ! "$AIS_NUM_PROMPTS" =~ ^[0-9]+$ ]]; then
+            echo "Error: AIS_ACC_NUM_PROMPTS must be an integer, got '$AIS_NUM_PROMPTS'" >&2
+            exit 1
+        fi
+        AIS_HOST="${AIS_HOST:-$GATEWAY_HOST}"
+        AIS_PORT="${AIS_PORT:-$GATEWAY_PORT}"
+        AIS_MODEL_CFG="${AIS_MODEL_CFG:-vllm_api_stream_chat}"
+        AIS_TASKSET_CPUS="${AIS_TASKSET_CPUS:-$DEFAULT_AIS_TASKSET_CPUS}"
+
+        # Locate the ais_bench package inside the dedicated conda env
+        if [[ -z "${AIS_BASE:-}" ]]; then
+            AIS_BASE=$(ls -d "$CONDA_BASE_PATH/envs/$AIS_CONDA_ENV"/lib/python*/site-packages/ais_bench 2>/dev/null | head -n1)
+        fi
+        if [[ -z "${AIS_BASE:-}" || ! -d "$AIS_BASE" ]]; then
+            echo "Error: cannot locate ais_bench under conda env '$AIS_CONDA_ENV' (tried \$AIS_BASE='$AIS_BASE'). Set AIS_BASE manually." >&2
+            exit 1
+        fi
+
+        AIS_MODEL_CFG_PATH="$AIS_BASE/benchmark/configs/models/vllm_api/$AIS_MODEL_CFG.py"
+        if [[ ! -f "$AIS_MODEL_CFG_PATH" ]]; then
+            echo "Error: ais_bench model config not found: $AIS_MODEL_CFG_PATH" >&2
+            exit 1
+        fi
+
+        # Dataset config dir is "<dataset>_gen..." -> strip from "_gen".
+        AIS_CFG_DIR="${AIS_TASK%%_gen*}"
+        AIS_DATASET_CFG_PATH="$AIS_BASE/benchmark/configs/datasets/$AIS_CFG_DIR/$AIS_TASK.py"
+        if [[ ! -f "$AIS_DATASET_CFG_PATH" ]]; then
+            echo "Error: ais_bench dataset config not found: $AIS_DATASET_CFG_PATH" >&2
+            exit 1
+        fi
+
+        # Dataset dir; `path=` is rewritten to an absolute path below.
+        if [[ "$SUITE" == "gpqa" ]]; then
+            AIS_ACC_DATA_DIR="${AIS_ACC_DATA_DIR:-$DATASET_PATH/aisbench/gpqa}"
+            AIS_DATA_PATH="$AIS_ACC_DATA_DIR"
+            AIS_DATA_PROBE="$AIS_ACC_DATA_DIR/gpqa_diamond.csv"
+        else
+            AIS_ACC_DATA_DIR="${AIS_ACC_DATA_DIR:-$DATASET_PATH/aisbench/aime2026}"
+            AIS_DATA_PATH="$AIS_ACC_DATA_DIR/aime2026.jsonl"
+            AIS_DATA_PROBE="$AIS_DATA_PATH"
+        fi
+        if [[ ! -e "$AIS_DATA_PROBE" ]]; then
+            echo "Error: dataset file not found: $AIS_DATA_PROBE" >&2
+            echo "       Put the data there, or set AIS_ACC_DATA_DIR." >&2
+            exit 1
+        fi
+
+        echo "[aisbench] base:     $AIS_BASE"
+        echo "[aisbench] dataset:  $AIS_TASK ($AIS_DATA_PROBE)"
+        echo "[aisbench] target:   $AIS_HOST:$AIS_PORT"
+        echo "[aisbench] model:    batch_size=$AIS_BATCH max_out_len=$AIS_MAX_OUT_LEN temperature=$AIS_TEMPERATURE top_p=$AIS_TOP_P rep_penalty=$AIS_REP_PENALTY retry=$AIS_RETRY model=${AIS_ACC_MODEL:-<config>} ignore_eos=$AIS_ACC_IGNORE_EOS"
+
+        # Patch model config (perf defaults are wrong for accuracy: ignore_eos
+        # keeps generating past the answer, model/path may point elsewhere).
+        sed -i -E "s/(host_ip=).*/\1\"$AIS_HOST\",/" "$AIS_MODEL_CFG_PATH"
+        sed -i -E "s/(host_port=).*/\1$AIS_PORT,/" "$AIS_MODEL_CFG_PATH"
+        sed -i -E "s/(batch_size=).*/\1$AIS_BATCH,/" "$AIS_MODEL_CFG_PATH"
+        sed -i -E "s/(max_out_len=).*/\1$AIS_MAX_OUT_LEN,/" "$AIS_MODEL_CFG_PATH"
+        sed -i -E "s/(retry=).*/\1$AIS_RETRY,/" "$AIS_MODEL_CFG_PATH"
+        sed -i -E "s/(temperature[[:space:]]*=[[:space:]]*)[0-9.]+/\1$AIS_TEMPERATURE/" "$AIS_MODEL_CFG_PATH"
+        if ! grep -qE "temperature[[:space:]]*=[[:space:]]*${AIS_TEMPERATURE}([,)]|$)" "$AIS_MODEL_CFG_PATH"; then
+            echo "Error: failed to set temperature=$AIS_TEMPERATURE in $AIS_MODEL_CFG_PATH" >&2
+            exit 1
+        fi
+        if [[ "$AIS_ACC_IGNORE_EOS" == "1" ]]; then AIS_EOS=True; else AIS_EOS=False; fi
+        sed -i -E "s/ignore_eos[[:space:]]*=[[:space:]]*[^,)]*/ignore_eos=$AIS_EOS/" "$AIS_MODEL_CFG_PATH"
+        if ! grep -qE "ignore_eos[[:space:]]*=[[:space:]]*$AIS_EOS" "$AIS_MODEL_CFG_PATH"; then
+            echo "Error: failed to set ignore_eos=$AIS_EOS in $AIS_MODEL_CFG_PATH" >&2
+            exit 1
+        fi
+        sed -i -E "s/(top_p|repetition_penalty)[[:space:]]*=[[:space:]]*[0-9.]+,?[[:space:]]*//g" "$AIS_MODEL_CFG_PATH"
+        sed -i -E "s/(generation_kwargs[[:space:]]*=[[:space:]]*dict\()/\1top_p=$AIS_TOP_P, repetition_penalty=$AIS_REP_PENALTY, /" "$AIS_MODEL_CFG_PATH"
+        if ! grep -qE "top_p=$AIS_TOP_P[,)]" "$AIS_MODEL_CFG_PATH" ||
+           ! grep -qE "repetition_penalty=$AIS_REP_PENALTY[,)]" "$AIS_MODEL_CFG_PATH"; then
+            echo "Error: failed to set top_p=$AIS_TOP_P / repetition_penalty=$AIS_REP_PENALTY in $AIS_MODEL_CFG_PATH" >&2
+            exit 1
+        fi
+        if [[ -n "$AIS_ACC_MODEL" ]]; then
+            sed -i -E "s|^([[:space:]]*model=).*|\1'$AIS_ACC_MODEL',|" "$AIS_MODEL_CFG_PATH"
+        fi
+        if [[ -n "$AIS_ACC_MODEL_PATH" ]]; then
+            sed -i -E "s|^([[:space:]]*path=).*|\1'$AIS_ACC_MODEL_PATH',|" "$AIS_MODEL_CFG_PATH"
+        fi
+
+        # Absolute dataset path, then the question cap via reader_cfg.test_range
+        # (drop any old value first so runs are idempotent).
+        sed -i -E "s|(\\bpath=)['\"][^'\"]*['\"]|\\1'$AIS_DATA_PATH'|" "$AIS_DATASET_CFG_PATH"
+        sed -i -E "s/test_range='[^']*',[[:space:]]*//g" "$AIS_DATASET_CFG_PATH"
+        if [[ -n "$AIS_NUM_PROMPTS" ]]; then
+            sed -i -E "s/(reader_cfg[[:space:]]*=[[:space:]]*dict\()/\1test_range='[:$AIS_NUM_PROMPTS]', /" "$AIS_DATASET_CFG_PATH"
+            echo "[aisbench] limit:    first $AIS_NUM_PROMPTS question(s) via reader_cfg.test_range"
+        fi
+
+        # shellcheck disable=SC1091
+        conda activate "$AIS_CONDA_ENV"
+
+        launch_prefix=()
+        if [[ -n "$AIS_TASKSET_CPUS" ]]; then
+            launch_prefix=(taskset -c "$AIS_TASKSET_CPUS")
+        fi
+
+        # Explicit work dir: results never depend on where this script runs.
+        AIS_ACC_WORK_DIR="${AIS_ACC_WORK_DIR:-$PWD/ais_acc_outputs}"
+        mkdir -p "$AIS_ACC_WORK_DIR"
+
+        echo "[aisbench] launching: ${AIS_TASKSET_CPUS:+taskset -c $AIS_TASKSET_CPUS }ais_bench --models $AIS_MODEL_CFG --datasets $AIS_TASK --work-dir $AIS_ACC_WORK_DIR --dump-eval-details"
+        "${launch_prefix[@]}" \
+            ais_bench --models "$AIS_MODEL_CFG" --datasets "$AIS_TASK" \
+            --work-dir "$AIS_ACC_WORK_DIR" \
+            --dump-eval-details \
+            "$@"
+        rc=$?
+
+        # Print the newest summary csv so the accuracy is visible at a glance.
+        summary=$(ls -t "$AIS_ACC_WORK_DIR"/outputs/default/*/results/*/*/summary*.csv \
+                       "$AIS_ACC_WORK_DIR"/*/results/*/*/summary*.csv 2>/dev/null | head -n1)
+        if [[ -n "$summary" ]]; then
+            echo "[aisbench] result: $summary"
+            cat "$summary"
+        fi
+        exit "$rc"
         ;;
     sharegpt)
         # Offline ShareGPT perf run via the official sglang bench_serving.
