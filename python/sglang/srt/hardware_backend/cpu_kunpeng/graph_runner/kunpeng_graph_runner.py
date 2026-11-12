@@ -998,6 +998,11 @@ class KunpengGraphRunner:
         return decline(forward_batch, kwargs) if decline is not None else None
 
     def _graph_unsupported_reason(self, forward_batch, kwargs):
+        if (
+            self.is_graph_active()
+            and self._pp_row_mismatch(forward_batch, kwargs) is not None
+        ):
+            return "pp_shape_mismatch"
         provider = self._provider_for_forward()
         if not self.is_graph_active():
             reason = "graph_disabled"
@@ -1021,6 +1026,18 @@ class KunpengGraphRunner:
 
     def _graph_supports_forward(self, forward_batch, kwargs):
         if not self.is_graph_active():
+            return False
+        # Choke point: decode/extend/idle all pass through here.  The guard is
+        # re-evaluated (pure) in _graph_unsupported_reason() to name the
+        # coverage reason, so only this call site logs.
+        mismatch = self._pp_row_mismatch(forward_batch, kwargs)
+        if mismatch is not None:
+            logger.warning(
+                "[PP-SHAPE-MISMATCH] upstream=%d local=%d mode=%s pp=%s -> eager "
+                "(replay would trip the RMSNorm assert)",
+                mismatch[0], mismatch[1], forward_batch.forward_mode.name,
+                getattr(self.model_runner, "pp_rank", -1),
+            )
             return False
         provider = self._provider_for_forward()
         if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
@@ -1066,6 +1083,33 @@ class KunpengGraphRunner:
             )
             self._decode_coverage[key] = row
         return row
+
+    def _pp_row_mismatch(self, forward_batch, kwargs) -> Optional[tuple]:
+        """Return (upstream rows, local rows) when this stage must not replay.
+
+        A captured graph is keyed by this stage's own token count
+        (input_ids.shape[0]) and every in-graph buffer was frozen at that
+        shape.  Replaying with an upstream payload of a different row count
+        feeds those buffers the other shape and RMSNorm trips
+        TORCH_CHECK(outs.size(0) == height), killing the worker.  Returns None
+        when replay is safe; the caller owns all bookkeeping.
+        """
+        if not getattr(self.model_runner, "support_pp", False):
+            return None
+        proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if proxy_tensors is None:
+            return None  # First stage: it produces the payload.
+        hidden = proxy_tensors.tensors.get("hidden_states")
+        if hidden is None or hidden.dim() == 0:
+            return None
+        if forward_batch.forward_mode.is_idle():
+            # Idle never carries a payload: replay() rewrites the proxy tensors
+            # to zero-row views and the input set is rebuilt at 0 tokens, so
+            # there is nothing to cross-check.
+            return None
+        n_up = int(hidden.shape[0])
+        n_local = int(forward_batch.input_ids.shape[0])
+        return None if n_up == n_local else (n_up, n_local)
 
     def _forward_decode(
         self,
