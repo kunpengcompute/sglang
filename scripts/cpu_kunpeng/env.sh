@@ -136,11 +136,18 @@ export LOG_RUN_DIR="${LOG_BASE_DIR}/${LOG_DATE}/${LOG_TIME}"
 export LOG_DIR="${LOG_RUN_DIR}/${LOG_SUBDIR}"
 export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 
-# Role/instance env files may have re-enabled NUMA duplication after the base
-# normalization; re-check before the toolchain decision below reads the flag.
-_normalize_numa_dup
-
-if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] || [[ "$ACTION" == "router" ]] || [[ "$ACTION" == "tokenizer" ]] || [[ "$ACTION" == "mooncake" ]] || [[ "$ACTION" == "store" ]] || [[ "$ACTION" == "build" ]]; then
+# The toolchain env is only skipped for the per-rank pyinstall binaries, which
+# carry their own libs and are used only under binary launch. Without binary
+# launch server.sh starts a plain `python -m sglang.launch_server`, which needs
+# OpenBLAS/KUPL/KUTACC on LD_LIBRARY_PATH, so load the toolchain in that case
+# even when NUMA duplication is on.
+if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] \
+    || [[ "${SGLANG_ENABLE_BINARY_LAUNCH:-1}" != "1" ]] \
+    || [[ "$ACTION" == "router" ]] \
+    || [[ "$ACTION" == "tokenizer" ]] \
+    || [[ "$ACTION" == "mooncake" ]] \
+    || [[ "$ACTION" == "store" ]] \
+    || [[ "$ACTION" == "build" ]]; then
     source ${HPCKIT_PATH}/latest/compiler/bisheng/env/setvars.sh
 
     export LD_LIBRARY_PATH=${OpenBLAS_PATH}/lib:${LD_LIBRARY_PATH}
