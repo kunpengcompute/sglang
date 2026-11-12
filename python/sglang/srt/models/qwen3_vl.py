@@ -1084,7 +1084,18 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             grid_thw_list = grid_thw.tolist()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        # The eager forward interpolates position embeddings through
+        # fast_pos_embed_interpolate_from_list. The tensor variant used
+        # here before honors enable_precise_embedding_interpolation
+        # (align_corners): with the default False it samples a half-pixel
+        # grid while the from_list path always uses the linspace grid, so
+        # the graph paths fed the tower a different position-embedding
+        # input than eager and graph-vs-eager generation diverged (same
+        # image, different output length/content; traced to this line by
+        # hashing the staged tower input). Route the graph paths through
+        # the SAME interpolation the eager forward runs so both modes
+        # stage bit-identical tower inputs.
+        pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
 
         # rotary embedding -> (cos, sin)
