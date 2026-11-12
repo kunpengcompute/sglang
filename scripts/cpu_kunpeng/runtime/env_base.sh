@@ -259,6 +259,11 @@ if [[ -f "$SCRIPT_DIR/runtime/.user_env_base.sh" ]]; then
     source "$SCRIPT_DIR/runtime/.user_env_base.sh" "$USER_ENV_ROLE"
 fi
 
+# Binary launch disabled => NUMA duplication has nothing to duplicate (and
+# would also skip the toolchain env). Normalize after the user overrides above
+# so an explicit SGLANG_ENABLE_BINARY_LAUNCH=0 wins over the default NUMA flag.
+_normalize_numa_dup
+
 # ------------------------------------------------------------
 # Derived paths, resolved after the user env files above so that both the
 # inputs (CONDA_BASE_PATH / CONDA_ENV_NAME / SGLANG_PATH) and the derived
