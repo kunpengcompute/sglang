@@ -1,0 +1,31 @@
+{
+  "model": "/home/share/songzhenlong/large_model/GLM-5.3-w8a8-kunpeng-state/GLM-5.3-W8A8-Channel-INT8-tp16",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call lookup_weather for San Francisco."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_weather",
+        "description": "Look up weather by city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" }
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "function",
+    "function": { "name": "lookup_weather" }
+  },
+  "max_tokens": 256,
+  "temperature": 0
+}
