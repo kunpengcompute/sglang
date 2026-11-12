@@ -27,6 +27,7 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Tuple,
     TypeGuard,
     runtime_checkable,
 )
@@ -668,6 +669,19 @@ def grouped_topk_cpu(
     )
 
 
+def _kunpeng_topk_slice(state, num_tokens: int) -> Tuple[int, int]:
+    """Return ``(start, full_tokens)`` for this rank's slice in the SHM tables.
+
+    Under SP each rank owns rows ``[start, start + num_tokens)`` of the full
+    ``[num_tokens * attn_tp_size, ...]`` tables; otherwise the tables are
+    full on every rank.
+    """
+    if state.use_sp:
+        start = state.attn_tp_rank * num_tokens
+        return start, num_tokens * state.attn_tp_size
+    return 0, num_tokens
+
+
 def _get_kunpeng_topk_buffers(batch_size: int, topk: int):
     """Return SHM-backed topk output views for the Kunpeng RDMA dispatcher.
 
@@ -678,6 +692,9 @@ def _get_kunpeng_topk_buffers(batch_size: int, topk: int):
     into the even columns of the interleaved topk_ids_index_buf consumed by
     the RDMA dispatcher (odd columns hold the per-expert token index written
     by the kutacc dispatch kernel).
+
+    In SP mode ``batch_size`` is the per-rank token count and only this
+    rank's segment of the SHM buffers is returned.
 
     Returns ``(topk_weights_out, topk_ids_out)`` or ``(None, None)`` when
     the dispatcher is not initialized, in which case callers fall back to
@@ -690,12 +707,14 @@ def _get_kunpeng_topk_buffers(batch_size: int, topk: int):
     w_buf = state.topk_weights_buf
     if ids_buf is None or w_buf is None:
         return None, None
-    if batch_size > ids_buf.shape[0] or ids_buf.shape[1] != topk:
+    start, _ = _kunpeng_topk_slice(state, batch_size)
+    if start + batch_size > ids_buf.shape[0] or ids_buf.shape[1] != topk:
         raise ValueError(
-            f"Kunpeng topk buffer mismatch: batch={batch_size} > {ids_buf.shape[0]} "
+            f"Kunpeng topk buffer mismatch: batch={batch_size} "
+            f"(slice start={start}) > {ids_buf.shape[0]} "
             f"or topk={topk} != {ids_buf.shape[1]}"
         )
-    return w_buf[:batch_size], ids_buf[:batch_size]
+    return w_buf[start : start + batch_size], ids_buf[start : start + batch_size]
 
 
 def _kunpeng_allgather_interleaved_slots(full_buf: torch.Tensor, num_tokens: int, topk: int) -> None:
@@ -713,6 +732,11 @@ def _kunpeng_allgather_interleaved_slots(full_buf: torch.Tensor, num_tokens: int
     interleaved table directly: each rank contributes its own token slice
     (rows [start:end]) and the collective assembles the full table in the
     attention-TP (intra-node) domain.
+
+    In SP mode the second channel is load-bearing: it allgathers
+    ``topk_weights_buf`` (each rank computed only its own token slice of
+    the weights). Outside SP the second channel is a harmless dummy
+    (``topk_ids_flat_buf``, already consumed by then).
     """
     from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
         _KunpengDispatcherState,
@@ -729,12 +753,17 @@ def _kunpeng_allgather_interleaved_slots(full_buf: torch.Tensor, num_tokens: int
 
     # Each rank's own token slice (contiguous rows of the interleaved buf).
     src = full_buf[start:end]
-    # Pair the rank-slot table with the local-slot table: allgather the
-    # interleaved table (src -> full_buf) and reuse topk_ids_flat_buf as a
-    # harmless second channel (its content is consumed before this point).
-    flat = state.topk_ids_flat_buf[:num_tokens]
-    src1 = flat[start:end]
-    kunpeng.shm_dual_allgather_kunpeng(src, full_buf, src1, flat)
+    if state.use_sp:
+        # SP: merge the per-rank topk weights slices into the full table.
+        w = state.topk_weights_buf[:num_tokens]
+        src1, dst1 = w[start:end], w
+    else:
+        # Pair the rank-slot table with the local-slot table: allgather the
+        # interleaved table (src -> full_buf) and reuse topk_ids_flat_buf as a
+        # harmless second channel (its content is consumed before this point).
+        flat = state.topk_ids_flat_buf[:num_tokens]
+        src1, dst1 = flat[start:end], flat
+    kunpeng.shm_dual_allgather_kunpeng(src, full_buf, src1, dst1)
 
 
 def _kunpeng_etp_remap_topk_ids(topk_ids: torch.Tensor):
@@ -782,12 +811,13 @@ def _kunpeng_publish_and_sync_topk_ids(topk_ids: torch.Tensor) -> None:
 
     state = _KunpengDispatcherState.get()
     num_tokens, topk = topk_ids.shape
-    full_buf = state.topk_ids_index_buf[:num_tokens]
+    start, full_tokens = _kunpeng_topk_slice(state, num_tokens)
+    full_buf = state.topk_ids_index_buf[:full_tokens]
     if state.etp_enabled:
         _kunpeng_etp_remap_topk_ids(topk_ids)
     else:
-        kunpeng.copy_kunpeng(full_buf[:, 0::2], topk_ids)
-    _kunpeng_allgather_interleaved_slots(full_buf, num_tokens, topk)
+        kunpeng.copy_kunpeng(full_buf[start : start + num_tokens, 0::2], topk_ids)
+    _kunpeng_allgather_interleaved_slots(full_buf, full_tokens, topk)
 
 
 def grouped_topk_kunpeng(
@@ -806,44 +836,32 @@ def grouped_topk_kunpeng(
     topk_weights_out, topk_ids_out = _get_kunpeng_topk_buffers(
         hidden_states.shape[0], topk
     )
+    # The fused-shared / rsf fixup runs INSIDE the kernel (recorded and
+    # replayed by the Kunpeng graph): routed_i = (score_i / sum) * rsf,
+    # shared = 1.0.
+    _rsf = routed_scaling_factor if routed_scaling_factor is not None else 0.0
     if topk_ids_out is not None:
         kunpeng.grouped_topk_inplace_kunpeng(
             gating_output, topk_weights_out, topk_ids_out, None, topk,
             num_expert_group, topk_group,
-            bool(renormalize), False, False, 0)
-        token_weights = topk_weights_out
-        token_ids = topk_ids_out
+            bool(renormalize), False, False, 0,
+            num_fused_shared_experts, _rsf)
+        topk_weights = topk_weights_out
+        topk_ids = topk_ids_out
     else:
-        token_weights, token_ids = kunpeng.grouped_topk_kunpeng(
+        topk_weights, topk_ids = kunpeng.grouped_topk_kunpeng(
             gating_output, None, topk, num_expert_group, topk_group,
-            bool(renormalize), False, False, 0)
+            bool(renormalize), False, False, 0,
+            num_fused_shared_experts, _rsf)
 
-    topk_weights = token_weights
-    topk_ids = token_ids
-
-    if num_fused_shared_experts:
-        num_experts = gating_output.shape[1]
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        )
-        if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-            )
-
-    if renormalize:
-        topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
-            if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-        )
-        topk_weights /= topk_weights_sum
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+    if num_fused_shared_experts == 0:
+        # Plain path: python-side renormalize / rsf semantics, unchanged.
+        if renormalize:
+            topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+            if apply_routed_scaling_factor_on_output:
+                topk_weights *= routed_scaling_factor
+    # else: the kernel already applied renormalize and the fused-shared
+    # scaling; python post-processing would not be graph-replayed.
 
     if topk_ids_out is not None:
         # Publish the consistent full ids table into the interleaved
@@ -859,8 +877,12 @@ def grouped_topk_kunpeng(
         if state.etp_enabled:
             _kunpeng_etp_remap_topk_ids(topk_ids)
         else:
+            start, _ = _kunpeng_topk_slice(state, topk_ids.shape[0])
             kunpeng.copy_kunpeng(
-                state.topk_ids_index_buf[: topk_ids.shape[0], 0::2], topk_ids
+                state.topk_ids_index_buf[
+                    start : start + topk_ids.shape[0], 0::2
+                ],
+                topk_ids,
             )
 
     return topk_weights, topk_ids
@@ -1274,9 +1296,18 @@ def _load_balance_padded_tokens_kunpeng(
     dp_size = max(1, tp_size // attn_tp_size)
     dp_rank = get_tensor_model_parallel_rank() // attn_tp_size
     expert_offset = (dp_rank * max(1, num_experts // dp_size)) % num_experts
+    # Flash-comm SP: topk_ids holds only this rank's token slice; pass the
+    # global row offset so the kernel derives the slice-local real-token
+    # boundary (num_token_non_padded stays the global count).
+    from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
+        _KunpengDispatcherState,
+    )
+
+    state = _KunpengDispatcherState.get()
+    slice_offset, _ = _kunpeng_topk_slice(state, topk_ids.shape[0])
     kunpeng.load_balance_padded_tokens_kunpeng(
         topk_ids, topk_weights, num_token_non_padded, num_experts, topk,
-        force_balance, expert_offset)
+        force_balance, expert_offset, slice_offset)
     return topk_ids, topk_weights
 
 
@@ -1310,7 +1341,11 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
     )
 
     state = _KunpengDispatcherState.get()
-    full_buf = state.topk_ids_index_buf[: topk_ids.shape[0]]
+    num_tokens, _ = topk_ids.shape
+    start, full_tokens = _kunpeng_topk_slice(state, num_tokens)
+    # Remap writes this rank's token slice; under SP that is rows
+    # [start, start + num_tokens) of the global interleaved buffer.
+    full_buf = state.topk_ids_index_buf[:full_tokens]
     ep_size = get_moe_expert_parallel_world_size()
 
     # All ranks in the attn-TP group hold the SAME tokens and remap into the
@@ -1318,26 +1353,31 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
     # shared pool, so every rank's tensor is the same physical memory), but
     # each rank's remap table is rank-local: static uses the per-ep-rank
     # nearest-copy dispatch map, dynamic additionally advances a process-
-    # private round-robin counter.  If every rank remapped all rows they
+    # private round-robin counter. If every rank remapped all rows they
     # would concurrently write DIFFERENT (rank, slot) values into the same
-    # rows -> torn entries.  In dynamic mode this happens every step and
+    # rows -> torn entries. In dynamic mode this happens every step and
     # hangs the dispatch nbb; in static mode it is rarer but can still route
     # a token to a copy of a DIFFERENT logical expert (silent corruption).
     # So BOTH paths remap only this rank's own token slice; the trailing
     # allgather acts as the fence that publishes every slice to the group --
     # each row is decided by exactly one owner rank.
-    num_tokens, _ = topk_ids.shape
-    if state.attn_tp_size > 1 and num_tokens % state.attn_tp_size == 0:
+    if state.use_sp:
+        # SP: topk_ids is already this rank's slice; it maps to rows
+        # [start, start + num_tokens) of the global table.
+        remap_start, remap_end = start, start + num_tokens
+        my_topk_ids = topk_ids
+    elif state.attn_tp_size > 1 and num_tokens % state.attn_tp_size == 0:
         chunk = num_tokens // state.attn_tp_size
         remap_start = state.attn_tp_rank * chunk
         remap_end = remap_start + chunk
+        my_topk_ids = topk_ids[remap_start:remap_end]
     else:
         # No allgather fence in this case either (_kunpeng_allgather_interleaved_slots
         # skips), so there is no owner to publish foreign slices: every rank
         # must fall back to the full remap (single-writer only when
         # attn_tp_size == 1).
         remap_start, remap_end = 0, num_tokens
-    my_topk_ids = topk_ids[remap_start:remap_end]
+        my_topk_ids = topk_ids
     my_full_buf = full_buf[remap_start:remap_end]
 
     if algorithm == "static":
@@ -1396,8 +1436,16 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
     # barrier (nbb) may wait for a rank that actually never sends data.
     # Merge the per-rank token slices within the attention-TP (intra-node)
     # domain, mirroring the reference small_package_dual_allgather.
-    _kunpeng_allgather_interleaved_slots(full_buf, topk_ids.shape[0], topk_ids.shape[1])
+    _kunpeng_allgather_interleaved_slots(
+        full_buf,
+        full_tokens,
+        topk_ids.shape[1],
+    )
 
+    if state.use_sp:
+        # SP: return this rank's slice so topk_ids stays row-consistent
+        # with the sliced topk_weights.
+        return full_buf[start : start + num_tokens, 0::2]
     return full_buf[:, 0::2]
 
 
@@ -1417,33 +1465,23 @@ def biased_grouped_topk_kunpeng(
     topk_weights_out, topk_ids_out = _get_kunpeng_topk_buffers(
         hidden_states.shape[0], topk
     )
+    # The fused-shared / rsf fixup runs INSIDE the kernel (recorded and
+    # replayed by the Kunpeng graph): routed_i = (score_i / sum) * rsf,
+    # shared = 1.0.
+    _rsf = routed_scaling_factor if routed_scaling_factor is not None else 0.0
     if topk_ids_out is not None:
         kunpeng.grouped_topk_inplace_kunpeng(
             gating_output, topk_weights_out, topk_ids_out, correction_bias,
             topk, num_expert_group, topk_group,
-            renormalize, True, False, 0)
-        token_weights = topk_weights_out
-        token_ids = topk_ids_out
+            renormalize, True, False, 0,
+            num_fused_shared_experts, _rsf)
+        topk_weights = topk_weights_out
+        topk_ids = topk_ids_out
     else:
-        token_weights, token_ids = kunpeng.grouped_topk_kunpeng(
+        topk_weights, topk_ids = kunpeng.grouped_topk_kunpeng(
             gating_output, correction_bias, topk, num_expert_group, topk_group,
-            renormalize, True, False, 0)
-
-    topk_weights = token_weights
-    topk_ids = token_ids
-
-    if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        )
-        if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-            )
+            renormalize, True, False, 0,
+            num_fused_shared_experts, _rsf)
 
     if topk_ids_out is not None:
         # Publish the consistent full ids table into the interleaved
@@ -1459,8 +1497,12 @@ def biased_grouped_topk_kunpeng(
         if state.etp_enabled:
             _kunpeng_etp_remap_topk_ids(topk_ids)
         else:
+            start, _ = _kunpeng_topk_slice(state, topk_ids.shape[0])
             kunpeng.copy_kunpeng(
-                state.topk_ids_index_buf[: topk_ids.shape[0], 0::2], topk_ids
+                state.topk_ids_index_buf[
+                    start : start + topk_ids.shape[0], 0::2
+                ],
+                topk_ids,
             )
 
     return topk_weights, topk_ids

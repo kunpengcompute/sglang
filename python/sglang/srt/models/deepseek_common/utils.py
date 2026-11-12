@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_kunpeng_flash_comm,
     is_musa,
     is_npu,
     is_nvidia_cublas_version_ge_12_9,
@@ -46,6 +47,10 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_cpu_920f = is_cpu_920f()
+# Module-level flag snapshot: is_kunpeng_flash_comm() reads IS_PREFILL /
+# SGLANG_KUNPENG_FLASH_COMM at import time, which is after env.sh has been
+# sourced for this serving role.
+_is_kunpeng_flash_comm = is_kunpeng_flash_comm()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported

@@ -24,10 +24,10 @@ SKIP_CONDA=1 source "$SCRIPT_DIR/env.sh" store || exit 1
 
 sh "$SCRIPT_DIR/stop.sh" store
 
+# "<base>/latest/store" -> this run's store dir
 mkdir -p "$LOG_DIR"
-ln -sfn "$LOG_TIME" "$LOG_BASE_DIR/$LOG_DATE/store/latest"
 mkdir -p "$LOG_BASE_DIR/latest"
-ln -sfn "$LOG_BASE_DIR/$LOG_DATE/store/$LOG_TIME" "$LOG_BASE_DIR/latest/store"
+ln -sfn "$LOG_DIR" "$LOG_BASE_DIR/latest/store"
 
 echo "[$(date +%T)] Launching mooncake store service on $MOONCAKE_STORE_NODE:$MOONCAKE_STORE_PORT (segment $MOONCAKE_GLOBAL_SEGMENT_SIZE, master $MOONCAKE_MASTER)"
 

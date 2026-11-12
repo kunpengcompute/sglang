@@ -120,6 +120,17 @@ class ExpertLocationMetadata:
         if common is None:
             return None
 
+        num_physical_expected = common["num_physical_experts"]
+        if physical_to_logical_map.shape[-1] != num_physical_expected:
+            raise ValueError(
+                f"--init-expert-location map has {physical_to_logical_map.shape[-1]} "
+                f"physical slots, but num_logical_experts ("
+                f"{common['model_config_for_expert_location'].num_logical_experts}) + "
+                f"ep_num_redundant_experts ({server_args.ep_num_redundant_experts}) = "
+                f"{num_physical_expected}. Fix --ep-num-redundant-experts or use a "
+                f"matching map."
+            )
+
         model_config_for_expert_location = common["model_config_for_expert_location"]
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
             server_args=server_args,
@@ -201,7 +212,27 @@ class ExpertLocationMetadata:
             + server_args.ep_num_redundant_experts
         )
         ep_size = server_args.ep_size
-        assert num_physical_experts % ep_size == 0
+        if num_physical_experts % ep_size != 0:
+            from sglang.srt.utils import is_kunpeng_flash_comm
+
+            hint = ""
+            if is_kunpeng_flash_comm():
+                hint = (
+                    " Hint: Kunpeng flash-comm (SGLANG_KUNPENG_FLASH_COMM=1) counts "
+                    "the fused shared expert as an extra logical expert (257 for "
+                    "DeepSeek V3/R1). Launch with --init-expert-location pointing "
+                    "to a 257-logical physical_to_logical_map json and "
+                    "--ep-num-redundant-experts chosen so the sum is divisible by "
+                    "ep_size. Generate the map with "
+                    "scripts/cpu_kunpeng/convert_expert_deployment.py."
+                )
+            raise ValueError(
+                f"num_physical_experts ({num_physical_experts} = "
+                f"{model_config_for_expert_location.num_logical_experts} logical + "
+                f"{server_args.ep_num_redundant_experts} redundant) is not divisible "
+                f"by ep_size ({ep_size}). Adjust --ep-num-redundant-experts and/or "
+                f"--init-expert-location (the map width must equal the sum).{hint}"
+            )
         num_local_physical_experts = num_physical_experts // ep_size
 
         return dict(
@@ -595,6 +626,17 @@ def compute_initial_expert_location_metadata(
 ) -> Optional[ExpertLocationMetadata]:
     data = server_args.init_expert_location
     if data == "trivial":
+        from sglang.srt.utils import is_kunpeng_flash_comm
+
+        if is_kunpeng_flash_comm():
+            raise ValueError(
+                "SGLANG_KUNPENG_FLASH_COMM=1 (Kunpeng shared+routed expert "
+                "co-location) requires a non-trivial expert location: launch "
+                "with --init-expert-location <physical_to_logical_map json> "
+                "covering n_routed+1 logical experts and --ep-num-redundant-"
+                "experts chosen so the sum is divisible by ep_size. Generate "
+                "the map with scripts/cpu_kunpeng/convert_expert_deployment.py."
+            )
         return ExpertLocationMetadata.init_trivial(
             server_args, model_config, moe_ep_rank
         )

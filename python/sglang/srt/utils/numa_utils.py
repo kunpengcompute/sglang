@@ -116,6 +116,12 @@ else:
     libnuma.numa_bitmask_isbitset.argtypes = [POINTER(bitmask_t), c_uint]
     libnuma.numa_bitmask_isbitset.restype = c_int
 
+    libnuma.numa_allocate_nodemask.argtypes = []
+    libnuma.numa_allocate_nodemask.restype = POINTER(bitmask_t)
+
+    libnuma.numa_set_membind.argtypes = [POINTER(bitmask_t)]
+    libnuma.numa_set_membind.restype = c_int
+
 
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
@@ -231,6 +237,58 @@ def set_interleave_memory_policy() -> bool:
         return False
 
 
+def get_max_numa_node() -> Optional[int]:
+    """Highest NUMA node id on this host, or ``None`` when libnuma is missing."""
+    if libnuma is None:
+        return None
+    try:
+        if libnuma.numa_available() < 0:
+            return None
+        return int(_get_max_node())
+    except Exception:
+        return None
+
+
+def set_interleave_memory_policy_for_nodes(nodes) -> bool:
+    """Round-robin this thread's future pages over exactly ``nodes``.
+
+    ``MPOL_INTERLEAVE`` restricted to a node set: used by the shared KV pool so
+    the segment is spread over the whole share group (each rank then reads
+    ~1/group of it locally) instead of being parked on one node.
+    """
+    if not _can_set_mempolicy():
+        return False
+    node_list = [int(node) for node in nodes]
+    if not node_list:
+        return False
+    mask = None
+    try:
+        mask = libnuma.numa_allocate_nodemask()
+        if not mask:
+            return False
+        # ``numa_bitmask_setbit`` is a header inline rather than an exported
+        # symbol, so set the bits through the struct fields.
+        for node in node_list:
+            if node < 0:
+                return False
+            word, bit = divmod(node, 64)
+            if word >= mask.contents.size:
+                return False
+            mask.contents.maskp[word] = mask.contents.maskp[word] | (1 << bit)
+        return libnuma.numa_set_interleave_mask(mask) == 0
+    except Exception:
+        logger.warning(
+            "numa_set_interleave_mask(nodes=%s) failed", node_list, exc_info=True
+        )
+        return False
+    finally:
+        if mask is not None:
+            try:
+                libnuma.numa_bitmask_free(mask)
+            except Exception:
+                pass
+
+
 def set_local_memory_policy() -> bool:
     """Restore the default first-touch (local) allocation policy.
 
@@ -245,6 +303,101 @@ def set_local_memory_policy() -> bool:
         return True
     except Exception:
         return False
+
+
+def get_current_numa_node() -> Optional[int]:
+    """NUMA node this process is confined to, or ``None`` when unknown.
+
+    ``None`` means either libnuma is unavailable or the CPU affinity spans more
+    than one node. Callers that need a definite node must treat it as an error
+    rather than guessing one.
+    """
+    if libnuma is None or libnuma.numa_available() < 0:
+        return None
+    try:
+        nodes = _current_affinity_numa_nodes()
+    except Exception:
+        logger.debug("cannot map the CPU affinity to NUMA nodes", exc_info=True)
+        return None
+    if len(nodes) == 1:
+        return next(iter(nodes))
+    return None
+
+
+def set_membind_memory_policy(node: int) -> bool:
+    """Strictly bind this thread's future page allocations to ``node``.
+
+    ``MPOL_BIND``: pages are taken from ``node`` only (no fallback to other
+    nodes). Returns True when the policy was applied.
+    """
+    if not _can_set_mempolicy():
+        return False
+    mask = None
+    try:
+        mask = libnuma.numa_allocate_nodemask()
+        if not mask:
+            return False
+        # ``numa_bitmask_setbit`` is a header inline rather than an exported
+        # symbol, so set the bit through the struct fields.
+        word, bit = divmod(int(node), 64)
+        if word >= mask.contents.size:
+            return False
+        mask.contents.maskp[word] = mask.contents.maskp[word] | (1 << bit)
+        return libnuma.numa_set_membind(mask) == 0
+    except Exception:
+        logger.warning("numa_set_membind(node=%s) failed", node, exc_info=True)
+        return False
+    finally:
+        if mask is not None:
+            try:
+                libnuma.numa_bitmask_free(mask)
+            except Exception:
+                pass
+
+
+def _read_node_meminfo(node: int) -> Optional[dict]:
+    """Parse the fields of ``/sys/devices/system/node/nodeN/meminfo`` (kB)."""
+    path = f"/sys/devices/system/node/node{int(node)}/meminfo"
+    values = {}
+    try:
+        with open(path, "r") as handle:
+            for line in handle:
+                # e.g. "Node 0 MemFree:       123456789 kB"
+                field, _, rest = line.partition(":")
+                if not rest:
+                    continue
+                name = field.split()[-1]
+                try:
+                    values[name] = int(rest.split()[0]) * 1024
+                except (ValueError, IndexError):
+                    continue
+    except OSError:
+        return None
+    return values or None
+
+
+def get_node_free_bytes(node: int) -> Optional[int]:
+    """Free memory of one NUMA node in bytes, or ``None`` when unreadable."""
+    values = _read_node_meminfo(node)
+    return None if values is None else values.get("MemFree")
+
+
+def get_node_available_bytes(node: int) -> Optional[int]:
+    """Memory a new allocation can still get on one NUMA node, in bytes.
+
+    ``MemFree`` alone under-reports badly while the page cache holds the model
+    weights: those pages are reclaimable and the kernel hands them back during
+    a large allocation. Mirror the host-level ``MemAvailable`` formula per
+    node, minus ``Shmem`` -- tmpfs pages (our own sgkv/psm segments) are NOT
+    reclaimable and must not be counted as available.
+    """
+    values = _read_node_meminfo(node)
+    if values is None or "MemFree" not in values:
+        return None
+    available = values["MemFree"]
+    available += max(0, values.get("FilePages", 0) - values.get("Shmem", 0))
+    available += values.get("SReclaimable", 0)
+    return available
 
 
 def _is_numa_available() -> bool:

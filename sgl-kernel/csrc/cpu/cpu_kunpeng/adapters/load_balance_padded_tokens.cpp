@@ -20,7 +20,7 @@
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
                                         int64_t num_experts, int64_t topk, bool force_balance,
-                                        int64_t expert_offset);
+                                        int64_t expert_offset, int64_t slice_offset);
 
 static KernelRegistrar _r_load_balance_padded_tokens(
     "load_balance_padded_tokens_kunpeng",

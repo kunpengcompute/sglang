@@ -5,12 +5,20 @@ import torch
 from sglang.srt.graph import ops
 
 
-def conv_prefill(x, weight, bias, activation, state, initial, indices, qsl, seq_lens_cpu, *, metadata_validated=False):
+def conv_prefill(x, weight, bias, activation, state, initial, indices, qsl, seq_lens_cpu):
     from . import prefill_graph
-    if indices.numel() == 1 and x.shape[1] > 128:
+    if (
+        indices.numel() == 1
+        and x.shape[1] > 128
+        # conv_c1 takes its conv-state tail from the buffer END; with power-of-2
+        # bucket padding those rows are padding rows, and a capture-time Python
+        # branch cannot follow the replayed live boundary. Route single
+        # requests through the segmented kernel, which reads the live
+        # boundaries from qsl at execution time.
+        and not prefill_graph.padding_enabled()
+    ):
         return prefill_graph.conv_c1(x, weight, bias, activation, state, initial, indices)
-    return prefill_graph.conv_segmented(x, weight, bias, activation, state, initial, indices, qsl,
-                                        metadata_validated=metadata_validated)
+    return prefill_graph.conv_segmented(x, weight, bias, activation, state, initial, indices, qsl)
 
 def gating(A_log, a, b, dt_bias, beta=1., threshold=20.):
     from .backend import cast

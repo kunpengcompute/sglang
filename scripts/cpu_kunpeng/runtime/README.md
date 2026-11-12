@@ -64,7 +64,7 @@ env_base.sh（含 .user_env_base.sh，所有角色共享）
 
 因此 **实例必须在 `INSTANCES` 中列出**：显式指定一个未列出的实例（如 `./launch.sh prefill 128p` 而 `INSTANCES` 无 `prefill_128p`）会直接报错，而不是静默退化成序号 0 的端口（否则会和真正的序号 0 实例抢同一段端口/NUMA）。
 
-日志目录同样按实例隔离：`$LOG_BASE_DIR/<日期>/<role>[_<instance>]/<时间>/`。
+日志目录同样按实例隔离：`$LOG_BASE_DIR/<日期>/<时间>/<role>[_<instance>]/`（时间戳在角色目录之前，一次 `launch.sh all` 的所有角色都落在同一个 `<时间>/` 下）。另外每次启动都会刷新 `$LOG_BASE_DIR/latest/<role>[_<instance>]` 软链，直接指向本次运行的角色目录，不带日期/时间层，方便 `tail`/分析脚本用固定路径访问最新一次。
 
 ## 4. 路由：分组模式（短/长序列固定分组）
 

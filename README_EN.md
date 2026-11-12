@@ -2,6 +2,7 @@
 
 ## Release Notes
 
+- \[2026/11] Added flash-comm deployment guide (prefill SP MoE + shared-expert EPLB co-location, see Section 3.2); `split_weights_glm5.py` now emits the shared-expert file automatically, and the new `add_shared_expert_glm5.py` patches existing trees in place.
 - \[2026/10] Added GLM-5.3 deployment guide (weight preprocessing, configuration, startup); added HiCache tiered KV cache with the mooncake L3 backend, and mooncake/store deployment roles.
 - \[2026/09] Updated deployment docs: added multi-instance deployment, tokenizer-separate PD disaggregated deployment, and related environment variables.
 - \[2026/05] This release is based on SGLang official v0.5.11 with optimizations and adaptations.
@@ -154,6 +155,7 @@ GLM-5.3-specific splitting handled by the script:
 - DSA indexer projections follow the model-side attention-TP split by default (`indexer.wq_b` split along dim0; `indexer.wk` / `indexer.weights_proj` split along dim1). Pass `--replicate-indexer` and set `SGLANG_KUNPENG_DISABLE_INDEXER_TP_SPLIT=1` on the serving side to replicate them on every rank instead.
 - bf16 tensors without a scale (`kv_b_proj`, `indexer.wk`, `weights_proj`, `lm_head`, embeddings, etc.) are copied as-is.
 - MoE experts take a byte-level fast path (sendfile) when the source shards are standard safetensors; expert output layout matches the DeepSeek script (`experts/layer_L/expert_E.safetensors`, `w13_weight` = fused `[gate; up]`).
+- The MoE split also emits each layer's `mlp.shared_experts.*` as `experts/layer_L/expert_{n_routed}.safetensors` (`expert_256` for GLM-5.3; the id is one past the layer's highest routed expert), so flash-comm deployments can load it through the same layout as routed experts (see the flash-comm part below); non-flash deployments never read this file.
 
 **2. Configuration**
 
@@ -178,6 +180,44 @@ sh launch.sh native          # native mode
 sh stop.sh server native
 # or the PD disaggregated flow (Section 3.5):
 sh launch.sh all
+```
+
+**4. flash-comm (optional)**
+
+flash-comm is a communication/MoE optimization for prefill instances, with two sub-features:
+
+- **SP prefill MoE (token-sliced sequence parallelism)**: within the attn-TP group each rank holds only one token slice of the sequence; attention outputs are reduce-scattered so LayerNorm and the MLP run on the local slice, per-rank topk tables are merged into the full table by a single `shm_dual_allgather`, and the MoE combine writes back only this rank's home slice — avoiding full-batch allgather/allreduce at every layer;
+- **Shared-expert EPLB co-location**: the shared expert enters the EPLB physical expert map as logical expert `n_routed` (256 for GLM-5.3) and shares the dispatch/combine pipeline with routed experts; the `grouped_topk` kernel bakes `routed_scaling_factor` into the routed weights (the shared column's weight is fixed at 1.0), so the forward pass no longer scales separately.
+
+Prerequisites (validated at startup — violations abort): prefill instances only (decode is inert via `IS_PREFILL=0`); attn-TP > 1; the RDMA dispatch path (single-node local-SHM-dispatch topologies do not implement home-slice combine); PP=1 on the prefill instance; `ep_size == tp_size` (ETP not supported).
+
+The three environment variables (set on the prefill side, e.g. in `runtime/.user_env_prefill[_<instance>].sh`):
+
+```shell
+export SGLANG_KUNPENG_FLASH_COMM=1              # master switch, default off
+export PREFILL_INIT_EXPERT_LOCATION="$SGLANG_PATH/scripts/cpu_kunpeng/configs/ep256_glm5_3_flash_comm.json"
+export PREFILL_REDUNDANT_EXPERTS=255            # 257 + 255 = 512; 32 local slots per rank at ep_size=16
+```
+
+- `SGLANG_KUNPENG_FLASH_COMM`: the flash-comm master switch. Effective on prefill instances only (decode is inert via `IS_PREFILL=0`); do not put it in global configs, or the native role (`IS_PREFILL` is also 1) would pick it up too.
+- `PREFILL_INIT_EXPERT_LOCATION` (falls back to the global `INIT_EXPERT_LOCATION`): path of the EPLB expert map, turned into `--init-expert-location` by the launch scripts. flash-comm counts the shared expert as one extra logical expert, so a non-trivial map is required — it must cover `n_routed + 1` logical experts (257 for GLM-5.3); trivial maps or mismatched slot counts abort at startup. The GLM-5.3 reference map is `scripts/cpu_kunpeng/configs/ep256_glm5_3_flash_comm.json` (78 layers × 512 physical slots).
+- `PREFILL_REDUNDANT_EXPERTS` (falls back to the global `REDUNDANT_EXPERTS`): number of redundant experts, turned into `--ep-num-redundant-experts`; `n_routed + 1 + redundant experts` must be divisible by `ep_size` (255 for the reference map: 257 + 255 = 512).
+
+Two further prerequisites are satisfied automatically and need no manual configuration: `IS_PREFILL=1` is exported by `source env.sh prefill`, and `SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1` (default on) keeps the batch token count divisible by attn_tp_size (required by the equal token slicing).
+
+The decode side needs no changes — just `sh launch.sh all` (or `sh launch.sh prefill [instance]` alone) as usual.
+
+**Shared-expert weight file**: at runtime flash-comm loads the shared expert through the same `experts/layer_L/expert_E.safetensors` layout as routed experts (id `n_routed`, i.e. `expert_256.safetensors` for GLM-5.3):
+
+- **Freshly preprocessed trees**: `split_weights_glm5.py --moe` already emits this file automatically (see the splitting notes above) — nothing extra to do.
+- **Trees preprocessed before flash-comm**: they only contain `expert_0..255`, and enabling flash-comm fails with `Cannot find expert weight file .../expert_256.safetensors`. Patch the tree in place from the original checkpoint's `mlp.shared_experts.*` with `scripts/cpu_kunpeng/model_processing/add_shared_expert_glm5.py` — it reuses the name resolution and gate/up fusion of `split_weights_glm5.py` and writes the same format; detects the `{output_dir}_mtp` tree automatically and offsets layer ids by `--num_hidden_layers`; fails loudly when the shared expert's shape differs from the routed experts' (instead of being silently truncated by the FusedMoE slot); `--layer_range <start> <end>` parallelizes across machines and `--force` overwrites existing files:
+
+```shell
+cd scripts/cpu_kunpeng/model_processing
+python add_shared_expert_glm5.py \
+    --model_dir /path-to-glm5.3-quantized \
+    --output_dir /path-to-glm5.3-split \
+    --num_hidden_layers 78
 ```
 
 ### 3.3 Using Other Non-DeepSeek Models
@@ -373,6 +413,14 @@ export ENABLE_KUNPENG_HICACHE=0  # default off
 ```
 
 - **Effect**: When =1, enables the HiCache tiered KV cache (prefill/native roles only); the L3 backend is selected by `KUNPENG_HICACHE_BACKEND` (mooncake/file). See Section 3.6 and the [HiCache guide](docs/kunpeng/hicache.md).
+
+**11. SGLANG\_KUNPENG\_FLASH\_COMM — flash-comm**
+
+```
+export SGLANG_KUNPENG_FLASH_COMM=0  # default off
+```
+
+- **Effect**: When =1, enables flash-comm (prefill SP MoE token slicing + shared-expert EPLB co-location). Effective on prefill instances only; requires the companion environment variables `PREFILL_INIT_EXPERT_LOCATION` (non-trivial expert map, 257 logical experts) and `PREFILL_REDUNDANT_EXPERTS` (257 + redundant must be divisible by `ep_size`), plus the shared-expert weight file. See part 4 of Section 3.2 for the full deployment procedure.
 
 #### 3.7.2 Other Toggles
 

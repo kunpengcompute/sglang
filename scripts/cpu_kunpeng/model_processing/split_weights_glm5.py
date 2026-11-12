@@ -629,6 +629,57 @@ def split_moe_experts(
                     raise KeyError(f"key {k} 被多个专家引用")
                 owner[k] = dest
 
+    # Shared experts: flash-comm co-locates the shared expert as logical
+    # expert n_routed (e.g. 256 for GLM-5), loaded by the runtime from the
+    # same per-expert file layout.  Emit expert_{n_routed}.safetensors per
+    # layer from mlp.shared_experts.* so preprocessed trees are complete;
+    # non-flash deployments simply never read the extra file.
+    for layer in sorted(layer_to_experts.keys()):
+        shared_prefix = f"model.layers.{layer}.mlp.shared_experts"
+        shared_gateup = resolver.resolve_gateup(shared_prefix)
+        if shared_gateup[0] is None:
+            continue
+        shared_down_key, shared_scale_key = resolver.resolve(
+            f"{shared_prefix}.down_proj"
+        )
+        if shared_down_key is None:
+            raise KeyError(f"缺少 {shared_prefix}.down_proj")
+
+        shared_id = max(layer_to_experts[layer]) + 1
+        plan_keys = []
+        for wk, sk in (
+            (shared_gateup[1],)
+            if shared_gateup[0] == "fused"
+            else (shared_gateup[1], shared_gateup[2])
+        ):
+            plan_keys.append(wk)
+            if sk is not None:
+                plan_keys.append(sk)
+        plan_keys.append(shared_down_key)
+        if shared_scale_key is not None:
+            plan_keys.append(shared_scale_key)
+
+        if num_hidden_layers is not None and layer >= num_hidden_layers:
+            layer_dir = os.path.join(
+                mtp_output_dir, f"layer_{layer - num_hidden_layers}"
+            )
+        else:
+            layer_dir = os.path.join(output_dir, f"layer_{layer}")
+
+        dest = (layer, shared_id)
+        plans[dest] = {
+            "prefix": shared_prefix,
+            "gateup": shared_gateup,
+            "w_down": shared_down_key,
+            "s_down": shared_scale_key,
+            "keys": plan_keys,
+            "out": os.path.join(layer_dir, f"expert_{shared_id}.safetensors"),
+        }
+        for k in plan_keys:
+            if owner.get(k, dest) != dest:
+                raise KeyError(f"key {k} 被多个专家引用")
+            owner[k] = dest
+
     # 2) 按 key 所属分片分组, 每个 shard 只加载一次
     shard_keys = defaultdict(list)
     for k, dest in owner.items():

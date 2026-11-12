@@ -632,7 +632,7 @@ class DeepseekMLAKunpengForwardMixin:
                 self.attn_mqa.tp_q_head_num = saved_tp_q_head_num
 
             # All2All #2: kunpeng SHM operator
-            # (B/a2a, Nh_in_group, D_kv) → (B, numhead_local, D_kv)
+            # (B/a2a, Nh_in_group, D_kv) → (B, num_local_heads, D_kv)
             all_heads_in_group = self.num_local_heads * all2all_size
             attn_output = attn_output.view(
                 batchsize_per_tp, all_heads_in_group, self.kv_lora_rank

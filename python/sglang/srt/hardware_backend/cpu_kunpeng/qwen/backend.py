@@ -183,7 +183,11 @@ class QwenGDNKernel(LinearAttnKernelBase):
             )
         output = torch.empty_like(v)
         library = initialize()
-        parallel = q.shape[1] > 32
+        # The kernel contract (enforced by the graph-side gdn() checks) is
+        # m == qsl[-1]: with power-of-2 bucket padding, q.shape[1] also counts
+        # padding rows that belong to no segment.
+        m = int(query_start_loc[-1])
+        parallel = m > 32
         sequences = query_start_loc.numel() - 1
         grain = (
             32
@@ -208,8 +212,8 @@ class QwenGDNKernel(LinearAttnKernelBase):
         # slice across the token recurrence, with one pool launch per layer.
         rc = kernel(
             *(t.data_ptr() for t in (q, k, v, g, beta, state, query_start_loc, output)),
-            query_start_loc.numel() - 1,
-            q.shape[1],
+            sequences,
+            m,
             q.shape[2],
             v.shape[2],
             q.shape[3],
@@ -220,6 +224,11 @@ class QwenGDNKernel(LinearAttnKernelBase):
         )
         if rc:
             raise RuntimeError(f"Qwen GDN prefill failed: {rc}")
+        # The kernel only writes the live rows; zero the padding tail so
+        # uninitialized bytes (possibly NaN/Inf) never reach the finiteness-
+        # checked norm/quant kernels downstream. Mirrors the C++ gdn() tail.
+        if m < output.shape[1]:
+            output[:, m:].zero_()
         return output, state, None
 
     def target_verify(

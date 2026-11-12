@@ -35,6 +35,22 @@ IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 # Source environment config (exports CONDA_ACTIVATE_CMD, PYTHON_SCRIPT, etc.)
 source ./env.sh "$ROLE" "$INSTANCE" || exit 1
 
+# --- /dev/shm hygiene -------------------------------------------------------
+# Every run leaves POSIX shm behind: our sgkv* KV segments, psm_* Python
+# shared-memory buffers (ShmBroadcast creates them anonymously) and
+# shm_mmap_*. A crashed rank never unlinks them, and leftover segments keep
+# whole NUMA nodes mapped, which trips the KV-share capacity pre-check on the
+# next start. These boxes are dedicated, so wipe the directory before any rank
+# of this node starts. SGLANG_KUNPENG_CLEAR_SHM=0 keeps the segments.
+if [[ "${SGLANG_KUNPENG_CLEAR_SHM:-1}" != "0" ]]; then
+    if pgrep -f "sglang[_.:]" >/dev/null 2>&1; then
+        echo "WARNING: sglang is still running on $(hostname); clearing /dev/shm anyway"
+    fi
+    _shm_used=$(du -sh /dev/shm 2>/dev/null | cut -f1)
+    echo "[$(date +%T)] clearing /dev/shm on $(hostname) (was ${_shm_used:-unknown})"
+    rm -rf /dev/shm/* 2>/dev/null || true
+fi
+
 rmmod sdma_dae 2>/dev/null || true
 insmod "$SDMA_KO_PATH" safe_mode=0 share_chns=160
 

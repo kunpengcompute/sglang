@@ -595,6 +595,10 @@ class Envs:
     KUTACC_ASYNC_LAUNCH = EnvBool(True)
     SGLANG_KUNPENG_ENABLE_SHM_FENCE = EnvBool(False)
     SGLANG_KUNPENG_RDMA_BCAST = EnvBool(False)
+    # Kunpeng flash-comm: prefill sequence-parallel (token-sliced) MoE path
+    # plus shared-expert co-location into the MoE dispatch/combine pipeline.
+    # Active only when IS_PREFILL=1 as well (see is_kunpeng_flash_comm).
+    SGLANG_KUNPENG_FLASH_COMM = EnvBool(False)
     SGLANG_ENABLE_KUCCL = EnvBool(False)
     # PP layout for the Kunpeng CPU path (consumed by
     # sglang.srt.distributed.rank_layout):
@@ -656,6 +660,15 @@ class Envs:
     # attention_schedule.row_start/row_rows). Read per forward; orthogonal
     # to the construction-time weight split above.
     SGLANG_KUNPENG_DISABLE_INDEXER_SCORE_TP_SPLIT = EnvBool(False)
+    # Kunpeng 920F GLM-5 shared KV-cache pool: how many consecutive TP ranks
+    # share ONE KV pool.
+    #   0  (default) = disabled: every rank allocates its own KV pool.
+    #   4           = one pool per die (4 consecutive TP ranks).
+    #   8           = one pool per socket (8 consecutive TP ranks).
+    #   16          = one pool per node (16 consecutive TP ranks).
+    # Only 0 / 4 / 8 / 16 are valid; the consumer rejects anything else at
+    # startup instead of silently ignoring it.
+    SGLANG_KUNPENG_KV_SHARE_GROUP = EnvInt(0)
 
 envs = Envs()
 EnvField._allow_set_name = False

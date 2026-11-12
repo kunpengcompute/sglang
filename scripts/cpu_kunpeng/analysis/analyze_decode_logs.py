@@ -19,8 +19,10 @@ charts and an analysis report (no split log files are produced).
 
 Usage: python analyze_decode_logs.py [log_file] [output_dir]
        When log_file is omitted, the newest rank0 decode log is auto-detected
-       under LOG_BASE_DIR (<LOG_BASE_DIR>/<date>/decode/<time>/pp0_dp0_tp0_*.log,
-       legacy binary: 0_0_*.log).
+       under LOG_BASE_DIR
+       (<LOG_BASE_DIR>/<date>/<time>/decode[_<instance>]/pp0_dp0_tp0_*.log,
+       legacy layout <LOG_BASE_DIR>/<date>/decode/<time>/..., legacy binary
+       name 0_0_*.log).
 """
 
 import re
@@ -572,25 +574,55 @@ def resolve_log_base_dir(script_dir):
     return log_base
 
 
-def find_latest_rank0_log(log_base_dir):
-    """Locate the newest rank0 decode log under LOG_BASE_DIR.
+def _rank0_log_in(directory):
+    """First rank0 log inside directory (binary name first, then legacy)."""
+    for pattern in ("pp0_dp0_tp0_*.log", "0_0_*.log", "0_*.log"):
+        hits = sorted(glob.glob(os.path.join(directory, pattern)))
+        if hits:
+            return hits[0]
+    return None
 
-    Expected layout (created by launch.sh/env.sh):
-        <LOG_BASE_DIR>/<yymmdd>/decode/<HHMMSS>/pp0_dp0_tp0_<node_ip>.log
+
+def _stamp_dirs(directory):
+    """Descending list of "<yymmdd>" / "<HHMMSS>" style subdirs of directory.
+
+    Filtering on six digits keeps discovery inside real run dirs (it also
+    skips the leftover "latest" symlink trees of older deployments)."""
+    dirs = [
+        path
+        for path in glob.glob(os.path.join(directory, "*"))
+        if os.path.isdir(path) and re.fullmatch(r"\d{6}", os.path.basename(path))
+    ]
+    return sorted(dirs, reverse=True)
+
+
+def find_latest_rank0_log(log_base_dir, role="decode"):
+    """Locate the newest rank0 log under LOG_BASE_DIR.
+
+    Current layout (created by launch.sh/env.sh):
+        <LOG_BASE_DIR>/<yymmdd>/<HHMMSS>/<role>[_<instance>]/pp0_dp0_tp0_<ip>.log
+    Legacy layout, still honoured:
+        <LOG_BASE_DIR>/<yymmdd>/<role>/<HHMMSS>/pp0_dp0_tp0_<node_ip>.log
     Falls back to the legacy binary name 0_0_*.log / non-binary 0_*.log.
     Returns None when no matching log exists.
     """
-    for date_dir in sorted(glob.glob(os.path.join(log_base_dir, "*")), reverse=True):
-        decode_dir = os.path.join(date_dir, "decode")
-        if not os.path.isdir(decode_dir):
-            continue
-        for time_dir in sorted(glob.glob(os.path.join(decode_dir, "*")), reverse=True):
-            if not os.path.isdir(time_dir):
+    for date_dir in _stamp_dirs(log_base_dir):
+        # Current layout: <date>/<time>/<role>[_<instance>]/
+        for time_dir in _stamp_dirs(date_dir):
+            for role_dir in glob.glob(os.path.join(time_dir, role + "*")):
+                if not os.path.isdir(role_dir):
+                    continue
+                hit = _rank0_log_in(role_dir)
+                if hit:
+                    return hit
+        # Legacy layout: <date>/<role>/<HHMMSS>/
+        for role_dir in glob.glob(os.path.join(date_dir, role + "*")):
+            if not os.path.isdir(role_dir):
                 continue
-            for pattern in ("pp0_dp0_tp0_*.log", "0_0_*.log", "0_*.log"):
-                hits = sorted(glob.glob(os.path.join(time_dir, pattern)))
-                if hits:
-                    return hits[0]
+            for time_dir in _stamp_dirs(role_dir):
+                hit = _rank0_log_in(time_dir)
+                if hit:
+                    return hit
     return None
 
 

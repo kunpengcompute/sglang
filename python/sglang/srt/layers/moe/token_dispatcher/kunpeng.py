@@ -39,6 +39,7 @@ from sglang.srt.hardware_backend.cpu_kunpeng.profiler import KunpengProfiler
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_kunpeng_flash_comm
 
 kernel = torch.ops.sgl_kernel
 
@@ -140,6 +141,10 @@ class _KunpengDispatcherState:
         self.attn_tp_rank: int = 0
         self.use_static_route: bool = False
         self.parallel_policy: Optional[torch.Tensor] = None
+        # Flash-comm SP mode: hidden states handed to dispatch/combine are
+        # already this rank's token slice; the topk tables are merged with
+        # shm_dual_allgather instead of being computed redundantly.
+        self.use_sp: bool = False
 
         # ETP (expert tensor parallel, moe_tp_size > 1) state.  Each MOE_TP
         # group (moe_tp_size consecutive ranks, node-local) holds the full
@@ -288,6 +293,38 @@ def _ensure_rdma_initialized(
             if state.etp_enabled
             else state.num_experts
         )
+
+        # Flash-comm SP: prefill role only; requires the RDMA dispatch path
+        # and a sliced attention-TP domain > 1.
+        state.use_sp = is_kunpeng_flash_comm()
+        if state.use_sp:
+            if state.attn_tp_size <= 1:
+                raise ValueError(
+                    "Kunpeng flash-comm SP requires attention-TP > 1 "
+                    "(token slicing over the attn-TP group)"
+                )
+            if state.use_local_dis_com:
+                raise ValueError(
+                    "Kunpeng flash-comm SP requires the RDMA dispatch path "
+                    "(local SHM dispatch does not implement home-slice combine)"
+                )
+            if state.etp_enabled:
+                raise ValueError(
+                    "Kunpeng flash-comm SP is incompatible with ETP "
+                    "(run prefill with ep_size == tp_size)"
+                )
+            from sglang.srt.distributed.parallel_state import (
+                get_pipeline_model_parallel_world_size,
+            )
+
+            if get_pipeline_model_parallel_world_size() > 1:
+                # Non-last PP stages hand the token slice to the next stage
+                # via PPProxyTensors; the receiving stage's scatter modes are
+                # not validated for that handoff. Block until tested.
+                raise ValueError(
+                    "Kunpeng flash-comm SP requires PP=1 (token-slice handoff "
+                    "through PPProxyTensors is untested)"
+                )
 
         # Step 1: RDMA communication domain.  Only needed when MoE dispatch/
         # combine actually runs over RDMA (i.e. not local SHM dispatch).  When
@@ -836,8 +873,13 @@ class KunpengDispatcher(BaseDispatcher):
         t_total_start = time.perf_counter()
 
         state = self._state
-        batch_size = hidden_states.shape[0]
-        num_tokens = batch_size // self.attn_tp_size
+        if state.use_sp:
+            # Flash-comm SP: hidden_states is already this rank's token slice.
+            num_tokens = hidden_states.shape[0]
+            batch_size = num_tokens * self.attn_tp_size
+        else:
+            batch_size = hidden_states.shape[0]
+            num_tokens = batch_size // self.attn_tp_size
 
         # Each TP rank writes to its own slice of the shared send buffer.
         # num_tokens is the per-TP-rank count after reduce-scatter;
@@ -855,9 +897,15 @@ class KunpengDispatcher(BaseDispatcher):
             _tp_offset : _tp_offset + _tp_count, hidden_states.shape[1] :
         ].view(torch.float32)
 
-        kunpeng.quant_inplace_kunpeng(
-            hidden_states[_tp_offset : _tp_offset + _tp_count], norm_int8, norm_scale
-        )
+        if state.use_sp:
+            # The input tensor is already the local slice (rows [0, num_tokens)).
+            kunpeng.quant_inplace_kunpeng(hidden_states, norm_int8, norm_scale)
+        else:
+            kunpeng.quant_inplace_kunpeng(
+                hidden_states[_tp_offset : _tp_offset + _tp_count],
+                norm_int8,
+                norm_scale,
+            )
 
         t_quant_and_copy_end = time.perf_counter()
 
@@ -1065,7 +1113,9 @@ class KunpengDispatcher(BaseDispatcher):
                 topk_weights,
                 batch_size,
                 topk_ids_index.shape[1] // 2,
-                True,
+                # SP: the combine writes each token's result back to its
+                # home rank only; outside SP it allgathers the full batch.
+                not state.use_sp,
             )
         t_send_end = time.perf_counter()
 
@@ -1113,6 +1163,13 @@ class KunpengDispatcher(BaseDispatcher):
         t_recv_end = time.perf_counter()
 
         result = state.combined_x[:batch_size]
+        if state.use_sp:
+            # SP: only this rank's token slice of combined_x is valid; the
+            # view is a defensive no-op if kutacc already wrote only the
+            # home slice.
+            result = result[
+                self.attn_tp_rank * num_tokens : (self.attn_tp_rank + 1) * num_tokens
+            ]
 
         self._combine_pending = None
         return result

@@ -256,7 +256,8 @@ void bf16_gemm_prepack_kunpeng(at::Tensor &weight, int64_t batch_size);
 void grouped_topk_kunpeng(at::Tensor router_logits, at::Tensor token_weights, at::Tensor token_ids, int64_t topk,
                           int64_t num_expert_group, int64_t topk_group, const c10::optional<at::Tensor> bias,
                           const c10::optional<at::Tensor> experts_offset, bool renormalize, bool scoring_func_sigmoid,
-                          bool moe_balance, int64_t v2);
+                          bool moe_balance, int64_t v2, int64_t num_fused_shared_experts,
+                          double routed_scaling_factor);
 
 void moe_comm_create_kunpeng(int64_t process_group_ptr);
 
@@ -376,7 +377,7 @@ void etp_remap_topk_ids_kunpeng(at::Tensor topk_ids, at::Tensor topk_ids_index_b
 
 void load_balance_padded_tokens_kunpeng(at::Tensor topk_ids, at::Tensor topk_weights, at::Tensor num_token_non_padded,
                                         int64_t num_experts, int64_t topk, bool force_balance,
-                                        int64_t expert_offset);
+                                        int64_t expert_offset, int64_t slice_offset);
 
 at::Tensor get_expert_load_stats_kunpeng();
 
@@ -438,6 +439,8 @@ void shm_batched_allgather_init_kunpeng(int64_t dim);
 
 void shm_dual_allgather_kunpeng(at::Tensor src0_tensor, at::Tensor dst0_tensor, at::Tensor src1_tensor,
                                 at::Tensor dst1_tensor);
+
+void shm_allgather_kunpeng(at::Tensor input, at::Tensor output);
 
 void shm_batched_allgather_kunpeng(at::Tensor input, at::Tensor output, int64_t comm_size);
 
@@ -930,13 +933,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int topk, int num_expert_group, int topk_group, "
         "Tensor? bias=None, Tensor? experts_offset=None, "
         "bool renormalize=False, bool scoring_func_sigmoid=False, "
-        "bool moe_balance=False, int v2=0) -> ()");
+        "bool moe_balance=False, int v2=0, "
+        "int num_fused_shared_experts=0, float routed_scaling_factor=0.0) -> ()");
     m.impl("grouped_topk_kunpeng", grouped_topk_kunpeng);
 
     m.def(
         "load_balance_padded_tokens_kunpeng("
         "Tensor(a!) topk_ids, Tensor(b!) topk_weights, Tensor num_token_non_padded, "
-        "int num_experts, int topk, bool force_balance, int expert_offset) -> ()");
+        "int num_experts, int topk, bool force_balance, int expert_offset, "
+        "int slice_offset) -> ()");
     m.impl("load_balance_padded_tokens_kunpeng", load_balance_padded_tokens_kunpeng);
 
     m.def("get_expert_load_stats_kunpeng() -> Tensor");
@@ -1214,6 +1219,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "shm_dual_allgather_kunpeng(Tensor src0_tensor, Tensor dst0_tensor, Tensor src1_tensor, Tensor dst1_tensor) -> "
         "()");
     m.impl("shm_dual_allgather_kunpeng", shm_dual_allgather_kunpeng);
+
+    m.def("shm_allgather_kunpeng(Tensor input, Tensor output) -> ()");
+    m.impl("shm_allgather_kunpeng", shm_allgather_kunpeng);
 
     m.def("shm_batched_allgather_kunpeng(Tensor(a!) input, Tensor(b!) output, int comm_size) -> ()");
     m.impl("shm_batched_allgather_kunpeng", shm_batched_allgather_kunpeng);

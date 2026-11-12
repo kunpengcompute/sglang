@@ -892,10 +892,9 @@ class CommunicateSimpleFn:
         if isinstance(hidden_states, tuple):
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
-                with use_symmetric_memory(
-                    get_tp_group(),
-                    disabled=not is_allocation_symmetric(),
-                ):
+                if _is_cpu_920f:
+                    # Kunpeng: plain allocation; the capture-aware SHM token
+                    # allgather registers the output storage itself.
                     output = torch.empty(
                         (
                             local_hidden_states.shape[0] * context.attn_tp_size,
@@ -904,12 +903,42 @@ class CommunicateSimpleFn:
                         dtype=local_hidden_states.dtype,
                         device=local_hidden_states.device,
                     )
+                else:
+                    with use_symmetric_memory(
+                        get_tp_group(),
+                        disabled=not is_allocation_symmetric(),
+                    ):
+                        output = torch.empty(
+                            (
+                                local_hidden_states.shape[0] * context.attn_tp_size,
+                                *local_hidden_states.shape[1:],
+                            ),
+                            dtype=local_hidden_states.dtype,
+                            device=local_hidden_states.device,
+                        )
                 attn_tp_all_gather_into_tensor(
                     output,
                     local_hidden_states,
                 )
                 gathered_hidden_states.append(output)
             return tuple(gathered_hidden_states)
+
+        if _is_cpu_920f:
+            if hidden_states.shape[0] == 0:
+                # Idle DP ranks: no-op.  Return the input itself: a fresh
+                # torch.empty((0, H)) has nullptr storage, which graph
+                # capture rejects.
+                return hidden_states
+            # Kunpeng: no DP buffers in this deployment (attn_tp == tp);
+            # the SHM allgather allocates the output directly and registers
+            # its storage under graph capture itself.
+            output = torch.empty(
+                (hidden_states.shape[0] * context.attn_tp_size, *hidden_states.shape[1:]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            attn_tp_all_gather_into_tensor(output, hidden_states)
+            return output
 
         hidden_states, local_hidden_states = (
             get_local_dp_buffer(),

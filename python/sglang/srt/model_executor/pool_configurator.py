@@ -19,10 +19,46 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
+    get_nsa_index_head_dim,
+    is_deepseek_nsa,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
+
+
+def _shared_flat_index_k_layers(mr: ModelRunner, num_layers: int) -> Optional[int]:
+    """Number of real index-K layers of the 920F shared pool, else ``None``.
+
+    The 920F ``KunpengNSATokenToKVPool`` gives index-K buffers ONLY to the full
+    (non skip-topk) layers, as a flat array of the plain KV dtype -- see
+    ``shared_kv_pool.KvShareLayout.per_slot_bytes``. The generic NSA formula
+    below charges every layer and adds the quant scale per token, which
+    over-estimates by ~5% and silently costs the shared pool ~2 GiB of tokens.
+
+    Only applies when the KV sharing switch is on: the baseline keeps the
+    conservative generic figure so existing deployments do not change size.
+    """
+    try:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() <= 0:
+            return None
+        from sglang.srt.utils.common import is_cpu_920f
+
+        if not is_cpu_920f():
+            return None
+        hf_config = mr.model_config.hf_config
+        start_layer = int(getattr(mr, "start_layer", 0))
+        return sum(
+            1
+            for layer_id in range(start_layer, start_layer + int(num_layers))
+            if not dsa_layer_skips_topk(hf_config, layer_id)
+        )
+    except Exception:
+        return None
 
 
 @dataclass
@@ -140,14 +176,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                flat_layers = _shared_flat_index_k_layers(mr, num_layers)
+                if flat_layers is not None:
+                    # Shared 920F pool: only the full layers carry index-K and
+                    # there is no per-token quant scale, so charge exactly what
+                    # the segment will contain.
+                    cell_size += index_head_dim * flat_layers * kv_size
+                else:
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
+                    cell_size += indexer_size_per_token * num_layers * element_size
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)

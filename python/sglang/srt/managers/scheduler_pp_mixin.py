@@ -71,14 +71,16 @@ _PP_ROW_OWNER_KEYS = frozenset({"topk_indices"})
 _PP_MSG_SLOTS = 10
 _PP_MAX_INFLIGHT_MSG = _PP_MSG_SLOTS - 1
 
-# Per-pyobj size cap for forwarding recv_reqs down the PP ring. A single message
-# slot holds 1MB (PP_MSG_SLOT_SIZE in pp_comm.cpp), so long inputs (e.g. 64k)
-# whose request list exceeds it after pickling must be split. We use a 768KB
-# threshold: an oversized recv_reqs is sent as one fragment header plus N
-# fragment sub-lists, and the receiver reassembles them by header, so multiple
-# batches flow through the PP ring as a pipeline instead of one-at-a-time.
+# Per-frame byte cap for forwarding recv_reqs down the PP ring.  A single
+# message slot holds 1MB (PP_MSG_SLOT_SIZE in comm/pp_comm.cpp) minus a 12-byte
+# frame header, so an oversized request list must be fragmented.  We slice the
+# *pickled byte stream*, not the request list: one long-prompt request
+# (input_text + input_ids), or a BatchTokenizedGenerateReqInput carrying many
+# requests, can by itself exceed a slot and a python object cannot be split.
+# 768KB leaves headroom for the extra pickle wrapper send_pyobj adds per frame.
 _PP_INPUT_FRAG_MAX_BYTES = 768 * 1024
 _PP_INPUT_FRAG_TAG = "__kunpeng_pp_input_frag__"
+_PP_INPUT_FRAG_MODE_BYTES = "bytes"
 
 # When "1", delay the prefill loop's send ack commits until after
 # _pp_launch_batch so the downstream ack wait overlaps with graph_run compute
@@ -1392,64 +1394,97 @@ class SchedulerPPMixin:
                 )
         return p2p_work
 
-    def _split_input_reqs_by_bytes(self: Scheduler, reqs, max_bytes: int):
-        """Greedily split requests by pickle size so each fragment stays <= max_bytes."""
-        frags = []
-        cur = []
-        cur_bytes = 0
-        for r in reqs:
-            b = len(pickle.dumps(r))
-            if cur and cur_bytes + b > max_bytes:
-                frags.append(cur)
-                cur = []
-                cur_bytes = 0
-            cur.append(r)
-            cur_bytes += b
-        if cur:
-            frags.append(cur)
-        return frags
-
     def _pp_send_input_reqs_to_next_stage(self: Scheduler, recv_reqs):
-        """Forward recv_reqs to the next PP stage, splitting long lists to fit the 1MB slot.
+        """Forward recv_reqs to the next PP stage.
 
-        The normal (including empty) case takes the single-pyobj fast path, matching the
-        old behavior. Only when the serialized size exceeds _PP_INPUT_FRAG_MAX_BYTES do we
-        split into "one fragment header + N sub-lists" sent one by one; the receiver
-        reassembles them in _pp_recv_input_reqs_from_prev_stage. Fragments preserve FIFO
-        order and do not affect the subsequent consensus / proxy send-recv pairing.
+        The RDMA control channel has a hard 1MB-per-message limit
+        (PP_MSG_SLOT_SIZE in comm/pp_comm.cpp).  Oversized request lists are
+        fragmented by slicing the *pickled byte stream*, not by splitting the
+        python list: a single long-prompt TokenizedGenerateReqInput or a
+        BatchTokenizedGenerateReqInput holding many requests can by itself
+        exceed one slot, and a python object cannot be split.  The receiver
+        reassembles the bytes and unpickles, so the object reaching
+        process_input_requests is identical on every PP stage.
         """
         if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
             return []
+
+        # Gloo has no per-message size cap and its receiver consumes exactly
+        # one pyobj, so never fragment on that path (an old list-level
+        # fragment header would be mistaken for the request list itself).
+        rdma_control = (
+            self.pp_group.kunpeng_pp_communicator is not None
+            and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
+        )
+        if not rdma_control:
+            return self._pp_send_pyobj_to_next_stage(recv_reqs, async_send=True)
+
         payload = pickle.dumps(recv_reqs)
         if len(payload) <= _PP_INPUT_FRAG_MAX_BYTES:
             return self._pp_send_pyobj_to_next_stage(recv_reqs, async_send=True)
-        frags = self._split_input_reqs_by_bytes(recv_reqs, _PP_INPUT_FRAG_MAX_BYTES)
-        if len(frags) <= 1:
-            # A single request already exceeds the cap and cannot be split further;
-            # keep the old behavior (it still errors out) but log a hint to help
-            # locate the more extreme long-input case.
-            logger.warning(
-                "PP input reqs: single pyobj still exceeds %d bytes, sending as-is",
-                _PP_INPUT_FRAG_MAX_BYTES,
-            )
-            return self._pp_send_pyobj_to_next_stage(recv_reqs, async_send=True)
-        p2p_work = self._pp_send_pyobj_to_next_stage(
-            {_PP_INPUT_FRAG_TAG: True, "n": len(frags)}, async_send=True
+
+        chunks = [
+            payload[i : i + _PP_INPUT_FRAG_MAX_BYTES]
+            for i in range(0, len(payload), _PP_INPUT_FRAG_MAX_BYTES)
+        ]
+        logger.warning(
+            "PP input reqs: pickled %d bytes (n_reqs=%d) exceeds the %d-byte "
+            "fragment cap; sending %d byte fragments",
+            len(payload),
+            len(recv_reqs),
+            _PP_INPUT_FRAG_MAX_BYTES,
+            len(chunks),
         )
-        for f in frags:
-            p2p_work = self._pp_send_pyobj_to_next_stage(f, async_send=True)
+        # Every send goes through _pp_ensure_send_slot, so an arbitrary number
+        # of fragments is safe against the 10-slot ring (acks are reclaimed
+        # while the peer drains the frames in FIFO order).
+        p2p_work = list(
+            self._pp_send_pyobj_to_next_stage(
+                {
+                    _PP_INPUT_FRAG_TAG: True,
+                    "mode": _PP_INPUT_FRAG_MODE_BYTES,
+                    "n": len(chunks),
+                    "total": len(payload),
+                },
+                async_send=True,
+            )
+        )
+        for chunk in chunks:
+            p2p_work.extend(
+                self._pp_send_pyobj_to_next_stage(chunk, async_send=True)
+            )
         return p2p_work
 
     def _pp_recv_input_reqs_from_prev_stage(self: Scheduler):
-        """Receive recv_reqs from the previous PP stage, reassembling fragmented lists."""
+        """Receive recv_reqs, reassembling byte-level fragments when present.
+
+        The legacy "header + N sub-lists of request objects" format is still
+        understood, so a new receiver can read an old sender.  An old
+        receiver cannot parse the new byte fragments, so all PP ranks must be
+        restarted together (no rolling upgrade across this protocol change).
+        """
         first = self._pp_recv_message("pyobj")["data"]
-        if isinstance(first, dict) and first.get(_PP_INPUT_FRAG_TAG):
-            n = first["n"]
-            reqs = []
+        if not (isinstance(first, dict) and first.get(_PP_INPUT_FRAG_TAG)):
+            return first
+
+        n = first["n"]
+        if first.get("mode") == _PP_INPUT_FRAG_MODE_BYTES:
+            buf = bytearray()
             for _ in range(n):
-                reqs.extend(self._pp_recv_message("pyobj")["data"])
-            return reqs
-        return first
+                buf.extend(self._pp_recv_message("pyobj")["data"])
+            total = first.get("total")
+            if total is not None and len(buf) != total:
+                raise RuntimeError(
+                    f"PP input reqs: fragment size mismatch: "
+                    f"reassembled {len(buf)} bytes, expected {total}"
+                )
+            return pickle.loads(bytes(buf))
+
+        # Legacy list-level fragmentation: each frame is a sub-list of reqs.
+        reqs = []
+        for _ in range(n):
+            reqs.extend(self._pp_recv_message("pyobj")["data"])
+        return reqs
 
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
