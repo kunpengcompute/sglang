@@ -2,6 +2,7 @@
 
 ## Release Notes
 
+- \[2026/11] 新增flash-comm部署说明（prefill SP MoE + 共享专家EPLB共置，见3.2节）；`split_weights_glm5.py`切分时自动输出共享专家文件，新增旧目录补齐脚本`add_shared_expert_glm5.py`。
 - \[2026/10] 新增GLM-5.3部署指南（权重预处理、配置、启动）；新增多级KV缓存（HiCache）与mooncake L3后端部署说明、mooncake/store部署角色。
 - \[2026/09] 更新部署文档：新增多实例部署、分离tokenizer的PD分离部署方式及相关环境变量说明。
 - \[2026/05] 本版本基于SGLang官方v0.5.11版本进行优化适配。
@@ -153,6 +154,7 @@ python split_weights_glm5.py --moe \
 - DSA indexer投影默认跟随模型侧attention-TP切分（`indexer.wq_b`沿dim0切分；`indexer.wk` / `indexer.weights_proj`沿dim1切分）。如需改为在每个rank上复制，请传入`--replicate-indexer`并在服务侧设置`SGLANG_KUNPENG_DISABLE_INDEXER_TP_SPLIT=1`。
 - 无scale的bf16张量（`kv_b_proj`、`indexer.wk`、`weights_proj`、`lm_head`、embedding等）原样拷贝。
 - 源分片为标准safetensors时，MoE专家走字节级快速路径（sendfile）；专家输出布局与DeepSeek脚本一致（`experts/layer_L/expert_E.safetensors`，`w13_weight` = 融合后的`[gate; up]`）。
+- MoE切分同时会把每层`mlp.shared_experts.*`输出为`experts/layer_L/expert_{n_routed}.safetensors`（GLM-5.3即`expert_256`，编号取该层已有路由专家最大id + 1），供flash-comm部署按与路由专家相同的布局加载（见下方flash-comm小节）；非flash-comm部署不读取该文件，不受影响。
 
 **2. 配置**
 
@@ -177,6 +179,44 @@ sh launch.sh native          # native模式
 sh stop.sh server native
 # 或PD分离部署流程（见3.5节）：
 sh launch.sh all
+```
+
+**4. flash-comm（可选）**
+
+flash-comm是prefill实例的通信与MoE优化，包含两项子特性：
+
+- **SP prefill MoE（token切片序列并行）**：attn-TP组内每个rank只持有序列的一个token切片；注意力输出reduce-scatter后在本地切片上做LayerNorm与MLP，各rank的topk表用一次`shm_dual_allgather`合并成全表，MoE combine只写回本rank的home切片，避免逐层全量allgather/allreduce；
+- **共享专家EPLB共置**：共享专家作为第`n_routed`个逻辑专家（GLM-5.3为256）放进EPLB物理专家表，与路由专家共用同一条dispatch/combine流水线；`grouped_topk`内核直接把`routed_scaling_factor`折入路由权重（共享专家列权重固定为1.0），forward侧不再单独缩放。
+
+启用前提（启动时逐项校验，违反即报错退出）：仅prefill实例（decode侧`IS_PREFILL=0`自动失效）；attn-TP > 1；需走RDMA dispatch路径（单节点本地SHM dispatch拓扑不支持home切片combine）；prefill实例需PP=1；`ep_size == tp_size`（不支持ETP）。
+
+三个环境变量（prefill实例侧设置，如`runtime/.user_env_prefill[_<instance>].sh`）：
+
+```shell
+export SGLANG_KUNPENG_FLASH_COMM=1              # flash-comm总开关，默认关
+export PREFILL_INIT_EXPERT_LOCATION="$SGLANG_PATH/scripts/cpu_kunpeng/configs/ep256_glm5_3_flash_comm.json"
+export PREFILL_REDUNDANT_EXPERTS=255            # 257 + 255 = 512，ep_size=16时每rank 32个本地槽位
+```
+
+- `SGLANG_KUNPENG_FLASH_COMM`：flash-comm总开关。仅prefill实例生效（decode侧`IS_PREFILL=0`自动失效）；不要放进全局配置，否则native角色（`IS_PREFILL`同样为1）会一并启用。
+- `PREFILL_INIT_EXPERT_LOCATION`（未设时回退全局`INIT_EXPERT_LOCATION`）：EPLB专家表路径，启动脚本转为`--init-expert-location`。flash-comm把共享专家计为1个额外逻辑专家，因此要求非trivial的专家表——覆盖`n_routed + 1`个逻辑专家（GLM-5.3为257），trivial表或槽位数不匹配会启动报错。GLM-5.3参考配置为`scripts/cpu_kunpeng/configs/ep256_glm5_3_flash_comm.json`（78层 × 512物理槽位）。
+- `PREFILL_REDUNDANT_EXPERTS`（未设时回退全局`REDUNDANT_EXPERTS`）：冗余专家数，启动脚本转为`--ep-num-redundant-experts`；需满足`n_routed + 1 + 冗余专家数`能被`ep_size`整除（参考表配套255：257 + 255 = 512）。
+
+另有两条前提自动满足、无需手工配置：`IS_PREFILL=1`由`source env.sh prefill`自动导出；`SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1`（默认开）保证batch token数可被attn_tp_size整除（token等分切片的前提）。
+
+decode侧无需任何改动。
+
+**共享专家权重文件**：flash-comm运行时按与路由专家相同的`experts/layer_L/expert_E.safetensors`布局加载共享专家（编号`n_routed`，GLM-5.3即`expert_256.safetensors`）：
+
+- **新预处理的目录**：`split_weights_glm5.py --moe`已自动输出该文件（见上方切分逻辑列表），无需额外操作。
+- **flash-comm之前预处理的旧目录**：只含`expert_0..255`，直接启用会报`Cannot find expert weight file .../expert_256.safetensors`。用`scripts/cpu_kunpeng/model_processing/add_shared_expert_glm5.py`就地把原始checkpoint中的`mlp.shared_experts.*`补进已有目录——复用`split_weights_glm5.py`的命名解析与gate/up融合逻辑，输出格式与切分脚本一致；自动检测`{output_dir}_mtp`树并按`--num_hidden_layers`换算层号；共享专家与路由专家形状不一致时直接报错（避免被FusedMoE槽位静默截断）；`--layer_range <start> <end>`支持多机分工，`--force`覆盖已存在文件：
+
+```shell
+cd scripts/cpu_kunpeng/model_processing
+python add_shared_expert_glm5.py \
+    --model_dir /path-to-glm5.3-quantized \
+    --output_dir /path-to-glm5.3-split \
+    --num_hidden_layers 78
 ```
 
 ### 3.3 非DeepSeek模型使用
@@ -372,6 +412,14 @@ export ENABLE_KUNPENG_HICACHE=0  # 默认关
 ```
 
 - **作用**：=1时启用HiCache多级KV缓存（仅prefill/native角色参与），L3后端由`KUNPENG_HICACHE_BACKEND`选择（mooncake/file）。详见3.6节与[HiCache使用指南](docs/kunpeng/hicache.md)。
+
+**11. SGLANG\_KUNPENG\_FLASH\_COMM — flash-comm**
+
+```
+export SGLANG_KUNPENG_FLASH_COMM=0  # 默认关
+```
+
+- **作用**：=1时启用flash-comm（prefill SP MoE token切片 + 共享专家EPLB共置）。仅在prefill实例生效，需配套`PREFILL_INIT_EXPERT_LOCATION`（非trivial专家表，257逻辑专家）与`PREFILL_REDUNDANT_EXPERTS`（257 + 冗余数需能被`ep_size`整除）两个环境变量及共享专家权重文件。完整部署方法见3.2节第4部分。
 
 #### 3.7.2 其他开关类
 
