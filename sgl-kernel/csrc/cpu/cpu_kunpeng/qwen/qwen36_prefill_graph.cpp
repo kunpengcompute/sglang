@@ -276,20 +276,27 @@ void gdn_multi_checkpoint(std::vector<at::Tensor> &t, int64_t grain) {
                     t[2].dim() == 4 && t[2].size(0) == 1 && t[2].size(1) == t[0].size(1) &&
                     t[15].sizes() == t[2].sizes(),
                 "GDN multi-checkpoint token shapes");
-    const auto m = t[0].size(1), hk = t[0].size(2), dk = t[0].size(3);
+    // Power-of-2 bucket padding appends rows that belong to no segment: tensor
+    // shapes use the padded row count, while the recurrence and the workspace
+    // contract follow the live token count carried by qsl.
+    const auto padded_tokens = t[0].size(1), hk = t[0].size(2), dk = t[0].size(3);
     const auto hv = t[2].size(2), dv = t[2].size(3);
+    const auto m = integer(t[6], t[6].numel() - 1);
+    TORCH_CHECK(m > 0 && m <= padded_tokens,
+                "GDN multi-checkpoint live tokens exceed the row count");
     const auto sequences = validate_cu(t[6], m);
     // Tracking always runs the parallel recurrence, so its workspace layout
     // applies to short prefills as well.
     const auto required =
         2 * m * hk + sequences * hv * ((dv + grain - 1) / grain) * 3 * grain;
-    TORCH_CHECK(hk == 1 && hv == 3 && dk == 128 && dv == 128 && t[3].numel() == m * hv &&
-                    t[4].numel() == m * hv &&
+    TORCH_CHECK(hk == 1 && hv == 3 && dk == 128 && dv == 128 &&
+                    t[3].numel() == padded_tokens * hv &&
+                    t[4].numel() == padded_tokens * hv &&
                     t[5].sizes() == at::IntArrayRef({sequences, hv, dk, dv}) && t[7].dim() == 1 &&
                     t[7].numel() >= required,
                 "GDN multi-checkpoint state/metadata/workspace shapes");
-    TORCH_CHECK(t[8].dim() == 2 && t[8].size(0) == m && t[8].size(1) > 0 && t[9].dim() == 3 &&
-                    t[9].size(0) > 0 && t[9].size(1) == t[8].size(1),
+    TORCH_CHECK(t[8].dim() == 2 && t[8].size(0) == padded_tokens && t[8].size(1) > 0 &&
+                    t[9].dim() == 3 && t[9].size(0) > 0 && t[9].size(1) == t[8].size(1),
                 "GDN multi-checkpoint conv snapshot shapes");
     const auto width = t[9].size(2);
     const auto rows = t[10].numel();
@@ -331,6 +338,12 @@ void gdn_multi_checkpoint(std::vector<at::Tensor> &t, int64_t grain) {
         t[12].data_ptr<float>(), t[13].data_ptr<int32_t>(), t[14].data_ptr<int32_t>(),
         t[7].data_ptr<float>(), t[7].numel());
     TORCH_CHECK(rc == 0, "GDN multi-checkpoint prefill graph kernel error ", rc);
+    // Padding tail: the kernel only produces the live rows; zero the rest so
+    // uninitialized pool bytes (possibly NaN/Inf) never reach the residual
+    // stream and the finiteness-checked rmsnorm/quant kernels downstream.
+    // The boundary is recomputed from qsl on every execution, like gdn().
+    if (m < t[15].size(1))
+        t[15].narrow(1, m, t[15].size(1) - m).zero_();
     // A target equal to the request's extend length snapshots the state after
     // its last token, which the recurrence has just produced in place.
     float *track = t[12].data_ptr<float>();

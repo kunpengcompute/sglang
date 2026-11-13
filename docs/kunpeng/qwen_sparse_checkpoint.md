@@ -34,7 +34,7 @@ export SGLANG_KUNPENG_QWEN=1
 export SGLANG_ENABLE_HBW_POOL=1
 export SGLANG_KUNPENG_MAX_SEQ_NUM=2048
 export SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS=4096
-export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=0
+export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=0   # 0/1 均可；=1 减少图数量但按 2 的幂多算 token
 
 # 需要 prefill 图回放时再加
 export SGLANG_ENABLE_GRAPH_CAPTURE=1
@@ -53,7 +53,7 @@ export SGLANG_KUNPENG_QWEN_SHARED_PREFILL_KV=1
 | `--page-size 64` | 与 `FLA_CHUNK_SIZE=64` 一致，checkpoint 只能落在 64-token 边界 |
 | `MAX_SEQ_NUM=2048` | 让所有 prefill batch 落进同一个 SHM small 缓存。超过该值会走 large 分支逐级分配，图捕获占满池后容易出现 `Not enough shared memory ... remain 0`；设为 chunk 大小即可，不要盲目调大 |
 | `COLLECTIVE_MAX_TOKENS=4096` | 单批 collective 行数上限，与图捕获的 4096 token 上限对齐 |
-| `EXTEND_POWER_2_PADDING=0` | 上游 padding 与 MTP 同时开启时 target/draft 行数不一致，保持关闭 |
+| `EXTEND_POWER_2_PADDING` | 0/1 均可。=0 不额外计算；=1 按 2 的幂桶 pad，减少 EXTEND 图数量，但多出的行仍参与 GEMM，prefill 计算量会增加。仓库 `env_base.sh` 默认 1 |
 | `--max-mamba-cache-size 128` | 必须显式设置。不设时按 `--mamba-full-memory-ratio 0.9` 自动计算，得到的 slot 数会超出 HBW 池最大连续空闲块，启动阶段直接报 `HBW pool exhausted`。128 是当前验证值；调大前先确认 HBW 池有空闲块，调小会减少可缓存的 checkpoint 数 |
 
 ## 怎么确认生效
@@ -72,4 +72,4 @@ grep -i "cached-token" <log> | tail -20
 - 短 batch 没有 64 对齐点，不产生 checkpoint，也不新写 Radix Cache；
 - stride 越小，checkpoint slot 越多，容量不足会频繁淘汰，命中率下降；
 - `no_buffer` 模式不支持本特性；
-- padding 与 MTP 不能同时开启。
+- `SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1` 需要包含多 checkpoint padding 适配的 sgl-kernel；旧内核会在首个 checkpoint 批次报 `GDN extend requires complete live token coverage`。

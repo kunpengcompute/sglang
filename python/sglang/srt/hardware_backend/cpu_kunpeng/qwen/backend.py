@@ -295,7 +295,7 @@ class QwenGDNKernel(LinearAttnKernelBase):
                 rc = kernel(
                     *pointers,
                     sequences,
-                    q.shape[1],
+                    m,
                     q.shape[2],
                     v.shape[2],
                     q.shape[3],
