@@ -1860,6 +1860,19 @@ def run_benchmark(args_: argparse.Namespace):
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
 
+    # Pin bootstrap_room so repeated runs reuse the same rank's prefix cache.
+    # With prefill --load-balance-method follow_bootstrap_room the dp rank is
+    # bootstrap_room % dp_size, so room = base + i pins request i to a fixed
+    # rank.  -1 = let the gateway assign a random room.
+    bootstrap_room_base = getattr(args, "bootstrap_room_base", -1)
+    if bootstrap_room_base >= 0:
+        for i, req in enumerate(input_requests):
+            if isinstance(req, dict):  # mooncake returns raw dicts
+                continue
+            extra = dict(req.extra_request_body or {})
+            extra["bootstrap_room"] = bootstrap_room_base + i
+            req.extra_request_body = extra
+
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
@@ -2131,6 +2144,14 @@ if __name__ == "__main__":
         type=str,
         help="Append given JSON object to the request payload. You can use this to specify"
         "additional generate params like sampling params.",
+    )
+    parser.add_argument(
+        "--bootstrap-room-base",
+        type=int,
+        default=-1,
+        help="Set bootstrap_room = base + request_index (base >= 0).  Requires "
+        "prefill --load-balance-method follow_bootstrap_room; the dp rank then "
+        "becomes (base + i) %% dp_size.  -1 = let the gateway assign a room.",
     )
     parser.add_argument(
         "--apply-chat-template",
