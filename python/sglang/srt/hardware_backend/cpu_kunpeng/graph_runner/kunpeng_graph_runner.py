@@ -1565,6 +1565,37 @@ class KunpengGraphRunner:
             return list(self._graph_bindings.all_fixed_tensors())
         fixed = self.graph_fixed_weights[:]
         backend = self._resolve_attn_backend(self.model_runner, forward_batch)
+        # Explicit Qwen graphs have no graph provider, so nothing else reserves
+        # the SHM slots that eager fallbacks use. A prefill batch with Mamba
+        # state tracking bypasses the graph and runs the embedding all-reduce
+        # through the pool, which fails once the graph has claimed the remaining
+        # bytes. Reserve both row buckets before the backend early return below.
+        server_args = self.model_runner.server_args
+        if (
+            getattr(self.model_runner.attn_backend, "_kunpeng_explicit_graph", False)
+            and server_args.enable_mamba_extra_buffer()
+        ):
+            try:
+                from sglang.srt.distributed.parallel_state import get_tp_group
+
+                comm = get_tp_group().kunpeng_communicator
+                if comm is not None:
+                    width = self.model_runner.model_config.hidden_size
+                    rows = comm.max_tokens
+                    if server_args.chunked_prefill_size:
+                        rows = min(rows, int(server_args.chunked_prefill_size))
+                    reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
+                    reserve(width, 1)
+                    reserve(width, rows)
+                    logger.info(
+                        "[graph] reserved eager all-reduce SHM buckets: "
+                        f"width={width} rows={rows}"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[graph] failed to reserve eager all-reduce SHM buckets: %s", exc
+                )
+
         if hasattr(backend, "get_graph_fixed_tensors"):
             fixed.extend(backend.get_graph_fixed_tensors(forward_batch))
             seen = set()
@@ -1758,37 +1789,6 @@ class KunpengGraphRunner:
                     fixed.append(comm.get_shm_tensor(local_vocab_size))
             except Exception:
                 pass
-
-        # Explicit Qwen graphs have no graph provider, so nothing else reserves
-        # the SHM slots that eager fallbacks use. A prefill batch with Mamba
-        # state tracking bypasses the graph and runs the embedding all-reduce
-        # through the pool, which fails once the graph has claimed the remaining
-        # bytes. Reserve both row buckets before that happens.
-        server_args = self.model_runner.server_args
-        if (
-            getattr(self.model_runner.attn_backend, "_kunpeng_explicit_graph", False)
-            and server_args.enable_mamba_extra_buffer()
-        ):
-            try:
-                from sglang.srt.distributed.parallel_state import get_tp_group
-
-                comm = get_tp_group().kunpeng_communicator
-                if comm is not None:
-                    width = self.model_runner.model_config.hidden_size
-                    rows = comm.max_tokens
-                    if server_args.chunked_prefill_size:
-                        rows = min(rows, int(server_args.chunked_prefill_size))
-                    reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
-                    reserve(width, 1)
-                    reserve(width, rows)
-                    logger.info(
-                        "[graph] reserved eager all-reduce SHM buckets: "
-                        f"width={width} rows={rows}"
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "[graph] failed to reserve eager all-reduce SHM buckets: %s", exc
-                )
 
         return fixed
 
