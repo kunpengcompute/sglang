@@ -10,6 +10,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
 from . import ops as primitives
+from . import mrope_section_rope_enabled
 from .capabilities import NATIVE_DECODE_MAX_TOKENS, get_capabilities
 
 def contiguous(x):
@@ -525,7 +526,39 @@ def native_rope_cache(module):
 
 def qknorm_rope(module, positions, q, k):
     cache = native_rope_cache(module)
-    return ops.qwen_qknorm_rope(
+    rotary = getattr(module, "rotary_emb", None)
+    section = None
+    if (
+        mrope_section_rope_enabled()
+        and positions is not None
+        and positions.ndim == 2
+        and positions.shape[0] == 3
+        and positions.shape[1] == q.shape[0]
+        and not getattr(rotary, "mrope_interleaved", False)
+        and not getattr(rotary, "mrope_interleaved_glm", False)
+    ):
+        candidate = getattr(rotary, "mrope_section", None)
+        if isinstance(candidate, (list, tuple)) and len(candidate) == 3:
+            section = [int(x) for x in candidate]
+    if section is None:
+        # Legacy single-position entry: one position per token row (the t
+        # component of the [3, S] M-RoPE tensor). Exact for text and decode
+        # traffic (components equal) and for 1D positions on text-only models.
+        return ops.qwen_qknorm_rope(
+            q,
+            k,
+            module.q_norm.gemma_weight,
+            module.k_norm.gemma_weight,
+            cache,
+            positions,
+            float(module.q_norm.variance_epsilon),
+            0,
+        )
+    # M-RoPE entry: reads all three position components and rotates each
+    # mrope_section with its own component, so image prefill rows (distinct
+    # t/h/w) get the same rotation the Python MRotaryEmbedding path produces.
+    # Equal components reduce to the legacy entry bit-for-bit.
+    return ops.qwen_qknorm_rope_mrope(
         q,
         k,
         module.q_norm.gemma_weight,
@@ -534,6 +567,9 @@ def qknorm_rope(module, positions, q, k):
         positions,
         float(module.q_norm.variance_epsilon),
         0,
+        section[0],
+        section[1],
+        section[2],
     )
 
 

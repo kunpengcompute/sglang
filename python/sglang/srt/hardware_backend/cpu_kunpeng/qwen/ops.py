@@ -71,6 +71,10 @@ def register_primitives():
         [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 2 + [ctypes.c_float, ctypes.c_int64]
     )
     rope.qwen36_attention_qknorm_rope_bf16.restype = ctypes.c_int
+    rope.qwen36_attention_qknorm_rope_mrope_bf16.argtypes = (
+        [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 2 + [ctypes.c_float] + [ctypes.c_int64] * 4
+    )
+    rope.qwen36_attention_qknorm_rope_mrope_bf16.restype = ctypes.c_int
     gdn.qwen36_gdn_decode_with_workspace.argtypes = (
         [ctypes.c_void_p] * 10
         + [ctypes.c_int64] * 6
@@ -119,6 +123,7 @@ def register_primitives():
         ("qwen_gqa_decode", "qwen_graph_gqa_dispatch"),
         ("qwen_qkv_layout", "qwen_graph_qkv_dispatch"),
         ("qwen_qknorm_rope", "qwen_graph_rope_dispatch"),
+        ("qwen_qknorm_rope_mrope", "qwen_graph_rope_mrope_dispatch"),
         ("qwen_ar_pack_block", "qwen_graph_ar_pack_block_dispatch"),
         ("qwen_ar_unpack_block", "qwen_graph_ar_unpack_block_dispatch"),
     ]:
@@ -436,6 +441,46 @@ def register_primitives():
 
     register_op("qwen_qkv_layout", qkv_shape, qkv_eager)
     register_op("qwen_qknorm_rope", rope_shape, rope_eager)
+
+    def rope_mrope_shape(q, k, qw, kw, cache, pos, eps, mode, section_t, section_h, section_w):
+        # Positions must be the full [3, rows] M-RoPE tensor and the section
+        # triple must cover the 32 rotated pairs (kRotaryDim // 2 in the
+        # kernel). Failing here aborts capture instead of replaying wrong
+        # rotations.
+        if pos.ndim != 2 or pos.shape[0] != 3 or pos.shape[1] != q.shape[0]:
+            raise ValueError(
+                f"mrope rope positions must be [3, rows], got {tuple(pos.shape)}"
+            )
+        if (
+            int(section_t) + int(section_h) + int(section_w) != 32
+            or min(section_t, section_h, section_w) < 0
+        ):
+            raise ValueError(
+                f"invalid mrope sections {(section_t, section_h, section_w)}"
+            )
+        return [(tuple(q.shape), q.dtype), (tuple(k.shape), k.dtype)]
+
+    def rope_mrope_eager(q, k, qw, kw, cache, pos, eps, mode, section_t, section_h, section_w):
+        if pos.ndim != 2 or pos.shape[0] != 3 or pos.shape[1] != q.shape[0]:
+            raise ValueError(
+                f"mrope rope positions must be [3, rows], got {tuple(pos.shape)}"
+            )
+        qo, ko = torch.empty_like(q), torch.empty_like(k)
+        rc = rope.qwen36_attention_qknorm_rope_mrope_bf16(
+            *(t.data_ptr() for t in (q, k, qw, kw, cache, pos, qo, ko)),
+            q.shape[0],
+            cache.shape[0],
+            eps,
+            mode,
+            int(section_t),
+            int(section_h),
+            int(section_w),
+        )
+        if rc:
+            raise RuntimeError(f"QKNorm M-RoPE eager failed {rc}")
+        return qo, ko
+
+    register_op("qwen_qknorm_rope_mrope", rope_mrope_shape, rope_mrope_eager)
     bridge.qwen_graph_gdn_calls.restype = bridge.qwen_graph_norm_calls.restype = (
         ctypes.c_uint64
     )

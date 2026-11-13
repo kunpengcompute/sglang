@@ -897,13 +897,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and qkv.shape[0] > 0
             and self.attn_output_gate
             and (
-                # Image PREFILL keeps the manual
-                # split path (its M-RoPE rows genuinely differ per component,
-                # which the fused single-position kernels cannot read), but
-                # image DECODE positions repeat one scalar delta across all
-                # three rows, so the fused path is exact there. This also
-                # keeps captured image decode graphs structurally identical
-                # to text decode graphs (shared cache key).
+                # general_mm_embed_routine consumes and clears fb.mm_inputs
+                # before the language tower runs, so image PREFILL batches
+                # arrive here with contains_image_inputs() == False and take
+                # this fused path; only image DECODE (which keeps mm_inputs
+                # attached until the request finishes) is diverted by this
+                # gate. Fused M-RoPE correctness comes from the mrope-section
+                # rope entry (qwen/__init__.mrope_section_rope_enabled,
+                # default on): it reads all three position components, so
+                # image prefill rows with distinct t/h/w rotate exactly, while
+                # text and decode (components equal) stay bit-identical to the
+                # legacy single-position kernel. This also keeps captured
+                # image decode graphs structurally identical to text decode
+                # graphs (shared cache key).
                 not forward_batch.contains_image_inputs()
                 or (
                     forward_batch.forward_mode.is_decode()

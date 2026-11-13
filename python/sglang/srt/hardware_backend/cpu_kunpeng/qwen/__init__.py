@@ -19,6 +19,22 @@ def image_decode_graph_enabled():
     return os.environ.get("SGLANG_KUNPENG_GRAPH_IMAGE_DECODE", "1") != "0"
 
 
+def mrope_section_rope_enabled():
+    # Route the fused qwen_qknorm_rope kernel through the M-RoPE entry that
+    # reads all three position components and rotates each mrope_section
+    # with its own component. Historically the fused kernel read one position
+    # per token row (the t component of the [3, S] M-RoPE tensor): exact for
+    # text and decode traffic (components equal), but image prefill rows have
+    # genuinely distinct t/h/w, so their h/w sections rotated with the
+    # constant t phase. With this enabled the image prefill rotation matches
+    # the Python MRotaryEmbedding path; text and decode stay bit-identical to
+    # the legacy kernel because their components agree. The dispatch is
+    # model-static (config mrope_section), so captured graphs stay
+    # structurally stable. Opt out with SGLANG_KUNPENG_MROPE_SECTION_ROPE=0
+    # to restore the legacy single-component behavior.
+    return os.environ.get("SGLANG_KUNPENG_MROPE_SECTION_ROPE", "1") != "0"
+
+
 def configure_hbw_shm():
     """Select the existing split HBM budget before communication creates SHM."""
     if not (enabled() and os.environ.get("SGLANG_ENABLE_HBW_POOL") == "1"
