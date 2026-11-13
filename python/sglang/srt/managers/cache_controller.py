@@ -20,6 +20,7 @@ import time
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
@@ -1872,7 +1873,10 @@ class HiCacheController:
                 for s, hit in enumerate(hits):
                     if hit:
                         kv_mask |= 1 << s
-                self.tp_shard_views[slot][my][:n_mine].copy_(self.flat_read[:n_mine])
+                np.copyto(
+                    self.tp_shard_views[slot][my][:n_mine].view(torch.uint8).numpy(),
+                    self.flat_read[:n_mine].view(torch.uint8).numpy(),
+                )
             self._shard_publish(slot, my, job.seq, kv_mask)
             self.tp_shard_last_seq[slot] = job.seq
             job.published = True
@@ -2086,8 +2090,11 @@ class HiCacheController:
                         for s, hit in enumerate(idx_hits):
                             if hit:
                                 idx_mask |= 1 << s
-                        self.tp_shard_idx_views[slot][my][:n_mine_idx].copy_(
-                            self.flat_read_idx[:n_mine_idx]
+                        np.copyto(
+                            self.tp_shard_idx_views[slot][my][:n_mine_idx]
+                            .view(torch.uint8)
+                            .numpy(),
+                            self.flat_read_idx[:n_mine_idx].view(torch.uint8).numpy(),
                         )
                     self._shard_publish(slot, my, idx_seq, idx_mask, idx=True)
                     self.tp_shard_idx_last_seq[slot] = idx_seq
