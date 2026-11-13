@@ -1767,7 +1767,7 @@ class KunpengGraphRunner:
         server_args = self.model_runner.server_args
         if (
             getattr(self.model_runner.attn_backend, "_kunpeng_explicit_graph", False)
-            and server_args.mamba_checkpoint_stride_pages is not None
+            and server_args.enable_mamba_extra_buffer()
         ):
             try:
                 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -1863,6 +1863,14 @@ class KunpengGraphRunner:
             mtp_carry_key = _carry_si is not None and (
                 getattr(_carry_si, "dsa_topk_indices", None) is not None
             )
+        # Explicit Qwen checkpoint graphs add four dynamic inputs and a fixed
+        # tracking buffer. Provider bindings are absent here, so the checkpoint
+        # variant and its padded row count must split the cache key explicitly.
+        checkpoint_plan = getattr(forward_batch, "kunpeng_checkpoint_plan", None)
+        checkpoint_graph_key = (
+            checkpoint_plan is not None,
+            checkpoint_plan.tokens.numel() if checkpoint_plan is not None else 0,
+        )
         graph_cache_key = (
             forward_batch.forward_mode,
             total_tokens,
@@ -1876,6 +1884,7 @@ class KunpengGraphRunner:
             absorbed_prefill_key,
             all_padding_key,
             mtp_carry_key,
+            checkpoint_graph_key,
         )
 
         # index_share_for_mtp_iteration: the incoming carry (the

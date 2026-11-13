@@ -21,6 +21,9 @@ class _FakeMambaPool:
         self.alloc_calls = 0
         self.freed = []
         self.free_slots = torch.arange(1, 10000, dtype=torch.int64)
+        self.mamba_cache = SimpleNamespace(
+            conv=[SimpleNamespace(shape=(1, 1, 1, 4))]
+        )
 
     def alloc(self, total):
         self.alloc_calls += 1
@@ -100,7 +103,7 @@ class TestMambaPrefillCheckpointPlanning(unittest.TestCase):
         self.assertEqual(batch.mamba_checkpoint_offsets.tolist(), [0, 2, 2])
         self.assertEqual(batch.mamba_checkpoint_tokens.tolist(), [256, 512])
         self.assertEqual(first.mamba_prefill_checkpoints, [(512, 1), (768, 2)])
-        self.assertEqual(second.mamba_prefill_checkpoints, [])
+        self.assertIsNone(second.mamba_prefill_checkpoints)
 
     def test_allocation_failure_restores_legacy_marker(self):
         pool = _FakeMambaPool(failures=2)
