@@ -1582,8 +1582,16 @@ class KunpengGraphRunner:
                 if comm is not None:
                     width = self.model_runner.model_config.hidden_size
                     rows = comm.max_tokens
-                    if server_args.chunked_prefill_size:
-                        rows = min(rows, int(server_args.chunked_prefill_size))
+                    chunk = server_args.chunked_prefill_size
+                    if chunk is not None and chunk > 0:
+                        from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_hybrid_backend import (
+                            extend_pad_cap,
+                            padded_tokens,
+                        )
+
+                        rows = min(
+                            rows, padded_tokens(int(chunk), cap=extend_pad_cap())
+                        )
                     reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
                     reserve(width, 1)
                     reserve(width, rows)
@@ -1595,6 +1603,7 @@ class KunpengGraphRunner:
                 logger.warning(
                     "[graph] failed to reserve eager all-reduce SHM buckets: %s", exc
                 )
+                raise
 
         if hasattr(backend, "get_graph_fixed_tensors"):
             fixed.extend(backend.get_graph_fixed_tensors(forward_batch))
