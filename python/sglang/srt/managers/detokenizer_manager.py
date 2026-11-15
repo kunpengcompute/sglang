@@ -29,6 +29,7 @@ import zmq
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -161,6 +162,7 @@ class DetokenizerManager(
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (AbortReq, self.handle_abort_req),
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (FreezeGCReq, self.handle_freeze_gc_req),
@@ -319,14 +321,20 @@ class DetokenizerManager(
             try:
                 s = self.decode_status[rid]
             except KeyError:
-                raise RuntimeError(
-                    f"Decode status not found for request {rid}. "
-                    "It may be due to the request being evicted from the decode status due to memory pressure. "
-                    "Please increase the maximum number of requests by setting "
-                    "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                    f"The current value is {DETOKENIZER_MAX_STATES}. "
-                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                # Still-running request whose state was evicted (the table is
+                # capped by SGLANG_DETOKENIZER_MAX_STATES), or an output that
+                # arrived after the request finished. Drop this chunk instead
+                # of raising: an exception here kills the detokenizer process
+                # and makes every later request fail health checks.
+                logger.debug(
+                    "Decode status not found for request %s; dropping this chunk "
+                    "(entries=%d, SGLANG_DETOKENIZER_MAX_STATES=%d).",
+                    rid,
+                    len(self.decode_status),
+                    DETOKENIZER_MAX_STATES,
                 )
+                output_strs.append("")
+                continue
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
@@ -420,6 +428,20 @@ class DetokenizerManager(
             time_stats=recv_obj.time_stats,
         )
 
+    def handle_abort_req(self, recv_req: AbortReq):
+        """Release the decode state of an aborted request.
+
+        A request aborted before it finishes never produces a finish output, so
+        without this its state stays in decode_status until the table reaches
+        SGLANG_DETOKENIZER_MAX_STATES and starts evicting still-running ones.
+        Idempotent: a stale/duplicate abort simply finds nothing to remove.
+        """
+        if recv_req.abort_all:
+            self.decode_status.clear()
+            return None
+        self.decode_status.pop(recv_req.rid, None)
+        return None
+
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")
         return None
@@ -435,7 +457,9 @@ class LimitedCapacityDict(OrderedDict):
         self.capacity = capacity
 
     def __setitem__(self, key, value):
-        if len(self) >= self.capacity:
+        # Only a new key can overflow the table: re-assigning an existing key
+        # must not evict an unrelated (possibly still running) entry.
+        if key not in self and len(self) >= self.capacity:
             # Remove the oldest element (first item in the dict)
             self.popitem(last=False)
         # Set the new item
