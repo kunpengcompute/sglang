@@ -1023,11 +1023,37 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             else:
                 bootstrap_breakdown = ""
 
+            # forward_duration = completion - forward_entry, but completion is
+            # stamped only after the KV transfer poll succeeds. Split it directly
+            # into model-forward time and KV-transfer wait time so they don't have
+            # to be reverse-engineered from the low-precision transfer_speed.
+            if (
+                self.prefill_transfer_queue_entry_time > 0
+                and self.completion_time > 0
+            ):
+                compute_duration = (
+                    self.prefill_transfer_queue_entry_time - self.forward_entry_time
+                )
+                kv_wait_duration = (
+                    self.completion_time - self.prefill_transfer_queue_entry_time
+                )
+                if SGLANG_TEST_REQUEST_TIME_STATS:
+                    assert (
+                        compute_duration >= 0 and kv_wait_duration >= 0
+                    ), f"compute_duration={compute_duration} < 0 or kv_wait_duration={kv_wait_duration} < 0"
+                forward_breakdown = (
+                    f" = compute({self.format_duration(compute_duration)}) "
+                    f"+ kv_wait({self.format_duration(kv_wait_duration)}); "
+                )
+            else:
+                forward_breakdown = ", "
+
             return (
                 f"bootstrap_queue_duration({self.format_duration(bootstrap_queue_duration)}) "
                 f"{bootstrap_breakdown}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
-                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"forward_duration({self.format_duration(forward_duration)})"
+                f"{forward_breakdown}"
                 f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
                 f"transfer_total={self.transfer_total_mb:.2f}MB, "
