@@ -193,7 +193,7 @@ class SchedulerPPMixin:
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.recv_requests()
+                    recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -336,7 +336,7 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 pp_perf_start(f"mb{mb_id}", tag=f"pp{self.pp_group.rank_in_group}")
-                recv_reqs = self.recv_requests()
+                recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank and not pp_prefill_overlap_comm:
@@ -355,7 +355,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                batch = self.maybe_prepare_mlp_sync_batch(batch)
+                batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -505,7 +505,7 @@ class SchedulerPPMixin:
 
                 pp_perf_start(f"mb{mb_id}", tag=f"pp{self.pp_group.rank_in_group}")
                 # 1.recv_requests / proc_input (decorated methods)
-                recv_reqs = self.recv_requests()
+                recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
