@@ -677,7 +677,7 @@ class SchedulerOutputProcessorMixin:
             # Shape guard failure: do not free a misaligned slice (it would
             # corrupt the pool). Log it so a real desync is visible.
             if _DEBUG_PP_MTP:
-                pp_rank = getattr(self, "pp_rank", None)
+                pp_rank = getattr(self.ps, "pp_rank", None)
                 logger.warning(
                     f"[PP{pp_rank}] evict_rejected_drafts: shape guard failed "
                     f"(num_accepted={num_accepted.numel()}, bs={bs}, "
@@ -1626,12 +1626,12 @@ class SchedulerOutputProcessorMixin:
 
             if (
                 req.finished()
-                and self.attn_tp_rank == 0
+                and self.ps.attn_tp_rank == 0
                 and self.server_args.enable_request_time_stats_logging
             ):
                 req.log_time_stats()
 
-        dp_ranks = [self.dp_rank] * len(rids) if rids else None
+        dp_ranks = [self.ps.dp_rank] * len(rids) if rids else None
 
         # Send to detokenizer
         if reqs or is_idle_batch:

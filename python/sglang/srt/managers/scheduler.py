@@ -65,6 +65,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group, rank_layout
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -374,18 +375,6 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
-        self.tp_rank = tp_rank
-        self.moe_ep_rank = moe_ep_rank
-        self.pp_rank = pp_rank
-        self.attn_cp_rank = attn_cp_rank
-        self.attn_cp_size = server_args.attn_cp_size
-        self.moe_dp_rank = moe_dp_rank
-        self.moe_dp_size = server_args.moe_dp_size
-        self.dp_rank = dp_rank
-        self.tp_size = server_args.tp_size
-        self.moe_ep_size = server_args.ep_size
-        self.pp_size = server_args.pp_size
-        self.dp_size = server_args.dp_size
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
@@ -409,7 +398,6 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
@@ -418,14 +406,33 @@ class Scheduler(
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
         # Distributed rank info
-        self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
+        attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
-                self.tp_rank,
-                self.tp_size,
-                self.dp_size,
-                self.attn_cp_size,
+                tp_rank,
+                server_args.tp_size,
+                server_args.dp_size,
+                server_args.attn_cp_size,
             )
+        )
+        self.ps = ParallelState(
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            pp_rank=pp_rank,
+            pp_size=server_args.pp_size,
+            dp_rank=dp_rank,
+            dp_size=server_args.dp_size,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=attn_tp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=server_args.attn_cp_size,
+            attn_dp_rank=attn_dp_rank,
+            attn_dp_size=attn_dp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
+            moe_dp_rank=moe_dp_rank,
+            moe_dp_size=server_args.moe_dp_size,
+            gpu_id=gpu_id,
         )
 
         # Init model configs
@@ -462,7 +469,7 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
-        if self.pp_size > 1:
+        if self.ps.pp_size > 1:
             # Under PP, the last rank may take longer to initialize (e.g.
             # loading MTP draft model weights) while other ranks have already
             # finished. Synchronize all PP ranks here so no rank proceeds to the
@@ -554,14 +561,18 @@ class Scheduler(
         context = zmq_context_core_binding(zmq.Context(2), ZmqOffset.SCHEDULER)
         self.idle_sleeper = None
 
-        if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+        if (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
             # When dp_size > 1, the scheduler receives requests from the
             # DataParallelController, which already binds the worker port as a
             # PUSH socket; the scheduler's PULL must connect instead of bind.
             # Only when dp_size == 1 in tokenizer-separate mode does the
             # scheduler receive directly from the tokenizer (router connects),
             # so it must bind.
-            _bind_recv_from_tokenizer = _is_skip_http and self.dp_size == 1
+            _bind_recv_from_tokenizer = _is_skip_http and self.ps.dp_size == 1
             self.recv_from_tokenizer = get_zmq_socket(
                 context,
                 zmq.PULL,
@@ -682,13 +693,13 @@ class Scheduler(
     def init_tp_model_worker(self):
         worker_kwargs = dict(
             server_args=self.server_args,
-            gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            moe_ep_rank=self.moe_ep_rank,
-            pp_rank=self.pp_rank,
-            attn_cp_rank=self.attn_cp_rank,
-            moe_dp_rank=self.moe_dp_rank,
-            dp_rank=self.dp_rank,
+            gpu_id=self.ps.gpu_id,
+            tp_rank=self.ps.tp_rank,
+            moe_ep_rank=self.ps.moe_ep_rank,
+            pp_rank=self.ps.pp_rank,
+            attn_cp_rank=self.ps.attn_cp_rank,
+            moe_dp_rank=self.ps.moe_dp_rank,
+            dp_rank=self.ps.dp_rank,
             nccl_port=self.nccl_port,
         )
 
@@ -708,24 +719,24 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
-        if self.pp_size > 1:
+        if self.ps.pp_size > 1:
             logger.info(
-                f"[PP{self.pp_rank}] Creating draft worker on all PP ranks "
+                f"[PP{self.ps.pp_rank}] Creating draft worker on all PP ranks "
                 f"to participate in init all_reduce (only last rank uses it "
-                f"for MTP; pp_size={self.pp_size})"
+                f"for MTP; pp_size={self.ps.pp_size})"
             )
 
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
-            gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            moe_ep_rank=self.moe_ep_rank,
+            gpu_id=self.ps.gpu_id,
+            tp_rank=self.ps.tp_rank,
+            moe_ep_rank=self.ps.moe_ep_rank,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
-            dp_rank=self.dp_rank,
-            attn_cp_rank=self.attn_cp_rank,
-            moe_dp_rank=self.moe_dp_rank,
+            dp_rank=self.ps.dp_rank,
+            attn_cp_rank=self.ps.attn_cp_rank,
+            moe_dp_rank=self.ps.moe_dp_rank,
         )
 
         if self.server_args.speculative_draft_load_format is not None:
@@ -741,7 +752,7 @@ class Scheduler(
         # PPNextNWorker under PP (rather than falling through to EAGLEWorker).
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
 
-        if self.pp_size > 1:
+        if self.ps.pp_size > 1:
             # The draft worker is a local, single-layer model that is not part of
             # the PP pipeline. Present it with pp_size=1 so its ModelRunner skips
             # the PP support assertion and the per-rank layer splitting.
@@ -774,21 +785,21 @@ class Scheduler(
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
-        elif self.pp_size > 1 and self.pp_rank != self.pp_size - 1:
+        elif self.ps.pp_size > 1 and self.ps.pp_rank != self.ps.pp_size - 1:
             # Under PP, all ranks create the draft worker to participate in
             # collective ops during init (see get_available_gpu_memory), but
             # only the last rank uses it as model_worker — non-last ranks
             # use the plain target worker.
             self.model_worker = self.tp_worker
             logger.info(
-                f"[PP{self.pp_rank}] model_worker=TpModelWorker "
-                f"(draft_worker exists but unused, pp_size={self.pp_size})"
+                f"[PP{self.ps.pp_rank}] model_worker=TpModelWorker "
+                f"(draft_worker exists but unused, pp_size={self.ps.pp_size})"
             )
         else:
             self.model_worker = self.draft_worker
             logger.info(
-                f"[PP{self.pp_rank}] model_worker={type(self.draft_worker).__name__} "
-                f"(pp_size={self.pp_size}, spec={self.spec_algorithm})"
+                f"[PP{self.ps.pp_rank}] model_worker={type(self.draft_worker).__name__} "
+                f"(pp_size={self.ps.pp_size}, spec={self.spec_algorithm})"
             )
 
         # Install device timer on model runners for fwd occupancy tracking
@@ -820,7 +831,7 @@ class Scheduler(
         ) = self.tp_worker.get_worker_info()
         if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
-                self.max_running_requests // self.pp_size, 1
+                self.max_running_requests // self.ps.pp_size, 1
             )
 
         self.tp_group = get_tp_group()
@@ -850,9 +861,9 @@ class Scheduler(
 
         # Print debug info
         avail_mem = get_available_gpu_memory(
-            self.device, self.gpu_id, empty_cache=False
+            self.device, self.ps.gpu_id, empty_cache=False
         )
-        if self.tp_rank == 0:
+        if self.ps.tp_rank == 0:
             logger.info(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
                 f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
@@ -911,20 +922,20 @@ class Scheduler(
                 f"{out_of_range} (dp_size={self.server_args.dp_size})"
             )
 
-        if not is_lc_dp_rank(self.dp_rank):
+        if not is_lc_dp_rank(self.ps.dp_rank):
             return
 
         # This rank runs LC decode CP: the attention-tp group acts as the
         # CP group (interleaved KV layout, 1/cp of every sequence per rank).
-        if self.attn_tp_size != 8:
+        if self.ps.attn_tp_size != 8:
             raise ValueError(
                 f"Long-context decode CP requires attn_tp_size == 8, "
-                f"got {self.attn_tp_size}"
+                f"got {self.ps.attn_tp_size}"
             )
-        set_lc_cp_info(self.attn_tp_size, self.attn_tp_rank)
+        set_lc_cp_info(self.ps.attn_tp_size, self.ps.attn_tp_rank)
         logger.info(
-            f"Long-context decode CP enabled on DP rank {self.dp_rank} "
-            f"(cp_size={self.attn_tp_size}, cp_rank={self.attn_tp_rank})"
+            f"Long-context decode CP enabled on DP rank {self.ps.dp_rank} "
+            f"(cp_size={self.ps.attn_tp_size}, cp_rank={self.ps.attn_tp_rank})"
         )
 
     def init_cache_with_memory_pool(self):
@@ -939,7 +950,7 @@ class Scheduler(
             # effective per-request length bound is the per-rank pool size
             # times cp_size (still capped by the model context length). This
             # also lifts the validate_input_length admission gate.
-            cp_size = self.attn_tp_size
+            cp_size = self.ps.attn_tp_size
             self.max_req_len = min(
                 self.model_config.context_len - 1,
                 self.max_total_num_tokens * cp_size - 1,
@@ -970,7 +981,7 @@ class Scheduler(
         # the per-request decode reserve for speculative verify pages, so the
         # request finishes by length instead of OOM-ing.
         if is_cpu() and server_args.disaggregation_mode == "decode":
-            cp_size = self.attn_tp_size if is_lc_cp_enabled() else 1
+            cp_size = self.ps.attn_tp_size if is_lc_cp_enabled() else 1
             # At least two pages: a speculative verify allocates a
             # page-aligned draft block on top of the last committed length.
             decode_reserve = max(
@@ -1074,8 +1085,8 @@ class Scheduler(
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
         )
@@ -1145,8 +1156,8 @@ class Scheduler(
                 self.tree_cache = LMCRadixCache(
                     params=params,
                     model_config=self.model_config,
-                    tp_size=self.tp_size,
-                    rank=self.tp_rank,
+                    tp_size=self.ps.tp_size,
+                    rank=self.ps.tp_rank,
                     tp_group=self.tp_group,
                 )
             else:
@@ -1292,7 +1303,7 @@ class Scheduler(
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
-            self.server_args.enable_dynamic_chunking and self.pp_size > 1
+            self.server_args.enable_dynamic_chunking and self.ps.pp_size > 1
         )
         if self.enable_dynamic_chunking:
             try:
@@ -1323,8 +1334,8 @@ class Scheduler(
                 )
             else:
                 self.prefill_delayer = PrefillDelayer(
-                    dp_size=self.dp_size,
-                    attn_tp_size=self.attn_tp_size,
+                    dp_size=self.ps.dp_size,
+                    attn_tp_size=self.ps.attn_tp_size,
                     cpu_group=self.tp_cpu_group,
                     server_args=self.server_args,
                     metrics_collector=(
@@ -1380,7 +1391,7 @@ class Scheduler(
         # Init recv skipper and input blocker
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(self.server_args)
         self.input_blocker = (
-            SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
+            SchedulerInputBlocker(noop=self.ps.attn_tp_rank != 0)
             if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
             else None
         )
@@ -1426,7 +1437,7 @@ class Scheduler(
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                tp_rank=self.tp_rank,
+                tp_rank=self.ps.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
@@ -1443,13 +1454,13 @@ class Scheduler(
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
                 gloo_group=self.attn_tp_cpu_group,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                tp_rank=self.ps.tp_rank,
+                tp_size=self.ps.tp_size,
                 dp_size=self.server_args.dp_size,
-                gpu_id=self.gpu_id,
+                gpu_id=self.ps.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
-                pp_rank=self.pp_rank,
+                pp_rank=self.ps.pp_rank,
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
@@ -1482,15 +1493,15 @@ class Scheduler(
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                gpu_id=self.gpu_id,
+                tp_rank=self.ps.tp_rank,
+                tp_size=self.ps.tp_size,
+                gpu_id=self.ps.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
-                pp_rank=self.pp_rank,
-                pp_size=self.pp_size,
+                pp_rank=self.ps.pp_rank,
+                pp_size=self.ps.pp_size,
                 transfer_backend=self.transfer_backend,
             )
             # The prefill requests that are in the middle of kv sending
@@ -1504,8 +1515,8 @@ class Scheduler(
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 hf_config=self.model_config.hf_config,
-                pp_rank=self.pp_rank,
-                tp_rank=self.tp_rank,
+                pp_rank=self.ps.pp_rank,
+                tp_rank=self.ps.tp_rank,
                 tp_group=self.tp_group,
                 scheduler=self,
             )
@@ -1871,8 +1882,8 @@ class Scheduler(
             if not self.recv_skipper.handle(last_forward_mode):
                 return []
 
-        if self.pp_rank == 0:
-            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+        if self.ps.pp_rank == 0:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
 
                 while True:
@@ -1895,7 +1906,7 @@ class Scheduler(
             else:
                 recv_reqs = None
         else:
-            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 if (
                     self.pp_group.kunpeng_pp_communicator is not None
                     and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
@@ -1903,13 +1914,13 @@ class Scheduler(
                     # Unified RDMA channel: pyobj demux, acks auto-consumed.
                     recv_reqs = self._pp_recv_input_reqs_from_prev_stage()
                 else:
-                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
                     recv_reqs = point_to_point_pyobj(
                         [],
-                        self.pp_rank * self.tp_size + dp_offset,
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
                         self.world_group.cpu_group,
-                        (self.pp_rank - 1) * self.tp_size + dp_offset,
-                        self.pp_rank * self.tp_size + dp_offset,
+                        (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
                     )
             else:
                 recv_reqs = None
@@ -1918,13 +1929,13 @@ class Scheduler(
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
         if self.server_args.enable_dp_attention:
-            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
                 work_reqs = None
                 control_reqs = None
 
-            if self.attn_tp_size != 1:
+            if self.ps.attn_tp_size != 1:
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_tp_group.rank,
@@ -1932,7 +1943,7 @@ class Scheduler(
                     src=self.attn_tp_group.ranks[0],
                 )
 
-            if self.attn_cp_size != 1:
+            if self.ps.attn_cp_size != 1:
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_cp_group.rank,
@@ -1947,21 +1958,21 @@ class Scheduler(
             # all-ranks gloo sync.
             _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
             if _local_ctrl:
-                if self.attn_tp_size != 1:
+                if self.ps.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
                         control_reqs,
                         self.attn_tp_group.rank,
                         self.attn_tp_cpu_group,
                         src=self.attn_tp_group.ranks[0],
                     )
-                if self.attn_cp_size != 1:
+                if self.ps.attn_cp_size != 1:
                     control_reqs = broadcast_pyobj(
                         control_reqs,
                         self.attn_cp_group.rank,
                         self.attn_cp_cpu_group,
                         src=self.attn_cp_group.ranks[0],
                     )
-            elif self.tp_size != 1:
+            elif self.ps.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     self.tp_group.rank,
@@ -1969,7 +1980,7 @@ class Scheduler(
                     src=self.tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
-        elif self.tp_size != 1:
+        elif self.ps.tp_size != 1:
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.tp_group.rank,
@@ -1979,7 +1990,7 @@ class Scheduler(
 
         # Process MM requests under EPD-disaggregation mode
         if (
-            self.pp_rank == 0
+            self.ps.pp_rank == 0
             and self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
@@ -2013,7 +2024,7 @@ class Scheduler(
             # removes the name; already-open handles stay valid.
             if (
                 not self.server_args.enable_dp_attention
-                and self.tp_size > 1
+                and self.ps.tp_size > 1
                 and self.model_config.is_multimodal
                 and has_shm_features(recv_reqs)
             ):
@@ -2789,7 +2800,7 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        if self.pp_size > 1:
+        if self.ps.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -3203,7 +3214,7 @@ class Scheduler(
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
-            elif self.pp_size > 1 and not self.pp_group.is_last_rank:
+            elif self.ps.pp_size > 1 and not self.pp_group.is_last_rank:
                 # PP + spec: non-last ranks run the plain target worker on a model
                 # worker batch; the verify batch was prepared by the scheduler
                 # (scheduler_pp_mixin), so no worker-side spec preparation happens.
@@ -3258,16 +3269,16 @@ class Scheduler(
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
-                    if (self.spec_algorithm.is_none() or self.pp_size > 1)
+                    if (self.spec_algorithm.is_none() or self.ps.pp_size > 1)
                     else {}
                 )
                 if (
-                    self.pp_size > 1
+                    self.ps.pp_size > 1
                     and not self.spec_algorithm.is_none()
                     and envs.SGLANG_DEBUG_PP_MTP.get()
                 ):
                     logger.info(
-                        f"[PP{self.pp_rank}] run_batch: forward_mode={batch.forward_mode} "
+                        f"[PP{self.ps.pp_rank}] run_batch: forward_mode={batch.forward_mode} "
                         f"model_worker={type(self.model_worker).__name__} "
                         f"batch_mode={type(worker_batch_or_batch).__name__} "
                         f"has_pp_proxy={pp_proxy_tensors is not None}"
@@ -3335,7 +3346,7 @@ class Scheduler(
             tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
             tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
             tp_active_ranks &= tp_active_ranks_cpu
-            dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
+            dp_active_ranks = tp_active_ranks.reshape(self.ps.dp_size, -1).prod(axis=1)
             self.send_to_tokenizer.send_output(
                 ActiveRanksOutput(status=dp_active_ranks.tolist())
             )
@@ -3502,7 +3513,7 @@ class Scheduler(
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
-            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+            and (self.ps.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
@@ -3694,12 +3705,12 @@ class Scheduler(
 
             directory = Path(evidence_dir)
             directory.mkdir(parents=True, exist_ok=True)
-            target = directory / f"rank{self.tp_rank}_latest.json"
+            target = directory / f"rank{self.ps.tp_rank}_latest.json"
             temporary = target.with_suffix(".tmp")
             temporary.write_text(
                 json.dumps(
                     {
-                        "rank": self.tp_rank,
+                        "rank": self.ps.tp_rank,
                         "graph": ret.get("kunpeng_graph_coverage"),
                         "memory": ret.get("kunpeng_memory_placement"),
                     },
@@ -3739,10 +3750,10 @@ class Scheduler(
                 if_success = False
                 break
             elif k == "pp_max_micro_batch_size" and (
-                v > self.max_running_requests // self.pp_size or v < 1
+                v > self.max_running_requests // self.ps.pp_size or v < 1
             ):
                 logging.warning(
-                    f"Updating {k} to {v} is rejected because it is out of the valid range [1, {self.max_running_requests // self.pp_size}]."
+                    f"Updating {k} to {v} is rejected because it is out of the valid range [1, {self.max_running_requests // self.ps.pp_size}]."
                 )
                 if_success = False
                 break
@@ -4045,7 +4056,7 @@ class Scheduler(
 
     def open_session(self, recv_req: OpenSessionReqInput):
         output = self.session_controller.open(recv_req)
-        if self.pp_rank == 0 and self.tp_rank == 0 and self.attn_cp_rank == 0:
+        if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None
 

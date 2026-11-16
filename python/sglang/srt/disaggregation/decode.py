@@ -427,7 +427,7 @@ class DecodePreallocQueue:
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
         kv_args.decode_start_layer = self.token_to_kv_pool.start_layer
         # A hybrid pool only owns KV for its full-attention layers, so the count
         # is not the layer-id span `end_layer - start_layer`.
@@ -509,7 +509,7 @@ class DecodePreallocQueue:
             kv_args.state_type = "none"
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_args.gpu_id = self.scheduler.ps.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
