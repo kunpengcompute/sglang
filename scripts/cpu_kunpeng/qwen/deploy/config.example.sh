@@ -91,6 +91,9 @@ export SGLANG_KUNPENG_GRAPH_CACHE_SIZE="40"
 export SGLANG_KUNPENG_GRAPH_LOG_REPLAY="0"
 # 已验证MTP配方：原生验证、draft图捕获及固定draft-extend行布局。
 export SGLANG_KUNPENG_GDN_VERIFY_FUSED="1"
+# 1 = GDN verify 改用 TileLang 算子（替代 C++ SVE 融合核）；此时 TARGET_VERIFY 退回 eager，
+# 便于与默认 C++ 路径做性能回退对比。0 = 保持原 C++ 实现。
+export SGLANG_KUNPENG_GDN_VERIFY_TILELANG="0"
 export SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE="1"
 export SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD="1"
 export SGLANG_KUNPENG_HBW_ALLOW_DDR_FALLBACK="0"

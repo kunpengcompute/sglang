@@ -4,12 +4,24 @@ import os
 
 import torch
 
-from sglang.srt.graph import ops
+from sglang.srt.graph import is_capturing, ops
 
 # Fused verify recurrence (one native call per (layer, batch) instead of one
 # single-token decode per speculative step plus a full state snapshot per
 # step). SGLANG_KUNPENG_GDN_VERIFY_FUSED=0 restores the per-step path.
 _FUSED_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_FUSED", "1") == "1"
+
+# TileLang replacement for the fused C++ kernel. It is a plain Python call with
+# no GraphOpRegistry dispatch symbol, so enabling it also disables TARGET_VERIFY
+# graph capture (see graph_provider.unsupported_reason).
+_TILELANG_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_TILELANG", "0") == "1"
+
+if _TILELANG_VERIFY:
+    print(
+        "[QwenVerify] SGLANG_KUNPENG_GDN_VERIFY_TILELANG=1: GDN verify uses the "
+        "TileLang kernel and TARGET_VERIFY is NOT graph-captured.",
+        flush=True,
+    )
 
 if not _FUSED_VERIFY:
     # The per-step fallback gathers/snapshots the recurrent state with plain
@@ -25,6 +37,10 @@ if not _FUSED_VERIFY:
 
 def verify_fused_enabled() -> bool:
     return _FUSED_VERIFY
+
+
+def tilelang_verify_enabled() -> bool:
+    return _TILELANG_VERIFY
 
 
 def verify_conv(x, state, weight, cache_indices, checkpoints, checkpoint_indices):
@@ -70,6 +86,33 @@ def verify_gdn(
     steps,
 ):
     batch = cache_indices.numel()
+    if _TILELANG_VERIFY:
+        from .tilelang_gdn_verify import gdn_verify as tilelang_gdn_verify
+
+        assert not is_capturing(), "TileLang GDN verify cannot be graph-captured"
+        assert checkpoints.shape[1] == steps, "checkpoint block must match steps"
+        # Same fused-projection views as the C++ kernel, but the TileLang
+        # kernel reads contiguous tiles, so q/k and a/b are repacked inside it.
+        q = q.reshape(-1, q.shape[-2], q.shape[-1])
+        k = k.reshape(-1, k.shape[-2], k.shape[-1])
+        v = v.reshape(-1, v.shape[-2], v.shape[-1])
+        a = a.reshape(-1, a.shape[-1])
+        b = b.reshape(-1, b.shape[-1])
+        output = tilelang_gdn_verify(
+            A_log,
+            dt_bias,
+            q,
+            k,
+            v,
+            a,
+            b,
+            state,
+            cache_indices,
+            checkpoints,
+            checkpoint_indices,
+        )
+        return output.reshape(1, batch * steps, *v.shape[-2:])
+
     if _FUSED_VERIFY:
         # The persistent slot is read once; every step then rolls the state
         # into the next checkpoint block, so the live state stays untouched
