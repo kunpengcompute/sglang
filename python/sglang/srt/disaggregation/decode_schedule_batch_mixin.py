@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from array import array
 from http import HTTPStatus
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import torch
 
@@ -110,9 +110,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
         future_map: FutureMap,
     ):
         """Assign the buffered last input id to schedule batch"""
-        self.output_ids = []
+        last_tokens: List[int] = []
         for req in self.reqs:
-            self.output_ids.append(req.output_ids[-1])
+            last_tokens.append(req.output_ids[-1])
             maybe_cache_unfinished_req(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -133,7 +133,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        self.output_ids = torch.tensor(self.output_ids, device=self.device)
+        last_tokens_tensor = torch.tensor(
+            last_tokens, dtype=torch.int64, device=self.device
+        )
 
         # Simulate the eagle run.
         # Under PP, this simulation is skipped: the first verify batch is
@@ -181,10 +183,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
-                verified_id=self.output_ids,
+                verified_id=last_tokens_tensor,
                 new_seq_lens=self.seq_lens,
             )
-            spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
                 spec_info.future_indices = future_map.alloc_future_indices(
@@ -194,3 +195,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     spec_info.future_indices, spec_info
                 )
             self.spec_info = spec_info
+        elif not self.spec_algorithm.is_eagle():
+            # Non-spec: input_ids feeds the next decode forward directly.
+            self.input_ids = last_tokens_tensor

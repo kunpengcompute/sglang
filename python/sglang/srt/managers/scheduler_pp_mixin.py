@@ -1879,7 +1879,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        batch.output_ids = pp_outputs["next_token_ids"]
+        batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
 
         if self._pp_mtp_enabled:
             # PP + MTP: stash the per-req drafts for the next verify round and
