@@ -110,25 +110,42 @@ fi
 echo "[$(date +%T)] Waiting for backends to be ready (up to 20 minutes):"
 for _ep in "${endpoints[@]}"; do echo "  ${_ep%%|*}  ${_ep#*|}"; done
 ready=()
-for _j in "${endpoints[@]}"; do ready+=(0); done
-for i in $(seq 1 12000); do
+probe_interval=()
+probe_next_at=()
+probe_code=()
+for _j in "${!endpoints[@]}"; do
+    ready+=("0"); probe_interval+=("1"); probe_next_at+=("0"); probe_code+=("")
+done
+_deadline=$(( $(date +%s) + 1200 ))
+while (( $(date +%s) < _deadline )); do
+    _now=$(date +%s)
     for j in "${!endpoints[@]}"; do
+        [[ "${ready[$j]}" -eq 1 ]] && continue
+        (( _now < ${probe_next_at[j]} )) && continue
         _role="${endpoints[$j]%%|*}"
         _addr="${endpoints[$j]#*|}"
-        if [[ "${ready[$j]}" -eq 0 ]] &&
-            curl -sf --noproxy "*" --max-time 5 "http://${_addr}/health" >/dev/null 2>&1; then
+        case "$_role" in
+            tokenizer-*) _path="/v1/models" ;;
+            *)           _path="/health" ;;
+        esac
+        probe_code[$j]="$(curl -s -o /dev/null -w '%{http_code}' --noproxy "*" --max-time 2 \
+            "http://${_addr}${_path}" 2>/dev/null)"
+        if [[ "${probe_code[$j]}" == "200" ]]; then
             ready[$j]=1
-            echo "[$(date +%T)] ${_role} ${_addr} ready"
+            echo "[$(date +%T)] ${_role} ${_addr} ready (${_path})"
+        else
+            probe_next_at[$j]=$(( _now + probe_interval[j] ))
+            (( probe_interval[j] = probe_interval[j] < 10 ? probe_interval[j] * 2 : 10 ))
         fi
     done
     ready_all=1
     for v in "${ready[@]}"; do [[ "$v" -eq 1 ]] || { ready_all=0; break; }; done
     [[ "$ready_all" -eq 1 ]] && break
-    sleep 0.1
+    sleep 0.5
 done
 for j in "${!endpoints[@]}"; do
     if [[ "${ready[$j]}" -eq 0 ]]; then
-        echo "ERROR: HTTP server at ${endpoints[$j]%%|*} (${endpoints[$j]#*|}) failed to start within 20 minutes"
+        echo "ERROR: HTTP server at ${endpoints[$j]%%|*} (${endpoints[$j]#*|}) failed to start within 20 minutes (last probe: ${probe_code[$j]:-no-response})"
         exit 1
     fi
 done
@@ -150,6 +167,59 @@ echo "Gateway launched."
 
 rank0_log_file="$LOG_DIR/router_${ROUTER_IP}.log"
 echo "Log file of rank_0: $rank0_log_file"
+
+# ---- End-to-end smoke check through the gateway -------------------------
+# Gate on the gateway's /readiness: in PD mode it only answers 200 once a
+# prefill AND a decode worker are registered and healthy. /v1/models is not a
+# gate (it is proxied to the first prefill worker and answers 200 while the
+# decode side is still registering, which made the first smoke attempt fail);
+# it is only used to learn the served model name.
+# SKIP_E2E_SMOKE=1 skips this block entirely.
+if [[ "${SKIP_E2E_SMOKE:-0}" != "1" ]]; then
+    _gw="http://${ROUTER_IP}:30000"
+    _smoke_resp="$(mktemp -t sglang_smoke.XXXXXX 2>/dev/null || echo "/tmp/sglang_smoke.$$")"
+    _smoke_err=""
+    _smoke_code=""
+
+    # 1) Readiness, up to 30 minutes: the workers may still be loading.
+    echo "[$(date +%T)] Waiting for gateway readiness ($_gw/readiness)"
+    _ready_deadline=$(( $(date +%s) + 1800 ))
+    while :; do
+        _ready_code="$(curl -s -o /dev/null -w '%{http_code}' --noproxy "*" --max-time 3 "$_gw/readiness" 2>/dev/null)"
+        [[ "$_ready_code" == "200" ]] && break
+        # Gateway built without the endpoint: keep the old, lenient behaviour.
+        [[ "$_ready_code" == "404" ]] && { echo "WARNING: gateway has no /readiness; skipping that gate"; break; }
+        (( $(date +%s) >= _ready_deadline )) && {
+            _smoke_err="gateway $_gw/readiness not ready after 30 minutes (last http=${_ready_code:-no-response})"
+            break
+        }
+        sleep 2
+    done
+
+    # 2) Model id, then one real completion. Take the FIRST "id": the last one
+    #    is an adapter name once LoRA adapters are registered.
+    _model="$(curl -s --noproxy "*" --max-time 5 "$_gw/v1/models" 2>/dev/null \
+        | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+    [[ -z "$_model" ]] && _smoke_err="${_smoke_err:-cannot read a model id from $_gw/v1/models}"
+
+    # 3) One real completion. The response body is echoed on failure so the
+    #    reason (e.g. "No decode workers available") is visible in the log.
+    for _try in 1 2 3 4 5; do
+        [[ -n "$_smoke_err" ]] && break
+        _smoke_code="$(curl -s -o "$_smoke_resp" -w '%{http_code}' --noproxy "*" --max-time 180 \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"${_model}\",\"prompt\":\"1+1=\",\"max_tokens\":1,\"temperature\":0}" \
+            "$_gw/v1/completions" 2>/dev/null)"
+        [[ "$_smoke_code" == "200" ]] && break
+        echo "[$(date +%T)] smoke attempt ${_try}/6 failed (http=${_smoke_code:-no-response}): $(head -c 300 "$_smoke_resp" | tr -d '\n')"
+        sleep 5
+    done
+
+    rm -f "$_smoke_resp"
+    [[ -n "$_smoke_err" ]] && { echo "ERROR: $_smoke_err; deployment is not usable" >&2; exit 1; }
+    [[ "$_smoke_code" != "200" ]] && { echo "ERROR: end-to-end smoke failed after 6 attempts (last http=${_smoke_code:-no-response}); deployment is not usable" >&2; exit 1; }
+    echo "[$(date +%T)] ===== End-to-end smoke passed (model=$_model) ====="
+fi
 
 if [[ "${SKIP_LOG:-0}" == "1" ]]; then
     exit 0
