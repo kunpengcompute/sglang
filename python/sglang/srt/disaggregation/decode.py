@@ -278,6 +278,7 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    is_rebootstrap: bool = False
 
     @property
     def seqlen(self) -> int:
@@ -342,6 +343,13 @@ class DecodePreallocQueue:
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        # Retracted requests staged for rebootstrap while generation is paused.
+        # Enqueued into ``self.queue`` only on ``continue_generation`` so the
+        # prefix KV is recomputed under the post-retract (updated) weights.
+        # NOTE: requests held here are not reachable by ``/abort_request``; to
+        # support aborting them we would need an additional fix in the
+        # scheduler. In practice this shouldn't arise in the RL scenario.
+        self.held_rebootstrap_reqs: List[Req] = []
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -526,8 +534,18 @@ class DecodePreallocQueue:
                     )
         return kv_manager
 
-    def add(self, req: Req, is_retracted: bool = False) -> None:
-        """Add a request to the pending queue."""
+    def add(
+        self, req: Req, is_retracted: bool = False, is_rebootstrap: bool = False
+    ) -> None:
+        """Add a request to the pending queue.
+
+        ``is_rebootstrap`` marks a PD true-retraction request whose prefix KV
+        must be recomputed by the original prefill worker under the current
+        weights (rather than resumed from stale CPU KV). It otherwise follows the
+        same bootstrap-handshake path as a fresh request; the ``/generate``
+        dispatch happens later, after preallocation and ``send_metadata`` (see
+        ``pop_preallocated``).
+        """
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -535,7 +553,9 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            decode_req = self._create_receiver_and_enqueue(req)
+            decode_req = self._create_receiver_and_enqueue(
+                req, is_rebootstrap=is_rebootstrap
+            )
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req, self.scheduler.server_args):
@@ -590,7 +610,9 @@ class DecodePreallocQueue:
 
         return None
 
-    def _create_receiver_and_enqueue(self, req: Req) -> DecodeRequest:
+    def _create_receiver_and_enqueue(
+        self, req: Req, is_rebootstrap: bool = False
+    ) -> DecodeRequest:
         backend = (
             TransferBackend.FAKE
             if _is_fake_transfer(req, self.scheduler.server_args)
@@ -604,17 +626,63 @@ class DecodePreallocQueue:
             bootstrap_room=req.bootstrap_room,
         )
 
-        decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
+        decode_req = DecodeRequest(
+            req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
+        )
         self.queue.append(decode_req)
         return decode_req
+
+    def hold_rebootstrap(self, req: Req) -> None:
+        """Stage a retracted request for rebootstrap without enqueuing it yet.
+
+        Retraction is always paired with a weight update
+        (``pause_generation(mode="retract")`` -> ``update_weights`` ->
+        ``continue_generation``). Enqueuing the rebootstrap into ``self.queue``
+        here would leave the preallocation queue non-empty, which makes the
+        scheduler non-idle so ``update_weights``' post-update cache flush
+        asserts and crashes the decode worker. Instead we hold the request and
+        enqueue it from ``enqueue_held_rebootstrap`` on resume, so its prefix KV
+        is recomputed by the prefill worker under the updated weights.
+        """
+        self.held_rebootstrap_reqs.append(req)
+
+    def enqueue_held_rebootstrap(self) -> None:
+        """Enqueue all staged rebootstrap requests when generation resumes."""
+        held = self.held_rebootstrap_reqs
+        self.held_rebootstrap_reqs = []
+        for req in held:
+            self.add(req, is_rebootstrap=True)
+
+    @staticmethod
+    def _rebootstrap_prefill_len(req: Req) -> int:
+        if getattr(req, "pd_rebootstrap_in_progress", False):
+            return len(req.origin_input_ids) + len(req.output_ids)
+        return len(req.origin_input_ids)
+
+    @staticmethod
+    def _pre_alloc_fill_len(req: Req) -> int:
+        if getattr(req, "pd_rebootstrap_in_progress", False):
+            # pause_generation(retract) already popped the boundary token out of
+            # output_ids (it is replayed via the decode-side override at commit
+            # time), so output_ids here is prompt + emitted-tokens-minus-boundary,
+            # i.e. the original seqlen - 1. The prefill recomputes KV for *all* of
+            # these tokens, leaving no just-sampled "pending" token in the list, so
+            # we allocate exactly len(origin)+len(output_ids) with no -1 (unlike
+            # normal decode, where the last token's KV has not been written yet).
+            # This is the same token count as offloading-based retraction, where
+            # offload_kv_cache saves seqlen-1 tokens; the boundary token's KV is
+            # (re)computed on the decode side once generation resumes.
+            return len(req.origin_input_ids) + len(req.output_ids)
+        return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         # Under long-context decode CP every rank stores only 1/cp of a
         # sequence's KV, so the effective per-sequence capacity is the
         # per-rank pool size multiplied by cp_size.
         max_total = self.max_total_num_tokens * _lc_cp_size()
-        if len(req.origin_input_ids) > max_total:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {max_total}"
+        input_len = self._rebootstrap_prefill_len(req)
+        if input_len > max_total:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {max_total}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
@@ -847,9 +915,10 @@ class DecodePreallocQueue:
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                self.scheduler.stream_output(
-                    [decode_req.req], decode_req.req.return_logprob
-                )
+                if not getattr(decode_req.req, "finished_output", False):
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
                 if decode_req.kv_receiver is not None:
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
@@ -902,8 +971,12 @@ class DecodePreallocQueue:
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
-            origin_input_len = len(decode_req.req.origin_input_ids)
-            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
+            use_decode_radix_cache = (
+                self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+                and not decode_req.is_rebootstrap
+            )
+            if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_indices, prefix_len = self._match_prefix_and_lock(decode_req.req)
                 # Align prefix_len down to page boundary so both prefill and
@@ -913,7 +986,7 @@ class DecodePreallocQueue:
                     prefix_len = page_align_floor(prefix_len, page_size)
                     prefix_indices = prefix_indices[:prefix_len]
 
-                fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
+                fill_len = self._pre_alloc_fill_len(decode_req.req)
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
                 )
@@ -928,7 +1001,9 @@ class DecodePreallocQueue:
             else:
                 prefix_indices = None
                 prefix_len = 0
-                required_alloc_tokens = _lc_scale_tokens(origin_input_len)
+                required_alloc_tokens = _lc_scale_tokens(
+                    self._pre_alloc_fill_len(decode_req.req)
+                )
 
             required_tokens_for_request = (
                 required_alloc_tokens + _lc_scale_tokens(self.num_reserved_decode_tokens)
@@ -1000,7 +1075,7 @@ class DecodePreallocQueue:
                 ]
             elif isinstance(self.token_to_kv_pool, SWAKVPool):
                 # SWA hybrid model: send decode-side SWA window indices
-                seq_len = len(decode_req.req.origin_input_ids)
+                seq_len = origin_input_len
                 window_size = self.scheduler.sliding_window_size
 
                 window_start = max(0, seq_len - window_size)
@@ -1018,7 +1093,7 @@ class DecodePreallocQueue:
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif is_nsa_pool(self.token_to_kv_pool):
-                seq_len = len(decode_req.req.origin_input_ids)
+                seq_len = origin_input_len
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
@@ -1040,6 +1115,11 @@ class DecodePreallocQueue:
                 state_indices,
                 decode_prefix_len=prefix_len,
             )
+            if decode_req.is_rebootstrap:
+                self.kv_manager.submit_prefill_recompute(
+                    decode_req.kv_receiver,
+                    decode_req.req.build_rebootstrap_payload(),
+                )
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1162,7 +1242,7 @@ class DecodePreallocQueue:
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
-        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        fill_len = self._pre_alloc_fill_len(req)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
@@ -1383,7 +1463,25 @@ class DecodeTransferQueue:
             return True
 
         # Case 3: Success - commit the transfer
-        decode_req.req.output_ids.append(output_id[0].item())
+        # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
+        # under the current weights and sampled a fresh handoff token, but when
+        # there is a remembered boundary token we are *replaying* an
+        # already-emitted token. Override the handoff with it, and skip
+        # re-committing a logprob for it -- it keeps its original behavior
+        # logprob from before the retract (we never re-score generated tokens
+        # under the new policy). A rebootstrap with no boundary token (retracted
+        # before emitting any output) falls through to the normal path so its
+        # first token and logprob are committed as usual.
+        replayed_boundary = (
+            decode_req.is_rebootstrap
+            and decode_req.req.pd_rebootstrap_forced_output_id is not None
+        )
+        if replayed_boundary:
+            committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
+            decode_req.req.pd_rebootstrap_forced_output_id = None
+        else:
+            committed_output_id = output_id[0].item()
+        decode_req.req.output_ids.append(committed_output_id)
         decode_req.req.cached_tokens = cached_tokens[0].item()
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
@@ -1401,7 +1499,7 @@ class DecodeTransferQueue:
             else:
                 decode_req.req.hidden_states_tensor = output_hidden_states
 
-        if decode_req.req.return_logprob:
+        if decode_req.req.return_logprob and not replayed_boundary:
             decode_req.req.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )
@@ -1539,9 +1637,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.process_decode_queue()
             if self._engine_paused:
                 continue
+            self.process_decode_queue()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -1567,9 +1665,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.process_decode_queue()
             if self._engine_paused:
                 continue
+            self.process_decode_queue()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
