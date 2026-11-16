@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.utils.common import is_cpu_920f
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -423,6 +424,12 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        # 920F: defer the HiCache control-plane sync (attn-TP allreduce) until
+        # after the forward. Issued right after recv_requests' kuccl broadcast,
+        # a large payload may still be in flight on another rank; two different
+        # collectives in flight on the same ucg_group can mispair and block the
+        # whole group.
+        self._hicache_sync_after_forward = is_cpu_920f()
 
         while True:
             # Receive requests
@@ -447,6 +454,9 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self.on_idle()
 
+            # The 256-rank MoE barrier inside run_batch has aligned the group.
+            self._sync_hicache_events_after_forward()
+
             self.process_disagg_prefill_inflight_queue()
 
             # Update last_batch
@@ -456,6 +466,10 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        # Same as event_loop_normal_disagg_prefill: on 920F, move the HiCache
+        # control-plane sync after the forward to avoid interleaving it with
+        # recv_requests' broadcast.
+        self._hicache_sync_after_forward = is_cpu_920f()
 
         while True:
             # Receive requests
@@ -487,6 +501,9 @@ class SchedulerDisaggregationPrefillMixin:
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            # The 256-rank MoE barrier inside run_batch has aligned the group.
+            self._sync_hicache_events_after_forward()
 
             self.process_disagg_prefill_inflight_queue()
 

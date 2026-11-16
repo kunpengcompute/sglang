@@ -2809,6 +2809,18 @@ class Scheduler(
 
         return ret
 
+    def _sync_hicache_events_after_forward(self) -> None:
+        """Run the HiCache control-plane sync after the forward (920F disagg prefill).
+
+        run_batch's 256-rank MoE barrier aligns all ranks first. Issuing this
+        attn-TP allreduce right after recv_requests' broadcast can pair wrong
+        with a large payload still in flight on another rank, and the kuccl/ucg
+        group then deadlocks. Only active when the loop sets the flag.
+        """
+        if getattr(self, "_hicache_sync_after_forward", False):
+            if self.enable_hierarchical_cache:
+                self.tree_cache.check_hicache_events()
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2818,7 +2830,9 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache and not getattr(
+            self, "_hicache_sync_after_forward", False
+        ):
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption:
