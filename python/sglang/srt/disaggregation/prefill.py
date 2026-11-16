@@ -153,8 +153,12 @@ class PrefillBootstrapQueue:
         # the bootstrap server so the decode side can map its PP stages onto
         # prefill PP ranks by layer interval when prefill pp != decode pp. A
         # hybrid pool only owns KV for its full-attention layers, so the count
-        # is not the layer-id span `end_layer - start_layer`.
-        kv_args.prefill_num_layers = self.token_to_kv_pool.num_kv_layers
+        # is not the layer-id span `end_layer - start_layer`. Pools without
+        # `end_layer` (e.g. SWA pools) report no count; send None so the decode
+        # side falls back to the legacy rank-index PP mapping.
+        kv_args.prefill_num_layers = getattr(
+            self.token_to_kv_pool, "num_kv_layers", None
+        )
         # default to 0, will be filled from decode metadata per-request
         kv_args.decode_start_layer = 0
         kv_args.decode_num_layers = 0

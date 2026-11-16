@@ -430,8 +430,10 @@ class DecodePreallocQueue:
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
         kv_args.decode_start_layer = self.token_to_kv_pool.start_layer
         # A hybrid pool only owns KV for its full-attention layers, so the count
-        # is not the layer-id span `end_layer - start_layer`.
-        kv_args.decode_num_layers = self.token_to_kv_pool.num_kv_layers
+        # is not the layer-id span `end_layer - start_layer`. Pools without
+        # `end_layer` (e.g. SWA pools) report no count; 0 means unknown and the
+        # transfer falls back to the unsliced, full-range layout.
+        kv_args.decode_num_layers = getattr(self.token_to_kv_pool, "num_kv_layers", 0)
         # Layer range of every decode PP stage. Used to count how many decode
         # stages share a prefill PP rank (dst_session_num) when prefill pp !=
         # decode pp and stage boundaries do not nest, so that a prefill rank
