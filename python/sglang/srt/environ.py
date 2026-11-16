@@ -674,6 +674,11 @@ class Envs:
     # shm segments and may use different group sizes (the index-K rows are
     # identical on every attn-TP rank).
     SGLANG_KUNPENG_INDEXER_SHARE_GROUP = EnvInt(0)
+    # Temporary PD KV-transfer timing logs, for locating slow kv transfers.
+    # Prints one line per stage on the prefill side (enqueue -> worker pick ->
+    # RDMA write -> status success) and one per rank on the decode side.
+    # Verbose: only enable while debugging.
+    SGLANG_KUNPENG_LOG_KV_WAIT_TIMING = EnvBool(False)
 
 envs = Envs()
 EnvField._allow_set_name = False
