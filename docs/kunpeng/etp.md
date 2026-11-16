@@ -133,7 +133,7 @@ MTP steps每+1，dense相关SHM按steps+1线性放大（见SGLANG_KUNPENG_ETP_DE
 
 ### 静态 EPLB（采集→导出→导入）
 
-仅在ETP decode实例上操作，prefill保持原配置。以下变量由`server.sh`透传；热度目录需要各decode节点可访问。
+仅在ETP decode实例上操作，prefill保持原配置。以下变量由`runtime/server_cluster.sh`透传；热度目录需要各decode节点可访问。
 
 1. 采集前关闭压测用的强制均衡，配置recorder并启动server：
 

@@ -243,7 +243,7 @@ Script call hierarchy (`launch.sh` is a pure task dispatcher; the real logic liv
 ```
 launch.sh (dispatcher: ./launch.sh <role> [instance])
   ├─→ runtime/launch_cluster.sh (prefill/decode/native: env loading, stop-first, SSH fan-out to nodes)
-  │      └─→ server.sh (single-node process launch)
+  │      └─→ runtime/server_cluster.sh (single-node process launch)
   ├─→ runtime/launch_tokenizer.sh (tokenizer: SSH to the router node)
   │      └─→ runtime/server_tokenizer.sh (tokenizer HTTP server)
   ├─→ runtime/launch_mooncake.sh (mooncake: store master)
@@ -328,7 +328,7 @@ export SGLANG_ENABLE_BINARY_LAUNCH=1      # default on
 export SGLANG_ENABLE_NUMA_DUPLICATION=1   # default on
 ```
 
-- **Effect**: Each scheduler process starts independently using `--tp-rank-in-node` to distinguish ranks. `server.sh` iterates `RANK_IN_NODE` to launch processes one by one, pinning CPU cores (`taskset -c`) and configuring huge pages. When disabled, only a single `python -m sglang.launch_server` process is used.
+- **Effect**: Each scheduler process starts independently using `--tp-rank-in-node` to distinguish ranks. `runtime/server_cluster.sh` iterates `RANK_IN_NODE` to launch processes one by one, pinning CPU cores (`taskset -c`) and configuring huge pages. When disabled, only a single `python -m sglang.launch_server` process is used.
 - **SGLANG\_ENABLE\_NUMA\_DUPLICATION**: On top of the above, each NUMA node uses its own pre-built binary from `PYINSTALL_PATH/dist/sglang_server_tp{rank}/` (requires `SGLANG_ENABLE_BINARY_LAUNCH`), achieving per-NUMA memory locality and reducing cross-NUMA access. When disabled, all ranks share one binary and the `LD_LIBRARY_PATH` setup logic changes. For building the replicas (PyInstaller packaging and NUMA duplication), refer to the [PyInstaller packaging guide](scripts/cpu_kunpeng/pyinstall/readme.md).
 
 **2. SGLANG\_ENABLE\_TOKENIZER\_SEPERATE — Separate Tokenizer**

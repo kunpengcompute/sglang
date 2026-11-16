@@ -242,7 +242,7 @@ python add_shared_expert_glm5.py \
 ```
 launch.sh（任务分发器：./launch.sh <role> [instance]）
   ├─→ runtime/launch_cluster.sh（prefill/decode/native：env加载、stop前置、SSH分发到各节点）
-  │      └─→ server.sh（单节点进程启动）
+  │      └─→ runtime/server_cluster.sh（单节点进程启动）
   ├─→ runtime/launch_tokenizer.sh（tokenizer：SSH到router节点）
   │      └─→ runtime/server_tokenizer.sh（tokenizer HTTP server）
   ├─→ runtime/launch_mooncake.sh（mooncake：store master）
@@ -327,7 +327,7 @@ export SGLANG_ENABLE_BINARY_LAUNCH=1      # 默认开
 export SGLANG_ENABLE_NUMA_DUPLICATION=1   # 默认开
 ```
 
-- **作用**：每个scheduler进程独立启动，使用`--tp-rank-in-node`区分rank号。`server.sh`遍历`RANK_IN_NODE`逐个启动进程，绑CPU核（`taskset -c`）并配置大页。关闭时仅有一个`python -m sglang.launch_server`进程。
+- **作用**：每个scheduler进程独立启动，使用`--tp-rank-in-node`区分rank号。`runtime/server_cluster.sh`遍历`RANK_IN_NODE`逐个启动进程，绑CPU核（`taskset -c`）并配置大页。关闭时仅有一个`python -m sglang.launch_server`进程。
 - **SGLANG\_ENABLE\_NUMA\_DUPLICATION**：在上述基础上，每个NUMA节点使用`PYINSTALL_PATH/dist/sglang_server_tp{rank}/`下的独立预编译二进制（`SGLANG_ENABLE_BINARY_LAUNCH`开启前提下），实现各NUMA节点内存本地化，减少跨NUMA访存。关闭时所有rank共享一个二进制，同时影响`LD_LIBRARY_PATH`的设置逻辑。多副本的构建（PyInstaller打包与NUMA副本复制）请参考[PyInstaller打包工具说明](scripts/cpu_kunpeng/pyinstall/readme.md)。
 
 **2. SGLANG\_ENABLE\_TOKENIZER\_SEPERATE — 分离Tokenizer**

@@ -66,7 +66,7 @@ if [[ "$1" == "prefill" || "$1" == "native" ]]; then
 fi
 ```
 
-> `KUNPENG_HICACHE_BACKEND` 默认 `file`。打开总开关后**必须**设置 `KUNPENG_HICACHE_L3_DIR`，否则 `server.sh` 启动时直接报错退出。
+> `KUNPENG_HICACHE_BACKEND` 默认 `file`。打开总开关后**必须**设置 `KUNPENG_HICACHE_L3_DIR`，否则 `runtime/server_cluster.sh` 启动时直接报错退出。
 
 ---
 
@@ -130,7 +130,7 @@ scripts/cpu_kunpeng/
 >
 > 两级模式的约束：只支持 **MLA** 池（MHA/NSA 直接 `NotImplementedError`）；写策略不支持 `write_back`。
 >
-> 上面 `SGLANG_KUNPENG_HICACHE_*` 由 `server.sh` 依据脚本变量自动导出，一般不用手写。
+> 上面 `SGLANG_KUNPENG_HICACHE_*` 由 `runtime/server_cluster.sh` 依据脚本变量自动导出，一般不用手写。
 
 ### 3.3 L3（存储后端）
 
@@ -151,9 +151,9 @@ scripts/cpu_kunpeng/
 
 | 变量 | 默认 | 类型 | 作用 |
 |---|---|---|---|
-| `KUNPENG_HICACHE_L3_DIR` | 空 | 路径 | 页文件目录（需被所有 prefill 节点共享）。**在 `ENABLE_KUNPENG_HICACHE=1 && BACKEND=file` 下留空会让 `server.sh` 启动直接报错退出** |
+| `KUNPENG_HICACHE_L3_DIR` | 空 | 路径 | 页文件目录（需被所有 prefill 节点共享）。**在 `ENABLE_KUNPENG_HICACHE=1 && BACKEND=file` 下留空会让 `runtime/server_cluster.sh` 启动直接报错退出** |
 
-`server.sh` 会 `mkdir -p` 该目录，并导出 `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR`。
+`runtime/server_cluster.sh` 会 `mkdir -p` 该目录，并导出 `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR`。
 适用：单机/小规模验证、无 RDMA 环境。缺点：无淘汰、无容量上限、依赖共享文件系统。
 
 #### 3.3.3 后端 B：`mooncake`（可选）

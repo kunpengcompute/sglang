@@ -128,7 +128,7 @@ export SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET=18
 export SGLANG_LOG_MS=1
 # Request logging: record per-request metadata and input/output text
 # (python/sglang/srt/utils/request_logger.py). LOG_REQUESTS=1 adds the
-# --log-requests flags in server.sh (native role) and runtime/server_tokenizer.sh
+# --log-requests flags in runtime/server_cluster.sh (native role) and runtime/server_tokenizer.sh
 # (PD roles, where the HTTP server and tokenizer manager live).
 #   LOG_REQUESTS_LEVEL  0 = metadata only, 1 = + sampling params,
 #                       2 = + truncated input/output (2048 chars),
@@ -216,7 +216,7 @@ export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1 # Kunpeng prefill graph padding t
 export SGLANG_GRAPH_DEBUG_PRINT=0  # 1 = per-op debug print in eager/capture (ops.py) and graph replay (C++)
 # Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
-# Chat template / parsers: model-specific, opt-in. server.sh only passes
+# Chat template / parsers: model-specific, opt-in. runtime/server_cluster.sh only passes
 # the flag when the variable is non-empty — set them in .user_env*.sh for
 # models that need them (e.g. DeepSeek-R1:
 #   CHAT_TEMPLATE="$SGLANG_PATH/examples/chat_template/tool_chat_template_deepseekr1.jinja"
