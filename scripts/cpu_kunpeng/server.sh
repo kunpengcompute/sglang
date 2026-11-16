@@ -99,6 +99,11 @@ if [[ "${LOG_REQUESTS:-0}" == "1" ]]; then
     )
 fi
 
+# Per-request time stats logging, gated by SGLANG_ENABLE_REQUEST_TIME_STATS_LOGGING
+if [[ "${SGLANG_ENABLE_REQUEST_TIME_STATS_LOGGING:-0}" == "1" ]]; then
+    BASE_ARGS+=(--enable-request-time-stats-logging)
+fi
+
 # Add redundant experts only when enabled (REDUNDANT_EXPERTS > 0)
 if [[ "${REDUNDANT_EXPERTS:-0}" -gt 0 ]]; then
     BASE_ARGS+=(--ep-num-redundant-experts "$REDUNDANT_EXPERTS")

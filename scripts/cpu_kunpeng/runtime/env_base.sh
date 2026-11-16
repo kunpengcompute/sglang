@@ -150,6 +150,9 @@ export SGLANG_LOG_REQUEST_EXCEEDED_MS=-1
 # Extra request headers to include in the request log (comma-separated,
 # e.g. "x-request-id,my-trace-id")
 export SGLANG_LOG_REQUEST_HEADERS=""
+# Per-request time stats logging (--enable-request-time-stats-logging):
+# 1 = log a time breakdown per finished request in the scheduler logs.
+export SGLANG_ENABLE_REQUEST_TIME_STATS_LOGGING=0
 export SGLANG_USE_CPU_ENGINE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
