@@ -61,7 +61,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
@@ -693,6 +697,9 @@ class Req(ReqDllmMixin):
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
+        # None means legacy single-track mode. In multi-checkpoint mode this
+        # list owns only slots that have not been transferred to the radix tree.
+        self.mamba_prefill_checkpoints: Optional[List[tuple[int, int]]] = None
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
@@ -1246,6 +1253,8 @@ class Req(ReqDllmMixin):
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
+        assert not self.mamba_prefill_checkpoints
+        self.mamba_prefill_checkpoints = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
         self.kv_allocated_len = 0
@@ -1404,6 +1413,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    mamba_checkpoint_offsets: Optional[torch.Tensor] = None  # shape: [b + 1], int32
+    mamba_checkpoint_tokens: Optional[torch.Tensor] = None  # shape: [m], int32
+    mamba_checkpoint_indices: Optional[torch.Tensor] = None  # shape: [m], int64
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -1753,6 +1765,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        server_args = get_global_server_args()
+        use_multi_checkpoints = (
+            server_args.enable_mamba_extra_buffer()
+            and server_args.mamba_checkpoint_stride_pages is not None
+        )
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1828,13 +1845,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.already_computed = seq_len
             req.is_retracted = False
 
-            if get_global_server_args().enable_mamba_extra_buffer():
-                self._mamba_radix_cache_v2_req_prepare_for_extend(
-                    req,
-                    mamba_track_mask_cpu,
-                    mamba_track_indices_cpu,
-                    mamba_track_seqlens_cpu,
-                )
+            if server_args.enable_mamba_extra_buffer():
+                if use_multi_checkpoints:
+                    mamba_track_mask_cpu.append(False)
+                    mamba_track_indices_cpu.append(
+                        req.mamba_ping_pong_track_buffer[
+                            req.mamba_next_track_idx
+                        ].item()
+                    )
+                    mamba_track_seqlens_cpu.append(-1)
+                else:
+                    self._mamba_radix_cache_v2_req_prepare_for_extend(
+                        req,
+                        mamba_track_mask_cpu,
+                        mamba_track_indices_cpu,
+                        mamba_track_seqlens_cpu,
+                    )
 
             if self.return_logprob:
                 # Find input logprob token ids.
@@ -1951,6 +1977,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
+        if use_multi_checkpoints:
+            self._prepare_mamba_prefill_checkpoints(reqs)
+
         if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
@@ -1976,6 +2005,103 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+
+    def _prepare_mamba_prefill_checkpoints(self, reqs: List[Req]):
+        server_args = get_global_server_args()
+        stride = server_args.mamba_checkpoint_stride_pages * server_args.page_size
+        chunk_size = server_args.mamba_cache_chunk_size
+        # A snapshot's conv window has to sit inside this prefill chunk. Targets
+        # closer than the conv width would read the request prefix, whose conv
+        # state is not part of mixed_qkv, so drop them here instead of letting
+        # the backend reject the whole batch later.
+        conv_width = self.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape[-1]
+        offsets = [0]
+        tokens = []
+        targets_per_req = []
+
+        for req in reqs:
+            prefix_len = len(req.prefix_indices)
+            extend_len = req.extend_input_len
+            aligned_len = prefix_len + (extend_len // chunk_size) * chunk_size
+            targets = set()
+            if aligned_len > prefix_len:
+                first_stride = (prefix_len // stride + 1) * stride
+                targets.update(range(first_stride, aligned_len + 1, stride))
+                targets.add(aligned_len)
+            branching_len = req.mamba_branching_seqlen
+            if (
+                branching_len is not None
+                and prefix_len < branching_len <= aligned_len
+                and (branching_len - prefix_len) % chunk_size == 0
+            ):
+                targets.add(branching_len)
+
+            req_targets = sorted(
+                target for target in targets if target - prefix_len >= conv_width
+            )
+            targets_per_req.append(req_targets)
+            tokens.extend(target - prefix_len for target in req_targets)
+            offsets.append(len(tokens))
+            # Empty is meaningful: this request is in multi-checkpoint mode and
+            # must not fall back to the legacy prefill single-track path. A
+            # request with no target keeps None and stays on the legacy path.
+            req.mamba_prefill_checkpoints = [] if req_targets else None
+
+        total = len(tokens)
+        if total == 0:
+            # Nothing to snapshot. Keep the whole batch on the legacy prefill
+            # path: an empty checkpoint batch is rejected by the graph runner
+            # and would fall back to eager, whose collective buffers no longer
+            # fit in the SHM pool once graph capture has claimed the rest.
+            return
+        slots = None
+        if total > 0:
+            slots = self.req_to_token_pool.mamba_pool.alloc(total)
+            if slots is None:
+                self.tree_cache.evict(
+                    EvictParams(num_tokens=0, mamba_num=total)
+                )
+                slots = self.req_to_token_pool.mamba_pool.alloc(total)
+            if slots is None:
+                for req in reqs:
+                    req.mamba_prefill_checkpoints = None
+                raise RuntimeError(
+                    f"Unable to allocate {total} Mamba checkpoint slots; "
+                    f"available={self.req_to_token_pool.mamba_pool.available_size()}"
+                )
+
+        try:
+            slot_values = slots.tolist() if slots is not None else []
+            cursor = 0
+            for req, req_targets in zip(reqs, targets_per_req):
+                count = len(req_targets)
+                if count:
+                    req.mamba_prefill_checkpoints = [
+                        (target, slot_values[cursor + i])
+                        for i, target in enumerate(req_targets)
+                    ]
+                cursor += count
+
+            self.mamba_checkpoint_offsets = torch.tensor(
+                offsets, dtype=torch.int32, device=self.device
+            )
+            self.mamba_checkpoint_tokens = torch.tensor(
+                tokens, dtype=torch.int32, device=self.device
+            )
+            self.mamba_checkpoint_indices = (
+                slots.to(dtype=torch.int64, device=self.device)
+                if slots is not None
+                else torch.empty(0, dtype=torch.int64, device=self.device)
+            )
+        except Exception:
+            for req in reqs:
+                req.mamba_prefill_checkpoints = None
+            if slots is not None:
+                self.req_to_token_pool.mamba_pool.free(slots)
+            self.mamba_checkpoint_offsets = None
+            self.mamba_checkpoint_tokens = None
+            self.mamba_checkpoint_indices = None
+            raise
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
@@ -2297,6 +2423,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+        self.mamba_checkpoint_offsets = None
+        self.mamba_checkpoint_tokens = None
+        self.mamba_checkpoint_indices = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -2373,6 +2502,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():
+            pin_track = is_pin_memory_available(self.device)
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
@@ -2386,7 +2516,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     torch.tensor(
                         [req.mamba_next_track_idx for req in self.reqs],
                         dtype=torch.int64,
-                        pin_memory=True,
+                        pin_memory=pin_track,
                     )
                     .unsqueeze(1)
                     .to(device=all_buffers.device, non_blocking=True)
@@ -2396,10 +2526,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
             # async H2D
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
+            track_mask = (
+                self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0
+            )
+            if pin_track:
+                track_mask = track_mask.pin_memory()
+            self.mamba_track_mask = track_mask.to(
+                device=self.device, non_blocking=True
             )
 
     def maybe_wait_verify_done(self):
@@ -2466,6 +2599,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_checkpoint_offsets = None
+        self.mamba_checkpoint_tokens = None
+        self.mamba_checkpoint_indices = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -2629,6 +2765,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_checkpoint_offsets=self.mamba_checkpoint_offsets,
+            mamba_checkpoint_tokens=self.mamba_checkpoint_tokens,
+            mamba_checkpoint_indices=self.mamba_checkpoint_indices,
         )
 
     def copy(self):
@@ -2656,6 +2795,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_checkpoint_offsets=self.mamba_checkpoint_offsets,
+            mamba_checkpoint_tokens=self.mamba_checkpoint_tokens,
+            mamba_checkpoint_indices=self.mamba_checkpoint_indices,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
         )
@@ -2840,3 +2982,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_checkpoint_offsets: Optional[torch.Tensor] = None  # shape: [b + 1], int32
+    mamba_checkpoint_tokens: Optional[torch.Tensor] = None  # shape: [m], int32
+    mamba_checkpoint_indices: Optional[torch.Tensor] = None  # shape: [m], int64

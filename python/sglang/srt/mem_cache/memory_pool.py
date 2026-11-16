@@ -643,6 +643,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_mamba_cache(
         self, req: "Req", mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
+        pending = getattr(req, "mamba_prefill_checkpoints", None)
+        if pending:
+            pending_indices = torch.tensor(
+                [slot for _, slot in pending],
+                dtype=torch.int64,
+                device=self.mamba_pool.free_slots.device,
+            )
+            self.mamba_pool.free(pending_indices)
+        req.mamba_prefill_checkpoints = None
+
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_pool.free(mamba_index.unsqueeze(0))
