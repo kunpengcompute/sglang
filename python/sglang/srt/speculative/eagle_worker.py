@@ -627,8 +627,8 @@ class EAGLEWorker(TpModelWorker):
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
+            logits_output, verify_output, can_run_cuda_graph = self.verify(
+                batch, spec_info
             )
 
             if get_global_tracing_enabled():
@@ -704,9 +704,13 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
-        model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch.capture_hidden_mode = capture_mode
+        batch_result = self.target_worker.forward_batch_generation(batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
@@ -714,7 +718,7 @@ class EAGLEWorker(TpModelWorker):
         return (
             logits_output,
             next_token_ids,
-            model_worker_batch.seq_lens_cpu,
+            batch.seq_lens_cpu,
             batch_result.can_run_cuda_graph,
         )
 
@@ -930,11 +934,8 @@ class EAGLEWorker(TpModelWorker):
         batch.return_hidden_states = False
 
         # Get forward batch
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+        assert forward_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
@@ -1177,11 +1178,6 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.spec_info = spec_info
 
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu
-        )
-        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
-
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
             retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
@@ -1190,8 +1186,9 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
+        batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
+            batch, is_verify=True
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -1259,7 +1256,7 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.spec_info = res.draft_input
 
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        return logits_output, res, can_run_cuda_graph
 
     def _mamba_verify_update(
         self,
@@ -1375,26 +1372,37 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=seq_lens_cpu
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
         )
+        batch.spec_info.capture_hidden_mode = capture_mode
+        batch.seq_lens_cpu_cache = seq_lens_cpu
         # The target's sparse mamba checkpoints describe GDN layers the dense
         # MTP draft does not have. Left on the draft batch they make every
         # draft-extend decline graph capture, and the eager fallback then asks
         # for a fresh SHM slice after capture has already consumed the pool.
-        model_worker_batch.mamba_checkpoint_offsets = None
-        model_worker_batch.mamba_checkpoint_tokens = None
-        model_worker_batch.mamba_checkpoint_indices = None
         # Same for the target's tracking metadata: the draft has no recurrent
         # layers to track, and a live mask makes prefill_graph decline the
-        # draft-extend as well.
-        model_worker_batch.mamba_track_mask = None
-        model_worker_batch.mamba_track_indices = None
-        model_worker_batch.mamba_track_seqlens = None
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
+        # draft-extend as well. ForwardBatch.init_new now reads these fields
+        # straight off the ScheduleBatch, so detach them around the call.
+        mamba_fields = (
+            "mamba_track_indices",
+            "mamba_track_mask",
+            "mamba_track_seqlens",
+            "mamba_checkpoint_offsets",
+            "mamba_checkpoint_tokens",
+            "mamba_checkpoint_indices",
         )
+        saved_mamba_fields = {name: getattr(batch, name) for name in mamba_fields}
+        for name in mamba_fields:
+            setattr(batch, name, None)
+        try:
+            forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+        finally:
+            for name, value in saved_mamba_fields.items():
+                setattr(batch, name, value)
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
@@ -1448,11 +1456,11 @@ class EAGLEWorker(TpModelWorker):
         )
 
         batch.return_hidden_states = False
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
+        # The draft-extend spec_info defaults to LAST; pin it explicitly so
+        # ForwardBatch.init_new derives the same capture mode from the batch.
+        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+        assert forward_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:

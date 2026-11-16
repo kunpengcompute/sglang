@@ -132,9 +132,8 @@ class PPNextNWorker(EAGLEWorker):
                     f"[PP_LAST] forward_batch: IDLE mode, "
                     f"n_reqs={batch.batch_size()}"
                 )
-            model_worker_batch = batch.get_model_worker_batch()
             result = self.target_worker.forward_batch_generation(
-                model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+                batch, pp_proxy_tensors=pp_proxy_tensors
             )
             # The parent EAGLEWorker never skips the draft forward for idle
             # batches: it always runs draft() → verify() → draft_extend under
@@ -196,10 +195,9 @@ class PPNextNWorker(EAGLEWorker):
                 f"seq_lens={batch.seq_lens.tolist() if batch.seq_lens is not None else 'N/A'}"
             )
 
-        model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+            batch, pp_proxy_tensors=pp_proxy_tensors
         )
         logits_output = batch_result.logits_output
         next_token_ids = batch_result.next_token_ids
@@ -217,7 +215,7 @@ class PPNextNWorker(EAGLEWorker):
                 batch,
                 logits_output.hidden_states,
                 next_token_ids,
-                model_worker_batch.seq_lens_cpu,
+                batch.seq_lens_cpu,
                 logits_output.mm_input_embeds,
             )
 
@@ -268,11 +266,9 @@ class PPNextNWorker(EAGLEWorker):
             )
 
         batch.return_hidden_states = False
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu
-        )
+        batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
+            batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
         )
         logits_output = batch_result.logits_output
 
@@ -623,14 +619,13 @@ class PPNextNWorker(EAGLEWorker):
                 spec_info.positions = None  # positions := clamp(seq_lens)
                 spec_info.hidden_states = hidden_states
 
-                model_worker_batch = batch.get_model_worker_batch()
-                assert (
-                    model_worker_batch.capture_hidden_mode
-                    == CaptureHiddenMode.LAST
-                ), model_worker_batch.capture_hidden_mode
+                batch.capture_hidden_mode = CaptureHiddenMode.LAST
                 forward_batch = ForwardBatch.init_new(
-                    model_worker_batch, self.draft_model_runner
+                    batch, self.draft_model_runner
                 )
+                assert (
+                    forward_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+                ), forward_batch.capture_hidden_mode
                 forward_batch.return_logprob = False
                 forward_batch.out_cache_loc = chain_slots[:, step]
 
