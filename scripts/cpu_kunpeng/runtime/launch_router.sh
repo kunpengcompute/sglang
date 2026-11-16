@@ -169,56 +169,50 @@ rank0_log_file="$LOG_DIR/router_${ROUTER_IP}.log"
 echo "Log file of rank_0: $rank0_log_file"
 
 # ---- End-to-end smoke check through the gateway -------------------------
-# Gate on the gateway's /readiness: in PD mode it only answers 200 once a
-# prefill AND a decode worker are registered and healthy. /v1/models is not a
-# gate (it is proxied to the first prefill worker and answers 200 while the
-# decode side is still registering, which made the first smoke attempt fail);
-# it is only used to learn the served model name.
-# SKIP_E2E_SMOKE=1 skips this block entirely.
+# Gate on a REAL completion instead of the gateway's /readiness: in PD mode
+# /readiness lags behind the true worker state (and the gateway's own health
+# interval is 10000s), so a successful 1-token completion is the only signal
+# that prefill -> KV transfer -> decode -> detokenizer all work.
+# The model id is re-read from /v1/models on every attempt until it appears
+# (it is proxied to the first prefill worker). SKIP_E2E_SMOKE=1 skips this.
 if [[ "${SKIP_E2E_SMOKE:-0}" != "1" ]]; then
     _gw="http://${ROUTER_IP}:30000"
     _smoke_resp="$(mktemp -t sglang_smoke.XXXXXX 2>/dev/null || echo "/tmp/sglang_smoke.$$")"
-    _smoke_err=""
-    _smoke_code=""
+    _model=""
+    _attempt=0
+    _smoke_deadline=$(( $(date +%s) + 1200 ))
+    echo "[$(date +%T)] Waiting for gateway e2e (real completion every 1s, up to 20 minutes)"
 
-    # 1) Readiness, up to 30 minutes: the workers may still be loading.
-    echo "[$(date +%T)] Waiting for gateway readiness ($_gw/readiness)"
-    _ready_deadline=$(( $(date +%s) + 1800 ))
     while :; do
-        _ready_code="$(curl -s -o /dev/null -w '%{http_code}' --noproxy "*" --max-time 3 "$_gw/readiness" 2>/dev/null)"
-        [[ "$_ready_code" == "200" ]] && break
-        # Gateway built without the endpoint: keep the old, lenient behaviour.
-        [[ "$_ready_code" == "404" ]] && { echo "WARNING: gateway has no /readiness; skipping that gate"; break; }
-        (( $(date +%s) >= _ready_deadline )) && {
-            _smoke_err="gateway $_gw/readiness not ready after 30 minutes (last http=${_ready_code:-no-response})"
+        _attempt=$(( _attempt + 1 ))
+
+        if [[ -z "$_model" ]]; then
+            _model="$(curl -s --noproxy "*" --max-time 2 "$_gw/v1/models" 2>/dev/null \
+                | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+        fi
+
+        if [[ -n "$_model" ]]; then
+            _smoke_code="$(curl -s -o "$_smoke_resp" -w '%{http_code}' --noproxy "*" --max-time 15 \
+                -H 'Content-Type: application/json' \
+                -d "{\"model\":\"${_model}\",\"prompt\":\"1+1=\",\"max_tokens\":1,\"temperature\":0}" \
+                "$_gw/v1/completions" 2>/dev/null)"
+        else
+            _smoke_code=""
+        fi
+
+        if [[ "$_smoke_code" == "200" ]]; then
+            echo "[$(date +%T)] ===== Router started successfully: gateway -> prefill -> decode verified end-to-end (attempt=$_attempt) ====="
+            rm -f "$_smoke_resp"
             break
-        }
-        sleep 2
+        fi
+
+        if (( $(date +%s) >= _smoke_deadline )); then
+            echo "ERROR: end-to-end smoke not ready after 20 minutes (last http=${_smoke_code:-no-response}); deployment is not usable" >&2
+            rm -f "$_smoke_resp"
+            exit 1
+        fi
+        sleep 1
     done
-
-    # 2) Model id, then one real completion. Take the FIRST "id": the last one
-    #    is an adapter name once LoRA adapters are registered.
-    _model="$(curl -s --noproxy "*" --max-time 5 "$_gw/v1/models" 2>/dev/null \
-        | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
-    [[ -z "$_model" ]] && _smoke_err="${_smoke_err:-cannot read a model id from $_gw/v1/models}"
-
-    # 3) One real completion. The response body is echoed on failure so the
-    #    reason (e.g. "No decode workers available") is visible in the log.
-    for _try in 1 2 3 4 5; do
-        [[ -n "$_smoke_err" ]] && break
-        _smoke_code="$(curl -s -o "$_smoke_resp" -w '%{http_code}' --noproxy "*" --max-time 180 \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"${_model}\",\"prompt\":\"1+1=\",\"max_tokens\":1,\"temperature\":0}" \
-            "$_gw/v1/completions" 2>/dev/null)"
-        [[ "$_smoke_code" == "200" ]] && break
-        echo "[$(date +%T)] smoke attempt ${_try}/6 failed (http=${_smoke_code:-no-response}): $(head -c 300 "$_smoke_resp" | tr -d '\n')"
-        sleep 5
-    done
-
-    rm -f "$_smoke_resp"
-    [[ -n "$_smoke_err" ]] && { echo "ERROR: $_smoke_err; deployment is not usable" >&2; exit 1; }
-    [[ "$_smoke_code" != "200" ]] && { echo "ERROR: end-to-end smoke failed after 6 attempts (last http=${_smoke_code:-no-response}); deployment is not usable" >&2; exit 1; }
-    echo "[$(date +%T)] ===== End-to-end smoke passed (model=$_model) ====="
 fi
 
 if [[ "${SKIP_LOG:-0}" == "1" ]]; then
@@ -228,4 +222,6 @@ fi
 while [ ! -f "$rank0_log_file" ]; do
     sleep 1
 done
-tail -f "$rank0_log_file"
+# Replay the last lines (worker registration / tokenizer info) so the console
+# shows the gateway is up, then follow new lines.
+tail -n 5 -f "$rank0_log_file"
