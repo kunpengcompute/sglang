@@ -2439,12 +2439,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
 
         # Sharding is decided solely by THIS decode process: when a pool is
-        # shared by its group, only two ranks own a disjoint layer shard of that
-        # pool and the rest receive nothing of it. Otherwise every rank gets a
-        # full copy via the legacy 8-frame metadata. KV and index-K are sharded
-        # by their OWN group, so the two specs are computed independently;
-        # pd_*_shard_spec() returns None whenever that pool is not actually
-        # shared, so no prefill-side capability negotiation is involved.
+        # shared by its group, every member of the group owns a disjoint layer
+        # shard of that pool and receives only that shard, so the per-rank
+        # transfer volume is 1/group_size of a full copy. Otherwise every rank
+        # gets a full copy via the legacy 8-frame metadata. KV and index-K are
+        # sharded by their OWN group, so the two specs are computed
+        # independently; pd_*_shard_spec() returns None whenever that pool is
+        # not actually shared, so no prefill-side capability negotiation is
+        # involved.
         kv_shard_spec = None
         state_shard_spec = None
         if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0:
