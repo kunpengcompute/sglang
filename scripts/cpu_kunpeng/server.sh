@@ -134,6 +134,11 @@ if [[ "$SGLANG_DISABLE_RADIX_CACHE" == "1" ]]; then
     BASE_ARGS+=(--disable-radix-cache)
 fi
 
+# Enable Prometheus metrics
+if [[ "${SGLANG_ENABLE_METRICS:-0}" == "1" ]]; then
+    BASE_ARGS+=(--enable-metrics)
+fi
+
 # Disable overlap schedule
 if [[ "$SGLANG_ENABLE_OVERLAP" == "0" ]]; then
     BASE_ARGS+=(
