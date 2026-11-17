@@ -913,13 +913,13 @@ void igemm_fusedmoe_down_kunpeng(at::Tensor moe_silu_int8,     // [silu_total, i
 // ---------------------------------------------------------------------------
 // record_expert_activation_kunpeng
 //
-// Graph-replay-safe helper for the at_trace dump. In graph mode the Python
+// Graph-replay-safe helper for expert-activation counters (the EPLB recorder
+// and the DeepSeek redundant-expert at_trace dump). In graph mode the Python
 // activation-counting code in layer.py executes only once during capture, so
 // the per-step expert token counts must instead be accumulated by a C++ op
 // that runs on every replay. It adds the running per-slot totals into
 // ``counter`` (int64, laid out as [num_layers, num_local_experts]); the Python
-// side diffs ``counter`` against the previous snapshot after each forward
-// batch to recover the per-step counts (see at_trace.py).
+// side reads/diffs ``counter`` after each forward batch.
 // ---------------------------------------------------------------------------
 void record_expert_activation_kunpeng(at::Tensor experts_offset,  // [num_local_experts + 1] int32
                                       at::Tensor counter,         // [num_layers * num_local_experts] int64

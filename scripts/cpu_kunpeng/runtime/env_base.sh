@@ -238,7 +238,9 @@ else
 fi
 
 export SGLANG_KUNPENG_MOE_TOKEN_MULTIPLE=2
-export SGLANG_KUNPENG_SAVE_AT_TRACE=0 # set 1 to open record experts activation number
+# DeepSeek redundant-expert (1.5 experts/rank) offline pipeline only; leave
+# disabled for other models (use the EPLB expert-distribution recorder instead).
+export SGLANG_KUNPENG_SAVE_AT_TRACE=0
 # ------------------------------------------------------------
 # Load local config
 # ------------------------------------------------------------
