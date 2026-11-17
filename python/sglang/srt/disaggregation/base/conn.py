@@ -36,7 +36,9 @@ class KVArgs:
     pp_rank: int
     prefill_start_layer: int
     # Main-model layers owned by this prefill stage, excluding appended draft KV.
-    prefill_num_layers: int
+    # None when the KV pool does not expose a layer count (e.g. pools without
+    # `end_layer`); receivers then fall back to the legacy rank-index mapping.
+    prefill_num_layers: Optional[int]
     # for pp decode (start layer of the decode-side KV pool that dst_kv_ptrs points to)
     decode_start_layer: int
     # Main-model layers in the decode-side pool, excluding appended draft KV.

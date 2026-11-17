@@ -13,6 +13,8 @@
 # ==============================================================================
 """TokenizerManager is a process that tokenizes the text."""
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import dataclasses
@@ -24,6 +26,7 @@ import signal
 import socket
 import sys
 import threading
+from array import array
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -1044,12 +1047,15 @@ class TokenizerManager(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
-        input_ids: List[int],
+        input_ids: Optional[List[int]],
         input_embeds: Optional[Union[List[float], None]] = None,
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        input_ids_arr: Optional[array[int]] = (
+            array("q", input_ids) if input_ids is not None else None
+        )
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -1077,7 +1083,7 @@ class TokenizerManager(
 
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text,
-                input_ids,
+                input_ids_arr,
                 mm_inputs,
                 sampling_params,
                 obj.return_logprob,
@@ -1117,12 +1123,12 @@ class TokenizerManager(
                 and obj.embed_override_token_id is not None
             ):
                 positional_embed_overrides = self._resolve_embed_overrides(
-                    input_ids, obj.embed_override_token_id, obj.embed_overrides
+                    input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
                 )
 
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text,
-                input_ids,
+                input_ids_arr,
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
@@ -1143,7 +1149,7 @@ class TokenizerManager(
 
     @staticmethod
     def _resolve_embed_overrides(
-        input_ids: List[int],
+        input_ids: array[int],
         token_id: int,
         embeds: List[torch.Tensor],
     ) -> PositionalEmbeds:
@@ -1558,7 +1564,15 @@ class TokenizerManager(
                         pass
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
-        if not abort_all and rid not in self.rid_to_state:
+        # Empty rid would startswith-match every request on the scheduler.
+        if not abort_all and not rid:
+            logger.warning("Ignore abort_request with empty rid and abort_all=False")
+            return
+        if (
+            not abort_all
+            and self.server_args.tokenizer_worker_num == 1
+            and rid not in self.rid_to_state
+        ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
@@ -1813,7 +1827,7 @@ class TokenizerManager(
                     self.server_args.incremental_streaming_output and is_stream
                 )
                 delta_text = recv_obj.output_strs[i]
-                delta_output_ids = recv_obj.output_ids[i]
+                delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
                 state.output_ids.extend(delta_output_ids)
@@ -1856,7 +1870,7 @@ class TokenizerManager(
                 incremental = (
                     self.server_args.incremental_streaming_output and is_stream
                 )
-                delta_output_ids = recv_obj.output_ids[i]
+                delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
 
