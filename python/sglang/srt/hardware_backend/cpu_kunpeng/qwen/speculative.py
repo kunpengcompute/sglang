@@ -4,22 +4,22 @@ import os
 
 import torch
 
-from sglang.srt.graph import is_capturing, ops
+from sglang.srt.graph import ops
 
 # Fused verify recurrence (one native call per (layer, batch) instead of one
 # single-token decode per speculative step plus a full state snapshot per
 # step). SGLANG_KUNPENG_GDN_VERIFY_FUSED=0 restores the per-step path.
 _FUSED_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_FUSED", "1") == "1"
 
-# TileLang replacement for the fused C++ kernel. It is a plain Python call with
-# no GraphOpRegistry dispatch symbol, so enabling it also disables TARGET_VERIFY
-# graph capture (see graph_provider.unsupported_reason).
+# TileLang replacement for the fused C++ kernel. Its compiled entry is
+# registered into common_ops by shape (tilelang_gdn_verify.register_tilelang_verify)
+# so TARGET_VERIFY keeps using the common graph.
 _TILELANG_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_TILELANG", "0") == "1"
 
 if _TILELANG_VERIFY:
     print(
         "[QwenVerify] SGLANG_KUNPENG_GDN_VERIFY_TILELANG=1: GDN verify uses the "
-        "TileLang kernel and TARGET_VERIFY is NOT graph-captured.",
+        "TileLang kernel (graph replay enabled).",
         flush=True,
     )
 
@@ -37,10 +37,6 @@ if not _FUSED_VERIFY:
 
 def verify_fused_enabled() -> bool:
     return _FUSED_VERIFY
-
-
-def tilelang_verify_enabled() -> bool:
-    return _TILELANG_VERIFY
 
 
 def verify_conv(x, state, weight, cache_indices, checkpoints, checkpoint_indices):
@@ -87,25 +83,33 @@ def verify_gdn(
 ):
     batch = cache_indices.numel()
     if _TILELANG_VERIFY:
-        from .tilelang_gdn_verify import gdn_verify as tilelang_gdn_verify
+        from . import tilelang_gdn_verify
 
-        assert not is_capturing(), "TileLang GDN verify cannot be graph-captured"
         assert checkpoints.shape[1] == steps, "checkpoint block must match steps"
-        # Same fused-projection views as the C++ kernel, but the TileLang
-        # kernel reads contiguous tiles, so q/k and a/b are repacked inside it.
+        # q/k/v are slices of the fused qkv row and a/b keep their strided
+        # projection partitions. The TileLang kernel reads contiguous tiles, so
+        # repack here: both ops are ordinary ATen nodes, recorded and replayed
+        # by the common graph like any other eager cat/clone.
         q = q.reshape(-1, q.shape[-2], q.shape[-1])
         k = k.reshape(-1, k.shape[-2], k.shape[-1])
         v = v.reshape(-1, v.shape[-2], v.shape[-1])
         a = a.reshape(-1, a.shape[-1])
         b = b.reshape(-1, b.shape[-1])
-        output = tilelang_gdn_verify(
+        qk = torch.cat((q, k), dim=1)
+        ab = torch.cat((a, b), dim=1)
+        v = v.contiguous()
+        # Compiling must not leak its own torch calls into the captured graph.
+        with torch._C._DisableTorchDispatch():
+            tilelang_gdn_verify.prepare(
+                A_log, dt_bias, qk, v, ab, state, cache_indices, checkpoints,
+                checkpoint_indices,
+            )
+        output = ops.qwen_gdn_verify_tilelang(
             A_log,
             dt_bias,
-            q,
-            k,
+            qk,
             v,
-            a,
-            b,
+            ab,
             state,
             cache_indices,
             checkpoints,

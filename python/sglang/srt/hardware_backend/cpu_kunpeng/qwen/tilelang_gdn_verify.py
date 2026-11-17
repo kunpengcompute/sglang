@@ -8,12 +8,15 @@ Experimental replacement for the C++ SVE kernel behind
 ``[tokens, 2 * v_heads, value_dim]``, whose second half the kernel never reads.
 
 The kernel is compiled per concrete shape, because tilelang bakes every tensor
-shape into the generated code. TARGET_VERIFY therefore has to run eagerly while
-this is enabled: the operator is a plain Python call and has no
-GraphOpRegistry dispatch symbol, so it cannot be replayed inside a captured
-graph (see ``graph_provider.unsupported_reason``).
+shape into the generated code. Its ``extern "C" void call(uint8_t* ...)`` entry
+is registered into ``common_ops`` by shape so ``qwen_gdn_verify_tilelang`` can
+be replayed by the common graph through ``qwen_graph_gdn_verify_tilelang_dispatch``
+(``sgl-kernel/csrc/cpu/cpu_kunpeng/qwen/qwen_tilelang_gdn_verify.cpp``). The
+graph planner owns every buffer: ``QK``/``V``/``AB`` are ordinary captured
+``aten`` cat/clone nodes, ``Checkpoints``/``State`` stay bound model tensors.
 """
 
+import ctypes
 import math
 from functools import lru_cache
 
@@ -26,6 +29,10 @@ _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: False,
 }
+
+_bridge = None
+_register_call = None
+_registered = set()
 
 
 def _gdn_verify_kernel(batch, steps, q_heads, v_heads, key_dim, value_dim,
@@ -164,33 +171,95 @@ def _compiled(batch, steps, q_heads, v_heads, key_dim, value_dim, state_slots,
     )
     prim = _gdn_verify_kernel(batch, steps, q_heads, v_heads, key_dim,
                               value_dim, state_slots, ckpt_slots)
-    return tilelang.compile(prim, out_idx=[9], target='pto',
-                            pass_configs=_PASS_CONFIGS)
+    kernel = tilelang.compile(prim, out_idx=[9], target='pto',
+                              pass_configs=_PASS_CONFIGS)
+    # Keep the ctypes handle alive next to the kernel; replay calls its raw
+    # `call` entry directly, without the cython wrapper.
+    lib = getattr(kernel.adapter, "lib", None)
+    if lib is None:
+        lib = ctypes.CDLL(kernel.adapter.lib_generator.libpath)
+    if not hasattr(lib, "call"):
+        raise RuntimeError("TileLang GDN verify library has no 'call' entry")
+    return kernel, lib
 
 
-def gdn_verify(A_log, dt_bias, q, k, v, a, b, state, indices, checkpoints,
-               ckpt_indices):
-    """Same contract as ``ops.qwen_gdn_verify``: returns O, writes checkpoints."""
-    batch = indices.numel()
-    steps = checkpoints.shape[1]
-    tokens = q.shape[0]
-    assert tokens == batch * steps, "tokens must be batch * steps"
-    q_heads, key_dim = q.shape[1], q.shape[2]
-    v_heads, value_dim = v.shape[1], v.shape[2]
-    assert v_heads % q_heads == 0
+def _shape_key(qk, v, state, indices, checkpoints):
+    return (
+        int(indices.numel()),
+        int(checkpoints.shape[1]),
+        int(qk.shape[1]) // 2,
+        int(v.shape[1]),
+        int(qk.shape[2]),
+        int(v.shape[2]),
+        int(state.shape[0]),
+        int(checkpoints.shape[0]),
+    )
+
+
+def _check(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
+           ckpt_indices):
     assert A_log.dtype == state.dtype == checkpoints.dtype == torch.float32
     assert indices.dtype == ckpt_indices.dtype == torch.int32
-    assert all(t.dtype == torch.bfloat16 for t in (dt_bias, q, k, v, a, b))
+    assert all(t.dtype == torch.bfloat16 for t in (dt_bias, qk, v, ab))
     # The persistent state is read-only and never copied, so it must already be
     # laid out the way the kernel addresses it.
     assert all(t.is_contiguous() for t in (state, indices, checkpoints, ckpt_indices))
 
-    # q/k and a/b are strided partitions of the fused projection rows; the
-    # kernel reads contiguous tiles only.
-    qk = torch.cat((q, k), dim=1)
-    ab = torch.cat((a, b), dim=1)
-    func = _compiled(batch, steps, q_heads, v_heads, key_dim, value_dim,
-                     state.shape[0], checkpoints.shape[0])
-    return func(A_log.contiguous(), dt_bias.contiguous(), qk, v.contiguous(),
-                ab, state, indices.contiguous(), checkpoints,
-                ckpt_indices.contiguous())
+
+def prepare(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
+            ckpt_indices):
+    """Compile this shape and publish its entry to the graph dispatcher."""
+    key = _shape_key(qk, v, state, indices, checkpoints)
+    kernel, lib = _compiled(*key)
+    if key not in _registered:
+        if _bridge is None:
+            raise RuntimeError(
+                "TileLang GDN verify graph dispatch is not registered; "
+                "SGLANG_KUNPENG_GDN_VERIFY_TILELANG requires a rebuilt sgl-kernel"
+            )
+        _register_call(*key, ctypes.cast(lib.call, ctypes.c_void_p))
+        _registered.add(key)
+    return kernel
+
+
+def gdn_verify(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
+               ckpt_indices):
+    """Packed-input form used by both eager and graph replay.
+
+    ``qk`` is ``[tokens, 2 * q_heads, key_dim]`` and ``ab`` is
+    ``[tokens, 2 * v_heads]``; the caller repacks the strided projections
+    (captured as ordinary ATen nodes when replaying from a graph).
+    """
+    _check(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
+           ckpt_indices)
+    kernel = prepare(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
+                      ckpt_indices)
+    return kernel(A_log.contiguous(), dt_bias.contiguous(), qk,
+                  v.contiguous(), ab, state, indices.contiguous(),
+                  checkpoints, ckpt_indices.contiguous())
+
+
+def _shape(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
+           ckpt_indices):
+    return [(tuple(v.shape), v.dtype)]
+
+
+def register_tilelang_verify(bridge, register_dispatch):
+    """Register the graph op and its C++ replay dispatch into common_ops."""
+    global _bridge, _register_call
+    from sglang.srt.graph import register_op
+
+    try:
+        register_call = bridge.qwen_tilelang_register_gdn_verify
+    except AttributeError as exc:
+        raise RuntimeError(
+            "sgl-kernel is missing the TileLang GDN verify graph dispatch; "
+            "rebuild it from sources that include qwen_tilelang_gdn_verify.cpp"
+        ) from exc
+    register_call.argtypes = [ctypes.c_int64] * 8 + [ctypes.c_void_p]
+    register_call.restype = None
+    _register_call = register_call
+    _bridge = bridge
+    register_op("qwen_gdn_verify_tilelang", _shape, gdn_verify)
+    register_dispatch(bridge, "qwen_gdn_verify_tilelang",
+                      "qwen_graph_gdn_verify_tilelang_dispatch")

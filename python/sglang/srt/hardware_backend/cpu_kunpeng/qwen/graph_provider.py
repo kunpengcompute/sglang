@@ -53,12 +53,6 @@ class QwenHybridGraphProvider:
             return "forward_mode"
         tokens = fb.input_ids.numel()
         if fb.forward_mode.is_target_verify():
-            from .speculative import tilelang_verify_enabled
-
-            if tilelang_verify_enabled():
-                # The TileLang GDN verify kernel is a plain Python call with no
-                # GraphOpRegistry dispatch symbol, so it cannot be replayed.
-                return "tilelang_gdn_verify"
             # Verify rows are batch_size * draft_token_num; `rowwise_gqa`
             # chunks them, so only the declared batch and total row capacity
             # bound the graph.
