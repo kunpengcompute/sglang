@@ -153,7 +153,7 @@ curl --location 'http://127.0.0.1:8000/start_expert_distribution_record'
 curl --location 'http://127.0.0.1:8000/dump_expert_distribution_record'
 ```
 
-导出文件为`expert_distribution_recorder_<timestamp>.pt`，内容是按层聚合的`logical_count`。采集支持eager和graph replay；ETP仅group leader计数，PP仅全局rank 0写文件，MTP只统计target模型。
+导出文件为`expert_distribution_recorder_<timestamp>.pt`，内容是按层聚合的`logical_count`和padding热度`pad_logical_count`。采集支持eager和graph replay；ETP仅group leader计数，PP仅全局rank 0写文件。MTP开启时draft自动使用独立行采集，无需额外开关（见下）。
 
 3. 将同一个`.pt`文件分发到全部decode节点，关闭recorder并配置静态导入后重启：
 
@@ -164,7 +164,12 @@ export INIT_EXPERT_LOCATION=/home/xxxx/eplb/expert_distribution_recorder_<timest
 # 不再设置EXPERT_DISTRIBUTION_RECORDER_MODE；EPLB_ALGORITHM缺省为auto
 ```
 
-静态导入会跳过按trivial布局生成的`experts_etp{N}`目录，必须保留原始`experts/`整专家权重，由loader按新映射加载并执行ETP切分。NextN draft不参与热度采集，其权重、HBW和路由统一复用target最后一层映射。该流程只在重启时生效，不进行在线权重或专家位置更新。
+静态导入会跳过按trivial布局生成的`experts_etp{N}`目录，必须保留原始`experts/`整专家权重，由loader按新映射加载并执行ETP切分。该流程只在重启时生效，不进行在线权重或专家位置更新。
+
+#### padding热度与MTP独立行
+
+- padding热度：`prepare_mlp_sync_batch`为对齐token数补出的padding行，其topk会被负载均衡改写成低负载专家，混入会污染真实热点。采集侧由`record_padded_expert_activation_kunpeng`只统计`topk_ids[num_token_non_padded:]`并记入`pad_logical_count`；多个attn-TP rank冗余持有同一batch时仅`use_sp`或`attn_tp_rank==0`记录，避免重复计数。导入前必须经merge脚本逐层`logical_count -= pad_logical_count`（负值截断并告警）；`--keep-padding`仅用于排查，不扣除。正常情况下target各层扣除后应接近均匀，若某行仍明显偏热且与空转DP的padding模式吻合，优先确认dump是否来自旧版本。
+- MTP独立行：MTP开启时自动生效（kunpeng_cpu且`speculative_algorithm==EAGLE`（NEXTN归一化）、`num_nextn_predict_layers>0`），metadata末尾追加一行draft行（`num_layers`=target层数+1），draft的权重加载、HBW分配、路由和热度全部使用该行，target各层不再混入draft热度；MTP多个step的热度都累计在这一行。导入旧N行布局的heat/map时末行自动复制target最后一行作为初始放置；MTP关闭时导入带draft行的N+1行文件会自动丢弃末尾draft行。两个方向都可直接导入，其他行数会报错。该行为无需环境变量开关。
 
 ### 无 HTTP 的自动采集与离线合并（PP 临时流程）
 
@@ -176,7 +181,7 @@ export EXPERT_DISTRIBUTION_RECORDER_MODE=stat
 export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=/home/xxxx/eplb/raw
 ```
 
-recorder随server自动启动，不需要调用start/stop/dump HTTP端点。target模型每次非idle forward结束后，仅ETP group leader把本次热度累加到本地汇总，并覆盖写`expert_distribution_recorder_rank_<world_rank>.pt`中的最新累计快照；普通EP仍由每个rank写出，draft、idle和ETP peer不写。每个leader固定只有一个文件，不保存逐forward历史，因此文件数量不随请求数增长，单个文件也只包含有效热度而不包含循环缓冲区中的空槽。该路径不做`all_reduce`或指标broadcast，因此不存在PP间dump同步。记录中的`forward_id`只用于本rank排查，不同DP的forward编号不要求对齐，离线合并时直接累加各leader的最新快照。
+recorder随server自动启动，不需要调用start/stop/dump HTTP端点。每次forward（含idle）结束后：ETP group leader把本次热度累加到本地汇总并覆盖写`expert_distribution_recorder_rank_<world_rank>.pt`；非leader rank若本轮持有padding计数（它是本DP副本的attn-TP leader）同样写盘，其热度为0、只含pad计数供merge扣除；MTP开启时draft worker也按此规则写盘；普通EP由每个rank写出。全部计数为零的idle forward跳过dump，避免空转server刷出零文件；只要本轮heat或pad非零就落盘，因此`BUFFER_SIZE=1`时不会再有idle段被下一次forward覆盖丢失。每个rank固定只有一个文件，不保存逐forward历史，文件数量不随请求数增长，单个文件只包含有效热度而不含循环缓冲区空槽。该路径不做`all_reduce`或指标broadcast，因此不存在PP间dump同步。记录中的`forward_id`只用于本rank排查，不同DP的forward编号不要求对齐，离线合并时直接累加各rank的最新快照。
 
 数据集跑完后，等所有rank文件落盘，再合并成现有静态导入格式：
 
@@ -186,7 +191,15 @@ python scripts/cpu_kunpeng/analysis/merge_expert_distribution.py \
     --output /home/xxxx/eplb/expert_distribution_recorder_merged.pt
 ```
 
-将合并后的文件按上一节方式分发并导入。每个rank文件在每次dump时整体覆盖为最新累计快照，文件大小不随forward轮数增长；重新调用start_record会清空该rank的本地累计。
+将合并后的文件按上一节方式分发并导入。每个rank文件在每次dump时整体覆盖为最新累计快照，文件大小不随forward轮数增长；重新调用start_record会清空该rank的本地累计。合并后可用`python scripts/cpu_kunpeng/analysis/analyze_expert_heat.py --input <merged.pt>`输出每层热点汇总CSV、层×专家矩阵和热力图。
+
+#### 计数、缓冲区与dump语义
+
+- 计数器：C++侧计数器在每个forward内持续累加；`on_forward_pass_start`记录本forward起点，`collect()`返回"本forward增量"，即缓冲区存的是增量而非累计值。
+- 缓冲区：`EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE`是增量槽数，`1`为单槽（每次append覆盖上一槽），`N>1`为环形窗口（最多保留最近N个forward的增量，超出覆盖最旧），负数为不设上限的增长缓冲。
+- dump：把缓冲内所有槽求和（物理计数先转逻辑计数）→本地模式累加到进程内`_local_*_count`→整体覆盖写文件→`_reset()`清空缓冲并清零计数器。因此文件内容是"自record开始以来的累计快照"，磁盘不会追加历史。
+- 示例：某专家连续三次forward的增量为a、b、c。`BUFFER_SIZE=1`且逐forward auto-dump时，缓冲依次为`a`、`b`、`c`，磁盘依次为`a`、`a+b`、`a+b+c`；若一直不dump，单槽只剩`c`，a、b已丢失。`BUFFER_SIZE=3`且不dump时缓冲为`[a,b,c]`，dump时求和写盘`a+b+c`；超过3个forward不dump才覆盖最旧槽。
+- 手动HTTP与auto-dump：手动`dump_expert_distribution_record`走集合通信，全部rank参与`all_reduce`，仅全局rank 0写一个`expert_distribution_recorder_<timestamp>.pt`（内容含全局汇总与`pad_logical_count`）；auto-dump逐rank写`expert_distribution_recorder_rank_<rank>.pt`、无同步，靠离线merge累加。两者dump后都会清空缓冲并重置计数，不要混用同一目录下的产物。
 
 ## 4. 性能与调优（32p-etp8实测，DSV3，单请求1kin/128out/MTP1）
 
