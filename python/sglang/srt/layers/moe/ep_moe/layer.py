@@ -848,9 +848,8 @@ class KunpengMoE(FusedMoE):
             kunpeng.record_expert_activation_kunpeng(
                 dispatch_output.recv_experts_offset,
                 recorder_counter,
-                # NextN (MTP draft) layers record into the target's last
-                # MoE-layer row via `record_layer_id` (see
-                # Glm4MoeSparseMoeBlock); all other layers use layer_id.
+                # NextN layers use `record_layer_id` (draft row or the target's
+                # last layer; see Glm4MoeSparseMoeBlock/DeepseekV2MoE).
                 getattr(self, "record_layer_id", self.layer_id),
                 num_local_experts,
             )

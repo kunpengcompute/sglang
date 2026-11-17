@@ -14,6 +14,7 @@
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
 
+import contextlib
 import logging
 import os
 from typing import Iterable, Optional, Tuple
@@ -292,7 +293,21 @@ class DeepseekModelNextN(nn.Module):
         # step 0 sees None and recomputes via should_run_indexer's NextN
         # fallback, later steps reuse the published step-0 top-k).
         index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
-        with get_global_expert_distribution_recorder().disable_this_region():
+        # Dedicated MTP row: record draft heat/pad; otherwise keep it excluded.
+        record_draft = False
+        if _is_cpu_920f and get_global_server_args().moe_a2a_backend == "kunpeng_cpu":
+            from sglang.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            metadata = get_global_expert_location_metadata()
+            record_draft = metadata is not None and metadata.has_draft_layer
+        record_ctx = (
+            contextlib.nullcontext()
+            if record_draft
+            else get_global_expert_distribution_recorder().disable_this_region()
+        )
+        with record_ctx:
             hidden_states, residual, topk_indices = self.decoder(
                 positions,
                 hidden_states,
