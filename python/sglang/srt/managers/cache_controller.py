@@ -1543,6 +1543,51 @@ class HiCacheController:
                 return False
         return self.tp_shard_shm is not None
 
+    def _share_group_size(self, kind: str) -> int:
+        """Share group of ``kind`` when that pool lives in a shared segment.
+
+        ``SGLANG_KUNPENG_KV_SHARE_GROUP`` / ``..._INDEXER_SHARE_GROUP`` = 4/8/16
+        make that group's ranks write ONE physical L1 pool, so a staged region
+        has to be scattered once per group instead of once per rank. 0 = private
+        L1 (baseline) or a group that does not divide this TP shard / does not
+        place this rank where the shard expects it, in which case the per-rank
+        scatter is kept.
+        """
+        try:
+            from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
+                get_share_group,
+                get_share_state,
+            )
+        except Exception:
+            return 0
+        state = get_share_state(kind)
+        if not state["enabled"]:
+            return 0
+        group = int(get_share_group(kind))
+        shards = int(self.tp_shard_nranks)
+        if group <= 1 or group > shards or shards % group != 0:
+            logger.warning(
+                "[hicache] tp-shard: ignoring share group %d of the %s pool "
+                "(TP shard has %d rank(s)); keeping the per-rank scatter",
+                group,
+                kind,
+                shards,
+            )
+            return 0
+        my = int(self.tp_rank) % shards
+        if int(state["intra_group_rank"]) != my % group:
+            logger.warning(
+                "[hicache] tp-shard: rank %d sits at intra=%d of the %s share "
+                "group but the TP shard expects intra=%d; keeping the per-rank "
+                "scatter",
+                my,
+                int(state["intra_group_rank"]),
+                kind,
+                my % group,
+            )
+            return 0
+        return group
+
     def _init_tp_shard(self):
         """One segment per (node, DP rank); one page-interleaved region per rank."""
         import hashlib
@@ -1568,7 +1613,9 @@ class HiCacheController:
         )
         self.tp_shard_last_seq = [0] * self.tp_shard_slots
         self.tp_shard_no_ack_wait = False
-        # Per-rank pub/ack/mask triplets for the KV and index-K shards.
+        # Per-rank pub/ack/mask triplets for the KV and index-K shards, plus one
+        # (seq, ok) record per rank and kind of the shared-L1 barrier (see
+        # ``_shard_grp_sync``): 16 bytes each -> 32 * n.
         n = self.tp_shard_nranks
         self.tp_shard_pub_off = 64
         self.tp_shard_ack_off = 64 + 8 * n
@@ -1576,7 +1623,24 @@ class HiCacheController:
         self.tp_shard_idx_pub_off = 64 + 24 * n
         self.tp_shard_idx_ack_off = 64 + 32 * n
         self.tp_shard_idx_mask_off = 64 + 40 * n
-        self.tp_shard_data_off = 64 + 48 * n
+        self.tp_shard_grp_off = 64 + 48 * n
+        self.tp_shard_idx_grp_off = self.tp_shard_grp_off + 16 * n
+        self.tp_shard_data_off = self.tp_shard_idx_grp_off + 16 * n
+        # Share group of [KV, index-K] when that pool is shared in THIS process
+        # (SGLANG_KUNPENG_{KV,INDEXER}_SHARE_GROUP=4/8/16); 0 = private L1, in
+        # which case every rank still scatters every region (baseline).
+        self.tp_shard_share_g = [
+            self._share_group_size("kv"),
+            self._share_group_size("indexer"),
+        ]
+        if any(self.tp_shard_share_g):
+            logger.info(
+                "[hicache] tp-shard shared-L1: kv_group=%d idx_group=%d "
+                "(nranks=%d); each region is scattered once per share group",
+                self.tp_shard_share_g[0],
+                self.tp_shard_share_g[1],
+                n,
+            )
         self.tp_shard_idx_page_bytes = 0
         if self.indexer_page_elems and self.flat_read_idx is not None:
             self.tp_shard_idx_page_bytes = (
@@ -1593,10 +1657,12 @@ class HiCacheController:
         key = hashlib.md5(
             f"{socket.gethostname()}:{os.environ.get('SGLANG_DP_RANK', '0')}".encode()
         ).hexdigest()[:12]
-        # Geometry is part of the name: never attach a stale segment.
+        # Geometry is part of the name: never attach a stale segment. ``_v2``
+        # also covers the header growth of the shared-L1 barrier, whose 32*n
+        # bytes can be lost in the KB-truncated slot size.
         name = (
             f"sgk_hicache_shard_{key}_{self.tp_shard_slot_bytes >> 10}K"
-            f"_s{self.tp_shard_slots}"
+            f"_s{self.tp_shard_slots}_v2"
         )
         size = self.tp_shard_slots * self.tp_shard_slot_bytes
         try:
@@ -1659,7 +1725,7 @@ class HiCacheController:
         if _hicache_debug():
             logger.info(
                 "[hicache] tp-shard: %s rank=%d slots=%d/%d pages=%d "
-                "page=%dB idx=%dB timeout=%.0fs",
+                "page=%dB idx=%dB timeout=%.0fs share_group=kv%d/idx%d",
                 name,
                 self.tp_rank,
                 self.tp_shard_slots,
@@ -1668,6 +1734,8 @@ class HiCacheController:
                 self.tp_shard_page_bytes,
                 self.tp_shard_idx_page_bytes,
                 self.tp_shard_timeout,
+                self.tp_shard_share_g[0],
+                self.tp_shard_share_g[1],
             )
         # Warm up every slot: the segment itself is the barrier (each rank waits
         # for all peers to publish the sentinel seq before touching regions,
@@ -1912,13 +1980,23 @@ class HiCacheController:
         self, operation, slot, seq, batch_idx, pages, layers, views, starts,
         page_size, idx=False,
     ):
-        """Copy every published region into L1; returns (ok, hit_pages)."""
+        """Copy the published regions into L1; returns (ok, hit_pages).
+
+        Private L1 (share group 0): every rank scatters all ``nranks`` regions,
+        i.e. it copies ``(nranks - 1)/nranks`` of the batch from its peers.
+        Shared L1 (SGLANG_KUNPENG_{KV,INDEXER}_SHARE_GROUP = 4/8/16): the group's
+        ranks write ONE physical pool, so a region is scattered by its owner
+        when it belongs to my group and by exactly one member of my group
+        otherwise; ``_shard_grp_sync`` replaces the local completion because the
+        pool is only complete once every member wrote its share.
+        """
         nranks = self.tp_shard_nranks
         my = int(self.tp_rank) % nranks
         order = [(my + k) % nranks for k in range(nranks)]
         tag = "tp-shard idx" if idx else "tp-shard"
         fail = f"[hicache] {tag} fallback: req=%s batch=%d rank=%d"
         gone = f"[hicache] {tag} recycled: req=%s batch=%d rank=%d"
+        group = getattr(self, "tp_shard_share_g", [0, 0])[1 if idx else 0]
         masks = [0] * nranks
         ok_all = True
         for r in order:
@@ -1928,6 +2006,8 @@ class HiCacheController:
                 ok_all = False
                 break
             masks[r] = mask
+            if not self._shard_mine(r, my, group):
+                continue
             n_r = self._shard_page_count(r, pages)
             if not n_r:
                 continue
@@ -1939,6 +2019,17 @@ class HiCacheController:
                 logger.warning(gone, operation.request_id, batch_idx, r)
                 ok_all = False
                 break
+        if group > 0:
+            ok_all = self._shard_grp_sync(slot, seq, my, group, ok_all, idx)
+            if not ok_all:
+                logger.warning(
+                    "[hicache] %s shared-L1 barrier failed: req=%s batch=%d "
+                    "rank=%d; the group reads the full batch per rank instead",
+                    tag,
+                    operation.request_id,
+                    batch_idx,
+                    my,
+                )
         hit_pages = 0
         if ok_all:
             hit_pages = pages
@@ -1947,6 +2038,79 @@ class HiCacheController:
                     hit_pages = j
                     break
         return ok_all, hit_pages
+
+    def _shard_mine(self, rank: int, my: int, group: int) -> bool:
+        """Whether THIS rank scatters region ``rank`` into its L1 pool.
+
+        ``group == 0``: private pool, every rank needs every region.
+        Otherwise my group owns one physical pool: a region of my own group is
+        scattered by its owner only, and a region of another group by exactly one
+        member of my group, so the group pays one scatter per region instead of
+        ``group``. The assignment is a pure function of the rank ids, so every
+        member computes the same split without any handshake.
+        """
+        if group <= 0:
+            return True
+        gbase = (my // group) * group
+        if gbase <= rank < gbase + group:
+            return rank == my
+        nranks = self.tp_shard_nranks
+        foreign = [r for r in range(nranks) if not (gbase <= r < gbase + group)]
+        return foreign.index(rank) % group == my - gbase
+
+    def _shard_grp_sync(self, slot, seq, my, group, my_ok, idx=False) -> bool:
+        """Shared-L1 barrier: publish my status, wait for the group, return all-ok.
+
+        A rank may only report the batch as prefetched once every member wrote
+        its share of the shared pool. Any failure (publish timeout, recycled
+        region, barrier timeout) makes the WHOLE group fall back to the per-rank
+        full read: serving a partially written shared pool would read stale KV.
+        """
+        self._shard_grp_publish(slot, my, seq, my_ok, idx)
+        gbase = (my // group) * group
+        pending = {r for r in range(gbase, gbase + group) if r != my}
+        ok = my_ok
+        deadline = time.monotonic() + self.tp_shard_timeout
+        while pending:
+            for r in list(pending):
+                ready, ok_r = self._shard_grp_read(slot, r, seq, idx)
+                if ready:
+                    pending.discard(r)
+                    ok = ok and ok_r
+            if not pending:
+                break
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "[hicache] tp-shard group barrier timeout: slot=%d seq=%d, "
+                    "%d/%d rank(s) pending=%s",
+                    slot,
+                    seq,
+                    len(pending),
+                    group - 1,
+                    sorted(pending),
+                )
+                return False
+            time.sleep(0.0005)
+        return ok
+
+    def _shard_grp_publish(self, slot, rank, seq, ok, idx=False):
+        """Publish the (seq, ok) record of one rank; ``seq`` is written LAST."""
+        import struct
+
+        off = self.tp_shard_idx_grp_off if idx else self.tp_shard_grp_off
+        base = slot * self.tp_shard_slot_bytes + off + 16 * rank
+        struct.pack_into("<Q", self.tp_shard_shm.buf, base + 8, 1 if ok else 0)
+        struct.pack_into("<Q", self.tp_shard_shm.buf, base, seq)
+
+    def _shard_grp_read(self, slot, rank, seq, idx=False):
+        """``(published this seq, ok)`` of one rank's shared-L1 record."""
+        import struct
+
+        off = self.tp_shard_idx_grp_off if idx else self.tp_shard_grp_off
+        base = slot * self.tp_shard_slot_bytes + off + 16 * rank
+        if struct.unpack_from("<Q", self.tp_shard_shm.buf, base)[0] != seq:
+            return False, False
+        return True, struct.unpack_from("<Q", self.tp_shard_shm.buf, base + 8)[0] != 0
 
     def _l1l3_read_scatter_batch(self, batch_hashes, batch_indices, prefix_keys):
         """Read one whole batch per-rank from L3 and scatter it into L1.
@@ -1998,9 +2162,10 @@ class HiCacheController:
         return hit_pages
 
     def _page_transfer_l1l3_shard(self, operation):
-        """Cooperative L3 -> L1 read: rank r fetches pages r, r+nranks, ... and
-        every rank copies all regions into its own L1; only the leading run of
-        hits is published, after its bytes landed in L1.
+        """Cooperative L3 -> L1 read: rank r fetches pages r, r+nranks, ..., and
+        the regions are scattered into L1 (all of them per rank when the L1 pool
+        is private, one share per rank when the pool is shared by a group); only
+        the leading run of hits is published, after its bytes landed in L1.
         """
         import zlib
 
