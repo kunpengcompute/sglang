@@ -76,10 +76,11 @@ Not done yet (next steps, do NOT assume):
    are untouched: every rank still sizes its pools as if it were going to
    allocate the whole thing.
 5. PD disaggregation (D9): one RDMA copy of each shared pool is enough, split
-   into two disjoint layer shards received by intra-group rank 0 and rank
-   ``group_size // 2`` (opposite NUMA halves). KV and index-K are sharded by
-   their OWN group; see ``pd_kv_shard_spec()`` / ``pd_indexer_shard_spec()``;
-   the wire protocol lives in ``disaggregation/mooncake/conn.py``.
+   into ``group_size`` disjoint layer shards with one shard per intra-group
+   rank, so every member receives ``1/group_size`` of the copy. KV and index-K
+   are sharded by their OWN group; see ``pd_kv_shard_spec()`` /
+   ``pd_indexer_shard_spec()``; the wire protocol lives in
+   ``disaggregation/mooncake/conn.py``.
 """
 
 from __future__ import annotations
@@ -306,45 +307,30 @@ def get_kv_share_state() -> Dict[str, Any]:
     return get_share_state(POOL_KIND_KV)
 
 
-#: PD disaggregation: with a shared pool enabled on decode, the pool's layers
-#: are split into this many disjoint contiguous shards, each received by a
-#: different rank over RDMA. Fixed at two; see ``pd_shard_spec``.
-PD_SHARD_COUNT: int = 2
-PD_KV_SHARD_COUNT: int = PD_SHARD_COUNT
-
-
 def pd_shard_spec(kind: str = POOL_KIND_KV) -> Optional[Tuple[int, int]]:
-    """``(shard_id, PD_SHARD_COUNT)`` for this rank's PD transfer of ``kind``.
+    """``(shard_id, shard_count)`` for this rank's PD transfer of ``kind``.
 
     With a shared pool enabled, one RDMA copy of that pool is enough because
-    every rank maps the same POSIX shm segment. Splitting that copy by layer
-    across two ranks raises the available transfer bandwidth and keeps the two
-    writers on opposite NUMA halves of the group: rank 0 owns the first half of
-    the layers, rank ``group_size // 2`` owns the second half.
+    every rank of the group maps the same POSIX shm segment. That copy is split
+    by layer across the WHOLE group -- shard ``intra + 1`` of ``group_size`` --
+    so each member writes a disjoint layer range into the shared pool and the
+    per-rank transfer volume is ``1/group_size`` of a full copy, the same shape
+    as the L3 -> L1 TP shard. ``None`` means the pool is not shared and every
+    rank needs a full copy.
 
-    ``shard_id == 0`` means this rank receives NO data of that kind (it still
-    receives its private aux metadata). ``None`` means the pool is not shared
-    and every rank needs a full copy.
-
-    Each kind is sharded by its OWN group, so KV sharding and index-K sharding
-    are decided independently. Shards are disjoint and their union covers every
-    layer by construction of :func:`pd_layer_shard_range`.
+    Shards are disjoint and their union covers every layer by construction of
+    :func:`pd_layer_shard_range`; a shard is empty when the stage has fewer
+    layers than the group has ranks.
     """
     state = get_share_state(kind)
     if not state["enabled"]:
         return None
     group_size = int(state["group_size"])
-    if group_size <= 0 or group_size % PD_SHARD_COUNT != 0:
+    if group_size <= 0:
         raise SharedKvPoolError(
-            f"PD {kind} sharding needs an even share group, got "
-            f"group_size={group_size}"
+            f"PD {kind} sharding needs a share group, got group_size={group_size}"
         )
-    intra = int(state["intra_group_rank"])
-    if intra == 0:
-        return (1, PD_SHARD_COUNT)
-    if intra == group_size // PD_SHARD_COUNT:
-        return (2, PD_SHARD_COUNT)
-    return (0, PD_SHARD_COUNT)
+    return (int(state["intra_group_rank"]) + 1, group_size)
 
 
 def pd_kv_shard_spec() -> Optional[Tuple[int, int]]:
