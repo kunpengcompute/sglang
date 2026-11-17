@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+import zlib
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -52,6 +53,18 @@ logger = logging.getLogger(__name__)
 def _hicache_debug() -> bool:
     """True when per-transfer HiCache tracing is on (SGLANG_HICACHE_DEBUG=1)."""
     return envs.SGLANG_HICACHE_DEBUG.get()
+
+
+def _page_shard_of(key: str, nranks: int) -> int:
+    """Content-addressed shard of a page key.
+
+    The L1 -> L3 backup and the L3 hit query must agree on who owns a page:
+    the backup numbers pages from the node it writes while the query numbers
+    them from the request, so an index-based shard drifts apart and a rank
+    ends up stat-ing pages another rank has not written yet. Hashing the key
+    makes the owner independent of that offset.
+    """
+    return zlib.crc32(key.encode()) % max(1, nranks)
 
 
 # CPU added to SGLANG_KUNPENG_HICACHE_CPU_OFFSET per storage thread.
@@ -695,6 +708,10 @@ class HiCacheController:
             self.storage_config.is_mla_model
             # todo: load balancing
             and self.storage_config.tp_rank != 0
+            # Exception: the two-tier L1 -> L3 layout shards the pages across
+            # the whole attention group, so every rank owns a disjoint share
+            # and skipping any of them would leave that share unwritten.
+            and not (self.l1l3_only and self.storage_config.tp_size > 1)
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -2486,8 +2503,12 @@ class HiCacheController:
                     if hit_page_num < pages:
                         first_miss_page = page_base + hit_page_num
                 else:
+                    # Same content-addressed rule as the L1 -> L3 write, so a
+                    # rank only stats the pages it wrote itself.
                     mine = [
-                        i for i in range(pages) if (page_base + i) % shards == my_shard
+                        i
+                        for i in range(pages)
+                        if _page_shard_of(batch_hashes[i], shards) == my_shard
                     ]
                     if mine:
                         bits = self.storage_backend.batch_exists_bits(
@@ -2746,51 +2767,67 @@ class HiCacheController:
         Runs on the backup thread: the gather is the serial batch kernel (safe
         there), the backend call is zero-copy out of the registered flat buffer.
         ``operation.host_indices`` holds L1 device slots in this mode.
+
+        Pages are sharded across the attention group by ``crc32(page_hash) %
+        tp_size``: every rank owns a disjoint slice, so each page is stored
+        exactly once and the per-rank I/O drops to ``1/tp_size``. The L3 hit
+        query applies the same rule, which keeps a rank stat-ing only the pages
+        it wrote. ``completed_tokens`` still charges the whole batch, so the
+        backup metrics keep counting pages rather than shards.
         """
         debug = _hicache_debug()
         prefix_keys = operation.prefix_keys
         layers = self.mem_pool_device.kv_buffer
         src_indices = operation.host_indices
+        nranks = max(1, int(getattr(self, "tp_size", 1)))
+        my = int(getattr(self, "tp_rank", 0)) % nranks
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             pages = len(batch_hashes)
             batch_indices = src_indices[
                 i * self.page_size : (i + pages) * self.page_size
             ]
+            # Content-addressed shard: same rule as the L3 hit query below.
+            mine = [
+                j
+                for j in range(pages)
+                if _page_shard_of(batch_hashes[j], nranks) == my
+            ]
 
             t_batch_start = time.perf_counter() if debug else 0.0
             if debug:
                 cpu_batch_start, rq_batch_start = _thread_stat()
 
-            hicache_page_flatten_batch(
-                layers,
-                self.flat_write[:pages],
-                self._device_page_starts(batch_indices, pages, "L1->L3"),
-                self.page_size,
-            )
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = all(
-                self.storage_backend.batch_set_flat(
-                    batch_hashes,
-                    [self.flat_write[j] for j in range(pages)],
-                    extra_info,
+            success = True
+            page_starts = None
+            if mine:
+                page_starts = self._device_page_starts(batch_indices, pages, "L1->L3")
+                hicache_page_flatten_batch(
+                    layers,
+                    self.flat_write[: len(mine)],
+                    page_starts[mine],
+                    self.page_size,
                 )
-            )
-            if success and self.indexer_page_elems:
-                page_ids = (
-                    self._device_page_starts(batch_indices, pages, "L1->L3")
-                    // self.page_size
+                success = all(
+                    self.storage_backend.batch_set_flat(
+                        [batch_hashes[j] for j in mine],
+                        [self.flat_write[k] for k in range(len(mine))],
+                        extra_info,
+                    )
                 )
+            if success and page_starts is not None and self.indexer_page_elems:
+                page_ids = page_starts // self.page_size
                 hicache_page_flatten_batch(
                     self._indexer_page_layers(),
-                    self.flat_write_idx[:pages],
-                    page_ids,
+                    self.flat_write_idx[: len(mine)],
+                    page_ids[mine],
                     1,
                 )
                 success = all(
                     self.storage_backend.batch_set_flat(
-                        self._indexer_keys(batch_hashes),
-                        [self.flat_write_idx[j] for j in range(pages)],
+                        self._indexer_keys([batch_hashes[j] for j in mine]),
+                        [self.flat_write_idx[k] for k in range(len(mine))],
                         extra_info,
                     )
                 )
@@ -2799,7 +2836,7 @@ class HiCacheController:
                         "[hicache] L1->flat copy + flat->L3 write (indexer): op=%d, "
                         "%d page(s), device%s, key_suffix=%s, ok=%s",
                         operation.id,
-                        pages,
+                        len(mine),
                         _idx_range(batch_indices),
                         self.indexer_key_suffix,
                         success,
@@ -2810,10 +2847,14 @@ class HiCacheController:
                 cpu_batch_end, rq_batch_end = _thread_stat()
                 cpu_used = cpu_batch_end - cpu_batch_start
                 logger.info(
-                    "[hicache] L1->flat copy + flat->L3 write: op=%d, %d page(s), "
-                    "device%s, done=%d/%d, total=%.3fs, cpu=%.3fs offcpu=%.3fs rqwait=%ss",
+                    "[hicache] L1->flat copy + flat->L3 write: op=%d, %d/%d page(s) "
+                    "shard=%d/%d, device%s, done=%d/%d, total=%.3fs, cpu=%.3fs "
+                    "offcpu=%.3fs rqwait=%ss",
                     operation.id,
+                    len(mine),
                     pages,
+                    my,
+                    nranks,
                     _idx_range(batch_indices),
                     operation.completed_tokens,
                     len(operation.hash_value) * self.page_size,
@@ -2825,13 +2866,14 @@ class HiCacheController:
 
             if not success:
                 logger.warning(
-                    f"Write page to storage: {len(batch_hashes)} pages failed."
+                    f"Write page to storage: {len(mine)} of {pages} page(s) failed."
                 )
                 break
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
-            operation.completed_tokens += self.page_size * len(batch_hashes)
+            # Full batch, not just this rank's shard: the metric counts pages.
+            operation.completed_tokens += self.page_size * pages
 
     def backup_thread_func(self):
         """
