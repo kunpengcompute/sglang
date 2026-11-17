@@ -4,6 +4,21 @@ import os
 def enabled():
     return os.environ.get('SGLANG_USE_CPU_920F') == '1' and os.environ.get('SGLANG_KUNPENG_QWEN') == '1'
 
+
+def image_decode_graph_enabled():
+    # Allow image-carrying DECODE batches into the
+    # graph cache and the native fused attention path. M-RoPE decode
+    # positions are (mrope_position_delta + seq_len) repeated across all
+    # three components (ForwardBatch._expand_mrope_from_input), so fused
+    # kernels that read one position per token row stay correct for image
+    # requests while decoding. PREFILL must remain excluded: image prefill
+    # positions have genuinely distinct t/h/w rows. The graph gate
+    # (graph_provider.py) and the use_native_batch gate (qwen3_5.py) must
+    # always flip together because decode graphs share one cache key, hence
+    # a single env for both. Opt out with SGLANG_KUNPENG_GRAPH_IMAGE_DECODE=0.
+    return os.environ.get("SGLANG_KUNPENG_GRAPH_IMAGE_DECODE", "1") != "0"
+
+
 def configure_hbw_shm():
     """Select the existing split HBM budget before communication creates SHM."""
     if not (enabled() and os.environ.get("SGLANG_ENABLE_HBW_POOL") == "1"

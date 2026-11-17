@@ -15,7 +15,9 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 
 import logging
+import os
 import re
+import time
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -76,6 +78,7 @@ from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
     is_cpu,
+    is_cpu_920f,
     is_npu,
     round_up,
 )
@@ -90,8 +93,30 @@ if _is_npu:
 
     graph_runners_dict["npu"] = ViTNpuGraphRunner
 
+_is_cpu_920f = is_cpu_920f()
+if _is_cpu_920f:
+    from sglang.srt.hardware_backend.cpu_kunpeng.graph_runner.vit_kunpeng_graph_runner import (
+        ViTKunpengGraphRunner,
+    )
+
+    graph_runners_dict["cpu"] = ViTKunpengGraphRunner
+
 
 logger = logging.getLogger(__name__)
+
+
+def _kunpeng_vit_graph_enabled() -> bool:
+    """Gate for the Kunpeng ViT C++ graph: default OFF on 920F; opt in
+    with SGLANG_KUNPENG_VIT_GRAPH=1. On single-image serving the graph
+    replay only matches eager steady-state latency (4.38 s vs 4.37 s
+    measured) while the first request pays a one-time per-shape capture
+    (~1.4 s) on the critical path, so the eager tower is the better
+    default; the graph stays a verified-correct opt-in. Requests that
+    are not capture-ready fall back to the eager tail automatically."""
+    return _is_cpu_920f and os.environ.get("SGLANG_KUNPENG_VIT_GRAPH", "0") not in (
+        "",
+        "0",
+    )
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -225,6 +250,8 @@ class Qwen3_VisionBlock(nn.Module):
         output_ws: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        flash_seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -236,6 +263,8 @@ class Qwen3_VisionBlock(nn.Module):
             output_ws=output_ws,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            attention_mask=attention_mask,
+            flash_seq_lens=flash_seq_lens,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
@@ -760,6 +789,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
     ) -> torch.Tensor:
         if hasattr(self, "_runtime_capabilities"):
             self._runtime_capabilities.require("vision")
+        if _is_cpu_920f and _kunpeng_vit_graph_enabled():
+            return self.forward_with_kunpeng_graph(x, grid_thw)
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
@@ -840,6 +871,47 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
+        t0 = time.perf_counter()
+        hidden_states = self._forward_blocks(
+            x,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
+        )
+        # Same measurement boundary as the graph runner's "[vit-graph] run"
+        # line: blocks + deepstack mergers + merger + cat, with mask
+        # generation lru-cached after the first request. Back-to-back A/B
+        # against [vit-graph] under the same session/load is the only fair
+        # eager-vs-graph comparison; cross-session numbers on this box vary
+        # by roughly 8% with load.
+        logger.info(
+            "[vit-eager] run S=%d %.3f ms",
+            x.shape[0],
+            1000 * (time.perf_counter() - t0),
+        )
+        return hidden_states
+
+    def _forward_blocks(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        max_seqlen: Optional[torch.Tensor] = None,
+        sequence_lengths: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        flash_seq_lens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Eager "blocks + deepstack mergers + merger" tail, shared by the
+        eager forward, the Kunpeng graph runner's capture body, and its eager
+        fallback. With attention_mask=None every block generates its own
+        block-diagonal mask from cu_seqlens (the pre-existing behavior); a
+        hoisted mask is passed only by the SDPA graph path, and
+        flash_seq_lens (per-image token counts) only by the flash graph
+        path - when both are None the attention backend derives whatever it
+        needs from cu_seqlens itself."""
         deepstack_feature_lists = []
         num_deepstack_captured = 0
 
@@ -851,6 +923,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
+                attention_mask=attention_mask,
+                flash_seq_lens=flash_seq_lens,
             )
 
             if layer_num in self.deepstack_visual_indexes:
@@ -864,6 +938,64 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
+
+    def forward_with_kunpeng_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        if hasattr(self, "_runtime_capabilities"):
+            self._runtime_capabilities.require("vision")
+        (
+            x,
+            cu_seqlens,
+            rotary_pos_emb_cos,
+            rotary_pos_emb_sin,
+        ) = self._prepare_graph_inputs(x, grid_thw)
+
+        s = x.shape[0]
+        num_images = int(cu_seqlens.shape[0]) - 1
+        ready, reason = self.graph_runners.ready_to_capture(s, num_images)
+        if not ready:
+            # The tower's TP reductions would fall back to gloo (which graph
+            # capture cannot record - the replay would silently skip them),
+            # or the request is not captureable as-is (e.g. multiple images
+            # in one request under the flash path, whose graphs bake
+            # single-image token counts). Run the eager tail for this
+            # request; later requests capture.
+            if reason not in self.graph_runners.logged_not_ready_reasons:
+                self.graph_runners.logged_not_ready_reasons.add(reason)
+                logger.info(
+                    "[vit-graph] not ready to capture S=%d: %s (running eager)",
+                    s,
+                    reason,
+                )
+            t0 = time.perf_counter()
+            hidden_states = self._forward_blocks(
+                x.unsqueeze(1),
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+            )
+            # Mirrors the "[vit-graph] run" boundary so not-ready eager
+            # fallbacks can be compared against graph replays directly.
+            logger.info(
+                "[vit-eager] run S=%d %.3f ms (not-ready fallback)",
+                s,
+                1000 * (time.perf_counter() - t0),
+            )
+            return hidden_states
+
+        # The runner builds its own fourth graph input: the hoisted
+        # block-diagonal mask for the SDPA path, or the (constant)
+        # per-image token counts for the flash path.
+        return self.graph_runners.run(
+            x,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            output_indices=None,
+        )
 
     def forward_with_npu_graph(
         self,
@@ -964,7 +1096,18 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             grid_thw_list = grid_thw.tolist()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        # The eager forward interpolates position embeddings through
+        # fast_pos_embed_interpolate_from_list. The tensor variant used
+        # here before honors enable_precise_embedding_interpolation
+        # (align_corners): with the default False it samples a half-pixel
+        # grid while the from_list path always uses the linspace grid, so
+        # the graph paths fed the tower a different position-embedding
+        # input than eager and graph-vs-eager generation diverged (same
+        # image, different output length/content; traced to this line by
+        # hashing the staged tower input). Route the graph paths through
+        # the SAME interpolation the eager forward runs so both modes
+        # stage bit-identical tower inputs.
+        pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
 
         # rotary embedding -> (cos, sin)

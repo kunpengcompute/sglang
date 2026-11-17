@@ -8,7 +8,7 @@ import contextlib
 import os
 import torch
 from sglang.srt.graph import ops
-from . import prefill_graph
+from . import image_decode_graph_enabled, prefill_graph
 from .capabilities import get_capabilities
 from sglang.srt.graph.bindings import (
     GraphBindings,
@@ -34,10 +34,21 @@ class QwenHybridGraphProvider:
         self.static_weights = None
         self.use_static_weights = True
         self.context = None
-        self.decompose_dense = True
+        # Retired: this legacy mechanism decomposed the sgl_kernel::bf16_linear_kunpeng
+        # op (emitted by the retired _kunpeng_qwen_dense packing path, which also set
+        # _kunpeng_bf16_weight_packed) into pack+GEMM graph ops under a provider-planned
+        # tiling/workspace. The upstream rebuild replaced that execution path with the
+        # _cpu_projection_role hooks (configure_modules -> prepare_dense/apply_dense):
+        # apply_dense calls the registered packed-GEMM GraphOps directly, so the
+        # projections self-register during capture and neither the marker nor the
+        # intercepted op exists anymore. Keeping this True aborts bind with
+        # "No packed dense weights for decomposition".
+        self.decompose_dense = False
         self.decompose_clone = True
         self.dense_plans = {}
         self.dense_context = None
+        # One-shot guard for the vision SHM width reservations in bind().
+        self._vision_shm_reserved = False
 
     def unsupported_reason(self, fb, kwargs):
         if fb.forward_mode.name == "EXTEND":
@@ -67,7 +78,15 @@ class QwenHybridGraphProvider:
             )
             if reason is not None:
                 return reason
-        if fb.contains_image_inputs():
+        if fb.contains_image_inputs() and not (
+            # Decode batches carry mm_inputs until
+            # the request finishes but never consume them; decode M-RoPE
+            # rows are equal (see qwen/__init__.image_decode_graph_enabled),
+            # so replay-safe with text decode graphs. Target-verify stays
+            # excluded, and image PREFILL still falls to eager.
+            fb.forward_mode.is_decode()
+            and image_decode_graph_enabled()
+        ):
             return "image_inputs"
         if (
             getattr(fb, "mamba_checkpoint_offsets", None) is not None
@@ -252,6 +271,59 @@ class QwenHybridGraphProvider:
         from sglang.srt.distributed import get_tp_group
 
         communicator = get_tp_group().kunpeng_communicator
+        # Vision tower TP reductions stage through the communicator's
+        # dim-keyed SHM cache, but their widths only first appear at the
+        # initial image request - long after the text graphs claimed the
+        # pool, which is exactly the exhaustion that used to crash image
+        # batches ("remain 0"). The upstream rebuild dropped the legacy
+        # embedding/lm-head eager reservations here (the explicit
+        # collectives read graph-owned SHM now), but the vision path still
+        # stages through the dim-keyed cache: reserve both row buckets for
+        # every vision reduce width once, at the first bind, and publish
+        # the reserved capacity so RowParallelLinear's vision branch can
+        # fall back to gloo beyond it instead of asking the pool to grow
+        # an entry post-capture.
+        if not self._vision_shm_reserved:
+            self._vision_shm_reserved = True
+            visual = getattr(runner.model, "visual", None)
+            if visual is not None:
+                from sglang.srt.layers.linear import (
+                    RowParallelLinear,
+                    _vision_shm_rows as vision_registry,
+                )
+
+                vision_widths = sorted(
+                    {
+                        int(module.output_size)
+                        for module in visual.modules()
+                        if isinstance(module, RowParallelLinear)
+                        and getattr(module, "_runtime_component", None) == "vision"
+                    }
+                )
+                if vision_widths:
+                    vision_budget = min(
+                        int(
+                            os.environ.get(
+                                "SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "2304"
+                            )
+                        ),
+                        int(communicator.max_tokens),
+                    )
+                    reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
+                    for vision_width in vision_widths:
+                        # The kernel's cache keys by dim: the small call pins
+                        # the [batch_size, dim] entry, the large call pins a
+                        # bucket-rounded [budget, dim] entry. Row counts up to
+                        # the returned capacity then always hit a reservation.
+                        small = reserve(vision_width, 1)
+                        large = reserve(vision_width, vision_budget)
+                        capacity = max(int(small.size(0)), int(large.size(0)))
+                        vision_registry[vision_width] = capacity
+                    print(
+                        f"[QwenRegisteredGraph] vision_shm_rows={vision_registry} "
+                        f"budget={vision_budget}",
+                        flush=True,
+                    )
         for shm_width, tensor in sorted(communicator.shm_tensors.items()):
             persistent(f"collective.shm.{shm_width}", tensor)
         persistent("collective.dummy", communicator.dummy_tensor)
@@ -294,6 +366,23 @@ class QwenHybridGraphProvider:
                 return ops.bf16_packed_gemm_kunpeng(packed, weight, workspace, 32)
 
             decompositions[("sgl_kernel::bf16_linear_kunpeng", "")] = dense
+
+        # The BF16 projection hooks (qwen/linear.py apply_dense, wired via
+        # unquant.py's _cpu_linear_apply) query the host-side tiling planner
+        # and then parameterize the registered packed-GEMM graph ops with the
+        # returned tile sizes. The planner is a scalar-only custom op (int
+        # M/N/K -> int tiles, no tensors), and the capture mode intercepts
+        # every op entering torch dispatch - scalar-only calls included - so
+        # capture aborts with "Native op needs a registered graph adapter".
+        # Decompose it to eager execution: the callback already runs under
+        # _DisableTorchDispatch (torch_capture.py), the plan depends only on
+        # the static GEMM shape (fixed per captured graph), and the explicit
+        # runtime calls the same planner outside any dispatch mode while
+        # capturing.
+        def tiling_plan(M, N, K):
+            return torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(M, N, K)
+
+        decompositions[("sgl_kernel::bgemm_find_optimal_tiling_plan", "")] = tiling_plan
         self.context = AutomaticTorchCapture(decompositions)
         with self.context:
             yield self.context

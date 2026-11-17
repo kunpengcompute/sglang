@@ -223,6 +223,19 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if explicit_kunpeng:
             from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_hybrid_backend import KunpengHybridBackend
             return KunpengHybridBackend(runner, full_attn_backend)
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as _kunpeng_qwen_enabled
+        if _kunpeng_qwen_enabled() and not getattr(runner.model, "_kunpeng_explicit_graph", False):
+            # Vision-enabled (non-explicit) kunpeng runtime. The generic
+            # GDNAttnBackend __init__ swaps in the rebuilt qwen ops whenever
+            # the kunpeng qwen runtime is enabled - regardless of which
+            # attention-backend slot selected the full backend - but its
+            # forward no longer binds conv_prefill's rewritten positional
+            # parameters. Route the GDN layers through the same kunpeng GDN
+            # backend the explicit runtime uses, minus the explicit-graph
+            # marker so the common graph runner keeps the graph-provider
+            # path (image decode graph admission).
+            from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_hybrid_backend import KunpengVisionHybridBackend
+            return KunpengVisionHybridBackend(runner, full_attn_backend)
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (

@@ -1,4 +1,6 @@
 """Kunpeng GQA/GDN metadata and persistent resources for the common graph runner."""
+import logging
+
 import torch
 from sglang.srt.graph import ops
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import HybridLinearAttnBackend
@@ -117,6 +119,15 @@ def pad_extend_tokens(fb, cap: int = None) -> None:
     fb.num_token_non_padded = torch.tensor([live], dtype=torch.int32)
     fb.extend_num_tokens = padded
 
+
+logger = logging.getLogger(__name__)
+
+
+def _logical_lm_head_mm(x, head, bias=None):
+    """Logical-weight LM-head mm, valid for every M (bf16_lm_head's M1 contract)."""
+    if bias is not None:
+        raise ValueError("LM head expects bias=None")
+    return ops.tensor_mm(x, head.weight)
 
 class KunpengGQABackend(QwenAttention):
     def init_forward_metadata(self, fb):
@@ -417,3 +428,80 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
             # Tracking writes into a persistent buffer shared by all GDN layers.
             values.append(plan.track_states)
         return values
+
+class KunpengVisionHybridBackend(HybridLinearAttnBackend):
+    """Vision-enabled (non-explicit) Kunpeng runtime.
+
+    The upstream rebuild routes the explicit runtime's GDN layers through
+    KunpengGDNBackend, whose calling conventions match the rebuilt qwen
+    backend ops. The non-explicit runtime used to dispatch the generic
+    GDNAttnBackend forward with those ops swapped in, but the rebuild
+    renamed conv_prefill's parameters, so the generic caller's keyword
+    arguments no longer bind ("conv_prefill() got an unexpected keyword
+    argument 'conv_states'"). Pair the same kunpeng GDN backend here
+    WITHOUT the _kunpeng_explicit_graph marker, so the common graph runner
+    keeps the graph-provider path (image decode graph admission). Rope
+    caches and the prefill workspace come from the graph provider's bind,
+    configure_modules wires the int8 consumers and dense projection hooks,
+    and the unified loader's weight_loader copy semantics keep the
+    build-time conv_weights view valid. The LM head, however, has no role
+    declaration and no loader-side prepack, so this backend prepares it
+    exactly like the explicit runtime (see _prepare_lm_head).
+    """
+
+    def __init__(self, runner, full):
+        super().__init__(
+            full,
+            KunpengGDNBackend(runner),
+            runner.mambaish_config.full_attention_layer_ids,
+        )
+        self._prepare_lm_head(runner)
+
+    def _prepare_lm_head(self, runner):
+        """Pack the LM head and route logits away from the raw-weight branch.
+
+        The rebuild deleted logits_processor's _kunpeng_lm_head_role branch
+        (old graph runner -> prepare_model_lm_head -> try_linear, with a
+        logical-weight matmul fallback) and left exactly two wirings of the
+        packed BF16 kernels: the explicit text-only wrapper sets
+        lm_head._cpu_lm_head_apply, and the explicit backend packs the head
+        in KunpengHybridBackend.__init__. Neither runs for the vision-
+        enabled runtime, so every request fell into _compute_lm_head's
+        generic _is_cpu_920f branch, which feeds the RAW lm_head.weight to
+        bf16_packed_gemm_kunpeng. That kernel reads its B operand in
+        bf16_gemm_pack tiles - every other packed-B caller prepacks first
+        (bf16_lm_head.prepare/prepare_weight, prepare_dense, unquant.py's
+        _kunpeng_bf16_weight_packed gate) - so logits were silently wrong
+        for text AND image requests, and each M=1 decode/logits step was
+        padded to 64 GEMM rows. Restore the explicit runtime's pairing:
+        pack the head once (this backend is built after load_model, when
+        weights are loaded) and route logits through bf16_lm_head.linear.
+        If packing declines (non-32-task plan, HBW pool exhausted or
+        disabled), keep the logical-weight mm for every M instead - the
+        same M1 contract bf16_lm_head.linear itself uses.
+        """
+        head = getattr(runner.model, "lm_head", None)
+        if head is None or not hasattr(head, "weight"):
+            return
+        from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import (
+            linear as packed_linear,
+            prepare,
+        )
+
+        try:
+            prepare(head, getattr(runner.kunpeng_runner, "weight_hbw_pool", None))
+            head._cpu_lm_head_apply = packed_linear
+        except Exception as exc:  # Any decline keeps logits correct.
+            logger.warning(
+                "Kunpeng vision runtime: packed LM head unavailable (%r); "
+                "using the logical-weight mm for logits",
+                exc,
+            )
+            head._cpu_lm_head_apply = _logical_lm_head_mm
+
+    def init_forward_metadata(self, fb):
+        # Same int32 contract as the explicit wrapper: the kunpeng GDN ops
+        # take int32 cache indices.
+        super().init_forward_metadata(fb)
+        metadata = self.linear_attn_backend.forward_metadata
+        metadata.mamba_cache_indices = metadata.mamba_cache_indices.to(torch.int32)
