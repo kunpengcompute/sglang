@@ -138,7 +138,7 @@ export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 
 # The toolchain env is only skipped for the per-rank pyinstall binaries, which
 # carry their own libs and are used only under binary launch. Without binary
-# launch server.sh starts a plain `python -m sglang.launch_server`, which needs
+# launch server_cluster.sh starts a plain `python -m sglang.launch_server`, which needs
 # OpenBLAS/KUPL/KUTACC on LD_LIBRARY_PATH, so load the toolchain in that case
 # even when NUMA duplication is on.
 if [[ "$SGLANG_ENABLE_NUMA_DUPLICATION" != "1" ]] \

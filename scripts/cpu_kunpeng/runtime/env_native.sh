@@ -26,7 +26,7 @@
 # Native role defaults (prefill-side values; native previously inherited
 # these from env_prefill.sh)
 # ------------------------------------------------------------
-# Per-DP-rank chunked prefill size; server.sh multiplies it by DP_SIZE
+# Per-DP-rank chunked prefill size; runtime/server_cluster.sh multiplies it by DP_SIZE
 # for the global --chunked-prefill-size.
 export CHUNKED_PREFILL_SIZE_PER_DP="${CHUNKED_PREFILL_SIZE_PER_DP:-4096}"
 

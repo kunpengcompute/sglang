@@ -36,7 +36,7 @@ PREFILL_MASTER_ADDR="${PREFILL_MASTER_ADDR:-xxx.xxx.xxx.1}"
 # PP_SIZE=2 to the stale env_base defaults.
 
 
-# Per-DP-rank chunked prefill size; server.sh multiplies it by DP_SIZE
+# Per-DP-rank chunked prefill size; runtime/server_cluster.sh multiplies it by DP_SIZE
 # for the global --chunked-prefill-size.
 export CHUNKED_PREFILL_SIZE_PER_DP=4096
 
@@ -99,13 +99,13 @@ export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB="${SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB:
 #            (empty L3_DIR = L3 off, L1<->L2 only); layer_first host layout.
 #   mooncake mooncake store master (runtime/env_mooncake.sh), needs
 #            MOONCAKE_MASTER* and the RDMA settings in .user_env.sh; the store
-#            is page_first-only, so server.sh selects that layout.
+#            is page_first-only, so runtime/server_cluster.sh selects that layout.
 # PREFETCH_POLICY (default timeout): wait_complete blocks the request until the
 # whole L3->L2 load is done (so no recompute); timeout/best_effort give up early.
 # The timeout budget is base + pages x per_ki_token (code defaults 1s / 0.25s);
 # EXTRA_CONFIG passes the whole --hicache-storage-backend-extra-config JSON
 # through and wins over the two timeout knobs. DEBUG = verbose per-transfer
-# "[hicache]" logs. Off by default; server.sh wires it for prefill.
+# "[hicache]" logs. Off by default; runtime/server_cluster.sh wires it for prefill.
 # ------------------------------------------------------------
 export ENABLE_KUNPENG_HICACHE="${ENABLE_KUNPENG_HICACHE:-0}"
 export KUNPENG_HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"

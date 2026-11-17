@@ -284,7 +284,7 @@ resolve_prefill_tok_port() {
 
 # The side's own HTTP endpoint when the tokenizer HTTP server is NOT split
 # out (SGLANG_ENABLE_TOKENIZER_SEPERATE=0): the prefill/decode master hosts
-# it on --port 30000 (see server.sh / server_router.sh's backend URL), so
+# it on --port 30000 (see runtime/server_cluster.sh / server_router.sh's backend URL), so
 # there is no router-node tokenizer port to address. The master address is
 # read from the side's role env (per-instance overrides included) in a
 # subshell, exactly like launch_router.sh. Echoes nothing when the layout
