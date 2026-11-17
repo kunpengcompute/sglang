@@ -134,6 +134,15 @@ export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-65536}"
 # also needs INIT_EXPERT_LOCATION / REDUNDANT_EXPERTS, see README section 3.2-4).
 export SGLANG_KUNPENG_FLASH_COMM="${SGLANG_KUNPENG_FLASH_COMM:-0}"
 
+# ---- external DP pinning with --load-balance-method follow_bootstrap_room ----
+# The gateway assigns a random bootstrap_room per request, so a client-side
+# routed_dp_rank would otherwise trip the "follow_bootstrap_room conflict"
+# check (room % dp_size != dispatched rank). Allowing mixed routing here lets
+# routed_dp_rank win and registers the actual rank for decode to look up.
+# Prefill only: enabling it on decode would send EVERY request through the
+# /query_dp_ranks slow path.
+export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK="${SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK:-1}"
+
 # ---- kutacc fused-MoE switches --------------------------------------------
 # Fused MoE GEMM inner tile (rows); 2048 = prefill reference, one chunk per
 # rank in the per-expert loop. ETP instances (8 local experts, ~8x the rows)

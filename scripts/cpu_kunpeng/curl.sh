@@ -40,6 +40,11 @@ usage() {
   echo "  -d RANK|RANGE  DP rank (e.g. 5: every request pinned to it) or ranks"
   echo "              (e.g. 0-15, 0,2,5: requests round-robin across them)."
   echo "              Omit -d for the server default load balancing (round robin)."
+  echo "              Sends routed_dp_rank + disagg_prefill_dp_rank together:"
+  echo "              with prefill --load-balance-method follow_bootstrap_room"
+  echo "              the gateway picks a random bootstrap_room, so the pin only"
+  echo "              works with SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1"
+  echo "              on the prefill side."
   echo "  -n NUM      Number of requests (default: all lines from file; prompts"
   echo "              cycle when NUM exceeds the file size). NUM=1 keeps EOS"
   echo "              enabled (no ignore_eos), so the model may stop naturally."
@@ -474,11 +479,16 @@ if [ "$INTERACTIVE" = false ]; then
 
   send_request() {
     local idx=$1
+    # -d pins both sides: routed_dp_rank picks the prefill DP worker and
+    # disagg_prefill_dp_rank tells decode which prefill worker owns the KV.
+    # Under follow_bootstrap_room the gateway assigns a random bootstrap_room,
+    # so the prefill would otherwise dispatch by room % dp_size instead.
     local rank_line=""
     if [ "$ROUND_ROBIN" = true ]; then
-      rank_line=",\"routed_dp_rank\": ${DP_RANKS[$((idx % NUM_RANKS))]}"
+      local rr_rank=${DP_RANKS[$((idx % NUM_RANKS))]}
+      rank_line=",\"routed_dp_rank\": $rr_rank,\"disagg_prefill_dp_rank\": $rr_rank"
     elif [ "$DP_ENABLED" = true ]; then
-      rank_line=",\"routed_dp_rank\": $DP_RANK"
+      rank_line=",\"routed_dp_rank\": $DP_RANK,\"disagg_prefill_dp_rank\": $DP_RANK"
     fi
     # Fake transfer: unique room per request + magic host; the decode side
     # (_is_fake_transfer) then force-selects the FAKE receiver and decodes
@@ -1248,7 +1258,7 @@ if [ "$INTERACTIVE" = true ]; then
 
     DP_LINE=""
     if [ "$DP_ENABLED" = true ]; then
-      DP_LINE=",\"routed_dp_rank\":$DP_RANK"
+      DP_LINE=",\"routed_dp_rank\":$DP_RANK,\"disagg_prefill_dp_rank\":$DP_RANK"
     fi
 
     BODY="{"
