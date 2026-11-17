@@ -86,36 +86,51 @@ def verify_gdn(
         from . import tilelang_gdn_verify
 
         assert checkpoints.shape[1] == steps, "checkpoint block must match steps"
-        # q/k/v are slices of the fused qkv row and a/b keep their strided
-        # projection partitions. The TileLang kernel reads contiguous tiles, so
-        # repack here: both ops are ordinary ATen nodes, recorded and replayed
-        # by the common graph like any other eager cat/clone.
+        # q/k/v are strided views of the fused qkv row and a/b of the BA row.
+        # The TileLang kernel reads contiguous packed tiles. Packing must use
+        # registered primitives only: this target captures without the
+        # automatic ATen adapter, so a plain torch.cat/clone would allocate
+        # storages the graph never learns about and the next op would fail
+        # lookup_or_register on them.
         q = q.reshape(-1, q.shape[-2], q.shape[-1])
         k = k.reshape(-1, k.shape[-2], k.shape[-1])
         v = v.reshape(-1, v.shape[-2], v.shape[-1])
         a = a.reshape(-1, a.shape[-1])
         b = b.reshape(-1, b.shape[-1])
-        qk = torch.cat((q, k), dim=1)
-        ab = torch.cat((a, b), dim=1)
-        v = v.contiguous()
+        tokens, q_heads, key_dim = q.shape
+        v_heads, value_dim = v.shape[1], v.shape[2]
+        qk = ops.alloc_buffer(
+            tokens * 2 * q_heads * key_dim, dtype=q.dtype
+        ).view(tokens, 2 * q_heads, key_dim)
+        ops.copy_kunpeng(qk[:, :q_heads], q)
+        ops.copy_kunpeng(qk[:, q_heads:], k)
+        ab = ops.alloc_buffer(tokens * 2 * v_heads, dtype=a.dtype).view(
+            tokens, 2 * v_heads
+        )
+        ops.copy_kunpeng(ab[:, :v_heads], a)
+        ops.copy_kunpeng(ab[:, v_heads:], b)
+        packed_v = ops.alloc_buffer(
+            tokens * v_heads * value_dim, dtype=v.dtype
+        ).view(tokens, v_heads, value_dim)
+        ops.copy_kunpeng(packed_v, v)
         # Compiling must not leak its own torch calls into the captured graph.
         with torch._C._DisableTorchDispatch():
             tilelang_gdn_verify.prepare(
-                A_log, dt_bias, qk, v, ab, state, cache_indices, checkpoints,
-                checkpoint_indices,
+                A_log, dt_bias, qk, packed_v, ab, state, cache_indices,
+                checkpoints, checkpoint_indices,
             )
         output = ops.qwen_gdn_verify_tilelang(
             A_log,
             dt_bias,
             qk,
-            v,
+            packed_v,
             ab,
             state,
             cache_indices,
             checkpoints,
             checkpoint_indices,
         )
-        return output.reshape(1, batch * steps, *v.shape[-2:])
+        return output.reshape(1, batch * steps, v_heads, value_dim)
 
     if _FUSED_VERIFY:
         # The persistent slot is read once; every step then rolls the state

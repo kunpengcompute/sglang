@@ -12,8 +12,11 @@ shape into the generated code. Its ``extern "C" void call(uint8_t* ...)`` entry
 is registered into ``common_ops`` by shape so ``qwen_gdn_verify_tilelang`` can
 be replayed by the common graph through ``qwen_graph_gdn_verify_tilelang_dispatch``
 (``sgl-kernel/csrc/cpu/cpu_kunpeng/qwen/qwen_tilelang_gdn_verify.cpp``). The
-graph planner owns every buffer: ``QK``/``V``/``AB`` are ordinary captured
-``aten`` cat/clone nodes, ``Checkpoints``/``State`` stay bound model tensors.
+graph planner owns every buffer: ``QK``/``V``/``AB`` must be contiguous, so the
+caller packs them from the strided qkv/BA views with ``alloc_buffer`` plus
+``copy_kunpeng`` -- this target captures without the automatic ATen adapter, and
+plain ``torch.cat``/``clone`` would allocate unregistered storages. ``State`` and
+``Checkpoints`` stay bound model tensors.
 """
 
 import ctypes

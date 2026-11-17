@@ -275,7 +275,10 @@ class AutomaticTorchCapture(TorchDispatchMode):
             if native_shape is not None
             else func(*positional, **keywords)
         )
-        inputs = [lookup_or_register(t, idx=i) for i, t in enumerate(tensors)]
+        inputs = [
+            lookup_or_register(t, idx=i, where=str(func))
+            for i, t in enumerate(tensors)
+        ]
         outputs = []
         actual = []
         if mutable:
