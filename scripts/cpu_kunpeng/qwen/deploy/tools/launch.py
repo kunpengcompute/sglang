@@ -178,7 +178,7 @@ def main():
                 PYTHONDONTWRITEBYTECODE="1",
                 PYTHONPATH=f"{repo}/python:{image}/packages",
                 LD_PRELOAD=str(image / "lib/libkutacc.so"),
-                LD_LIBRARY_PATH=f"{image}/lib:{image}/packages/torch/lib:{images['python_prefix']}/lib:{os.environ.get('LD_LIBRARY_PATH', '')}",
+                LD_LIBRARY_PATH=f"{image}/lib:{image}/packages/torch/lib:{images['python_prefix']}/lib:{env.get('LD_LIBRARY_PATH', '')}",
                 KUTACC_LIB=str(image / "lib"),
                 KUPL_LIB=str(image / "lib"),
             )
