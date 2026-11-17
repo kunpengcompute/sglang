@@ -1376,6 +1376,12 @@ class TokenizerMetricsCollector:
             buckets=bucket_time_to_first_token,
         )
 
+        self.gauge_time_to_first_token_last = Gauge(
+            name="sglang:time_to_first_token_seconds_last",
+            documentation="Time to first token in seconds of the most recent request.",
+            labelnames=labels.keys(),
+        )
+
         self.histogram_inter_token_latency = Histogram(
             name="sglang:inter_token_latency_seconds",
             documentation="Histogram of inter-token latency in seconds.",
@@ -1439,6 +1445,7 @@ class TokenizerMetricsCollector:
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
         self.histogram_time_to_first_token.labels(**labels).observe(value)
+        self.gauge_time_to_first_token_last.labels(**labels).set(value)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
         his = self.histogram_time_to_first_token.labels(**self.labels)
