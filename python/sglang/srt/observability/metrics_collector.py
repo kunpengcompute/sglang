@@ -1200,7 +1200,7 @@ class TokenizerMetricsCollector:
         bucket_e2e_request_latency: Optional[List[float]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels or {}
 
