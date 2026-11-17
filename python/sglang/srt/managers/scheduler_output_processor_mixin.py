@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEBUG_PP_MTP = get_bool_env_var("SGLANG_DEBUG_PP_MTP")
+_is_cpu_920f = is_cpu_920f()
 
 # Sentinel for an unlimited max_new_tokens / vocab_size in the fused PP+MTP
 # finish-check kernel (a request with max_new_tokens=None can never hit the
@@ -109,12 +110,17 @@ class SchedulerOutputProcessorMixin:
         use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
+        pp_mtp = getattr(self, "_pp_mtp_enabled", False)
+        # A prebuilt step runs no forward and emits no output frame, so the last
+        # rank's verdict cannot reach the other stages for this batch.  Defer
+        # `to_finish` on EVERY stage: otherwise the last rank releases the
+        # request here while the others keep it, and the microbatch liveness
+        # splits (one stage's lane becomes empty while the other still decodes).
+        # The next TARGET_VERIFY round consumes the pending abort on all stages.
+        defer_abort = pp_mtp and _is_cpu_920f
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
-            if (
-                getattr(self, "_pp_mtp_enabled", False)
-                and not self.pp_group.is_last_rank
-            ):
+            if defer_abort or (pp_mtp and not self.pp_group.is_last_rank):
                 # PP+MTP: aborts/timeout (`to_finish`) are arbitrated by the
                 # last rank's verify and reconciled via the ring `-1`
                 # placeholder (see `_pp_mtp_apply_verify_batch`); keep the
@@ -773,10 +779,31 @@ class SchedulerOutputProcessorMixin:
         # authoritative and both ranks keep the same finish semantics).
         verdict = self._pp_mtp_fused_finish_verdict(batch, result, total_accepted)
 
+        # The last rank is the single finish arbiter; `pp_mtp_ring_finished`
+        # (the ring `-1` draft placeholder) is its per-req verdict, so a pending
+        # `to_finish` may only be consumed on a round the arbiter also finished
+        # that request.  Consuming it from local state instead let this rank
+        # finish (and release) a request one round before the arbiter did, when
+        # the AbortReq reached the stages at different points of the loop; the
+        # lane then went empty here while the last rank still had a verify batch
+        # (0-row proxy -> [PP-DESYNC]).
+        ring_finished = batch.pp_mtp_ring_finished
+        if ring_finished is not None and len(ring_finished) != len(batch.reqs):
+            ring_finished = None  # misaligned with the batch: keep local state
+
         for i, req in enumerate(batch.reqs):
             req: Req
             num_accepted = counts_int[i]
+            arbiter_finished = bool(ring_finished[i]) if ring_finished else False
             if num_accepted < 1:
+                # The arbiter's shell (`_verify_kunpeng` in eagle_info.py)
+                # consumes `to_finish` for every request, with no num_accepted
+                # guard.  Mirror it here: otherwise this stage keeps the request
+                # (and its KV) while the last rank has already released it, and
+                # the two stages stop agreeing on this microbatch's liveness.
+                if _is_cpu_920f and arbiter_finished and req.to_finish is not None:
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
                 continue
             offset = offsets[i]
             toks = flat_toks[offset : offset + num_accepted]
@@ -800,11 +827,11 @@ class SchedulerOutputProcessorMixin:
                             matched="NaN happened"
                         )
                     req.finished_len = verdict[3][i]
-                elif req.to_finish is not None:
+                elif arbiter_finished and req.to_finish is not None:
                     # Mirror the last-rank shell ordering (eagle_info.py
                     # `_verify_kunpeng`): the kernel verdict wins; a pending
-                    # to_finish is consumed only when the verdict kept the
-                    # request alive.
+                    # to_finish is consumed only on a round the arbiter also
+                    # finished the request (ring `-1` verdict).
                     req.finished_reason = req.to_finish
                     req.to_finish = None
             else:
@@ -828,22 +855,28 @@ class SchedulerOutputProcessorMixin:
                     and not sp.stop_regex_strs
                 ):
                     req.output_ids.extend(toks)
-                    req.check_finished(num_accepted)
+                    req.check_finished(num_accepted, skip_to_finish=True)
                 else:
                     for tok in toks:
                         req.output_ids.append(tok)
                         if need_reasoning:
                             req.update_reasoning_tokens(tok, think_end_id)
-                        req.check_finished()
+                        req.check_finished(skip_to_finish=True)
                         if not req.finished() and req.grammar is not None:
                             try:
                                 req.grammar.accept_token(tok)
                             except ValueError as e:
                                 logger.info(f"{req=}\n{e}")
                                 raise e
-                            req.check_finished()
+                            req.check_finished(skip_to_finish=True)
                         if req.finished():
                             break
+                if arbiter_finished and req.to_finish is not None:
+                    # Same rule as the fused path: the local replica never
+                    # finishes a request on its own `to_finish`; only the
+                    # arbiter's ring verdict can (see the block above).
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
 
             req.kv_committed_len += num_accepted
             req.kv_allocated_len = req.kv_committed_len

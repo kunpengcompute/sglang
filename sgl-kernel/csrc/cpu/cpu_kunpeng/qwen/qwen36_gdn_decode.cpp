@@ -44,15 +44,56 @@ inline void store_bf16_columns16(svbool_t pg, uint16_t *target, svfloat32_t valu
     svst1h_u32(pg, target, svlsr_n_u32_x(pg, rounded, 16));
 }
 
+// Copy the current (pre-token) recurrent state slice of one head into the
+// per-sequence snapshot buffer used by the mamba prefix cache. Layout matches
+// ssm_states rows: [v_heads, key_dim, value_dim].
+inline void snapshot_head_state(float *destination, const float *head_state, int64_t key_dim,
+                                int64_t value_dim, int64_t first, int64_t width) {
+    float *destination_first = destination + first;
+    for (int64_t kd = 0; kd < key_dim; ++kd) {
+        std::memcpy(destination_first + kd * value_dim, head_state + kd * value_dim + first,
+                    static_cast<size_t>(width) * sizeof(float));
+    }
+}
+
+struct TrackCursor {
+    float *head;
+    const int32_t *tokens;
+    int64_t remaining;
+    int64_t single_token;
+    int64_t token_base;
+    int64_t head_stride;
+};
+
+inline void snapshot_tracked_state(TrackCursor &track, int64_t token, const float *head_state,
+                                   int64_t key_dim, int64_t value_dim, int64_t first,
+                                   int64_t width) {
+    if (track.remaining == 0)
+        return;
+    const int64_t track_token =
+        track.tokens == nullptr ? track.single_token : track.token_base + *track.tokens;
+    if (token != track_token)
+        return;
+    snapshot_head_state(track.head, head_state, key_dim, value_dim, first, width);
+    if (track.tokens == nullptr) {
+        track.remaining = 0;
+    } else {
+        ++track.tokens;
+        --track.remaining;
+        track.head += track.head_stride;
+    }
+}
+
 inline void gdn_prefill_columns32_register(const uint16_t *q, const uint16_t *k, const uint16_t *v,
                                            const float *g, const float *beta, float *head_state,
                                            uint16_t *output, const float *qs, const float *ks,
                                            int64_t start, int64_t end, int64_t q_heads,
                                            int64_t v_heads, int64_t key_dim, int64_t value_dim,
                                            int64_t qh, int64_t vh, int64_t first, float *memory,
-                                           float *delta, float *acc) {
+                                           float *delta, float *acc, TrackCursor &track) {
     const svbool_t pg = svptrue_b32();
     for (int64_t token = start; token < end; ++token) {
+        snapshot_tracked_state(track, token, head_state, key_dim, value_dim, first, 32);
         const int64_t qb = (token * q_heads + qh) * key_dim;
         const int64_t vb = (token * v_heads + vh) * value_dim + first;
         const float decay = std::exp(g[token * v_heads + vh]);
@@ -427,14 +468,18 @@ extern "C" int qwen36_gdn_prefill_with_workspace(
     return 0;
 }
 
+namespace {
+
 // Parallelize independent state columns, retaining the recurrence's token
 // order and each column's FP32 accumulation order. Each worker keeps its
 // state slice hot across the chunk; no per-token barrier or nested pool.
-extern "C" int qwen36_gdn_prefill_parallel_with_workspace(
+int qwen36_gdn_prefill_parallel_track_impl(
     const uint16_t *q, const uint16_t *k, const uint16_t *v, const float *g, const float *beta,
     float *state, const int32_t *cu_seqlens, uint16_t *output, int64_t num_sequences,
     int64_t total_tokens, int64_t q_heads, int64_t v_heads, int64_t key_dim, int64_t value_dim,
-    int64_t column_grain, float *workspace, int64_t workspace_numel) {
+    int64_t column_grain, float *track_states, const int32_t *track_chunks, int64_t track_chunk,
+    const int32_t *track_offsets, const int32_t *track_tokens, bool multi_track, float *workspace,
+    int64_t workspace_numel) {
     if (num_sequences <= 0 || total_tokens <= 0 || q_heads <= 0 || v_heads <= 0 || key_dim <= 0 ||
         value_dim <= 0 || v_heads % q_heads)
         return 1;
@@ -442,6 +487,45 @@ extern "C" int qwen36_gdn_prefill_parallel_with_workspace(
         if (cu_seqlens[seq] < 0 || cu_seqlens[seq + 1] < cu_seqlens[seq] ||
             cu_seqlens[seq + 1] > total_tokens)
             return 2;
+    if (multi_track) {
+        if (track_offsets == nullptr || track_offsets[0] != 0)
+            return 6;
+        for (int64_t seq = 0; seq < num_sequences; ++seq)
+            if (track_offsets[seq + 1] < track_offsets[seq])
+                return 6;
+        const int64_t num_tracks = track_offsets[num_sequences];
+        if (num_tracks != 0 && (track_states == nullptr || track_tokens == nullptr))
+            return 6;
+        for (int64_t seq = 0; seq < num_sequences; ++seq) {
+            const int64_t sequence_length = cu_seqlens[seq + 1] - cu_seqlens[seq];
+            int32_t previous = 0;
+            for (int64_t index = track_offsets[seq]; index < track_offsets[seq + 1]; ++index) {
+                const int32_t relative = track_tokens[index];
+                // Negative tokens are static-shape padding rows: the cursor
+                // skips them and they never match a real token position.
+                if (relative < 0)
+                    continue;
+                // A target equal to the sequence length snapshots the state
+                // after the last token. The recurrence never reaches it, so the
+                // caller fills that row from the final state afterwards.
+                if (relative <= previous || relative > sequence_length)
+                    return 7;
+                previous = relative;
+            }
+        }
+    } else if (track_states != nullptr) {
+        if (track_chunks == nullptr || track_chunk <= 0)
+            return 4;
+        for (int64_t seq = 0; seq < num_sequences; ++seq) {
+            const int32_t chunk = track_chunks[seq];
+            if (chunk < 0)
+                continue;
+            const int64_t token =
+                static_cast<int64_t>(cu_seqlens[seq]) + static_cast<int64_t>(chunk) * track_chunk;
+            if (token < cu_seqlens[seq] || token >= cu_seqlens[seq + 1])
+                return 5;
+        }
+    }
     const int64_t groups = v_heads / q_heads;
     const float scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
     if (column_grain <= 0) {
@@ -480,16 +564,38 @@ extern "C" int qwen36_gdn_prefill_parallel_with_workspace(
             const int64_t first = (task % slices) * column_grain;
             const int64_t width = std::min(column_grain, value_dim - first);
             float *head_state = state + (seq * v_heads + vh) * key_dim * value_dim;
+            TrackCursor track{nullptr, nullptr, 0, -1, cu_seqlens[seq],
+                              v_heads * key_dim * value_dim};
+            if (multi_track) {
+                const int64_t track_begin = track_offsets[seq];
+                const int64_t track_end = track_offsets[seq + 1];
+                if (track_begin != track_end) {
+                    track.head = track_states +
+                                 (track_begin * v_heads + vh) * key_dim * value_dim;
+                    track.tokens = track_tokens + track_begin;
+                    track.remaining = track_end - track_begin;
+                }
+            } else {
+                const int32_t track_chunk_idx = track_chunks == nullptr ? -1 : track_chunks[seq];
+                if (track_chunk_idx >= 0 && track_states != nullptr) {
+                    track.head =
+                        track_states + (seq * v_heads + vh) * key_dim * value_dim;
+                    track.remaining = 1;
+                    track.single_token = static_cast<int64_t>(cu_seqlens[seq]) +
+                                         static_cast<int64_t>(track_chunk_idx) * track_chunk;
+                }
+            }
             if (total_tokens > 32 && total_tokens <= 4096 && q_heads == 1 && v_heads == 3 &&
                 key_dim == 128 && value_dim == 128 && column_grain == 32 && width == 32 &&
                 svcntw() == 16) {
                 gdn_prefill_columns32_register(q, k, v, g, beta, head_state, output, qs, ks,
                                                cu_seqlens[seq], cu_seqlens[seq + 1], q_heads,
                                                v_heads, key_dim, value_dim, qh, vh, first, memory,
-                                               delta, acc);
+                                               delta, acc, track);
                 continue;
             }
             for (int64_t token = cu_seqlens[seq]; token < cu_seqlens[seq + 1]; ++token) {
+                snapshot_tracked_state(track, token, head_state, key_dim, value_dim, first, width);
                 std::fill_n(memory, column_grain, 0.0f);
                 std::fill_n(acc, column_grain, 0.0f);
                 const int64_t qb = (token * q_heads + qh) * key_dim;
@@ -523,6 +629,42 @@ extern "C" int qwen36_gdn_prefill_parallel_with_workspace(
         }
     });
     return 0;
+}
+
+} // namespace
+
+extern "C" int qwen36_gdn_prefill_parallel_with_track_workspace(
+    const uint16_t *q, const uint16_t *k, const uint16_t *v, const float *g, const float *beta,
+    float *state, const int32_t *cu_seqlens, uint16_t *output, int64_t num_sequences,
+    int64_t total_tokens, int64_t q_heads, int64_t v_heads, int64_t key_dim, int64_t value_dim,
+    int64_t column_grain, float *track_states, const int32_t *track_chunks, int64_t track_chunk,
+    float *workspace, int64_t workspace_numel) {
+    return qwen36_gdn_prefill_parallel_track_impl(
+        q, k, v, g, beta, state, cu_seqlens, output, num_sequences, total_tokens, q_heads, v_heads,
+        key_dim, value_dim, column_grain, track_states, track_chunks, track_chunk, nullptr, nullptr,
+        false, workspace, workspace_numel);
+}
+
+extern "C" int qwen36_gdn_prefill_parallel_with_multi_track_workspace(
+    const uint16_t *q, const uint16_t *k, const uint16_t *v, const float *g, const float *beta,
+    float *state, const int32_t *cu_seqlens, uint16_t *output, int64_t num_sequences,
+    int64_t total_tokens, int64_t q_heads, int64_t v_heads, int64_t key_dim, int64_t value_dim,
+    int64_t column_grain, float *track_states, const int32_t *track_offsets,
+    const int32_t *track_tokens, float *workspace, int64_t workspace_numel) {
+    return qwen36_gdn_prefill_parallel_track_impl(
+        q, k, v, g, beta, state, cu_seqlens, output, num_sequences, total_tokens, q_heads, v_heads,
+        key_dim, value_dim, column_grain, track_states, nullptr, 1, track_offsets, track_tokens,
+        true, workspace, workspace_numel);
+}
+
+extern "C" int qwen36_gdn_prefill_parallel_with_workspace(
+    const uint16_t *q, const uint16_t *k, const uint16_t *v, const float *g, const float *beta,
+    float *state, const int32_t *cu_seqlens, uint16_t *output, int64_t num_sequences,
+    int64_t total_tokens, int64_t q_heads, int64_t v_heads, int64_t key_dim, int64_t value_dim,
+    int64_t column_grain, float *workspace, int64_t workspace_numel) {
+    return qwen36_gdn_prefill_parallel_with_track_workspace(
+        q, k, v, g, beta, state, cu_seqlens, output, num_sequences, total_tokens, q_heads, v_heads,
+        key_dim, value_dim, column_grain, nullptr, nullptr, 1, workspace, workspace_numel);
 }
 
 // Compatibility entry points share the same arithmetic implementation.

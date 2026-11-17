@@ -564,7 +564,7 @@ sh curl.sh -p -s -f prompts/ragged.txt
 | `-F` | Fake-transfer mode (injects bootstrap_host=2.2.2.2; decode skips KV transfer; port auto-derived from the decode entry in INSTANCES, `CURL_PORT` overrides) | off |
 | `-i` | Multi-turn interactive chat mode | off |
 
-The target address and port can be overridden via the `CURL_HOST`/`CURL_PORT` environment variables (default: local NIC IP:30000). Verify correctness based on the response returned by the request.
+Requests go to `ROUTER_IP` (the gateway node) by default, which `curl.sh` reads via `source env.sh none`. The target address and port can be overridden via the `CURL_HOST`/`CURL_PORT` environment variables (default port: 30000). Verify correctness based on the response returned by the request.
 
 ### 4.5 Benchmarks
 

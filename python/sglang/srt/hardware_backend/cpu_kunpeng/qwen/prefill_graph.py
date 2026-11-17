@@ -10,27 +10,12 @@ import os
 
 import torch
 from sgl_kernel import common_ops
-from sglang.srt.graph import ops, register_op
-from sglang.srt.utils.common import is_cpu_920f
+from sglang.srt.graph import is_capturing, ops, register_op
 from .capabilities import get_capabilities
 
 
 def tokens_supported(tokens):
     return 1 <= tokens <= get_capabilities().prefill_max_tokens
-
-
-def padding_enabled():
-    return is_cpu_920f() and os.environ.get(
-        "SGLANG_KUNPENG_EXTEND_POWER_2_PADDING", "0"
-    ) == "1"
-
-
-def padded_tokens(tokens):
-
-    if not padding_enabled() or tokens <= 0:
-        return tokens
-    padded = 1 << (tokens - 1).bit_length()
-    return padded if tokens_supported(padded) else tokens
 
 
 _libraries = []
@@ -51,7 +36,17 @@ def unsupported_reason(fb):
         return "prefill_invalid_request_count"
     if fb.contains_image_inputs():
         return "image_inputs"
-    if fb.mamba_track_mask is not None:
+    # The provider checks the mask before capture. Calling any() while capturing
+    # would create an unregistered scalar tensor in the boxed ATen bridge.
+    if getattr(fb, "mamba_checkpoint_offsets", None) is not None and getattr(
+        fb, "kunpeng_checkpoint_plan", None
+    ) is None:
+        return "mamba_state_tracking"
+    if (
+        fb.mamba_track_mask is not None
+        and not is_capturing()
+        and bool(fb.mamba_track_mask.any())
+    ):
         return "mamba_state_tracking"
     if fb.return_logprob:
         return "return_logprob"
@@ -89,6 +84,10 @@ def register():
     registry = graph_cpp.GraphOpRegistry.instance()
     for name, symbol in (
         ("qwen_gdn_prefill", "qwen_graph_gdn_prefill_dispatch"),
+        (
+            "qwen_gdn_prefill_multi_checkpoint",
+            "qwen_graph_gdn_prefill_multi_checkpoint_dispatch",
+        ),
         (
             "qwen_validate_extend_metadata",
             "qwen_graph_validate_extend_metadata_dispatch",
@@ -138,6 +137,48 @@ def register():
         "qwen_gdn_prefill",
         gdn_shape,
         lambda *args: torch.ops.sgl_kernel.qwen_registered_gdn_prefill(*args),
+    )
+
+    def gdn_multi_checkpoint_shape(
+        q, k, v, g, beta, state, qsl, workspace, mixed_qkv, conv, conv_dst,
+        conv_start, track_states, track_offsets, track_tokens, grain
+    ):
+        assert gdn_supported(q, k, v) and grain == 32
+        sequences = qsl.numel() - 1
+        assert qsl.ndim == 1 and sequences > 0 and qsl.dtype == torch.int32
+        assert tuple(state.shape) == (sequences, 3, 128, 128)
+        assert g.numel() == beta.numel() == q.shape[1] * 3
+        assert workspace.ndim == 1 and workspace.dtype == torch.float32
+        # Tracking always runs the parallel recurrence, whatever the token count.
+        assert workspace.numel() >= 2 * q.shape[1] + sequences * 1152
+        rows = conv_dst.numel()
+        assert (
+            mixed_qkv.ndim == 2
+            and mixed_qkv.shape[0] == q.shape[1]
+            and mixed_qkv.dtype == torch.bfloat16
+            and mixed_qkv.is_contiguous()
+            and conv.ndim == 3
+            and conv.shape[1] == mixed_qkv.shape[1]
+            and conv.dtype == torch.bfloat16
+            and rows > 0
+            and conv_start.numel() == track_tokens.numel() == rows
+            and track_states.shape[0] == rows
+            and track_offsets.numel() == sequences + 1
+            and tuple(track_states.shape[1:]) == (3, 128, 128)
+            and track_states.dtype == torch.float32
+            and all(
+                t.dtype == torch.int32 and t.ndim == 1
+                for t in (conv_dst, conv_start, track_offsets, track_tokens)
+            )
+        ), "GDN multi-checkpoint static tracking contract"
+        return [(tuple(v.shape), v.dtype)]
+
+    register_op(
+        "qwen_gdn_prefill_multi_checkpoint",
+        gdn_multi_checkpoint_shape,
+        lambda *args: torch.ops.sgl_kernel.qwen_registered_gdn_prefill_multi_checkpoint(
+            *args
+        ),
     )
     register_op(
         "qwen_validate_extend_metadata",
@@ -235,6 +276,128 @@ def gdn_supported(q, k, v):
 def gdn_workspace_numel(tokens, sequences):
     assert tokens_supported(tokens) and 0 < sequences <= tokens
     return 386 if tokens <= 32 else 2 * tokens + sequences * 1152
+
+
+# The capture path needs one fixed checkpoint row count per graph key. Rows are
+# padded up to this bound; larger batches keep the eager implementation.
+CHECKPOINT_GRAPH_CAPACITY = 64
+CHECKPOINT_GRAPH_GRAIN = 32
+
+
+class CheckpointPlan:
+    """Static-shape checkpoint metadata shared by every GDN layer of a batch."""
+
+    __slots__ = ("offsets", "tokens", "dst", "conv_start", "track_states")
+
+
+def capture_enabled():
+    # Must agree with KunpengGraphRunner.is_graph_active(), which also resolves
+    # the flag once at import time. Reading the env var here on every call can
+    # build static-shape plans for batches that never reach graph replay.
+    from sglang.srt.utils.common import is_kunpeng_graph_capture
+
+    return is_kunpeng_graph_capture()
+
+
+def multi_checkpoint_workspace_numel(tokens, sequences):
+    # Tracking always takes the parallel recurrence: 2*m*q_heads plus
+    # sequences*v_heads*ceil(value_dim/grain)*3*grain, with q_heads=1,
+    # v_heads=3, value_dim=128 and grain=32.
+    return 2 * tokens + sequences * 1152
+
+
+_track_buffers = {}
+_eager_track_buffer = None
+
+
+def _track_state_buffer(rows, shape):
+    """Stable buffer per padded row count: a captured graph keeps the pointer."""
+    buffer = _track_buffers.get(rows)
+    if buffer is None:
+        buffer = torch.zeros((rows,) + tuple(shape), dtype=torch.float32)
+        _track_buffers[rows] = buffer
+    return buffer
+
+
+def _eager_track_state_buffer(rows, shape):
+    """One grow-only scratch buffer: eager row counts differ on every batch."""
+    global _eager_track_buffer
+    if (
+        _eager_track_buffer is None
+        or _eager_track_buffer.shape[0] < rows
+        or tuple(_eager_track_buffer.shape[1:]) != tuple(shape)
+    ):
+        _eager_track_buffer = torch.zeros(
+            (rows,) + tuple(shape), dtype=torch.float32
+        )
+    return _eager_track_buffer[:rows]
+
+
+def prepare_checkpoint_plan(fb, query_start_loc, conv_width, dummy_slot, state_shape):
+    """Build checkpoint metadata for the fused primitive, or None when it cannot run.
+
+    Capture replays a fixed shape, so rows are padded up to a static bound and
+    the extra rows are neutralised (dummy state slot, negative conv start).
+    Eager runs the same primitive with exactly the live rows, so both modes
+    share a single implementation.
+    """
+    offsets = getattr(fb, "mamba_checkpoint_offsets", None)
+    tokens = (
+        [] if offsets is None else fb.mamba_checkpoint_tokens.tolist()
+    )
+    if not tokens or conv_width <= 0:
+        return None
+    if capture_enabled():
+        from sglang.srt.server_args import get_global_server_args
+
+        args = get_global_server_args()
+        stride = args.mamba_checkpoint_stride_pages * args.page_size
+        if stride <= 0 or dummy_slot is None:
+            return None
+        rows = fb.input_ids.numel() // stride + fb.batch_size
+        if not 1 <= rows <= CHECKPOINT_GRAPH_CAPACITY or len(tokens) > rows:
+            return None
+        # Bucket the padded rows: one stable tracking buffer per bucket, and
+        # at most log2(CAP) buffers exist in total.
+        rows = 1 << (rows - 1).bit_length()
+    else:
+        rows = len(tokens)
+    plan = CheckpointPlan()
+    plan.offsets = offsets.to(torch.int32).contiguous()
+    plan.tokens = torch.full((rows,), -1, dtype=torch.int32)
+    plan.tokens[: len(tokens)] = torch.tensor(tokens, dtype=torch.int32)
+    plan.dst = fb.mamba_checkpoint_indices.to(torch.int32).contiguous()
+    if rows > plan.dst.numel():
+        plan.dst = torch.cat(
+            [
+                plan.dst,
+                torch.full(
+                    (rows - plan.dst.numel(),), dummy_slot, dtype=torch.int32
+                ),
+            ]
+        )
+    plan.conv_start = torch.full((rows,), -1, dtype=torch.int32)
+    boundaries = plan.offsets.tolist()
+    starts = query_start_loc.tolist()
+    for seq in range(len(boundaries) - 1):
+        first, last = boundaries[seq], boundaries[seq + 1]
+        if first == last:
+            continue
+        assert seq < len(starts)
+        base = starts[seq]
+        for row in range(first, last):
+            # The snapshot window has to sit inside this chunk. A shorter offset
+            # would reach back into the request prefix, whose conv state is not
+            # part of mixed_qkv, so hand the batch back to the legacy path.
+            if tokens[row] < conv_width:
+                return None
+            plan.conv_start[row] = base + tokens[row] - conv_width
+    plan.track_states = (
+        _track_state_buffer(rows, state_shape)
+        if capture_enabled()
+        else _eager_track_state_buffer(rows, state_shape)
+    )
+    return plan
 
 
 def validate_extend_metadata(qsl, indices, slots):
@@ -335,7 +498,11 @@ def conv_segmented(x, weight, bias, activation, state, has_initial_state, indice
 
 def forward_attention(q, k, v, layer, fb, save_kv_cache):
     from .backend import contiguous
-    assert unsupported_reason(fb) is None
+    # Mamba state tracking is handled by the GDN layers; it does not constrain
+    # the full-attention prefill kernel, which is the only eager implementation
+    # for the explicit Qwen backend.
+    reason = unsupported_reason(fb)
+    assert reason is None or reason == "mamba_state_tracking", reason
     register()
     heads, dim = layer.tp_q_head_num, layer.qk_head_dim
     assert heads == 2 and dim == layer.v_head_dim == 256

@@ -754,7 +754,9 @@ class DecodePreallocQueue:
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    # kv_receiver may be None after a prior queue cleanup.
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.abort()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -834,8 +836,20 @@ class DecodePreallocQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
+                if decode_req.kv_receiver is not None:
+                    decode_req.kv_receiver.clear()
+                    decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
+
+        # DecodeRequest is referenced by both self.queue and self.pending_reqs;
+        # drop failed ones from both so the pending resolver never touches a
+        # request whose receiver has already been cleared.
+        if failed_reqs:
+            failed_ids = {id(r) for r in failed_reqs}
+            self.pending_reqs = [
+                r for r in self.pending_reqs if id(r) not in failed_ids
+            ]
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
@@ -1444,6 +1458,9 @@ class DecodeTransferQueue:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                if decode_req.kv_receiver is not None:
+                    decode_req.kv_receiver.clear()
+                    decode_req.kv_receiver = None
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -1486,6 +1503,9 @@ class DecodeTransferQueue:
                 )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
+            # Reset so the next owner sees actual_room == 0 ("not yet written")
+            # instead of a stale value that looks like a room mismatch.
+            self.metadata_buffers.bootstrap_room[idx] = 0
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [

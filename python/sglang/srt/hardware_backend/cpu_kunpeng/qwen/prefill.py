@@ -3,6 +3,7 @@ import os
 from functools import lru_cache
 import torch
 from sglang.srt.graph import ops
+from sglang.srt.utils.common import is_kunpeng_extend_pad
 
 
 def conv_prefill(x, weight, bias, activation, state, initial, indices, qsl, seq_lens_cpu):
@@ -15,7 +16,7 @@ def conv_prefill(x, weight, bias, activation, state, initial, indices, qsl, seq_
         # branch cannot follow the replayed live boundary. Route single
         # requests through the segmented kernel, which reads the live
         # boundaries from qsl at execution time.
-        and not prefill_graph.padding_enabled()
+        and not is_kunpeng_extend_pad()
     ):
         return prefill_graph.conv_c1(x, weight, bias, activation, state, initial, indices)
     return prefill_graph.conv_segmented(x, weight, bias, activation, state, initial, indices, qsl)

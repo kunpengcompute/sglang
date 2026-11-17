@@ -5,11 +5,120 @@ import torch
 from sglang.srt.graph import ops
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import HybridLinearAttnBackend
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
-    QwenAttention, QwenGDNKernel, conv_decode, conv_prefill, gating, scatter, native_rope_cache,
+    QwenAttention, QwenGDNKernel, cast, contiguous, conv_decode, conv_prefill, gating,
+    scatter, select, native_rope_cache,
 )
 from sglang.srt.hardware_backend.cpu_kunpeng.qwen import prefill_graph
+from sglang.srt.hardware_backend.cpu_kunpeng.qwen.capabilities import get_capabilities
+from sglang.srt.utils.common import is_kunpeng_extend_pad
+
+
+def padding_enabled() -> bool:
+    return is_kunpeng_extend_pad()
+
+
+def padded_tokens(tokens: int, cap: int = None) -> int:
+    """Next power-of-2 bucket for ``tokens``, unchanged if it exceeds ``cap``."""
+    if not padding_enabled() or tokens <= 0:
+        return tokens
+    padded = 1 << (tokens - 1).bit_length()
+    if cap is not None and padded > cap:
+        return tokens
+    return padded
+
+
+def extend_pad_cap() -> int:
+    """Largest token count a prefill graph of this backend can capture.
+
+    The padding mechanism itself is model agnostic; only this ceiling is
+    supplied by the model's declared prefill capability.
+    """
+    return get_capabilities().prefill_max_tokens
+
+
+def pad_extend_tokens(fb, cap: int = None) -> None:
+    """Grow an EXTEND batch's token rows to their power-of-2 bucket.
+
+    The prefill graph is keyed by the exact token-row count, so without this
+    every distinct prefill length captures its own graph. This is the shared
+    mechanism for CPU 920F EXTEND batches; the bucket cap is model specific and
+    supplied by the caller.
+
+    Only the token-shaped inputs are extended; request metadata
+    (req_pool_indices/seq_lens/extend_*, mamba query_start_loc) keeps the real
+    request count and the live token count travels in num_token_non_padded.
+
+    Must be idempotent: every EXTEND metadata init calls it (an eager retry, a
+    spec pass consuming the same batch, a graph replay after the eager entry),
+    and an already-padded batch reports a row count above the live count.
+
+    ForwardBatch.prepare_mlp_sync_batch also grows EXTEND token lists
+    (power-of-2/tp-aligned), but the CPU prefill graph is gated off whenever
+    that method runs. Should the two ever coexist, the live-count check below
+    keeps this pass a no-op on an upstream-padded batch instead of padding
+    twice and overwriting num_token_non_padded with the larger upstream count.
+    """
+    if fb.forward_mode.name != "EXTEND":
+        return
+    counts = fb.extend_seq_lens
+    if counts is None or counts.numel() == 0:
+        return
+    real = int(fb.input_ids.shape[0])
+    live = int(counts.sum())
+    # sum(extend_seq_lens) is the live token count; input_ids carries it
+    # exactly until someone pads the rows. A row count above the live count
+    # means an upstream pass already padded this batch to a fixed shape, and a
+    # count below it means inconsistent metadata; either way, do not bucket
+    # again.
+    if real != live:
+        return
+    padded = padded_tokens(real, cap=cap)
+    if padded <= real:
+        return
+    extra = padded - real
+
+    # Pure graph inputs; no kernel reads them for the padding rows.
+    fb.input_ids = torch.cat([fb.input_ids, fb.input_ids.new_zeros(extra)])
+    fb.positions = torch.cat([fb.positions, fb.positions.new_zeros(extra)])
+
+    # Other per-token tensors are read by row (RoPE tables, multimodal
+    # embeddings) or bound as dynamic graph inputs, so they must carry the same
+    # row count as input_ids. Only live-sized ones grow: an upstream pass (the
+    # target prefill handing its already-padded mm embeddings to the draft) may
+    # have grown them to this bucket already.
+    if fb.mrope_positions is not None and fb.mrope_positions.shape[1] == real:
+        fb.mrope_positions = torch.cat(
+            [
+                fb.mrope_positions,
+                fb.mrope_positions.new_zeros((fb.mrope_positions.shape[0], extra)),
+            ],
+            dim=1,
+        )
+    for name in ("input_embeds", "mm_input_embeds"):
+        embeds = getattr(fb, name, None)
+        if embeds is not None and embeds.shape[0] == real:
+            setattr(
+                fb,
+                name,
+                torch.cat([embeds, embeds.new_zeros((extra, embeds.shape[1]))]),
+            )
+
+    # Padding rows carry the -1 skip sentinel: set_kv_buffer_kunpeng stores
+    # every row whose slot is non-negative, so repeating the last live slot
+    # would let the padding rows' k/v overwrite that token's cache entry. -1
+    # stays invisible to the validators (only the live prefix of
+    # out_cache_loc is range/uniqueness-checked) and to the request's KV
+    # release path, which reads the schedule batch's original tensor, never
+    # this padded copy.
+    fb.out_cache_loc = torch.cat(
+        [fb.out_cache_loc, fb.out_cache_loc.new_full((extra,), -1)]
+    )
+
+    fb.num_token_non_padded_cpu = live
+    fb.num_token_non_padded = torch.tensor([live], dtype=torch.int32)
+    fb.extend_num_tokens = padded
+
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +132,12 @@ def _logical_lm_head_mm(x, head, bias=None):
 class KunpengGQABackend(QwenAttention):
     def init_forward_metadata(self, fb):
         self.forward_metadata = None
+        # Runs before the GDN half builds its metadata (HybridLinearAttnBackend
+        # inits full then linear) and is also the whole backend for Qwen models
+        # without linear layers. The attached MTP draft's EXTEND batch runs on
+        # TorchNativeAttnBackend, which calls the same pad_extend_tokens, so the
+        # target prefill and the draft prefill-extend land in one bucket.
+        pad_extend_tokens(fb, cap=extend_pad_cap())
     def forward_extend(self, q, k, v, layer, fb, save_kv_cache=True, **kwargs):
         if fb.forward_mode.is_target_verify():
             # Verify reuses the extend entry point; the Qwen verify attention
@@ -39,8 +154,6 @@ class KunpengGDNBackend(GDNAttnBackend):
         self.kernel_dispatcher.supports_packed_decode = False
 
     def _state(self, layer, fb):
-        if fb.mamba_track_mask is not None:
-            raise ValueError('State tracking has not been explicitly registered for this backend')
         cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         return cache.conv[0], cache.temporal, self.forward_metadata.mamba_cache_indices, self.forward_metadata.query_start_loc
 
@@ -55,8 +168,110 @@ class KunpengGDNBackend(GDNAttnBackend):
         x = conv_decode(mixed_qkv, conv, layer.conv_weights, layer.bias, layer.activation,
                         conv_state_indices=indices)
         q, k, v = self._split(layer, x)
-        return self.kernel_dispatcher.decode(q, k, v, a, b, A_log=layer.A_log, dt_bias=layer.dt_bias,
-                                             ssm_states=state, cache_indices=indices, query_start_loc=qsl, post_conv_base=x)
+        output = self.kernel_dispatcher.decode(q, k, v, a, b, A_log=layer.A_log, dt_bias=layer.dt_bias,
+                                               ssm_states=state, cache_indices=indices, query_start_loc=qsl, post_conv_base=x)
+        self._track_mamba_state_decode(forward_batch, conv, state, indices)
+        return output
+
+    def _forward_extend_multi_checkpoints(
+        self, layer, fb, mixed_qkv, a, b, conv, state, indices, qsl
+    ):
+        initial = ops.tensor_scalar(fb.extend_prefix_lens, 0., 2)
+        x = conv_prefill(mixed_qkv.transpose(0,1), layer.conv_weights, layer.bias, layer.activation,
+                         conv, initial, indices, qsl, fb.extend_seq_lens_cpu).transpose(0,1)
+        q, k, v = self._split(layer, x)
+        g, beta = gating(layer.A_log, a, b, layer.dt_bias)
+        plan = getattr(fb, "kunpeng_checkpoint_plan", None)
+        if (
+            plan is not None
+            and mixed_qkv.is_contiguous()
+            and prefill_graph.gdn_supported(q, k, v)
+        ):
+            # Conv snapshots, recurrence tracking and the post-chunk checkpoint
+            # states all live in one record-only primitive, in eager as well.
+            prefill_graph.register()
+            q, k, v = contiguous(q), contiguous(k), contiguous(v)
+            g, beta = contiguous(cast(g, torch.float32)), contiguous(
+                cast(beta, torch.float32)
+            )
+            state_rows = select(state, indices)
+            workspace = ops.alloc_buffer(
+                prefill_graph.multi_checkpoint_workspace_numel(
+                    q.shape[1], qsl.numel() - 1
+                ),
+                dtype=torch.float32,
+            )
+            output = ops.qwen_gdn_prefill_multi_checkpoint(
+                q, k, v, g, beta, state_rows, qsl, workspace,
+                mixed_qkv, conv, plan.dst, plan.conv_start, plan.track_states,
+                plan.offsets, plan.tokens, prefill_graph.CHECKPOINT_GRAPH_GRAIN,
+            )
+            scatter(state, indices, state_rows)
+            # Padding rows land in the reserved dummy slot.
+            scatter(state, plan.dst, plan.track_states)
+            return output
+        return self._forward_extend_multi_checkpoints_eager(
+            fb, mixed_qkv, conv, state, indices, qsl, q, k, v, g, beta
+        )
+
+    def _forward_extend_multi_checkpoints_eager(
+        self, fb, mixed_qkv, conv, state, indices, qsl, q, k, v, g, beta
+    ):
+        offsets = fb.mamba_checkpoint_offsets.to(torch.int64)
+        tokens = fb.mamba_checkpoint_tokens.to(torch.int64)
+        dst_indices = fb.mamba_checkpoint_indices
+        checkpoint_ids = torch.arange(tokens.numel(), device=tokens.device)
+        row_ids = torch.searchsorted(offsets[1:], checkpoint_ids, right=True)
+
+        conv_width = conv.shape[-1]
+        starts = qsl.to(torch.int64)[row_ids] + tokens - conv_width
+        positions = starts.unsqueeze(1) + torch.arange(
+            conv_width, device=tokens.device, dtype=torch.int64
+        )
+        conv[dst_indices] = mixed_qkv[positions].transpose(1, 2)
+
+        extend_lens = fb.extend_seq_lens.to(torch.int64)[row_ids]
+        internal_mask = tokens < extend_lens
+        internal_rows = internal_mask.nonzero(as_tuple=True)[0]
+        h_track_buf = None
+        internal_offsets = None
+        internal_tokens = None
+        if internal_rows.numel() > 0:
+            internal_tokens = tokens[internal_rows].to(torch.int32)
+            counts = torch.bincount(
+                row_ids[internal_rows], minlength=offsets.numel() - 1
+            ).to(torch.int32)
+            internal_offsets = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=tokens.device),
+                    counts.cumsum(0).to(torch.int32),
+                ]
+            )
+            h_track_buf = self._track_state_buffer(
+                internal_rows.numel(), state.shape[1:]
+            )
+
+        output, updated, _ = self.kernel_dispatcher.extend(
+            q, k, v, g, beta,
+            ssm_states=state,
+            cache_indices=indices,
+            query_start_loc=qsl,
+            track_state=h_track_buf,
+            track_offsets=internal_offsets,
+            track_tokens=internal_tokens,
+        )
+        scatter(state, indices, updated)
+
+        if internal_rows.numel() > 0:
+            state[dst_indices[internal_rows]] = h_track_buf.to(
+                state.dtype, copy=False
+            )
+        final_rows = (~internal_mask).nonzero(as_tuple=True)[0]
+        if final_rows.numel() > 0:
+            state[dst_indices[final_rows]] = updated[
+                row_ids[final_rows]
+            ].to(state.dtype, copy=False)
+        return output
 
     def forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
         if forward_batch.forward_mode.is_target_verify():
@@ -66,15 +281,38 @@ class KunpengGDNBackend(GDNAttnBackend):
             return super().forward_extend(layer, forward_batch, mixed_qkv, a, b, **kwargs)
         fb=forward_batch
         conv, state, indices, qsl = self._state(layer, fb)
+        metadata = self.forward_metadata
         prefill_graph.validate_extend_metadata(qsl, indices, state.shape[0])
+        if fb.mamba_checkpoint_offsets is not None:
+            return self._forward_extend_multi_checkpoints(
+                layer, fb, mixed_qkv, a, b, conv, state, indices, qsl
+            )
+        if metadata.has_mamba_track_mask:
+            mixed_qkv_to_track = mixed_qkv.transpose(0, 1)[
+                :, metadata.track_conv_indices
+            ].transpose(0, 1)
+            conv[metadata.conv_states_mask_indices] = mixed_qkv_to_track
         initial = ops.tensor_scalar(fb.extend_prefix_lens, 0., 2)
         x = conv_prefill(mixed_qkv.transpose(0,1), layer.conv_weights, layer.bias, layer.activation,
                          conv, initial, indices, qsl, fb.extend_seq_lens_cpu).transpose(0,1)
         q, k, v = self._split(layer, x)
         g, beta = gating(layer.A_log, a, b, layer.dt_bias)
-        output, updated, _ = self.kernel_dispatcher.extend(q,k,v,g,beta,ssm_states=state,
-                                                           cache_indices=indices,query_start_loc=qsl)
+        h_track_buf = None
+        if metadata.has_mamba_track_mask and metadata.track_ssm_h_src.numel() > 0:
+            h_track_buf = self._track_state_buffer(indices.shape[0], state.shape[1:])
+        output, updated, _ = self.kernel_dispatcher.extend(
+            q, k, v, g, beta,
+            ssm_states=state,
+            cache_indices=indices,
+            query_start_loc=qsl,
+            track_state=h_track_buf,
+            track_chunk_idx=metadata.track_chunk_idx if h_track_buf is not None else None,
+        )
         scatter(state, indices, updated)
+        if metadata.has_mamba_track_mask:
+            self._track_mamba_state_extend(
+                fb, None, state, metadata, h_track_buf=h_track_buf
+            )
         return output
 
 class KunpengHybridBackend(HybridLinearAttnBackend):
@@ -104,62 +342,35 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
         super().init_forward_metadata(fb)
         metadata = self.linear_attn_backend.forward_metadata
         metadata.mamba_cache_indices = metadata.mamba_cache_indices.to(torch.int32)
-        self._apply_prefill_padding(fb)
+        # The full-attention half already padded the batch; this pass is a no-op
+        # there and only matters when the full backend is not a Kunpeng one.
+        pad_extend_tokens(fb, cap=extend_pad_cap())
 
-    def _apply_prefill_padding(self, fb):
-        """Bucket-align the prefill token list.
+        fb.kunpeng_checkpoint_plan = None
+        if getattr(fb, "mamba_checkpoint_offsets", None) is not None:
+            cache = self.runner.req_to_token_pool.mamba_pool.mamba_cache
+            # Only a fixed-shape replay has padded rows that need a parking slot.
+            dummy = (
+                self._dummy_checkpoint_slot()
+                if prefill_graph.capture_enabled()
+                else None
+            )
+            fb.kunpeng_checkpoint_plan = prefill_graph.prepare_checkpoint_plan(
+                fb,
+                metadata.query_start_loc,
+                cache.conv[0].shape[-1],
+                dummy,
+                # cache.temporal is layer-major, so only the trailing dims are
+                # the per-slot state that checkpoint rows snapshot.
+                cache.temporal.shape[2:],
+            )
 
-        ForwardBatch.prepare_mlp_sync_batch also grows EXTEND token lists
-        (power-of-2/tp-aligned), but the Kunpeng prefill graph is gated off
-        whenever that method runs (prefill_graph.unsupported_reason requires
-        the shared-KV backend, which needs dp_size == 1 and no gathered
-        buffer). Should the two ever coexist, the live-count check below
-        keeps this pass a no-op on an upstream-padded batch instead of
-        padding twice and overwriting num_token_non_padded with the larger
-        upstream count.
-        Only the token-shaped inputs are extended; request metadata
-        (req_pool_indices/seq_lens/extend_*, mamba query_start_loc) keeps the
-        real request count and the live token count travels in
-        num_token_non_padded.
-        """
-        if fb.forward_mode != ForwardMode.EXTEND:
-            return
-        counts = fb.extend_seq_lens
-        if counts is None or counts.numel() == 0:
-            return
-        real = int(fb.input_ids.shape[0])
-        live = int(counts.sum())
-        # sum(extend_seq_lens) is the live token count; input_ids carries it
-        # exactly until someone pads the rows. A row count above the live
-        # count means an upstream pass (prepare_mlp_sync_batch) already
-        # padded this batch to a fixed shape, and a count below it means
-        # inconsistent metadata; either way, do not bucket again. (This also
-        # makes a repeated init a no-op once this method padded the batch.)
-        if real != live:
-            return
-        padded = prefill_graph.padded_tokens(real)
-        if padded <= real:
-            return
-        extra = padded - real
-
-        # Pure graph inputs; no kernel reads them for the padding rows.
-        fb.input_ids = torch.cat([fb.input_ids, fb.input_ids.new_zeros(extra)])
-        fb.positions = torch.cat([fb.positions, fb.positions.new_zeros(extra)])
-
-        # Padding rows carry the -1 skip sentinel: set_kv_buffer_kunpeng
-        # stores every row whose slot is non-negative, so repeating the last
-        # live slot would let the padding rows' k/v overwrite that token's
-        # cache entry. -1 stays invisible to the validators (only the live
-        # prefix of out_cache_loc is range/uniqueness-checked) and to the
-        # request's KV release path, which reads the schedule batch's
-        # original tensor, never this padded copy.
-        fb.out_cache_loc = torch.cat(
-            [fb.out_cache_loc, fb.out_cache_loc.new_full((extra,), -1)]
-        )
-
-        fb.num_token_non_padded_cpu = live
-        fb.num_token_non_padded = torch.tensor([live], dtype=torch.int32)
-        fb.extend_num_tokens = padded
+    def _dummy_checkpoint_slot(self):
+        # Static-shape replay scatters padded checkpoint rows somewhere harmless.
+        # Slot 0 is the pool's permanently reserved padding row: it is never in
+        # free_slots and never enters the radix tree, so the idle pool accounting
+        # keeps balancing instead of reporting a one-slot leak.
+        return 0
 
     def graph_unsupported_reason(self, fb, kwargs):
         # The per-step (non-fused) MTP verify fallback gathers and scatters the
@@ -181,6 +392,11 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
                 self.linear_attn_backend.forward_metadata.query_start_loc]
         if fb.forward_mode.is_extend():
             values.extend([fb.extend_seq_lens,fb.extend_prefix_lens,fb.extend_start_loc])
+            plan = getattr(fb, "kunpeng_checkpoint_plan", None)
+            if plan is not None:
+                # Padded checkpoint metadata: shapes are fixed by the graph key,
+                # values are bound per batch.
+                values.extend([plan.offsets, plan.tokens, plan.dst, plan.conv_start])
         if fb.forward_mode.is_target_verify():
             # Verify row metadata is rebuilt outside the graph once per verify
             # and shared by every layer, so it is bound as a dynamic input.
@@ -207,6 +423,10 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
             values.extend(state.intermediate_conv_window)
             values.append(state.intermediate_ssm)
         if fb.next_token_logits_buffer is not None:values.append(fb.next_token_logits_buffer)
+        plan = getattr(fb, "kunpeng_checkpoint_plan", None)
+        if plan is not None:
+            # Tracking writes into a persistent buffer shared by all GDN layers.
+            values.append(plan.track_states)
         return values
 
 class KunpengVisionHybridBackend(HybridLinearAttnBackend):

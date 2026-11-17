@@ -88,7 +88,10 @@ class QwenHybridGraphProvider:
             and image_decode_graph_enabled()
         ):
             return "image_inputs"
-        if fb.mamba_track_mask is not None:
+        if (
+            getattr(fb, "mamba_checkpoint_offsets", None) is not None
+            or (fb.mamba_track_mask is not None and bool(fb.mamba_track_mask.any()))
+        ):
             return "mamba_state_tracking"
         if fb.return_logprob:
             return "return_logprob"
@@ -578,6 +581,13 @@ class QwenAttachedMTPGraphProvider(QwenHybridGraphProvider):
         hidden = getattr(spec_info, "hidden_states", None) if spec_info else None
         if hidden is None or hidden.shape[0] != tokens:
             return "draft_prefill_extend_hidden_states_missing"
+        # Capture is only possible when the attention backend records the
+        # segmented prefill kernel. Otherwise forward_extend falls through to
+        # the eager per-row SDPA loop, whose Python slicing and int offsets
+        # cannot be replayed from a graph.
+        reason = prefill_graph.unsupported_reason(fb)
+        if reason is not None:
+            return "draft_prefill_extend_" + reason
         return None
 
     def _draft_extend_unsupported_reason(self, fb, kwargs):

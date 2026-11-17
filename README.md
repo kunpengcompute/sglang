@@ -563,7 +563,7 @@ sh curl.sh -p -s -f prompts/ragged.txt
 | `-F`             | fake-transfer模式（注入bootstrap\_host=2.2.2.2，decode跳过KV传输；端口从INSTANCES的decode条目自动推导，`CURL_PORT`可覆盖） | 关闭              |
 | `-i`             | 多轮交互式对话模式                                                         | 关闭              |
 
-通过`CURL_HOST`/`CURL_PORT`环境变量可指定目标地址与端口（默认本机网卡IP:30000）。根据请求的返回结果对正确性进行验证。
+请求默认发往`env.sh`中配置的`ROUTER_IP`（gateway所在节点，`curl.sh`通过`source env.sh none`读取）；通过`CURL_HOST`/`CURL_PORT`环境变量可覆盖目标地址与端口（默认端口30000）。根据请求的返回结果对正确性进行验证。
 
 ### 4.5 基准测试
 

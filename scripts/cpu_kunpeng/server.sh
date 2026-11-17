@@ -163,7 +163,7 @@ case "$ROLE" in
             --max-total-tokens "${PREFILL_MAX_TOTAL_TOKENS:-131072}"
             --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
             --max-running-requests $((8 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
-            --load-balance-method round_robin
+            --load-balance-method "${PREFILL_LB_METHOD:-follow_bootstrap_room}"
             --enable-dynamic-batch-tokenizer
             --disaggregation-bootstrap-port "${PREFILL_BOOTSTRAP_PORT:-9001}"
         )

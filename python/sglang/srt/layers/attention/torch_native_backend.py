@@ -48,7 +48,21 @@ class TorchNativeAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        pass
+        if self.kunpeng_qwen is None:
+            return
+        # The attached Qwen MTP draft runs on this backend (ModelRunner picks
+        # TorchNativeAttnBackend for the borrowed runner) and consumes the
+        # target prefill's CaptureHiddenMode.FULL hidden states row-for-row.
+        # Bucket it with the same policy as the target prefill, otherwise the
+        # draft prefill-extend sees hidden.shape[0] != input_ids.numel() and
+        # falls back to eager, which cannot allocate SHM after the first
+        # capture ("remain 0").
+        from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_hybrid_backend import (
+            extend_pad_cap,
+            pad_extend_tokens,
+        )
+
+        pad_extend_tokens(forward_batch, cap=extend_pad_cap())
 
     def _run_sdpa_forward_extend(
         self,

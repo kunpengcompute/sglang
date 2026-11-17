@@ -133,8 +133,13 @@ export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-65536}"
 # flash-comm: prefill SP MoE + shared-expert EPLB co-location (=1 to enable;
 # also needs INIT_EXPERT_LOCATION / REDUNDANT_EXPERTS, see README section 3.2-4).
 export SGLANG_KUNPENG_FLASH_COMM="${SGLANG_KUNPENG_FLASH_COMM:-0}"
-# Fused MoE GEMM inner tile (rows); 2048 = prefill reference. Sync with ep_moe/layer.py.
-export KUTACC_FUSEDMOE_TILEBUF="${KUTACC_FUSEDMOE_TILEBUF:-2048}"
+
+# ---- kutacc fused-MoE switches --------------------------------------------
+# Fused MoE GEMM inner tile (rows); 2048 = prefill reference, one chunk per
+# rank in the per-expert loop. ETP instances (8 local experts, ~8x the rows)
+# must raise TILEBUF. Sync with ep_moe/layer.py.
+export KUTACC_FUSEDMOE_TILEBUF="${KUTACC_FUSEDMOE_TILEBUF:-2048}"      # single-wave capacity
+export KUTACC_FUSEDMOE_MULTI_OPERAND_GEMM="${KUTACC_FUSEDMOE_MULTI_OPERAND_GEMM:-0}"  # 1 = all experts in one kernel call (ETP only), 0 = per-expert loop
 
 # Per-server overrides (sourced after role defaults so they take priority).
 # With an instance (env.sh prefill 128p -> INSTANCE=128p), ONLY the instance

@@ -84,6 +84,17 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
+    # PD KV layer sharding over a shared decode KV pool. Both default to 0 for
+    # the legacy 8-frame metadata (every rank receives a full KV copy).
+    # count > 0 and id == 0: aux only, this rank owns no layer shard.
+    # id in [1, count]: receive exactly that disjoint layer shard.
+    kv_shard_id: int = 0
+    kv_shard_count: int = 0
+    # PD index-K (NSA state) layer sharding over a shared decode index-K pool.
+    # Independent of the KV shard above: both default to 0, which means every
+    # rank needs a full index-K copy (private index-K cache).
+    state_shard_id: int = 0
+    state_shard_count: int = 0
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -102,6 +113,26 @@ class TransferInfo:
             else:
                 dst_state_indices = list(np.frombuffer(msg[6], dtype=np.int32))
             is_dummy = False
+
+        # Frames 8-11 are appended by decode whenever one of its pools is shared
+        # by a group; a decode without shared pools sends the legacy 8 frames.
+        # KV and index-K are sharded by their OWN group, so the two specs are
+        # independent. The counts are just how many disjoint layer shards the
+        # sender split each pool into -- no capability negotiation is involved.
+        kv_shard_id = int(msg[8]) if len(msg) > 8 and msg[8] else 0
+        kv_shard_count = int(msg[9]) if len(msg) > 9 and msg[9] else 0
+        if kv_shard_count < 0 or not (0 <= kv_shard_id <= kv_shard_count):
+            raise ValueError(
+                f"invalid PD KV shard {kv_shard_id}/{kv_shard_count}"
+            )
+        state_shard_id = int(msg[10]) if len(msg) > 10 and msg[10] else 0
+        state_shard_count = int(msg[11]) if len(msg) > 11 and msg[11] else 0
+        if state_shard_count < 0 or not (
+            0 <= state_shard_id <= state_shard_count
+        ):
+            raise ValueError(
+                f"invalid PD index-K shard {state_shard_id}/{state_shard_count}"
+            )
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -112,6 +143,10 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+            kv_shard_id=kv_shard_id,
+            kv_shard_count=kv_shard_count,
+            state_shard_id=state_shard_id,
+            state_shard_count=state_shard_count,
         )
 
 
@@ -263,12 +298,63 @@ class MooncakeKVManager(CommonKVManager):
                     daemon=True,
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self._log_pd_kv_shard_decision()
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
+
+    def _log_pd_kv_shard_decision(self):
+        """Startup record of the PD shard decisions of this decode process.
+
+        Sharding is decided solely from the process-local shared-pool state, so
+        if the receiver ever runs where a pool was not opened it silently falls
+        back to one full copy per rank. KV and index-K are sharded by their OWN
+        group, so both decisions are logged. Logging them once at startup makes
+        the fallback visible instead of showing up only as missing transfer
+        bandwidth.
+        """
+        env_kv = envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get()
+        env_indexer = envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get()
+        if env_kv == 0 and env_indexer == 0:
+            return
+        from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
+            POOL_KIND_INDEXER,
+            POOL_KIND_KV,
+            get_share_state,
+            pd_indexer_shard_spec,
+            pd_kv_shard_spec,
+        )
+
+        def _describe(spec) -> str:
+            if spec is None:
+                return "legacy: every rank receives a full copy"
+            if spec[0] == 0:
+                return f"aux only, none (shard 0/{spec[1]})"
+            return f"layer shard {spec[0]}/{spec[1]}"
+
+        kv_spec = pd_kv_shard_spec()
+        state_spec = pd_indexer_shard_spec()
+        kv_state = get_share_state(POOL_KIND_KV)
+        indexer_state = get_share_state(POOL_KIND_INDEXER)
+        logger.info(
+            "[pd-kv-shard] decode rank=%d env_kv_group=%d env_indexer_group=%d "
+            "kv{enabled=%s group_size=%d intra=%d -> %s} "
+            "indexer{enabled=%s group_size=%d intra=%d -> %s}",
+            self.kv_args.engine_rank,
+            env_kv,
+            env_indexer,
+            kv_state["enabled"],
+            kv_state["group_size"],
+            kv_state["intra_group_rank"],
+            _describe(kv_spec),
+            indexer_state["enabled"],
+            indexer_state["group_size"],
+            indexer_state["intra_group_rank"],
+            _describe(state_spec),
+        )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -625,10 +711,15 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         decode_start_layer: Optional[int] = None,
         decode_num_layers: Optional[int] = None,
+        layer_shard: Optional[Tuple[int, int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
         This method is used by both send_kvcache (full pool) and maybe_send_extra.
+
+        ``layer_shard`` is ``(shard_id, shard_count)`` when the decode side owns
+        a shared KV pool: only this shard of the (post PP-mapping) layer list
+        is written, so two prefill ranks can transfer one KV copy in parallel.
         """
         valid_dst = dst_data_indices >= 0
         if not valid_dst.all():
@@ -734,6 +825,34 @@ class MooncakeKVManager(CommonKVManager):
             ]
         assert layers_params is not None
 
+        if layer_shard is not None:
+            # PD KV sharding over a shared decode pool: this prefill rank owns
+            # one disjoint contiguous slice of the layer list. Slice by
+            # POSITION (after PP mapping), not by absolute layer id, so the
+            # main KV and the NSA index-K list stay aligned with each other.
+            if not self.is_mla_backend:
+                raise RuntimeError(
+                    "PD KV layer sharding is only supported on the MLA backend"
+                )
+            from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
+                pd_layer_shard_range,
+            )
+
+            shard_id, shard_count = layer_shard
+            lo, hi = pd_layer_shard_range(
+                len(layers_params), shard_id, shard_count
+            )
+            logger.debug(
+                "[pd-kv-shard] session=%s shard=%d/%d layers=[%d,%d) of %d",
+                mooncake_session_id,
+                shard_id,
+                shard_count,
+                lo,
+                hi,
+                len(layers_params),
+            )
+            layers_params = layers_params[lo:hi]
+
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
@@ -792,6 +911,7 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         decode_start_layer: Optional[int] = None,
         decode_num_layers: Optional[int] = None,
+        layer_shard: Optional[Tuple[int, int]] = None,
     ):
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
@@ -803,6 +923,7 @@ class MooncakeKVManager(CommonKVManager):
             executor=executor,
             decode_start_layer=decode_start_layer,
             decode_num_layers=decode_num_layers,
+            layer_shard=layer_shard,
         )
 
     def send_kvcache_hisparse(
@@ -1104,6 +1225,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_state_data_ptrs: list[int],
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        layer_shard: Optional[Tuple[int, int]] = None,
     ):
         """Send state or extra pool data with type-specific handling."""
         state_type = getattr(self.kv_args, "state_type", "none")
@@ -1173,6 +1295,7 @@ class MooncakeKVManager(CommonKVManager):
                     if target_rank_registration_info is not None
                     else None
                 ),
+                layer_shard=layer_shard,
             )
         else:
             return 0
@@ -1374,7 +1497,45 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if self.is_mla_backend or (
+                        skip_kv = req.kv_shard_count > 0 and req.kv_shard_id == 0
+                        layer_shard = (
+                            (req.kv_shard_id, req.kv_shard_count)
+                            if req.kv_shard_count > 0 and not skip_kv
+                            else None
+                        )
+                        # index-K (state) is sharded by the INDEXER group, which
+                        # is independent of the KV group: a shared index-K pool
+                        # needs only its two shard owners to receive it, while a
+                        # private per-rank index-K cache needs every rank to get
+                        # a full copy (state_shard_count == 0).
+                        skip_state = (
+                            req.state_shard_count > 0 and req.state_shard_id == 0
+                        )
+                        state_layer_shard = (
+                            (req.state_shard_id, req.state_shard_count)
+                            if req.state_shard_count > 0 and not skip_state
+                            else None
+                        )
+                        if layer_shard is not None and not self.is_mla_backend:
+                            raise RuntimeError(
+                                "PD KV layer sharding requires the MLA backend"
+                            )
+                        if (
+                            layer_shard is not None
+                            and target_rank_registration_info.enable_hisparse
+                        ):
+                            raise RuntimeError(
+                                "PD KV layer sharding is incompatible with HiSparse"
+                            )
+                        if skip_kv:
+                            # This decode rank shares the group's KV pool but
+                            # owns no layer shard: skip the KV RDMA write while
+                            # keeping aux + status so the group's MIN
+                            # all_reduce converges. Indices stay real (only the
+                            # write is skipped), so the shared kv_chunk is
+                            # never truncated by the length guard above.
+                            ret = 0
+                        elif self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
@@ -1419,6 +1580,7 @@ class MooncakeKVManager(CommonKVManager):
                                         "decode_num_layers",
                                         0,
                                     ),
+                                    layer_shard=layer_shard,
                                 )
                         elif (
                             self.enable_staging
@@ -1485,13 +1647,14 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices is not None:
+                            if kv_chunk.state_indices is not None and not skip_state:
                                 self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     target_rank_registration_info.dst_state_data_ptrs,
                                     executor,
                                     target_rank_registration_info,
+                                    layer_shard=state_layer_shard,
                                 )
 
                             # Only the last chunk we need to send the aux data
@@ -2199,9 +2362,42 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
+        # Sharding is decided solely by THIS decode process: when a pool is
+        # shared by its group, only two ranks own a disjoint layer shard of that
+        # pool and the rest receive nothing of it. Otherwise every rank gets a
+        # full copy via the legacy 8-frame metadata. KV and index-K are sharded
+        # by their OWN group, so the two specs are computed independently;
+        # pd_*_shard_spec() returns None whenever that pool is not actually
+        # shared, so no prefill-side capability negotiation is involved.
+        kv_shard_spec = None
+        state_shard_spec = None
+        if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0:
+            from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
+                pd_kv_shard_spec,
+            )
+
+            kv_shard_spec = pd_kv_shard_spec()
+        if envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() != 0:
+            from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
+                pd_indexer_shard_spec,
+            )
+
+            state_shard_spec = pd_indexer_shard_spec()
+        send_shard_frames = kv_shard_spec is not None or state_shard_spec is not None
+
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            if is_dummy:
+                # A dummy connection carries no real indices and has its own
+                # branch on the prefill side; it never transfers KV.
+                shard_id, shard_count = 0, 0
+                state_shard_id, state_shard_count = 0, 0
+            else:
+                shard_id, shard_count = kv_shard_spec if kv_shard_spec else (0, 0)
+                state_shard_id, state_shard_count = (
+                    state_shard_spec if state_shard_spec else (0, 0)
+                )
 
             # Sessions per prefill rank: required_dst_info_num covers the
             # attn-tp dimension; decode PP stages sharing the same prefill PP
@@ -2230,6 +2426,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(dst_session_num).encode("ascii"),
                     ]
+                    + (
+                        [
+                            str(shard_id).encode("ascii"),
+                            str(shard_count).encode("ascii"),
+                            str(state_shard_id).encode("ascii"),
+                            str(state_shard_count).encode("ascii"),
+                        ]
+                        if send_shard_frames
+                        else []
+                    )
                 )
         self.init_time = time.time()
 
