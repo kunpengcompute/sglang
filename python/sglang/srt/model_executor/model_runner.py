@@ -3295,29 +3295,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 _KunpengDispatcherState,
             )
 
-            # Draft-worker (NextN) forwards dump too when MTP heat collection
-            # is on: with a size-1 recorder buffer each forward pass
-            # overwrites the previous step's counts, so a draft step's counts
-            # would otherwise never reach a dump (dumps only ran after target
-            # forwards). The draft layer records into the target's last
-            # MoE-layer row (record_layer_id), so merged snapshots see the
-            # full per-round serving heat.
-            record_mtp = (
-                os.environ.get("SGLANG_KUNPENG_EXPERT_DISTRIBUTION_INCLUDE_MTP", "0")
-                == "1"
-            )
+            # NextN MTP records into a dedicated draft row, so the draft worker
+            # dumps too (only active when the recorder is enabled).
+            metadata = get_global_expert_location_metadata()
+            record_mtp = metadata is not None and metadata.has_draft_layer
             if (
                 (not self.is_draft_worker or record_mtp)
-                and not forward_batch.forward_mode.is_idle()
-                and _KunpengDispatcherState.get().moe_tp_rank == 0
                 and os.environ.get("SGLANG_KUNPENG_EXPERT_DISTRIBUTION_AUTO_DUMP", "0")
                 == "1"
             ):
                 recorder = get_global_expert_distribution_recorder()
                 if recorder.recording:
-                    recorder.dump_record(
-                        collective=False, forward_pass_id=self.forward_pass_id
+                    # Idle DP ranks still receive remote tokens via the MoE
+                    # all-to-all, so commit pending counts; skip empty forwards
+                    # to avoid zero-file spam on a fully idle server.
+                    counter = recorder.get_kunpeng_counter()
+                    pad_counter = recorder.get_kunpeng_pad_counter()
+                    has_heat = counter is not None and bool(counter.any())
+                    has_pad = pad_counter is not None and bool(pad_counter.any())
+                    # Only ETP leaders own the heat counter. A non-leader rank
+                    # can still hold padding assignments (it is the attn-TP
+                    # leader of its own DP replica), and those must reach a
+                    # dump file for the merge to subtract them; its heat count
+                    # is zero, so the extra file is harmless.
+                    owns_records = (
+                        _KunpengDispatcherState.get().moe_tp_rank == 0 or has_pad
                     )
+                    if owns_records and (
+                        not forward_batch.forward_mode.is_idle()
+                        or has_heat
+                        or has_pad
+                    ):
+                        recorder.dump_record(
+                            collective=False, forward_pass_id=self.forward_pass_id
+                        )
 
         return output
 

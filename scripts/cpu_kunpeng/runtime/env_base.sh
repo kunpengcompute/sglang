@@ -98,9 +98,8 @@ export INIT_EXPERT_LOCATION=""
 export EP_DISPATCH_ALGORITHM=""  # e.g. static, dynamic
 # Expert heat collection is opt-in per instance; reset inherited shell state.
 export SGLANG_KUNPENG_EXPERT_DISTRIBUTION_AUTO_DUMP=0
-# 1 = record the NextN (MTP draft) layer's expert heat into the target's
-# last MoE-layer row (kunpeng_cpu backend only)
-export SGLANG_KUNPENG_EXPERT_DISTRIBUTION_INCLUDE_MTP=0
+# NextN (MTP draft) expert heat is collected automatically into its own EPLB
+# row when MTP is enabled on kunpeng_cpu; no per-instance switch is needed.
 export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="/tmp"
 export EXPERT_DISTRIBUTION_RECORDER_MODE=""
 export EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE=""
@@ -242,7 +241,9 @@ else
 fi
 
 export SGLANG_KUNPENG_MOE_TOKEN_MULTIPLE=2
-export SGLANG_KUNPENG_SAVE_AT_TRACE=0 # set 1 to open record experts activation number
+# DeepSeek redundant-expert (1.5 experts/rank) offline pipeline only; leave
+# disabled for other models (use the EPLB expert-distribution recorder instead).
+export SGLANG_KUNPENG_SAVE_AT_TRACE=0
 # ------------------------------------------------------------
 # Load local config
 # ------------------------------------------------------------

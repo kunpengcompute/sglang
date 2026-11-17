@@ -363,6 +363,10 @@ int64_t topk_convert_kunpeng(at::Tensor count, at::Tensor src_info, at::Tensor s
 void record_expert_activation_kunpeng(at::Tensor experts_offset, at::Tensor counter,
                                       int64_t layer_id, int64_t num_local_experts);
 
+void record_padded_expert_activation_kunpeng(at::Tensor topk_ids, at::Tensor num_token_non_padded,
+                                             at::Tensor counter, int64_t layer_id,
+                                             int64_t num_experts, int64_t slice_offset);
+
 void moe_etp_dispatch_share_kunpeng(at::Tensor packed_recv_x, at::Tensor token_ids,
                                     at::Tensor experts_offset, at::Tensor dense_buf,
                                     at::Tensor etp_experts_offset, at::Tensor etp_total,
@@ -1100,6 +1104,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "record_expert_activation_kunpeng("
         "Tensor experts_offset, Tensor(a!) counter, int layer_id, int num_local_experts) -> ()");
     m.impl("record_expert_activation_kunpeng", record_expert_activation_kunpeng);
+
+    m.def(
+        "record_padded_expert_activation_kunpeng("
+        "Tensor topk_ids, Tensor num_token_non_padded, Tensor(a!) counter, "
+        "int layer_id, int num_experts, int slice_offset) -> ()");
+    m.impl("record_padded_expert_activation_kunpeng", record_padded_expert_activation_kunpeng);
 
     m.def(
         "moe_etp_dispatch_share_kunpeng("

@@ -16,7 +16,6 @@
 
 import contextlib
 import logging
-import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -105,16 +104,16 @@ class Glm4MoeModelNextN(nn.Module):
             )
 
         residual = None
-        # The NextN draft layer's expert heat is real serving load (the draft
-        # layer runs speculative_num_steps extra times per decode round) and
-        # its EPLB dispatch reuses the target's last MoE layer mapping, so
-        # record it into that row when MTP collection is enabled. The
-        # recorder's kunpeng counter write lands in `record_layer_id`
-        # (set by Glm4MoeSparseMoeBlock for is_nextn layers). Keep the
-        # legacy exclude-by-default behaviour otherwise.
-        if os.environ.get(
-            "SGLANG_KUNPENG_EXPERT_DISTRIBUTION_INCLUDE_MTP", "0"
-        ) == "1" and (get_global_server_args().moe_a2a_backend == "kunpeng_cpu"):
+        # Record draft heat/pad into its dedicated EPLB row when available.
+        record_draft = False
+        if get_global_server_args().moe_a2a_backend == "kunpeng_cpu":
+            from sglang.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            metadata = get_global_expert_location_metadata()
+            record_draft = metadata is not None and metadata.has_draft_layer
+        if record_draft:
             hidden_states, residual = self.decoder(
                 positions, hidden_states, forward_batch, residual
             )

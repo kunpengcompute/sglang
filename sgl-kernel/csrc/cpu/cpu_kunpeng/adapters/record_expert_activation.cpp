@@ -21,6 +21,10 @@
 void record_expert_activation_kunpeng(at::Tensor experts_offset, at::Tensor counter,
                                       int64_t layer_id, int64_t num_local_experts);
 
+void record_padded_expert_activation_kunpeng(at::Tensor topk_ids, at::Tensor num_token_non_padded,
+                                             at::Tensor counter, int64_t layer_id,
+                                             int64_t num_experts, int64_t slice_offset);
+
 // Graph-replay dispatch. The signature (tensors first, then int64 scalars in
 // declaration order) is what DispatchAdapter decomposes a captured op into:
 // experts_offset/counter map to the tensor vector, layer_id/num_local_experts
@@ -28,3 +32,8 @@ void record_expert_activation_kunpeng(at::Tensor experts_offset, at::Tensor coun
 static KernelRegistrar _r_record_expert_activation(
     "record_expert_activation_kunpeng",
     make_dispatch_v<decltype(&record_expert_activation_kunpeng), &record_expert_activation_kunpeng>);
+
+static KernelRegistrar _r_record_padded_expert_activation(
+    "record_padded_expert_activation_kunpeng",
+    make_dispatch_v<decltype(&record_padded_expert_activation_kunpeng),
+                    &record_padded_expert_activation_kunpeng>);

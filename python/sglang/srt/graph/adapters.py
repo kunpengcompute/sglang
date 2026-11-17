@@ -1766,6 +1766,22 @@ def _setup_record_expert_activation_kunpeng():
     register_op('record_expert_activation_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_record_padded_expert_activation_kunpeng():
+    # In-place padding-token expert histogram, subtracted in the offline merge.
+    def shape_infer(topk_ids, num_token_non_padded, counter, layer_id, num_experts,
+                    slice_offset):
+        return []
+
+    def eager_fn(topk_ids, num_token_non_padded, counter, layer_id, num_experts,
+                 slice_offset):
+        torch.ops.sgl_kernel.record_padded_expert_activation_kunpeng(
+            topk_ids, num_token_non_padded, counter, int(layer_id), int(num_experts),
+            int(slice_offset))
+        return None
+
+    register_op('record_padded_expert_activation_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_moe_comm_barrier_kunpeng():
     def shape_infer():
         return []
@@ -1882,6 +1898,7 @@ def setup():
     _setup_igemm_fusedmoe_gateup_kunpeng()
     _setup_igemm_fusedmoe_down_kunpeng()
     _setup_record_expert_activation_kunpeng()
+    _setup_record_padded_expert_activation_kunpeng()
     _setup_moe_etp_dispatch_share_kunpeng()
     _setup_moe_etp_reduce_kunpeng()
     _setup_etp_remap_topk_ids_kunpeng()
