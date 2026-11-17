@@ -90,6 +90,12 @@ HTTP_COMMON_ARGS=(
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"}
 )
 
+# Enable Prometheus metrics (TTFT/time_to_first_token_seconds are observed
+# here by the tokenizer manager, so this process needs --enable-metrics too).
+if [[ "${SGLANG_ENABLE_METRICS:-0}" == "1" ]]; then
+    HTTP_COMMON_ARGS+=(--enable-metrics)
+fi
+
 # Request logging (inputs/outputs of all requests), gated by LOG_REQUESTS.
 # The HTTP server / tokenizer manager runs here in PD-separated mode, so the
 # Receive/Finish request logs are emitted by this process.
