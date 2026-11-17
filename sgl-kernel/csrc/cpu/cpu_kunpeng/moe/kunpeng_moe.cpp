@@ -937,6 +937,50 @@ void record_expert_activation_kunpeng(at::Tensor experts_offset,  // [num_local_
     }
 }
 
+// Graph-replay-safe histogram of padding-token expert assignments. Padding
+// rows get artificial load-balanced ids, so the offline merge subtracts this
+// ([num_layers, num_logical_experts] counter) from the recorded heat.
+void record_padded_expert_activation_kunpeng(at::Tensor topk_ids,   // [num_tokens, topk] int16
+                                             at::Tensor num_token_non_padded,  // int32 scalar
+                                             at::Tensor counter,    // [num_layers, num_logical_experts] int64
+                                             int64_t layer_id, int64_t num_experts,
+                                             int64_t slice_offset)
+{
+    TORCH_CHECK(topk_ids.scalar_type() == at::kShort, "topk_ids must be int16");
+    TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D");
+    TORCH_CHECK(num_token_non_padded.scalar_type() == at::kInt,
+                "num_token_non_padded must be int32");
+    TORCH_CHECK(counter.scalar_type() == at::kLong, "counter must be int64");
+    TORCH_CHECK(counter.dim() == 2, "counter must be 2D");
+    TORCH_CHECK(layer_id >= 0 && layer_id < counter.size(0), "layer_id out of range");
+    TORCH_CHECK(counter.size(1) >= num_experts, "counter width smaller than num_experts");
+
+    const int64_t num_total = topk_ids.size(0);
+    int64_t pad_start = num_token_non_padded.data_ptr<int32_t>()[0];
+    // SP mode: topk_ids holds only this rank's slice of the global table while
+    // num_token_non_padded is the global real-token count (same convention as
+    // load_balance_padded_tokens_kunpeng).
+    pad_start -= slice_offset;
+    if (pad_start < 0) pad_start = 0;
+    if (pad_start > num_total) pad_start = num_total;
+    if (pad_start >= num_total) return;
+
+    const int64_t topk = topk_ids.size(1);
+    const int64_t stride0 = topk_ids.stride(0);
+    const int64_t stride1 = topk_ids.stride(1);
+    const int16_t *ids = topk_ids.data_ptr<int16_t>();
+    int64_t *cnt = counter.data_ptr<int64_t>() + layer_id * counter.stride(0);
+
+    for (int64_t i = pad_start; i < num_total; ++i) {
+        for (int64_t j = 0; j < topk; ++j) {
+            const int16_t e = ids[i * stride0 + j * stride1];
+            if (e >= 0 && e < num_experts) {
+                cnt[e] += 1;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // topk_convert_kunpeng
 //

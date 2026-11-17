@@ -176,6 +176,9 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    # Recorder row for the padding histogram; defaults to `layer_id` (nextn
+    # overrides it so padding lands in the same row as its heat).
+    pad_layer_id: Optional[int] = None
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -282,6 +285,7 @@ class TopK(MultiPlatformOp):
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
+        pad_layer_id: Optional[int] = None,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -305,6 +309,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            pad_layer_id=pad_layer_id,
         )
 
     def forward_native(
@@ -1284,6 +1289,7 @@ def _load_balance_padded_tokens_kunpeng(
     num_token_non_padded: torch.Tensor,
     num_experts: int,
     topk: int,
+    layer_id: Optional[int] = None,
 ) -> torch.Tensor:
     force_balance = get_bool_env_var("SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE")
     # Rotate the t_high target window per DP rank so aggregated loads stay
@@ -1308,6 +1314,15 @@ def _load_balance_padded_tokens_kunpeng(
     kunpeng.load_balance_padded_tokens_kunpeng(
         topk_ids, topk_weights, num_token_non_padded, num_experts, topk,
         force_balance, expert_offset, slice_offset)
+    # Record the padding-row logical-expert histogram for offline subtraction.
+    # Non-SP topk_ids is replicated across the attn-TP group, so record once.
+    record_pad = state.use_sp or state.attn_tp_rank == 0
+    if record_pad and layer_id is not None and num_token_non_padded is not None:
+        pad_counter = get_global_expert_distribution_recorder().get_kunpeng_pad_counter()
+        if pad_counter is not None:
+            kunpeng.record_padded_expert_activation_kunpeng(
+                topk_ids, num_token_non_padded, pad_counter, int(layer_id),
+                int(num_experts), int(slice_offset))
     return topk_ids, topk_weights
 
 
@@ -1607,6 +1622,11 @@ def _post_process_topk_ids(
             num_token_non_padded=num_token_non_padded,
             num_experts=router_logits.shape[1],
             topk=topk_ids.shape[1],
+            layer_id=(
+                topk_config.pad_layer_id
+                if topk_config.pad_layer_id is not None
+                else layer_id
+            ),
         )
         if expert_location_dispatch_info is not None:
             topk_ids = _remap_kunpeng_topk_ids_to_rank_slot(

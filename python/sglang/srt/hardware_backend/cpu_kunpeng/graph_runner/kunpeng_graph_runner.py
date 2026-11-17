@@ -1736,6 +1736,11 @@ class KunpengGraphRunner:
             )
             if recorder_counter is not None:
                 fixed.append(recorder_counter)
+            recorder_pad_counter = (
+                get_global_expert_distribution_recorder().get_kunpeng_pad_counter()
+            )
+            if recorder_pad_counter is not None:
+                fixed.append(recorder_pad_counter)
         except Exception:
             pass
         # EPLB static dispatch map (logical -> physical expert per layer),

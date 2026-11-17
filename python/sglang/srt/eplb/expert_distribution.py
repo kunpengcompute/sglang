@@ -96,6 +96,9 @@ class ExpertDistributionRecorder(ABC):
     def get_kunpeng_counter(self) -> Optional[torch.Tensor]:
         return None
 
+    def get_kunpeng_pad_counter(self) -> Optional[torch.Tensor]:
+        return None
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -225,6 +228,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             return None
         gatherer = self._single_pass_gatherers[_SINGLE_PASS_GATHERER_KEY_PRIMARY]
         return getattr(gatherer, "get_kunpeng_counter", lambda: None)()
+
+    def get_kunpeng_pad_counter(self) -> Optional[torch.Tensor]:
+        if self._disable_all:
+            return None
+        gatherer = self._single_pass_gatherers[_SINGLE_PASS_GATHERER_KEY_PRIMARY]
+        return getattr(gatherer, "get_kunpeng_pad_counter", lambda: None)()
 
     def on_deepep_dispatch_normal(
         self,
@@ -661,18 +670,30 @@ class _KunpengSinglePassGatherer(_SinglePassGatherer):
         num_local = expert_location_metadata.num_local_physical_experts
         self._num_layers = num_layers
         self._num_local = num_local
+        self._num_logical = expert_location_metadata.num_logical_experts
         self._counter = torch.zeros(num_layers * num_local, dtype=torch.int64)
         self._forward_start = self._counter.clone()
+        # Padding assignments in logical expert space; subtracted by the merge.
+        self._pad_counter = torch.zeros(
+            (num_layers, self._num_logical), dtype=torch.int64
+        )
+        self._pad_forward_start = self._pad_counter.clone()
 
     def get_kunpeng_counter(self):
         return self._counter
 
+    def get_kunpeng_pad_counter(self):
+        return self._pad_counter
+
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         self._forward_start.copy_(self._counter)
+        self._pad_forward_start.copy_(self._pad_counter)
 
     def reset(self):
         self._counter.zero_()
         self._forward_start.zero_()
+        self._pad_counter.zero_()
+        self._pad_forward_start.zero_()
 
     def collect(self) -> Dict:
         local_count = (self._counter - self._forward_start).view(
@@ -684,7 +705,10 @@ class _KunpengSinglePassGatherer(_SinglePassGatherer):
             num_local_physical_experts=self._num_local,
             num_physical_experts=self._expert_location_metadata.num_physical_experts,
         )
-        return dict(global_physical_count=global_count)
+        return dict(
+            global_physical_count=global_count,
+            pad_logical_count=self._pad_counter - self._pad_forward_start,
+        )
 
 
 # --------------------------------------- Accumulator -----------------------------------------
@@ -930,11 +954,23 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             dtype=torch.int32,
             device=self._server_args.device,
         )
+        # Padding histogram subtracted from logical_count by the offline merge.
+        self._pad_logical_count_of_buffered_step = _Buffer.init_new(
+            item_shape=(
+                self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.num_logical_experts,
+            ),
+            buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
+            dtype=torch.int32,
+            device=self._server_args.device,
+        )
         self._first_dump = True
         self._local_logical_count = None
+        self._local_pad_logical_count = None
 
     def reset_local_dump(self):
         self._local_logical_count = None
+        self._local_pad_logical_count = None
 
     def append(
         self,
@@ -948,10 +984,14 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.append(
             single_pass_data["global_physical_count"]
         )
+        pad_logical_count = single_pass_data.get("pad_logical_count")
+        if pad_logical_count is not None:
+            self._pad_logical_count_of_buffered_step.append(pad_logical_count)
 
     def reset(self):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
+        self._pad_logical_count_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
         return self._dump_impl(output_mode, collective=True)
@@ -986,6 +1026,17 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 self._local_logical_count += logical_count_of_buffered_step
             logical_count_of_buffered_step = self._local_logical_count
 
+        pad_all = self._pad_logical_count_of_buffered_step.get_all()
+        pad_logical_count = None
+        if pad_all.numel() > 0:
+            pad_logical_count = pad_all.sum(dim=0, dtype=torch.int64)
+            if not collective:
+                if self._local_pad_logical_count is None:
+                    self._local_pad_logical_count = pad_logical_count.clone()
+                else:
+                    self._local_pad_logical_count += pad_logical_count
+                pad_logical_count = self._local_pad_logical_count
+
         if self._first_dump:
             self._first_dump = False
             if self._server_args.device != "cpu":
@@ -995,6 +1046,10 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.distributed.all_reduce(
                 logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
             )
+            if pad_logical_count is not None:
+                torch.distributed.all_reduce(
+                    pad_logical_count, op=torch.distributed.ReduceOp.SUM
+                )
             average_utilization = self._get_global_average_utilization_rate()
         else:
             average_utilization = None
@@ -1005,6 +1060,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             world_rank=world_rank,
             forward_pass_id=forward_pass_id,
             logical_count=logical_count_of_buffered_step,
+            pad_logical_count=pad_logical_count,
             average_utilization_rate_over_window=average_utilization,
         )
 
