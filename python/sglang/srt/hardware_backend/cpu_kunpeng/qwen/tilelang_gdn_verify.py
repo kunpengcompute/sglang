@@ -21,6 +21,9 @@ plain ``torch.cat``/``clone`` would allocate unregistered storages. ``State`` an
 
 import ctypes
 import math
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
 import torch
@@ -36,6 +39,16 @@ _PASS_CONFIGS = {
 _bridge = None
 _register_call = None
 _registered = set()
+
+# Startup precompilation (SGLANG_KUNPENG_TL_OP_PRECOMPILE=1): rank 0 of the TP
+# group compiles every batch size ahead of the first request. The pool size is
+# the deployment node's logical CPU count; it is only an upper bound, since one
+# shape per worker is submitted.
+_PRECOMPILE_JOBS = 608
+
+# Batch sizes whose TileLang compilation failed. They are served by the
+# reference C++ kernel instead of crashing the worker.
+_fallback_batches: set[int] = set()
 
 
 def _gdn_verify_kernel(batch, steps, q_heads, v_heads, key_dim, value_dim,
@@ -162,20 +175,66 @@ def _gdn_verify_kernel(batch, steps, q_heads, v_heads, key_dim, value_dim,
     return main
 
 
+def _disk_cache_has_entry(prim):
+    """Whether the disk cache already holds this PrimFunc's built kernel.
+
+    Used only to report cache hits honestly: ``tilelang.compile`` is silent, and
+    probing the same key avoids claiming a compile when the kernel is reused
+    from a previous run.
+    """
+    try:
+        from tilelang.cache.kernel_cache import (
+            KERNEL_LIB_PATH,
+            PARAMS_PATH,
+            WRAPPED_KERNEL_PATH,
+            KernelCache,
+        )
+        from tilelang.env import is_cache_enabled
+        from tilelang.utils.target import determine_platform
+
+        if not is_cache_enabled():
+            return False
+        cache = KernelCache()
+        key = cache._generate_key(
+            func=prim,
+            out_idx=[9],
+            workspace_idx=None,
+            execution_backend="cython",
+            args=(),
+            target="pto",
+            target_host=None,
+            platform=determine_platform("auto"),
+            pass_configs=_PASS_CONFIGS,
+        )
+        cache_path = os.path.join(cache.cache_dir, key)
+        return all(
+            os.path.exists(os.path.join(cache_path, name))
+            for name in (WRAPPED_KERNEL_PATH, PARAMS_PATH, KERNEL_LIB_PATH)
+        )
+    except Exception:
+        return False
+
+
 @lru_cache(maxsize=None)
 def _compiled(batch, steps, q_heads, v_heads, key_dim, value_dim, state_slots,
               ckpt_slots):
-    print(
-        "[QwenVerify] compiling TileLang gdn_verify for "
-        f"batch={batch} steps={steps} hq={q_heads} hv={v_heads} "
-        f"kd={key_dim} vd={value_dim} state_slots={state_slots} "
-        f"ckpt_slots={ckpt_slots}",
-        flush=True,
-    )
     prim = _gdn_verify_kernel(batch, steps, q_heads, v_heads, key_dim,
                               value_dim, state_slots, ckpt_slots)
+    cache_hit = _disk_cache_has_entry(prim)
+    t0 = time.perf_counter()
     kernel = tilelang.compile(prim, out_idx=[9], target='pto',
                               pass_configs=_PASS_CONFIGS)
+    elapsed = time.perf_counter() - t0
+    print(
+        "[QwenVerify] batch=%d steps=%d hq=%d hv=%d kd=%d vd=%d "
+        "state_slots=%d ckpt_slots=%d %s in %.1f ms"
+        % (
+            batch, steps, q_heads, v_heads, key_dim, value_dim, state_slots,
+            ckpt_slots, "cache hit" if cache_hit else "compiled",
+            elapsed * 1e3,
+        ),
+        flush=True,
+    )
     # Keep the ctypes handle alive next to the kernel; replay calls its raw
     # `call` entry directly, without the cython wrapper.
     lib = getattr(kernel.adapter, "lib", None)
@@ -245,6 +304,242 @@ def gdn_verify(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
 def _shape(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
            ckpt_indices):
     return [(tuple(v.shape), v.dtype)]
+
+
+def fallback_batches() -> set:
+    """Batch sizes that must not use the TileLang kernel in this process."""
+    return _fallback_batches
+
+
+def mark_failed(batch, exc, qk, v, ab, state, checkpoints):
+    """Log a failed shape and degrade it to the reference C++ kernel."""
+    if batch in _fallback_batches:
+        return
+    _fallback_batches.add(batch)
+    print(
+        "[QwenVerify] batch=%d TileLang fallback to C++: %s: %s "
+        "QK=%s AB=%s V=%s state=%s checkpoints=%s"
+        % (
+            batch, type(exc).__name__, exc,
+            (tuple(qk.shape), qk.dtype),
+            (tuple(ab.shape), ab.dtype),
+            (tuple(v.shape), v.dtype),
+            (tuple(state.shape), state.dtype),
+            (tuple(checkpoints.shape), checkpoints.dtype),
+        ),
+        flush=True,
+    )
+
+
+def precompile_batches(*, state, checkpoints, q_heads, v_heads, key_dim,
+                       value_dim, max_batch, jobs=_PRECOMPILE_JOBS):
+    """Compile and register ``batch = 1..max_batch``; never run the kernel.
+
+    Each shape is one thread pinned to a distinct logical CPU: a single compile
+    is single threaded (codegen plus one clang invocation), so the speedup comes
+    from compiling different shapes concurrently. Threads exit when the pool is
+    closed. Returns the sorted list of batch sizes that failed.
+    """
+    steps = int(checkpoints.shape[1])
+    dtype = torch.bfloat16
+    tokens = max_batch * steps
+    # Only shapes and dtypes reach the compiler; contents are never read.
+    qk = torch.empty((tokens, 2 * q_heads, key_dim), dtype=dtype)
+    v = torch.empty((tokens, v_heads, value_dim), dtype=dtype)
+    ab = torch.empty((tokens, 2 * v_heads), dtype=dtype)
+    a_log = torch.empty(v_heads, dtype=torch.float32)
+    dt_bias = torch.empty(v_heads, dtype=dtype)
+    indices = torch.arange(max_batch, dtype=torch.int32)
+    ckpt_indices = torch.arange(max_batch, dtype=torch.int32)
+
+    total_cpus = os.cpu_count() or 1
+    workers = max(1, min(int(jobs), max_batch, total_cpus))
+    started = time.perf_counter()
+    failures = []
+    bind_error = []
+
+    def _compile_one(batch, cpu):
+        try:
+            os.sched_setaffinity(0, {cpu})
+        except OSError as exc:
+            # Usually the container cpuset is narrower than the node; report
+            # once and keep compiling instead of failing the shape.
+            if not bind_error:
+                bind_error.append(exc)
+                print(
+                    "[QwenVerify] precompile cannot bind cpu %d: %s"
+                    % (cpu, exc),
+                    flush=True,
+                )
+        try:
+            prepare(
+                a_log, dt_bias,
+                qk[: batch * steps], v[: batch * steps], ab[: batch * steps],
+                state, indices[:batch], checkpoints, ckpt_indices[:batch],
+            )
+        except Exception as exc:  # reported by mark_failed, degraded at runtime
+            mark_failed(batch, exc, qk[: batch * steps], v[: batch * steps],
+                        ab[: batch * steps], state, checkpoints)
+            return batch
+        return None
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_compile_one, batch, (batch - 1) % total_cpus)
+            for batch in range(1, max_batch + 1)
+        ]
+        for future in as_completed(futures):
+            failed = future.result()
+            if failed is not None:
+                failures.append(failed)
+
+    failures.sort()
+    print(
+        "[QwenVerify] precompile batches=1..%d steps=%d workers=%d cpus=%d "
+        "failed=%s wall=%.2fs"
+        % (
+            max_batch, steps, workers, total_cpus, failures,
+            time.perf_counter() - started,
+        ),
+        flush=True,
+    )
+    return failures
+
+
+def _first_gdn_layer(model):
+    """Return a linear-attention layer, whose attributes describe the shape."""
+    from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+
+    for module in model.modules():
+        if isinstance(module, RadixLinearAttention) and module.A_log is not None:
+            return module
+    return None
+
+
+def precompile_gdn_verify(runner) -> None:
+    """Compile and register this shape family for batch=1..M at startup.
+
+    Called once per scheduler process after the memory pool exists. Only the
+    TP-group rank 0 compiles; every other rank waits on the group barrier, so a
+    long compile cannot desynchronize the group around a later collective.
+    Peers register a shape lazily on first use, which is a disk-cache hit on the
+    shared ``~/.tilelang/cache``. The kernel is never executed here.
+    """
+    verbose = int(getattr(runner, "tp_rank", 0)) == 0
+
+    def skip(reason):
+        if verbose:
+            print(f"[QwenVerify] precompile skipped: {reason}", flush=True)
+
+    if os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_TILELANG", "0") != "1":
+        skip("SGLANG_KUNPENG_GDN_VERIFY_TILELANG != 1")
+        return
+    # qwen3.8 27b ships as single-node tp16/dp1/pp1. A PP stage may not own any
+    # linear-attention layer, so skipping must stay symmetric; keep the feature
+    # off for layouts where the barrier group would differ.
+    if runner.server_args.pp_size != 1 or runner.server_args.dp_size != 1:
+        skip(
+            f"pp_size={runner.server_args.pp_size} "
+            f"dp_size={runner.server_args.dp_size} (only 1/1 supported)"
+        )
+        return
+    if runner.is_draft_worker:
+        return  # the target runner in the same process precompiles
+    pool = getattr(
+        getattr(getattr(runner, "req_to_token_pool", None), "mamba_pool", None),
+        "mamba_cache",
+        None,
+    )
+    checkpoints_all = getattr(pool, "intermediate_ssm", None)
+    if pool is None or checkpoints_all is None:
+        skip(
+            "mamba speculative checkpoints unavailable "
+            "(speculative decoding off?)"
+        )
+        return
+    gdn = _first_gdn_layer(runner.model)
+    if gdn is None:
+        skip("no linear-attention (GDN) layer found")
+        return
+    # Only shapes reach the compiler, so reuse the real cache views instead of
+    # allocating state_slots-sized stubs. The cache is authoritative for the
+    # per-rank head geometry; only the query head count is not in it.
+    state = pool.temporal[0]
+    checkpoints = checkpoints_all[0]
+    v_heads, key_dim, value_dim = (
+        int(state.shape[1]), int(state.shape[2]), int(state.shape[3])
+    )
+    q_heads = int(gdn.num_q_heads)
+    assert (
+        q_heads > 0
+        and v_heads % q_heads == 0
+        and int(gdn.num_v_heads) == v_heads
+        and int(gdn.head_k_dim) == key_dim
+        and int(gdn.head_v_dim) == value_dim
+    ), (
+        f"unexpected GDN head geometry hq={q_heads} hv={v_heads} "
+        f"kd={key_dim} vd={value_dim} state={tuple(state.shape)} "
+        f"layer_hv={int(gdn.num_v_heads)} layer_kd={int(gdn.head_k_dim)} "
+        f"layer_vd={int(gdn.head_v_dim)}"
+    )
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen.capabilities import (
+        get_capabilities,
+    )
+
+    max_batch = min(
+        get_capabilities().decode_max_requests,
+        int(runner.max_running_requests),
+        int(checkpoints.shape[0]) - 1,
+    )
+    if max_batch <= 0:
+        skip(f"max_batch={max_batch}")
+        return
+    if verbose:
+        print(
+            "[QwenVerify] precompile start: tp_rank=%d batches=1..%d steps=%d "
+            "hq=%d hv=%d kd=%d vd=%d state_slots=%d ckpt_slots=%d"
+            % (
+                int(getattr(runner, "tp_rank", 0)), max_batch,
+                int(checkpoints.shape[1]), q_heads, v_heads, key_dim,
+                value_dim, int(state.shape[0]), int(checkpoints.shape[0]),
+            ),
+            flush=True,
+        )
+
+    import torch.distributed as dist
+
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
+    tp_group = get_tp_group()
+    failure = None
+    if tp_group.rank_in_group == 0:
+        try:
+            failures = precompile_batches(
+                state=state,
+                checkpoints=checkpoints,
+                q_heads=q_heads,
+                v_heads=v_heads,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                max_batch=max_batch,
+            )
+            if failures:
+                failure = (
+                    "TileLang gdn_verify precompile failed for batch="
+                    f"{failures}"
+                )
+        except BaseException as exc:
+            failure = f"TileLang gdn_verify precompile crashed: {exc!r}"
+    # Barrier first: a failed rank 0 must not strand its peers on a later
+    # collective before the assertion takes the process down.
+    dist.barrier(group=tp_group.cpu_group)
+    assert failure is None, failure
+    print(
+        "[QwenVerify] precompile ready: batches=1..%d steps=%d "
+        "tp_rank_in_group=%d"
+        % (max_batch, checkpoints.shape[1], tp_group.rank_in_group),
+        flush=True,
+    )
 
 
 def register_tilelang_verify(bridge, register_dispatch):

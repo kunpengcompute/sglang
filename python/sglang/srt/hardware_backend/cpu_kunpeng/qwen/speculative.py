@@ -82,9 +82,14 @@ def verify_gdn(
     steps,
 ):
     batch = cache_indices.numel()
+    use_tilelang = False
     if _TILELANG_VERIFY:
         from . import tilelang_gdn_verify
 
+        # A shape whose compilation failed (startup precompile or earlier
+        # first use) is served by the reference C++ kernel instead.
+        use_tilelang = batch not in tilelang_gdn_verify.fallback_batches()
+    if use_tilelang:
         assert checkpoints.shape[1] == steps, "checkpoint block must match steps"
         # q/k/v are strided views of the fused qkv row and a/b of the BA row.
         # The TileLang kernel reads contiguous packed tiles. Packing must use
@@ -114,23 +119,30 @@ def verify_gdn(
         ).view(tokens, v_heads, value_dim)
         ops.copy_kunpeng(packed_v, v)
         # Compiling must not leak its own torch calls into the captured graph.
-        with torch._C._DisableTorchDispatch():
-            tilelang_gdn_verify.prepare(
-                A_log, dt_bias, qk, packed_v, ab, state, cache_indices,
-                checkpoints, checkpoint_indices,
+        try:
+            with torch._C._DisableTorchDispatch():
+                tilelang_gdn_verify.prepare(
+                    A_log, dt_bias, qk, packed_v, ab, state, cache_indices,
+                    checkpoints, checkpoint_indices,
+                )
+        except Exception as exc:
+            # Keep serving: this batch degrades to the C++ kernel below.
+            tilelang_gdn_verify.mark_failed(
+                batch, exc, qk, packed_v, ab, state, checkpoints
             )
-        output = ops.qwen_gdn_verify_tilelang(
-            A_log,
-            dt_bias,
-            qk,
-            packed_v,
-            ab,
-            state,
-            cache_indices,
-            checkpoints,
-            checkpoint_indices,
-        )
-        return output.reshape(1, batch * steps, v_heads, value_dim)
+        else:
+            output = ops.qwen_gdn_verify_tilelang(
+                A_log,
+                dt_bias,
+                qk,
+                packed_v,
+                ab,
+                state,
+                cache_indices,
+                checkpoints,
+                checkpoint_indices,
+            )
+            return output.reshape(1, batch * steps, v_heads, value_dim)
 
     if _FUSED_VERIFY:
         # The persistent slot is read once; every step then rolls the state

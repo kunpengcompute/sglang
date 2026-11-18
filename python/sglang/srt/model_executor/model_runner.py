@@ -767,6 +767,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init Kunpeng CPU swap HBM buffers (expert weights + KV cache).
         if _is_cpu_920f:
             self.kunpeng_runner.init_swap_buffers()
+            # Backend kernel precompilation (SGLANG_KUNPENG_TL_OP_PRECOMPILE).
+            # Must run after init_memory_pool(): the compiled shapes include the
+            # mamba pool sizes and max_running_requests resolved there.
+            self.precompile_tilelang_op()
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -2173,6 +2177,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         return result
+
+    def precompile_tilelang_op(self):
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import precompile_ops
+
+        precompile_ops(self)
 
     @property
     def qwen3_next_config(self):
