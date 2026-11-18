@@ -54,6 +54,37 @@ _precompiling = False
 # shape per worker is submitted.
 _PRECOMPILE_JOBS = 608
 
+
+def _parse_fallback_batches(value):
+    """Parse ``"1"`` / ``"1,3,4"`` into ``{1, 3, 4}``; empty means none."""
+    batches = set()
+    for item in (value or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            batch = int(item)
+        except ValueError:
+            batch = 0
+        if batch < 1:
+            raise ValueError(
+                "SGLANG_KUNPENG_GDN_VERIFY_TILELANG_FALLBACK_BATCH_SIZE must "
+                f"be a comma-separated list of positive ints, got {value!r}"
+            )
+        batches.add(batch)
+    return batches
+
+
+# Batch sizes that always use the reference C++ kernel, even though the
+# TileLang kernel is available and compiled. bs=1 is the usual entry: with a
+# single request the packing overhead of the TileLang path outweighs its
+# parallelism, so the native kernel is faster.
+_CONFIGURED_FALLBACK_BATCHES = _parse_fallback_batches(
+    os.environ.get(
+        "SGLANG_KUNPENG_GDN_VERIFY_TILELANG_FALLBACK_BATCH_SIZE", ""
+    )
+)
+
 # Batch sizes whose TileLang compilation failed. They are served by the
 # reference C++ kernel instead of crashing the worker.
 _fallback_batches: set[int] = set()
@@ -351,8 +382,18 @@ def _shape(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
 
 
 def fallback_batches() -> set:
-    """Batch sizes that must not use the TileLang kernel in this process."""
+    """Batch sizes whose TileLang compile failed in this process."""
     return _fallback_batches
+
+
+def configured_fallback_batches() -> set:
+    """Batch sizes pinned to the C++ kernel by env configuration."""
+    return _CONFIGURED_FALLBACK_BATCHES
+
+
+def tilelang_disabled(batch) -> bool:
+    """True when this batch must use the reference C++ kernel."""
+    return batch in _CONFIGURED_FALLBACK_BATCHES or batch in _fallback_batches
 
 
 def mark_failed(batch, exc, qk, v, ab, state, checkpoints):
@@ -376,14 +417,17 @@ def mark_failed(batch, exc, qk, v, ab, state, checkpoints):
 
 
 def precompile_batches(*, state, checkpoints, q_heads, v_heads, key_dim,
-                       value_dim, max_batch, jobs=_PRECOMPILE_JOBS):
-    """Compile and register ``batch = 1..max_batch``; never run the kernel.
+                       value_dim, max_batch, jobs=_PRECOMPILE_JOBS, skip=()):
+    """Compile and register ``batch = 1..max_batch`` except ``skip``.
 
     Each shape is one thread pinned to a distinct logical CPU: a single compile
     is single threaded (codegen plus one clang invocation), so the speedup comes
     from compiling different shapes concurrently. Threads exit when the pool is
     closed. Returns the sorted list of batch sizes that failed.
     """
+    wanted = [b for b in range(1, max_batch + 1) if b not in set(skip)]
+    if not wanted:
+        return []
     steps = int(checkpoints.shape[1])
     dtype = torch.bfloat16
     tokens = max_batch * steps
@@ -397,7 +441,7 @@ def precompile_batches(*, state, checkpoints, q_heads, v_heads, key_dim,
     ckpt_indices = torch.arange(max_batch, dtype=torch.int32)
 
     total_cpus = os.cpu_count() or 1
-    workers = max(1, min(int(jobs), max_batch, total_cpus))
+    workers = max(1, min(int(jobs), len(wanted), total_cpus))
     started = time.perf_counter()
     failures = []
     bind_error = []
@@ -436,7 +480,7 @@ def precompile_batches(*, state, checkpoints, q_heads, v_heads, key_dim,
     # (non-TTY); tqdm still renders there when the log is followed with
     # `tail -f`. stdout keeps it next to the other [QwenVerify] lines.
     bar = tqdm(
-        total=max_batch,
+        total=len(wanted),
         desc="[QwenVerify] TL gdn_verify",
         unit="shape",
         dynamic_ncols=True,
@@ -448,7 +492,7 @@ def precompile_batches(*, state, checkpoints, q_heads, v_heads, key_dim,
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [
                 pool.submit(_compile_one, batch, (batch - 1) % total_cpus)
-                for batch in range(1, max_batch + 1)
+                for batch in wanted
             ]
             for future in as_completed(futures):
                 batch, cache_hit, elapsed_ms = future.result()
@@ -472,7 +516,7 @@ def precompile_batches(*, state, checkpoints, q_heads, v_heads, key_dim,
         "[QwenVerify] precompile done: %d shapes (%d compiled, %d hit) in "
         "%.1fs, workers=%d, failed=%s"
         % (
-            max_batch, compiles, hits, time.perf_counter() - started,
+            len(wanted), compiles, hits, time.perf_counter() - started,
             workers, failures,
         ),
         flush=True,
@@ -587,11 +631,12 @@ def precompile_gdn_verify(runner) -> None:
         print(
             "[QwenVerify] precompile start: tp_rank=%d rin_in_node=%d "
             "batches=1..%d steps=%d hq=%d hv=%d kd=%d vd=%d "
-            "state_slots=%d ckpt_slots=%d"
+            "state_slots=%d ckpt_slots=%d cpp_fallback=%s"
             % (
                 int(getattr(runner, "tp_rank", 0)), rin_in_node, max_batch,
                 int(checkpoints.shape[1]), q_heads, v_heads, key_dim,
                 value_dim, int(state.shape[0]), int(checkpoints.shape[0]),
+                sorted(_CONFIGURED_FALLBACK_BATCHES),
             ),
             flush=True,
         )
@@ -614,6 +659,7 @@ def precompile_gdn_verify(runner) -> None:
                 key_dim=key_dim,
                 value_dim=value_dim,
                 max_batch=max_batch,
+                skip=_CONFIGURED_FALLBACK_BATCHES,
             )
             if failures:
                 failure = (

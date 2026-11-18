@@ -86,9 +86,11 @@ def verify_gdn(
     if _TILELANG_VERIFY:
         from . import tilelang_gdn_verify
 
-        # A shape whose compilation failed (startup precompile or earlier
-        # first use) is served by the reference C++ kernel instead.
-        use_tilelang = batch not in tilelang_gdn_verify.fallback_batches()
+        # Batches pinned to C++ by
+        # SGLANG_KUNPENG_GDN_VERIFY_TILELANG_FALLBACK_BATCH_SIZE (bs=1 is
+        # faster natively), plus shapes whose compilation failed, are served by
+        # the reference C++ kernel.
+        use_tilelang = not tilelang_gdn_verify.tilelang_disabled(batch)
     if use_tilelang:
         assert checkpoints.shape[1] == steps, "checkpoint block must match steps"
         # q/k/v are strided views of the fused qkv row and a/b of the BA row.

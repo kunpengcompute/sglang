@@ -267,5 +267,21 @@ def test_shape_key_matches_packing():
     )
 
 
+def test_parse_fallback_batch_sizes():
+    """The C++-fallback env list accepts only positive, comma-separated ints."""
+    pytest.importorskip("tilelang")
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
+        tilelang_gdn_verify as tgv,
+    )
+
+    assert tgv._parse_fallback_batches("") == set()
+    assert tgv._parse_fallback_batches("1") == {1}
+    assert tgv._parse_fallback_batches(" 1, 3 ,4 ") == {1, 3, 4}
+    assert tgv._parse_fallback_batches("2,2") == {2}
+    for bad in ("1,x", "0", "-2", "1,,0"):
+        with pytest.raises(ValueError):
+            tgv._parse_fallback_batches(bad)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))
