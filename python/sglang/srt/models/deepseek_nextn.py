@@ -220,6 +220,8 @@ class DeepseekModelNextN(nn.Module):
             self.swap_mgr.swap_kv_layer(
                 0, forward_batch.token_to_kv_pool.get_key_buffer(0)
             )
+            # DSA index-K: mirror the draft pool's first full layer into HBM.
+            self.swap_mgr.swap_first_index_k_layer(forward_batch)
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
