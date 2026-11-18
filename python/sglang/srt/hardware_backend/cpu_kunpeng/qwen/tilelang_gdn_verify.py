@@ -19,7 +19,9 @@ plain ``torch.cat``/``clone`` would allocate unregistered storages. ``State`` an
 ``Checkpoints`` stay bound model tensors.
 """
 
+import contextlib
 import ctypes
+import fcntl
 import math
 import os
 import sys
@@ -221,23 +223,58 @@ def _disk_cache_has_entry(prim):
         return False
 
 
+@contextlib.contextmanager
+def _key_compile_lock(key):
+    """Serialize one shape's build across processes.
+
+    ``KernelCache`` only guards its in-memory map and the disk read/write; the
+    compile runs outside that lock, and saving copies over ``kernel_lib.so``.
+    Two nodes sharing a cache directory would race, so hold an flock keyed by
+    the shape tuple for the whole build. Different shapes use different files
+    and stay parallel.
+    """
+    try:
+        from tilelang.env import TILELANG_CACHE_DIR
+
+        lock_dir = os.path.join(TILELANG_CACHE_DIR, "locks")
+        os.makedirs(lock_dir, exist_ok=True)
+        path = os.path.join(
+            lock_dir, "gdn_verify_%s.lock" % "_".join(str(v) for v in key)
+        )
+        fp = open(path, "w")
+    except Exception:
+        yield
+        return
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+        finally:
+            fp.close()
+
+
 @lru_cache(maxsize=None)
 def _compiled(batch, steps, q_heads, v_heads, key_dim, value_dim, state_slots,
               ckpt_slots):
     prim = _gdn_verify_kernel(batch, steps, q_heads, v_heads, key_dim,
                               value_dim, state_slots, ckpt_slots)
-    cache_hit = _disk_cache_has_entry(prim)
-    t0 = time.perf_counter()
-    kernel = tilelang.compile(prim, out_idx=[9], target='pto',
-                              pass_configs=_PASS_CONFIGS)
-    elapsed_ms = (time.perf_counter() - t0) * 1e3
-    # Keep the ctypes handle alive next to the kernel; replay calls its raw
-    # `call` entry directly, without the cython wrapper.
-    lib = getattr(kernel.adapter, "lib", None)
-    if lib is None:
-        lib = ctypes.CDLL(kernel.adapter.lib_generator.libpath)
-    if not hasattr(lib, "call"):
-        raise RuntimeError("TileLang GDN verify library has no 'call' entry")
+    key = (batch, steps, q_heads, v_heads, key_dim, value_dim, state_slots,
+           ckpt_slots)
+    with _key_compile_lock(key):
+        cache_hit = _disk_cache_has_entry(prim)
+        t0 = time.perf_counter()
+        kernel = tilelang.compile(prim, out_idx=[9], target='pto',
+                                  pass_configs=_PASS_CONFIGS)
+        elapsed_ms = (time.perf_counter() - t0) * 1e3
+        # Keep the ctypes handle alive next to the kernel; replay calls its raw
+        # `call` entry directly, without the cython wrapper.
+        lib = getattr(kernel.adapter, "lib", None)
+        if lib is None:
+            lib = ctypes.CDLL(kernel.adapter.lib_generator.libpath)
+        if not hasattr(lib, "call"):
+            raise RuntimeError("TileLang GDN verify library has no 'call' entry")
     # Report once per shape per process: prepare() is called once per GDN
     # layer, but this body runs only on the first call for the key.
     if not cache_hit and not _precompiling:
@@ -456,13 +493,23 @@ def _first_gdn_layer(model):
 def precompile_gdn_verify(runner) -> None:
     """Compile and register this shape family for batch=1..M at startup.
 
-    Called once per scheduler process after the memory pool exists. Only the
-    TP-group rank 0 compiles; every other rank waits on the group barrier, so a
-    long compile cannot desynchronize the group around a later collective.
-    Peers register a shape lazily on first use, which is a disk-cache hit on the
-    shared ``~/.tilelang/cache``. The kernel is never executed here.
+    Called once per scheduler process after the memory pool exists. The
+    TileLang cache lives on local disk, so every node compiles its own copy:
+    within a node only the rank whose in-node slot is 0 compiles, and every
+    other rank waits on the TP-group barrier so a long compile cannot
+    desynchronize the group around a later collective. Peers register a shape
+    lazily on first use, which is a local disk-cache hit. The kernel is never
+    executed here.
     """
-    verbose = int(getattr(runner, "tp_rank", 0)) == 0
+    from sglang.srt.hardware_backend.cpu_kunpeng.distributed import rank_layout
+
+    pp_size = int(runner.server_args.pp_size)
+    rin_in_node = rank_layout.compute_rin_in_node(
+        int(getattr(runner, "pp_rank", 0)),
+        int(getattr(runner, "tp_rank", 0)),
+        pp_size,
+    )
+    verbose = rin_in_node == 0  # one reporter per node
 
     def skip(reason):
         if verbose:
@@ -471,14 +518,19 @@ def precompile_gdn_verify(runner) -> None:
     if os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_TILELANG", "0") != "1":
         skip("SGLANG_KUNPENG_GDN_VERIFY_TILELANG != 1")
         return
-    # qwen3.8 27b ships as single-node tp16/dp1/pp1. A PP stage may not own any
-    # linear-attention layer, so skipping must stay symmetric; keep the feature
-    # off for layouts where the barrier group would differ.
-    if runner.server_args.pp_size != 1 or runner.server_args.dp_size != 1:
+    # A PP stage may not own any linear-attention layer, so skipping must stay
+    # symmetric; keep the feature off for layouts where the barrier group would
+    # differ.
+    if pp_size != 1 or runner.server_args.dp_size != 1:
         skip(
-            f"pp_size={runner.server_args.pp_size} "
+            f"pp_size={pp_size} "
             f"dp_size={runner.server_args.dp_size} (only 1/1 supported)"
         )
+        return
+    if runner.server_args.disaggregation_mode == "prefill":
+        # Target verify only runs on the decode instance; the prefill side has
+        # no use for these kernels.
+        skip("prefill instance (target verify runs on decode)")
         return
     if runner.is_draft_worker:
         return  # the target runner in the same process precompiles
@@ -533,10 +585,11 @@ def precompile_gdn_verify(runner) -> None:
         return
     if verbose:
         print(
-            "[QwenVerify] precompile start: tp_rank=%d batches=1..%d steps=%d "
-            "hq=%d hv=%d kd=%d vd=%d state_slots=%d ckpt_slots=%d"
+            "[QwenVerify] precompile start: tp_rank=%d rin_in_node=%d "
+            "batches=1..%d steps=%d hq=%d hv=%d kd=%d vd=%d "
+            "state_slots=%d ckpt_slots=%d"
             % (
-                int(getattr(runner, "tp_rank", 0)), max_batch,
+                int(getattr(runner, "tp_rank", 0)), rin_in_node, max_batch,
                 int(checkpoints.shape[1]), q_heads, v_heads, key_dim,
                 value_dim, int(state.shape[0]), int(checkpoints.shape[0]),
             ),
@@ -549,7 +602,9 @@ def precompile_gdn_verify(runner) -> None:
 
     tp_group = get_tp_group()
     failure = None
-    if tp_group.rank_in_group == 0:
+    # One warmer per node: the TileLang cache is local to the node, and every
+    # node's rank-in-node 0 compiles the full range concurrently.
+    if rin_in_node == 0:
         try:
             failures = precompile_batches(
                 state=state,
@@ -567,7 +622,7 @@ def precompile_gdn_verify(runner) -> None:
                 )
         except BaseException as exc:
             failure = f"TileLang gdn_verify precompile crashed: {exc!r}"
-    # Barrier first: a failed rank 0 must not strand its peers on a later
+    # Barrier first: a failed node warmer must not strand its peers on a later
     # collective before the assertion takes the process down.
     dist.barrier(group=tp_group.cpu_group)
     assert failure is None, failure
