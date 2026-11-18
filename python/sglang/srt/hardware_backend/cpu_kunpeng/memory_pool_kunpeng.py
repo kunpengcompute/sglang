@@ -193,22 +193,52 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         index_k [T, D] bf16. Routes through the graph-compatible
         set_kv_buffer_kunpeng op (the C++ kernel skips loc < 0), so the
         write is replayed inside a captured graph.
+
+        With index-K whole-layer swap enabled, the DDR pool stays the
+        authoritative copy (PD / shared segment / HiCache read it) and the
+        current layer's HBM mirror is double-written. The HBM access drains
+        the layer's pending swap-in first, so a late whole-pool DMA cannot
+        clobber the freshly written rows.
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self._index_k_buf(layer_id)
+        ddr_buf = self._index_k_buf(layer_id)
         if loc.numel() != index_k.shape[0]:
             raise ValueError(
                 f"loc numel {loc.numel()} != index_k rows {index_k.shape[0]}"
             )
         from sglang.srt.graph import ops as kunpeng
+        from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
+            KunpengSwapManager,
+        )
 
-        kunpeng.set_kv_buffer_kunpeng(buf, loc, index_k)
+        # Authoritative DDR copy: always updated regardless of swap.
+        kunpeng.set_kv_buffer_kunpeng(ddr_buf, loc, index_k)
+
+        swap_mgr = KunpengSwapManager.get_instance()
+        if swap_mgr.enable_swap_index_k_in:
+            # get_index_k_cache() waits for the swap-in events, then returns
+            # the HBM mirror of the current layer.
+            kunpeng.set_kv_buffer_kunpeng(
+                swap_mgr.get_index_k_cache(), loc, index_k
+            )
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
-        """[num_slots, index_head_dim] bf16 flat index-K buffer."""
+        """[num_slots, index_head_dim] bf16 flat index-K buffer.
+
+        Swap enabled: the current layer's HBM mirror (the access drains its
+        pending DDR->HBM SDMA events). Otherwise: this layer's DDR buffer.
+        Skip-topk (shared/S) layers never call this -- they have no buffer.
+        """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
+            KunpengSwapManager,
+        )
+
+        swap_mgr = KunpengSwapManager.get_instance()
+        if swap_mgr.enable_swap_index_k_in:
+            return swap_mgr.get_index_k_cache()
         return self._index_k_buf(layer_id)
 
     def get_index_k_size_bytes(self) -> int:

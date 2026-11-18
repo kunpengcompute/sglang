@@ -205,7 +205,11 @@ class KunpengGraphRunner:
     def init_swap_buffers(self):
         """Initialize HBM swap buffers for expert weights and KV cache."""
         if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
-            if self.swap_mgr.enable_swap_expert or self.swap_mgr.enable_swap_kv_in:
+            if (
+                self.swap_mgr.enable_swap_expert
+                or self.swap_mgr.enable_swap_kv_in
+                or self.swap_mgr.enable_swap_index_k_in
+            ):
                 raise ValueError(
                     "Attached MTP requires independent DDR KV with swap disabled"
                 )
@@ -248,6 +252,18 @@ class KunpengGraphRunner:
                 head_num=head_num,
                 kv_cache_dim=kv_cache_dim,
                 dtype=self.model_runner.kv_cache_dtype,
+            )
+
+        if self.swap_mgr.enable_swap_index_k_in:
+            nsa_pool = self.model_runner.token_to_kv_pool
+            # Any full (non-skip-topk) layer has the same flat geometry; skip
+            # layers carry None. Sized by the first runner (target/draft) like
+            # the KV HBM buffer -- swap_index_k_layer fails loudly on a mismatch.
+            full_index_k = next(b for b in nsa_pool.index_k_buffer if b is not None)
+            self.swap_mgr.init_index_k_buffer(
+                num_slots=full_index_k.shape[0],
+                index_head_dim=full_index_k.shape[1],
+                dtype=nsa_pool.index_k_dtype,
             )
 
     def _move_parameter_to_hbw(self, name, param, label=None):
@@ -1666,6 +1682,20 @@ class KunpengGraphRunner:
                 self.swap_mgr._cur_kv_hbm,
                 self.swap_mgr._kv_swap_in_event_tensor,
                 self.swap_mgr._kv_swap_in_event_num_tensor,
+            ):
+                if buf is not None:
+                    fixed.append(buf)
+        if self.swap_mgr.enable_swap_index_k_in:
+            # The recycled HBM index-K mirror and its dedicated SDMA event
+            # table are persistent fixed-address storages, exactly like the
+            # main-KV swap buffers above. kupl_sdma_kv_swapin takes them as
+            # non-return-value parameters during capture, so they must be
+            # registered as fixed storage before capture or lookup_or_register
+            # fails on the first (HBM destination) parameter.
+            for buf in (
+                self.swap_mgr._cur_index_k_hbm,
+                self.swap_mgr._index_k_swap_in_event_tensor,
+                self.swap_mgr._index_k_swap_in_event_num_tensor,
             ):
                 if buf is not None:
                     fixed.append(buf)

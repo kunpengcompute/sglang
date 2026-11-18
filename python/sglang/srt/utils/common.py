@@ -295,6 +295,11 @@ def is_kunpeng_swap_kv_blockwise() -> bool:
     )
 
 
+def is_kunpeng_swap_index_k_in() -> bool:
+    """Whether the DSA/NSA index-K cache is swapped DDR -> HBM layer-wise via SDMA."""
+    return is_kunpeng_hbw_pool() and os.environ.get("SGLANG_KUNPENG_SWAP_INDEX_K_IN") == "1"
+
+
 def is_kunpeng_graph_capture() -> bool:
     return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_GRAPH_CAPTURE") == "1"
 

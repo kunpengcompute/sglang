@@ -2084,6 +2084,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if _is_cpu_920f and (not self.is_nextn):
             self._swap_mgr.swap_next_kv_layer(self.layer_id, forward_batch)
+            self._swap_mgr.swap_next_index_k_layer(self.layer_id, forward_batch)
 
         # Flash-comm SP dense layers: reduce-scatter instead of allreduce
         # around the MLP (see _forward_dense_sp_prepare_mlp /
@@ -2465,6 +2466,9 @@ class DeepseekV2Model(nn.Module):
                 self.start_layer,
                 forward_batch.token_to_kv_pool.get_key_buffer(self.start_layer),
             )
+            # DSA index-K: mirror the first full layer's DDR cache into HBM.
+            # Skip-topk layers carry no index-K buffer and are skipped inside.
+            self.swap_mgr.swap_first_index_k_layer(forward_batch)
 
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
