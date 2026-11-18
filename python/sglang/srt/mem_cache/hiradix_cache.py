@@ -1696,11 +1696,18 @@ class HiRadixCache(RadixCache):
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold:
+            return
+        if self.cache_controller.prefetch_rate_limited():
+            if _hicache_debug():
+                logger.info(
+                    "[hicache] prefetch skipped (rate limited): req=%s, need=%d, "
+                    "in-flight=%d/%d token(s)",
+                    req_id,
+                    prefetch_length,
+                    self.cache_controller.prefetch_tokens_occupied,
+                    self.cache_controller.prefetch_capacity_limit,
+                )
             return
 
         last_host_node.protect_host()

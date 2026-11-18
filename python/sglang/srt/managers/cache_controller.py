@@ -799,40 +799,27 @@ class HiCacheController:
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
-            if is_cpu_920f():
-                if self.l1l3_only and not self._l1l3_io_pending:
+            if is_cpu_920f() and _hicache_debug():
+                if self.l1l3_only:
                     blob_bytes = (
                         self.flat_write.size(-1) * self.flat_write.element_size()
                         if self.flat_write is not None
-                        else 0
+                        else None
                     )
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] L3 ready: backend=%s page=%d/%dB batch=%d "
-                            "buf=%.1fGB prefetch=%d/%d skip=%s",
-                            self.storage_backend_type,
-                            self.page_size,
-                            blob_bytes,
-                            self.storage_batch_size,
-                            blob_bytes * self.storage_batch_size / 1e9,
-                            self.prefetch_threshold,
-                            self.prefetch_capacity_limit,
-                            self.backup_skip,
-                        )
                 else:
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] L3 ready: backend=%s dir=%s page=%d/%dB "
-                            "batch=%d prefetch=%d/%d skip=%s",
-                            self.storage_backend_type,
-                            getattr(self.storage_backend, "file_path", "-"),
-                            self.page_size,
-                            self.mem_pool_host.get_size_per_token() * self.page_size,
-                            self.storage_batch_size,
-                            self.prefetch_threshold,
-                            self.prefetch_capacity_limit,
-                            self.backup_skip,
-                        )
+                    blob_bytes = self.mem_pool_host.get_size_per_token() * self.page_size
+                logger.info(
+                    "[hicache] L3 ready: backend=%s dir=%s page=%d/%s batch=%d "
+                    "prefetch=%d/%d skip=%s",
+                    self.storage_backend_type,
+                    getattr(self.storage_backend, "file_path", "-"),
+                    self.page_size,
+                    "-" if blob_bytes is None else f"{blob_bytes}B",
+                    self.storage_batch_size,
+                    self.prefetch_threshold,
+                    self.prefetch_capacity_limit,
+                    self.backup_skip,
+                )
         except Exception:
             # Best-effort cleanup for partial init.
             try:

@@ -122,7 +122,7 @@ scripts/cpu_kunpeng/
 | 变量 | 默认 | 类型 | 作用 |
 |---|---|---|---|
 | `KUNPENG_HICACHE_IO_BATCH_PAGES` | `128` | 大小 | flat 缓冲能装多少页，**同时**决定单次 L3 批次的最大页数与缓冲大小。调小 = 省 DDR、但 L3 往返更频繁 |
-| `SGLANG_KUNPENG_HICACHE_L1L3_PREFETCH_RATIO` | `0.25` | 限流 | 在途预取 token 最多占 L1 池的比例，超过即限流，避免预取挤爆 L1 |
+| `SGLANG_KUNPENG_HICACHE_L1L3_PREFETCH_RATIO` | `0.5` | 限流 | 在途预取 token 最多占 L1 池的比例，超过即限流，避免预取挤爆 L1 |
 | `SGLANG_KUNPENG_HICACHE_L3_INDEX_RATIO` | `4.0` | 上界 | 「只剩 L3 有副本」的树上界（这类节点不占内存、只占元数据），上限 = `L1 池 × 该比例` |
 
 > 单页字节数 = `层数 × 64 × kv_dim × 2B`；例如 78 层 MLA、`kv_dim=576` 时约 **5.49 MiB/页**。
