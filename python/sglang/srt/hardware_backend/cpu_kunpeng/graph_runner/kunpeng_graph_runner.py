@@ -33,11 +33,16 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
+from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_world_size,
+)
 from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import pp_span
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.utils import (
     is_cpu_920f,
+    is_kunpeng_flash_comm,
     is_kunpeng_graph_capture,
     is_kunpeng_hbw_pool,
     is_kunpeng_hbw_resident_expert_weights,
@@ -1141,6 +1146,10 @@ class KunpengGraphRunner:
         feeds those buffers the other shape and RMSNorm trips
         TORCH_CHECK(outs.size(0) == height), killing the worker.  Returns None
         when replay is safe; the caller owns all bookkeeping.
+
+        Flash-comm SP: the upstream stage hands each attn-TP rank its token
+        slice through PPProxyTensors, so the expected payload is
+        input_ids / attn_tp_size rows, not the full batch.
         """
         if not getattr(self.model_runner, "support_pp", False):
             return None
@@ -1157,6 +1166,18 @@ class KunpengGraphRunner:
             return None
         n_up = int(hidden.shape[0])
         n_local = int(forward_batch.input_ids.shape[0])
+        if (
+            is_kunpeng_flash_comm()
+            and get_moe_a2a_backend().is_kunpeng_cpu()
+        ):
+            attn_tp_size = get_attn_tensor_model_parallel_world_size()
+            if attn_tp_size > 1:
+                # Flash-comm SP: the upstream stage hands each attn-TP rank
+                # its token slice, so the proxy payload carries
+                # input_ids / attn_tp_size rows, not the full batch.
+                if n_local % attn_tp_size != 0 or n_up != n_local // attn_tp_size:
+                    return (n_up, n_local)
+                return None
         return None if n_up == n_local else (n_up, n_local)
 
     def _forward_decode(

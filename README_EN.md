@@ -186,10 +186,12 @@ sh launch.sh all
 
 flash-comm is a communication/MoE optimization for prefill instances, with two sub-features:
 
-- **SP prefill MoE (token-sliced sequence parallelism)**: within the attn-TP group each rank holds only one token slice of the sequence; attention outputs are reduce-scattered so LayerNorm and the MLP run on the local slice, per-rank topk tables are merged into the full table by a single `shm_dual_allgather`, and the MoE combine writes back only this rank's home slice — avoiding full-batch allgather/allreduce at every layer;
+- **SP prefill MoE (token-sliced sequence parallelism)**: within the attn-TP group each rank holds only one token slice of the sequence; attention outputs are reduce-scattered so LayerNorm and the MLP run on the local slice, per-rank topk tables are merged into the full table by a single `shm_dual_allgather`, and only this rank's home slice is kept (the RDMA-dispatch combine writes home slices directly; the local-SHM-dispatch path extracts the home slice in combine_recv) — avoiding full-batch allgather/allreduce at every layer;
 - **Shared-expert EPLB co-location**: the shared expert enters the EPLB physical expert map as logical expert `n_routed` (256 for GLM-5.3) and shares the dispatch/combine pipeline with routed experts; the `grouped_topk` kernel bakes `routed_scaling_factor` into the routed weights (the shared column's weight is fixed at 1.0), so the forward pass no longer scales separately.
 
-Prerequisites (validated at startup — violations abort): prefill instances only (decode is inert via `IS_PREFILL=0`); attn-TP > 1; the RDMA dispatch path (single-node local-SHM-dispatch topologies do not implement home-slice combine); PP=1 on the prefill instance; `ep_size == tp_size` (ETP not supported).
+Prerequisites (validated at startup — violations abort): prefill instances only (decode is inert via `IS_PREFILL=0`); attn-TP > 1; `ep_size == tp_size` (ETP not supported).
+
+**PP topologies**: both PP=1 and PP>1 (e.g. pp=16 prefill) are supported. With PP>1, non-last stages hand the (hidden_states, residual) token slices to the next stage through PPProxyTensors; the receiving stage's first layer gathers full rows in prepare_attn (layer_input_mode is derived from the global layer_id), and the Kunpeng graph runner validates the sliced payload against `input_ids / attn_tp_size` rows. Either dispatch path works: RDMA dispatch (combine writes home slices, minimal communication) and single-node local SHM dispatch (the one-node-per-stage pp=16 topology; dispatch/combine keep the full-batch layout and combine_recv extracts the home slice — the home-slice write optimization remains RDMA-only, while the per-rank router/topk savings apply unchanged).
 
 The three environment variables (set on the prefill side, e.g. in `runtime/.user_env_prefill[_<instance>].sh`):
 

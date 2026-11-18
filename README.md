@@ -185,10 +185,12 @@ sh launch.sh all
 
 flash-comm是prefill实例的通信与MoE优化，包含两项子特性：
 
-- **SP prefill MoE（token切片序列并行）**：attn-TP组内每个rank只持有序列的一个token切片；注意力输出reduce-scatter后在本地切片上做LayerNorm与MLP，各rank的topk表用一次`shm_dual_allgather`合并成全表，MoE combine只写回本rank的home切片，避免逐层全量allgather/allreduce；
+- **SP prefill MoE（token切片序列并行）**：attn-TP组内每个rank只持有序列的一个token切片；注意力输出reduce-scatter后在本地切片上做LayerNorm与MLP，各rank的topk表用一次`shm_dual_allgather`合并成全表（RDMA dispatch路径下MoE combine只写回本rank的home切片，本地SHM dispatch路径下由combine_recv提取本rank切片），避免逐层全量allgather/allreduce；
 - **共享专家EPLB共置**：共享专家作为第`n_routed`个逻辑专家（GLM-5.3为256）放进EPLB物理专家表，与路由专家共用同一条dispatch/combine流水线；`grouped_topk`内核直接把`routed_scaling_factor`折入路由权重（共享专家列权重固定为1.0），forward侧不再单独缩放。
 
-启用前提（启动时逐项校验，违反即报错退出）：仅prefill实例（decode侧`IS_PREFILL=0`自动失效）；attn-TP > 1；需走RDMA dispatch路径（单节点本地SHM dispatch拓扑不支持home切片combine）；prefill实例需PP=1；`ep_size == tp_size`（不支持ETP）。
+启用前提（启动时逐项校验，违反即报错退出）：仅prefill实例（decode侧`IS_PREFILL=0`自动失效）；attn-TP > 1；`ep_size == tp_size`（不支持ETP）。
+
+**PP拓扑**：PP=1与PP>1（如pp=16 prefill）均可启用。PP>1时非末级stage通过PPProxyTensors把（hidden_states, residual）token切片传给下一stage，接收stage首个layer在prepare_attn聚回全量行（layer_input_mode按全局layer_id推导），Kunpeng graph runner按`input_ids / attn_tp_size`行数校验切片负载。dispatch路径两条均可：RDMA dispatch（combine写home切片，最小通信）与单节点本地SHM dispatch（每stage一节点的pp=16即此拓扑；dispatch/combine保持全量布局，combine_recv提取home切片，home切片写优化仅RDMA路径，但router/topk每rank只算1/attn_tp的收益不受影响）。
 
 三个环境变量（prefill实例侧设置，如`runtime/.user_env_prefill[_<instance>].sh`）：
 
