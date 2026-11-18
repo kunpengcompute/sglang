@@ -693,10 +693,11 @@ def _get_kunpeng_topk_buffers(batch_size: int, topk: int):
     When the KunpengMoE dispatcher is active, the router writes topk results
     into the contiguous SHM buffers (topk_weights_buf / topk_ids_flat_buf).
     topk_ids_flat_buf is contiguous so that the per-rank slices can be
-    merged with shm_dual_allgather; afterwards the merged ids are copied
-    into the even columns of the interleaved topk_ids_index_buf consumed by
-    the RDMA dispatcher (odd columns hold the per-expert token index written
-    by the kutacc dispatch kernel).
+    merged with shm_dual_allgather; afterwards the merged ids are published
+    as (peer rank, local expert slot) pairs into the interleaved
+    topk_ids_index_buf consumed by the RDMA / local SHM dispatchers (on the
+    RDMA path the kutacc dispatch kernel later reuses the odd columns as
+    its per-expert token-index workspace).
 
     In SP mode ``batch_size`` is the per-rank token count and only this
     rank's segment of the SHM buffers is returned.
@@ -799,16 +800,42 @@ def _kunpeng_etp_remap_topk_ids(topk_ids: torch.Tensor):
     )
 
 
+def _kunpeng_publish_topk_ids_rank_slot(
+    state, topk_ids: torch.Tensor, start: int
+) -> None:
+    """Publish logical topk ids as (rank, local slot) pairs into the dispatch buffer.
+
+    Every producer filling ``topk_ids_index_buf`` must emit the ONE canonical
+    encoding its consumers read: even columns = peer rank, odd columns = local
+    expert slot.  The EPLB remap kernels and the ETP remap already write
+    these pairs; this helper serves the non-redundant (no-EPLB) path by
+    reusing the graph-registered remap op with ``dispatch_map=None`` — the
+    identity transform (the trivial layout keeps logical id == physical
+    slot, so rank = id // num_local_experts and slot = id %
+    num_local_experts — exactly the packed-id decode the local dispatch/sum
+    kernels performed before the encoding was unified).  None survives graph
+    capture/replay: it is recorded as the none-storage view and replayed as
+    an undefined tensor.
+    """
+    kunpeng.remap_topk_ids_to_rank_slot_kunpeng(
+        topk_ids,
+        state.topk_ids_index_buf[start : start + topk_ids.shape[0]],
+        None,
+        state.num_local_experts * state.ep_size,
+        state.ep_size,
+        state.moe_tp_size,
+    )
+
+
 def _kunpeng_publish_and_sync_topk_ids(topk_ids: torch.Tensor) -> None:
-    """Publish the logical ids into the dispatch buffer and sync across ranks.
+    """Publish the routing table into the dispatch buffer and sync across ranks.
 
     Used on the non-redundant-expert path (no ``remap_topk_ids_to_rank_slot``):
-    the interleaved dispatch buffer's even columns hold the logical ids, which
-    may differ across ranks after the rank-local load-balance fill.  This
-    re-publishes ``topk_ids`` and runs the same single allgather used by the
-    remap path, so every rank agrees on the routing table.  Under ETP the
-    even/odd columns hold the expert group leader rank and the local expert
-    slot instead of the raw logical id.
+    the interleaved dispatch buffer's even/odd columns hold (peer rank, local
+    expert slot) pairs, which may differ across ranks after the rank-local
+    load-balance fill.  This re-publishes ``topk_ids`` and runs the same single
+    allgather used by the remap path, so every rank agrees on the routing
+    table.
     """
     from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
         _KunpengDispatcherState,
@@ -821,7 +848,7 @@ def _kunpeng_publish_and_sync_topk_ids(topk_ids: torch.Tensor) -> None:
     if state.etp_enabled:
         _kunpeng_etp_remap_topk_ids(topk_ids)
     else:
-        kunpeng.copy_kunpeng(full_buf[start : start + num_tokens, 0::2], topk_ids)
+        _kunpeng_publish_topk_ids_rank_slot(state, topk_ids, start)
     _kunpeng_allgather_interleaved_slots(full_buf, full_tokens, topk)
 
 
@@ -869,10 +896,9 @@ def grouped_topk_kunpeng(
     # scaling; python post-processing would not be graph-replayed.
 
     if topk_ids_out is not None:
-        # Publish the consistent full ids table into the interleaved
-        # dispatch buffer (even columns); every rank writes identical data.
-        # Under ETP the even/odd columns hold the expert group leader rank
-        # and the local expert slot instead of the raw logical id.
+        # Publish the consistent full routing table into the interleaved
+        # dispatch buffer as (peer rank, local expert slot) pairs; every rank
+        # writes identical data.
         from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
             _KunpengDispatcherState,
         )
@@ -883,12 +909,7 @@ def grouped_topk_kunpeng(
             _kunpeng_etp_remap_topk_ids(topk_ids)
         else:
             start, _ = _kunpeng_topk_slice(state, topk_ids.shape[0])
-            kunpeng.copy_kunpeng(
-                state.topk_ids_index_buf[
-                    start : start + topk_ids.shape[0], 0::2
-                ],
-                topk_ids,
-            )
+            _kunpeng_publish_topk_ids_rank_slot(state, topk_ids, start)
 
     return topk_weights, topk_ids
 
@@ -1332,12 +1353,14 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
 ) -> torch.Tensor:
     """Map logical expert ids to (rank, local) slots for the Kunpeng RDMA dispatcher.
 
-    ``grouped_topk_kunpeng`` writes logical expert ids into the even columns of
-    ``topk_ids_index_buf`` and leaves the odd columns (local slot) as zero.  The
-    kutacc dispatch kernel reads the interleaved pairs as ``(peer_rank,
-    local_expert)``, so redundant/EPLB layouts must remap logical ids to their
-    physical slots first.  This mirrors the CUDA ``topk_ids_logical_to_physical``
-    step and the reference ``topk_ids2rank_slot`` op.
+    ``grouped_topk_kunpeng`` publishes (rank, local slot) pairs for the
+    trivial no-EPLB layout; this remap rewrites them per the EPLB dispatch
+    map so redundant experts route to their physical copies.  The kutacc
+    dispatch kernel and the local SHM dispatch/sum kernels read the
+    interleaved pairs as ``(peer_rank, local_expert)``, so every producer
+    must emit that pair encoding.  This mirrors the CUDA
+    ``topk_ids_logical_to_physical`` step and the reference
+    ``topk_ids2rank_slot`` op.
 
     The actual remap runs in a C++ kernel (``remap_topk_ids_to_rank_slot_kunpeng``
     for static EPLB, ``remap_topk_ids_to_rank_slot_dynamic_kunpeng`` for the
@@ -1499,10 +1522,9 @@ def biased_grouped_topk_kunpeng(
             num_fused_shared_experts, _rsf)
 
     if topk_ids_out is not None:
-        # Publish the consistent full ids table into the interleaved
-        # dispatch buffer (even columns); every rank writes identical data.
-        # Under ETP the even/odd columns hold the expert group leader rank
-        # and the local expert slot instead of the raw logical id.
+        # Publish the consistent full routing table into the interleaved
+        # dispatch buffer as (peer rank, local expert slot) pairs; every rank
+        # writes identical data.
         from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
             _KunpengDispatcherState,
         )
@@ -1513,12 +1535,7 @@ def biased_grouped_topk_kunpeng(
             _kunpeng_etp_remap_topk_ids(topk_ids)
         else:
             start, _ = _kunpeng_topk_slice(state, topk_ids.shape[0])
-            kunpeng.copy_kunpeng(
-                state.topk_ids_index_buf[
-                    start : start + topk_ids.shape[0], 0::2
-                ],
-                topk_ids,
-            )
+            _kunpeng_publish_topk_ids_rank_slot(state, topk_ids, start)
 
     return topk_weights, topk_ids
 

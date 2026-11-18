@@ -330,7 +330,9 @@ def is_kunpeng_flash_comm() -> bool:
     # SGLANG_KUNPENG_FLASH_COMM=1; decode/native roles keep the plain path.
     # Gates two sub-features: (1) token-sliced sequence-parallel prefill MoE
     # (requires attn-TP > 1; per-rank topk tables merged by one
-    # shm_dual_allgather, combine writes only the home slice) and
+    # shm_dual_allgather; on the RDMA dispatch path the combine writes only
+    # the home slice, on the local SHM dispatch path combine_recv extracts
+    # it; PP > 1 hands the slice between stages via PPProxyTensors) and
     # (2) shared-expert co-location as logical expert n_routed in the EPLB
     # map (requires a non-trivial --init-expert-location with n_routed+1
     # logical experts).

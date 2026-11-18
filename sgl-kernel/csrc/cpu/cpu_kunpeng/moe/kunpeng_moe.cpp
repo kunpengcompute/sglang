@@ -1117,9 +1117,12 @@ void moe_local_dispatch_kunpeng(at::Tensor topk_idx, at::Tensor token_ids, at::T
         experts_offset_data[expert_id_off] = ti;
         for (int64_t token = 0; token < batch_size; token++) {
             for (int64_t j = 0; j < num_topk; ++j) {
-                int16_t global_expert = topk_idx_data[token * num_topk * 2 + j * 2];
-                int64_t peer_rank = global_expert / num_local_experts;
-                int64_t local_exp = global_expert % num_local_experts;
+                // Interleaved (peer rank, local expert slot) pairs — the one
+                // canonical encoding of topk_ids_index_buf written by
+                // remap_topk_ids_to_rank_slot[_dynamic]_kunpeng (EPLB), the
+                // ETP remap, and the identity publish path (non-EPLB).
+                int64_t peer_rank = topk_idx_data[token * num_topk * 2 + j * 2];
+                int64_t local_exp = topk_idx_data[token * num_topk * 2 + j * 2 + 1];
                 if (peer_rank == local_rank && local_exp == expert_id_off) {
                     // Full token id (matching Sample's local_dispatch zero-copy fill).
                     token_ids_data[ti] = static_cast<int32_t>(token);
@@ -1339,20 +1342,19 @@ void moe_local_sum_kunpeng(at::Tensor moe_down,          // [ntoken, hidden] bf1
     // Step 1: token_convert (Sample fusedmoe.cpp token_convert).  `ret` (==
     // ntoken) must equal moe_down's valid row count and match the dispatch
     // enumeration order.
-    // sglang's topk_ids_index even columns hold the GLOBAL expert id (not the
-    // pre-split [rank, local_expert] pair of Sample's topk_ids_index), so the
-    // local hit test must re-derive peer_rank / local_exp exactly like
-    // moe_local_dispatch_kunpeng does.  This keeps the enumeration order and
-    // the produced token_ids sequence identical to the dispatch pass (which is
-    // what keeps moe_down row order aligned with this reduce).
+    // topk_ids_index holds interleaved (peer rank, local expert slot) pairs —
+    // the same canonical encoding moe_local_dispatch_kunpeng consumes — so
+    // the hit test reads the pair columns directly.  This keeps the
+    // enumeration order and the produced token_ids sequence identical to the
+    // dispatch pass (which is what keeps moe_down row order aligned with this
+    // reduce).
     int64_t ret = 0;
     for (int64_t expert_id_off = 0; expert_id_off < num_local_experts; expert_id_off++) {
         for (int64_t token = 0; token < batch_size; token++) {
             int64_t k = -1;
             for (int64_t j = 0; j < num_topk; ++j) {
-                int16_t global_expert = topk_idx_data[token * num_topk * 2 + j * 2];
-                int64_t peer_rank = global_expert / num_local_experts;
-                int64_t local_exp = global_expert % num_local_experts;
+                int64_t peer_rank = topk_idx_data[token * num_topk * 2 + j * 2];
+                int64_t local_exp = topk_idx_data[token * num_topk * 2 + j * 2 + 1];
                 if (peer_rank == local_rank && local_exp == expert_id_off) {
                     k = j;
                 }

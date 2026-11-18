@@ -2497,6 +2497,29 @@ class DeepseekV2Model(nn.Module):
                 f"power-of-2 extend padding "
                 f"(SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1) or pad the batch."
             )
+        if (
+            not self.pp_group.is_first_rank
+            and is_kunpeng_flash_comm()
+            and get_moe_a2a_backend().is_kunpeng_cpu()
+            and not forward_batch.forward_mode.is_idle()
+            and forward_batch.input_ids is not None
+            and hidden_states.shape[0] > 0
+            and hidden_states.shape[0] * get_attn_tensor_model_parallel_world_size()
+            != forward_batch.input_ids.shape[0]
+        ):
+            # Flash-comm SP with PP > 1: the predecessor stage hands each
+            # attn-TP rank its token slice through PPProxyTensors, so the
+            # incoming hidden_states must be exactly input_ids / attn_tp_size
+            # rows. A mismatch means the stages disagree on the SP schedule.
+            raise ValueError(
+                f"PP stage starting at layer {self.start_layer} received "
+                f"{hidden_states.shape[0]} hidden_states rows from the "
+                f"predecessor, but flash-comm SP expects the rank's token "
+                f"slice of {forward_batch.input_ids.shape[0]} rows "
+                f"(/ attn_tp_size="
+                f"{get_attn_tensor_model_parallel_world_size()}): the "
+                f"predecessor stage must run the same flash-comm SP schedule."
+            )
         # DSA topk carry: this stage starts on a skip-topk (shared) layer, so the
         # predecessor must have shipped its top-k. Idle/empty batches compute
         # nothing and carry none by design.

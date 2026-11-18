@@ -48,7 +48,14 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.distributed import get_socket_tp_group
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_bool_env_var, get_device_module, is_xpu, is_cpu_920f, is_shm_available
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    get_device_module,
+    is_cpu_920f,
+    is_kunpeng_flash_comm,
+    is_shm_available,
+    is_xpu,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +115,29 @@ def _is_idle_only_batch(batch: Optional[ScheduleBatch]) -> bool:
     return batch is None or (
         _is_scheduler_skip_all_gather and batch.forward_mode.is_idle()
     )
+
+
+def _pp_proxy_payloads_sp_sliced() -> bool:
+    """True when flash-comm SP proxy payloads are per-rank token slices.
+
+    With flash-comm SP (prefill) each attn-TP rank's PPProxyTensors carry a
+    UNIQUE token slice (rows [r*n, (r+1)*n)), not the identical full-batch
+    copies the PP send-allgather scheme assumes (every rank sends chunk
+    ``tensor.reshape(attn_tp_size, -1)[rank]``, receivers all-gather the
+    chunks).  Applied to unique slices that interleaves bytes of different
+    ranks' payloads into a shape-correct but data-scrambled tensor — silent,
+    because the SP row-count invariants still hold.  Proxy messages must
+    instead travel 1:1 unsharded, which is byte-neutral per RDMA link (a
+    slice is already 1/attn_tp of the batch, the same size as one shard) and
+    drops the node-local all_gather on receive.  "output" messages keep the
+    shard scheme: the last stage gathers full rows before the final norm /
+    lm_head, so those payloads stay identical copies.
+    """
+    if not (_is_cpu_920f and is_kunpeng_flash_comm()):
+        return False
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    return get_moe_a2a_backend().is_kunpeng_cpu()
 
 
 def _ppmtp_log(self, msg: str, *args) -> None:
@@ -1575,15 +1605,24 @@ class SchedulerPPMixin:
             and self.pp_group.kunpeng_pp_communicator is not None
         ):
             self._pp_ensure_send_slot()
+        # Flash-comm SP: proxy payloads are per-rank token slices, unique per
+        # attn-TP rank — ship each slice 1:1 unsharded and skip the shard /
+        # all-gather reassembly (see _pp_proxy_payloads_sp_sliced).  The
+        # receiver mirrors this in _pp_consume_message.
+        sp_sliced = msg_type == "proxy" and _pp_proxy_payloads_sp_sliced()
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
                 dst=dst,
                 all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                    None
+                    if sp_sliced
+                    else (
+                        self.attn_tp_group if self.require_attn_tp_allgather else None
+                    )
                 ),
-                per_key_group=self._pp_per_key_shard_groups(),
+                per_key_group=(None if sp_sliced else self._pp_per_key_shard_groups()),
                 async_send=async_send,
             )
         )
@@ -1743,7 +1782,18 @@ class SchedulerPPMixin:
         # The recv side must read the offset the sender wrote to. kutacc::pp_put
         # writes local[off] -> remote[off] with one offset, so both sides agree
         # on the slot: output and proxy frames each advance their own slot ring.
-        is_output = _msg_type_from_metadata(recv_metadata_list) == "output"
+        msg_type = _msg_type_from_metadata(recv_metadata_list)
+        is_output = msg_type == "output"
+        if (
+            default_group is not None
+            and msg_type == "proxy"
+            and _pp_proxy_payloads_sp_sliced()
+        ):
+            # Flash-comm SP: the sender shipped each rank's token slice 1:1
+            # unsharded (see _pp_send_dict_to_next_stage); re-sharding and
+            # all-gathering here would interleave bytes of different ranks'
+            # slices into a shape-correct but data-scrambled tensor.
+            default_group = None
         offset_base = (
             comm.output_recv_offset(src) if is_output else comm.proxy_recv_offset(src)
         )
