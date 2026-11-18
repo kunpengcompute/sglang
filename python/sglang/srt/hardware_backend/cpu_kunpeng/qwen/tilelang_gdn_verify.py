@@ -22,9 +22,11 @@ plain ``torch.cat``/``clone`` would allocate unregistered storages. ``State`` an
 import ctypes
 import math
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
+from tqdm import tqdm
 
 import torch
 
@@ -39,6 +41,10 @@ _PASS_CONFIGS = {
 _bridge = None
 _register_call = None
 _registered = set()
+
+# Set while precompile_batches() runs so a shape-by-shape log line is not
+# emitted for the whole sweep; the progress bar carries that information.
+_precompiling = False
 
 # Startup precompilation (SGLANG_KUNPENG_TL_OP_PRECOMPILE=1): rank 0 of the TP
 # group compiles every batch size ahead of the first request. The pool size is
@@ -224,17 +230,7 @@ def _compiled(batch, steps, q_heads, v_heads, key_dim, value_dim, state_slots,
     t0 = time.perf_counter()
     kernel = tilelang.compile(prim, out_idx=[9], target='pto',
                               pass_configs=_PASS_CONFIGS)
-    elapsed = time.perf_counter() - t0
-    print(
-        "[QwenVerify] batch=%d steps=%d hq=%d hv=%d kd=%d vd=%d "
-        "state_slots=%d ckpt_slots=%d %s in %.1f ms"
-        % (
-            batch, steps, q_heads, v_heads, key_dim, value_dim, state_slots,
-            ckpt_slots, "cache hit" if cache_hit else "compiled",
-            elapsed * 1e3,
-        ),
-        flush=True,
-    )
+    elapsed_ms = (time.perf_counter() - t0) * 1e3
     # Keep the ctypes handle alive next to the kernel; replay calls its raw
     # `call` entry directly, without the cython wrapper.
     lib = getattr(kernel.adapter, "lib", None)
@@ -242,7 +238,14 @@ def _compiled(batch, steps, q_heads, v_heads, key_dim, value_dim, state_slots,
         lib = ctypes.CDLL(kernel.adapter.lib_generator.libpath)
     if not hasattr(lib, "call"):
         raise RuntimeError("TileLang GDN verify library has no 'call' entry")
-    return kernel, lib
+    # Report once per shape per process: prepare() is called once per GDN
+    # layer, but this body runs only on the first call for the key.
+    if not cache_hit and not _precompiling:
+        print(
+            "[QwenVerify] batch=%d compiled in %.0f ms" % (batch, elapsed_ms),
+            flush=True,
+        )
+    return kernel, lib, cache_hit, elapsed_ms
 
 
 def _shape_key(qk, v, state, indices, checkpoints):
@@ -270,9 +273,13 @@ def _check(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
 
 def prepare(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
             ckpt_indices):
-    """Compile this shape and publish its entry to the graph dispatcher."""
+    """Compile this shape and publish its entry to the graph dispatcher.
+
+    Returns ``(kernel, cache_hit, elapsed_ms)``; the startup precompile uses
+    the timing/cache flag for its progress bar, the lazy path ignores them.
+    """
     key = _shape_key(qk, v, state, indices, checkpoints)
-    kernel, lib = _compiled(*key)
+    kernel, lib, cache_hit, elapsed_ms = _compiled(*key)
     if key not in _registered:
         if _bridge is None:
             raise RuntimeError(
@@ -281,7 +288,7 @@ def prepare(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
             )
         _register_call(*key, ctypes.cast(lib.call, ctypes.c_void_p))
         _registered.add(key)
-    return kernel
+    return kernel, cache_hit, elapsed_ms
 
 
 def gdn_verify(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
@@ -294,8 +301,8 @@ def gdn_verify(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
     """
     _check(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
            ckpt_indices)
-    kernel = prepare(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
-                      ckpt_indices)
+    kernel, _, _ = prepare(A_log, dt_bias, qk, v, ab, state, indices,
+                           checkpoints, ckpt_indices)
     return kernel(A_log.contiguous(), dt_bias.contiguous(), qk,
                   v.contiguous(), ab, state, indices.contiguous(),
                   checkpoints, ckpt_indices.contiguous())
@@ -371,8 +378,9 @@ def precompile_batches(*, state, checkpoints, q_heads, v_heads, key_dim,
                     % (cpu, exc),
                     flush=True,
                 )
+        t0 = time.perf_counter()
         try:
-            prepare(
+            _, cache_hit, _ = prepare(
                 a_log, dt_bias,
                 qk[: batch * steps], v[: batch * steps], ab[: batch * steps],
                 state, indices[:batch], checkpoints, ckpt_indices[:batch],
@@ -380,26 +388,55 @@ def precompile_batches(*, state, checkpoints, q_heads, v_heads, key_dim,
         except Exception as exc:  # reported by mark_failed, degraded at runtime
             mark_failed(batch, exc, qk[: batch * steps], v[: batch * steps],
                         ab[: batch * steps], state, checkpoints)
-            return batch
-        return None
+            return batch, None, (time.perf_counter() - t0) * 1e3
+        return batch, cache_hit, (time.perf_counter() - t0) * 1e3
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_compile_one, batch, (batch - 1) % total_cpus)
-            for batch in range(1, max_batch + 1)
-        ]
-        for future in as_completed(futures):
-            failed = future.result()
-            if failed is not None:
-                failures.append(failed)
+    global _precompiling
+    hits = 0
+    compiles = 0
+    _precompiling = True
+    # Always draw: the deployment redirects scheduler output to a log file
+    # (non-TTY); tqdm still renders there when the log is followed with
+    # `tail -f`. stdout keeps it next to the other [QwenVerify] lines.
+    bar = tqdm(
+        total=max_batch,
+        desc="[QwenVerify] TL gdn_verify",
+        unit="shape",
+        dynamic_ncols=True,
+        mininterval=1.0,
+        disable=False,
+        file=sys.stdout,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_compile_one, batch, (batch - 1) % total_cpus)
+                for batch in range(1, max_batch + 1)
+            ]
+            for future in as_completed(futures):
+                batch, cache_hit, elapsed_ms = future.result()
+                if cache_hit is None:
+                    failures.append(batch)
+                elif cache_hit:
+                    hits += 1
+                else:
+                    compiles += 1
+                bar.set_postfix(
+                    hit=hits, compiled=compiles,
+                    last="%.0fms" % elapsed_ms, refresh=False,
+                )
+                bar.update(1)
+    finally:
+        _precompiling = False
+        bar.close()
 
     failures.sort()
     print(
-        "[QwenVerify] precompile batches=1..%d steps=%d workers=%d cpus=%d "
-        "failed=%s wall=%.2fs"
+        "[QwenVerify] precompile done: %d shapes (%d compiled, %d hit) in "
+        "%.1fs, workers=%d, failed=%s"
         % (
-            max_batch, steps, workers, total_cpus, failures,
-            time.perf_counter() - started,
+            max_batch, compiles, hits, time.perf_counter() - started,
+            workers, failures,
         ),
         flush=True,
     )
@@ -534,12 +571,6 @@ def precompile_gdn_verify(runner) -> None:
     # collective before the assertion takes the process down.
     dist.barrier(group=tp_group.cpu_group)
     assert failure is None, failure
-    print(
-        "[QwenVerify] precompile ready: batches=1..%d steps=%d "
-        "tp_rank_in_group=%d"
-        % (max_batch, checkpoints.shape[1], tp_group.rank_in_group),
-        flush=True,
-    )
 
 
 def register_tilelang_verify(bridge, register_dispatch):
