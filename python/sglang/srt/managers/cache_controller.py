@@ -448,6 +448,14 @@ class HiCacheController:
         self.flat_read_idx: Optional[torch.Tensor] = None
         self.indexer_page_elems = 0
         self.indexer_key_suffix = "@idx"
+        # Two-tier L1<->L3 draft (MTP) layers are COALESCED into the target
+        # page blobs, so they share the target's flat buffers, page sharding,
+        # tp-shard read and shared-L1 scatter. The draft pool is registered
+        # after the controller is built, so the buffers are allocated in
+        # finalize_l1l3_io() instead of the constructor.
+        self.has_l1l3_draft = False
+        self.l1l3_kv_layers: list = []
+        self._l1l3_io_pending = False
         self.tp_shard_enabled = (
             os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD", "1") == "1"
         )
@@ -730,22 +738,13 @@ class HiCacheController:
                         "flat I/O interface required by "
                         "SGLANG_KUNPENG_HICACHE_L1L3_ONLY."
                     )
-                self._alloc_flat_io_buffers()
-                if self.tp_shard_enabled:
-                    # Building the shared segment first-touches every region
-                    # page; the first prefetch of the first request would
-                    # otherwise pay those page faults. A broken group setup must
-                    # not disable L3 storage, so fall back to per-rank reads
-                    # instead of failing the attach.
-                    try:
-                        self._init_tp_shard()
-                    except Exception:
-                        self.tp_shard_enabled = False
-                        self.tp_shard_shm = None
-                        logger.exception(
-                            "[hicache] tp-shard init failed at startup; "
-                            "disabling the cooperative read on this rank"
-                        )
+                # Flat buffers and the tp-shard segment are sized once the
+                # draft pool is known (its layers are coalesced into the same
+                # page blobs), so both are built in finalize_l1l3_io().
+                self.flat_io_batch_pages = max(
+                    1, envs.SGLANG_KUNPENG_HICACHE_IO_BATCH_PAGES.get()
+                )
+                self._l1l3_io_pending = True
             else:
                 self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
@@ -800,40 +799,27 @@ class HiCacheController:
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
-            if is_cpu_920f():
+            if is_cpu_920f() and _hicache_debug():
                 if self.l1l3_only:
                     blob_bytes = (
                         self.flat_write.size(-1) * self.flat_write.element_size()
                         if self.flat_write is not None
-                        else 0
+                        else None
                     )
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] L3 ready: backend=%s page=%d/%dB batch=%d "
-                            "buf=%.1fGB prefetch=%d/%d skip=%s",
-                            self.storage_backend_type,
-                            self.page_size,
-                            blob_bytes,
-                            self.storage_batch_size,
-                            blob_bytes * self.storage_batch_size / 1e9,
-                            self.prefetch_threshold,
-                            self.prefetch_capacity_limit,
-                            self.backup_skip,
-                        )
                 else:
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] L3 ready: backend=%s dir=%s page=%d/%dB "
-                            "batch=%d prefetch=%d/%d skip=%s",
-                            self.storage_backend_type,
-                            getattr(self.storage_backend, "file_path", "-"),
-                            self.page_size,
-                            self.mem_pool_host.get_size_per_token() * self.page_size,
-                            self.storage_batch_size,
-                            self.prefetch_threshold,
-                            self.prefetch_capacity_limit,
-                            self.backup_skip,
-                        )
+                    blob_bytes = self.mem_pool_host.get_size_per_token() * self.page_size
+                logger.info(
+                    "[hicache] L3 ready: backend=%s dir=%s page=%d/%s batch=%d "
+                    "prefetch=%d/%d skip=%s",
+                    self.storage_backend_type,
+                    getattr(self.storage_backend, "file_path", "-"),
+                    self.page_size,
+                    "-" if blob_bytes is None else f"{blob_bytes}B",
+                    self.storage_batch_size,
+                    self.prefetch_threshold,
+                    self.prefetch_capacity_limit,
+                    self.backup_skip,
+                )
         except Exception:
             # Best-effort cleanup for partial init.
             try:
@@ -867,11 +853,29 @@ class HiCacheController:
         and neither can stall the other. They are allocated once, never freed
         and never split into slots: the transfer API completes before returning,
         so a single buffer per direction is enough.
+
+        The MTP draft layers (when present) are appended to the target layer
+        list, so the draft KV and index-K live inside the same page blob and
+        ride the target's page sharding / tp-shard read / shared-L1 scatter.
         """
         self.flat_io_batch_pages = max(
             1, envs.SGLANG_KUNPENG_HICACHE_IO_BATCH_PAGES.get()
         )
-        blob_elems = self.layer_num * self.page_size * self.mem_pool_device.kv_cache_dim
+        self.l1l3_kv_layers = list(self.mem_pool_device.kv_buffer)
+        if self.has_l1l3_draft:
+            draft_pool = getattr(self, "mem_pool_device_draft", None)
+            draft_layers = getattr(draft_pool, "kv_buffer", None)
+            if draft_layers:
+                if int(draft_pool.kv_cache_dim) != int(
+                    self.mem_pool_device.kv_cache_dim
+                ):
+                    raise RuntimeError(
+                        "[hicache] draft KV dim %s != target KV dim %s; cannot "
+                        "coalesce the L1<->L3 page blob"
+                        % (draft_pool.kv_cache_dim, self.mem_pool_device.kv_cache_dim)
+                    )
+                self.l1l3_kv_layers.extend(list(draft_layers))
+        blob_elems = len(self.l1l3_kv_layers) * self.page_size * self.mem_pool_device.kv_cache_dim
         self.flat_write = torch.empty(
             (self.flat_io_batch_pages, blob_elems),
             dtype=self.mem_pool_device.store_dtype,
@@ -895,6 +899,50 @@ class HiCacheController:
 
         for buffer in (self.flat_write, self.flat_read):
             self.storage_backend.register_io_buffer(buffer)
+
+    def finalize_l1l3_io(self) -> None:
+        """Build the flat buffers and the tp-shard segment (two-tier mode).
+
+        Called by the scheduler after the MTP draft pool (if any) is
+        registered, because the draft layers are part of the same page blob.
+        """
+        if not self.l1l3_only or not self._l1l3_io_pending:
+            return
+        self._l1l3_io_pending = False
+        self._alloc_flat_io_buffers()
+        if self.tp_shard_enabled:
+            # Building the shared segment first-touches every region page; the
+            # first prefetch would otherwise pay those page faults. A broken
+            # group setup must not disable L3 storage, so fall back to per-rank
+            # reads instead of failing the attach.
+            try:
+                self._init_tp_shard()
+            except Exception:
+                self.tp_shard_enabled = False
+                self.tp_shard_shm = None
+                logger.exception(
+                    "[hicache] tp-shard init failed at startup; "
+                    "disabling the cooperative read on this rank"
+                )
+        if _hicache_debug():
+            blob_bytes = (
+                self.flat_write.size(-1) * self.flat_write.element_size()
+                if self.flat_write is not None
+                else 0
+            )
+            logger.info(
+                "[hicache] L3 ready: backend=%s page=%d/%dB batch=%d "
+                "buf=%.1fGB prefetch=%d/%d skip=%s draft_layers=%d",
+                self.storage_backend_type,
+                self.page_size,
+                blob_bytes,
+                self.storage_batch_size,
+                blob_bytes * self.storage_batch_size / 1e9,
+                self.prefetch_threshold,
+                self.prefetch_capacity_limit,
+                self.backup_skip,
+                len(self.l1l3_kv_layers) - self.layer_num,
+            )
 
     def _device_page_starts(
         self, indices: torch.Tensor, pages: int, op: str
@@ -921,8 +969,24 @@ class HiCacheController:
 
         pool = self.mem_pool_device
         if isinstance(pool, KunpengNSATokenToKVPool):
+            layers = [buf for buf in pool.index_k_buffer if buf is not None]
+            if self.has_l1l3_draft:
+                draft_pool = getattr(self, "mem_pool_device_draft", None)
+                draft_layers = [
+                    buf
+                    for buf in (getattr(draft_pool, "index_k_buffer", None) or [])
+                    if buf is not None
+                ]
+                if draft_layers:
+                    if int(draft_pool.index_head_dim) != int(pool.index_head_dim):
+                        raise RuntimeError(
+                            "[hicache] draft index head dim %s != target %s; "
+                            "cannot coalesce the L1<->L3 index-K blob"
+                            % (draft_pool.index_head_dim, pool.index_head_dim)
+                        )
+                    layers = layers + draft_layers
             return (
-                [buf for buf in pool.index_k_buffer if buf is not None],
+                layers,
                 pool.index_head_dim,
                 pool.index_k_dtype,
                 "@idxk",
@@ -996,6 +1060,7 @@ class HiCacheController:
         self.flat_read = None
         self.flat_write_idx = None
         self.flat_read_idx = None
+        self.has_l1l3_draft = False
         # The segment geometry follows the flat buffers, so drop it on detach;
         # the next attach rebuilds it (the name carries the slot size).
         self.tp_shard_shm = None
@@ -1311,16 +1376,43 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
-    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
-        """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
-        self.has_draft = True
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool=None) -> None:
+        """Register the MTP draft pool for HiCache.
+
+        Three-tier mode passes a host pool and piggybacks the draft on the
+        L2/L3 transfers. Two-tier mode (l1l3_only) coalesces the draft KV and
+        index-K into the target page blobs: only the geometry is validated
+        here, and the buffers are built later by finalize_l1l3_io().
+        """
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
-        logger.info(
-            "HiCache draft KV registered: %s (host %d slots)",
-            type(draft_device_pool).__name__,
-            draft_host_pool.size,
-        )
+        if draft_host_pool is not None:
+            self.has_draft = True
+            logger.info(
+                "HiCache draft KV registered: %s (host %d slots)",
+                type(draft_device_pool).__name__,
+                draft_host_pool.size,
+            )
+            return
+        self.has_draft = False
+        if not self.l1l3_only:
+            return
+        layers = getattr(draft_device_pool, "kv_buffer", None)
+        if (
+            not layers
+            or not isinstance(layers, (list, tuple))
+            or int(getattr(draft_device_pool, "page_size", 0)) != self.page_size
+            or not int(getattr(draft_device_pool, "kv_cache_dim", 0))
+        ):
+            logger.warning(
+                "[hicache] draft pool geometry mismatch (page_size=%s/%s, "
+                "kv_dim=%s); the L1<->L3 page blob stays target-only",
+                getattr(draft_device_pool, "page_size", None),
+                self.page_size,
+                getattr(draft_device_pool, "kv_cache_dim", None),
+            )
+            return
+        self.has_l1l3_draft = True
 
     def prefetch(
         self,
@@ -2164,7 +2256,7 @@ class HiCacheController:
                 "L3->L1",
             )
             hicache_page_unflatten_batch(
-                self.mem_pool_device.kv_buffer,
+                self.l1l3_kv_layers,
                 self.flat_read[:hit_pages],
                 page_starts,
                 self.page_size,
@@ -2188,7 +2280,7 @@ class HiCacheController:
 
         debug = _hicache_debug()
         prefix_keys = operation.prefix_keys
-        layers = self.mem_pool_device.kv_buffer
+        layers = self.l1l3_kv_layers
         nranks = self.tp_shard_nranks
         my = int(self.tp_rank) % nranks
         op_tag = zlib.crc32(operation.request_id.encode())
@@ -2777,7 +2869,7 @@ class HiCacheController:
         """
         debug = _hicache_debug()
         prefix_keys = operation.prefix_keys
-        layers = self.mem_pool_device.kv_buffer
+        layers = self.l1l3_kv_layers
         src_indices = operation.host_indices
         nranks = max(1, int(getattr(self, "tp_size", 1)))
         my = int(getattr(self, "tp_rank", 0)) % nranks

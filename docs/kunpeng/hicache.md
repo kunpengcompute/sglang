@@ -122,7 +122,7 @@ scripts/cpu_kunpeng/
 | 变量 | 默认 | 类型 | 作用 |
 |---|---|---|---|
 | `KUNPENG_HICACHE_IO_BATCH_PAGES` | `128` | 大小 | flat 缓冲能装多少页，**同时**决定单次 L3 批次的最大页数与缓冲大小。调小 = 省 DDR、但 L3 往返更频繁 |
-| `SGLANG_KUNPENG_HICACHE_L1L3_PREFETCH_RATIO` | `0.25` | 限流 | 在途预取 token 最多占 L1 池的比例，超过即限流，避免预取挤爆 L1 |
+| `SGLANG_KUNPENG_HICACHE_L1L3_PREFETCH_RATIO` | `0.5` | 限流 | 在途预取 token 最多占 L1 池的比例，超过即限流，避免预取挤爆 L1 |
 | `SGLANG_KUNPENG_HICACHE_L3_INDEX_RATIO` | `4.0` | 上界 | 「只剩 L3 有副本」的树上界（这类节点不占内存、只占元数据），上限 = `L1 池 × 该比例` |
 
 > 单页字节数 = `层数 × 64 × kv_dim × 2B`；例如 78 层 MLA、`kv_dim=576` 时约 **5.49 MiB/页**。
@@ -273,3 +273,25 @@ sh launch.sh store
 | 启动时报 `NotImplementedError: ... MLA pools only` | 两级模式只支持 MLA 池 |
 | 启动时报 `... supports write_through / write_through_selective only` | 两级模式不支持 `write_back` |
 | 最后一页始终不命中（如 511/512） | 属预期：EAGLE bigram 视图下 `N` 个 token 只有 `N-1` 个 bigram，且 L3 只存整页，尾部残页不落盘 |
+
+---
+
+## 5. L3 池管理工具（`file` 后端）
+
+L3 目录是“一页一文件”的扁平结构，长期运行会持续增长。仓库提供了管理脚本
+[`scripts/cpu_kunpeng/tools/hicache_pool.sh`](../../scripts/cpu_kunpeng/tools/hicache_pool.sh)，
+默认目录取 `KUNPENG_HICACHE_L3_DIR`，可用 `--dir` 覆盖。支持：
+
+| 功能 | 说明 |
+|---|---|
+| `info` | 盘点总量、四类文件（target/draft 的 KV 与 index-K）数量、按写入日期分布 |
+| `clean` | 按天数（滚动 N×24 小时）、指定日期、或“该日期及之前”删除页 |
+| `size` | 设定容量上限，超出时按最久未使用优先删除（`max(atime, mtime)` 近似 LRU） |
+| `orphan` | 清理缺少配套文件的孤儿页（如只有 `@idxk` 没有对应 KV） |
+| `watch-once` / `start` | 单轮清理（可挂 cron）或后台常驻，按过期天数 + 容量阈值定期执行 |
+
+所有删除默认只预览，加 `-f` 才真正执行；支持 `-j` 控制并发。完整参数与用法：
+
+```bash
+sh scripts/cpu_kunpeng/tools/hicache_pool.sh -h
+```
