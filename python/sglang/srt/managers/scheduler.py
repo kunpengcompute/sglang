@@ -1252,14 +1252,18 @@ class Scheduler(
             return
 
         if getattr(self.tree_cache, "l1l3_only", False):
-            # Two-tier mode has no L2 to piggyback on, so the draft rides along
-            # in the L1<->L3 flat blobs: register the device pool only and let
-            # the controller allocate the per-page draft buffers lazily.
+            # Two-tier mode has no L2 to piggyback on: the draft KV and index-K
+            # are coalesced into the target page blob, so only the pool is
+            # registered here. The flat buffers and the tp-shard segment are
+            # sized afterwards (finalize_l1l3_io), which keeps the draft on the
+            # same page sharding / cooperative read as the target.
             # Without this, an L3-restored prefix would leave the MTP draft KV
             # stale and only hurt acceptance, not the final answer.
             draft_kv_pool, _ = self._get_draft_kv_pool()
+            controller = self.tree_cache.cache_controller
             if draft_kv_pool is not None:
-                self.tree_cache.cache_controller.set_draft_kv_pool(draft_kv_pool)
+                controller.set_draft_kv_pool(draft_kv_pool)
+            controller.finalize_l1l3_io()
             return
 
         draft_kv_pool, _ = self._get_draft_kv_pool()

@@ -654,12 +654,20 @@ class HiCacheFile(HiCacheStorage):
     ) -> List[bool]:
         results = []
         for key, buffer in zip(keys, buffers):
-            if self.exists(key):
-                results.append(True)
-                continue
             tensor_path = os.path.join(
                 self.file_path, f"{self._get_suffixed_key(key)}.bin"
             )
+            needed = buffer.numel() * buffer.element_size()
+            # Write-once, unless the existing blob was written by an older page
+            # layout (e.g. before the draft layers were coalesced). Rewriting on
+            # a size mismatch keeps those prefixes usable instead of turning
+            # them into permanent misses.
+            try:
+                if os.path.getsize(tensor_path) == needed:
+                    results.append(True)
+                    continue
+            except OSError:
+                pass
             try:
                 buffer.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
                 results.append(True)
