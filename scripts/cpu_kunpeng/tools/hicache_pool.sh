@@ -5,11 +5,8 @@
 # 任何删除动作默认只预览（dry-run），必须加 -f 才真正执行。
 #
 # 目录结构（HiCacheFile 后端，一页一文件）：
-#   {hash}{config_suffix}.bin           target KV
-#   {hash}@idxk{config_suffix}.bin      target index-K
-#   d:{hash}{config_suffix}.bin         MTP draft KV
-#   d:{hash}@idxk{config_suffix}.bin    MTP draft index-K
-# 四类文件按 hash 为一组，删除时整组删除，避免留下半套数据。
+#   {hash}{config_suffix}.bin           KV 页 blob（target 各层 + MTP draft 层）
+#   {hash}@idxk{config_suffix}.bin      index-K 页 blob（target + draft）
 
 set -u
 
@@ -30,7 +27,7 @@ cat <<'EOF'
   sh hicache_pool.sh <命令> [数值参数] [选项]
 
 命令:
-  info                查看缓存池概览：总量、四类文件数量、按天分布
+  info                查看缓存池概览：总量、页文件数量、按天分布
   clean [天数]        删除 N 天前写入的页（需指定天数或 --date）
   size  [上限GB]      超过容量上限时，从最久未使用开始删（需指定上限）
   orphan              删除孤儿文件（有 d:/@idxk 但缺少对应 target 文件）
@@ -61,6 +58,7 @@ cat <<'EOF'
 清理规则:
   1) clean：按 mtime 删除过期页；需指定 --days 或 --date，未指定时不删除；
   2) size：超过 --max-gb 时，按 max(atime, mtime) 从最久未使用开始逐页删除；
+     文件系统不更新 atime 时（如 dtfs）等价于按写入时间淘汰，脚本会提示；
   3) --days 与 --max-gb 默认都是 0，即默认不做任何清理；
   4) 默认只预览，加 -f 执行删除。
 
@@ -195,10 +193,8 @@ cmd_info() {
     echo "占用空间: $bytes 字节 ($(human_gb "$bytes"))"
     echo ""
     echo "按文件类型:"
-    printf "  target KV        : %d 页\n" "$t_kv"
-    printf "  target index-K   : %d 页\n" "$t_idx"
-    printf "  draft  KV        : %d 页\n" "$d_kv"
-    printf "  draft  index-K   : %d 页\n" "$d_idx"
+    printf "  KV 页 blob      : %d 页\n" "$t_kv"
+    printf "  index-K 页 blob : %d 页\n" "$t_idx"
     echo ""
     echo "按写入日期（mtime）:"
     sort -n "$daysf" | while read -r d n g; do
@@ -363,6 +359,10 @@ cmd_size() {
     fi
     need=$((total - limit))
     echo "需释放: $(human_gb "$need")"
+    # （dtfs/nfs 常见），此时 max(atime, mtime) 就等于 mtime。
+    if [ "$(awk '$2 > $3 { n++ } END { print n + 0 }' "$listing")" -eq 0 ]; then
+        echo "提示: 文件系统未更新 atime，等价于按写入时间(mtime)淘汰"
+    fi
 
     now=$(date +%s)
     guard=$((10 * 60))
@@ -398,7 +398,7 @@ cmd_size() {
     cnt=${summary%% *}
     freed=${summary##* }
     if [ "$cnt" -gt 0 ]; then
-        echo "按最久未使用优先，选中:"
+        echo "按 max(atime, mtime) 最旧优先，选中:"
         cat "$tbl"
     fi
     rm -f "$tbl"
