@@ -448,6 +448,18 @@ class HiCacheController:
         self.flat_read_idx: Optional[torch.Tensor] = None
         self.indexer_page_elems = 0
         self.indexer_key_suffix = "@idx"
+        # Two-tier L1<->L3 draft (MTP) blobs. The draft pool is registered
+        # after the controller is built (scheduler._maybe_register_hicache_draft),
+        # so these buffers are allocated lazily in set_draft_kv_pool().
+        self.has_l1l3_draft = False
+        self.draft_kv_layers: list = []
+        self.draft_index_layers: list = []
+        self.flat_write_draft: Optional[torch.Tensor] = None
+        self.flat_read_draft: Optional[torch.Tensor] = None
+        self.draft_indexer_page_elems = 0
+        self.flat_write_idx_draft: Optional[torch.Tensor] = None
+        self.flat_read_idx_draft: Optional[torch.Tensor] = None
+        self.draft_key_prefix = "d:"
         self.tp_shard_enabled = (
             os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD", "1") == "1"
         )
@@ -955,6 +967,113 @@ class HiCacheController:
         stride = self.indexer_page_elems // len(layers)
         return [t.view(-1, 1, stride) for t in layers]
 
+    # ---- two-tier draft (MTP) blobs -------------------------------------
+    def _draft_kv_key(self, page_hash: str) -> str:
+        """L3 key of a draft KV page; the prefix keeps it out of the target
+        namespace so old entries (no draft section) are a clean miss."""
+        return f"{self.draft_key_prefix}{page_hash}"
+
+    def _draft_indexer_key(self, page_hash: str) -> str:
+        return f"{self._draft_kv_key(page_hash)}{self.indexer_key_suffix}"
+
+    def _draft_indexer_page_layers(self) -> list:
+        stride = self.draft_indexer_page_elems // len(self.draft_index_layers)
+        return [t.view(-1, 1, stride) for t in self.draft_index_layers]
+
+    def _l1l3_write_draft(self, batch_hashes, page_starts, mine, extra_info) -> bool:
+        """Write this rank's shard of the draft KV / index-K pages to L3.
+
+        Reuses the target's per-page content shard (``mine``), so every page
+        exists exactly once in L3 while the volume stays 1/nranks of a full
+        draft copy.
+        """
+        n = len(mine)
+        hicache_page_flatten_batch(
+            self.draft_kv_layers,
+            self.flat_write_draft[:n],
+            page_starts[mine],
+            self.page_size,
+        )
+        ok = all(
+            self.storage_backend.batch_set_flat(
+                [self._draft_kv_key(batch_hashes[j]) for j in mine],
+                [self.flat_write_draft[k] for k in range(n)],
+                extra_info,
+            )
+        )
+        if ok and self.draft_indexer_page_elems:
+            page_ids = page_starts // self.page_size
+            hicache_page_flatten_batch(
+                self._draft_indexer_page_layers(),
+                self.flat_write_idx_draft[:n],
+                page_ids[mine],
+                1,
+            )
+            ok = all(
+                self.storage_backend.batch_set_flat(
+                    [self._draft_indexer_key(batch_hashes[j]) for j in mine],
+                    [self.flat_write_idx_draft[k] for k in range(n)],
+                    extra_info,
+                )
+            )
+        return ok
+
+    def _l1l3_read_draft(self, batch_hashes, batch_indices, prefix_keys) -> int:
+        """Restore one batch of draft (MTP) pages from L3 into L1.
+
+        Every rank reads the whole batch (the draft blob is a small fraction of
+        the target's), so the leading-hit count is identical on all ranks and
+        the scatter is valid for both private and group-shared draft pools. A
+        page without a draft blob (e.g. written before this path existed, or a
+        draft write that failed) caps the returned prefix, which makes the
+        caller recompute that range instead of using stale draft KV.
+        """
+        pages = len(batch_hashes)
+        if not pages:
+            return 0
+        extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+        hits = self.storage_backend.batch_get_flat(
+            [self._draft_kv_key(h) for h in batch_hashes],
+            [self.flat_read_draft[j] for j in range(pages)],
+            extra_info,
+        )
+        got = 0
+        for hit in hits:
+            if not hit:
+                break
+            got += 1
+        if not got:
+            return 0
+        page_starts = self._device_page_starts(
+            batch_indices[: got * self.page_size], got, "L3->L1(draft)"
+        )
+        hicache_page_unflatten_batch(
+            self.draft_kv_layers,
+            self.flat_read_draft[:got],
+            page_starts,
+            self.page_size,
+        )
+        if self.draft_indexer_page_elems:
+            idx_hits = self.storage_backend.batch_get_flat(
+                [self._draft_indexer_key(h) for h in batch_hashes[:got]],
+                [self.flat_read_idx_draft[j] for j in range(got)],
+                extra_info,
+            )
+            idx_got = 0
+            for hit in idx_hits:
+                if not hit:
+                    break
+                idx_got += 1
+            got = min(got, idx_got)
+            if got:
+                hicache_page_unflatten_batch(
+                    self._draft_indexer_page_layers(),
+                    self.flat_read_idx_draft[:got],
+                    page_starts[:got] // self.page_size,
+                    1,
+                )
+        return got
+
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
 
@@ -996,6 +1115,11 @@ class HiCacheController:
         self.flat_read = None
         self.flat_write_idx = None
         self.flat_read_idx = None
+        self.flat_write_draft = None
+        self.flat_read_draft = None
+        self.flat_write_idx_draft = None
+        self.flat_read_idx_draft = None
+        self.has_l1l3_draft = False
         # The segment geometry follows the flat buffers, so drop it on detach;
         # the next attach rebuilds it (the name carries the slot size).
         self.tp_shard_shm = None
@@ -1311,16 +1435,94 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
-    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
-        """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
-        self.has_draft = True
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool=None) -> None:
+        """Register the MTP draft pool for HiCache.
+
+        Three-tier mode passes a host pool and piggybacks the draft on the
+        L2/L3 transfers. Two-tier mode (l1l3_only) has no L2, so the draft KV
+        and index-K ride along in the L1<->L3 flat blobs instead: only the
+        device pool is registered here and the per-page draft buffers are
+        allocated lazily (this runs after the controller is built).
+        """
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
+        if draft_host_pool is None:
+            self.has_draft = False
+            self._enable_l1l3_draft(draft_device_pool)
+            return
+        self.has_draft = True
         logger.info(
             "HiCache draft KV registered: %s (host %d slots)",
             type(draft_device_pool).__name__,
             draft_host_pool.size,
         )
+
+    def _enable_l1l3_draft(self, draft_pool) -> None:
+        """Allocate the draft flat I/O buffers for the L1<->L3 two-tier mode."""
+        if not self.l1l3_only or self.flat_write is None:
+            return
+        layers = getattr(draft_pool, "kv_buffer", None)
+        if not layers or not isinstance(layers, (list, tuple)):
+            logger.warning(
+                "[hicache] draft pool exposes no per-layer KV buffers; "
+                "L1<->L3 draft blobs stay disabled"
+            )
+            return
+        # Page blobs share the target's page geometry; a mismatch would make
+        # the draft page indices disagree with the radix tree's.
+        if (
+            int(getattr(draft_pool, "page_size", 0)) != self.page_size
+            or not int(getattr(draft_pool, "kv_cache_dim", 0))
+        ):
+            logger.warning(
+                "[hicache] draft pool geometry mismatch (page_size=%s/%s, "
+                "kv_dim=%s); L1<->L3 draft blobs stay disabled",
+                getattr(draft_pool, "page_size", None),
+                self.page_size,
+                getattr(draft_pool, "kv_cache_dim", None),
+            )
+            return
+        self.draft_kv_layers = list(layers)
+        kv_elems = (
+            len(self.draft_kv_layers)
+            * self.page_size
+            * int(draft_pool.kv_cache_dim)
+        )
+        self.flat_write_draft = torch.empty(
+            (self.flat_io_batch_pages, kv_elems),
+            dtype=draft_pool.store_dtype,
+        )
+        self.flat_read_draft = torch.empty_like(self.flat_write_draft)
+
+        idx_layers = [
+            buf
+            for buf in (getattr(draft_pool, "index_k_buffer", None) or [])
+            if buf is not None
+        ]
+        if idx_layers:
+            self.draft_index_layers = idx_layers
+            self.draft_indexer_page_elems = (
+                len(idx_layers) * self.page_size * int(draft_pool.index_head_dim)
+            )
+            self.flat_write_idx_draft = torch.empty(
+                (self.flat_io_batch_pages, self.draft_indexer_page_elems),
+                dtype=draft_pool.index_k_dtype,
+            )
+            self.flat_read_idx_draft = torch.empty_like(self.flat_write_idx_draft)
+            for buf in (self.flat_write_idx_draft, self.flat_read_idx_draft):
+                self.storage_backend.register_io_buffer(buf)
+        for buf in (self.flat_write_draft, self.flat_read_draft):
+            self.storage_backend.register_io_buffer(buf)
+        self.has_l1l3_draft = True
+        if _hicache_debug():
+            logger.info(
+                "[hicache] L1<->L3 draft blobs enabled: %d kv layer(s), "
+                "page=%d/%dB, indexer_page=%d elems",
+                len(self.draft_kv_layers),
+                self.page_size,
+                kv_elems * self.flat_write_draft.element_size(),
+                self.draft_indexer_page_elems,
+            )
 
     def prefetch(
         self,
@@ -2157,6 +2359,18 @@ class HiCacheController:
                     break
                 idx_hit_pages += 1
             hit_pages = min(hit_pages, idx_hit_pages)
+        if hit_pages and self.has_l1l3_draft:
+            # MTP draft KV of the same prefix must exist too, otherwise the
+            # decode side would run with stale draft attention over the prompt.
+            # A failed read is best-effort: cap the prefix and recompute.
+            try:
+                draft_pages = self._l1l3_read_draft(
+                    batch_hashes[:hit_pages], batch_indices, prefix_keys
+                )
+            except Exception:
+                draft_pages = 0
+                logger.exception("[hicache] draft L3->L1 read failed")
+            hit_pages = min(hit_pages, draft_pages)
         if hit_pages:
             page_starts = self._device_page_starts(
                 batch_indices[: hit_pages * self.page_size],
@@ -2309,6 +2523,22 @@ class HiCacheController:
                             page_starts[:hit_pages] // self.page_size,
                             1,
                         )
+
+            if hit_pages and self.has_l1l3_draft:
+                # Every rank reads the whole draft batch, so the leading-hit
+                # count stays identical across ranks; only the (small) draft
+                # blob is fetched redundantly. A failed read caps the prefix.
+                try:
+                    draft_pages = self._l1l3_read_draft(
+                        batch_hashes[:hit_pages], batch_indices, prefix_keys
+                    )
+                except Exception:
+                    draft_pages = 0
+                    logger.exception(
+                        "[hicache] draft L3->L1 read failed: req=%s",
+                        operation.request_id,
+                    )
+                hit_pages = min(hit_pages, draft_pages)
 
             if hit_pages == 0:
                 operation.mark_terminate()
@@ -2840,6 +3070,30 @@ class HiCacheController:
                         _idx_range(batch_indices),
                         self.indexer_key_suffix,
                         success,
+                    )
+
+            if success and page_starts is not None and self.has_l1l3_draft:
+                # The draft blob is an optimization: never let it abort the
+                # target backup or kill this storage thread.
+                try:
+                    draft_ok = self._l1l3_write_draft(
+                        batch_hashes, page_starts, mine, extra_info
+                    )
+                except Exception:
+                    draft_ok = False
+                    logger.exception(
+                        "[hicache] draft L1->L3 write failed: op=%d, %d page(s)",
+                        operation.id,
+                        len(mine),
+                    )
+                if debug:
+                    logger.info(
+                        "[hicache] L1->flat copy + flat->L3 write (draft): op=%d, "
+                        "%d page(s), device%s, ok=%s",
+                        operation.id,
+                        len(mine),
+                        _idx_range(batch_indices),
+                        draft_ok,
                     )
 
             if debug:

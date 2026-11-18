@@ -1252,9 +1252,14 @@ class Scheduler(
             return
 
         if getattr(self.tree_cache, "l1l3_only", False):
-            # Two-tier mode: the draft pool is not part of L3 (the L3 blob
-            # encoding is target-KV only) and there is no L2 to piggyback on, so
-            # it simply stays L1-only.
+            # Two-tier mode has no L2 to piggyback on, so the draft rides along
+            # in the L1<->L3 flat blobs: register the device pool only and let
+            # the controller allocate the per-page draft buffers lazily.
+            # Without this, an L3-restored prefix would leave the MTP draft KV
+            # stale and only hurt acceptance, not the final answer.
+            draft_kv_pool, _ = self._get_draft_kv_pool()
+            if draft_kv_pool is not None:
+                self.tree_cache.cache_controller.set_draft_kv_pool(draft_kv_pool)
             return
 
         draft_kv_pool, _ = self._get_draft_kv_pool()
