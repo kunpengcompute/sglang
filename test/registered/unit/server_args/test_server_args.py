@@ -493,5 +493,79 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestMambaCheckpointStride(unittest.TestCase):
+    def _make_args(self, **overrides):
+        kwargs = dict(
+            model_path="dummy",
+            device="cpu",
+            mamba_scheduler_strategy="extra_buffer",
+            mamba_checkpoint_stride_pages=4,
+            page_size=64,
+            chunked_prefill_size=2048,
+            max_prefill_tokens=16384,
+        )
+        kwargs.update(overrides)
+        return ServerArgs(**kwargs)
+
+    def _validate(self, args):
+        with (
+            patch("sglang.srt.server_args.is_cpu_920f", return_value=True),
+            patch.dict(
+                "os.environ",
+                {
+                    "SGLANG_KUNPENG_QWEN": "1",
+                    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "0",
+                },
+            ),
+        ):
+            args._validate_mamba_checkpoint_stride()
+
+    def test_default_disabled_and_cli(self):
+        self.assertIsNone(
+            ServerArgs(model_path="dummy").mamba_checkpoint_stride_pages
+        )
+        args = prepare_server_args(
+            ["--model-path", "dummy", "--mamba-checkpoint-stride-pages", "4"]
+        )
+        self.assertEqual(args.mamba_checkpoint_stride_pages, 4)
+
+    def test_valid_configuration_does_not_require_large_chunks(self):
+        self._validate(
+            self._make_args(chunked_prefill_size=64, max_prefill_tokens=64)
+        )
+
+    def test_rejects_unified_radix_tree(self):
+        with (
+            patch("sglang.srt.server_args.is_cpu_920f", return_value=True),
+            patch.dict(
+                "os.environ",
+                {
+                    "SGLANG_KUNPENG_QWEN": "1",
+                    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                },
+            ),
+            self.assertRaises(AssertionError),
+        ):
+            self._make_args()._validate_mamba_checkpoint_stride()
+
+    def test_invalid_configurations(self):
+        cases = [
+            ({"mamba_checkpoint_stride_pages": 0}, "greater than or equal"),
+            ({"mamba_scheduler_strategy": "no_buffer"}, "requires"),
+            (
+                {"mamba_checkpoint_stride_pages": 1, "page_size": 32},
+                "must be divisible",
+            ),
+            ({"enable_dynamic_chunking": True}, "--enable-dynamic-chunking"),
+            ({"enable_mixed_chunk": True}, "--enable-mixed-chunk"),
+            ({"enable_streaming_session": True}, "--enable-streaming-session"),
+        ]
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(AssertionError) as context:
+                    self._validate(self._make_args(**overrides))
+                self.assertIn(message, str(context.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

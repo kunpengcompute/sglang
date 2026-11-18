@@ -571,6 +571,16 @@ class DeepseekV2MoE(nn.Module):
         if _is_kunpeng_flash_comm:
             self.experts.should_fuse_routed_scaling_factor_in_topk = True
 
+        if is_nextn:
+            # Dedicated MTP row: draft heat/padding land in the last metadata row.
+            from sglang.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            metadata = get_global_expert_location_metadata()
+            if metadata is not None and metadata.has_draft_layer:
+                self.experts.record_layer_id = metadata.draft_layer_id
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             layer_id=self.layer_id,
@@ -592,6 +602,8 @@ class DeepseekV2MoE(nn.Module):
                 and (not get_moe_runner_backend().is_flashinfer_trtllm())
                 else None
             ),
+            # NextN padding rows belong to the draft EPLB row.
+            pad_layer_id=getattr(self.experts, "record_layer_id", None),
         )
 
         self.shared_experts_is_int8 = False

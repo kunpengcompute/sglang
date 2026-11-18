@@ -1881,6 +1881,9 @@ class KunpengStateLoader(BaseModelLoader):
         if logical_count.ndim == 2:
             logical_count = logical_count.unsqueeze(0)
         heat = logical_count.to(torch.int64).sum(dim=0)
+        if metadata.has_draft_layer and heat.shape[0] + 1 == metadata.num_layers:
+            # Old heat without the draft row: mirror init_by_mapping for logging.
+            heat = torch.cat([heat, heat[-1:]], dim=0)
         physical_to_logical = metadata.physical_to_logical_map_cpu.to(torch.int64)
         physical_heat = heat.gather(1, physical_to_logical)
         group_heat = physical_heat.view(

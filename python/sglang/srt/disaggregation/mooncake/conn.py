@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 _is_cpu_920f = is_cpu_920f()
 
+# SGLANG_KUNPENG_LOG_KV_WAIT_TIMING=1: print per-stage KV transfer timings
+# (prefill enqueue -> worker pick -> RDMA write -> status success, and
+# decode-side per-rank status arrival). Verbose, debug only.
+_KV_WAIT_TIMING = envs.SGLANG_KUNPENG_LOG_KV_WAIT_TIMING.get()
+
 
 class KVTransferError(Exception):
     def __init__(self, bootstrap_room: int, failure_reason: str):
@@ -62,6 +67,8 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
+    # perf_counter() at enqueue time, for SGLANG_KUNPENG_LOG_KV_WAIT_TIMING.
+    enqueue_ts: float = 0.0
 
 
 from sglang.srt.disaggregation.common.staging_handler import (
@@ -696,6 +703,19 @@ class MooncakeKVManager(CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        if _KV_WAIT_TIMING:
+            t0 = time.perf_counter()
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
+            logger.info(
+                "[kv-timing] WRITE blocks=%d bytes=%.2fMB dur=%.1fms ret=%d",
+                len(lengths),
+                sum(lengths) / 1e6,
+                (time.perf_counter() - t0) * 1e3,
+                ret,
+            )
+            return ret
         return self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
@@ -1450,6 +1470,24 @@ class MooncakeKVManager(CommonKVManager):
                     if in_transfer_infos
                     else []
                 )
+                if _KV_WAIT_TIMING:
+                    logger.info(
+                        "[kv-timing] PICK room=%s last=%s queued=%.1fms dsts=%d",
+                        kv_chunk.room,
+                        kv_chunk.is_last_chunk,
+                        (
+                            (time.perf_counter() - kv_chunk.enqueue_ts) * 1e3
+                            if kv_chunk.enqueue_ts
+                            else -1.0
+                        ),
+                        len(reqs_to_be_processed),
+                    )
+                    if not reqs_to_be_processed:
+                        logger.warning(
+                            "[kv-timing] DROP room=%s last=%s: room has no transfer_infos",
+                            kv_chunk.room,
+                            kv_chunk.is_last_chunk,
+                        )
                 polls = []
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
@@ -1678,6 +1716,20 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             if should_sync:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                if _KV_WAIT_TIMING:
+                                    logger.info(
+                                        "[kv-timing] DONE room=%s status=%s since_enqueue=%.1fms dsts=%d",
+                                        req.room,
+                                        status,
+                                        (
+                                            (time.perf_counter() - kv_chunk.enqueue_ts)
+                                            * 1e3
+                                            if kv_chunk.enqueue_ts
+                                            else -1.0
+                                        ),
+                                        len(dst_ranks_infos),
+                                    )
+                                t_sync = time.perf_counter()
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
@@ -1686,6 +1738,12 @@ class MooncakeKVManager(CommonKVManager):
                                         room,
                                         status,
                                         prefill_unique_rank,
+                                    )
+                                if _KV_WAIT_TIMING:
+                                    logger.info(
+                                        "[kv-timing] STATUS_SENT room=%s dur=%.1fms",
+                                        req.room,
+                                        (time.perf_counter() - t_sync) * 1e3,
                                     )
                                 # reset accumulators so each dst session gets its own sync_status
                                 polls = []
@@ -1913,6 +1971,14 @@ class MooncakeKVManager(CommonKVManager):
                             arrived_response_num = len(
                                 self.prefill_response_tracker[bootstrap_room]
                             )
+                            if _KV_WAIT_TIMING:
+                                logger.info(
+                                    "[kv-timing] DECODE_STATUS room=%s prefill_rank=%s arrived=%d/%d",
+                                    bootstrap_room,
+                                    prefill_rank,
+                                    arrived_response_num,
+                                    expected_response_num,
+                                )
                             if arrived_response_num == expected_response_num:
                                 if self.enable_staging:
                                     handler = self._staging_handler
@@ -2048,8 +2114,18 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                enqueue_ts=time.perf_counter(),
             )
         )
+        if _KV_WAIT_TIMING:
+            logger.info(
+                "[kv-timing] ENQUEUE room=%s last=%s pages=%d q=%d dsts=%d",
+                bootstrap_room,
+                is_last_chunk,
+                len(kv_indices),
+                shard_idx,
+                len(dst_infos),
+            )
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -2363,12 +2439,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
 
         # Sharding is decided solely by THIS decode process: when a pool is
-        # shared by its group, only two ranks own a disjoint layer shard of that
-        # pool and the rest receive nothing of it. Otherwise every rank gets a
-        # full copy via the legacy 8-frame metadata. KV and index-K are sharded
-        # by their OWN group, so the two specs are computed independently;
-        # pd_*_shard_spec() returns None whenever that pool is not actually
-        # shared, so no prefill-side capability negotiation is involved.
+        # shared by its group, every member of the group owns a disjoint layer
+        # shard of that pool and receives only that shard, so the per-rank
+        # transfer volume is 1/group_size of a full copy. Otherwise every rank
+        # gets a full copy via the legacy 8-frame metadata. KV and index-K are
+        # sharded by their OWN group, so the two specs are computed
+        # independently; pd_*_shard_spec() returns None whenever that pool is
+        # not actually shared, so no prefill-side capability negotiation is
+        # involved.
         kv_shard_spec = None
         state_shard_spec = None
         if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0:

@@ -50,7 +50,21 @@ void flash_attention_with_workspace_graph(
     std::vector<int64_t> seq_lens(bs);
     for (int64_t i = 0; i < bs; i++) {
         cur_lens[i] = ext_a[i];
-        seq_lens[i] = ext_a[i];
+        // Non-causal (vision) callers must move the kernel's causal
+        // anchor past the whole K range: the SME flash kernel masks
+        // k_pos > q_pos unconditionally and anchors every query at
+        // prefill_start = seq_lens[i] - cur_lens[i] (+ the
+        // intra-sequence q offset). A per-sequence "prefix" equal to the
+        // sequence's own K length pushes that anchor beyond k_len, so
+        // the mask never fires and each image attends bidirectionally.
+        // This graph kernel is what replays execute - the Python
+        // adapter's eager_fn (adapters.py
+        // _setup_flash_attention_with_workspace_kunpeng) applies the
+        // same doubling for eager calls, and the wrapper
+        // (kunpeng_attention.cpp) shifts non-causal seq_lens again; the
+        // three compose harmlessly (any anchor past the K range works).
+        // Causal (text prefill) callers are unchanged.
+        seq_lens[i] = causal ? ext_a[i] : 2 * ext_a[i];
     }
 
     flash_attention_with_workspace(

@@ -46,6 +46,9 @@ export QWEN_CONTEXT_LENGTH=69632
 export QWEN_MAX_TOTAL_TOKENS=73728
 export QWEN_MAX_RUNNING_REQUESTS=16
 export QWEN_SEED=77101
+# 注意力后端：多模态(vision)部署必须torch_native；kunpeng_cpu与vision运行时组合在init即失败。
+# 纯文本部署可删除本行（launch.py缺省仍传kunpeng_cpu）。
+export QWEN_ATTENTION_BACKEND="torch_native"
 export QWEN_TEST_INPUT_TOKENS=1024
 export QWEN_TEST_OUTPUT_TOKENS=1024
 export QWEN_TEST_CONCURRENCY=1
@@ -111,6 +114,8 @@ export SGLANG_KUNPENG_QWEN_PREFILL_BACKEND="kutacc"
 export SGLANG_KUNPENG_QWEN_PREFILL_GEMM_ROWS="512"
 export SGLANG_KUNPENG_QWEN_PREFILL_WORKSPACE_HBM="1"
 export SGLANG_KUNPENG_QWEN_SHARED_PREFILL_KV="1"
+# 多模态vision运行时开关；代码缺省已开启，显式声明便于识别多模态部署，置0退回纯文本服务。
+export SGLANG_KUNPENG_QWEN_VISION="1"
 export SGLANG_KUNPENG_RDMA_ALLGATHER="0"
 export SGLANG_KUNPENG_SWAP_EXPERT="0"
 export SGLANG_KUNPENG_SWAP_KV_BLOCKWISE="0"

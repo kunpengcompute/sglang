@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.utils.common import is_cpu_920f
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -145,15 +146,19 @@ class PrefillBootstrapQueue:
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         # Number of main-model layers owned by this prefill PP rank (MTP/draft
         # layers live in draft_token_to_kv_pool and are excluded). Registered to
         # the bootstrap server so the decode side can map its PP stages onto
         # prefill PP ranks by layer interval when prefill pp != decode pp. A
         # hybrid pool only owns KV for its full-attention layers, so the count
-        # is not the layer-id span `end_layer - start_layer`.
-        kv_args.prefill_num_layers = self.token_to_kv_pool.num_kv_layers
+        # is not the layer-id span `end_layer - start_layer`. Pools without
+        # `end_layer` (e.g. SWA pools) report no count; send None so the decode
+        # side falls back to the legacy rank-index PP mapping.
+        kv_args.prefill_num_layers = getattr(
+            self.token_to_kv_pool, "num_kv_layers", None
+        )
         # default to 0, will be filled from decode metadata per-request
         kv_args.decode_start_layer = 0
         kv_args.decode_num_layers = 0
@@ -185,7 +190,7 @@ class PrefillBootstrapQueue:
             self.metadata_buffers.get_buf_infos()
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_args.gpu_id = self.scheduler.ps.gpu_id
 
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
             state_data_ptrs, state_data_lens, state_item_lens = (
@@ -322,10 +327,15 @@ class PrefillBootstrapQueue:
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if rids_to_check is not None:
-                # if req not in reqs_info_to_check, skip
-                if req.rid not in rids_to_check:
-                    continue
+            if (
+                rids_to_check is not None
+                and req.rid not in rids_to_check
+                and poll != KVPoll.Failed
+            ):
+                # In PP mode, successful bootstrap still requires cross-rank
+                # consensus. Local failures are terminal and must be drained
+                # even if an earlier PP rank has already removed the request.
+                continue
 
             if poll == KVPoll.Bootstrapping:
                 continue
@@ -412,7 +422,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
-        batch = self.maybe_prepare_mlp_sync_batch(batch)
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
@@ -423,16 +433,22 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        # 920F: defer the HiCache control-plane sync (attn-TP allreduce) until
+        # after the forward. Issued right after recv_requests' kuccl broadcast,
+        # a large payload may still be in flight on another rank; two different
+        # collectives in flight on the same ucg_group can mispair and block the
+        # whole group.
+        self._hicache_sync_after_forward = is_cpu_920f()
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            if self._engine_paused:
-                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -447,6 +463,9 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self.on_idle()
 
+            # The 256-rank MoE barrier inside run_batch has aligned the group.
+            self._sync_hicache_events_after_forward()
+
             self.process_disagg_prefill_inflight_queue()
 
             # Update last_batch
@@ -456,16 +475,20 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        # Same as event_loop_normal_disagg_prefill: on 920F, move the HiCache
+        # control-plane sync after the forward to avoid interleaving it with
+        # recv_requests' broadcast.
+        self._hicache_sync_after_forward = is_cpu_920f()
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            if self._engine_paused:
-                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -487,6 +510,9 @@ class SchedulerDisaggregationPrefillMixin:
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            # The 256-rank MoE barrier inside run_batch has aligned the group.
+            self._sync_hicache_events_after_forward()
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -538,6 +564,17 @@ class SchedulerDisaggregationPrefillMixin:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
+            if logits_output.next_token_top_logprobs_val:
+                logits_output.next_token_top_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                ]
+            if logits_output.next_token_token_ids_logprobs_val:
+                logits_output.next_token_token_ids_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                ]
 
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
@@ -574,7 +611,7 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     else:
                         logger.debug(
-                            f"[PP{getattr(self, 'pp_rank', None)}] "
+                            f"[PP{getattr(self.ps, 'pp_rank', None)}] "
                             f"rid={req.rid}: no pending draft at prefill transfer"
                         )
                     req.hidden_states_tensor = None
@@ -686,7 +723,7 @@ class SchedulerDisaggregationPrefillMixin:
                     KVPoll.Failed,
                 ):
                     logger.warning(
-                        f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
                         f"from consensus; treating as undone"
                     )
                     undone_reqs.append(req)
@@ -709,7 +746,7 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
-                error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                error_message = f"Prefill transfer failed for request rank={self.ps.tp_rank} {req.rid=} {req.bootstrap_room=}"
                 try:
                     req.disagg_kv_sender.failure_exception()
                 except Exception as e:

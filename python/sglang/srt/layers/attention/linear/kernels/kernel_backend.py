@@ -10,6 +10,12 @@ class LinearAttnKernelBase(ABC):
     and provides decode/extend/target_verify methods with a unified interface.
     """
 
+    # True when extend() honors `track_state` / `track_chunk_idx`, i.e. writes
+    # the fp32 chunk-boundary snapshot the mamba extra_buffer prefix cache
+    # reads. Kernels that ignore those arguments leave the buffer unwritten,
+    # so callers must gate the allocation on this flag.
+    supports_track_state_snapshot: bool = False
+
     @abstractmethod
     def decode(
         self,

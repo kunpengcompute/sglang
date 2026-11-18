@@ -1131,7 +1131,23 @@ def _setup_flash_attention_with_workspace_kunpeng():
         qsl[1:] = torch.cumsum(extend_seq_lens, dim=0)
         ksl = qsl.clone()
         cur_lens = (qsl[1:] - qsl[:-1]).tolist()
-        seq_lens = cur_lens
+        if causal:
+            seq_lens = cur_lens
+        else:
+            # Non-causal (vision) calls must move the kernel's causal
+            # anchor past the whole K range. The SME flash kernel masks
+            # k_pos > q_pos unconditionally (it has no causal flag) and
+            # anchors every query at prefill_start = seq_lens[i] -
+            # cur_lens[i] (+ the intra-sequence q offset). Handing it a
+            # per-sequence "prefix" equal to the sequence's own K length
+            # (seq_lens = 2 * cur_lens) pushes that anchor beyond k_len
+            # for every query, so the mask condition never fires and each
+            # image attends bidirectionally. qsl/ksl (the real Q/K row
+            # bounds used for slicing and packing) are untouched. The C++
+            # wrapper applies the same shift for non-causal calls; the two
+            # compose harmlessly (any anchor past the K range works).
+            # Causal (text prefill) callers are unchanged.
+            seq_lens = [2 * c for c in cur_lens]
 
         out = torch.empty(q.shape[0], q.shape[1], v.shape[2], dtype=q.dtype)
         torch.ops.sgl_kernel.flash_attention_with_workspace(
@@ -1750,6 +1766,22 @@ def _setup_record_expert_activation_kunpeng():
     register_op('record_expert_activation_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_record_padded_expert_activation_kunpeng():
+    # In-place padding-token expert histogram, subtracted in the offline merge.
+    def shape_infer(topk_ids, num_token_non_padded, counter, layer_id, num_experts,
+                    slice_offset):
+        return []
+
+    def eager_fn(topk_ids, num_token_non_padded, counter, layer_id, num_experts,
+                 slice_offset):
+        torch.ops.sgl_kernel.record_padded_expert_activation_kunpeng(
+            topk_ids, num_token_non_padded, counter, int(layer_id), int(num_experts),
+            int(slice_offset))
+        return None
+
+    register_op('record_padded_expert_activation_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_moe_comm_barrier_kunpeng():
     def shape_infer():
         return []
@@ -1866,6 +1898,7 @@ def setup():
     _setup_igemm_fusedmoe_gateup_kunpeng()
     _setup_igemm_fusedmoe_down_kunpeng()
     _setup_record_expert_activation_kunpeng()
+    _setup_record_padded_expert_activation_kunpeng()
     _setup_moe_etp_dispatch_share_kunpeng()
     _setup_moe_etp_reduce_kunpeng()
     _setup_etp_remap_topk_ids_kunpeng()

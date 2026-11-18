@@ -141,17 +141,16 @@ class ReqToTokenPool:
         )
 
         self.size = size
+        # +1 padding row at index 0: cuda-graph padded batches default
+        # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
+        self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # +1 row for padding slot 0 (mirrors KV pool): cuda-graph padded
-            # batches default req_pool_indices to 0, so routing dummies through
-            # unowned slot 0 keeps req_to_token[0, :] zero and downstream writes
-            # harmless.
             self.req_to_token = torch.zeros(
-                (size + 1, max_context_len), dtype=torch.int32, device=device
+                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
-        self.free_slots = list(range(1, size + 1))
+        self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -191,7 +190,7 @@ class ReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(1, self.size + 1))
+        self.free_slots = list(range(1, self._alloc_size))
 
 
 class MambaPool:
@@ -643,6 +642,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_mamba_cache(
         self, req: "Req", mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
+        pending = getattr(req, "mamba_prefill_checkpoints", None)
+        if pending:
+            pending_indices = torch.tensor(
+                [slot for _, slot in pending],
+                dtype=torch.int64,
+                device=self.mamba_pool.free_slots.device,
+            )
+            self.mamba_pool.free(pending_indices)
+        req.mamba_prefill_checkpoints = None
+
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_pool.free(mamba_index.unsqueeze(0))

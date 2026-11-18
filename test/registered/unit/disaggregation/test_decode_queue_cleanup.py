@@ -140,7 +140,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.cur_batch = None
         scheduler.enable_overlap = False
         scheduler.result_queue = []
-        scheduler.pp_size = 1
+        scheduler.ps = SimpleNamespace(pp_size=1)
         scheduler.running_mbs = []
         scheduler.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])

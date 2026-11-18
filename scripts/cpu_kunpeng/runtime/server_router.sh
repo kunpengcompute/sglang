@@ -146,7 +146,7 @@ if [[ ! -x "$GATEWAY_BIN" ]]; then
     exit 1
 fi
 # Pin the gateway to a dedicated core range so it does not collide with
-# the tokenizer/detokenizer workers (see the NUMA plan in server.sh).
+# the tokenizer/detokenizer workers (see the NUMA plan in runtime/server_cluster.sh).
 _router_log="$LOG_PATH/router_$IP.log"
 echo "[$(date +%T)] command: LD_PRELOAD=$LIBPTHREAD_HOOK_PATH taskset -c $GATEWAY_CPUS $GATEWAY_BIN ${SPECIFIC_ARGS[*]}" > "$_router_log"
 LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \

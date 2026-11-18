@@ -38,6 +38,13 @@ class ForwardMetadata:
     track_ssm_h_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
+    # Per-batch chunk index (in FLA chunk units) of the interior boundary to
+    # snapshot; -1 for rows that need no interior state. Consumed by kernels
+    # that write a single checkpoint per sequence (`supports_track_state_snapshot`).
+    track_chunk_idx: Optional[torch.Tensor] = None
+    # Batch rows of the chunk-unaligned tracked sequences; indexes the
+    # per-batch fp32 snapshot buffer with plain integer indexing.
+    track_ssm_h_batch_src: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1

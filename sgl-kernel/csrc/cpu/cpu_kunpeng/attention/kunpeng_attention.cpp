@@ -1279,6 +1279,41 @@ void flash_attention_with_workspace(at::Tensor q, at::Tensor k, at::Tensor v, at
         pack_len = std::max(pack_len, (x + BC - 1) / BC * BC);
     }
 
+    if (!causal) {
+        // Bidirectional attention via "prefix shift". The kutacc SME flash
+        // kernel only knows causal masking: it anchors every query row on
+        // the causal diagonal at prefill_start = seq_lens[i] - cur_lens[i]
+        // (plus the intra-sequence q offset) and masks k_causal > q_causal
+        // to -inf. Adding each sequence's own K length to seq_lens moves
+        // the anchor past the whole K range, so the mask condition can
+        // never fire and every query attends to every key: true
+        // bidirectional attention.
+        // seq_lens is consumed ONLY as this offset inside
+        // kutacc::flash_attention (verified against its source: the K/V
+        // loop and pack bounds come from key_start_loc), and the sizing
+        // above used the unshifted lengths - the shift is invisible to the
+        // workspace math. CAUTION: if a future kutacc release validates
+        // seq_lens or derives bounds from them, non-causal results change
+        // silently; the SGLANG_KUNPENG_VIT_FLASH_ATTN=0/1 A/B output
+        // comparison is the canary for that.
+        // The kernel zero-pads each sequence's K to 16-row tiles; unmasked
+        // zero rows carry logit 0 and would bias the softmax denominator,
+        // so non-causal per-sequence K lengths must be 16-aligned. The
+        // Python side gates this; enforced here as a loud failure for any
+        // future non-causal caller.
+        TORCH_CHECK(seq_lens.size() == cur_lens.size(), "seq_lens/cur_lens size mismatch");
+        TORCH_CHECK(key_start_loc.scalar_type() == at::kInt, "key_start_loc must be int32");
+        TORCH_CHECK(key_start_loc.size(0) == static_cast<int64_t>(seq_lens.size()) + 1,
+                    "key_start_loc must have seq_lens.size() + 1 rows");
+        auto ks_a = key_start_loc.accessor<int32_t, 1>();
+        for (size_t i = 0; i < seq_lens.size(); i++) {
+            const int64_t k_len_i = ks_a[i + 1] - ks_a[i];
+            TORCH_CHECK(k_len_i >= 0 && k_len_i % 16 == 0,
+                        "non-causal flash attention requires 16-aligned per-sequence K lengths, got ", k_len_i);
+            seq_lens[i] += k_len_i;
+        }
+    }
+
     auto threads_num = kutacc::get_thread_num();
     auto dtype = q.scalar_type();
     auto f32 = at::kFloat;

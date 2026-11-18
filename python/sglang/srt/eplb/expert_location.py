@@ -42,12 +42,22 @@ class ExpertLocationMetadata:
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     ep_size: int
+    # True when the last row is the MTP/NextN draft (appended after target rows).
+    has_draft_layer: bool = False
 
     # -------------------------------- properties ------------------------------------
 
     @property
     def num_layers(self) -> int:
         return self.physical_to_logical_map.shape[0]
+
+    @property
+    def num_target_layers(self) -> int:
+        return self.num_layers - 1 if self.has_draft_layer else self.num_layers
+
+    @property
+    def draft_layer_id(self) -> Optional[int]:
+        return self.num_layers - 1 if self.has_draft_layer else None
 
     @property
     def num_physical_experts(self) -> int:
@@ -89,7 +99,7 @@ class ExpertLocationMetadata:
 
         num_physical_experts = common["num_physical_experts"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
-        num_layers = model_config_for_expert_location.num_layers
+        num_layers = common["num_rows"]
         num_logical_experts = model_config_for_expert_location.num_logical_experts
 
         physical_to_logical_map = (
@@ -132,6 +142,45 @@ class ExpertLocationMetadata:
             )
 
         model_config_for_expert_location = common["model_config_for_expert_location"]
+        target_rows = model_config_for_expert_location.num_layers
+        expected_rows = common["num_rows"]
+        if physical_to_logical_map.dim() != 2:
+            raise ValueError(
+                f"--init-expert-location physical_to_logical_map must be 2D, "
+                f"got shape {tuple(physical_to_logical_map.shape)}"
+            )
+        if common["has_draft_layer"] and physical_to_logical_map.shape[0] == target_rows:
+            # Old map without the draft row: copy the last target row.
+            logger.info(
+                "Dedicated MTP row: init map has %d rows, appending a copy of "
+                "the last target row as the draft row.",
+                target_rows,
+            )
+            physical_to_logical_map = torch.cat(
+                [physical_to_logical_map, physical_to_logical_map[-1:]], dim=0
+            )
+        elif (
+            not common["has_draft_layer"]
+            and physical_to_logical_map.shape[0] == target_rows + 1
+        ):
+            # MTP is off: the trailing draft row is unused, drop it.
+            logger.info(
+                "MTP is disabled: init map has %d rows, dropping the trailing "
+                "draft row and keeping the %d target rows.",
+                target_rows + 1,
+                target_rows,
+            )
+            physical_to_logical_map = physical_to_logical_map[:-1]
+        elif physical_to_logical_map.shape[0] != expected_rows:
+            raise ValueError(
+                f"--init-expert-location map has {physical_to_logical_map.shape[0]} "
+                f"layer rows, but {expected_rows} are expected "
+                f"({target_rows} target"
+                f"{' + 1 draft' if common['has_draft_layer'] else ''}). "
+                "Provide a target-only map (the draft row is warm-started from "
+                "the last target row) or regenerate the map."
+            )
+
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
             server_args=server_args,
             physical_to_logical_map=physical_to_logical_map,
@@ -146,6 +195,7 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
             moe_ep_rank=moe_ep_rank,
+            has_draft_layer=common["has_draft_layer"],
         )
 
     @staticmethod
@@ -170,6 +220,40 @@ class ExpertLocationMetadata:
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
         num_nodes = server_args.nnodes
+
+        target_rows = model_config_for_expert_location.num_layers
+        expected_rows = common["num_rows"]
+        if common["has_draft_layer"] and logical_count.shape[-2] == target_rows:
+            # Old heat without the draft row: warm-start from the last target row.
+            logger.info(
+                "Dedicated MTP row: heat has %d layer rows, warm-starting the "
+                "draft row from the last target row.",
+                target_rows,
+            )
+            logical_count = torch.cat(
+                [logical_count, logical_count[..., -1:, :]], dim=-2
+            )
+        elif (
+            not common["has_draft_layer"]
+            and logical_count.shape[-2] == target_rows + 1
+        ):
+            # MTP is off: the trailing draft row is unused, drop it.
+            logger.info(
+                "MTP is disabled: heat has %d layer rows, dropping the trailing "
+                "draft row and keeping the %d target rows.",
+                target_rows + 1,
+                target_rows,
+            )
+            logical_count = logical_count[..., :-1, :]
+        elif logical_count.shape[-2] != expected_rows:
+            raise ValueError(
+                f"expert distribution heat has {logical_count.shape[-2]} layer rows, "
+                f"but {expected_rows} are expected ({target_rows} target"
+                f"{' + 1 draft' if common['has_draft_layer'] else ''}). "
+                "Recollect the heat with the current build, or pass a "
+                "target-only file (the draft row is warm-started from the last "
+                "target row)."
+            )
 
         from sglang.srt.eplb import eplb_algorithms
 
@@ -196,6 +280,7 @@ class ExpertLocationMetadata:
                 server_args.device
             ),
             moe_ep_rank=moe_ep_rank,
+            has_draft_layer=common["has_draft_layer"],
         )
 
     @staticmethod
@@ -235,11 +320,42 @@ class ExpertLocationMetadata:
             )
         num_local_physical_experts = num_physical_experts // ep_size
 
+        # Dedicated MTP row appended after the target layers, so the legacy
+        # `num_layers - 1` draft references resolve to it unchanged. Enabled
+        # automatically for NextN MTP (NEXTN is normalized to EAGLE). Target-only
+        # heat/maps from older builds are warm-started from the last target row.
+        has_draft_layer = (
+            getattr(server_args, "moe_a2a_backend", None) == "kunpeng_cpu"
+            and getattr(server_args, "speculative_algorithm", None) == "EAGLE"
+            and int(
+                getattr(model_config.hf_config, "num_nextn_predict_layers", 0)
+                or getattr(
+                    getattr(model_config, "hf_text_config", None),
+                    "num_nextn_predict_layers",
+                    0,
+                )
+                or 0
+            )
+            > 0
+        )
+        num_rows = model_config_for_expert_location.num_layers + (
+            1 if has_draft_layer else 0
+        )
+        if has_draft_layer:
+            logger.info(
+                "Dedicated MTP EPLB row enabled: metadata layers=%d "
+                "(target=%d + draft=1)",
+                num_rows,
+                model_config_for_expert_location.num_layers,
+            )
+
         return dict(
             model_config_for_expert_location=model_config_for_expert_location,
             num_physical_experts=num_physical_experts,
             num_local_physical_experts=num_local_physical_experts,
             ep_size=ep_size,
+            num_rows=num_rows,
+            has_draft_layer=has_draft_layer,
         )
 
     @staticmethod
@@ -249,6 +365,7 @@ class ExpertLocationMetadata:
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
         moe_ep_rank: int = None,
+        has_draft_layer: bool = False,
     ):
         _, num_physical_experts = physical_to_logical_map.shape
 
@@ -284,6 +401,7 @@ class ExpertLocationMetadata:
                 else None
             ),
             ep_size=ep_size,
+            has_draft_layer=has_draft_layer,
         )
 
     # -------------------------------- mutation ------------------------------------

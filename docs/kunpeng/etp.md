@@ -133,9 +133,9 @@ MTP steps每+1，dense相关SHM按steps+1线性放大（见SGLANG_KUNPENG_ETP_DE
 
 ### 静态 EPLB（采集→导出→导入）
 
-仅在ETP decode实例上操作，prefill保持原配置。以下变量由`server.sh`透传；热度目录需要各decode节点可访问。
+仅在ETP decode实例上操作，prefill保持原配置。以下变量由`runtime/server_cluster.sh`透传；热度目录需要各decode节点可访问。
 
-1. 采集前关闭压测用的强制均衡，配置recorder并启动server：
+1. 采集前配置recorder并启动server：
 
 ```bash
 export SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE=0
@@ -153,20 +153,30 @@ curl --location 'http://127.0.0.1:8000/start_expert_distribution_record'
 curl --location 'http://127.0.0.1:8000/dump_expert_distribution_record'
 ```
 
-导出文件为`expert_distribution_recorder_<timestamp>.pt`，内容是按层聚合的`logical_count`。采集支持eager和graph replay；ETP仅group leader计数，PP仅全局rank 0写文件，MTP只统计target模型。
+导出文件为`expert_distribution_recorder_<timestamp>.pt`，内容是按层聚合的`logical_count`和padding热度`pad_logical_count`。采集支持eager和graph replay；ETP仅group leader计数，PP仅全局rank 0写文件。
 
-3. 将同一个`.pt`文件分发到全部decode节点，关闭recorder并配置静态导入后重启：
+#### padding热度与MTP独立行
+
+- padding：padding行的topk会被负载均衡改写成低负载专家，因此单独记入`pad_logical_count`（attn-TP冗余时仅`use_sp`或`attn_tp_rank==0`记录）。合并时必须扣除：HTTP单文件用`--input-file`，auto-dump目录用`--input-dir`；**直接导入原始HTTP dump会保留padding热度**。`--keep-padding`仅调试用。
+- MTP：kunpeng_cpu且NEXTN（归一化为EAGLE）、`num_nextn_predict_layers>0`时自动在metadata末尾追加draft行，draft的权重/HBW/路由/热度都走该行，多个step累计在同一行。导入旧N行文件时末行自动复制target最后一行；MTP关闭时N+1行自动丢弃末行。无需环境变量。
+
+3. 先扣除padding，再分发导入：
 
 ```bash
+# HTTP单文件用--input-file；auto-dump目录用--input-dir（见下一节）
+python scripts/cpu_kunpeng/analysis/merge_expert_distribution.py \
+    --input-file /home/xxxx/eplb/expert_distribution_recorder_<timestamp>.pt \
+    --output /home/xxxx/eplb/expert_distribution_recorder_<timestamp>_merged.pt
+
 export SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE=0
 export EP_DISPATCH_ALGORITHM=static
-export INIT_EXPERT_LOCATION=/home/xxxx/eplb/expert_distribution_recorder_<timestamp>.pt
+export INIT_EXPERT_LOCATION=/home/xxxx/eplb/expert_distribution_recorder_<timestamp>_merged.pt
 # 不再设置EXPERT_DISTRIBUTION_RECORDER_MODE；EPLB_ALGORITHM缺省为auto
 ```
 
-静态导入会跳过按trivial布局生成的`experts_etp{N}`目录，必须保留原始`experts/`整专家权重，由loader按新映射加载并执行ETP切分。NextN draft不参与热度采集，其权重、HBW和路由统一复用target最后一层映射。该流程只在重启时生效，不进行在线权重或专家位置更新。
+静态导入会跳过按trivial布局生成的`experts_etp{N}`目录，必须保留原始`experts/`整专家权重，由loader按新映射加载并执行ETP切分。该流程只在重启时生效，不进行在线权重或专家位置更新。
 
-### 无 HTTP 的自动采集与离线合并（PP 临时流程）
+### 无 HTTP 的自动采集与离线合并
 
 需要避开PP控制请求和dump集合通信时，可在采集实例增加：
 
@@ -176,9 +186,9 @@ export EXPERT_DISTRIBUTION_RECORDER_MODE=stat
 export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=/home/xxxx/eplb/raw
 ```
 
-recorder随server自动启动，不需要调用start/stop/dump HTTP端点。target模型每次非idle forward结束后，仅ETP group leader把本次热度累加到本地汇总，并覆盖写`expert_distribution_recorder_rank_<world_rank>.pt`中的最新累计快照；普通EP仍由每个rank写出，draft、idle和ETP peer不写。每个leader固定只有一个文件，不保存逐forward历史，因此文件数量不随请求数增长，单个文件也只包含有效热度而不包含循环缓冲区中的空槽。该路径不做`all_reduce`或指标broadcast，因此不存在PP间dump同步。记录中的`forward_id`只用于本rank排查，不同DP的forward编号不要求对齐，离线合并时直接累加各leader的最新快照。
+recorder随server自动启动，无需调用HTTP端点。每次forward（含idle）只要本轮heat或pad非零就dump：ETP leader写本rank累计快照，持有pad计数的非leader和MTP draft worker也写；全零idle跳过，`BUFFER_SIZE=1`也不会丢数。每个rank一个文件、每次覆盖，不保存逐forward历史，文件数不随请求增长；不做`all_reduce`，因此无PP间同步。
 
-数据集跑完后，等所有rank文件落盘，再合并成现有静态导入格式：
+数据集跑完后用`--input-dir`合并，输出带`padding_subtracted=True`，重复处理不会二次扣除：
 
 ```bash
 python scripts/cpu_kunpeng/analysis/merge_expert_distribution.py \
@@ -186,7 +196,15 @@ python scripts/cpu_kunpeng/analysis/merge_expert_distribution.py \
     --output /home/xxxx/eplb/expert_distribution_recorder_merged.pt
 ```
 
-将合并后的文件按上一节方式分发并导入。每个rank文件在每次dump时整体覆盖为最新累计快照，文件大小不随forward轮数增长；重新调用start_record会清空该rank的本地累计。
+将合并文件分发并导入。每个rank文件是自record以来的累计快照；重新调用start_record会清零。
+
+#### 计数、缓冲区与dump语义
+
+- 计数器每forward累加；`on_forward_pass_start`记录起点，`collect()`返回本forward增量，缓冲区存增量而非累计。
+- `EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE`：1为单槽，N为最近N个forward的环形窗口，负数为不限增长。
+- dump：缓冲求和（物理计数转逻辑）→本地模式累加`_local_*_count`→覆盖写文件→清空缓冲并清零计数器。文件是累计快照，不追加历史。
+- 示例：三次forward增量为a/b/c。`BUFFER_SIZE=1`逐次dump时缓冲为`a`、`b`、`c`，文件为`a`、`a+b`、`a+b+c`；一直不dump则只剩`c`。`BUFFER_SIZE=3`不dump时为`[a,b,c]`，dump写`a+b+c`。
+- 手动dump是集合通信，全rank `all_reduce`后仅rank0写单文件；auto-dump逐rank写、无同步，靠merge累加。两者都会清空缓冲和计数，不要混用同一目录。
 
 ## 4. 性能与调优（32p-etp8实测，DSV3，单请求1kin/128out/MTP1）
 

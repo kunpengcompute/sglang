@@ -13,10 +13,11 @@
 # ==============================================================================
 
 #!/bin/bash
-# server.sh - Single node execution for SGLang (prefill/decode/native).
+# server_cluster.sh - Single node execution for SGLang (prefill/decode/native).
+# Invoked remotely by runtime/launch_cluster.sh, one per cluster node.
 # Router (gateway) is launched by runtime/server_router.sh instead.
 # Tokenizer HTTP servers are launched by runtime/server_tokenizer.sh instead.
-# Usage: ./server.sh <role> <dp_rank> <log_path> [instance]
+# Usage: bash runtime/server_cluster.sh <role> <dp_rank> <log_path> [instance]
 
 if [[ $# -lt 3 ]]; then
     echo "Usage: $0 <role> <dp_rank> <log_path> [instance]" >&2
@@ -33,7 +34,9 @@ INSTANCE="${4:-}"
 IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 
 # Source environment config (exports CONDA_ACTIVATE_CMD, PYTHON_SCRIPT, etc.)
-source ./env.sh "$ROLE" "$INSTANCE" || exit 1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$SCRIPT_DIR"
+source "$SCRIPT_DIR/env.sh" "$ROLE" "$INSTANCE" || exit 1
 
 # --- /dev/shm hygiene -------------------------------------------------------
 # Every run leaves POSIX shm behind: our sgkv* KV segments, psm_* Python
@@ -99,6 +102,11 @@ if [[ "${LOG_REQUESTS:-0}" == "1" ]]; then
     )
 fi
 
+# Per-request time stats logging, gated by SGLANG_ENABLE_REQUEST_TIME_STATS_LOGGING
+if [[ "${SGLANG_ENABLE_REQUEST_TIME_STATS_LOGGING:-0}" == "1" ]]; then
+    BASE_ARGS+=(--enable-request-time-stats-logging)
+fi
+
 # Add redundant experts only when enabled (REDUNDANT_EXPERTS > 0)
 if [[ "${REDUNDANT_EXPERTS:-0}" -gt 0 ]]; then
     BASE_ARGS+=(--ep-num-redundant-experts "$REDUNDANT_EXPERTS")
@@ -132,6 +140,11 @@ fi
 # Disable radix cache
 if [[ "$SGLANG_DISABLE_RADIX_CACHE" == "1" ]]; then
     BASE_ARGS+=(--disable-radix-cache)
+fi
+
+# Enable Prometheus metrics
+if [[ "${SGLANG_ENABLE_METRICS:-0}" == "1" ]]; then
+    BASE_ARGS+=(--enable-metrics)
 fi
 
 # Disable overlap schedule
@@ -193,13 +206,13 @@ case "$ROLE" in
         ;;
     tokenizer)
         # Tokenizer HTTP servers now live in runtime/server_tokenizer.sh,
-        # invoked by runtime/launch_tokenizer.sh. server.sh no longer handles it.
+        # invoked by runtime/launch_tokenizer.sh. server_cluster.sh no longer handles it.
         echo "Error: role 'tokenizer' is handled by runtime/server_tokenizer.sh" >&2
         exit 1
         ;;
     router)
         # Router (gateway) launch now lives in runtime/server_router.sh,
-        # invoked by runtime/launch_router.sh. server.sh no longer handles it.
+        # invoked by runtime/launch_router.sh. server_cluster.sh no longer handles it.
         echo "Error: role 'router' is handled by runtime/server_router.sh" >&2
         exit 1
         ;;

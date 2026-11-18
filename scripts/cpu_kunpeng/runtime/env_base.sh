@@ -98,9 +98,8 @@ export INIT_EXPERT_LOCATION=""
 export EP_DISPATCH_ALGORITHM=""  # e.g. static, dynamic
 # Expert heat collection is opt-in per instance; reset inherited shell state.
 export SGLANG_KUNPENG_EXPERT_DISTRIBUTION_AUTO_DUMP=0
-# 1 = record the NextN (MTP draft) layer's expert heat into the target's
-# last MoE-layer row (kunpeng_cpu backend only)
-export SGLANG_KUNPENG_EXPERT_DISTRIBUTION_INCLUDE_MTP=0
+# NextN (MTP draft) expert heat is collected automatically into its own EPLB
+# row when MTP is enabled on kunpeng_cpu; no per-instance switch is needed.
 export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="/tmp"
 export EXPERT_DISTRIBUTION_RECORDER_MODE=""
 export EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE=""
@@ -128,7 +127,7 @@ export SGLANG_SET_ZMQ_CPU_AFFINITY_OFFSET=18
 export SGLANG_LOG_MS=1
 # Request logging: record per-request metadata and input/output text
 # (python/sglang/srt/utils/request_logger.py). LOG_REQUESTS=1 adds the
-# --log-requests flags in server.sh (native role) and runtime/server_tokenizer.sh
+# --log-requests flags in runtime/server_cluster.sh (native role) and runtime/server_tokenizer.sh
 # (PD roles, where the HTTP server and tokenizer manager live).
 #   LOG_REQUESTS_LEVEL  0 = metadata only, 1 = + sampling params,
 #                       2 = + truncated input/output (2048 chars),
@@ -150,6 +149,9 @@ export SGLANG_LOG_REQUEST_EXCEEDED_MS=-1
 # Extra request headers to include in the request log (comma-separated,
 # e.g. "x-request-id,my-trace-id")
 export SGLANG_LOG_REQUEST_HEADERS=""
+# Per-request time stats logging (--enable-request-time-stats-logging):
+# 1 = log a time breakdown per finished request in the scheduler logs.
+export SGLANG_ENABLE_REQUEST_TIME_STATS_LOGGING=0
 export SGLANG_USE_CPU_ENGINE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
@@ -213,7 +215,7 @@ export SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1 # Kunpeng prefill graph padding t
 export SGLANG_GRAPH_DEBUG_PRINT=0  # 1 = per-op debug print in eager/capture (ops.py) and graph replay (C++)
 # Load format (e.g. "kunpeng_state", leave empty for default)
 export LOAD_FORMAT=""
-# Chat template / parsers: model-specific, opt-in. server.sh only passes
+# Chat template / parsers: model-specific, opt-in. runtime/server_cluster.sh only passes
 # the flag when the variable is non-empty — set them in .user_env*.sh for
 # models that need them (e.g. DeepSeek-R1:
 #   CHAT_TEMPLATE="$SGLANG_PATH/examples/chat_template/tool_chat_template_deepseekr1.jinja"
@@ -239,7 +241,9 @@ else
 fi
 
 export SGLANG_KUNPENG_MOE_TOKEN_MULTIPLE=2
-export SGLANG_KUNPENG_SAVE_AT_TRACE=0 # set 1 to open record experts activation number
+# DeepSeek redundant-expert (1.5 experts/rank) offline pipeline only; leave
+# disabled for other models (use the EPLB expert-distribution recorder instead).
+export SGLANG_KUNPENG_SAVE_AT_TRACE=0
 # ------------------------------------------------------------
 # Load local config
 # ------------------------------------------------------------

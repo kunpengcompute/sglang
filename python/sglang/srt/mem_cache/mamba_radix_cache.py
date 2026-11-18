@@ -20,6 +20,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
+from array import array
 from collections import defaultdict
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -449,7 +450,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def reset(self) -> None:
         self.root_node = TreeNode()
-        self.root_node.key = RadixKey([], None)
+        self.root_node.key = RadixKey(array("q"), None)
         self.root_node.value = []
         self.root_node.full_lock_ref = 1
         self.root_node.mamba_lock_ref = 1
@@ -503,6 +504,81 @@ class MambaRadixCache(BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
+    def _free_prefill_checkpoints(self, req: Req):
+        pending = req.mamba_prefill_checkpoints
+        if not pending:
+            return
+        indices = torch.tensor(
+            [slot for _, slot in pending],
+            dtype=torch.int64,
+            device=self.req_to_token_pool.mamba_pool.free_slots.device,
+        )
+        self.req_to_token_pool.mamba_pool.free(indices)
+        pending.clear()
+
+    def _cache_prefill_checkpoints(
+        self, req: Req, token_ids, kv_indices, chunked: bool
+    ) -> int:
+        pending = req.mamba_prefill_checkpoints
+        assert pending is not None
+        original_protected = req.cache_protected_len
+        cursor = original_protected
+
+        while pending:
+            seqlen, slot = pending[0]
+            if seqlen <= cursor:
+                self.req_to_token_pool.mamba_pool.free(
+                    torch.tensor(
+                        [slot],
+                        dtype=torch.int64,
+                        device=self.req_to_token_pool.mamba_pool.free_slots.device,
+                    )
+                )
+                pending.pop(0)
+                continue
+
+            mamba_value = torch.tensor(
+                [slot],
+                dtype=torch.int64,
+                device=self.req_to_token_pool.mamba_pool.free_slots.device,
+            )
+            result = self.insert(
+                InsertParams(
+                    key=RadixKey(token_ids[:seqlen], req.extra_key),
+                    value=kv_indices[:seqlen].to(dtype=torch.int64, copy=True),
+                    mamba_value=mamba_value,
+                    prev_prefix_len=cursor,
+                    chunked=chunked,
+                )
+            )
+            if result.mamba_exist:
+                self.req_to_token_pool.mamba_pool.free(mamba_value)
+            # Only now has the slot either been released or transferred to the tree.
+            pending.pop(0)
+            cursor = seqlen
+
+        if cursor == original_protected:
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            return cursor
+
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids[:cursor], req.extra_key))
+        )
+        new_indices = match_result.device_indices
+        new_last_node = match_result.last_device_node
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(original_protected, len(new_indices))),
+            new_indices[original_protected:],
+        )
+        self.dec_lock_ref(req.last_node)
+        self.inc_lock_ref(new_last_node)
+        req.prefix_indices = torch.cat(
+            [new_indices, kv_indices[len(new_indices) :]]
+        )
+        req.cache_protected_len = len(new_indices)
+        req.last_node = new_last_node
+        return cursor
+
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
@@ -518,6 +594,23 @@ class MambaRadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
+
+        if req.mamba_prefill_checkpoints is not None:
+            if is_insert:
+                multi_cache_len = self._cache_prefill_checkpoints(
+                    req, token_ids, kv_indices, chunked=False
+                )
+                req.mamba_prefill_checkpoints = None
+                legacy_cache_len = req.mamba_last_track_seqlen
+                if legacy_cache_len is None or legacy_cache_len <= multi_cache_len:
+                    cache_end_idx = max(multi_cache_len, req.cache_protected_len)
+                    self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
+                    self.req_to_token_pool.free_mamba_cache(req)
+                    self.dec_lock_ref(req.last_node)
+                    return
+            else:
+                self._free_prefill_checkpoints(req)
+                req.mamba_prefill_checkpoints = None
 
         if is_insert:
             cache_len = (
@@ -601,6 +694,20 @@ class MambaRadixCache(BasePrefixCache):
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            return
+
+        if req.mamba_prefill_checkpoints is not None:
+            token_ids = req.fill_ids
+            if self.disable:
+                self._free_prefill_checkpoints(req)
+                return _skip_cache_unfinished_req(req)
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(token_ids)
+            ]
+            self._cache_prefill_checkpoints(
+                req, token_ids, kv_indices, chunked=chunked
+            )
+            req.mamba_last_track_seqlen = None
             return
 
         token_ids = req.fill_ids
