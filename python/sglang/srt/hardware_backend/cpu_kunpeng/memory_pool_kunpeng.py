@@ -213,14 +213,26 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         )
 
         # Authoritative DDR copy: always updated regardless of swap.
-        kunpeng.set_kv_buffer_kunpeng(ddr_buf, loc, index_k)
+        kunpeng.set_kv_buffer_kunpeng(
+            ddr_buf,
+            loc,
+            index_k,
+            profile_name="set_kv_buffer_kunpeng@index_k_ddr",
+        )
 
         swap_mgr = KunpengSwapManager.get_instance()
         if swap_mgr.enable_swap_index_k_in:
             # get_index_k_cache() waits for the swap-in events, then returns
             # the HBM mirror of the current layer.
             kunpeng.set_kv_buffer_kunpeng(
-                swap_mgr.get_index_k_cache(), loc, index_k
+                swap_mgr.get_index_k_cache(
+                    profile_name=(
+                        "kupl_sdma_wait_all@index_k_swap_in_before_write"
+                    )
+                ),
+                loc,
+                index_k,
+                profile_name="set_kv_buffer_kunpeng@index_k_hbm",
             )
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
@@ -238,7 +250,9 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
 
         swap_mgr = KunpengSwapManager.get_instance()
         if swap_mgr.enable_swap_index_k_in:
-            return swap_mgr.get_index_k_cache()
+            return swap_mgr.get_index_k_cache(
+                profile_name="kupl_sdma_wait_all@index_k_swap_in_before_read"
+            )
         return self._index_k_buf(layer_id)
 
     def get_index_k_size_bytes(self) -> int:

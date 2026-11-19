@@ -312,10 +312,12 @@ class DeepseekMLAKunpengForwardMixin:
                 self.swap_mgr.set_kv_buffer_2(
                     self.swap_mgr._cur_kv_hbm, cache_loc,
                     k_nope[start:end], k_pe[start:end],
+                    profile_name="set_kv_buffer_2_kunpeng@main_kv_hbm",
                 )
             else:
                 self.swap_mgr.set_kv_buffer_2(
-                    self.swap_mgr._cur_kv_hbm, loc_w, k_nope, k_pe
+                    self.swap_mgr._cur_kv_hbm, loc_w, k_nope, k_pe,
+                    profile_name="set_kv_buffer_2_kunpeng@main_kv_hbm",
                 )
 
             # DDR write keeps the original (un-remapped) out_cache_loc.
@@ -323,11 +325,13 @@ class DeepseekMLAKunpengForwardMixin:
                 self.swap_mgr.set_kv_buffer_2_sdma(loc_w, k_nope, k_pe)
             else:
                 self.swap_mgr.set_kv_buffer_2(
-                    self.swap_mgr._cur_kv_ddr, loc_w, k_nope, k_pe
+                    self.swap_mgr._cur_kv_ddr, loc_w, k_nope, k_pe,
+                    profile_name="set_kv_buffer_2_kunpeng@main_kv_ddr",
                 )
         else:
             self.swap_mgr.set_kv_buffer_2(
-                self.swap_mgr._cur_kv_ddr, loc_w, k_nope, k_pe
+                self.swap_mgr._cur_kv_ddr, loc_w, k_nope, k_pe,
+                profile_name="set_kv_buffer_2_kunpeng@main_kv_ddr",
             )
 
         return (

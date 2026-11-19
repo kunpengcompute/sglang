@@ -21,7 +21,12 @@
 #   Mode 2 (legacy): stats_to_csv.py <in.jsonl> <out.csv> [batch_size]
 #     Converts a single profile jsonl into stats csv.
 #   Both modes merge ops carrying a shape suffix (e.g. igemm@M16N3584K7168)
-#   into a single row (igemm); pass --split-shapes to keep them separate.
+#   into a single row (igemm). --split-shapes with NO argument keeps every
+#   shape as its own row; with arguments it splits only the selected ops:
+#     --split-shapes kv                 # just the KV / SDMA swap ops
+#     --split-shapes gemm allgather     # GEMM family + allgather
+#   Arguments are named groups (_SHAPE_SPLIT_GROUPS) or literal substrings of
+#   the op's base name; groups may overlap and an unknown name is used as-is.
 #   Whole forward runs are filtered per (mode, batch_size) group only when
 #   enabled with --run-outlier (default method: adaptive median +- k*MAD,
 #   k=3.5, at most 10% dropped). --run-outlier-ratio R switches the global
@@ -80,13 +85,93 @@ def compute_stats(durs, num_runs):
     }
 
 
+# Named op groups for --split-shapes. Each entry is a tuple of substrings
+# matched against an op's BASE name (the part before the "@" shape suffix);
+# a bare token that is not a known group is used as a literal pattern.
+# The grouping is arbitrary and human-defined: ops may belong to several
+# groups, and overlapping groups are intentional (e.g. "gemm" is the broad
+# family that also contains "igemm" and "bgemm").
+_SHAPE_SPLIT_GROUPS = {
+    "kv": (
+        "set_kv_buffer",
+        "kupl_sdma_kv_swapin",
+        "kupl_sdma_set_kv_buffer",
+        "kupl_sdma_wait_all",
+    ),
+    "sdma": ("kupl_sdma_",),
+    "gemm": ("gemm",),
+    "igemm": ("igemm",),
+    "bgemm": ("bgemm",),
+    "allgather": ("allgather",),
+    "alltoall": ("alltoall",),
+    "allreduce": ("allreduce",),
+    "moe": ("moe_",),
+    "norm": ("rmsnorm", "layernorm"),
+    "attn": ("flash_mla", "paged_mqa", "dsa_topk"),
+}
+
+
+class ShapeSplitPolicy:
+    """Which ops keep their ``@shape`` suffix as a separate stats row.
+
+    Three states, matching ``--split-shapes``:
+      - absent flag      -> ``ShapeSplitPolicy()``        (merge every shape)
+      - bare ``--split-shapes``  -> ``(split_all=True)``  (split every shape)
+      - ``--split-shapes X Y``   -> ``patterns=(...)``    (split only matches)
+    """
+
+    __slots__ = ("split_all", "patterns")
+
+    def __init__(self, split_all=False, patterns=()):
+        self.split_all = split_all
+        self.patterns = tuple(patterns)
+
+    def __bool__(self):
+        return self.split_all or bool(self.patterns)
+
+    def keeps_shape(self, base_name):
+        """True if *base_name* should stay split from its shape suffix."""
+        if self.split_all:
+            return True
+        return any(pattern in base_name for pattern in self.patterns)
+
+    def describe(self):
+        if self.split_all:
+            return "all ops"
+        if not self.patterns:
+            return "no ops (shapes merged)"
+        return ", ".join(self.patterns)
+
+
+def _as_split_policy(split_shapes):
+    """Accept a bool (legacy callers) or an already-built policy."""
+    if isinstance(split_shapes, ShapeSplitPolicy):
+        return split_shapes
+    return ShapeSplitPolicy(split_all=bool(split_shapes))
+
+
 def _norm_op_name(name, split_shapes):
     # Ops may carry a shape suffix from their call-site profile_name
-    # (e.g. "igemm@M16N3584K7168"); merge all shapes into one row unless
-    # split_shapes is set.
-    if split_shapes:
+    # (e.g. "igemm@M16N3584K7168"); merge shapes into one row unless the
+    # policy selects this op for splitting.
+    base, sep, _ = name.partition("@")
+    if not sep:
         return name
-    return name.split("@", 1)[0]
+    return name if _as_split_policy(split_shapes).keeps_shape(base) else base
+
+
+def _make_norm_fn(split_shapes):
+    """Bind the policy once so the per-op hot loop skips the bool/policy
+    normalization that :func:`_norm_op_name` would redo for every record."""
+    policy = _as_split_policy(split_shapes)
+
+    def norm(name):
+        base, sep, _ = name.partition("@")
+        if not sep:
+            return name
+        return name if policy.keeps_shape(base) else base
+
+    return norm
 
 
 def to_csv(
@@ -157,6 +242,7 @@ def load_stage_file(path, split_shapes=False):
     groups = {}
     cur_key = None
     cur_run = None
+    norm = _make_norm_fn(split_shapes)
 
     def close_run():
         # Keep empty runs too so run counts stay aligned across stages.
@@ -172,9 +258,7 @@ def load_stage_file(path, split_shapes=False):
                     group_order.append(cur_key)
                 cur_run = []
             elif obj.get("_type") == "op" and cur_run is not None:
-                cur_run.append(
-                    (_norm_op_name(obj["name"], split_shapes), obj["dur_ns"] / 1000.0)
-                )
+                cur_run.append((norm(obj["name"]), obj["dur_ns"] / 1000.0))
     close_run()
     return group_order, groups
 
@@ -673,6 +757,38 @@ def merge_to_csv(
     _write_filter_log(output_path, filter_log)
 
 
+def _parse_split_shapes(values, parser=None):
+    """Build a :class:`ShapeSplitPolicy` from the --split-shapes arguments.
+
+    ``None``        -> flag absent, merge every shape.
+    ``[]``          -> bare flag, split every shape.
+    ``[a, b, ...]`` -> split only ops matching any named group or literal
+                       substring; unknown names are taken literally.
+    """
+    if values is None:
+        return ShapeSplitPolicy()
+    if not values:
+        return ShapeSplitPolicy(split_all=True)
+    patterns = []
+    for value in values:
+        group = _SHAPE_SPLIT_GROUPS.get(value)
+        if group is None:
+            if not value.strip():
+                message = "--split-shapes: empty group name"
+                if parser is not None:
+                    parser.error(message)
+                raise ValueError(message)
+            # Not a known group: treat it as a literal substring so ad-hoc
+            # drill-downs (e.g. --split-shapes paged_mqa) still work.
+            patterns.append(value)
+        else:
+            patterns.extend(group)
+    # De-duplicate, keeping the user's order for a stable echo.
+    seen = set()
+    ordered = [p for p in patterns if not (p in seen or seen.add(p))]
+    return ShapeSplitPolicy(patterns=ordered)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert Kunpeng graph profile jsonl(s) into stats csv. "
@@ -683,16 +799,23 @@ def main():
     )
     parser.add_argument(
         "inputs",
-        nargs="+",
+        nargs="*",
         metavar="ARG",
         help="mode 1: <profiler_dir_or_jsonl> <tp_rank>; "
         "mode 2: <in.jsonl> <out.csv> [batch_size]",
     )
     parser.add_argument(
         "--split-shapes",
-        action="store_true",
+        nargs="*",
+        default=None,
+        metavar="GROUP",
         help="keep ops with a shape suffix (e.g. igemm@M16N3584K7168) as "
-        "separate rows; by default all shapes merge into one row (igemm)",
+        "separate rows. With NO argument every op is split. With arguments "
+        "only matching ops are split; each argument is a named group or a "
+        "substring of the op's base name. Named groups: "
+        + ", ".join(sorted(_SHAPE_SPLIT_GROUPS))
+        + ". Groups may overlap (e.g. 'gemm' also covers igemm/bgemm). "
+        "Examples: --split-shapes kv | --split-shapes gemm allgather",
     )
     parser.add_argument(
         "--no-sources",
@@ -730,7 +853,32 @@ def main():
     )
     ns = parser.parse_args()
     inputs = ns.inputs
-    split_shapes = ns.split_shapes
+    # nargs="*" greedy-absorbs positional args when --split-shapes precedes
+    # them, so a path/number landing in the group list is a swallowed
+    # positional, not a user typo. Diagnose that before the generic
+    # "missing inputs" error, which would otherwise hide the real cause.
+    if ns.split_shapes:
+        swallowed = [
+            value
+            for value in ns.split_shapes
+            if "/" in value or "\\" in value or value.lstrip("-").isdigit()
+        ]
+        if swallowed:
+            parser.error(
+                "--split-shapes consumed positional argument(s) "
+                f"{swallowed}; it takes an open-ended GROUP list, so pass it "
+                "AFTER the positional arguments "
+                "(e.g. '<dir> 0 --split-shapes kv') "
+                "or give it explicit groups."
+            )
+    if not inputs:
+        parser.error(
+            "expected either <profiler_dir_or_jsonl> <tp_rank> "
+            "or <in.jsonl> <out.csv> [batch_size]"
+        )
+    split_shapes = _parse_split_shapes(ns.split_shapes, parser)
+    if split_shapes:
+        print(f"[info] shape splitting: {split_shapes.describe()}")
     with_sources = not ns.no_sources
     run_outlier_ratio = ns.run_outlier_ratio
     try:
