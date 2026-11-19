@@ -846,27 +846,17 @@ class KunpengSwapManager:
                 profile_name="kupl_sdma_wait_all@index_k_swap_in_before_write",
             )
 
-    def get_index_k_cache(self, profile_name: str = "") -> torch.Tensor:
+    def get_index_k_cache(self) -> torch.Tensor:
         """Return the current layer's index-K: HBM mirror (swap on) or DDR.
 
-        Drains this layer's pending DDR->HBM copy events before handing out
-        the HBM mirror. Two distinct call sites reach here per layer and they
-        mean different things, so ``profile_name`` lets each pass its own tag:
-
-        - the indexer scoring read, which needs the copy landed before it
-          scores the pool;
-        - the double-write of this step's new tokens, which needs the copy
-          landed first so a late DMA cannot clobber the fresh rows.
-
-        Without a caller-supplied tag both waits collapse into one trace row
-        and a 21-layer run looks like 42 identical waits.
+        Does NOT drain the layer's pending DDR->HBM copy events: the write
+        side already did. ``set_index_k_buffer`` calls
+        :meth:`wait_index_k_swap_in` (tagged
+        ``@index_k_swap_in_before_write``) before its HBM double-write, which
+        drains the event table and zeroes its counter. A second wait here
+        would see an empty table and return immediately -- measured at 1.2 us
+        per layer, with nothing in between that issues new SDMA events.
         """
         if self.enable_swap_index_k_in:
-            kunpeng.kupl_sdma_wait_all(
-                self._index_k_swap_in_event_tensor,
-                self._index_k_swap_in_event_num_tensor,
-                profile_name=profile_name
-                or "kupl_sdma_wait_all@index_k_swap_in",
-            )
             return self._cur_index_k_hbm
         return self._cur_index_k_ddr

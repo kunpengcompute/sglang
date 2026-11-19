@@ -222,14 +222,14 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
 
         swap_mgr = KunpengSwapManager.get_instance()
         if swap_mgr.enable_swap_index_k_in:
-            # get_index_k_cache() waits for the swap-in events, then returns
-            # the HBM mirror of the current layer.
+            # Drain the layer's pending DDR->HBM copy before writing this
+            # step's new tokens into the HBM mirror: the swap-in is an async
+            # DMA over the whole pool, so a copy of the stale DDR contents
+            # landing at the new-token slots after the write would clobber
+            # the freshly written rows.
+            swap_mgr.wait_index_k_swap_in()
             kunpeng.set_kv_buffer_kunpeng(
-                swap_mgr.get_index_k_cache(
-                    profile_name=(
-                        "kupl_sdma_wait_all@index_k_swap_in_before_write"
-                    )
-                ),
+                swap_mgr.get_index_k_cache(),
                 loc,
                 index_k,
                 profile_name="set_kv_buffer_kunpeng@index_k_hbm",
@@ -238,9 +238,13 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         """[num_slots, index_head_dim] bf16 flat index-K buffer.
 
-        Swap enabled: the current layer's HBM mirror (the access drains its
-        pending DDR->HBM SDMA events). Otherwise: this layer's DDR buffer.
-        Skip-topk (shared/S) layers never call this -- they have no buffer.
+        Swap enabled: the current layer's HBM mirror. Otherwise: this layer's
+        DDR buffer. Skip-topk (shared/S) layers never call this -- they have
+        no buffer.
+
+        The HBM mirror is already complete here: ``set_index_k_buffer`` drains
+        this layer's pending DDR->HBM copy events before writing the new
+        tokens, so no wait is needed on the read side.
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -250,9 +254,7 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
 
         swap_mgr = KunpengSwapManager.get_instance()
         if swap_mgr.enable_swap_index_k_in:
-            return swap_mgr.get_index_k_cache(
-                profile_name="kupl_sdma_wait_all@index_k_swap_in_before_read"
-            )
+            return swap_mgr.get_index_k_cache()
         return self._index_k_buf(layer_id)
 
     def get_index_k_size_bytes(self) -> int:
