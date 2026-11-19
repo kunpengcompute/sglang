@@ -137,6 +137,13 @@ class _KunpengDispatcherState:
         # address is stable across graph captures; sized to the full logical
         # expert count (>= the routed rows of the EPLB all-physical map).
         self.dynamic_remap_counter: Optional[torch.Tensor] = None
+        # Explicit int64 logical->physical gather table used by the non-EPLB
+        # (trivial layout) publish path of remap_topk_ids_to_rank_slot_kunpeng.
+        # logical id == physical slot, so it is a plain arange.  Allocated once
+        # (stable address for graph capture) and passed instead of ``None``:
+        # a captured None is replayed as an undefined tensor, which the remap
+        # kernel rejects as a non-int64 dispatch map.
+        self.identity_dispatch_map: Optional[torch.Tensor] = None
         self.router_topk: int = 0
         self.attn_tp_size: int = 0
         self.attn_tp_rank: int = 0
@@ -341,6 +348,14 @@ def _ensure_rdma_initialized(
         # Dynamic redundant-expert remap counter: one int64 slot per logical
         # expert, allocated once so the address stays stable for graph capture.
         state.dynamic_remap_counter = torch.zeros(state.num_experts, dtype=torch.int64)
+
+        # Identity logical->physical gather table for the non-EPLB publish
+        # path.  Sized like the num_physical_experts passed there
+        # (num_local_experts * ep_size) so the remap kernel's bounds check and
+        # the physical/rank decode stay identical to the previous None path.
+        state.identity_dispatch_map = torch.arange(
+            state.num_local_experts * state.ep_size, dtype=torch.int64
+        )
 
         # Step 3: Dispatch & combine init
         if state.use_local_dis_com:

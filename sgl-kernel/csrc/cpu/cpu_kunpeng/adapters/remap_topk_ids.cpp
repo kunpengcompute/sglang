@@ -32,11 +32,11 @@
 // consumer (the kutacc RDMA dispatch kernel, moe_local_dispatch_kunpeng /
 // moe_local_sum_kunpeng): even columns = peer rank, odd columns = local
 // expert slot.  Producers: this kernel (from the EPLB dispatch map; the
-// non-EPLB trivial layout reuses it with dispatch_map=None — the identity
-// transform where physical slot == logical id, see
-// _kunpeng_publish_topk_ids_rank_slot), its dynamic-remap variant, and the
-// ETP remap.  This mirrors the CUDA ``topk_ids_logical_to_physical`` step
-// and the reference ``topk_ids2rank_slot`` op.
+// non-EPLB trivial layout reuses it with the identity gather table where
+// physical slot == logical id, see _kunpeng_publish_topk_ids_rank_slot), its
+// dynamic-remap variant, and the ETP remap.  This mirrors the CUDA
+// ``topk_ids_logical_to_physical`` step and the reference
+// ``topk_ids2rank_slot`` op.
 //
 // Only the static EPLB algorithm is supported (the dispatch map is a
 // precomputed gather table).  Dynamic/fake algorithms rely on
@@ -85,7 +85,10 @@ void remap_topk_ids_to_rank_slot_kunpeng(at::Tensor topk_ids, at::Tensor full_bu
                 "remap_topk_ids_to_rank_slot_kunpeng: full_buf cols must be 2 * topk");
     // dispatch_map may be None: the trivial non-EPLB layout
     // keeps physical slot == logical id, so no gather table is needed.
-    const bool identity_map = !dispatch_map.has_value();
+    // An undefined tensor reaches the optional with has_value() == true
+    // (graph replay materializes a captured None that way), so treat it as
+    // "no map" too instead of failing the dtype check below.
+    const bool identity_map = !dispatch_map.has_value() || !dispatch_map->defined();
     if (!identity_map) {
         TORCH_CHECK(dispatch_map->dim() == 1, "remap_topk_ids_to_rank_slot_kunpeng: dispatch_map must be 1D");
         TORCH_CHECK(dispatch_map->scalar_type() == at::kLong || dispatch_map->scalar_type() == at::kInt,
