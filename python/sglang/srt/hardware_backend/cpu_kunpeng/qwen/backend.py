@@ -529,10 +529,12 @@ class QwenAttention:
         vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if save_kv_cache:
             ops.set_kv_buffer_kunpeng(
-                kb.view(-1, 256), loc, k.reshape(-1, 256).contiguous()
+                kb.view(-1, 256), loc, k.reshape(-1, 256).contiguous(),
+                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_k",
             )
             ops.set_kv_buffer_kunpeng(
-                vb.view(-1, 256), loc, v.reshape(-1, 256).contiguous()
+                vb.view(-1, 256), loc, v.reshape(-1, 256).contiguous(),
+                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_v",
             )
         # The provider precomputes the ragged mapping; the ordinary eager path
         # has no binding and derives it here.
@@ -557,10 +559,12 @@ class QwenAttention:
         vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if save_kv_cache:
             ops.set_kv_buffer_kunpeng(
-                kb.view(-1, 256), fb.out_cache_loc, contiguous(k.reshape(-1, 256))
+                kb.view(-1, 256), fb.out_cache_loc, contiguous(k.reshape(-1, 256)),
+                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_k",
             )
             ops.set_kv_buffer_kunpeng(
-                vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256))
+                vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256)),
+                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_v",
             )
         steps = fb.spec_info.draft_token_num
         requests = getattr(fb.spec_info, "_kunpeng_verify_requests", None)
@@ -593,10 +597,12 @@ class QwenAttention:
         vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if save_kv_cache:
             ops.set_kv_buffer_kunpeng(
-                kb.view(-1, 256), fb.out_cache_loc, contiguous(k.reshape(-1, 256))
+                kb.view(-1, 256), fb.out_cache_loc, contiguous(k.reshape(-1, 256)),
+                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_k",
             )
             ops.set_kv_buffer_kunpeng(
-                vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256))
+                vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256)),
+                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_v",
             )
         query = contiguous(q.reshape(-1, layer.tp_q_head_num, 256))
         output = rowwise_gqa(

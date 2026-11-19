@@ -391,7 +391,9 @@ class KunpengSwapManager:
 
         if self.enable_swap_expert:
             kunpeng.kupl_sdma_wait_all(
-                self._expert_event_tensor, self._expert_event_num_tensor
+                self._expert_event_tensor,
+                self._expert_event_num_tensor,
+                profile_name="kupl_sdma_wait_all@expert",
             )
         return self._expert_buffer_w13, self._expert_buffer_w2
 
@@ -581,21 +583,31 @@ class KunpengSwapManager:
             self._kv_swap_in_event_tensor,
             self._kv_swap_in_event_num_tensor,
             total_bytes,
+            profile_name="kupl_sdma_kv_swapin@main_kv",
         )
 
     def set_kv_buffer(
-        self, target_kv_buffer: torch.Tensor, loc: torch.Tensor, cache_k: torch.Tensor
+        self,
+        target_kv_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        profile_name: str = "",
     ) -> None:
         """Scatter-write computed K into the current layer's DDR KV cache.
 
         Uses the buffer set by the preceding :meth:`swap_kv_layer` call.
         Routes through the graph-compatible ``set_kv_buffer_kunpeng`` op.
+
+        ``profile_name`` tags the op in the graph trace so a report can tell
+        which buffer was written (main-KV DDR vs HBM mirror) -- the op name
+        alone is identical for both.
         """
         kdim = target_kv_buffer.shape[-1]
         kunpeng.set_kv_buffer_kunpeng(
             target_kv_buffer.squeeze(1),
             loc,
             cache_k.reshape(-1, kdim),
+            profile_name=profile_name,
         )
 
     def set_kv_buffer_2(
@@ -604,18 +616,23 @@ class KunpengSwapManager:
         loc: torch.Tensor,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
+        profile_name: str = "",
     ) -> None:
         """Scatter-write computed K (two halves) into the current KV cache.
 
         Same as :meth:`set_kv_buffer` but takes the nope/rope halves
         separately, avoiding the k_combined assembly copy.
         Routes through the graph-compatible ``set_kv_buffer_2_kunpeng`` op.
+
+        ``profile_name`` tags the op in the graph trace (main-KV DDR vs HBM
+        mirror); without it every write of this kind collapses into one row.
         """
         kunpeng.set_kv_buffer_2_kunpeng(
             target_kv_buffer.squeeze(1),
             loc,
             k_nope.reshape(-1, k_nope.shape[-1]),
             k_pe.reshape(-1, k_pe.shape[-1]),
+            profile_name=profile_name,
         )
 
     def set_kv_buffer_2_sdma(self, loc: torch.Tensor, k_nope: torch.Tensor, k_pe: torch.Tensor) -> None:
@@ -633,6 +650,7 @@ class KunpengSwapManager:
             k_pe.reshape(-1, k_pe.shape[-1]),
             self._kv_ddr_event_tensor,
             self._kv_ddr_event_num_tensor,
+            profile_name="kupl_sdma_set_kv_buffer_2@main_kv_ddr",
         )
 
     def set_kv_buffer_sdma(self, loc: torch.Tensor, cache_k: torch.Tensor) -> None:
@@ -650,6 +668,7 @@ class KunpengSwapManager:
             cache_k.reshape(-1, kdim),
             self._kv_ddr_event_tensor,
             self._kv_ddr_event_num_tensor,
+            profile_name="kupl_sdma_set_kv_buffer@main_kv_ddr",
         )
 
     def wait_kv_ddr(self) -> None:
@@ -659,7 +678,9 @@ class KunpengSwapManager:
         cache writes are complete.
         """
         kunpeng.kupl_sdma_wait_all(
-            self._kv_ddr_event_tensor, self._kv_ddr_event_num_tensor
+            self._kv_ddr_event_tensor,
+            self._kv_ddr_event_num_tensor,
+            profile_name="kupl_sdma_wait_all@kv_ddr",
         )
 
     def wait_kv_swap_in(self) -> None:
@@ -674,7 +695,9 @@ class KunpengSwapManager:
         """
         if self.enable_swap_kv_in:
             kunpeng.kupl_sdma_wait_all(
-                self._kv_swap_in_event_tensor, self._kv_swap_in_event_num_tensor
+                self._kv_swap_in_event_tensor,
+                self._kv_swap_in_event_num_tensor,
+                profile_name="kupl_sdma_wait_all@kv_swap_in_before_write",
             )
 
     def get_kv_cache(self) -> torch.Tensor:
@@ -686,7 +709,9 @@ class KunpengSwapManager:
         """
         if self.enable_swap_kv_in:
             kunpeng.kupl_sdma_wait_all(
-                self._kv_swap_in_event_tensor, self._kv_swap_in_event_num_tensor
+                self._kv_swap_in_event_tensor,
+                self._kv_swap_in_event_num_tensor,
+                profile_name="kupl_sdma_wait_all@kv_swap_in_before_read",
             )
             return self._cur_kv_hbm
         return self._cur_kv_ddr
@@ -756,6 +781,7 @@ class KunpengSwapManager:
             self._index_k_swap_in_event_tensor,
             self._index_k_swap_in_event_num_tensor,
             total_bytes,
+            profile_name="kupl_sdma_kv_swapin@index_k",
         )
 
     def _first_full_index_k_layer(self, forward_batch) -> Optional[int]:
@@ -817,14 +843,30 @@ class KunpengSwapManager:
             kunpeng.kupl_sdma_wait_all(
                 self._index_k_swap_in_event_tensor,
                 self._index_k_swap_in_event_num_tensor,
+                profile_name="kupl_sdma_wait_all@index_k_swap_in_before_write",
             )
 
-    def get_index_k_cache(self) -> torch.Tensor:
-        """Return the current layer's index-K: HBM mirror (swap on) or DDR."""
+    def get_index_k_cache(self, profile_name: str = "") -> torch.Tensor:
+        """Return the current layer's index-K: HBM mirror (swap on) or DDR.
+
+        Drains this layer's pending DDR->HBM copy events before handing out
+        the HBM mirror. Two distinct call sites reach here per layer and they
+        mean different things, so ``profile_name`` lets each pass its own tag:
+
+        - the indexer scoring read, which needs the copy landed before it
+          scores the pool;
+        - the double-write of this step's new tokens, which needs the copy
+          landed first so a late DMA cannot clobber the fresh rows.
+
+        Without a caller-supplied tag both waits collapse into one trace row
+        and a 21-layer run looks like 42 identical waits.
+        """
         if self.enable_swap_index_k_in:
             kunpeng.kupl_sdma_wait_all(
                 self._index_k_swap_in_event_tensor,
                 self._index_k_swap_in_event_num_tensor,
+                profile_name=profile_name
+                or "kupl_sdma_wait_all@index_k_swap_in",
             )
             return self._cur_index_k_hbm
         return self._cur_index_k_ddr

@@ -520,10 +520,12 @@ def forward_attention(q, k, v, layer, fb, save_kv_cache):
     )
     if save_kv_cache:
         ops.set_kv_buffer_kunpeng(
-            keys.view(-1, dim), fb.out_cache_loc, contiguous(k.reshape(-1, dim))
+            keys.view(-1, dim), fb.out_cache_loc, contiguous(k.reshape(-1, dim)),
+            profile_name="set_kv_buffer_kunpeng@main_kv_ddr_k",
         )
         ops.set_kv_buffer_kunpeng(
-            values.view(-1, dim), fb.out_cache_loc, contiguous(v.reshape(-1, dim))
+            values.view(-1, dim), fb.out_cache_loc, contiguous(v.reshape(-1, dim)),
+            profile_name="set_kv_buffer_kunpeng@main_kv_ddr_v",
         )
     query = contiguous(q.reshape(-1, heads, dim))
     output = ops.alloc_buffer(query.numel(), dtype=query.dtype).view(query.shape)

@@ -1667,6 +1667,7 @@ class MLATokenToKVPool(KVCache):
                 kv.squeeze(1),
                 loc,
                 cache_k.reshape(-1, kdim),
+                profile_name="set_kv_buffer_kunpeng@main_kv_ddr",
             )
             return
 
