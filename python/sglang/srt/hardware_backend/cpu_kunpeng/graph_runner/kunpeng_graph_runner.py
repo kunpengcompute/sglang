@@ -1748,6 +1748,11 @@ class KunpengGraphRunner:
                 "topk_weights_buf",
                 "topk_ids_flat_buf",
                 "topk_ids_index_buf",
+                # Explicit int64 identity gather table consumed by the
+                # non-EPLB publish path (remap_topk_ids_to_rank_slot_kunpeng
+                # with logical == physical). Persistent, so its storage must
+                # be registered before capture like the other topk buffers.
+                "identity_dispatch_map",
                 "dynamic_remap_counter",
                 # ETP node-shared buffers: consumed by
                 # moe_etp_dispatch_share_kunpeng / moe_etp_reduce_kunpeng

@@ -809,18 +809,27 @@ def _kunpeng_publish_topk_ids_rank_slot(
     encoding its consumers read: even columns = peer rank, odd columns = local
     expert slot.  The EPLB remap kernels and the ETP remap already write
     these pairs; this helper serves the non-redundant (no-EPLB) path by
-    reusing the graph-registered remap op with ``dispatch_map=None`` — the
-    identity transform (the trivial layout keeps logical id == physical
-    slot, so rank = id // num_local_experts and slot = id %
-    num_local_experts — exactly the packed-id decode the local dispatch/sum
-    kernels performed before the encoding was unified).  None survives graph
-    capture/replay: it is recorded as the none-storage view and replayed as
-    an undefined tensor.
+    reusing the graph-registered remap op with the identity dispatch table —
+    the trivial layout keeps logical id == physical slot, so rank = id //
+    num_local_experts and slot = id % num_local_experts (exactly the packed-id
+    decode the local dispatch/sum kernels performed before the encoding was
+    unified).
+
+    The table is passed explicitly instead of ``None``: a captured ``None``
+    is replayed as an undefined/placeholder tensor, which the remap kernel
+    rejects as a non-int64 dispatch map.  ``identity_dispatch_map`` is a
+    persistent int64 tensor registered as a fixed graph storage so replay
+    hands the kernel a real 1-D gather table.
     """
+    identity_map = state.identity_dispatch_map
+    assert identity_map is not None, (
+        "Kunpeng identity dispatch map is not initialized; "
+        "_init_buffers must allocate it"
+    )
     kunpeng.remap_topk_ids_to_rank_slot_kunpeng(
         topk_ids,
         state.topk_ids_index_buf[start : start + topk_ids.shape[0]],
-        None,
+        identity_map,
         state.num_local_experts * state.ep_size,
         state.ep_size,
         state.moe_tp_size,
