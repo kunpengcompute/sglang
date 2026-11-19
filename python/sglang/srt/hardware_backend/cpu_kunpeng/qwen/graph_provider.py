@@ -301,7 +301,7 @@ class QwenHybridGraphProvider:
                     vision_budget = min(
                         int(
                             os.environ.get(
-                                "SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "2304"
+                                "SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "4096"
                             )
                         ),
                         int(communicator.max_tokens),

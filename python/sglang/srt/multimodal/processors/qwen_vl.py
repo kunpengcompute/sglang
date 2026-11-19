@@ -32,6 +32,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils import is_cpu_920f
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
@@ -103,6 +104,55 @@ def ceil_by_factor(number: int, factor: int) -> int:
 def floor_by_factor(number: int, factor: int) -> int:
     """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
     return math.floor(number / factor) * factor
+
+
+def _kunpeng_vision_align64_enabled() -> bool:
+    """Whether to pre-align images to the Kunpeng ViT flash-attention path.
+
+    Mirrors kunpeng_vit_flash_enabled() in layers/attention/vision.py
+    without importing the attention stack into the tokenizer-side process.
+    """
+    if not is_cpu_920f():
+        return False
+    return os.environ.get("SGLANG_KUNPENG_VIT_FLASH_ATTN", "1") not in ("", "0")
+
+
+def kunpeng_vision_align64(img, min_pixels: int, resample=None):
+    """Resize a PIL image so its patch grid always takes the flash path.
+
+    The Kunpeng flash kernel needs every image's patch count (side/16)^2 to
+    be a multiple of 16 - i.e. both sides multiples of 64 - and within the
+    shared flash workspace's row budget (SGLANG_KUNPENG_VISION_SHM_MAX_ROWS
+    patches). The stock smart_resize only aligns to patch*merge = 32, which
+    drops misaligned or oversized images onto the SDPA math chain where
+    TTFT grows quadratically. smart_resize with factor=64 and
+    max_pixels = budget * 16 * 16 enforces both gates, and the stock
+    factor-32 pass afterwards becomes a no-op because every 64-multiple is
+    a 32-multiple.
+    """
+    if not isinstance(img, Image.Image):
+        return img  # tensor / precomputed payloads pass through untouched
+    budget = int(os.environ.get("SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "4096"))
+    target_h, target_w = smart_resize(
+        img.height,
+        img.width,
+        factor=64,
+        min_pixels=min_pixels,
+        max_pixels=budget * 256,
+    )
+    if (target_h, target_w) != (img.height, img.width):
+        logger.info(
+            "[align64] %dx%d -> %dx%d (flash rows=%d)",
+            img.height,
+            img.width,
+            target_h,
+            target_w,
+            budget,
+        )
+        img = img.resize(
+            (target_w, target_h), RESIZE_RESAMPLE or resample or Image.BILINEAR
+        )
+    return img
 
 
 def smart_nframes(
@@ -504,6 +554,21 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
         load_time = time.perf_counter()
+
+        # Kunpeng 920F: pre-resize images to 64-aligned dims within the
+        # flash row budget, before the HF processor's factor-32 smart_resize
+        # re-rounds them onto the SDPA path (see kunpeng_vision_align64).
+        # This is the single choke point above both load paths (fast and
+        # legacy) that every image request through this processor passes.
+        if base_output.images and _kunpeng_vision_align64_enabled():
+            image_processor = getattr(self._processor, "image_processor", None)
+            min_pixels = int(getattr(image_processor, "min_pixels", 0) or 65_536)
+            resample = getattr(image_processor, "resample", None)
+            base_output.images = [
+                kunpeng_vision_align64(img, min_pixels, resample)
+                for img in base_output.images
+            ]
+
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
         video_metadata = None

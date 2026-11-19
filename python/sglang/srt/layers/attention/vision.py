@@ -184,7 +184,7 @@ def kunpeng_vision_flash_max_rows() -> int:
     """Largest total token count the shared flash workspace can serve.
     Reuses the vision SHM row budget's env and default, since the graph
     runner already refuses to capture beyond that budget."""
-    return int(os.environ.get("SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "2304"))
+    return int(os.environ.get("SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "4096"))
 
 
 @lru_cache(maxsize=1)
