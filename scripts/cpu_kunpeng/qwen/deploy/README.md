@@ -1,138 +1,153 @@
-# Qwen920F：构建一次，兼容节点复用
+# Qwen 920F：源码构建、发布和服务启动
 
-适用合入PR301及PR309的Qwen非MTP或MTP、单机920F TP16：DDR NUMA0～15各38个CPU，HBM NUMA16～31。本工具只管理部署，不改模型、算子和框架。完整验证范围见交付记录，不把历史性能当成本修订的实测成绩。
+入口统一为 `bash run.sh ACTION /绝对路径/config.sh`。`config.sh` 放在源码之外；运行输出放在 `DEPLOY_DIR`，不写回 SGLang 源码。支持文本和多模态，MTP 由同一配置控制。
 
-## 快速启动（单节点）
+## 1. 换一台同型号机器，需要填写什么
 
-本入口启动一套单节点TP16服务，Prefill和Decode在同一服务内执行。无需Router或PD测试控制器。
+先复制 `config.example.sh` 为自己的 `config.sh`。配置已经集中分为路径、日志、HBW/频率、模型参数、PD 拓扑和角色预算。
+
+| 配置 | 需要准备的信息 |
+|---|---|
+| `SGLANG_SOURCE`、`DEPLOY_DIR` | 本次源码目录、新的发布输出目录；不要指向旧实验的 release |
+| `PYTHON`、`CLIENT_PYTHON` | 推理 Python 3.12 环境；标准库控制脚本的 Python |
+| `CC`、`CXX`、`COMPILER_RUNTIME_LIB` | 配套毕昇 clang/clang++ 和运行库目录；`libomp.so` 等来自该环境，不是 Qwen 算子单独携带的包 |
+| `KUTACC_PREFIX`、`KUPL_PREFIX` | 匹配的 SDK 前缀，均包含 include/lib；相同库名不代表相同版本 |
+| `EXTRA_LIBRARY_PATH` | RDMA/系统运行库的补充目录；其余缺失项通过 deps/verify 报告定位 |
+| `MODEL` | Qwen3.8 权重目录，包含 config、量化描述、tokenizer 和完整权重 |
+| `PERF_TUNE` | 已获授权的 root_proxy 和 hugepage/调频/SDMA helper 所在目录 |
+| `PD_NODE_HOSTS` 或 `PD_NODE_FILE` | 当前已分配的计算节点，先 P 后 D；工具不申请节点 |
+| `PD_ADVERTISE_HOSTS`、`PD_IB_DEVICE`、`PD_NET_INTERFACE` | 节点间可达地址、RDMA 设备、控制网卡；端口和 SSH 用户也在配置中 |
+
+本 NUMA 配方要求 aarch64、TP16、608 CPU：DDR NUMA0–15，每 NUMA 38 CPU，HBW NUMA16–31；每物理节点一个 PP stage。相同 920F 芯片但 CPU/NUMA 编号或可用核范围不同，仍需要适配核表，不能仅替换路径。
+
+运行还需要对应 Python 依赖、RDMA 驱动/设备、`cmake`、`ldd`、`taskset`、`numactl` 和已授权的资源设置权限。部署包不负责安装驱动或替用户获得 root 权限。
+
+## 2. 首次：build → pack
 
 ```bash
-TOOL=/绝对路径/sglang/scripts/cpu_kunpeng/qwen/deploy
-DEPLOY=/绝对路径/deployments/qwen_20261106_mtp3_920f_tp16
+SOURCE=/共享绝对路径/sglang_20261120_r9_clean
+DEPLOY=/共享绝对路径/deployments/qwen38_r9_20261120_clean
+TOOL="$SOURCE/scripts/cpu_kunpeng/qwen/deploy"
+CONFIG="$DEPLOY/config.sh"
 mkdir -p "$DEPLOY"
-cp "$TOOL/config.example.sh" "$DEPLOY/config.sh"
-# 填写config.sh顶部的路径；MTP3设SGLANG_ENABLE_MTP=1、SGLANG_SPECULATIVE_NUM_STEPS=3。
-# 新源码首次部署保留KERNEL_BUILD_RECEIPT为空，使用本次build的结果。
-bash "$TOOL/run.sh" build "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" pack "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" start "$DEPLOY/config.sh"
+cp "$TOOL/config.example.sh" "$CONFIG"
+# 填写上述环境信息，并把当前节点清单写入配置指定的文件。
+bash "$TOOL/run.sh" build "$CONFIG"
+bash "$TOOL/run.sh" pack  "$CONFIG"
 ```
 
-出现READY后，在同一节点另开终端并设置相同TOOL/DEPLOY，再运行：
+- `build`：从选定源码编译 sgl_kernel，输出到 `DEPLOY_DIR/build`；编译记录为 `KERNEL_BUILD.json`。
+- `pack`：校验源码、构建产物和依赖，冻结 Python 应用、原生库和工具到 `release`，制作16份 rank 私有 NUMA 镜像到 `numa_images`。输出是目录，不是自动生成的压缩包。
+- 源码需要有本次完整的 Git 快照；不能修改 Python/C++ 后借用旧 DSO 打包。已有匹配构建记录时可设置 `KERNEL_BUILD_RECEIPT`，但 SDK/源码/DSO 校验仍执行。
+- 不覆盖已有 build、release 或 NUMA 镜像。升级代码或 SDK 使用新的 `DEPLOY_DIR`。
+
+`release/app` 不塞入整套 SDK 或模型权重。NUMA 镜像会复制运行所需的部分 ELF 和依赖，纯 Python 内容仍可能链接到本机环境；这与把整个 HPCKit/SDK 打成压缩包不同。
+
+## 3. 服务启动
+
+后续直接使用这次冻结发布中的入口，避免工具与应用版本混用：
 
 ```bash
-bash "$TOOL/run.sh" request "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" bench "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" status "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" stop "$DEPLOY/config.sh"
+RUN="$DEPLOY/release/run.sh"
+bash "$RUN" plan   "$CONFIG"  # PD：只打印计划，不联网、不分配资源
+bash "$RUN" check  "$CONFIG"  # PD：核查发布、SSH、网络和 router；不等同整模验收
+bash "$RUN" start  "$CONFIG"  # 前台运行，等待 READY
 ```
 
-后续启动相同release只需start；源码或原生依赖更新时换一个DEPLOY_DIR并重新build/pack。start始终使用该目录的冻结release，不会自动切换到config中另一个源码目录。
+另开终端管理：
 
-本次接入保留上游PR301/PR309的模型实现。旧验证版的性能不代表本次上游合入版已完成原生构建或整模性能验证。
+```bash
+bash "$RUN" status "$CONFIG"
+bash "$RUN" stop   "$CONFIG"
+```
 
-## 1. 配置与输出
+`start` 复用已打包应用，不重新编译。单节点使用 `QWEN_DEPLOY_MODE=single`，可通过 `request/bench` 发请求；PD 使用 `QWEN_DEPLOY_MODE=pd`，客户端访问输出的 router URL。PD 的首个 stage 提供 HTTP，后续 stage 等待实际 scheduler 就绪；router 完成真实 P/D 预热后接入。
 
-工具位于SGLang的`scripts/cpu_kunpeng/qwen/deploy`。填写一份`config.sh`：源码、模型、Python、KuTACC/KuPL、BiSheng运行库、资源工具路径、端口、HBM及频率配置。`DEPLOY_DIR`使用版本/依赖/拓扑名称，不使用运行节点名。
+默认 PD 拓扑为物理4P+4D：一个 TP16×PP4 的 P 实例，层数20/16/16/12；四个 TP16×PP1 的 D 实例。不是把四个 P 当成四套完整模型。
 
-`SGLANG_ENABLE_MTP=0`关闭MTP；设为`1`时使用`SGLANG_SPECULATIVE_NUM_STEPS`（默认3），固定topk=1、draft tokens=steps+1。启动传入NEXTN，框架归一为EAGLE。共享checkpoint可将`SPECULATIVE_DRAFT_MODEL_PATH`留空，需要独立draft权重时填写目录；实例状态和启动记录保存实际开关与步数，测试入口同时支持两种模式。
+- `PD_PREFILL_NODES` / `PD_DECODE_NODES`：物理节点数量。
+- `PD_*_NNODES` / `PD_*_PP_SIZE`：每逻辑实例占用节点数，本配方要求二者相同。
+- 逻辑副本数为 `NODES / NNODES`，必须整除；D 为 PP1 时，D 节点数就是 D 副本数。
+- MTP 由 `SGLANG_ENABLE_MTP`、`SGLANG_SPECULATIVE_NUM_STEPS` 控制；PD 示例使用 MTP3。PP 分层、请求容量或角色优化配方变化，需要相应验证。
+
+正常 Ctrl-C 也执行本次收尾。确认服务/资源清理后再释放调度作业；工具不会替调度器释放节点。
+
+## 4. HBW、大页与选频属于启动流程
+
+| 每 rank 配置 | Prefill | Decode |
+|---|---:|---:|
+| HBW 总预算 | 4000 MiB | 4000 MiB |
+| 共享通信 / 私有 HBW | 384 / 3616 MiB | 128 / 3872 MiB |
+| 最大请求 / KV token 容量 | 32 / 524544 | 8 / 262720 |
+| Target K/V 换入 / 双缓冲 | 关闭 / 关闭 | 开启 / 开启 |
+| Prefill 工作区放 HBW | 是 | 否 |
+| Draft 镜像 / V2 驻留 | 关闭 | 开启 |
+
+共享通信区包含在4000 MiB总预算内。大页自动预留覆盖私有 HBW，并加2页余量；共享区另外核对普通空闲容量。默认对应 P 每 HBW NUMA1810个2MiB页，D为1938页。
+
+`start` 的顺序是：校验发布与依赖 → 取得本节点所有权 → 记录原资源设置 → 按需补大页 → SDMA 设置/读回 → 按配置调频 → 启动模型 → 真实预热、采样并按配置选核 → READY。
+
+- `HBM_HUGEPAGE_MODE=ensure`：不足时通过已有 helper 补齐；`check`：只核查，由管理员预先准备。
+- `CPU_FREQ_MODE=apply`：申请目标计算核2GHz；`keep`：保持原频率，但仍采样。
+- `CPU_REMAP_SAME_NUMA`：控制是否在同 NUMA 内换到合适的核；不改变 TP/PP。
+- `CPU_FREQ_RESTORE_MHZ`：无法读取可靠原标称频率时使用管理员确认值，不能把其他机器的恢复值照搬。
+- 调频异常会记录告警后继续服务；HBW不足、依赖错误、SDMA设置失败则启动失败。正常停止按原记录恢复本次调整，大页/频率恢复不确定会保留待处理记录。
+
+GDN/MTP checkpoint HBW、短 query Flash-Decoding、直接 AllReduce、有效 Draft V2 驻留配方继续使用。未获采纳的 Prefill 驻留和精细 SDMA 流水线保持关闭。
+
+## 5. 多节点能否复用同一份 pack
+
+**同一共享环境可以。** 所有节点访问相同的 `DEPLOY_DIR/release` 和 `numa_images`；每次启动创建独立的实例、进程、状态和日志。host、PP rank、角色预算等运行信息也不同，并非只有日志文件名变化。
+
+需要保持配套的 Python/SDK/系统 ABI 和同样的绝对路径、NUMA 布局。工具核对依赖内容与实际加载路径，防止同名不同版本的库混用。
+
+**不同安装路径或不同环境不能直接搬旧 NUMA 镜像。** 镜像中含 Python prefix、绝对路径和链接；在另一环境填写配置后，使用源码重新执行 build/pack。这样生成属于该环境的镜像。仅改 config 后沿用旧 `numa_images` 不受支持。
+
+## 6. 日志位置、大小和历史保留
 
 ```text
-DEPLOY_DIR/                         例如pr301_20261105_920f_tp16
-├── config.sh                       可修改的默认配置
-├── KERNEL_BUILD.json               本目录构建时生成的记录
-├── PACKAGE.json                    pack状态
-├── build/                          本目录构建时生成的CMake及kernel
-├── release/                        冻结应用、kernel、打包时的工具
-├── numa_images/rank0..rank15/       pack一次生成的原生库独立副本
-├── instances/
-│   ├── current/<主机>_<端口>.json   当前实例指针，不再共用LAST_RUN
-│   ├── checks/<检查ID>/            verify/deps/check各自的报告
-│   └── <时间_主机_端口_PID_ID>/     配置快照、STATE.json、资源记录、PID、测试JSON
-└── logs/
-    ├── driver/                     各命令的输出，包含主机、时间、PID
-    ├── build/                      configure/build/install.log
-    ├── pack/                       NUMA副本生成日志
-    └── instances/<实例ID>/          launcher/rank/请求测试/调频等文本日志
+DEPLOY_DIR/
+├── config.sh、KERNEL_BUILD.json、PACKAGE.json
+├── build/                         编译产物
+├── release/                       冻结应用和工具
+├── numa_images/rank0 ... rank15/   可复用的NUMA镜像
+├── instances/<时间_节点_端口_PID_ID>/
+│   ├── STATE.json、environment.json、config.sh
+│   └── 资源设置、频率摘要、PID和清理记录
+├── logs/
+│   ├── instances/<实例ID>/         rank0...15.log、launcher.log
+│   ├── driver/                    run.sh入口输出
+│   ├── build/                     一次性编译诊断
+│   └── pack/                      一次性镜像制作诊断
+└── cluster/runs/<集群ID>/          PLAN/STATE、角色配置、router和SSH日志
 ```
 
-不生成artifacts或重复压缩包。测试代码不放进SGLang。多节点共享同一个DEPLOY_DIR时，发布文件和副本只保留一套，各节点运行记录分开；每个节点仍须单独申请调度资源。
-
-## 2. 首次从源码构建、打包
+配置中的生产默认值：
 
 ```bash
-TOOL=/绝对路径/sglang/scripts/cpu_kunpeng/qwen/deploy
-DEPLOY=/绝对路径/deployments/pr301_20261105_920f_tp16
-mkdir -p "$DEPLOY"
-cp "$TOOL/config.example.sh" "$DEPLOY/config.sh"
-# 填写config.sh中的路径与参数。
-bash "$TOOL/build.sh" "$DEPLOY/config.sh"
-bash "$TOOL/pack.sh" "$DEPLOY/config.sh"
+export QWEN_LOG_LEVEL=warning
+export QWEN_LOG_MAX_MIB=16
+export QWEN_LOG_BACKUPS=2
+export QWEN_FREQUENCY_LOG=summary
+export QWEN_LOG_KEEP_DAYS=7
+export QWEN_LOG_KEEP_RUNS=5
 ```
 
-build使用CMake从源码生成sgl_kernel。pack校验构建记录、源码、SDK和DSO，冻结应用，并在相同920F拓扑的构建节点制作16份NUMA副本。start不会执行编译、pack或再次复制镜像。
+rank、launcher、router、SSH和driver持续日志都轮转。每条流最多 `16 × (1+2) = 48 MiB`，文件名为 `rank0.log`、`.log.1`、`.log.2`；单节点16 rank+launcher+start-driver最多约864 MiB。4P4D连同控制/路由约7.2 GiB活跃日志；调试full频率日志另增加每节点最多48 MiB。
 
-有同版本、同依赖的完整构建记录时，可以在config中填写`KERNEL_BUILD_RECEIPT`，跳过build，只pack一次。已有release和numa_images不会被覆盖；算子/应用/依赖配方改变时使用新的版本目录。
+默认不记录请求正文，不启用 profile/replay；频率仅保存覆盖更新的摘要。`QWEN_FREQUENCY_LOG=full` 才持续记录有界JSONL。设置 `QWEN_LOG_LEVEL=info` 可增加诊断信息。SDK自己写到其他位置的文件、显式benchmark结果、一次性build/pack/helper诊断不包含在持续流上限内。
 
-## 3. 每次启动
-
-在已分配的独占920F计算节点执行，保持原命令形式：
+文件轮转不会自动删除历次运行目录。定期执行：
 
 ```bash
-bash "$TOOL/run.sh" verify "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" start "$DEPLOY/config.sh"
+bash "$RUN" prune "$CONFIG"          # 预览文件与预计释放字节
+bash "$RUN" prune "$CONFIG" --apply  # 按配置真正清理
 ```
 
-start流程：
+该策略按节点保留最近5个已结束日志集合，且最长7天；超出任一条件可清理。集群日志和完成的driver日志分别计数。只处理已确认停止/资源收尾的旧日志，跳过当前、活动、未确认实例及未闭合driver；不删除STATE/PLAN/配置/构建记录、release、镜像或其他部署。可以把 `prune --apply` 放入日常运维任务；只轮转而从不清理历史，仍会累计磁盘占用。
 
-```text
-取得本节点TP16管理锁、创建独立实例
-  → 核验冻结应用/运行库/拓扑及现有副本
-  → 保存本次配置与资源快照
-  → 按配置准备大页、HBM/SHM预算及频率
-  → 用已有NUMA副本启动16个rank
-  → 短请求、选频/同NUMA换核、预热
-  → READY并记录频率状态
-  → stop后清理自有进程/SHM、恢复本次资源改动
-```
+一次性build/pack日志随发布保留；旧发布目录的归档由版本保留策略处理，不由日志清理命令自动删除。
 
-副本里的hostname只表示制作来源，换节点不会因此要求重新pack。仍核验软件版本、依赖、Python路径和拓扑。镜像文件可复用不代表物理页永远本地：新节点仍需正确绑核、加载及核验内存放置。
+## 验证范围
 
-共享文件系统下可直接复用；本版保留绝对路径和inode校验，不承诺把文件搬到任意新路径后免准备启动。不同机器没有共享路径时，应在目标环境准备一次副本并保持依赖匹配；不会因后续每次启动而再准备。
-
-## 4. 请求、测试、状态、停止
-
-同一计算节点另开终端，默认用“当前主机＋配置HTTP端口”定位实例：
-
-```bash
-bash "$TOOL/run.sh" status "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" request "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" bench "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" stop "$DEPLOY/config.sh"
-```
-
-也可以显式指定完整实例ID：
-
-```bash
-bash "$TOOL/run.sh" status "$DEPLOY/config.sh" --instance 实例ID
-bash "$TOOL/run.sh" stop "$DEPLOY/config.sh" --instance 实例ID
-```
-
-共享文件系统下，从登录节点可通过显式ID查看状态或写入协作停止标记。request/bench要求在该实例所在节点执行，避免将另一节点的localhost误认作服务；跨节点发请求可使用HTTP客户端，指定实际节点地址。shared_tools的HTTP客户端继续可用。
-
-同一个deployment同一主机不允许同时启动两个完整TP16管理进程；不同主机互不阻塞。不会回退到其他节点的LAST_RUN。异常杀死管理进程时，文件锁自动释放，但远程服务/资源是否已清理必须依据实例记录确认；不要仅凭锁释放就认定清理成功。
-
-## 5. 资源配置沿用
-
-- 每rank总HBM 4000MiB：SHM 384MiB、私有HBW池3616MiB。SHM包含在总预算内；prefill/decode当前保持同值，不相加两次。
-- `HBM_HUGEPAGE_MODE=ensure|check`；`HBM_HUGEPAGE_MB_PER_NODE=auto`按私有池换算2MiB大页并留2页，当前1810页。保留原配置并只准备/恢复自有改动。
-- `CPU_FREQ_MODE=apply|keep`，目标`CPU_FREQ_TARGET_MHZ=2000`、容差`CPU_FREQ_TOLERANCE_MHZ=20`。
-- `CPU_FREQ_RESTORE_MHZ`按管理员确认的原标称值填写；无法可靠确定时不猜测恢复频点。
-- `CPU_REMAP_SAME_NUMA=1`沿用原工具在同NUMA替换计算worker，不跨NUMA；不能达到要求时明确告警并继续服务。READY和频率合格分开记录。
-- 调频、大页操作沿用授权的root_proxy；不新增权限机制。启动要求调度器已分配完整608CPU，不自行申请其他节点。
-
-## 6. 更新部署工具，不重打已有应用包
-
-只调整部署管理逻辑时，从已更新的SGLang工具目录执行相同run.sh命令即可：新工具读取DEPLOY_DIR中既有的冻结release和numa_images，不跳转回旧release中的旧run.sh。每个实例记录实际工具路径/修订及应用发布位置，以便追溯。
-
-已有旧release里的run.sh保持原样；它不会自动升级，请使用SGLang中的新入口。需要带走完整的新工具版本时，在下一个新版本目录pack；不要手改旧release的完整性清单。本修订不修改原生库、不重新编译、不重建已有镜像。
+本轮执行本地语法、路由/角色配置、日志轮转、历史日志保护及代码等价检查。没有重建920F DSO、制作新NUMA镜像或启动真实多节点服务；源码整理后应重新build/pack验证，不复用旧原生库。父R9真实验证为4P1D，且保留一项C8单token差异待查；不得把本轮本地验证视为4P4D性能或一致性验收。

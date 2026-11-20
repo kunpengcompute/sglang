@@ -40,6 +40,7 @@ class DraftBackendFactory:
         if (
             getattr(self.draft_model_runner, "borrowed_qwen_target_runner", None)
             is not None
+            or getattr(self.draft_model_runner.model, "_kunpeng_local_mtp", False)
         ):
             from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_bridge import (
                 AttachedQwenMultiStepDraftBackend,
@@ -80,6 +81,7 @@ class DraftBackendFactory:
         if (
             getattr(self.draft_model_runner, "borrowed_qwen_target_runner", None)
             is not None
+            or getattr(self.draft_model_runner.model, "_kunpeng_local_mtp", False)
         ):
             from sglang.srt.layers.attention.torch_native_backend import (
                 TorchNativeAttnBackend,

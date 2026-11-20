@@ -10,9 +10,9 @@ import sys
 import time
 import urllib.request
 from tools.check_dependencies import check as check_dependencies
-from tools.runtime_contract import environment, snapshot, verify, verify_payload, sha256
+from tools.runtime_contract import environment, snapshot, verify, verify_payload, sha256, mtp_settings
 from tools.resources import Resources, budget, prepare_compute, save as save_json, warning
-from tools import runtime_frequency, instances
+from tools import runtime_frequency, instances, runtime_logging
 
 kit = Path(os.environ['QWEN_KIT'])
 payload = Path(os.environ.get('QWEN_PAYLOAD_ROOT', str(kit)))
@@ -40,22 +40,46 @@ def checked_warmup(url):
     return response
 
 
-def mtp_settings():
-    enabled = os.environ['SGLANG_ENABLE_MTP']
-    if enabled not in ('0', '1'):
-        raise ValueError('SGLANG_ENABLE_MTP只能为0或1')
-    steps = int(os.environ.get('SGLANG_SPECULATIVE_NUM_STEPS', '3')) if enabled == '1' else 0
-    if enabled == '1' and steps < 1:
-        raise ValueError('开启MTP时SGLANG_SPECULATIVE_NUM_STEPS必须为正整数')
-    return {'mtp': int(enabled), 'mtp_steps': steps,
-            'speculative_algorithm': 'EAGLE' if steps else None,
-            'speculative_eagle_topk': 1 if steps else None,
-            'speculative_num_draft_tokens': steps + 1 if steps else None}
+def topology():
+    tp = int(os.environ.get('QWEN_TP_SIZE', '16'))
+    pp = int(os.environ.get('QWEN_PP_SIZE', '1'))
+    nnodes = int(os.environ.get('QWEN_NNODES', '1'))
+    rank = int(os.environ.get('QWEN_NODE_RANK', '0'))
+    if tp != 16 or pp != nnodes or not 0 <= rank < nnodes:
+        raise ValueError('NUMA配方要求TP16、每节点一个PP stage、有效node rank')
+    address = os.environ.get('QWEN_DIST_INIT_ADDR', '')
+    if nnodes > 1 and not address:
+        raise ValueError('多节点PP必须指定所有stage共享的QWEN_DIST_INIT_ADDR')
+    partition = os.environ.get('SGLANG_PP_LAYER_PARTITION', '')
+    parts = [int(x) for x in partition.split(',')] if partition else None
+    model = json.loads((Path(os.environ['MODEL']) / 'config.json').read_text())
+    layers = model.get('text_config', model).get('num_hidden_layers')
+    if layers is None:
+        raise ValueError('模型config.json缺少num_hidden_layers，无法核验PP切层')
+    if parts is None:
+        parts = [layers // pp + int(i >= pp - layers % pp) for i in range(pp)]
+    if len(parts) != pp or min(parts) < 1 or sum(parts) != layers:
+        raise ValueError('SGLANG_PP_LAYER_PARTITION项数/总层数不匹配模型与PP_SIZE')
+    return dict(tp_size=tp, pp_size=pp, nnodes=nnodes, node_rank=rank,
+                pp_rank=rank, http_endpoint=rank == 0,
+                dist_init_addr=address or os.environ['QWEN_HOST'] + ':' + os.environ['QWEN_DIST_PORT'],
+                global_rank_range=[rank * tp, (rank + 1) * tp - 1],
+                local_numa_ranks=list(range(16)), layer_partition=parts,
+                start_layer=sum(parts[:rank]), end_layer=sum(parts[:rank + 1]))
+
+
+def stage_ready(service_dir):
+    for rank in range(16):
+        path = service_dir / f'rank{rank}.json'
+        if not path.is_file() or json.loads(path.read_text()).get('status') != 'SCHEDULER_READY':
+            return False
+    return True
 
 
 def check(env, current, capacity=True):
     assert os.uname().machine == 'aarch64', '此配方用于 920F aarch64'
     mtp_settings()
+    topology()
     for n in range(16):
         p = Path(f'/sys/devices/system/node/node{n}/cpulist')
         assert p.read_text().strip() == f'{n*38}-{n*38+37}', 'NUMA/CPU编号与此配方不同，需要适配核表'
@@ -71,6 +95,13 @@ def check(env, current, capacity=True):
                         and kib+free*2048 >= plan['total_mib']*1024), f'HBM node{n}大页或空闲容量不足'
         print('每rank HBM预算：' + json.dumps(plan, ensure_ascii=False), flush=True)
     return dict(current['imports'], common_sha256=current['common_sha256'])
+
+
+def publish_state(run, state):
+    instances.write_json(run/'STATE.json', state)
+    if os.environ.get('QWEN_CLUSTER_STATE_FILE'):
+        state = dict(state, cluster_token=os.environ['QWEN_CLUSTER_TOKEN'], updated_at=time.time())
+        instances.write_json(Path(os.environ['QWEN_CLUSTER_STATE_FILE']), state)
 
 
 def main():
@@ -110,7 +141,7 @@ def main():
             state = {'phase': 'PREFLIGHT', 'run': str(r), 'logs': str(logs),
                      'hostname': socket.gethostname(), 'http_port': int(os.environ['QWEN_HTTP_PORT']),
                      'owner_pid': os.getpid(), **mtp_settings()}
-            instances.write_json(r/'STATE.json', state)
+            publish_state(r, state)
             instances.publish(root, os.environ['QWEN_HTTP_PORT'], r)
             try:
                 start(r, logs)
@@ -118,7 +149,7 @@ def main():
                 state = json.loads((r/'STATE.json').read_text())
                 if state['phase'] == 'PREFLIGHT':
                     state.update(phase='FAILED', error=repr(error), resources_acquired=False)
-                    instances.write_json(r/'STATE.json', state)
+                    publish_state(r, state)
                 raise
     else:
         r, _ = instances.create(root/'checks', os.environ['DEPLOY_DIR'], os.environ['QWEN_HTTP_PORT'], prefix=action+'_')
@@ -165,6 +196,7 @@ def validate_images(images):
 
 def start(r, logs):
     env, dependencies, current, probe = preflight('start', r)
+    layout = topology()
     for port in (int(os.environ['QWEN_HTTP_PORT']), int(os.environ['QWEN_DIST_PORT'])):
         with socket.socket() as probe_port:
             probe_port.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -175,21 +207,23 @@ def start(r, logs):
     assert set(range(608)) <= os.sched_getaffinity(0), '当前进程不能使用所需608个CPU'
     (r/'config.sh').write_bytes(Path(os.environ['QWEN_CONFIG_PATH']).read_bytes())
     (r/'IMPORT_PATHS.json').write_text(json.dumps(probe, indent=2)+'\n')
-    profile = {k: v for k, v in os.environ.items() if k.startswith(('SGLANG_', 'KUTACC_', 'KUPL_'))
+    profile = {k: v for k, v in env.items() if k.startswith(('SGLANG_', 'KUTACC_', 'KUPL_', 'MC_'))
                or k in ('EP_SIZE','PP_SIZE','WORLD_SIZE','HF_HUB_OFFLINE','TRANSFORMERS_OFFLINE',
                         'KMP_AFFINITY','MV2_COMM_WORLD_LOCAL_SIZE','OMP_NUM_THREADS','OMP_PROC_BIND',
                         'PYTHONNOUSERSITE','TORCH_COMPILE_DISABLE','TORCH_USE_KUPL',
-                        'SPECULATIVE_DRAFT_MODEL_PATH', 'LD_LIBRARY_PATH')}
+                        'SPECULATIVE_DRAFT_MODEL_PATH', 'GLOO_SOCKET_IFNAME', 'IS_PREFILL',
+                        'LD_LIBRARY_PATH')}
     (r/'environment.json').write_text(json.dumps(profile, indent=2)+'\n')
     state = {'phase': 'RESOURCES', 'run': str(r), 'http_port': int(os.environ['QWEN_HTTP_PORT']),
              'tools_path': str(kit), 'tools_revision': json.loads((kit/'VERSION.json').read_text())['tool_revision'],
-             'payload_root': str(payload), **mtp_settings(), 'hostname': socket.gethostname(), 'owner_pid': os.getpid(), 'logs': str(logs), 'url': 'http://127.0.0.1:'+os.environ['QWEN_HTTP_PORT']}
+             'payload_root': str(payload), 'topology': layout, 'pd_mode': os.environ.get('QWEN_PD_MODE', 'null'), **mtp_settings(), 'hostname': socket.gethostname(), 'owner_pid': os.getpid(), 'logs': str(logs), 'url': 'http://'+('127.0.0.1' if os.environ['QWEN_HOST'] in ('0.0.0.0', '::') else os.environ['QWEN_HOST'])+':'+os.environ['QWEN_HTTP_PORT']}
+    startup_timeout = int(os.environ.get('PD_START_TIMEOUT', '1800')) if state['pd_mode'] != 'null' else 1800
     service = None
     sampler = None
     resources = Resources(r, logs)
 
     def save():
-        instances.write_json(r/'STATE.json', state)
+        publish_state(r, state)
 
     def interrupted(*_):
         raise KeyboardInterrupt()
@@ -197,7 +231,7 @@ def start(r, logs):
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     save()
-    print('运行目录：'+str(r), flush=True)
+    print('运行目录：'+str(r)+'；实际拓扑：'+json.dumps(layout, ensure_ascii=False), flush=True)
     clean = {k: v for k, v in os.environ.items() if k not in ('PYTHONPATH','PYTHONHOME','LD_PRELOAD','LD_LIBRARY_PATH')}
     try:
         resources.prepare()
@@ -221,38 +255,73 @@ def start(r, logs):
             ('context-length','QWEN_CONTEXT_LENGTH'),('max-total-tokens','QWEN_MAX_TOTAL_TOKENS'),
             ('max-running-requests','QWEN_MAX_RUNNING_REQUESTS'),('random-seed','QWEN_SEED')]:
             argv += ['--'+option, os.environ[key]]
-        with (logs/'launcher.log').open('w') as log:
-            service = subprocess.Popen(list(map(str, argv)), env=clean, stdout=log,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
+        for option, key in [('tp-size', 'tp_size'), ('pp-size', 'pp_size'),
+                            ('nnodes', 'nnodes'), ('node-rank', 'node_rank'),
+                            ('dist-init-addr', 'dist_init_addr')]:
+            argv += ['--' + option, str(layout[key])]
+        argv += ['--disaggregation-mode', state['pd_mode'],
+                 '--disaggregation-bootstrap-port', os.environ.get('QWEN_PD_BOOTSTRAP_PORT', '9001'),
+                 '--disaggregation-ib-device', os.environ.get('QWEN_PD_IB_DEVICE', '')]
+        service = runtime_logging.spawn(list(map(str, argv)), logs/'launcher.log',
+                                        env=clean, start_new_session=True)
         state['phase'] = 'STARTING'
         save()
-        deadline = time.monotonic()+1800
+        deadline = time.monotonic()+startup_timeout
         while True:
+            runtime_logging.check(service)
             if (r/'STOP').exists():
                 raise KeyboardInterrupt()
             if service.poll() is not None:
                 raise RuntimeError('服务退出；查看logs中的rank0.log和launcher.log')
-            try:
-                http(state['url']+'/health')
-                break
-            except OSError:
-                pass
+            if stage_ready(r/'service'):
+                if not layout['http_endpoint']:
+                    break
+                try:
+                    http(state['url']+'/health')
+                    break
+                except OSError:
+                    pass
             if time.monotonic() > deadline:
-                raise TimeoutError('等待 health 超时')
+                raise TimeoutError('等待scheduler初始化/逻辑首stage health超时')
             time.sleep(3)
-        state['phase'] = 'FIRST_REQUEST'
-        save()
-        response = request(state['url'], tokens=16)
-        (r/'FIRST_REQUEST.json').write_text(json.dumps(response, ensure_ascii=False, indent=2)+'\n')
-        assert 'error' not in response and response.get('meta_info', {}).get('completion_tokens', 0) > 0, response
-        state['phase'] = 'FREQUENCY_CHECK'
-        save()
-        sampler, state['frequency'] = prepare_compute(r, logs, lambda: checked_warmup(state['url']))
+        if state['pd_mode'] != 'null':
+            # P/D endpoints cannot generate alone. The cluster router establishes
+            # a real transfer before frequency admission; never fake a local request.
+            state['phase'] = 'HTTP_READY' if layout['http_endpoint'] else 'STAGE_READY'
+            save()
+            deadline = time.monotonic() + startup_timeout
+            while not (r/'PD_ADMIT.json').is_file():
+                runtime_logging.check(service)
+                if (r/'STOP').exists():
+                    raise KeyboardInterrupt()
+                if service.poll() is not None:
+                    raise RuntimeError('PD服务在router接入前退出')
+                if time.monotonic() > deadline:
+                    raise TimeoutError('等待PD集群router接入超时')
+                time.sleep(1)
+            admission = json.loads((r/'PD_ADMIT.json').read_text())
+            if admission['cluster_token'] != os.environ.get('QWEN_CLUSTER_TOKEN'):
+                raise RuntimeError('PD admission不属于本集群实例')
+            from tools import compute_frequency as cores
+            cores.REPLACEMENT_OFFSETS = (16, 37)  # offset19 belongs to Mooncake
+            sampler, state['frequency'] = prepare_compute(r, logs, lambda: checked_warmup(admission['router_url']))
+        else:
+            state['phase'] = 'FIRST_REQUEST'
+            save()
+            response = request(state['url'], tokens=16)
+            (r/'FIRST_REQUEST.json').write_text(json.dumps(response, ensure_ascii=False, indent=2)+'\n')
+            assert 'error' not in response and response.get('meta_info', {}).get('completion_tokens', 0) > 0, response
+            state['phase'] = 'FREQUENCY_CHECK'
+            save()
+            sampler, state['frequency'] = prepare_compute(r, logs, lambda: checked_warmup(state['url']))
         state['phase'] = 'READY'
         save()
-        print('READY；频率状态=' + str(state['frequency']) + '；另开终端执行 bash run.sh request 或 bench。Ctrl-C 或 bash run.sh stop 停止。', flush=True)
+        test_hint = ('通过集群router发请求和测试。' if state['pd_mode'] != 'null' else
+                     '另开终端执行 bash run.sh request 或 bench。')
+        print('READY；频率状态=' + str(state['frequency']) + '；' + test_hint + 'Ctrl-C 或 bash run.sh stop 停止。', flush=True)
         frequency_warned = False
         while not (r/'STOP').exists():
+            runtime_logging.check(service)
             if sampler is not None:
                 condition = (False if sampler['out_of_range_reads'] else
                              None if sampler['missing_reads'] or sampler['error'] or not sampler['sample_rounds'] else True)
@@ -272,6 +341,7 @@ def start(r, logs):
         state['phase'] = 'STOPPED'
     except BaseException as error:
         state.update(phase='FAILED', error=repr(error))
+        save()  # Let the cluster stop router admission while local cleanup runs.
         raise
     finally:
         if sampler is not None:
@@ -283,6 +353,10 @@ def start(r, logs):
             if service is not None and service.poll() is None:
                 os.killpg(service.pid, signal.SIGTERM)
                 service.wait(timeout=75)
+            if service is not None:
+                log_error = runtime_logging.finish(service)
+                if log_error:
+                    state['log_error'] = log_error
             subprocess.run([os.environ['CLIENT_PYTHON'], '-B', '-S',
                             kit/'tools/cleanup_owned_shm.py', r], env=clean, check=True)
             state['cleanup'] = 'confirmed'

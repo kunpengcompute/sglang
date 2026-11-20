@@ -1,78 +1,130 @@
-# 复制为部署目录的config.sh；路径和服务参数只在这里填写。
-# 工具源码留在SGLang，输出全部写入DEPLOY_DIR。
-export SGLANG_SOURCE=/请填写/sglang源码目录
-export DEPLOY_DIR=/请填写/deployments/pr301_20261105_920f_tp16
-# DEPLOY_DIR对应源码版本/依赖/拓扑配方，不包含运行节点名。
-# 相同包在兼容节点复用；每次start自动创建独立instances和logs记录。
-export PYTHON=/请填写/配套Python/bin/python
+# Qwen3.8 920F当前环境示例：4P4D、MTP3、256k。
+# 新部署请修改DEPLOY_DIR及对应SSH配置，不覆盖现有release。
+# build/pack使用源码run.sh；启停使用release/run.sh；配置在下次启动生效。
+
+# ── 1. 环境路径：首次部署或换机器时核对源码、输出、模型、Python和SDK ──
+export MODEL=/home/share/lidonghua/workspaces_inference/data/models/Qwen3.8-27B-w8a8
+export SGLANG_SOURCE=/home/share/lidonghua/workspaces_inference/inference_work/qwen36_27b_bf16/sglang_20261120_r9_vlfix01
+export DEPLOY_DIR=/home/share/lidonghua/workspaces_inference/inference_work/qwen36_27b_bf16/deployments/qwen38_r9_cn21691_8nodes_20261120_vlfix01
+export PYTHON=/home/share/lidonghua/conda_envs/qwen36_0904_rebase/bin/python
 export CLIENT_PYTHON=/usr/bin/python3
-export CC=/请填写/bisheng/bin/clang
-export CXX=/请填写/bisheng/bin/clang++
-export KUTACC_PREFIX=/请填写/带日期的KuTACC安装前缀
-export KUPL_PREFIX=/请填写/带日期的KuPL安装前缀
-export COMPILER_RUNTIME_LIB=/请填写/bisheng/lib
+export CC=/work_ssd/software/HPCKit/26.0.RC1/compiler/bisheng/bin/clang
+export CXX=/work_ssd/software/HPCKit/26.0.RC1/compiler/bisheng/bin/clang++
+export KUTACC_PREFIX=/home/share/lidonghua/workspaces_inference/inference_work/kutacc/kutacc_20261104_edfe1e8fa
+export KUPL_PREFIX=/home/share/lidonghua/workspaces_inference/inference_work/kupl/kupl_20261104_26_0_rc1_e946222d
+export COMPILER_RUNTIME_LIB=/work_ssd/software/HPCKit/26.0.RC1/compiler/bisheng/lib
 export EXTRA_LIBRARY_PATH=/usr/lib64/libibverbs
-export MODEL=/请填写/模型权重目录
-export PERF_TUNE=/请填写/已授权的performance_tune
+export PERF_TUNE=/work_ssd/software/performance_tune
 export BUILD_JOBS=16
+export KERNEL_BUILD_RECEIPT=""  # 留空使用本DEPLOY_DIR/KERNEL_BUILD.json
+export PD_CLUSTER_DIR="$DEPLOY_DIR/cluster"
+export PD_CONTROL_PYTHON="$CLIENT_PYTHON"
 
-# 无需重新编译时，可填写已有、同源码版本的完整构建记录；pack校验DSO和依赖。
-# 留空则使用本DEPLOY_DIR/KERNEL_BUILD.json。不会覆盖或移动旧构建。
-export KERNEL_BUILD_RECEIPT=""
+# ── 2. 服务参数：256k为输入与输出合计；Router端口30000；MTP3 ──
+export QWEN_DEPLOY_MODE=pd
+export QWEN_CONTEXT_LENGTH=262144
+export QWEN_HOST=0.0.0.0
+export PD_ROUTER_NODE=cn21691
+export PD_ROUTER_PORT=30000
+export PD_ROUTER_METRICS_PORT=30010
+export QWEN_HTTP_PORT=31086
+export PD_SERVICE_PORT=31086
+export QWEN_DIST_PORT=29986
+export PD_DIST_PORT=29986
+export PD_BOOTSTRAP_PORT=9001
+export SGLANG_ENABLE_MTP=1
+export SGLANG_SPECULATIVE_NUM_STEPS=3
+export SPECULATIVE_DRAFT_MODEL_PATH="$MODEL"
+export SGLANG_KUNPENG_QWEN_VISION="1"
+export SGLANG_QWEN_DEFAULT_THINKING="0"
+export QWEN_TOOL_CALL_PARSER="qwen3_coder"
+export QWEN_SEED=77101
 
-# 每rank split HBM总预算；当前实现要求4000MiB。
-# SHM包含在总预算内，不是额外叠加。两个角色配置当前保持一致。
+# ── 3. 拓扑与网络：节点先P后D，IP顺序对应；4P组成PP4，4D为独立副本 ──
+export PD_PREFILL_NODES=4
+export PD_DECODE_NODES=4
+export PD_NODE_HOSTS="cn21691 cn21693 cn21694 cn21695 cn21696 cn21697 cn21698 cn21699"
+export PD_NODE_FILE=""
+export PD_ADVERTISE_HOSTS="10.36.170.59 10.36.170.61 10.36.170.62 10.36.170.63 10.36.170.64 10.36.170.65 10.36.170.66 10.36.170.67"
+export PD_PREFILL_TP_SIZE=16
+export PD_PREFILL_PP_SIZE=4
+export PD_PREFILL_NNODES=4
+export PD_PREFILL_LAYER_PARTITION="20,16,16,12"
+export PD_DECODE_TP_SIZE=16
+export PD_DECODE_PP_SIZE=1
+export PD_DECODE_NNODES=1
+export PD_DECODE_LAYER_PARTITION=""
+export PD_ROUTER_CPUS=586,607
+export PD_SSH_USER=lidonghua
+export PD_SSH_OPTIONS="-F /home/share/lidonghua/workspaces_inference/inference_work/qwen36_27b_bf16/deployments/qwen38_r9_cn21691_8nodes_20261120_vlfix01/control/ssh_config"
+export PD_IB_DEVICE=roceroh0
+export PD_NET_INTERFACE=enp26s0f0
+export PD_START_TIMEOUT=2400
+export PD_STOP_TIMEOUT=600
+
+# ── 4. 容量与资源：KV容量由实例内请求共享；每rank HBW含通信区；频率单位MHz ──
+export PD_PREFILL_MAX_RUNNING_REQUESTS=32
+export PD_PREFILL_MAX_SEQ_NUM=32
+export PD_PREFILL_MAX_TOTAL_TOKENS=524544
+export PD_DECODE_MAX_RUNNING_REQUESTS=8
+export PD_DECODE_MAX_SEQ_NUM=8
+export PD_DECODE_MAX_TOTAL_TOKENS=262720
+export PD_DECODE_GRAPH_MAX_REQUESTS=8
+export PD_DECODE_GRAPH_MAX_TOKENS=128
 export SGLANG_KUNPENG_WEIGHTS_HBW_POOL_SIZE_MB=4000
-export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=384
-export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=384
-# ensure：不足时保留原配置并补齐；check：仅核查，由管理员准备。
+export PD_PREFILL_SHARED_HBW_SHM_MIB=384
+export PD_DECODE_SHARED_HBW_SHM_MIB=128
 export HBM_HUGEPAGE_MODE=ensure
-# auto=私有HBW池向上按2MiB换算，再留2页余量；当前等于3620MiB/1810页。
 export HBM_HUGEPAGE_MB_PER_NODE=auto
-
-# 调频和频率验收分开；任何频率异常均告警后继续服务。
-export CPU_FREQ_MODE=apply              # keep不主动调频，仍采样/按配置换核
+export CPU_FREQ_MODE=apply
 export CPU_FREQ_TARGET_MHZ=2000
 export CPU_FREQ_TOLERANCE_MHZ=20
-# 某些920F的scaling_setspeed返回实测值。无法可靠识别原标称值时，
-# 填写经管理员确认的恢复频率；留空且无法识别时跳过主动调频并告警。
-export CPU_FREQ_RESTORE_MHZ=""
-export CPU_REMAP_SAME_NUMA=1
+export CPU_FREQ_RESTORE_MHZ=1550  # 本集群恢复值，换机器需确认
+export CPU_REMAP_SAME_NUMA=0
 
-export QWEN_HOST=0.0.0.0
-export QWEN_HTTP_PORT=31086
-export QWEN_DIST_PORT=29986
-export QWEN_CONTEXT_LENGTH=69632
+# ── 5. 日志：每条流16MiB、2份备份；历史保留由prune命令执行 ──
+export QWEN_LOG_LEVEL=warning
+export QWEN_LOG_MAX_MIB=16
+export QWEN_LOG_BACKUPS=2
+export QWEN_FREQUENCY_LOG=summary
+export QWEN_LOG_KEEP_DAYS=7
+export QWEN_LOG_KEEP_RUNS=5
+
+# ── 6. P/D配方：Decode启用Target双镜像和Draft驻留，通常保持不变 ──
+export PD_PREFILL_IS_PREFILL=1
+export PD_DECODE_IS_PREFILL=0
+export PD_PREFILL_SWAP_KV_IN=0
+export PD_DECODE_SWAP_KV_IN=1
+export PD_PREFILL_GQA_DOUBLE_PAIR=0
+export PD_DECODE_GQA_DOUBLE_PAIR=1
+export PD_PREFILL_PREFILL_WORKSPACE_HBM=1
+export PD_DECODE_PREFILL_WORKSPACE_HBM=0
+export PD_PREFILL_QWEN_DRAFT_MIRROR_REUSE=0
+export PD_DECODE_QWEN_DRAFT_MIRROR_REUSE=1
+export PD_PREFILL_QWEN_DRAFT_RESIDENCY_V2=0
+export PD_DECODE_QWEN_DRAFT_RESIDENCY_V2=1
+export PD_PREFILL_SDMA_THRESHOLD_PRESET=1
+export PD_DECODE_SDMA_THRESHOLD_PRESET=1
+export PD_PREFILL_SDMA_THRESHOLD=5
+export PD_DECODE_SDMA_THRESHOLD=5
+
+# ── 7. 派生值与基础默认值：PD启动时由前面的角色容量覆盖 ──
 export QWEN_MAX_TOTAL_TOKENS=73728
 export QWEN_MAX_RUNNING_REQUESTS=16
-export QWEN_SEED=77101
-# 注意力后端：多模态(vision)部署必须torch_native；kunpeng_cpu与vision运行时组合在init即失败。
-# 纯文本部署可删除本行（launch.py缺省仍传kunpeng_cpu）。
-export QWEN_ATTENTION_BACKEND="torch_native"
+export SGLANG_KUNPENG_MAX_CUR_LEN=4096
+export SGLANG_KUNPENG_MAX_SEQ_LEN="$QWEN_CONTEXT_LENGTH"
+export SGLANG_KUNPENG_MAX_SEQ_NUM="$QWEN_MAX_RUNNING_REQUESTS"
+export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=384
+export SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=384
+export SGLANG_KUNPENG_SHARED_HBW_TOTAL_MIB=4000
+export SGLANG_KUNPENG_SHARED_HBW_BACKING=split
+export QWEN_ATTENTION_BACKEND="kunpeng_cpu"
+
+# ── 8. 算子、图执行和线程配方：TileLang需匹配依赖后启用 ──
 export QWEN_TEST_INPUT_TOKENS=1024
 export QWEN_TEST_OUTPUT_TOKENS=1024
 export QWEN_TEST_CONCURRENCY=1
 export QWEN_TEST_WARMUP_TOKENS=16
-
-# 统一MTP开关；开启时走NEXTN（ServerArgs归一为EAGLE），topk=1，draft tokens=steps+1。
-export SGLANG_ENABLE_MTP=0
-export SGLANG_SPECULATIVE_NUM_STEPS=3
-# 共享checkpoint可留空；需要独立draft权重时填写对应目录。
-export SPECULATIVE_DRAFT_MODEL_PATH=""
-# 1 = GDN verify 使用 C++ 算子，可被 Tilelang 算子开关覆盖
-# 0 = GDN verify 使用 Pytorch 算子，可被 Tilelang 算子开关覆盖
-export SGLANG_KUNPENG_GDN_VERIFY_FUSED="1"
-# 1 = GDN verify 改用 TileLang 算子（替代 C++ SVE 融合核）
-# 0 = 保持 Pytorch 或 C++ 算子实现，便于做性能回退对比
-export SGLANG_KUNPENG_GDN_VERIFY_TILELANG="1"
-# 1 = 在启动阶段提前编译各 batch_size 的 TileLang 算子
-# 0 = 在实际遇到对应 batch_size 的输入时，再才编译指定 shape 的 TileLang 算子
-export SGLANG_KUNPENG_TL_OP_PRECOMPILE="1"
-# 对 Tilelang 算子进行回退，主要用来优化 bs1 的场景（bs1时cpp算子性能比tl算子性能更优）
-# 支持传入 "3", "1,3,4,5" 用来表示回退 bs{3} 或者回退 bs{1,3,4,5}
-export SGLANG_KUNPENG_GDN_VERIFY_TILELANG_FALLBACK_BATCH_SIZE="1"
-
-# Qwen公共运行配方。更改容量时同步映射下面三个字段。
 export EP_SIZE="1"
 export HF_HUB_OFFLINE="1"
 export KMP_AFFINITY="disabled"
@@ -104,26 +156,25 @@ export SGLANG_KUNPENG_ENABLE_PREFILL_GRAPH="1"
 export SGLANG_KUNPENG_ENABLE_SHM_FENCE="0"
 export SGLANG_KUNPENG_GRAPH_CACHE_SIZE="40"
 export SGLANG_KUNPENG_GRAPH_LOG_REPLAY="0"
+export SGLANG_KUNPENG_GDN_VERIFY_FUSED="1"
+export SGLANG_KUNPENG_GDN_VERIFY_TILELANG="0"
+export SGLANG_KUNPENG_TL_OP_PRECOMPILE="0"
+export SGLANG_KUNPENG_GDN_VERIFY_TILELANG_FALLBACK_BATCH_SIZE="1"
+export SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE="1"
 export SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD="1"
 export SGLANG_KUNPENG_HBW_ALLOW_DDR_FALLBACK="0"
 export SGLANG_KUNPENG_HBW_LOG_PLACEMENT="0"
-export SGLANG_KUNPENG_MAX_CUR_LEN="$QWEN_CONTEXT_LENGTH"
-export SGLANG_KUNPENG_MAX_SEQ_LEN="$QWEN_CONTEXT_LENGTH"
-export SGLANG_KUNPENG_MAX_SEQ_NUM="$QWEN_MAX_RUNNING_REQUESTS"
 export SGLANG_KUNPENG_QWEN="1"
 export SGLANG_KUNPENG_QWEN_PREFILL_BACKEND="kutacc"
 export SGLANG_KUNPENG_QWEN_PREFILL_GEMM_ROWS="512"
 export SGLANG_KUNPENG_QWEN_PREFILL_WORKSPACE_HBM="1"
 export SGLANG_KUNPENG_QWEN_SHARED_PREFILL_KV="1"
-# 多模态vision运行时开关；代码缺省已开启，显式声明便于识别多模态部署，置0退回纯文本服务。
-export SGLANG_KUNPENG_QWEN_VISION="1"
 export SGLANG_KUNPENG_RDMA_ALLGATHER="0"
 export SGLANG_KUNPENG_SWAP_EXPERT="0"
 export SGLANG_KUNPENG_SWAP_KV_BLOCKWISE="0"
 export SGLANG_KUNPENG_SWAP_KV_IN="0"
 export SGLANG_KUNPENG_SWAP_KV_OUT="0"
 export SGLANG_KUNPENG_TORCH_NUM_THREADS="32"
-export SGLANG_QWEN_DEFAULT_THINKING="0"
 export SGLANG_SET_CPU_AFFINITY="1"
 export SGLANG_USE_CPU_920F="1"
 export SGLANG_USE_CPU_ENGINE="1"
@@ -146,3 +197,10 @@ export SGLANG_KUNPENG_QWEN_NORM_PARTIAL_OCCUPANCY_ROWGROUPS="1"
 export SGLANG_KUNPENG_QWEN_GQA_ORDERED_EXP="1"
 export SGLANG_KUNPENG_SDMA_THRESHOLD="1048576"
 export SGLANG_KUNPENG_HBW_BIND_BEFORE_MMAP="1"
+export SGLANG_KUNPENG_MAMBA_CHECKPOINT_HBW=1
+export SGLANG_KUNPENG_MTP_MLP_TAIL=0
+export SGLANG_KUNPENG_QWEN_PREFILL_RESIDENT=0
+export SGLANG_KUNPENG_QWEN_PREFILL_STREAM=0
+export SGLANG_KUNPENG_QWEN_GQA_STREAM=0
+export SGLANG_KUNPENG_QWEN_GQA_STREAM_PREFETCH=0
+export SGLANG_KUNPENG_QWEN_GQA_LAYER_PIPELINE=0

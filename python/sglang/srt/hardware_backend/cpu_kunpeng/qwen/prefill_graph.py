@@ -34,8 +34,8 @@ def unsupported_reason(fb):
         return "prefill_total_tokens_outside_1_4096"
     if not 1 <= fb.batch_size <= fb.input_ids.numel():
         return "prefill_invalid_request_count"
-    if fb.contains_image_inputs():
-        return "image_inputs"
+    if fb.contains_image_inputs() and getattr(fb, "mm_input_embeds", None) is None:
+        return "image_inputs_not_embedded"
     # The provider checks the mask before capture. Calling any() while capturing
     # would create an unregistered scalar tensor in the boxed ATen bridge.
     if getattr(fb, "mamba_checkpoint_offsets", None) is not None and getattr(

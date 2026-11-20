@@ -217,6 +217,10 @@ class PPNextNWorker(EAGLEWorker):
                 next_token_ids,
                 batch.seq_lens_cpu,
                 logits_output.mm_input_embeds,
+                mrope_positions=(
+                    pp_proxy_tensors.tensors.get("mrope_positions")
+                    if pp_proxy_tensors is not None else None
+                ),
             )
 
         # Chain the remaining draft steps (prefill): the draft-extend

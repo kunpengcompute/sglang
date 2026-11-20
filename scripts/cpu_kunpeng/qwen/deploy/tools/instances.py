@@ -46,6 +46,8 @@ def select(root, port, instance_id=None):
 
 
 def require_local_http(state):
+    if state.get('topology', {}).get('http_endpoint') is False:
+        raise RuntimeError('此节点是PP后续stage，request/bench请通过集群router')
     if state['hostname'] != socket.gethostname():
         raise RuntimeError('request/bench请在实例所在节点执行；跨节点可用status/stop --instance，或HTTP客户端访问目标节点地址')
 

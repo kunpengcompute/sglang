@@ -38,15 +38,21 @@ def register_rows():
     bridge = ctypes.CDLL(common_ops.__file__)
     _libraries.append(bridge)
     _register_graph_dispatch(bridge, "qwen_gqa_rows", "qwen_graph_gqa_rows_dispatch")
+    workspace_numel = bridge.qwen36_gqa_flash_decode_workspace_numel
+    workspace_numel.argtypes = [ctypes.c_int64] * 3
+    workspace_numel.restype = ctypes.c_int64
 
     def shape(q, k, v, t, r, l, s):
         global rows_capture_count
         rows_capture_count += 1
         if not 1 <= q.shape[0] <= NATIVE_DECODE_MAX_TOKENS:
             raise ValueError(f"GQA query rows must be in 1..{NATIVE_DECODE_MAX_TOKENS}")
+        scratch = workspace_numel(min(q.shape[0], 32), q.shape[1], t.shape[1])
+        if scratch <= 0:
+            raise ValueError("Unsupported GQA Flash-Decoding workspace geometry")
         return [
             (tuple(q.shape), q.dtype),
-            ((min(q.shape[0], 32) * q.shape[1] * (t.shape[1] + 256),), torch.float32),
+            ((scratch,), torch.float32),
         ]
 
     register_op("qwen_gqa_rows", shape)
@@ -67,10 +73,11 @@ def register_primitives():
         ctypes.c_int64
     ] * 2
     layout.qwen36_attention_qkv_layout_bf16.restype = ctypes.c_int
-    rope.qwen36_attention_qknorm_rope_bf16.argtypes = (
-        [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 2 + [ctypes.c_float, ctypes.c_int64]
+    rope.qwen36_attention_qknorm_mrope_bf16.argtypes = (
+        [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 2
+        + [ctypes.c_float] + [ctypes.c_int64] * 6
     )
-    rope.qwen36_attention_qknorm_rope_bf16.restype = ctypes.c_int
+    rope.qwen36_attention_qknorm_mrope_bf16.restype = ctypes.c_int
     gdn.qwen36_gdn_decode_with_workspace.argtypes = (
         [ctypes.c_void_p] * 10
         + [ctypes.c_int64] * 6
@@ -422,17 +429,22 @@ def register_primitives():
             raise RuntimeError(f"QKV eager failed {rc}")
         return tuple(outputs)
 
-    def rope_shape(q, k, qw, kw, cache, pos, eps, mode):
+    def rope_shape(q, k, qw, kw, cache, pos, eps, mode, section_t=0, section_h=0, section_w=0, interleaved=False):
         return [(tuple(q.shape), q.dtype), (tuple(k.shape), k.dtype)]
 
-    def rope_eager(q, k, qw, kw, cache, pos, eps, mode):
+    def rope_eager(q, k, qw, kw, cache, pos, eps, mode, section_t=0, section_h=0, section_w=0, interleaved=False):
         qo, ko = torch.empty_like(q), torch.empty_like(k)
-        rc = rope.qwen36_attention_qknorm_rope_bf16(
+        axes = pos.numel() // q.shape[0]
+        if axes == 3 and section_t + section_h + section_w != 32:
+            if not (torch.equal(pos[0], pos[1]) and torch.equal(pos[0], pos[2])):
+                raise ValueError("Three-axis RoPE requires configured sections")
+            axes = 1
+        rc = rope.qwen36_attention_qknorm_mrope_bf16(
             *(t.data_ptr() for t in (q, k, qw, kw, cache, pos, qo, ko)),
             q.shape[0],
             cache.shape[0],
-            eps,
-            mode,
+            eps, mode, axes,
+            section_t, section_h, section_w, int(interleaved),
         )
         if rc:
             raise RuntimeError(f"QKNorm RoPE eager failed {rc}")

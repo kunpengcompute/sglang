@@ -76,18 +76,34 @@ inline void rotate_one_head_inplace(uint16_t *__restrict data, const uint16_t *_
 
 template <bool kEagerRounding>
 int apply_rope_inplace(uint16_t *query, uint16_t *key, const uint16_t *cos_sin_cache,
-                       const int64_t *positions, int64_t rows, int64_t cache_rows) {
+                       const int64_t *positions, int64_t rows, int64_t cache_rows,
+                       int64_t axes = 1, int64_t section_t = 0, int64_t section_h = 0,
+                       int64_t section_w = 0, bool interleaved = false) {
     if (query == nullptr || key == nullptr || cos_sin_cache == nullptr || positions == nullptr ||
-        rows <= 0 || cache_rows <= 0) {
+        rows <= 0 || cache_rows <= 0 || (axes != 1 && axes != 3) ||
+        (axes == 3 && section_t + section_h + section_w != kRotaryDim / 2)) {
         return 1;
     }
     for (int64_t row = 0; row < rows; ++row) {
-        const int64_t position = positions[row];
-        if (position < 0 || position >= cache_rows)
-            return 2;
-        const uint16_t *cache_row = cos_sin_cache + position * kRotaryDim;
-        const uint16_t *cos = cache_row;
-        const uint16_t *sin = cache_row + kRotaryDim / 2;
+        uint16_t selected_cos[kRotaryDim / 2], selected_sin[kRotaryDim / 2];
+        for (int64_t axis = 0; axis < axes; ++axis) {
+            const int64_t position = positions[axis * rows + row];
+            if (position < 0 || position >= cache_rows) return 2;
+        }
+        const uint16_t *cache_row = cos_sin_cache + positions[row] * kRotaryDim;
+        const uint16_t *cos = cache_row, *sin = cache_row + kRotaryDim / 2;
+        if (axes == 3) {
+            for (int64_t i = 0; i < kRotaryDim / 2; ++i) {
+                const int64_t axis = interleaved
+                    ? ((i % 3 == 1 && i < section_h * 3) ? 1
+                       : (i % 3 == 2 && i < section_w * 3) ? 2 : 0)
+                    : (i < section_t ? 0 : i < section_t + section_h ? 1 : 2);
+                const auto *selected = cos_sin_cache + positions[axis * rows + row] * kRotaryDim;
+                selected_cos[i] = selected[i];
+                selected_sin[i] = selected[kRotaryDim / 2 + i];
+            }
+            cos = selected_cos; sin = selected_sin;
+        }
         for (int64_t head = 0; head < kQueryHeads; ++head) {
             rotate_one_head_inplace<kEagerRounding>(query + (row * kQueryHeads + head) * kHeadDim,
                                                     cos, sin);
@@ -145,10 +161,11 @@ qwen36_attention_partial_neox_rope_bf16(const uint16_t *query, const uint16_t *k
 // Production candidate: two direct KuTACC RMSNorm calls followed by exact
 // in-place partial RoPE inside one C ABI.  Input/output and the tiny norm/cache
 // data remain rank-local DDR; no HBM object or collective is added.
-extern "C" __attribute__((visibility("default"))) int qwen36_attention_qknorm_rope_bf16(
+extern "C" __attribute__((visibility("default"))) int qwen36_attention_qknorm_mrope_bf16(
     uint16_t *query, uint16_t *key, const uint16_t *query_weight, const uint16_t *key_weight,
     const uint16_t *cos_sin_cache, const int64_t *positions, uint16_t *query_output,
-    uint16_t *key_output, int64_t rows, int64_t cache_rows, float eps, int64_t rounding_mode) {
+    uint16_t *key_output, int64_t rows, int64_t cache_rows, float eps, int64_t rounding_mode, int64_t axes,
+    int64_t section_t, int64_t section_h, int64_t section_w, int64_t interleaved) {
     if (rounding_mode < 0 || rounding_mode > 1)
         return 1;
     const int norm_status =
@@ -157,10 +174,19 @@ extern "C" __attribute__((visibility("default"))) int qwen36_attention_qknorm_ro
         return 10 + norm_status;
     if (rounding_mode == 0) {
         const int rope_status = apply_rope_inplace<true>(query_output, key_output, cos_sin_cache,
-                                                         positions, rows, cache_rows);
+                                                         positions, rows, cache_rows, axes, section_t, section_h, section_w, interleaved);
         return rope_status == 0 ? 0 : 20 + rope_status;
     }
     const int rope_status = apply_rope_inplace<false>(query_output, key_output, cos_sin_cache,
-                                                      positions, rows, cache_rows);
+                                                      positions, rows, cache_rows, axes, section_t, section_h, section_w, interleaved);
     return rope_status == 0 ? 0 : 20 + rope_status;
+}
+
+extern "C" __attribute__((visibility("default"))) int qwen36_attention_qknorm_rope_bf16(
+    uint16_t *query, uint16_t *key, const uint16_t *query_weight, const uint16_t *key_weight,
+    const uint16_t *cos_sin_cache, const int64_t *positions, uint16_t *query_output,
+    uint16_t *key_output, int64_t rows, int64_t cache_rows, float eps, int64_t rounding_mode) {
+    return qwen36_attention_qknorm_mrope_bf16(query, key, query_weight, key_weight,
+        cos_sin_cache, positions, query_output, key_output, rows, cache_rows, eps,
+        rounding_mode, 1, 0, 0, 0, false);
 }

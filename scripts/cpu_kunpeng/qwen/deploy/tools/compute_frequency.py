@@ -255,7 +255,7 @@ def load_rank_pids(evidence_dir: Path) -> dict[int, int]:
     for rank in range(RANK_COUNT):
         path = evidence_dir / f"rank{rank}.json"
         row = json.loads(path.read_text(encoding="utf-8"))
-        if row.get("status") != "SCHEDULER_STARTED":
+        if row.get("status") not in ("SCHEDULER_STARTED", "SCHEDULER_READY"):
             raise RuntimeError(f"rank {rank}: scheduler PID record is missing")
         if int(row.get("rank", -1)) != rank:
             raise RuntimeError(f"rank {rank}: evidence rank mismatch")

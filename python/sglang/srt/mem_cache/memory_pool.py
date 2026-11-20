@@ -27,6 +27,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -180,16 +181,22 @@ class ReqToTokenPool:
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
+                if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+                    hook.fresh_slot(select_index[offset])
                 r.req_pool_idx = select_index[offset]
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+            hook.release_slot(req)
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
+        if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+            hook.clear_slots()
         self.free_slots = list(range(1, self._alloc_size))
 
 
@@ -293,9 +300,15 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
+                # Placement is chosen once at pool construction; the default is unchanged.
+                checkpoint_zeros = (
+                    state_zeros
+                    if os.environ.get("SGLANG_KUNPENG_MAMBA_CHECKPOINT_HBW", "0") == "1"
+                    else torch.zeros
+                )
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
+                intermediate_ssm_state_cache = checkpoint_zeros(
                     size=(
                         num_mamba_layers,
                         spec_state_size + 1,
@@ -310,7 +323,7 @@ class MambaPool:
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
                 intermediate_conv_window_cache = [
-                    torch.zeros(
+                    checkpoint_zeros(
                         size=(
                             num_mamba_layers,
                             spec_state_size + 1,
@@ -1018,6 +1031,8 @@ class MHATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+            hook.before_pool_write()
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1072,6 +1087,8 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+            hook.before_pool_write()
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -1102,6 +1119,8 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+            hook.before_pool_write()
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return

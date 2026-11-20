@@ -185,16 +185,22 @@ class DecodeReqToTokenPool:
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
+                if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+                    hook.fresh_slot(select_index[offset])
                 r.req_pool_idx = select_index[offset]
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
     def free(self, req: "Req"):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+            hook.release_slot(req)
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
+        if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+            hook.clear_slots()
         self.free_slots = list(range(1, self._alloc_size))
 
 
@@ -260,6 +266,8 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
 
     def clear(self):
+        if (hook := getattr(self, "_qwen_draft_reuse", None)) is not None:
+            hook.clear_slots()
         self.free_slots = list(range(1, self._alloc_size))
         self.mamba_pool.clear()
 
@@ -1107,6 +1115,8 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            if (hook := getattr(self.draft_token_to_kv_pool, "_qwen_draft_reuse", None)) is not None:
+                hook.begin_receive(decode_req.req)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1460,6 +1470,8 @@ class DecodeTransferQueue:
                 f"This indicates metadata buffer index collision."
             )
             logger.error(error_msg)
+            if (hook := getattr(self.scheduler.disagg_decode_prealloc_queue.draft_token_to_kv_pool, "_qwen_draft_reuse", None)) is not None:
+                hook.fail_receive(decode_req.req)
             prepare_abort(
                 decode_req.req,
                 "Metadata corruption detected - bootstrap_room mismatch",
@@ -1469,6 +1481,8 @@ class DecodeTransferQueue:
             decode_req.kv_receiver = None
             return
 
+        if (hook := getattr(self.scheduler.disagg_decode_prealloc_queue.draft_token_to_kv_pool, "_qwen_draft_reuse", None)) is not None:
+            hook.finish_receive(decode_req.req)
         # Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
         # under the current weights and sampled a fresh handoff token, but when
@@ -1577,6 +1591,8 @@ class DecodeTransferQueue:
                 continue
 
             if poll == KVPoll.Failed:
+                if (hook := getattr(self.scheduler.disagg_decode_prealloc_queue.draft_token_to_kv_pool, "_qwen_draft_reuse", None)) is not None:
+                    hook.fail_receive(decode_req.req)
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
                     decode_req.kv_receiver.failure_exception()

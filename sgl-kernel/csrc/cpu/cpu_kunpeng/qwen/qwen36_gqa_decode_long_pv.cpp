@@ -1,262 +1,430 @@
-// P3 isolated long-PV leaf. Original parallel/serial and rows objects are reused.
-// QK and ordered-PV callbacks remain verbatim from accepted P3v1. Only
-// independent row/head softmax tasks are batched; short entries stay reused.
+#define QWEN_FLASH_QK_SME 0
+// Source-only Flash-Decoding candidate. The filename retains the existing TU.
+// BF16 paged KV -> FP32 online attention -> FP32 split merge -> BF16 output.
+// No full-history scores, persistent KV pack, heap workspace or nested launches.
 #include <arm_bf16.h>
 #include <arm_sve.h>
-
+#include <arm_sme.h>
+#include <kutacc.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
+#include <limits>
 
 namespace {
+constexpr int64_t kDim = 256;
+constexpr int64_t kBatch = 32;
+constexpr int64_t kQueries = 4;  // register reuse, not a service M restriction
+constexpr int64_t kKVTile = 128;
+constexpr int64_t kRecord = 272; // max, sum, padding, then 256 FP32 numerator values
+constexpr int64_t kNumerator = 16;
+constexpr float kNegativeInfinity = -std::numeric_limits<float>::infinity();
 
-constexpr int64_t kMaxQueryHeads = 6;
-constexpr int64_t kHeadDim = 256;
+int64_t ceil_div(int64_t a, int64_t b) { return a / b + (a % b != 0); }
+int64_t align_floats(int64_t n) { return ceil_div(n, 16) * 16; }
 
-inline float bf16_to_float(uint16_t value) {
-    const uint32_t bits = static_cast<uint32_t>(value) << 16;
-    float result;
-    std::memcpy(&result, &bits, sizeof(result));
-    return result;
+struct Layout {
+    int64_t workers, tile, task_slots, tile_stride, pack_stride, partial_rows, numel;
+};
+
+// Shape-only upper bound: grouping and live lengths are unknown at capture.
+// Actual tasks <= max(groups, workers), and every extra split adds <=4*heads
+// partial rows. Task-local tiles avoid relying on a pool worker-ID convention.
+Layout layout(int64_t batch, int64_t heads, int64_t capacity) {
+    if (batch < 1 || batch > kBatch || (heads != 2 && heads != 6) ||
+        capacity < 1 || capacity > INT32_MAX)
+        return {};
+    Layout p{};
+    p.workers = std::max<int64_t>(1, kutacc::get_thread_num());
+    p.tile = std::min(kKVTile, capacity);
+    const int64_t blocks = ceil_div(capacity, p.tile);
+    p.task_slots = std::min(std::max(batch, p.workers), batch * blocks);
+    p.tile_stride = align_floats(std::min(batch, kQueries) * heads * p.tile);
+    const int64_t extra = std::min({p.workers - 1, p.task_slots - 1,
+                                    batch * (blocks - 1)});
+    p.partial_rows = batch * heads + std::min(batch, kQueries) * heads * extra;
+    // Both arms reserve identical bounded micro-pack space. SVE leaves it unused.
+    p.pack_stride = (kDim / 2) * (p.tile + align_floats(std::min(batch, kQueries) * heads));
+    p.numel = p.task_slots * (p.tile_stride + p.pack_stride) + p.partial_rows * kRecord;
+    return p;
 }
 
-inline uint16_t float_to_bf16(float value) {
-    uint32_t bits;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t rounding_bias = 0x7fffu + ((bits >> 16) & 1u);
-    return static_cast<uint16_t>((bits + rounding_bias) >> 16);
-}
+struct Group {
+    int32_t request = 0;
+    int32_t rows[kQueries]{};
+    int64_t count = 0, maximum = 0, blocks = 0, splits = 1;
+    int64_t task_begin = 0, partial_begin = 0;
+};
 
-} // namespace
-
-
-#include <kutacc.h>
-#include <atomic>
-#include <vector>
-
-namespace {
 #if defined(__ARM_FEATURE_SVE_BF16)
-inline float qwen36_qk_dot_bf16(const uint16_t *__restrict query, const uint16_t *__restrict key) {
-    const svbool_t pg16 = svptrue_b16();
-    const svbool_t pg32 = svptrue_b32();
-    const int64_t lanes = static_cast<int64_t>(svcnth());
-    svfloat32_t accumulator = svdup_f32(0.0f);
-    for (int64_t column = 0; column < kHeadDim; column += lanes) {
-        accumulator = svbfdot_f32(
-            accumulator, svld1_bf16(pg16, reinterpret_cast<const bfloat16_t *>(query + column)),
-            svld1_bf16(pg16, reinterpret_cast<const bfloat16_t *>(key + column)));
+// Two adjacent local query heads; the same K vector feeds both and is reused
+// across up to four queries. H6 uses three head-pair passes over a tile.
+inline svfloat32x2_t qk_pair(svfloat32x2_t acc, const uint16_t *q,
+                            svbfloat16_t key, svbool_t pg) {
+    return svcreate2_f32(
+        svbfdot_f32(svget2_f32(acc, 0), svld1_bf16(pg,
+            reinterpret_cast<const bfloat16_t *>(q)), key),
+        svbfdot_f32(svget2_f32(acc, 1), svld1_bf16(pg,
+            reinterpret_cast<const bfloat16_t *>(q + kDim)), key));
+}
+
+void qk_tile_sve(const uint16_t *q, const uint16_t *k, const int32_t *indices,
+             const Group &g, const int32_t *lengths, int64_t heads, float scale,
+             int64_t first, int64_t count, int64_t stride, float *scores) {
+    const auto all32 = svptrue_b32();
+    for (int64_t t = 0; t < count; ++t) {
+        const auto *key = k + int64_t(indices[first + t]) * kDim;
+        for (int64_t h = 0; h < heads; h += 2) {
+            const auto zero = svdup_f32(0.0f);
+            auto a0 = svcreate2_f32(zero, zero), a1 = svcreate2_f32(zero, zero);
+            auto a2 = svcreate2_f32(zero, zero), a3 = svcreate2_f32(zero, zero);
+            for (int64_t c = 0; c < kDim; c += svcnth()) {
+                const auto pg = svwhilelt_b16(c, kDim);
+                const auto kv = svld1_bf16(pg,
+                    reinterpret_cast<const bfloat16_t *>(key + c));
+                if (g.count > 0 && first + t < lengths[g.rows[0]])
+                    a0 = qk_pair(a0, q + (int64_t(g.rows[0]) * heads + h) * kDim + c, kv, pg);
+                if (g.count > 1 && first + t < lengths[g.rows[1]])
+                    a1 = qk_pair(a1, q + (int64_t(g.rows[1]) * heads + h) * kDim + c, kv, pg);
+                if (g.count > 2 && first + t < lengths[g.rows[2]])
+                    a2 = qk_pair(a2, q + (int64_t(g.rows[2]) * heads + h) * kDim + c, kv, pg);
+                if (g.count > 3 && first + t < lengths[g.rows[3]])
+                    a3 = qk_pair(a3, q + (int64_t(g.rows[3]) * heads + h) * kDim + c, kv, pg);
+            }
+#define STORE_PAIR(I, A)                                                        \
+            if (g.count > I) {                                                  \
+                scores[((I) * heads + h) * stride + t] =                        \
+                    svaddv_f32(all32, svget2_f32(A, 0)) * scale;                 \
+                scores[((I) * heads + h + 1) * stride + t] =                    \
+                    svaddv_f32(all32, svget2_f32(A, 1)) * scale;                 \
+            }
+            STORE_PAIR(0, a0);
+            STORE_PAIR(1, a1);
+            STORE_PAIR(2, a2);
+            STORE_PAIR(3, a3);
+#undef STORE_PAIR
+        }
     }
-    return svaddv_f32(pg32, accumulator);
+}
+
+#if QWEN_FLASH_QK_SME
+// BF16 pairs are packed by reduction-dimension pair. One packed K block is
+// reused across all query/head rows of this request. No full-history pack.
+__arm_new("za") __attribute__((target("sme")))
+void qk_mopa(const uint32_t *qp, const uint32_t *kp, int64_t qstride,
+             int64_t kstride, int64_t rows, int64_t count, int64_t outstride,
+             float scale, float *scores) __arm_streaming {
+    const int64_t lanes = svcntw();
+    for (int64_t rb = 0; rb < rows; rb += lanes) {
+        const int64_t nr = std::min(lanes, rows - rb);
+        const auto pr = svwhilelt_b16(int64_t(0), 2 * nr);
+        for (int64_t nb = 0; nb < count; nb += 4 * lanes) {
+            const auto p0 = svwhilelt_b16(nb * 2, count * 2);
+            const auto p1 = svwhilelt_b16((nb + lanes) * 2, count * 2);
+            const auto p2 = svwhilelt_b16((nb + 2 * lanes) * 2, count * 2);
+            const auto p3 = svwhilelt_b16((nb + 3 * lanes) * 2, count * 2);
+            svzero_za();
+            for (int64_t d = 0; d < kDim / 2; ++d) {
+                const auto qq = svld1_bf16(pr, reinterpret_cast<const bfloat16_t *>(qp + d * qstride + rb));
+#define QK_MOPA(T, P, OFFSET)                                                   \
+                if (nb + OFFSET < count) {                                     \
+                    const auto kk = svld1_bf16(P, reinterpret_cast<const bfloat16_t *>(kp + d * kstride + nb + OFFSET)); \
+                    svmopa_za32_bf16_m(T, pr, P, qq, kk);                       \
+                }
+                QK_MOPA(0, p0, 0);
+                QK_MOPA(1, p1, lanes);
+                QK_MOPA(2, p2, 2 * lanes);
+                QK_MOPA(3, p3, 3 * lanes);
+#undef QK_MOPA
+            }
+            for (int64_t i = 0; i < nr; ++i) {
+#define QK_STORE(T, OFFSET)                                                     \
+                if (nb + OFFSET < count) {                                     \
+                    const auto po = svwhilelt_b32(nb + OFFSET, count);          \
+                    const auto ss = svread_hor_za32_f32_m(svdup_f32(0.0f), po, T, uint32_t(i)); \
+                    svst1_f32(po, scores + (rb + i) * outstride + nb + OFFSET, svmul_n_f32_x(po, ss, scale)); \
+                }
+                QK_STORE(0, 0);
+                QK_STORE(1, lanes);
+                QK_STORE(2, 2 * lanes);
+                QK_STORE(3, 3 * lanes);
+#undef QK_STORE
+            }
+        }
+    }
+}
+
+__attribute__((target("sme")))
+void qk_tile_sme(const uint16_t *q, const uint16_t *k, const int32_t *indices,
+                 const Group &g, int64_t heads, float scale, int64_t first,
+                 int64_t count, int64_t stride, float *scores, uint32_t *pack) {
+    const int64_t rows = g.count * heads, qr = align_floats(rows);
+    auto *kp = pack;
+    auto *qp = kp + (kDim / 2) * stride;
+    uint32_t qindex[kQueries * 6];
+    for (int64_t r = 0; r < rows; ++r)
+        qindex[r] = uint32_t((int64_t(g.rows[r / heads]) * heads + r % heads) * (kDim / 2));
+    const auto *q32 = reinterpret_cast<const uint32_t *>(q);
+    const auto *k32 = reinterpret_cast<const uint32_t *>(k);
+    // This ordinary ABI body may use SVE gather; the streaming kernel does not.
+    for (int64_t d = 0; d < kDim / 2; ++d) {
+        for (int64_t r = 0; r < rows; r += svcntw()) {
+            const auto pg = svwhilelt_b32(r, rows);
+            auto ix = svadd_n_u32_x(pg, svld1_u32(pg, qindex + r), uint32_t(d));
+            svst1_u32(pg, qp + d * qr + r, svld1_gather_u32index_u32(pg, q32, ix));
+        }
+        for (int64_t t = 0; t < count; t += svcntw()) {
+            const auto pg = svwhilelt_b32(t, count);
+            auto ix = svreinterpret_u32_s32(svld1_s32(pg, indices + first + t));
+            ix = svadd_n_u32_x(pg, svmul_n_u32_x(pg, ix, uint32_t(kDim / 2)), uint32_t(d));
+            svst1_u32(pg, kp + d * stride + t, svld1_gather_u32index_u32(pg, k32, ix));
+        }
+    }
+    qk_mopa(qp, kp, qr, stride, rows, count, stride, scale, scores);
 }
 #endif
 
+// Per-row online recurrence. scores becomes exp(score-new_max), NOT a BF16
+// probability matrix. Empty row/split intersections leave (max,sum,U) unchanged.
+void online_weights(float *scores, int64_t stride, int64_t count, int64_t first,
+                    const Group &g, int64_t heads, const int32_t *lengths,
+                    float *records, float *alpha, int32_t *row_lengths) {
+    for (int64_t r = 0; r < g.count; ++r)
+        for (int64_t h = 0; h < heads; ++h) {
+            const int64_t row = r * heads + h;
+            auto *s = scores + row * stride;
+            auto *state = records + row * kRecord;
+            row_lengths[row] = lengths[g.rows[r]];
+            const int64_t live = std::clamp<int64_t>(row_lengths[row] - first, 0, count);
+            alpha[row] = 1.0f;
+            if (live) {
+                float maximum = kNegativeInfinity;
+                for (int64_t t = 0; t < live; ++t) maximum = std::max(maximum, s[t]);
+                maximum = std::max(maximum, state[0]);
+                alpha[row] = state[1] > 0.0f ? std::exp(state[0] - maximum) : 0.0f;
+                float sum = 0.0f;
+                for (int64_t t = 0; t < live; ++t) {
+                    s[t] = std::exp(s[t] - maximum);
+                    sum += s[t];
+                }
+                state[0] = maximum;
+                state[1] = alpha[row] * state[1] + sum;
+            }
+            std::fill(s + live, s + count, 0.0f);
+        }
+}
+
+// Four ZA32 tiles cover four streaming FP32 column vectors. Row/column tails
+// follow each worker's streaming VL. Scores stay FP32; V widens exactly BF16->F32.
+__arm_new("za") __attribute__((target("sme")))
+void pv_tile_sme(const uint16_t *v, const int32_t *indices,
+                 const float *weights, int64_t stride, int64_t row_count,
+                 const int32_t *lengths, const float *alpha, int64_t first,
+                 int64_t count, float *records) __arm_streaming {
+    alignas(64) float probabilities[kQueries * 6];
+    const int64_t lanes = svcntw();
+    for (int64_t rb = 0; rb < row_count; rb += lanes) {
+        const int64_t nr = std::min(lanes, row_count - rb);
+        const auto pr = svwhilelt_b32(int64_t(0), nr);
+        const auto limits = svld1_s32(pr, lengths + rb);
+        for (int64_t c = 0; c < kDim; c += 4 * lanes) {
+            const auto p0 = svwhilelt_b32(c, kDim);
+            const auto p1 = svwhilelt_b32(c + lanes, kDim);
+            const auto p2 = svwhilelt_b32(c + 2 * lanes, kDim);
+            const auto p3 = svwhilelt_b32(c + 3 * lanes, kDim);
+            svzero_za();
+            for (int64_t t = 0; t < count; ++t) {
+                const auto active = svcmpgt_n_s32(pr, limits, int32_t(first + t));
+                // Base SME streaming mode does not admit SVE gather loads.
+#pragma clang loop vectorize(disable) interleave(disable)
+                for (int64_t i = 0; i < nr; ++i)
+                    probabilities[i] = weights[(rb + i) * stride + t];
+                const auto probability = svld1_f32(pr, probabilities);
+                const auto *value = v + int64_t(indices[first + t]) * kDim + c;
+#define PV_TILE(T, P, OFFSET)                                                    \
+                if (c + OFFSET < kDim) {                                       \
+                    const auto vv = svreinterpret_f32(svlsl_n_u32_x(P,          \
+                        svld1uh_u32(P, value + OFFSET), 16));                  \
+                    svmopa_za32_f32_m(T, active, P, probability, vv);            \
+                }
+                PV_TILE(0, p0, 0);
+                PV_TILE(1, p1, lanes);
+                PV_TILE(2, p2, 2 * lanes);
+                PV_TILE(3, p3, 3 * lanes);
+#undef PV_TILE
+            }
+            for (int64_t i = 0; i < nr; ++i) {
+                auto *u = records + (rb + i) * kRecord + kNumerator + c;
+                const auto a = svdup_f32(alpha[rb + i]);
+#define STORE_TILE(T, P, OFFSET)                                                 \
+                if (c + OFFSET < kDim) {                                       \
+                    const auto block = svread_hor_za32_f32_m(                   \
+                        svdup_f32(0.0f), P, T, uint32_t(i));                    \
+                    const auto merged = svmla_f32_x(P, block,                  \
+                        svld1_f32(P, u + OFFSET), a);                          \
+                    svst1_f32(P, u + OFFSET, merged);                           \
+                }
+                STORE_TILE(0, p0, 0);
+                STORE_TILE(1, p1, lanes);
+                STORE_TILE(2, p2, 2 * lanes);
+                STORE_TILE(3, p3, 3 * lanes);
+#undef STORE_TILE
+            }
+        }
+    }
+}
+
+// Ordinary ABI boundary: the compiler owns streaming-mode and ZA transitions.
+__attribute__((target("sme")))
+void pv_tile(const uint16_t *v, const int32_t *indices, const float *weights,
+              int64_t stride, int64_t rows, const int32_t *lengths,
+              const float *alpha, int64_t first, int64_t count, float *records) {
+    pv_tile_sme(v, indices, weights, stride, rows, lengths, alpha, first, count, records);
+}
+
+void merge_row(const Group &g, int64_t local_row, int64_t heads, float *partials,
+               uint16_t *output) {
+    const int64_t rh = g.count * heads;
+    auto record = [&](int64_t split) {
+        return partials + (g.partial_begin + split * rh + local_row) * kRecord;
+    };
+    float maximum = kNegativeInfinity;
+    for (int64_t split = 0; split < g.splits; ++split) {
+        const auto *s = record(split);
+        if (s[1] > 0.0f) maximum = std::max(maximum, s[0]);
+    }
+    float denominator = 0.0f;
+    for (int64_t split = 0; split < g.splits; ++split) {
+        auto *s = record(split);
+        // This row owns its records after the split phase joins. Reuse max as
+        // its merge weight so exp is evaluated once, not once per output column.
+        s[0] = s[1] > 0.0f ? std::exp(s[0] - maximum) : 0.0f;
+        denominator += s[0] * s[1];
+    }
+    const float reciprocal = 1.0f / denominator;
+    auto *out = output + (int64_t(g.rows[local_row / heads]) * heads + local_row % heads) * kDim;
+    for (int64_t c = 0; c < kDim; c += svcntw()) {
+        const auto pg = svwhilelt_b32(c, kDim);
+        auto sum = svdup_f32(0.0f);
+        for (int64_t split = 0; split < g.splits; ++split) {
+            const auto *s = record(split);
+            sum = svmla_f32_x(pg, sum, svld1_f32(pg, s + kNumerator + c), svdup_f32(s[0]));
+        }
+        const auto value = svmul_n_f32_x(pg, sum, reciprocal);
+        auto bits = svreinterpret_u32_f32(value);
+        const auto tie = svand_n_u32_x(pg, svlsr_n_u32_x(pg, bits, 16), 1);
+        bits = svadd_u32_x(pg, bits, svadd_n_u32_x(pg, tie, 0x7fff));
+        svst1h_u32(pg, out + c, svlsr_n_u32_x(pg, bits, 16));
+    }
+}
+#endif
 } // namespace
 
-static int qwen36_gqa_prepare_qk_parallel(
-    const uint16_t *__restrict query, const uint16_t *__restrict key_cache,
-    const uint16_t *__restrict value_cache, const int32_t *__restrict token_index,
-    uint16_t *__restrict output, float *__restrict score_scratch, int64_t sequence_length,
-    int64_t cache_tokens, int64_t query_heads, int64_t head_dim, float softmax_scale,
-    float *__restrict pv_workspace, int64_t pv_numel) {
-    // Same ABI-shaped validation as the original full-row routine.
-    if (!pv_workspace || pv_numel < query_heads * kHeadDim)
-        return 4;
-    if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
-        token_index == nullptr || output == nullptr || score_scratch == nullptr ||
-        sequence_length <= 0 || cache_tokens <= 0 || (query_heads != 2 && query_heads != 6) ||
-        head_dim != kHeadDim || !std::isfinite(softmax_scale)) {
-        return 1;
-    }
-
-#if !defined(__ARM_FEATURE_SVE_BF16)
-    return 2;
-#else
-    const int64_t workers = std::max<int64_t>(1, kutacc::get_thread_num());
-    const int64_t token_grain = std::max<int64_t>(1, (sequence_length + workers - 1) / workers);
-
-    for (int64_t token = 0; token < sequence_length; ++token) {
-        const int64_t source = static_cast<int64_t>(token_index[token]);
-        if (source < 0 || source >= cache_tokens)
-            return 3;
-    }
-
-    // QK: tokens are independent.  Each worker preserves the validated SVE
-    // reduction order inside one 256-wide dot product.
-    kutacc::parallel_for(0, sequence_length, token_grain, [&](int64_t begin, int64_t end) {
-        for (int64_t token = begin; token < end; ++token) {
-            const int64_t source = static_cast<int64_t>(token_index[token]);
-            const uint16_t *key = key_cache + source * kHeadDim;
-            for (int64_t head = 0; head < query_heads; ++head) {
-                score_scratch[head * sequence_length + token] =
-                    qwen36_qk_dot_bf16(query + head * kHeadDim, key) * softmax_scale;
-            }
-        }
-    });
-
-    return 0;
-#endif
+// Graph capture uses the same layout calculation as replay. Units are FP32
+// elements, not bytes. No worker launch or numerical kernel is executed here.
+extern "C" int64_t qwen36_gqa_flash_decode_workspace_numel(
+    int64_t batch, int64_t heads, int64_t capacity) {
+    return layout(batch, heads, capacity).numel;
 }
 
-static std::atomic<uint64_t> batched_softmax_calls{0};
-extern "C" __attribute__((visibility("default"))) uint64_t qwen36_gqa_rows_batched_softmax_calls() {
-    return batched_softmax_calls.load(std::memory_order_relaxed);
-}
-static std::atomic<uint64_t> long_pv_calls{0};
-extern "C" __attribute__((visibility("default"))) uint64_t qwen36_gqa_rows_long_pv_calls() {
-    return long_pv_calls.load(std::memory_order_relaxed);
-}
-
-// Multi-row long-KV GQA. QK retains original per-row pool calls and order.
-// One independent row/head softmax pool completes before unchanged PV.
-extern "C" __attribute__((visibility("default"))) int
-qwen36_gqa_decode_rows_long_pv_with_workspace(
+// Private graph-leaf ABI. The graph adapter has validated every visible page
+// and all rows BEFORE the first 32-row wave. Inputs are read-only; only output
+// and the declared graph scratch are written. Not a standalone unchecked API.
+extern "C" int qwen36_gqa_flash_decode_validated_with_workspace(
     const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t *table,
-    const int32_t *requests, const int32_t *lengths, uint16_t *output, float *scratch,
-    int64_t batch, int64_t heads, int64_t capacity, int64_t cache_tokens,
-    int64_t request_slots, float scale, float *pv_workspace, int64_t pv_numel) {
+    const int32_t *requests, const int32_t *lengths, uint16_t *output,
+    float *workspace, int64_t workspace_numel, int64_t batch, int64_t heads,
+    int64_t capacity, float scale) {
+    const auto p = layout(batch, heads, capacity);
+    if (!p.numel || workspace_numel < p.numel) return 1;
 #if !defined(__ARM_FEATURE_SVE_BF16)
     return 2;
 #else
-    if (!q || !k || !v || !table || !requests || !lengths || !output || !scratch ||
-        !pv_workspace || batch < 2 || batch > 32 || heads != 2 || capacity < 1 ||
-        cache_tokens < 1 || request_slots < 1 || !std::isfinite(scale) ||
-        pv_numel < batch * heads * kHeadDim)
-        return 1;
-    // Validate every row before the first scratch/output write.
-    for (int64_t row = 0; row < batch; ++row) {
-        if (requests[row] < 0 || requests[row] >= request_slots ||
-            lengths[row] < 384 || lengths[row] > capacity) return 3;
-        const int32_t *indices = table + int64_t(requests[row]) * capacity;
-        for (int64_t token = 0; token < lengths[row]; ++token)
-            if (indices[token] < 0 || indices[token] >= cache_tokens) return 3;
+    Group groups[kBatch];
+    int32_t group_for_row[kBatch], row_in_group[kBatch];
+    bool used[kBatch]{};
+    int64_t group_count = 0;
+    for (int64_t first_row = 0; first_row < batch; ++first_row) {
+        if (used[first_row]) continue;
+        const int64_t gi = group_count++;
+        auto &g = groups[gi];
+        g.request = requests[first_row];
+        for (int64_t row = first_row; row < batch && g.count < kQueries; ++row)
+            if (!used[row] && requests[row] == g.request) {
+                group_for_row[row] = int32_t(gi);
+                row_in_group[row] = int32_t(g.count);
+                g.rows[g.count++] = int32_t(row);
+                g.maximum = std::max<int64_t>(g.maximum, lengths[row]);
+                used[row] = true;
+            }
+        g.blocks = ceil_div(g.maximum, p.tile);
     }
-    for (int64_t row = 0; row < batch; ++row) {
-        const int rc = qwen36_gqa_prepare_qk_parallel(
-            q + row * heads * kHeadDim, k, v,
-            table + int64_t(requests[row]) * capacity, output + row * heads * kHeadDim,
-            scratch + row * heads * capacity, lengths[row], cache_tokens, heads, kHeadDim,
-            scale, pv_workspace + row * heads * kHeadDim, heads * kHeadDim);
-        if (rc) return rc;
+    int64_t tasks = group_count;
+    while (tasks < p.workers) {
+        int64_t best = -1, cost = -1;
+        for (int64_t i = 0; i < group_count; ++i) {
+            const auto &g = groups[i];
+            const int64_t candidate = ceil_div(g.blocks, g.splits) * g.count * heads;
+            if (g.splits < g.blocks && candidate > cost) { best = i; cost = candidate; }
+        }
+        if (best < 0) break;
+        ++groups[best].splits;
+        ++tasks;
     }
-    // All row QK calls returned before any head is normalized. Each task
-    // preserves the original max/exp/denominator/normalize token order.
-    // H=2,M=8 provides16 independent tasks, not32 useful softmax workers.
-    kutacc::parallel_for(0, batch * heads, 1, [&](int64_t begin, int64_t end) {
+    int64_t task_begin = 0, partial_begin = 0;
+    for (int64_t i = 0; i < group_count; ++i) {
+        auto &g = groups[i];
+        g.task_begin = task_begin;
+        g.partial_begin = partial_begin;
+        task_begin += g.splits;
+        partial_begin += g.splits * g.count * heads;
+    }
+    if (tasks > p.task_slots || partial_begin > p.partial_rows) return 3;
+    auto *partials = workspace + p.task_slots * (p.tile_stride + p.pack_stride);
+    kutacc::parallel_for(0, tasks, 1, [&](int64_t begin, int64_t end) {
         for (int64_t task = begin; task < end; ++task) {
-            const int64_t row = task / heads, head = task % heads;
-            const int64_t sequence_length = lengths[row];
-            float *scores = scratch + row * heads * capacity + head * sequence_length;
-                float maximum = scores[0];
-                for (int64_t token = 1; token < sequence_length; ++token) {
-                    maximum = std::max(maximum, scores[token]);
-                }
-                float denominator = 0.0f;
-                for (int64_t token = 0; token < sequence_length; ++token) {
-                    const float probability = std::exp(scores[token] - maximum);
-                    scores[token] = probability;
-                    denominator += probability;
-                }
-                const float reciprocal = 1.0f / denominator;
-#pragma clang loop vectorize(enable) interleave(enable)
-                for (int64_t token = 0; token < sequence_length; ++token) {
-                    scores[token] *= reciprocal;
-                }
-        }
-    });
-    ++batched_softmax_calls;
-    const int64_t workers = std::max<int64_t>(1, kutacc::get_thread_num());
-    const int64_t lanes = static_cast<int64_t>(svcntw());
-    // Four vectors per Q head at most: eight accumulators plus transient V/P.
-    // Width is runtime-SVE aware, and small row counts retain >=worker tasks.
-    const int64_t max_width = std::min<int64_t>(32, 4 * lanes);
-    int64_t total_length = 0;
-    for (int64_t row = 0; row < batch; ++row) total_length += lengths[row];
-    const int64_t target_work = std::max<int64_t>(1, total_length * kHeadDim / (2 * workers));
-    struct Task { int64_t row, begin, end, next; };
-    // Minimum SVE width is four FP32 lanes; 32 rows need <=2048 tasks.
-    Task tasks[2048];
-    int64_t task_count = 0;
-    int64_t order[32];
-    for (int64_t row = 0; row < batch; ++row) order[row] = row;
-    std::sort(order, order + batch, [&](int64_t a, int64_t b) {
-        return lengths[a] > lengths[b];
-    });
-    // The current pool uses static contiguous partitions. Use one bucket per
-    // worker, assign longer tasks first by their L*width cost, not a fake queue.
-    std::vector<int64_t> first(workers, -1), last(workers, -1), load(workers, 0);
-    for (int64_t ordinal = 0; ordinal < batch; ++ordinal) {
-        const int64_t row = order[ordinal];
-        int64_t width = std::min<int64_t>(8, lanes);
-        while (2 * width <= max_width && 2 * width * lengths[row] <= target_work)
-            width *= 2;
-        for (int64_t column = 0; column < kHeadDim; column += width) {
-            const int64_t end = std::min<int64_t>(kHeadDim, column + width);
-            const int64_t worker = std::min_element(load.begin(), load.end()) - load.begin();
-            tasks[task_count] = {row, column, end, -1};
-            if (first[worker] < 0) first[worker] = task_count;
-            else tasks[last[worker]].next = task_count;
-            last[worker] = task_count++;
-            load[worker] += lengths[row] * (end - column);
-        }
-    }
-    kutacc::parallel_for(0, workers, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t worker = begin; worker < end; ++worker) {
-            for (int64_t id = first[worker]; id >= 0; id = tasks[id].next) {
-                const Task task = tasks[id];
-                const int64_t row = task.row, length = lengths[row];
-                const int32_t *indices = table + int64_t(requests[row]) * capacity;
-                const float *scores = scratch + row * heads * capacity;
-                float *pv = pv_workspace + row * heads * kHeadDim;
-                const int64_t c0 = std::min<int64_t>(task.end, task.begin + 0 * lanes);
-                const svbool_t pg0 = svwhilelt_b32(c0, task.end);
-                svfloat32_t a0_0 = svdup_f32(0.0f), a1_0 = svdup_f32(0.0f);
-                const int64_t c1 = std::min<int64_t>(task.end, task.begin + 1 * lanes);
-                const svbool_t pg1 = svwhilelt_b32(c1, task.end);
-                svfloat32_t a0_1 = svdup_f32(0.0f), a1_1 = svdup_f32(0.0f);
-                const int64_t c2 = std::min<int64_t>(task.end, task.begin + 2 * lanes);
-                const svbool_t pg2 = svwhilelt_b32(c2, task.end);
-                svfloat32_t a0_2 = svdup_f32(0.0f), a1_2 = svdup_f32(0.0f);
-                const int64_t c3 = std::min<int64_t>(task.end, task.begin + 3 * lanes);
-                const svbool_t pg3 = svwhilelt_b32(c3, task.end);
-                svfloat32_t a0_3 = svdup_f32(0.0f), a1_3 = svdup_f32(0.0f);
-                for (int64_t token = 0; token < length; ++token) {
-                    const uint16_t *value = v + int64_t(indices[token]) * kHeadDim;
-                    const svfloat32_t p0 = svdup_f32(scores[token]);
-                    const svfloat32_t p1 = svdup_f32(scores[length + token]);
-                    const svfloat32_t v0 = svreinterpret_f32(
-                        svlsl_n_u32_x(pg0, svld1uh_u32(pg0, value + c0), 16));
-                    a0_0 = svmla_f32_x(pg0, a0_0, p0, v0);
-                    a1_0 = svmla_f32_x(pg0, a1_0, p1, v0);
-                    const svfloat32_t v1 = svreinterpret_f32(
-                        svlsl_n_u32_x(pg1, svld1uh_u32(pg1, value + c1), 16));
-                    a0_1 = svmla_f32_x(pg1, a0_1, p0, v1);
-                    a1_1 = svmla_f32_x(pg1, a1_1, p1, v1);
-                    const svfloat32_t v2 = svreinterpret_f32(
-                        svlsl_n_u32_x(pg2, svld1uh_u32(pg2, value + c2), 16));
-                    a0_2 = svmla_f32_x(pg2, a0_2, p0, v2);
-                    a1_2 = svmla_f32_x(pg2, a1_2, p1, v2);
-                    const svfloat32_t v3 = svreinterpret_f32(
-                        svlsl_n_u32_x(pg3, svld1uh_u32(pg3, value + c3), 16));
-                    a0_3 = svmla_f32_x(pg3, a0_3, p0, v3);
-                    a1_3 = svmla_f32_x(pg3, a1_3, p1, v3);
-                }
-                svst1_f32(pg0, pv + c0, a0_0);
-                svst1_f32(pg0, pv + kHeadDim + c0, a1_0);
-                svst1_f32(pg1, pv + c1, a0_1);
-                svst1_f32(pg1, pv + kHeadDim + c1, a1_1);
-                svst1_f32(pg2, pv + c2, a0_2);
-                svst1_f32(pg2, pv + kHeadDim + c2, a1_2);
-                svst1_f32(pg3, pv + c3, a0_3);
-                svst1_f32(pg3, pv + kHeadDim + c3, a1_3);
-                for (int64_t head = 0; head < heads; ++head)
-                    for (int64_t column = task.begin; column < task.end; ++column)
-                        output[(row * heads + head) * kHeadDim + column] =
-                            float_to_bf16(pv[head * kHeadDim + column]);
+            int64_t gi = 0;
+            while (gi + 1 < group_count && task >= groups[gi + 1].task_begin) ++gi;
+            const auto &g = groups[gi];
+            const int64_t split = task - g.task_begin, rh = g.count * heads;
+            auto *records = partials + (g.partial_begin + split * rh) * kRecord;
+            for (int64_t r = 0; r < rh; ++r) {
+                records[r * kRecord] = kNegativeInfinity;
+                records[r * kRecord + 1] = 0.0f;
+                std::fill(records + r * kRecord + kNumerator,
+                          records + r * kRecord + kNumerator + kDim, 0.0f);
+            }
+            auto *scores = workspace + task * p.tile_stride;
+            alignas(64) float alpha[kQueries * 6];
+            alignas(64) int32_t row_lengths[kQueries * 6];
+            const auto *indices = table + int64_t(g.request) * capacity;
+            const int64_t first_block = g.blocks * split / g.splits;
+            const int64_t last_block = g.blocks * (split + 1) / g.splits;
+            for (int64_t block = first_block; block < last_block; ++block) {
+                const int64_t first = block * p.tile;
+                const int64_t live = std::min(p.tile, g.maximum - first);
+                #if QWEN_FLASH_QK_SME
+                auto *pack = reinterpret_cast<uint32_t *>(workspace + p.task_slots * p.tile_stride + task * p.pack_stride);
+                qk_tile_sme(q, k, indices, g, heads, scale, first, live, p.tile, scores, pack);
+#else
+                qk_tile_sve(q, k, indices, g, lengths, heads, scale, first, live, p.tile, scores);
+#endif
+                online_weights(scores, p.tile, live, first, g, heads, lengths,
+                               records, alpha, row_lengths);
+                pv_tile(v, indices, scores, p.tile, rh, row_lengths,
+                        alpha, first, live, records);
             }
         }
     });
-    ++long_pv_calls;
+    // Same synchronous parallel_for contract as the old three-phase kernel.
+    // Each output row/head has one merge owner, so no atomics or TP collective.
+    kutacc::parallel_for(0, batch * heads, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t row_head = begin; row_head < end; ++row_head) {
+            const int64_t row = row_head / heads, head = row_head % heads;
+            merge_row(groups[group_for_row[row]], row_in_group[row] * heads + head,
+                      heads, partials, output);
+        }
+    });
     return 0;
 #endif
 }

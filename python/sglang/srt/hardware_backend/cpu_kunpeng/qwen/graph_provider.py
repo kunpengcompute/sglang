@@ -21,6 +21,48 @@ from sglang.srt.graph.torch_capture import (
 )
 
 
+def reserve_vision_collectives(runner):
+    """Reserve existing communicator buckets before any graph owns the free SHM."""
+    if os.environ.get("IS_PREFILL", "1") == "0":
+        return
+    visual = getattr(runner.model, "visual", None)
+    if visual is None:
+        return
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.linear import RowParallelLinear, _vision_shm_rows
+
+    communicator = get_tp_group().kunpeng_communicator
+    if communicator is None or getattr(communicator, "_qwen_vision_reserved", False):
+        return
+    widths = sorted({
+        int(module.output_size)
+        for module in visual.modules()
+        if isinstance(module, RowParallelLinear)
+        and getattr(module, "_runtime_component", None) == "vision"
+    })
+    if not widths:
+        return
+    vision_rows = min(
+        int(os.environ.get("SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "2304")),
+        int(communicator.max_tokens),
+    )
+    rows_by_width = dict.fromkeys(widths, vision_rows)
+    # Image prefill embeds the whole language chunk before graph replay. Its
+    # eager reduction shares this dim-keyed cache with the vision merger, so
+    # merge their capacities before carving a slab that cannot be reclaimed.
+    embedding_width = int(runner.model.get_input_embeddings().embedding_dim)
+    rows_by_width[embedding_width] = max(
+        rows_by_width.get(embedding_width, 0),
+        min(get_capabilities().prefill_max_tokens, int(communicator.max_tokens)),
+    )
+    reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
+    for width, rows in sorted(rows_by_width.items()):
+        small, large = reserve(width, 1), reserve(width, rows)
+        _vision_shm_rows[width] = max(int(small.size(0)), int(large.size(0)))
+    communicator._qwen_vision_reserved = True
+    print(f"[QwenVisionResources] shm_rows={_vision_shm_rows}", flush=True)
+
+
 class QwenHybridGraphProvider:
     # Explicit capabilities: the common runner's default capture contract is unchanged.
     capture_options = {
@@ -47,8 +89,6 @@ class QwenHybridGraphProvider:
         self.decompose_clone = True
         self.dense_plans = {}
         self.dense_context = None
-        # One-shot guard for the vision SHM width reservations in bind().
-        self._vision_shm_reserved = False
 
     def unsupported_reason(self, fb, kwargs):
         if fb.forward_mode.name == "EXTEND":
@@ -146,6 +186,9 @@ class QwenHybridGraphProvider:
             "input_ids",
             "positions",
             "mrope_positions",
+            "input_embeds",
+            "mm_input_embeds",
+            "_kunpeng_mtp_tail_indices",
             "req_pool_indices",
             "seq_lens",
             "out_cache_loc",
@@ -200,6 +243,12 @@ class QwenHybridGraphProvider:
         if self.static_weights is None:
             for i, tensor in enumerate(self.weights):
                 persistent(f"weight.{i}", tensor)
+        from .backend import gqa_swap_manager
+
+        swap = gqa_swap_manager()
+        if swap is not None:
+            for i, tensor in enumerate(swap.gqa_kv_fixed_tensors(runner.token_to_kv_pool)):
+                persistent(f"gqa.sdma.{i}", tensor)
         if self.decompose_dense:
             batch = fb.input_ids.numel()
             if batch not in self.dense_plans:
@@ -271,59 +320,7 @@ class QwenHybridGraphProvider:
         from sglang.srt.distributed import get_tp_group
 
         communicator = get_tp_group().kunpeng_communicator
-        # Vision tower TP reductions stage through the communicator's
-        # dim-keyed SHM cache, but their widths only first appear at the
-        # initial image request - long after the text graphs claimed the
-        # pool, which is exactly the exhaustion that used to crash image
-        # batches ("remain 0"). The upstream rebuild dropped the legacy
-        # embedding/lm-head eager reservations here (the explicit
-        # collectives read graph-owned SHM now), but the vision path still
-        # stages through the dim-keyed cache: reserve both row buckets for
-        # every vision reduce width once, at the first bind, and publish
-        # the reserved capacity so RowParallelLinear's vision branch can
-        # fall back to gloo beyond it instead of asking the pool to grow
-        # an entry post-capture.
-        if not self._vision_shm_reserved:
-            self._vision_shm_reserved = True
-            visual = getattr(runner.model, "visual", None)
-            if visual is not None:
-                from sglang.srt.layers.linear import (
-                    RowParallelLinear,
-                    _vision_shm_rows as vision_registry,
-                )
-
-                vision_widths = sorted(
-                    {
-                        int(module.output_size)
-                        for module in visual.modules()
-                        if isinstance(module, RowParallelLinear)
-                        and getattr(module, "_runtime_component", None) == "vision"
-                    }
-                )
-                if vision_widths:
-                    vision_budget = min(
-                        int(
-                            os.environ.get(
-                                "SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "2304"
-                            )
-                        ),
-                        int(communicator.max_tokens),
-                    )
-                    reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
-                    for vision_width in vision_widths:
-                        # The kernel's cache keys by dim: the small call pins
-                        # the [batch_size, dim] entry, the large call pins a
-                        # bucket-rounded [budget, dim] entry. Row counts up to
-                        # the returned capacity then always hit a reservation.
-                        small = reserve(vision_width, 1)
-                        large = reserve(vision_width, vision_budget)
-                        capacity = max(int(small.size(0)), int(large.size(0)))
-                        vision_registry[vision_width] = capacity
-                    print(
-                        f"[QwenRegisteredGraph] vision_shm_rows={vision_registry} "
-                        f"budget={vision_budget}",
-                        flush=True,
-                    )
+        reserve_vision_collectives(runner)
         for shm_width, tensor in sorted(communicator.shm_tensors.items()):
             persistent(f"collective.shm.{shm_width}", tensor)
         persistent("collective.dummy", communicator.dummy_tensor)

@@ -159,6 +159,28 @@ def validate_borrowed_pools(runner):
             raise ValueError("Draft DDR KV overlaps target KV/HBW storage")
 
 
+def prepare_draft_extend_mm_inputs(forward_batch, mm_input_embeds, mrope_positions):
+    """Apply EAGLE's per-request token rotation to Qwen image embeddings."""
+    import torch
+
+    shifted = torch.empty_like(mm_input_embeds)
+    offset, tails = 0, []
+    for length in forward_batch.extend_seq_lens_cpu:
+        end = offset + length
+        shifted[offset:end - 1] = mm_input_embeds[offset + 1:end]
+        shifted[end - 1].zero_()
+        tails.append(end - 1)
+        offset = end
+    if offset < shifted.shape[0]:
+        shifted[offset:].zero_()
+    forward_batch.mm_input_embeds = shifted
+    forward_batch._kunpeng_mtp_tail_indices = torch.tensor(
+        tails, dtype=torch.int64, device=shifted.device
+    )
+    if mrope_positions is not None:
+        forward_batch.mrope_positions = mrope_positions
+
+
 class AttachedQwenMultiStepDraftBackend:
     """CPU topk1 step metadata, using the existing TorchNative attention path."""
 
@@ -168,7 +190,10 @@ class AttachedQwenMultiStepDraftBackend:
         )
 
         if (
-            model_runner.borrowed_qwen_target_runner is None
+            (
+                model_runner.borrowed_qwen_target_runner is None
+                and not getattr(model_runner.model, "_kunpeng_local_mtp", False)
+            )
             or topk != 1
             or num_steps not in (2, 3)
         ):
@@ -186,6 +211,10 @@ class AttachedQwenMultiStepDraftBackend:
         self._base_lengths_cpu = (
             cpu.clone() if cpu is not None else self._base_lengths.cpu().clone()
         )
+        self._base_mrope_positions = (
+            forward_batch.mrope_positions.clone()
+            if forward_batch.mrope_positions is not None else None
+        )
 
     def prepare_step(self, index, forward_batch):
         # Metadata is bound before ModelRunner/graph inputs, never patched
@@ -198,6 +227,9 @@ class AttachedQwenMultiStepDraftBackend:
         ):
             raise ValueError("CPU draft step has no matching metadata snapshot")
         forward_batch.positions = (self._base_lengths + index).long()
+        if self._base_mrope_positions is not None:
+            # EAGLE enters at S-1; the first chained token is at S.
+            forward_batch.mrope_positions = self._base_mrope_positions + index + 1
         forward_batch.seq_lens = self._base_lengths + index + 1
         forward_batch.seq_lens_cpu = self._base_lengths_cpu + index + 1
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum().item())

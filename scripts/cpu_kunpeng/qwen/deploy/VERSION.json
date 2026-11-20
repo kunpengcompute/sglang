@@ -1,9 +1,9 @@
 {
   "name": "Qwen920F source build and deployment",
-  "base_commit": "bbdb4a698ef7851b134e37182326eb21398e4812",
+  "base_commit": "9660497f543079166782caed4db80ba4197feee1",
   "mode": "non-MTP or NEXTN/EAGLE MTP",
-  "tool_revision": "20261106_upstream_mtp_startup",
-  "launcher_revision": "20261106_upstream_mtp_startup",
-  "validation": "static and local mocked lifecycle/launcher checks passed; current upstream native build and model runtime unverified",
-  "validated_parent_commit": "7c548f9a7692d31b15b665ad68ef2001f836130a"
+  "tool_revision": "20261120_r9_clean_bounded_logs",
+  "launcher_revision": "20261120_r9_clean_bounded_logs",
+  "validation": "local source-equivalence, single/PD configuration, bounded subprocess logging and safe history-prune checks passed; no fresh 920F native rebuild, package or model performance validation",
+  "validated_parent_source": "20261119_q38_prefill_residency_vl_merge_06/groupB/sglang R9; TP16 PP4 Prefill plus TP16 PP1 Decode"
 }

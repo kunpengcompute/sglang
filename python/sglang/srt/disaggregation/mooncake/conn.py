@@ -795,6 +795,26 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for src_index, dst_index in zip(src_layer_indices, dst_layer_indices)
             ]
+        elif getattr(self.kv_args, "qwen_pp_full_indices", None) is not None:
+            # Wire layout is [target K, target V, optional draft K, draft V].
+            # A hybrid stage's absolute layer span is not its compact KV span.
+            if self.is_mla_backend or decode_start_layer != 0:
+                raise ValueError("Qwen hybrid PP transfer currently requires a full PP1 decode pool")
+            local_ids = self.kv_args.qwen_pp_full_indices
+            src_n = self.kv_args.prefill_num_layers
+            dst_n = self.kv_args.qwen_pp_full_count
+            if decode_num_layers != dst_n or len(local_ids) != src_n:
+                raise ValueError("Qwen hybrid PP KV layer metadata mismatch")
+            src_tail = len(src_data_ptrs) - 2 * src_n
+            dst_tail = len(dst_data_ptrs) - 2 * dst_n
+            if src_tail not in (0, dst_tail) or src_tail % 2 or dst_tail < 0:
+                raise ValueError("Qwen hybrid PP draft KV layout mismatch")
+            pairs = [(i, dst_i) for i, dst_i in enumerate(local_ids)]
+            pairs += [(src_n + i, dst_n + dst_i) for i, dst_i in enumerate(local_ids)]
+            pairs += [(2 * src_n + i, 2 * dst_n + i) for i in range(src_tail)]
+            if len(item_lens) != len(src_data_ptrs):
+                raise ValueError("Qwen hybrid PP KV strides do not match pointers")
+            layers_params = [(src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(
@@ -1333,10 +1353,26 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_data_ptrs = self.kv_args.state_data_ptrs
         prefill_state_item_lens = self.kv_args.state_item_lens
 
-        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+        if getattr(self.kv_args, "qwen_pp_state_indices", None) is not None:
+            local_ids = self.kv_args.qwen_pp_state_indices
+            local_n = len(local_ids)
+            total_n = self.kv_args.qwen_pp_state_count
+            if not local_n or len(prefill_state_data_ptrs) % local_n:
+                raise ValueError("Qwen hybrid PP state source layout mismatch")
+            kinds = len(prefill_state_data_ptrs) // local_n
+            if len(dst_state_data_ptrs) != kinds * total_n:
+                raise ValueError("Qwen hybrid PP state transfer requires a full PP1 decode pool")
+            indices = (
+                (kind * local_n + local_i, kind * total_n + global_i)
+                for kind in range(kinds)
+                for local_i, global_i in enumerate(local_ids)
+            )
+        else:
+            indices = ((i, i) for i in range(len(dst_state_data_ptrs)))
+        for i, j in indices:
             length = prefill_state_item_lens[i]
             src_addr = prefill_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
-            dst_addr = dst_state_ptr + length * int(req.dst_state_indices[0])
+            dst_addr = dst_state_data_ptrs[j] + length * int(req.dst_state_indices[0])
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)

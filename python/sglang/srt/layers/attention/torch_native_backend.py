@@ -40,7 +40,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             QwenHybridGraphProvider,
         )
 
-        if getattr(runner, "borrowed_qwen_target_runner", None) is not None:
+        if (getattr(runner, "borrowed_qwen_target_runner", None) is not None
+                or getattr(runner.model, "_kunpeng_local_mtp", False)):
             # The 64-layer target provider does not describe the attached
             # draft; the decode-chain provider does.
             return QwenAttachedMTPGraphProvider(runner)

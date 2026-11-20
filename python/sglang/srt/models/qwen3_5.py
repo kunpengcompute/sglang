@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -108,7 +109,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_amx_available = cpu_has_amx_support()
 from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
     enabled as qwen_kunpeng_enabled,
-    image_decode_graph_enabled,
 )
 from sglang.srt.model_executor.model_capabilities import _vision_execution_enabled
 
@@ -896,20 +896,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and self.attn_tp_size == 16
             and qkv.shape[0] > 0
             and self.attn_output_gate
-            and (
-                # Image PREFILL keeps the manual
-                # split path (its M-RoPE rows genuinely differ per component,
-                # which the fused single-position kernels cannot read), but
-                # image DECODE positions repeat one scalar delta across all
-                # three rows, so the fused path is exact there. This also
-                # keeps captured image decode graphs structurally identical
-                # to text decode graphs (shared cache key).
-                not forward_batch.contains_image_inputs()
-                or (
-                    forward_batch.forward_mode.is_decode()
-                    and image_decode_graph_enabled()
-                )
-            )
         )
         if use_native_batch:
             q, k, v, gate = qkv_layout(qkv)
@@ -1088,11 +1074,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+        # PPNextN owns its complete one-layer draft inside the target PP group.
+        self._local_nextn = is_nextn and _use_kunpeng_qwen
 
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
         # Embedding layer
-        if self.pp_group.is_first_rank:
+        if self._local_nextn or self.pp_group.is_first_rank:
             self.embed_tokens = (
                 shared_embed_tokens
                 if shared_embed_tokens is not None
@@ -1123,16 +1111,22 @@ class Qwen3_5ForCausalLM(nn.Module):
                 is_nextn=is_nextn,
             )
 
-        self.layers, self._start_layer, self._end_layer = make_layers(
-            config.num_hidden_layers,
-            get_layer,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
-            prefix=f"{prefix}.layers",
-        )
+        if self._local_nextn:
+            self.layers = make_layers(
+                config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
+            )
+            self._start_layer, self._end_layer = 0, config.num_hidden_layers
+        else:
+            self.layers, self._start_layer, self._end_layer = make_layers(
+                config.num_hidden_layers,
+                get_layer,
+                pp_rank=self.pp_group.rank_in_group,
+                pp_size=self.pp_group.world_size,
+                prefix=f"{prefix}.layers",
+            )
 
         # Final normalization
-        if self.pp_group.is_last_rank:
+        if self._local_nextn or self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -1168,7 +1162,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         # Initialize hidden states
-        if self.pp_group.is_first_rank:
+        if self._local_nextn or self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
@@ -1210,7 +1204,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 )
 
         # Return intermediate tensors for pipeline parallelism
-        if not self.pp_group.is_last_rank:
+        if not self._local_nextn and not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
@@ -1520,6 +1514,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    _kunpeng_explicit_graph = _use_kunpeng_qwen
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
@@ -1566,10 +1561,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 else default_kunpeng_qwen_policy()
             )
             validate_startup_capabilities(policy, get_global_server_args())
+            policy = dict(policy)
+            if get_pp_group().world_size > 1:
+                # PP uses a separate draft worker on its last stage.
+                policy["mtp"] = False
+            if not get_pp_group().is_first_rank or os.environ.get("IS_PREFILL", "1") == "0":
+                # PD decode consumes transmitted visual embeddings, not pixels.
+                policy["vision"] = False
 
             from sglang.srt.distributed import (
                 get_tensor_model_parallel_world_size,
-                get_pp_group,
             )
             from sglang.srt.layers.dp_attention import get_attention_tp_size
 
@@ -1578,11 +1579,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 raise ValueError("Attached MTP-on currently requires actual TP16")
             if (
                 actual_tp not in (1, 16)
-                or get_pp_group().world_size != 1
                 or get_attention_tp_size() != actual_tp
             ):
                 raise ValueError(
-                    "Unified constructor requires actual matching TP1 or TP16/attentionTP/PP1 before allocation"
+                    "Unified constructor requires actual matching TP1 or TP16/attentionTP before allocation"
                 )
             text = config.text_config
             expected_heads = (24, 4) if actual_tp == 1 else (32, 16)
@@ -1624,6 +1624,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             prefix,
             language_model_cls,
             visual_quant_config=visual_quant_config,
+            load_vision_tower=not unified or policy["vision"],
         )
         if unified:
             from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
@@ -1635,16 +1636,18 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 UnifiedCheckpointLoader,
             )
 
-            if self.pp_group.world_size != 1 or self.config.tie_word_embeddings:
-                raise ValueError(
-                    "Unified checkpoint currently requires PP1 and separate embed/head"
-                )
+            if self.config.tie_word_embeddings:
+                raise ValueError("Unified checkpoint requires separate embed/head")
             self.runtime_capabilities = ModelCapabilities(policy)
-            self.mtp = Qwen3_5ForCausalLMMTP(
-                config,
-                quant_config.for_component("mtp", execution_enabled=policy["mtp"]),
-                shared_embed_tokens=self.model.embed_tokens,
-                shared_lm_head=self.lm_head,
+            self.mtp = (
+                Qwen3_5ForCausalLMMTP(
+                    config,
+                    quant_config.for_component("mtp", execution_enabled=policy["mtp"]),
+                    shared_embed_tokens=self.model.embed_tokens,
+                    shared_lm_head=self.lm_head,
+                )
+                if self.pp_group.world_size == 1
+                else PPMissingLayer()
             )
             # Cached/stateless modules such as RoPE may be physically shared
             # with the executable language tree. Never attach a disabled
@@ -1665,14 +1668,50 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 else self.runtime_capabilities.attach_disabled
             )
             attach_mtp(self.mtp, "mtp", shared)
-            self._unified_checkpoint_loader = UnifiedCheckpointLoader(self, spec)
+            self._unified_checkpoint_loader = UnifiedCheckpointLoader(
+                self, spec, stage_partition=self.pp_group.world_size > 1
+            )
+            if self.pp_group.is_last_rank:
+                from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import linear
+                self.lm_head._cpu_lm_head_apply = linear
 
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = getattr(
+            self.visual, "deepstack_visual_indexes", config.vision_config.deepstack_visual_indexes
+        )
+
+    def prepare_forward_batch(self, forward_batch):
+        """Encode images once before capturing the common language graph."""
+        if not _use_kunpeng_qwen or not self.pp_group.is_first_rank:
+            return
+        if not forward_batch.contains_mm_inputs():
+            return
+        if (forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()):
+            return
+        if hasattr(self, "runtime_capabilities"):
+            self.runtime_capabilities.require("vision")
+        from sglang.srt.managers.mm_utils import embed_mm_inputs
+
+        selected = [i for i, item in enumerate(forward_batch.mm_inputs) if item is not None]
+        embeds, other = embed_mm_inputs(
+            mm_inputs_list=[forward_batch.mm_inputs[i] for i in selected],
+            extend_prefix_lens=[forward_batch.extend_prefix_lens_cpu[i] for i in selected],
+            extend_seq_lens=[forward_batch.extend_seq_lens_cpu[i] for i in selected],
+            input_ids=forward_batch.input_ids,
+            input_embedding=self.model.embed_tokens,
+            multimodal_model=self,
+            use_deepstack=self.use_deepstack,
+        )
+        # Fused residual/norm writes its input alias; MTP needs the original embedding.
+        forward_batch.mm_input_embeds = embeds
+        forward_batch.input_embeds = embeds.clone()
+        forward_batch.input_deepstack_embeds = other.get("input_deepstack_embeds")
+        forward_batch.mm_inputs = None
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
@@ -2191,111 +2230,5 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_groups=None,
         )
 
-
-if _use_kunpeng_qwen and not _vision_execution_enabled():
-    # Upstream's simplified explicit graph path rebinds
-    # Qwen3_5ForConditionalGeneration to a text-only wrapper whose
-    # forward() raises on any batch with image inputs. While vision
-    # execution is enabled (the default) the multimodal class defined
-    # above stays bound and serves images through KunpengCpuBackend and
-    # the graph provider path. SGLANG_KUNPENG_QWEN_VISION=0 selects this
-    # wrapper and, via the same helper, makes the request capability
-    # gate reject image requests, so model-class selection and request
-    # gating always stay consistent.
-    class Qwen3_5ForConditionalGeneration(nn.Module):
-        _kunpeng_explicit_graph = True
-        packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-        supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
-        def __init__(self, config, quant_config=None, prefix=""):
-            super().__init__()
-            from sglang.srt.layers.logits_processor import LogitsProcessor
-            from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-            self.config = config
-            text = config.text_config
-            self.model = Qwen3_5ForCausalLM(text, quant_config, prefix=add_prefix('model', prefix))
-            self.lm_head = ParallelLMHead(text.vocab_size, text.hidden_size, org_num_embeddings=text.vocab_size,
-                                          quant_config=None, prefix=add_prefix('lm_head', prefix))
-            from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import linear
-            self.lm_head._cpu_lm_head_apply = linear
-            self.logits_processor = LogitsProcessor(text)
-            self.pp_group = get_pp_group()
-            self.is_mrope_enabled = False
-            from sglang.srt.distributed import get_tensor_model_parallel_world_size
-
-            unified = (
-                quant_config is not None
-                and getattr(quant_config, "_cpu920f", False)
-                and quant_config.get_name() == "modelslim"
-                and get_tensor_model_parallel_world_size() == 16
-                and self.pp_group.world_size == 1
-            )
-            if unified:
-                from sglang.srt.model_executor.model_capabilities import (
-                    ModelCapabilities,
-                    default_kunpeng_qwen_policy,
-                    initial_policy_from_spec,
-                )
-                from sglang.srt.model_loader.unified_checkpoint import (
-                    UnifiedCheckpointLoader,
-                )
-                from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
-
-                spec = getattr(config, "checkpoint_loader_spec", None)
-                policy = (
-                    initial_policy_from_spec(spec)
-                    if spec is not None
-                    else default_kunpeng_qwen_policy()
-                )
-                self.runtime_capabilities = ModelCapabilities(policy)
-                # The attached MTP keeps the target-owned embed/head modules so
-                # the EAGLE draft worker can borrow both the component and the
-                # runner instead of loading a second checkpoint.
-                self.mtp = Qwen3_5ForCausalLMMTP(
-                    config,
-                    quant_config.for_component(
-                        "mtp", execution_enabled=policy["mtp"]
-                    ),
-                    shared_embed_tokens=self.model.embed_tokens,
-                    shared_lm_head=self.lm_head,
-                )
-                shared = {
-                    id(module)
-                    for root in (self.model, self.lm_head)
-                    for module in root.modules()
-                }
-                attach_mtp = (
-                    self.runtime_capabilities.attach_enabled
-                    if policy["mtp"]
-                    else self.runtime_capabilities.attach_disabled
-                )
-                attach_mtp(self.mtp, "mtp", shared)
-                self._unified_checkpoint_loader = UnifiedCheckpointLoader(self, spec)
-        def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
-            if forward_batch.contains_image_inputs():
-                raise ValueError('This explicit Kunpeng build supports text forward only')
-            hidden = self.model(input_ids, positions, forward_batch, input_embeds=input_embeds)
-            return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
-        def load_weights(self, weights):
-            checker = getattr(self, "_unified_checkpoint_loader", None)
-            if checker is not None:
-                # The attached MTP component shares the enclosing checkpoint,
-                # so one whole-model loader owns every parameter.
-                return checker.load(weights)
-            loaded = Qwen3_5ForCausalLM.load_weights(self, weights)
-            return loaded
-        def get_input_embeddings(self):
-            return self.model.embed_tokens
-        def get_embed_and_head(self):
-            # The EAGLE draft shares these modules with the target; the attached
-            # MTP keeps the very same objects, so returning them is enough.
-            return self.model.embed_tokens.weight, self.lm_head.weight
-        @property
-        def start_layer(self):
-            return self.model.start_layer
-        @property
-        def end_layer(self):
-            return self.model.end_layer
-        def pad_input_ids(self, input_ids, mm_inputs):
-            return input_ids
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

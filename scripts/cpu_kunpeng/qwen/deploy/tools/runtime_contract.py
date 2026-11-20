@@ -6,6 +6,20 @@ from pathlib import Path
 import subprocess
 
 
+def mtp_settings(env=None):
+    env = os.environ if env is None else env
+    enabled = env.get('SGLANG_ENABLE_MTP')
+    if enabled not in ('0', '1'):
+        raise ValueError('SGLANG_ENABLE_MTP只能为0或1')
+    steps = int(env.get('SGLANG_SPECULATIVE_NUM_STEPS', '3')) if enabled == '1' else 0
+    if enabled == '1' and steps < 1:
+        raise ValueError('开启MTP时SGLANG_SPECULATIVE_NUM_STEPS必须为正整数')
+    return {'mtp': int(enabled), 'mtp_steps': steps,
+            'speculative_algorithm': 'EAGLE' if steps else None,
+            'speculative_eagle_topk': 1 if steps else None,
+            'speculative_num_draft_tokens': steps + 1 if steps else None}
+
+
 def sha256(path):
     digest = hashlib.sha256()
     with Path(path).open('rb') as stream:

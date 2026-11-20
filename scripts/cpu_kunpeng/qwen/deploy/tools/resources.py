@@ -5,21 +5,16 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import time
 from tools import compute_frequency as cores
 from tools import runtime_frequency
+from tools.instances import write_json as save
 
 SYS = Path('/sys/devices/system')
 PAGE_KIB = (64, 2048, 32768, 1048576)
-
-
-def save(path, value):
-    path = Path(path)
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
-    temp.replace(path)
 
 
 def budget():
@@ -135,7 +130,44 @@ class Resources:
                 save(self.run / 'resources_applied.json', {'pages': self.pages_after})
             if rc or any(int(p.read_text()) < required for p in paths):
                 raise RuntimeError('大页准备未满足实际需求，详见hugepages.log')
+        self.prepare_sdma_threshold()
         self.prepare_frequency()
+
+    def prepare_sdma_threshold(self):
+        """Prepare the existing Qwen threshold preset before any worker starts."""
+        preset = os.environ.get('SGLANG_KUNPENG_SDMA_THRESHOLD_PRESET', '0')
+        if preset == '0':
+            return  # Preserve the native library's ordinary initialization path.
+        if (preset != '1' or os.environ.get('SGLANG_KUNPENG_SDMA_THRESHOLD') != '5'
+                or os.environ.get('SGLANG_USE_CPU_920F') != '1'
+                or os.environ.get('SGLANG_KUNPENG_QWEN') != '1'):
+            raise ValueError('SDMA preset仅支持Qwen CPU920F threshold=5')
+        prefix = Path(os.environ['PERF_TUNE'])
+        command = [str(prefix / 'root_proxy'), 'sdma_threshold.sh']
+        receipt = {'status': 'PREPARING', 'expected_threshold': 5,
+                   'command': command, 'before_service_start': True,
+                   'hostname': socket.gethostname()}
+        path = self.run / 'sdma_threshold.json'
+        save(path, receipt)
+        try:
+            result = subprocess.run(command, cwd=prefix, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+            (self.logs / 'sdma_threshold.log').write_text(result.stdout)
+            lines = [line.strip() for line in result.stdout.splitlines()
+                     if line.strip().startswith('SDMA_THRESHOLD_RESULT ')]
+            fields = dict(re.findall(r'(\w+)=([^\s]+)', lines[-1])) if lines else {}
+            confirmed = (result.returncode == 0 and fields.get('status') == 'OK'
+                         and fields.get('threshold') == '5' and fields.get('mismatches') == '0'
+                         and fields.get('registers', '').isdigit() and int(fields['registers']) > 0)
+            receipt.update(status='OK' if confirmed else 'FAILED', returncode=result.returncode,
+                           result_lines=lines, readback=fields)
+            if not confirmed:
+                raise RuntimeError('SDMA threshold=5设置/读回失败，见sdma_threshold.log')
+        except BaseException as error:
+            receipt.update(status='FAILED', error=repr(error))
+            raise
+        finally:
+            save(path, receipt)
 
     def prepare_frequency(self):
         mode = os.environ.get('CPU_FREQ_MODE', 'keep')

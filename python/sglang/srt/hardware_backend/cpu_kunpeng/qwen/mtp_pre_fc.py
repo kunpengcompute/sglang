@@ -63,6 +63,11 @@ def fc_linear(x, fc):
     layout. Falls back to F.linear when the weight was never prepared.
     """
     weight = fc.weight
+    if getattr(fc, "_kunpeng_mtp_quantized_fc", False):
+        output, bias = fc(x)
+        if bias is not None:
+            raise ValueError("Quantized MTP pre-FC must have bias=False")
+        return output
     if not getattr(weight, "_kunpeng_mtp_fc_packed", False):
         return fc(x)
     from sglang.srt.environ import envs
@@ -94,7 +99,11 @@ def pre_fc(input_embeds, hidden_states, norm_embedding, norm_hidden, fc):
     """
     assert input_embeds.device.type == hidden_states.device.type == "cpu"
     assert (
-        input_embeds.dtype == hidden_states.dtype == fc.weight.dtype == torch.bfloat16
+        input_embeds.dtype == hidden_states.dtype == torch.bfloat16
+        and (
+            fc.weight.dtype == torch.bfloat16
+            or (fc.weight.dtype == torch.int8 and getattr(fc, "_kunpeng_mtp_quantized_fc", False))
+        )
     )
     assert input_embeds.ndim == hidden_states.ndim == 2
     assert input_embeds.shape == hidden_states.shape
