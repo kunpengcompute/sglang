@@ -5,8 +5,11 @@
 # 任何删除动作默认只预览（dry-run），必须加 -f 才真正执行。
 #
 # 目录结构（HiCacheFile 后端，一页一文件）：
-#   {hash}{config_suffix}.bin           KV 页 blob（target 各层 + MTP draft 层）
-#   {hash}@idxk{config_suffix}.bin      index-K 页 blob（target + draft）
+#   {hash}{suffix}.bin          KV 页 blob（全模型 target 各层 + MTP draft 层）
+#   {hash}@idxk{suffix}.bin     index-K 页 blob（target 非 skip 层 + draft）
+#   {hash}{suffix}.s0..s15      PP 装配完成哨兵：每 stage 一个 0 字节文件，
+#                               O_CREAT|O_EXCL 原子创建、永不改写。16 个都在
+#                               即整页可用；PP1 一次创建全部 16 个。
 
 set -u
 
@@ -248,6 +251,7 @@ cmd_clean() {
             f = $4
             if (flt != "" && index(f, flt) == 0) next
             print f
+            for (i = 0; i < 16; i++) print substr(f, 1, length(f) - 4) ".s" i
             n++
             s += $1
             d = int(($3 + off) / 86400)
@@ -327,6 +331,18 @@ cmd_orphan() {
         done
     ' sh "$DIR" "$FILTER" >> "$orphans"
 
+    # PP 装配哨兵：去掉 .sN 后对应的页 blob 是否存在（页已删则哨兵也删）。
+    find "$DIR" -maxdepth 1 -type f \( -name '*.s[0-9]' -o -name '*.s1[0-5]' \) -printf '%f\n' 2>/dev/null |
+    xargs -r -P "$JOBS" -n 64 sh -c '
+        d=$1; flt=$2; shift 2
+        for f in "$@"; do
+            if [ -n "$flt" ]; then
+                case "$f" in *"$flt"*) ;; *) continue ;; esac
+            fi
+            [ -e "$d/${f%.s*}.bin" ] || printf "%s\n" "$f"
+        done
+    ' sh "$DIR" "$FILTER" >> "$orphans"
+
     cnt=$(wc -l < "$orphans" | tr -d ' ')
     echo "孤儿文件: $cnt 个"
     if [ "$cnt" -gt 0 ]; then
@@ -381,6 +397,7 @@ cmd_size() {
         if (flt != "" && index(name, flt) == 0) next
         if (freed >= need) next
         print name > dl
+        for (i = 0; i < 16; i++) print substr(name, 1, length(name) - 4) ".s" i > dl
         freed += $2
         cnt++
         d = strftime("%F", $1)

@@ -25,8 +25,10 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
+    FlatPageLayout,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    flat_kv_key_digest,
 )
 
 if TYPE_CHECKING:
@@ -456,6 +458,14 @@ class HiCacheController:
         self.has_l1l3_draft = False
         self.l1l3_kv_layers: list = []
         self._l1l3_io_pending = False
+        # PP-independent geometry of the page blob: how many target layers the
+        # model has and which of them skip top-k. Set by the scheduler before
+        # finalize_l1l3_io(); the per-stage slices are derived from it there.
+        self.total_layers = 0
+        self.total_draft_layers: Optional[int] = None
+        self.global_skip_topk_layers: Optional[List[bool]] = None
+        self.flat_shard_layout: Optional[FlatPageLayout] = None
+        self.flat_shard_layout_idx: Optional[FlatPageLayout] = None
         self.tp_shard_enabled = (
             os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD", "1") == "1"
         )
@@ -900,6 +910,231 @@ class HiCacheController:
         for buffer in (self.flat_write, self.flat_read):
             self.storage_backend.register_io_buffer(buffer)
 
+        self._build_flat_shard_layout()
+
+    def set_flat_shard_layout(
+        self,
+        num_hidden_layers: int,
+        skip_topk_layers: Optional[List[bool]] = None,
+        draft_layers: int = 0,
+    ) -> None:
+        """Declare the PP-independent page geometry of the L1<->L3 blob.
+
+        ``num_hidden_layers`` is the model's target-layer count and
+        ``skip_topk_layers`` the per-layer DSA skip-topk flags over all of them
+        (None for a pool without a DSA indexer), both identical on every PP
+        stage. ``draft_layers`` is the number of MTP draft KV layers the blob
+        carries at its tail -- also model-wide, because only the last stage
+        holds the draft pool and the others still need the whole-object size to
+        tell a complete page from a partially written one. The per-stage
+        offsets are derived in _build_flat_shard_layout(), once the draft pool
+        is registered.
+        """
+        self.total_layers = int(num_hidden_layers)
+        self.total_draft_layers = int(draft_layers)
+        self.global_skip_topk_layers = (
+            list(skip_topk_layers) if skip_topk_layers is not None else None
+        )
+
+    def _build_flat_shard_layout(self) -> None:
+        """Slice of the whole-page L3 object that this PP stage owns.
+
+        PP1 and PP16 share one L3 pool, so the object keeps the PP1 byte
+        layout: target layers in order, then the MTP draft layers. A stage
+        writes only its own layers, at the offset a PP1 process would have
+        written them, which keeps every stage's I/O at 1/pp_size of a page
+        while both layouts stay mutually readable. With ``pp_size == 1`` the
+        single stage covers the whole object, i.e. offsets collapse to zero.
+        """
+        if self.flat_write is None:
+            return
+        kv_bytes = (
+            self.page_size
+            * int(self.mem_pool_device.kv_cache_dim)
+            * self.flat_write.element_size()
+        )
+        draft_pool = (
+            getattr(self, "mem_pool_device_draft", None)
+            if self.has_l1l3_draft
+            else None
+        )
+        draft_layers = len(getattr(draft_pool, "kv_buffer", None) or [])
+        # Counted from the buffer itself so the segments tile it exactly; the
+        # draft layers are always the tail of l1l3_kv_layers.
+        target_layers = len(self.l1l3_kv_layers) - draft_layers
+        # Size of the whole object, which only the last stage can observe from
+        # its own pool: the others need the model-wide draft count instead.
+        draft_total = (
+            self.total_draft_layers
+            if self.total_draft_layers is not None
+            else draft_layers
+        )
+        start_layer = int(getattr(self.mem_pool_device, "start_layer", 0) or 0)
+        # Layer count of the model, not of this stage: a stage must place its
+        # layers where the PP1 process placed them. A single stage holds every
+        # layer, so there the pool itself is authoritative (and the object keeps
+        # exactly the pre-existing size even if the config disagrees).
+        model_layers = self.total_layers
+        if self.pp_size <= 1 or model_layers < start_layer + target_layers:
+            if model_layers and model_layers != start_layer + target_layers:
+                logger.warning(
+                    "[hicache] model layer count %d != pool layers %d; "
+                    "the L3 page blob uses the pool",
+                    model_layers,
+                    start_layer + target_layers,
+                )
+            total_layers = start_layer + target_layers
+        else:
+            total_layers = model_layers
+
+        # The stages that actually write this object, and where this stage sits
+        # among them: only they set a byte in the .stages marker, so a stage
+        # without index-K layers (all of them skip-topk) must not hold the
+        # index-K marker open forever.
+        from sglang.srt.distributed.utils import get_pp_indices
+
+        pp_size = max(1, int(self.pp_size))
+        pp_rank = int(self.pp_rank)
+        pp_ranges = [
+            get_pp_indices(total_layers, k, pp_size) for k in range(pp_size)
+        ]
+
+        def writer_index(contributes) -> tuple:
+            staging = [k for k, ok in enumerate(contributes) if ok]
+            if not staging:
+                return 0, 1
+            return (staging.index(pp_rank) if pp_rank in staging else 0), len(staging)
+
+        kv_writer, kv_writers = writer_index([e > s for (s, e) in pp_ranges])
+        # Only the last stage runs the MTP head (see Scheduler.maybe_init_draft_
+        # worker), so only it holds real draft KV. Every other stage's draft
+        # pool is never filled: letting them write the shared draft slot would
+        # overwrite the owner's bytes with zeros depending on write order.
+        owns_draft = pp_rank == pp_size - 1
+        kv_segments = []
+        if target_layers:
+            kv_segments.append((0, start_layer * kv_bytes, target_layers * kv_bytes))
+        if draft_layers and owns_draft:
+            kv_segments.append(
+                (
+                    target_layers * kv_bytes,
+                    total_layers * kv_bytes,
+                    draft_layers * kv_bytes,
+                )
+            )
+        kv_layout = FlatPageLayout(
+            tuple(kv_segments),
+            (total_layers + draft_total) * kv_bytes,
+            kv_writer,
+            kv_writers,
+        )
+
+        idx_layout = None
+        if self.indexer_page_elems:
+            idx_layers, idx_elems, _, _ = self._indexer_layout()
+            idx_bytes = (
+                self.page_size
+                * int(idx_elems)
+                * self.flat_write_idx.element_size()
+            )
+            idx_draft = sum(
+                1
+                for buf in (getattr(draft_pool, "index_k_buffer", None) or [])
+                if buf is not None
+            )
+            skip = self.global_skip_topk_layers
+            if skip is None:
+                skip = [False] * max(total_layers, start_layer + target_layers)
+            # The writer set comes from the skip table, so this stage's slice
+            # must be counted the same way. Taking it from the pool buffer
+            # instead lets a stage be counted as a writer while it has nothing
+            # to write, leaving its marker bit unset forever.
+            pool_idx_local = len(idx_layers or []) - idx_draft
+            idx_local = sum(
+                1
+                for i in range(start_layer, start_layer + target_layers)
+                if i < len(skip) and not skip[i]
+            )
+            # Same reasoning as the KV side: an MTP layer owns one index-K blob
+            # and the stages without the draft pool still need the total.
+            idx_draft_total = idx_draft or draft_total
+            # Skip-topk layers own no index-K blob, so a stage's offset is the
+            # number of *allocating* layers before it, not its layer id.
+            idx_before = sum(1 for s in skip[:start_layer] if not s)
+            idx_total = sum(1 for s in skip[:total_layers] if not s)
+            logger.info(
+                "[hicache] index-K layers: pp=%d/%d start=%d target=%d "
+                "pool=%d skip=%d draft=%d before=%d total=%d",
+                pp_rank,
+                pp_size,
+                start_layer,
+                target_layers,
+                pool_idx_local,
+                idx_local,
+                idx_draft,
+                idx_before,
+                idx_total,
+            )
+            if pool_idx_local != idx_local:
+                logger.warning(
+                    "[hicache] index-K layer mismatch at pp=%d/%d: pool=%d "
+                    "skip=%d (start=%d target=%d); using the skip table",
+                    pp_rank,
+                    pp_size,
+                    pool_idx_local,
+                    idx_local,
+                    start_layer,
+                    target_layers,
+                )
+            idx_writer, idx_writers = writer_index(
+                [
+                    any(not skip[i] for i in range(s, min(e, len(skip))))
+                    for (s, e) in pp_ranges
+                ]
+            )
+            idx_segments = []
+            if idx_local:
+                idx_segments.append(
+                    (0, idx_before * idx_bytes, idx_local * idx_bytes)
+                )
+            if idx_draft and owns_draft:
+                idx_segments.append(
+                    (
+                        idx_local * idx_bytes,
+                        idx_total * idx_bytes,
+                        idx_draft * idx_bytes,
+                    )
+                )
+            idx_layout = FlatPageLayout(
+                tuple(idx_segments),
+                (idx_total + idx_draft_total) * idx_bytes,
+                idx_writer,
+                idx_writers,
+            )
+
+        self.flat_shard_layout = kv_layout
+        self.flat_shard_layout_idx = idx_layout
+        self.storage_backend.set_flat_layout(
+            kv_layout, idx_layout, self.indexer_key_suffix
+        )
+        logger.info(
+            "[hicache] L3 page layout: pp=%d/%d start=%d target=%d draft=%d "
+            "draft_owner=%s kv_total=%d kv_seg=%s writer=%d/%d "
+            "idx_total=%s idx_seg=%s",
+            pp_rank,
+            pp_size,
+            start_layer,
+            target_layers,
+            draft_layers,
+            owns_draft,
+            kv_layout.total_bytes,
+            kv_layout.segments,
+            kv_layout.writer,
+            kv_layout.writers,
+            None if idx_layout is None else idx_layout.total_bytes,
+            None if idx_layout is None else idx_layout.segments,
+        )
+
     def finalize_l1l3_io(self) -> None:
         """Build the flat buffers and the tp-shard segment (two-tier mode).
 
@@ -1115,6 +1350,19 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
+        # Two-tier mode: name a page blob by what it holds, never by who wrote
+        # it, so PP1/PP16 (and any TP split) address the same files. The three
+        # tier mode keeps the legacy per-rank suffix.
+        key_digest = None
+        if self.l1l3_only:
+            key_digest = flat_kv_key_digest(
+                model_name,
+                self.mem_pool_device.dtype,
+                self.page_size,
+                int(getattr(self.mem_pool_device, "kv_cache_dim", 0) or 0),
+                int(getattr(self.mem_pool_device, "index_head_dim", 0) or 0),
+            )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -1134,6 +1382,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            key_digest=key_digest,
         )
 
     def reset(self):
@@ -2549,10 +2798,19 @@ class HiCacheController:
         return False
 
     def _query_shards(self) -> int:
-        """Ranks that share the L3 existence query (1 = every rank asks all)."""
+        """Ranks that share the L3 existence query (1 = every rank asks all).
+
+        Must match the shard space of the *read* (``_page_transfer_l1l3_shard``
+        uses ``tp_shard_nranks``): a page is only usable when the rank that owns
+        it can fetch it, so querying a different shard space makes the reported
+        hit length longer than what the read can actually deliver.
+        """
         if os.environ.get("SGLANG_KUNPENG_HICACHE_QUERY_SHARD", "1") != "1":
             return 1
-        return max(1, int(getattr(self, "tp_size", 1)))
+        nranks = getattr(self, "tp_shard_nranks", None) or getattr(
+            self, "tp_size", 1
+        )
+        return max(1, int(nranks))
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         """Return the operation's hash chain and its first missing page.
@@ -2610,6 +2868,18 @@ class HiCacheController:
                             if not exists:
                                 first_miss_page = page_base + i
                                 break
+                # The read needs kv *and* index-K for a page, so the reported
+                # prefix must be limited by the index-K objects too; otherwise
+                # the prefetch starts with a length it cannot deliver.
+                if self.indexer_page_elems and page_base < first_miss_page:
+                    upto = min(first_miss_page - page_base, pages)
+                    idx_bits = self.storage_backend.batch_exists_bits(
+                        self._indexer_keys(batch_hashes[:upto]), extra_info
+                    )
+                    for i, exists in enumerate(idx_bits):
+                        if not exists:
+                            first_miss_page = min(first_miss_page, page_base + i)
+                            break
             hash_value.extend(batch_hashes)
             page_base += pages
             if prefix_keys and len(prefix_keys) > 0 and page_base <= first_miss_page:
@@ -2889,9 +3159,24 @@ class HiCacheController:
             t_batch_start = time.perf_counter() if debug else 0.0
             if debug:
                 cpu_batch_start, rq_batch_start = _thread_stat()
+                # Per-batch audit: lets a stuck page be traced to the stage/rank
+                # that was supposed to write it (grep the page hash).
+                logger.info(
+                    "[hicache] L1->L3 batch: op=%d, batch=%d, pages=%d, mine=%d, "
+                    "shard=%d/%d, first=%s, last=%s",
+                    operation.id,
+                    i // self.storage_batch_size,
+                    pages,
+                    len(mine),
+                    my,
+                    nranks,
+                    batch_hashes[0][:16],
+                    batch_hashes[-1][:16],
+                )
 
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = True
+            failed = 0
             page_starts = None
             if mine:
                 page_starts = self._device_page_starts(batch_indices, pages, "L1->L3")
@@ -2901,13 +3186,13 @@ class HiCacheController:
                     page_starts[mine],
                     self.page_size,
                 )
-                success = all(
-                    self.storage_backend.batch_set_flat(
-                        [batch_hashes[j] for j in mine],
-                        [self.flat_write[k] for k in range(len(mine))],
-                        extra_info,
-                    )
+                kv_res = self.storage_backend.batch_set_flat(
+                    [batch_hashes[j] for j in mine],
+                    [self.flat_write[k] for k in range(len(mine))],
+                    extra_info,
                 )
+                failed = sum(1 for ok in kv_res if not ok)
+                success = failed == 0
             if success and page_starts is not None and self.indexer_page_elems:
                 page_ids = page_starts // self.page_size
                 hicache_page_flatten_batch(
@@ -2916,13 +3201,13 @@ class HiCacheController:
                     page_ids[mine],
                     1,
                 )
-                success = all(
-                    self.storage_backend.batch_set_flat(
-                        self._indexer_keys([batch_hashes[j] for j in mine]),
-                        [self.flat_write_idx[k] for k in range(len(mine))],
-                        extra_info,
-                    )
+                idx_res = self.storage_backend.batch_set_flat(
+                    self._indexer_keys([batch_hashes[j] for j in mine]),
+                    [self.flat_write_idx[k] for k in range(len(mine))],
+                    extra_info,
                 )
+                failed += sum(1 for ok in idx_res if not ok)
+                success = failed == 0
                 if debug:
                     logger.info(
                         "[hicache] L1->flat copy + flat->L3 write (indexer): op=%d, "
@@ -2958,7 +3243,11 @@ class HiCacheController:
 
             if not success:
                 logger.warning(
-                    f"Write page to storage: {len(mine)} of {pages} page(s) failed."
+                    "Write page to storage: %d of %d page(s) failed "
+                    "(this rank owns %d).",
+                    failed,
+                    pages,
+                    len(mine),
                 )
                 break
 

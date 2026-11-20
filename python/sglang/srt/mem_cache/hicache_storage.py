@@ -1,9 +1,11 @@
+import hashlib
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Set
+from typing import Any, List, Optional, Set, Tuple
 
 import torch
 
@@ -29,12 +31,70 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Topology-free page-blob identity (see flat_kv_key_digest). Set by the
+    # two-tier path so every PP/TP layout writes the same file names.
+    key_digest: Optional[str] = None
+
+
+def flat_kv_key_digest(
+    model_name: Optional[str],
+    dtype: torch.dtype,
+    page_size: int,
+    kv_dim: int,
+    index_head_dim: int = 0,
+) -> str:
+    """Topology-free identity of a page blob: what it holds, not who wrote it.
+
+    No tp/pp/cp rank enters the digest, so every PP (and TP) layout derives the
+    same file names and can share one pool. Layer counts are left out on
+    purpose: a mismatch already shows up as a wrong object size, i.e. a miss.
+    """
+    raw = "|".join(
+        [
+            model_name or "",
+            str(dtype).replace("torch.", ""),
+            str(int(page_size)),
+            str(int(kv_dim)),
+            str(int(index_head_dim)),
+        ]
+    )
+    return hashlib.sha1(raw.encode()).hexdigest()[:12]
 
 
 @dataclass
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = (None,)
     extra_info: Optional[dict] = None
+
+
+# Width of the ``.stages`` sidecar, in bytes, one bit per PP stage. It is a
+# constant (not ``layout.writers``) so a PP1 process and a PP16 process agree on
+# the same completion record: PP1 writes all slots, PP16 each writes its own.
+L3_STAGE_SLOTS = 16
+
+
+@dataclass(frozen=True)
+class FlatPageLayout:
+    """Where this PP stage's bytes live inside a whole-page L3 object.
+
+    PP1 and PP16 must read and write the same files, so the object keeps the
+    PP1 byte layout: the target layers in layer order, then the MTP draft
+    layers. Every stage writes only the slice it owns, at the offset a PP1
+    process would have put that slice at, so either layout can read what the
+    other wrote.
+
+    ``segments`` are ``(buffer_offset, file_offset, length)`` byte triples,
+    which lets the target and the draft slices be discontiguous in both the
+    flat buffer and the object. ``writer``/``writers`` index the byte of the
+    sidecar ``.stages`` marker that records this stage's write, over the stages
+    that actually contribute bytes to this object (a stage whose layer range
+    has no index-K blob does not take part in the index-K marker).
+    """
+
+    segments: Tuple[Tuple[int, int, int], ...]
+    total_bytes: int
+    writer: int = 0
+    writers: int = 1
 
 
 class PoolName(str, Enum):
@@ -248,6 +308,22 @@ class HiCacheStorage(ABC):
         """
         pass
 
+    def set_flat_layout(
+        self,
+        kv_layout: Optional["FlatPageLayout"],
+        idx_layout: Optional["FlatPageLayout"] = None,
+        idx_key_suffix: str = "@idx",
+    ) -> None:
+        """Declare the shared PP page geometry used by the flat interface.
+
+        Backends that keep one whole page per object (the file backend when
+        ``SGLANG_HICACHE_FILE_PP_SHARED`` is on) use this to pwrite/pread only
+        the slice of the current PP stage, so a PP1 and a PP16 process can
+        share one pool. The default keeps whole-page I/O, i.e. the flat
+        interface behaves exactly as before.
+        """
+        pass
+
     def batch_get_flat(
         self,
         keys: List[str],
@@ -406,15 +482,257 @@ class HiCacheFile(HiCacheStorage):
             storage_config.is_mla_model,
         )
         model_name = "-".join(model_name.split("/")) if model_name else ""
-        enable_pp = pp_size > 1
-        self.config_suffix = f"_{model_name}"
-        if not is_mla_model:
-            self.config_suffix += f"_{tp_rank}_{tp_size}"
-        if enable_pp:
-            self.config_suffix += f"_{pp_size}_{pp_rank}"
+        self.pp_rank = int(pp_rank)
+        self.pp_size = int(pp_size)
+        self.pp_shared = envs.SGLANG_HICACHE_FILE_PP_SHARED.get()
+        if storage_config.key_digest and self.pp_shared:
+            # Two-tier mode: the name carries only what the blob holds, so a
+            # PP1 and a PP16 process (and any TP split) address the same files.
+            self.config_suffix = (
+                f"_{model_name}-{storage_config.key_digest}"
+                if model_name
+                else f"_{storage_config.key_digest}"
+            )
+        else:
+            self.config_suffix = f"_{model_name}"
+            if not is_mla_model:
+                self.config_suffix += f"_{tp_rank}_{tp_size}"
+            # With the shared key off, a pp>1 run keeps its private per-stage
+            # files, exactly as before this change.
+            if not self.pp_shared and self.pp_size > 1:
+                self.config_suffix += f"_{self.pp_size}_{self.pp_rank}"
+        self.kv_layout: Optional[FlatPageLayout] = None
+        self.idx_layout: Optional[FlatPageLayout] = None
+        self.idx_key_suffix = "@idx"
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
+
+    def set_flat_layout(
+        self,
+        kv_layout: Optional[FlatPageLayout],
+        idx_layout: Optional[FlatPageLayout] = None,
+        idx_key_suffix: str = "@idx",
+    ) -> None:
+        if not self.pp_shared:
+            return
+        self.kv_layout = kv_layout
+        self.idx_layout = idx_layout
+        self.idx_key_suffix = idx_key_suffix
+
+    def _layout_for(self, key: str) -> Optional[FlatPageLayout]:
+        """Page layout of one key; ``None`` means the legacy whole-file I/O."""
+        if self.kv_layout is None:
+            return None
+        if self.idx_layout is not None and self.idx_key_suffix in key:
+            return self.idx_layout
+        return self.kv_layout
+
+    @staticmethod
+    def _stage_marker_path(path: str, stage: int) -> str:
+        """Per-stage completion sentinel (zero bytes) next to the page blob.
+
+        One file per stage instead of one shared 16-byte bitmap: a shared file
+        that 16 nodes pwrite into loses updates on a distributed filesystem
+        (observed: the byte lands locally, the server keeps the old value), which
+        leaves pages stuck at 15/16 forever. Creating a private file with
+        ``O_CREAT|O_EXCL`` is atomic and cannot be undone by another node.
+        """
+        stem = path[:-4] if path.endswith(".bin") else path
+        return f"{stem}.s{stage}"
+
+    def _marker_slots(self, layout: FlatPageLayout) -> int:
+        """How many stage sentinels this page has; ``0`` = not representable."""
+        if layout.writers > L3_STAGE_SLOTS:
+            return 0
+        return L3_STAGE_SLOTS
+
+    def _marker_need(self, layout: FlatPageLayout) -> int:
+        """How many sentinels must exist for the page to count as complete.
+
+        A whole-object writer (PP1) creates every sentinel, and must also
+        *require* every one: otherwise a PP16 page that another stage is still
+        assembling would look complete to it.
+        """
+        if layout.writers <= 1:
+            return L3_STAGE_SLOTS
+        return layout.writers
+
+    def _marker_count(self, path: str, need: int) -> int:
+        """Number of the first *need* sentinels that exist (cheap, no read)."""
+        n = 0
+        for i in range(max(0, need)):
+            if os.path.exists(self._stage_marker_path(path, i)):
+                n += 1
+        return n
+
+    def _page_ready(self, path: str, layout: FlatPageLayout) -> bool:
+        """Whole page present: full size and every stage sentinel present.
+
+        The size check alone is not enough: a stage's slice can sit at the very
+        end of the object (the MTP draft layer does), so the first write already
+        stretches the file to ``total_bytes`` while the rest is holes.
+        """
+        need = self._marker_need(layout)
+        if need <= 0 or self._marker_slots(layout) <= 0:
+            return False
+        try:
+            size = os.stat(path).st_size
+        except OSError:
+            return False
+        if size != layout.total_bytes:
+            return False
+        return self._marker_count(path, need) == need
+
+    def _wait_incomplete(
+        self, path: str, layout: FlatPageLayout, budget: float = None
+    ) -> bool:
+        """Wait for a page that another stage is still assembling.
+
+        A reader and a writer of the same prefix race by design: the writer's
+        last stages may land seconds after a page is already readable in
+        substance. Stopping the whole contiguous prefix on such a page turns a
+        nearly-complete hit into a full recompute, so look at the marker first:
+        ``0 < set < need`` means "in progress" (retry for a bounded time), while
+        a missing marker or zero slots means "not started" (do not wait).
+        """
+        need = self._marker_need(layout)
+        if need <= 0 or self._marker_slots(layout) <= 0:
+            return False
+        filled = self._marker_count(path, need)
+        if filled == 0 or filled >= need:
+            return False
+        if budget is None:
+            budget = float(envs.SGLANG_HICACHE_INCOMPLETE_WAIT.get())
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            if self._page_ready(path, layout):
+                return True
+        logger.warning(
+            "[hicache] L3 page %s stayed incomplete for %.1fs (%d/%d stages); "
+            "treating it as a miss",
+            os.path.basename(path),
+            budget,
+            filled,
+            need,
+        )
+        return False
+
+    def _read_slices(
+        self, path: str, buffer: torch.Tensor, layout: FlatPageLayout
+    ) -> bool:
+        """Read each segment at its file offset; a short read means a miss."""
+        buf = memoryview(buffer.view(torch.uint8).contiguous().numpy())
+        with open(path, "rb", buffering=0) as f:
+            for src, dst, length in layout.segments:
+                f.seek(dst)
+                if f.readinto(buf[src : src + length]) != length:
+                    return False
+        return True
+
+    @staticmethod
+    def _create_sentinel(path: str, stage: int) -> bool:
+        """Atomically record that *stage* finished this page.
+
+        ``O_CREAT|O_EXCL`` makes "create once" a single atomic operation, so two
+        nodes racing here can never lose each other's record (which is what a
+        shared bitmap does on a distributed filesystem).
+        """
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+            return True
+        except FileExistsError:
+            return True
+        except OSError as e:
+            logger.warning("[hicache] sentinel create failed for %s: %s", path, e)
+            return False
+
+    def _write_slices(
+        self, path: str, buffer: torch.Tensor, layout: FlatPageLayout
+    ) -> bool:
+        slots = self._marker_slots(layout)
+        need = self._marker_need(layout)
+        if slots <= 0 or need <= 0:
+            logger.warning(
+                "[hicache] L3 page %s needs %d PP stage slots but only %d are "
+                "supported; skipping write",
+                os.path.basename(path),
+                layout.writers,
+                L3_STAGE_SLOTS,
+            )
+            return False
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+        if size > layout.total_bytes:
+            # Another writer used a different page geometry. Truncating would
+            # wipe the slices it already wrote, so leave the object alone.
+            logger.warning(
+                "[hicache] L3 page %s is larger than the shared layout "
+                "(%d > %d bytes), skipping write",
+                os.path.basename(path),
+                size,
+                layout.total_bytes,
+            )
+            return False
+        if size == layout.total_bytes and self._marker_count(path, need) == need:
+            # Genuinely complete (readiness uses the same predicate), so there
+            # is nothing to add. Size alone never gets here.
+            return True
+        data = memoryview(buffer.view(torch.uint8).contiguous().numpy())
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            for src, dst, length in layout.segments:
+                view = data[src : src + length]
+                if len(view) < length:
+                    logger.warning(
+                        "[hicache] L3 page %s buffer shorter than its slice "
+                        "(%d < %d), skipping write",
+                        os.path.basename(path),
+                        len(view),
+                        length,
+                    )
+                    return False
+                done = 0
+                while done < length:
+                    n = os.pwrite(fd, view[done:], dst + done)
+                    if n <= 0:
+                        logger.warning(
+                            "[hicache] L3 page %s write stalled at %d/%d bytes",
+                            os.path.basename(path),
+                            done,
+                            length,
+                        )
+                        return False
+                    done += n
+        finally:
+            os.close(fd)
+        # Record this stage. Each stage owns a private sentinel file, so no
+        # node can ever overwrite another stage's record: the create is atomic
+        # and idempotent. PP1 covers the whole object, so it creates them all.
+        if layout.writers == 1:
+            ok = all(self._create_sentinel(self._stage_marker_path(path, i), 0)
+                     for i in range(slots))
+        else:
+            ok = self._create_sentinel(
+                self._stage_marker_path(path, layout.writer), 0
+            )
+        if not ok:
+            return False
+        if (
+            self._marker_count(path, need) == need
+            and size == layout.total_bytes
+            and envs.SGLANG_HICACHE_DEBUG.get()
+        ):
+            logger.info(
+                "[hicache] L3 page %s complete (%d/%d stages)",
+                os.path.basename(path),
+                need,
+                need,
+            )
+        return True
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -610,14 +928,19 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def exists(self, key: str) -> bool:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        return os.path.exists(tensor_path)
+        tensor_path = os.path.join(self.file_path, f"{self._get_suffixed_key(key)}.bin")
+        layout = self._layout_for(key)
+        if layout is None:
+            return os.path.exists(tensor_path)
+        # A page another stage is still assembling is not usable yet, and one
+        # written by the other layout (PP1 vs PP16) is only usable at full size.
+        return self._page_ready(tensor_path, layout)
 
     def batch_exists_bits(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> List[bool]:
-        """One `stat` per page; the sharded hit query splits these across ranks."""
+        """One existence check per page; the sharded hit query splits these
+        across ranks."""
         return [self.exists(key) for key in keys]
 
     def supports_flat_io(self) -> bool:
@@ -636,8 +959,20 @@ class HiCacheFile(HiCacheStorage):
             tensor_path = os.path.join(
                 self.file_path, f"{self._get_suffixed_key(key)}.bin"
             )
-            expected = buffer.numel() * buffer.element_size()
+            layout = self._layout_for(key)
             try:
+                if layout is not None:
+                    if not self._page_ready(tensor_path, layout) and not (
+                        # The prefix is being assembled by another PP stage right
+                        # now: waiting keeps a nearly-complete hit instead of
+                        # recomputing the whole suffix.
+                        self._wait_incomplete(tensor_path, layout)
+                    ):
+                        results.append(False)
+                        continue
+                    results.append(self._read_slices(tensor_path, buffer, layout))
+                    continue
+                expected = buffer.numel() * buffer.element_size()
                 with open(tensor_path, "rb", buffering=0) as f:
                     buf = memoryview(buffer.view(torch.uint8).contiguous().numpy())
                     results.append(f.readinto(buf) == expected)
@@ -657,18 +992,26 @@ class HiCacheFile(HiCacheStorage):
             tensor_path = os.path.join(
                 self.file_path, f"{self._get_suffixed_key(key)}.bin"
             )
-            needed = buffer.numel() * buffer.element_size()
-            # Write-once, unless the existing blob was written by an older page
-            # layout (e.g. before the draft layers were coalesced). Rewriting on
-            # a size mismatch keeps those prefixes usable instead of turning
-            # them into permanent misses.
+            layout = self._layout_for(key)
             try:
-                if os.path.getsize(tensor_path) == needed:
-                    results.append(True)
+                if layout is not None:
+                    # Writes only this stage's slices, at the offsets the PP1
+                    # layout puts them at; concurrent stages fill the rest.
+                    results.append(
+                        self._write_slices(tensor_path, buffer, layout)
+                    )
                     continue
-            except OSError:
-                pass
-            try:
+                needed = buffer.numel() * buffer.element_size()
+                # Write-once, unless the existing blob was written by an older
+                # page layout (e.g. before the draft layers were coalesced).
+                # Rewriting on a size mismatch keeps those prefixes usable
+                # instead of turning them into permanent misses.
+                try:
+                    if os.path.getsize(tensor_path) == needed:
+                        results.append(True)
+                        continue
+                except OSError:
+                    pass
                 buffer.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
                 results.append(True)
             except Exception as e:
