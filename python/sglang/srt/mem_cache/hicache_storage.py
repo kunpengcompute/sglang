@@ -61,8 +61,7 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
-# PP stages that can share one page: each owns one byte of ``{stem}.stages``,
-# and byte ``L3_STAGE_SLOTS`` holds the page's writer count.
+# PP stages that can share one page: each owns one sentinel of ``{stem}.s<k>``.
 L3_STAGE_SLOTS = 16
 
 
@@ -511,33 +510,38 @@ class HiCacheFile(HiCacheStorage):
         return self.kv_layout
 
     @staticmethod
+    def _stage_path(path: str, stage: int) -> str:
+        """Zero-byte sentinel of one PP stage; every stage owns its own inode."""
+        stem = path[:-4] if path.endswith(".bin") else path
+        return f"{stem}.s{stage}"
+
+    @staticmethod
     def _stages_path(path: str) -> str:
-        """Stage bytes plus a writer count: stage k owns byte k, nothing appended."""
+        """Writer count of the page (one byte, written identically by all)."""
         stem = path[:-4] if path.endswith(".bin") else path
         return f"{stem}.stages"
 
-    @staticmethod
-    def _mark_stage(path: str, stage: int, writers: int) -> bool:
-        """Write this stage's byte, plus the page's writer count.
+    def _mark_stage(self, path: str, stage: int, writers: int) -> bool:
+        """Mark this stage done and record how many stages the page has.
 
-        Stage ``k`` owns byte ``k`` and every writer stores the same ``writers``
-        byte at ``L3_STAGE_SLOTS``, so the reader needs no assumption about the
-        PP layout that produced the page: the file says how many stages it has.
-        Disjoint offsets are the same guarantee the page blob itself relies on;
-        the overlapping write of the count is idempotent (same value).
+        A shared file cannot carry the stage marks: 16 nodes writing bytes of
+        one 4KB block lose each other's updates on this filesystem (measured),
+        while every stage's own sentinel is a separate inode. The count byte is
+        written by all of them with the same value, so a racing write is
+        idempotent.
         """
+        if not self._create_file(self._stage_path(path, stage)):
+            return False
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+            fd = os.open(self._stages_path(path), os.O_WRONLY | os.O_CREAT, 0o644)
             try:
-                if os.pwrite(fd, b"\x01", stage) != 1:
-                    return False
-                if os.pwrite(fd, bytes([writers]), L3_STAGE_SLOTS) != 1:
+                if os.pwrite(fd, bytes([writers]), 0) != 1:
                     return False
             finally:
                 os.close(fd)
             return True
         except OSError as e:
-            logger.warning("[hicache] stage mark failed for %s: %s", path, e)
+            logger.warning("[hicache] writer count failed for %s: %s", path, e)
             return False
 
     @staticmethod
@@ -547,21 +551,43 @@ class HiCacheFile(HiCacheStorage):
         return f"{stem}.done"
 
     def _stage_state(self, path: str) -> Tuple[int, int]:
-        """``(stages finished, stages expected)`` from the ``.stages`` file.
+        """``(stages finished, stages expected)`` from the sentinels and count.
 
-        The expected count is whatever the writers recorded in byte
-        ``L3_STAGE_SLOTS``, so a PP1/PP4/PP16 reader judges every page the same
-        way instead of assuming its own stage count.
+        The expected count is whatever the writers recorded, so a PP1/PP4/PP16
+        reader judges every page the same way instead of assuming its own stage
+        count.
         """
         try:
             with open(self._stages_path(path), "rb") as f:
-                data = f.read(L3_STAGE_SLOTS + 1)
+                data = f.read(1)
         except OSError:
             return 0, 0
-        need = data[L3_STAGE_SLOTS] if len(data) > L3_STAGE_SLOTS else 0
+        need = data[0] if data else 0
         if not need:
             return 0, 0
-        return sum(1 for b in data[:need] if b), need
+        filled = sum(
+            1 for k in range(need) if os.path.exists(self._stage_path(path, k))
+        )
+        return filled, need
+
+    def _drop_stage_marks(self, path: str, need: int) -> None:
+        """Delete the sentinels and the count file once ``.done`` exists.
+
+        Readers only trust ``.done``, so these records are dead weight after
+        the page is elected; removing them keeps the directory at three entries
+        per page. Missing files are fine (a concurrent writer may have won).
+        """
+        for p in [self._stage_path(path, k) for k in range(need)] + [
+            self._stages_path(path)
+        ]:
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                # Another writer may be removing the same file right now.
+                if os.path.exists(p):
+                    logger.warning("[hicache] marker unlink failed for %s: %s", p, e)
 
     def _page_ready(self, path: str, layout: FlatPageLayout) -> bool:
         """Whole page present: ``.done`` exists, or the slow full check passes.
@@ -719,13 +745,13 @@ class HiCacheFile(HiCacheStorage):
                 # A whole-object writer needs no per-stage records.
                 ok = self._create_file(self._done_path(path))
             else:
-                ok = self._mark_stage(
-                    self._stages_path(path), layout.writer, layout.writers
-                )
+                ok = self._mark_stage(path, layout.writer, layout.writers)
                 filled, need = self._stage_state(path) if ok else (0, 0)
                 if need and filled >= need:
-                    # Last writer elects the page for O(1) reader checks.
-                    self._create_file(self._done_path(path))
+                    # Last writer elects the page for O(1) reader checks, then
+                    # drops the per-stage records nothing reads any more.
+                    if self._create_file(self._done_path(path)):
+                        self._drop_stage_marks(path, need)
             if not ok:
                 return False
         if envs.SGLANG_HICACHE_DEBUG.get():
