@@ -876,7 +876,7 @@ class HiRadixCache(RadixCache):
         node.hit_count += 1
 
         # Two-tier mode has no host_value to test, so "already backed up" is the
-        # L3 flag (set when the write is queued).
+        # L3 flag (set on the write ack).
         already_backed = node.storage_backed if self.l1l3_only else node.backuped
         if not already_backed:
             if node.hit_count >= self.write_through_threshold:
@@ -893,12 +893,8 @@ class HiRadixCache(RadixCache):
             return
         if node.evicted or node.storage_backed:
             return
-        if node.value is None or len(node.value) == 0 or not self.enable_storage:
-            return
-        if any(n is node for n in self.ongoing_backup.values()):
-            return
+        # write_backup() re-checks the value, the backend and the queue.
         self.write_backup(node, write_back=True)
-
 
     def writing_check(self, write_back=False):
         if self.l1l3_only:

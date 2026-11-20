@@ -463,8 +463,6 @@ class HiCacheController:
         self.total_layers = 0
         self.total_draft_layers: Optional[int] = None
         self.global_skip_topk_layers: Optional[List[bool]] = None
-        self.flat_shard_layout: Optional[FlatPageLayout] = None
-        self.flat_shard_layout_idx: Optional[FlatPageLayout] = None
         self.tp_shard_enabled = (
             os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD", "1") == "1"
         )
@@ -1090,8 +1088,6 @@ class HiCacheController:
                 idx_writers,
             )
 
-        self.flat_shard_layout = kv_layout
-        self.flat_shard_layout_idx = idx_layout
         self.storage_backend.set_flat_layout(
             kv_layout, idx_layout, self.indexer_key_suffix
         )
@@ -2467,10 +2463,14 @@ class HiCacheController:
                 break
             hit_pages += 1
         if hit_pages and self.indexer_page_elems:
+            # Index-K carries no marker of its own: the KV page's ``.done`` is
+            # written only after every stage closed its Index-K object, and the
+            # KV page hit above already proved that.
             idx_hits = self.storage_backend.batch_get_flat(
                 self._indexer_keys(batch_hashes[:hit_pages]),
                 [self.flat_read_idx[j] for j in range(hit_pages)],
                 extra_info,
+                verify=False,
             )
             idx_hit_pages = 0
             for hit in idx_hits:
@@ -2615,6 +2615,7 @@ class HiCacheController:
                         self._indexer_keys(batch_hashes[:hit_pages]),
                         [self.flat_read_idx[j] for j in range(hit_pages)],
                         HiCacheStorageExtraInfo(prefix_keys=prefix_keys),
+                        verify=False,
                     )
                     idx_hit_pages = 0
                     for hit in idx_hits:
