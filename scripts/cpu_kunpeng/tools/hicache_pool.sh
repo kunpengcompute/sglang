@@ -7,9 +7,12 @@
 # 目录结构（HiCacheFile 后端，一页一文件）：
 #   {hash}{suffix}.bin          KV 页 blob（全模型 target 各层 + MTP draft 层）
 #   {hash}@idxk{suffix}.bin     index-K 页 blob（target 非 skip 层 + draft）
-#   {hash}{suffix}.s0..s15      PP 装配完成哨兵：每 stage 一个 0 字节文件，
+#   {hash}{suffix}.s0..s15      PP 装配哨兵：PP16 每个 stage 一个 0 字节文件，
 #                               O_CREAT|O_EXCL 原子创建、永不改写。16 个都在
-#                               即整页可用；PP1 一次创建全部 16 个。
+#                               即整页装配完毕；PP1 整页写，不建哨兵。
+#   {hash}{suffix}.ok           整页完成标记（0 字节）：PP1 写完直接建；PP16 由
+#                               最后一个写者（能看到 16 个哨兵的那个）创建。
+#                               读者一次 stat 即可判定整页可用。
 
 set -u
 
@@ -252,6 +255,7 @@ cmd_clean() {
             if (flt != "" && index(f, flt) == 0) next
             print f
             for (i = 0; i < 16; i++) print substr(f, 1, length(f) - 4) ".s" i
+            print substr(f, 1, length(f) - 4) ".ok"
             n++
             s += $1
             d = int(($3 + off) / 86400)
@@ -331,15 +335,18 @@ cmd_orphan() {
         done
     ' sh "$DIR" "$FILTER" >> "$orphans"
 
-    # PP 装配哨兵：去掉 .sN 后对应的页 blob 是否存在（页已删则哨兵也删）。
-    find "$DIR" -maxdepth 1 -type f \( -name '*.s[0-9]' -o -name '*.s1[0-5]' \) -printf '%f\n' 2>/dev/null |
+    # PP 装配哨兵 .sN 与完成标记 .ok：去掉后缀后对应的页 blob 是否存在。
+    find "$DIR" -maxdepth 1 -type f \( -name '*.s[0-9]' -o -name '*.s1[0-5]' -o -name '*.ok' \) -printf '%f\n' 2>/dev/null |
     xargs -r -P "$JOBS" -n 64 sh -c '
         d=$1; flt=$2; shift 2
         for f in "$@"; do
             if [ -n "$flt" ]; then
                 case "$f" in *"$flt"*) ;; *) continue ;; esac
             fi
-            [ -e "$d/${f%.s*}.bin" ] || printf "%s\n" "$f"
+            case "$f" in
+                *.ok) [ -e "$d/${f%.ok}.bin" ] || printf "%s\n" "$f" ;;
+                *)    [ -e "$d/${f%.s*}.bin" ] || printf "%s\n" "$f" ;;
+            esac
         done
     ' sh "$DIR" "$FILTER" >> "$orphans"
 
@@ -398,6 +405,7 @@ cmd_size() {
         if (freed >= need) next
         print name > dl
         for (i = 0; i < 16; i++) print substr(name, 1, length(name) - 4) ".s" i > dl
+        print substr(name, 1, length(name) - 4) ".ok" > dl
         freed += $2
         cnt++
         d = strftime("%F", $1)

@@ -579,11 +579,9 @@ class HiRadixCache(RadixCache):
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
                     if self.l1l3_only:
-                        # Only now is the page actually in L3. A write can be
-                        # dropped half way (I/O error, a stage missing its
-                        # slice), so compare against the pages this operation
-                        # was asked to store: leaving the flag unset keeps
-                        # _flush_l1l3_node retrying it on the next request.
+                        # Only now is the page actually in L3: a write can be
+                        # dropped half way, so leave the flag unset and let
+                        # _flush_l1l3_node retry it.
                         expected = len(operation.hash_value) * self.page_size
                         if operation.completed_tokens >= expected:
                             entry.storage_backed = True
@@ -701,9 +699,8 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         TreeNode.counter = 0
-        # Drop in-flight backup bookkeeping: controller.reset() clears the ack
-        # queue, so these acks will never arrive and the nodes would stay
-        # pinned (and never retried).
+        # controller.reset() clears the ack queue: drop in-flight bookkeeping
+        # or those nodes stay pinned and never get retried.
         for node in self.ongoing_backup.values():
             self.dec_lock_ref(node)
         self.ongoing_backup.clear()
@@ -831,8 +828,7 @@ class HiRadixCache(RadixCache):
             # radix cache: nothing to write, nothing to index.
             return 0
         if any(n is node for n in self.ongoing_backup.values()):
-            # Already queued: storage_backed is only set on the ack now, so
-            # repeated chunks would otherwise queue the same node again.
+            # Already queued (repeated chunks would queue it again).
             return 0
 
         prefix_keys = (
@@ -849,8 +845,7 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         # storage_backed is set on the ack, not here: a queued write can still
-        # be dropped, and marking it early would stop _flush_l1l3_node from
-        # ever retrying the pages that were lost.
+        # be dropped and must stay retryable.
         self.inc_lock_ref(node)
         return len(node.value)
 
@@ -874,9 +869,8 @@ class HiRadixCache(RadixCache):
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         if self.cache_controller.write_policy == "write_back":
             return
-        # Unfinished (chunked) inserts are skipped only in the generic path;
-        # the two-tier kunpeng path flushes them via _flush_l1l3_node, which
-        # does not depend on hit counts.
+        # Chunked inserts are skipped only in the generic path; the two-tier
+        # path flushes them via _flush_l1l3_node.
         if chunked and not self.l1l3_only:
             return
         node.hit_count += 1
@@ -892,12 +886,8 @@ class HiRadixCache(RadixCache):
     def _flush_l1l3_node(self, node: TreeNode) -> None:
         """Queue this node's L1 pages for L3 if they are not there yet.
 
-        Chunked prefill skips the hit-count path, and the prefix-continuity rule
-        leaves later nodes unwritten when an earlier one was skipped; either way
-        the shared page blob ends up with missing slices that no reader can use.
-        Writing here, while insert walks root -> leaf, fills those holes.
-        ``write_back=True`` skips the parent check; ``storage_backed`` keeps it
-        idempotent, so repeated chunks do not rewrite the same page.
+        Fills the holes left by chunked prefills and by the prefix-continuity
+        rule (an earlier skipped node would leave every later one unwritten).
         """
         if not self.l1l3_only or self.disable:
             return
@@ -1468,9 +1458,8 @@ class HiRadixCache(RadixCache):
 
     # Timeout is linearly increasing with the number of pages
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
-        # hash_value is empty until the L3 hit query (and its MIN allreduce)
-        # returns; charge the query phase by the request's own page count so a
-        # 64K request does not expire on the bare base budget.
+        # hash_value is empty until the hit query returns; charge the query
+        # phase by the request's own page count, not the bare base budget.
         pages = max(
             len(operation.hash_value),
             len(operation.token_ids) // self.page_size,
@@ -1542,8 +1531,8 @@ class HiRadixCache(RadixCache):
         if completed_tokens >= total_tokens:
             stop_reason = "complete"
         elif not operation.hash_value:
-            # Empty hash means the hit query never returned; a genuine 0-page
-            # hit is revoked earlier and never reaches this branch.
+            # Empty hash: the hit query never returned (a real 0-page hit is
+            # revoked earlier).
             stop_reason = "query-timeout"
         elif self.prefetch_stop_policy == "timeout" and self.is_prefetch_timeout(
             operation
@@ -1688,12 +1677,8 @@ class HiRadixCache(RadixCache):
     def prefix_depth(self, node: TreeNode) -> int:
         """Token depth of *node* in the radix tree (root = 0).
 
-        In the two-tier mode the prefetch anchor is the deepest node whose
-        pages are in L3, and the fetched suffix must start exactly where that
-        node's key ends. ``len(prefix_indices)`` cannot be used for that: it
-        only counts non-evicted nodes, and any L3-only node between the anchor
-        and the deepest match is skipped, so the offset would drift and the
-        published subtree would be attached at the wrong position.
+        ``len(prefix_indices)`` cannot stand in for it: it skips L3-only nodes,
+        so the prefetch offset would drift.
         """
         depth = 0
         while node is not None and node is not self.root_node:

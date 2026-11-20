@@ -1266,9 +1266,8 @@ class Scheduler(
             # stale and only hurt acceptance, not the final answer.
             draft_kv_pool, _ = self._get_draft_kv_pool()
             controller = self.tree_cache.cache_controller
-            # The page blob is shared by all PP stages and keeps the PP1 byte
-            # layout, so each stage needs the model-wide layer geometry (not
-            # only its own range) to place its layers at the PP1 offset.
+            # The shared page blob keeps the PP1 layout, so every stage needs
+            # the model-wide geometry.
             controller.set_flat_shard_layout(
                 self.model_config.hf_config.num_hidden_layers,
                 self._global_skip_topk_layers(),
