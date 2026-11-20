@@ -371,8 +371,8 @@ def gdn_verify(A_log, dt_bias, qk, v, ab, state, indices, checkpoints,
            ckpt_indices)
     kernel, _, _ = prepare(A_log, dt_bias, qk, v, ab, state, indices,
                            checkpoints, ckpt_indices)
-    return kernel(A_log.contiguous(), dt_bias.contiguous(), qk,
-                  v.contiguous(), ab, state, indices.contiguous(),
+    return kernel(A_log.contiguous(), dt_bias.contiguous(), qk.contiguous(),
+                  v.contiguous(), ab.contiguous(), state, indices.contiguous(),
                   checkpoints, ckpt_indices.contiguous())
 
 

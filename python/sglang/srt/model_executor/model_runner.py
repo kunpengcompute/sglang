@@ -770,7 +770,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # Backend kernel precompilation (SGLANG_KUNPENG_TL_OP_PRECOMPILE).
             # Must run after init_memory_pool(): the compiled shapes include the
             # mamba pool sizes and max_running_requests resolved there.
-            self.precompile_tilelang_op()
+            self.maybe_precompile_tilelang_op()
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -2178,7 +2178,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return result
 
-    def precompile_tilelang_op(self):
+    def maybe_precompile_tilelang_op(self):
+        if os.environ.get("SGLANG_KUNPENG_TL_OP_PRECOMPILE", "0") != "1":
+            return
+
         from sglang.srt.hardware_backend.cpu_kunpeng.qwen import precompile_ops
 
         precompile_ops(self)

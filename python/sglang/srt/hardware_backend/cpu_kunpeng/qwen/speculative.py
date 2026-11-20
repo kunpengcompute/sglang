@@ -18,8 +18,7 @@ _TILELANG_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_TILELANG", "0") == 
 
 if _TILELANG_VERIFY:
     print(
-        "[QwenVerify] SGLANG_KUNPENG_GDN_VERIFY_TILELANG=1: GDN verify uses the "
-        "TileLang kernel (graph replay enabled).",
+        "[QwenVerify] SGLANG_KUNPENG_GDN_VERIFY_TILELANG=1: GDN verify uses the TileLang kernel.",
         flush=True,
     )
 

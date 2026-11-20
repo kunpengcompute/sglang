@@ -54,8 +54,6 @@ def precompile_ops(model_runner):
     """
     if not enabled():
         return
-    if os.environ.get("SGLANG_KUNPENG_TL_OP_PRECOMPILE", "0") != "1":
-        return
     from .tilelang_gdn_verify import precompile_gdn_verify
 
     precompile_gdn_verify(model_runner)
