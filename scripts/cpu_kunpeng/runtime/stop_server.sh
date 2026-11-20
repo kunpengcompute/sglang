@@ -14,8 +14,8 @@
 
 #!/bin/bash
 # stop_server.sh - Kill sglang on the role's cluster nodes (all of them,
-# in parallel via SSH), then clean up zombies / shm / hugepages (incl. the
-# stale HiCache tp0-bcast segment when that feature is enabled).
+# in parallel via SSH), then clean up zombies / shm / hugepages. All entries
+# under /dev/shm are removed outright, so no stale segment name matching.
 # Invoked by: ./stop.sh server [prefill|decode|native] [instance]
 # Usage: bash runtime/stop_server.sh [prefill|decode|native] [instance]
 
@@ -32,18 +32,6 @@ cd "$SCRIPT_DIR"
 # Source config for the specified role (+ optional instance)
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
 SKIP_CONDA=1 source ./env.sh "$ROLE" "$INSTANCE"
-
-# HiCache tp-shard leaves a POSIX shm segment (sgk_hicache_shard_*) on each
-# node. It is created lazily at the first prefetch and never unlinked, so it
-# outlives the server. A later run with a different geometry would attach the
-# stale segment and index past its end. Wipe it on stop whenever this
-# role/instance actually runs HiCache with the tp-shard segment.
-CLEAN_HICACHE_SHARD=0
-if [[ "$ROLE" == "prefill" || "$ROLE" == "native" ]] &&
-   [[ "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]] &&
-   [[ "${SGLANG_KUNPENG_HICACHE_TP_SHARD:-1}" == "1" ]]; then
-    CLEAN_HICACHE_SHARD=1
-fi
 
 # Convert space-separated IP list to array
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
@@ -91,11 +79,11 @@ for i in "${!NODES[@]}"; do
             done
         fi
 
-        rm -rf /dev/shm/shm_mmap_*
-        if [ "'"${CLEAN_HICACHE_SHARD}"'" = "1" ]; then
-            echo "Removing stale HiCache TP shard shm on '"$node"'"
-            rm -f /dev/shm/sgk_hicache_shard_*
-        fi
+        # Wipe the whole POSIX shm namespace instead of matching individual
+        # segment names (shm_mmap_*, sgk_hicache_shard_*, ...). Nothing else
+        # on these nodes relies on /dev/shm after the server is stopped.
+        rm -rf /dev/shm/*
+
         for i in $(seq 0 31); do
             echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
         done
