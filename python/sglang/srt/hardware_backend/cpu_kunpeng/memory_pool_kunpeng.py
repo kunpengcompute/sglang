@@ -42,7 +42,7 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         shared_pool_requests=None,
     ):
         # --- shared pools (SGLANG_KUNPENG_KV_SHARE_GROUP /
-        #     SGLANG_KUNPENG_INDEXER_SHARE_GROUP = 4/8/16) -------------------
+        #     SGLANG_KUNPENG_INDEXER_SHARE_GROUP = 4/8/16; 0/1 = no sharing) --
         # The two switches are independent and each pool has its OWN shm
         # segment: KV may be shared while index-K stays private, or the other
         # way round, and the two group sizes may differ.
