@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,197 @@ def _small_output_bf16_linear(x, weight, bias):
     return transposed.transpose(0, 1).contiguous()
 
 
+# SME packed-GEMM path for unquantized BF16 linears whose K cannot be
+# tiled (the vision mlp.fc2 shard: N=H=1152, K=I/16=269, a prime). The
+# kernel dispatch assumes exactly (N/tile_n)*(K/tile_k) == 32 tile pairs
+# with an even tile_k, so no plan can cover K=269; zero-padding K to the
+# next even 16-aligned multiple (269 -> 272, tile_k=272, tile_n=N/32=36)
+# makes a 32-task full-K plan legal while the zero columns contribute
+# exactly zero to every output. Mirrors the vision W8A8 scheme: an
+# in-service startup probe A/Bs F.linear against the exact runtime
+# callable and only shards that are accurate (Frobenius rel err <= 5e-3)
+# and faster at every probed row count switch; losers and fallbacks run
+# plain F.linear on the untouched row-major weight.
+_KPAD_TARGETS = ((1152, 269),)  # vision mlp.fc2 per rank
+_kpad_probe_cache = {}
+
+
+def _kpad_gemm(packed_weight, flat, k_pad):
+    """flat [m,k] @ packed_weight [n,k_pad].T via the SME packed GEMM.
+
+    Zero-pads the K tail of the activation, then runs the pack -> gemm
+    sequence. Returns None (plain F.linear fallback) under graph capture,
+    on plan failure, or for any tile that would violate the 32-task /
+    even-tile_k contract.
+    """
+    from sglang.srt.graph import is_capturing
+
+    if is_capturing():
+        # The opt-in ViT graph was traced against F.linear; keep replay
+        # equivalence by not switching the kernel under capture.
+        return None
+    m, k = flat.shape
+    n = packed_weight.shape[0]
+    try:
+        tile_m, tile_n, tile_k = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(
+            m, n, k_pad
+        )
+    except RuntimeError:
+        return None
+    if not tile_m or not tile_n or not tile_k or tile_k % 2:
+        return None
+    if m % tile_m or n % tile_n or k_pad % tile_k:
+        return None
+    if (n // tile_n) * (k_pad // tile_k) != 32:
+        # Sub-32 grids produce garbage; the dispatch assumes exactly 32.
+        return None
+    x = F.pad(flat, (0, k_pad - k))
+    packed = torch.empty(x.shape, dtype=x.dtype)
+    torch.ops.sgl_kernel.bf16_gemm_pack_kunpeng(x, packed, tile_m, tile_k)
+    blocks = k_pad // tile_k
+    workspace = torch.empty(
+        blocks * n * m + 1024 if blocks > 1 else 1, dtype=torch.bfloat16
+    )
+    out = torch.empty((m, n), dtype=flat.dtype)
+    torch.ops.sgl_kernel.bf16_packed_gemm_kunpeng(
+        packed, packed_weight, out, workspace, 32
+    )
+    return out
+
+
+def _kpad_probe(raw, packed, k_pad):
+    """In-service startup A/B: F.linear vs the K-padded packed GEMM.
+
+    Times the exact runtime callable (pad + pack + gemm) and prints one
+    [kunpeng-kpad-gemm] line per probe row count. Returns True only when
+    the packed path is accurate (Frobenius rel err <= 5e-3) and faster at
+    every probed row count.
+    """
+    n, k = tuple(raw.shape)
+    # Surface the tiling this variant runs with; the tasks field makes any
+    # violation of the 32-pair contract visible at a glance.
+    try:
+        _, tn, tk = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(1, n, k_pad)
+        print(
+            f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} tiling tn={tn}"
+            f" tk={tk} tasks={(n // tn) * (k_pad // tk)}",
+            flush=True,
+        )
+    except RuntimeError:
+        pass
+    rows_env = os.environ.get(
+        "SGLANG_KUNPENG_KPAD_GEMM_PROBE_ROWS", "1600,4096"
+    ).strip()
+    rows = [int(p) for p in rows_env.split(",") if p.strip().isdigit() and int(p) > 0]
+    if not rows:
+        print(
+            f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} probe 跳过 -> 直接启用",
+            flush=True,
+        )
+        return True
+    # Match the serving thread count so the F.linear baseline is not
+    # measured with a different global pool than at runtime.
+    try:
+        torch.set_num_threads(
+            int(os.environ.get("SGLANG_KUNPENG_TORCH_NUM_THREADS", "32"))
+        )
+    except (ValueError, RuntimeError):
+        pass
+    use = True
+    for m in rows:
+        x = torch.randn(m, k, dtype=torch.bfloat16)
+        lin = torch.nn.functional.linear(x, raw)
+        torch.nn.functional.linear(x, raw)  # warmup
+        t0 = time.perf_counter()
+        for _ in range(3):
+            torch.nn.functional.linear(x, raw)
+        t_lin = (time.perf_counter() - t0) / 3 * 1e3
+        try:
+            out = _kpad_gemm(packed, x, k_pad)
+        except RuntimeError as e:
+            print(
+                f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} m={m} bgemm 异常"
+                f"（{' '.join(str(e).split())[:60]}） -> 回退",
+                flush=True,
+            )
+            use = False
+            continue
+        if out is None:
+            print(
+                f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} m={m}"
+                f" plan/整除不过 -> 回退",
+                flush=True,
+            )
+            use = False
+            continue
+        # Frobenius-relative error gates the variant (benign bf16
+        # accumulation noise sits orders of magnitude below real damage);
+        # the legacy max-element metric is kept as a diagnostic only.
+        diff = out.double() - lin.double()
+        err = (diff.norm() / lin.double().norm().clamp_min(1e-6)).item()
+        merr = (diff.abs() / (lin.double().abs() + 1e-2)).max().item()
+        t0 = time.perf_counter()
+        for _ in range(3):
+            _kpad_gemm(packed, x, k_pad)
+        t_gemm = (time.perf_counter() - t0) / 3 * 1e3
+        ok = err <= 5e-3 and t_gemm < t_lin
+        use = use and ok
+        print(
+            f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} m={m}:"
+            f" F.linear={t_lin:.1f}ms bgemm={t_gemm:.1f}ms"
+            f" ({t_lin / t_gemm:.2f}x) err={err:.1e} merr={merr:.1e}"
+            f" -> {'启用' if ok else '回退'}",
+            flush=True,
+        )
+    return use
+
+
+def _kpad_setup(layer):
+    """Probe ladder for one K-pad target shard (see _KPAD_TARGETS).
+
+    The live weight is never modified in place: a winning variant's
+    zero-padded packed copy is stored on the layer and the row-major
+    weight stays the exact F.linear fallback.
+    """
+    n, k = tuple(layer.weight.shape)
+    if layer.weight.dtype != torch.bfloat16:
+        return
+    if (n, k) in _kpad_probe_cache:
+        use, k_pad = _kpad_probe_cache[(n, k)]
+    else:
+        raw = layer.weight.detach()
+        # Rungs: the next even 16-aligned K and the next 32-aligned K
+        # (269 -> 272 and 288). A full-K 32-task plan needs tile_n = N/32
+        # to be an integer and tile_k = k_pad even, which both rungs give
+        # for the target shapes.
+        rungs = [((k + 15) // 16) * 16, ((k + 31) // 32) * 32]
+        use, k_pad = False, None
+        for cand_pad in dict.fromkeys(r for r in rungs if r > k):
+            cand = torch.nn.functional.pad(raw, (0, cand_pad - k))
+            try:
+                torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(cand, 1)
+            except RuntimeError as e:
+                print(
+                    f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={cand_pad}"
+                    f" prepack 无可用 tiling"
+                    f"（{' '.join(str(e).split())[:72]}）",
+                    flush=True,
+                )
+                continue
+            if _kpad_probe(raw, cand, cand_pad):
+                use, k_pad = True, cand_pad
+                break
+        _kpad_probe_cache[(n, k)] = (use, k_pad)
+    if not use:
+        return
+    raw = layer.weight.detach()
+    packed = torch.nn.functional.pad(raw, (0, k_pad - k))
+    torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(packed, 1)
+    layer._kunpeng_kpad_weight = packed
+    layer._kunpeng_kpad_pad = k_pad
+    layer._kunpeng_kpad_packed = True
+
+
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -251,6 +443,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif getattr(layer, "_kunpeng_qwen_dense", False):
             torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(layer.weight, 1)
             layer._kunpeng_bf16_weight_packed = True
+        elif (
+            _is_cpu_920f
+            and tuple(layer.weight.shape) in _KPAD_TARGETS
+            and os.environ.get("SGLANG_KUNPENG_KPAD_GEMM", "1") not in ("", "0")
+        ):
+            # Best-effort fast path for the prime-K vision fc2 shard; any
+            # surprise verdict is a plain F.linear fallback, never a
+            # failed load.
+            try:
+                _kpad_setup(layer)
+            except Exception as e:
+                print(
+                    f"[kunpeng-kpad-gemm] n={layer.weight.shape[0]}"
+                    f" k={layer.weight.shape[1]} setup 异常"
+                    f"（{' '.join(str(e).split())[:72]}） -> F.linear",
+                    flush=True,
+                )
 
     def apply(
         self,
@@ -296,6 +505,26 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if output is not None:
                 return output
 
+        if (
+            _is_cpu_920f
+            and getattr(layer, "_kunpeng_kpad_packed", False)
+            and isinstance(x, torch.Tensor)
+            and x.device.type == "cpu"
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and x.dim() >= 2
+        ):
+            shape = x.shape
+            out = _kpad_gemm(
+                layer._kunpeng_kpad_weight,
+                x.reshape(-1, shape[-1]),
+                layer._kunpeng_kpad_pad,
+            )
+            if out is not None:
+                output = out.reshape(*shape[:-1], out.shape[-1])
+                if bias is not None:
+                    output = output + bias.to(output.dtype)
+                return output
         if getattr(layer, "_kunpeng_bf16_weight_packed", False):
             from sglang.srt.graph.torch_capture import native_call
 
