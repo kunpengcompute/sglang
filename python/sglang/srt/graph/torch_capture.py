@@ -275,7 +275,11 @@ class AutomaticTorchCapture(TorchDispatchMode):
             if native_shape is not None
             else func(*positional, **keywords)
         )
-        inputs = [lookup_or_register(t, idx=i) for i, t in enumerate(tensors)]
+        op_name = str(func)
+        inputs = [
+            lookup_or_register(t, idx=i, where=op_name)
+            for i, t in enumerate(tensors)
+        ]
         outputs = []
         actual = []
         if mutable:
@@ -305,7 +309,7 @@ class AutomaticTorchCapture(TorchDispatchMode):
             outputs,
             [name, schema.overload_name, len(tensors), len(outputs), mutable]
             + descriptors,
-            str(func),
+            op_name,
         )
-        self.operations.append(str(func))
+        self.operations.append(op_name)
         return result

@@ -43,3 +43,17 @@ def configure_hbw_shm():
         "SGLANG_KUNPENG_SHARED_HBW_SHM_PREFIX_MIB",
         os.environ.get(size_env, "476" if prefill else "24"),
     )
+
+
+def precompile_ops(model_runner):
+    """Compile backend kernels once the memory pool shapes are known.
+
+    Must be called after ``init_memory_pool()``: the compiled shapes include the
+    mamba pool sizes and ``max_running_requests`` resolved there. Off by default;
+    enable with ``SGLANG_KUNPENG_TL_OP_PRECOMPILE=1``.
+    """
+    if not enabled():
+        return
+    from .tilelang_gdn_verify import precompile_gdn_verify
+
+    precompile_gdn_verify(model_runner)

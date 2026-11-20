@@ -11,6 +11,17 @@ from sglang.srt.graph import ops
 # step). SGLANG_KUNPENG_GDN_VERIFY_FUSED=0 restores the per-step path.
 _FUSED_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_FUSED", "1") == "1"
 
+# TileLang replacement for the fused C++ kernel. Its compiled entry is
+# registered into common_ops by shape (tilelang_gdn_verify.register_tilelang_verify)
+# so TARGET_VERIFY keeps using the common graph.
+_TILELANG_VERIFY = os.environ.get("SGLANG_KUNPENG_GDN_VERIFY_TILELANG", "0") == "1"
+
+if _TILELANG_VERIFY:
+    print(
+        "[QwenVerify] SGLANG_KUNPENG_GDN_VERIFY_TILELANG=1: GDN verify uses the TileLang kernel.",
+        flush=True,
+    )
+
 if not _FUSED_VERIFY:
     # The per-step fallback gathers/snapshots the recurrent state with plain
     # ATen, which the explicit graph cannot record, so TARGET_VERIFY is kept
@@ -70,6 +81,70 @@ def verify_gdn(
     steps,
 ):
     batch = cache_indices.numel()
+    use_tilelang = False
+    if _TILELANG_VERIFY:
+        from . import tilelang_gdn_verify
+
+        # Batches pinned to C++ by
+        # SGLANG_KUNPENG_GDN_VERIFY_TILELANG_FALLBACK_BATCH_SIZE (bs=1 is
+        # faster natively), plus shapes whose compilation failed, are served by
+        # the reference C++ kernel.
+        use_tilelang = not tilelang_gdn_verify.tilelang_disabled(batch)
+    if use_tilelang:
+        assert checkpoints.shape[1] == steps, "checkpoint block must match steps"
+        # q/k/v are strided views of the fused qkv row and a/b of the BA row.
+        # The TileLang kernel reads contiguous packed tiles. Packing must use
+        # registered primitives only: this target captures without the
+        # automatic ATen adapter, so a plain torch.cat/clone would allocate
+        # storages the graph never learns about and the next op would fail
+        # lookup_or_register on them.
+        q = q.reshape(-1, q.shape[-2], q.shape[-1])
+        k = k.reshape(-1, k.shape[-2], k.shape[-1])
+        v = v.reshape(-1, v.shape[-2], v.shape[-1])
+        a = a.reshape(-1, a.shape[-1])
+        b = b.reshape(-1, b.shape[-1])
+        tokens, q_heads, key_dim = q.shape
+        v_heads, value_dim = v.shape[1], v.shape[2]
+        qk = ops.alloc_buffer(
+            tokens * 2 * q_heads * key_dim, dtype=q.dtype
+        ).view(tokens, 2 * q_heads, key_dim)
+        ops.copy_kunpeng(qk[:, :q_heads], q)
+        ops.copy_kunpeng(qk[:, q_heads:], k)
+        ab = ops.alloc_buffer(tokens * 2 * v_heads, dtype=a.dtype).view(
+            tokens, 2 * v_heads
+        )
+        ops.copy_kunpeng(ab[:, :v_heads], a)
+        ops.copy_kunpeng(ab[:, v_heads:], b)
+        packed_v = ops.alloc_buffer(
+            tokens * v_heads * value_dim, dtype=v.dtype
+        ).view(tokens, v_heads, value_dim)
+        ops.copy_kunpeng(packed_v, v)
+        # Compiling must not leak its own torch calls into the captured graph.
+        try:
+            with torch._C._DisableTorchDispatch():
+                tilelang_gdn_verify.prepare(
+                    A_log, dt_bias, qk, packed_v, ab, state, cache_indices,
+                    checkpoints, checkpoint_indices,
+                )
+        except Exception as exc:
+            # Keep serving: this batch degrades to the C++ kernel below.
+            tilelang_gdn_verify.mark_failed(
+                batch, exc, qk, packed_v, ab, state, checkpoints
+            )
+        else:
+            output = ops.qwen_gdn_verify_tilelang(
+                A_log,
+                dt_bias,
+                qk,
+                packed_v,
+                ab,
+                state,
+                cache_indices,
+                checkpoints,
+                checkpoint_indices,
+            )
+            return output.reshape(1, batch * steps, v_heads, value_dim)
+
     if _FUSED_VERIFY:
         # The persistent slot is read once; every step then rolls the state
         # into the next checkpoint block, so the live state stays untouched
