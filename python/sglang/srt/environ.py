@@ -663,16 +663,18 @@ class Envs:
     # Kunpeng 920F GLM-5 shared KV-cache pool: how many consecutive TP ranks
     # share ONE KV pool.
     #   0  (default) = disabled: every rank allocates its own KV pool.
+    #   1           = disabled too, same semantics as 0 (no sharing).
     #   4           = one pool per die (4 consecutive TP ranks).
     #   8           = one pool per socket (8 consecutive TP ranks).
     #   16          = one pool per node (16 consecutive TP ranks).
-    # Only 0 / 4 / 8 / 16 are valid; the consumer rejects anything else at
-    # startup instead of silently ignoring it.
+    # Only 0 / 1 / 4 / 8 / 16 are valid; 1 is normalized to 0 (no sharing),
+    # and the consumer rejects anything else at startup instead of silently
+    # ignoring it.
     SGLANG_KUNPENG_KV_SHARE_GROUP = EnvInt(0)
-    # Same semantics for the DSA index-K cache (same 0 / 4 / 8 / 16 values),
-    # but independent of the KV switch above: the two pools live in separate
-    # shm segments and may use different group sizes (the index-K rows are
-    # identical on every attn-TP rank).
+    # Same semantics for the DSA index-K cache (same 0 / 1 / 4 / 8 / 16 values,
+    # 1 means no sharing just like 0), but independent of the KV switch above:
+    # the two pools live in separate shm segments and may use different group
+    # sizes (the index-K rows are identical on every attn-TP rank).
     SGLANG_KUNPENG_INDEXER_SHARE_GROUP = EnvInt(0)
     # Temporary PD KV-transfer timing logs, for locating slow kv transfers.
     # Prints one line per stage on the prefill side (enqueue -> worker pick ->

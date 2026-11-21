@@ -1657,10 +1657,10 @@ class HiCacheController:
 
         ``SGLANG_KUNPENG_KV_SHARE_GROUP`` / ``..._INDEXER_SHARE_GROUP`` = 4/8/16
         make that group's ranks write ONE physical L1 pool, so a staged region
-        has to be scattered once per group instead of once per rank. 0 = private
-        L1 (baseline) or a group that does not divide this TP shard / does not
-        place this rank where the shard expects it, in which case the per-rank
-        scatter is kept.
+        has to be scattered once per group instead of once per rank. 0 and 1
+        mean a private L1 (baseline; 1 is an alias of 0) or a group that does
+        not divide this TP shard / does not place this rank where the shard
+        expects it, in which case the per-rank scatter is kept.
         """
         try:
             from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (

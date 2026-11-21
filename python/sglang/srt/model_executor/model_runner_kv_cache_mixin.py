@@ -568,10 +568,12 @@ class ModelRunnerKVCacheMixin:
                 # NO rank allocates a private buffer of that kind. Any failure
                 # raises SharedKvPoolError and aborts startup -- there is
                 # deliberately NO fallback to per-rank pools.
-                # With both switches off this block is a no-op.
+                # With both switches off this block is a no-op. A value of 1
+                # means no sharing (alias of 0) and is skipped as well; only
+                # group sizes > 1 enter the shared-pool path.
                 if (
-                    envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0
-                    or envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() != 0
+                    envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() > 1
+                    or envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() > 1
                 ):
                     from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
                         shared_pool_requests,
