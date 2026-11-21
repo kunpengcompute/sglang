@@ -754,12 +754,6 @@ class HiCacheFile(HiCacheStorage):
                         self._drop_stage_marks(path, need)
             if not ok:
                 return False
-        if envs.SGLANG_HICACHE_DEBUG.get():
-            logger.info(
-                "[hicache] L3 page %s written (done=%s)",
-                os.path.basename(path),
-                os.path.exists(self._done_path(path)),
-            )
         return True
 
     def _get_suffixed_key(self, key: str) -> str:

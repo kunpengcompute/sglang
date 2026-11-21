@@ -347,6 +347,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        req_id: Optional[str] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -354,12 +355,26 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # Only used to aggregate the L1->L3 write log per request.
+        self.req_id = req_id
+        # Read-side phase totals, aggregated into the per-request prefetch line.
+        self.read_own = 0.0
+        self.read_gather = 0.0
+        self.read_wait = 0.0
+        self.read_batches = 0
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
     def __lt__(self, other: "StorageOperation"):
         return self.id < other.id
+
+
+class _SealWriteSummary:
+    """Queue message: the request finished inserting, flush its summary now."""
+
+    def __init__(self, req_id: str):
+        self.req_id = req_id
 
 
 class PrefetchOperation(StorageOperation):
@@ -631,6 +646,10 @@ class HiCacheController:
         )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
+        # Per-request L1->L3 write log aggregation. Only the backup thread
+        # touches these (seal requests arrive through backup_queue).
+        self._write_summary = {}
+        self._write_summary_sealed = set()
 
         self.prefetch_revoke_queue = Queue()
         self.ack_backup_queue = Queue()
@@ -2638,19 +2657,10 @@ class HiCacheController:
             still_running = operation.increment(hit_pages * self.page_size)
             if debug:
                 t_end = time.perf_counter()
-                logger.info(
-                    "[hicache] tp-shard: req=%s, %d/%d page(s), device%s, "
-                    "done=%d/%d, ack_wait=%.3fs own=%.3fs gather=%.3fs",
-                    operation.request_id,
-                    hit_pages,
-                    pages,
-                    _idx_range(batch_indices),
-                    operation.completed_tokens,
-                    len(operation.hash_value) * self.page_size,
-                    t_wait,
-                    t_read,
-                    t_end - t_b - t_wait - t_read,
-                )
+                operation.read_wait += t_wait
+                operation.read_own += t_read
+                operation.read_gather += t_end - t_b - t_wait - t_read
+                operation.read_batches += 1
             if not still_running:
                 operation.mark_terminate()
                 break
@@ -2900,15 +2910,6 @@ class HiCacheController:
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] %s: req=%s, %d page(s), %s%s",
-                            "L3->flat start" if self.l1l3_only else "L3->L2 start",
-                            operation.request_id,
-                            storage_hit_count // self.page_size,
-                            "flat" if self.l1l3_only else "host",
-                            _idx_range(operation.host_indices),
-                        )
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
@@ -2931,6 +2932,7 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        req_id: Optional[str] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
@@ -2940,26 +2942,13 @@ class HiCacheController:
         straight out of L1 into the flat buffer and writes that out.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices,
+            token_ids,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
+            req_id=req_id,
         )
         self.backup_queue.put(operation)
-        if _hicache_debug():
-            if self.l1l3_only:
-                logger.info(
-                    "[hicache] L1->L3 queued: op=%d, %d page(s), device%s, %d token(s)",
-                    operation.id,
-                    len(operation.hash_value),
-                    _idx_range(host_indices),
-                    len(token_ids),
-                )
-            else:
-                logger.info(
-                    "[hicache] L2->L3 queued: op=%d, %d page(s), host%s, %d token(s)",
-                    operation.id,
-                    len(operation.hash_value),
-                    _idx_range(host_indices),
-                    len(token_ids),
-                )
         return operation.id
 
     # todo: deprecate
@@ -3090,6 +3079,9 @@ class HiCacheController:
         once; the hit query applies the same rule.
         """
         debug = _hicache_debug()
+        t_start = time.perf_counter() if debug else 0.0
+        sum_mine = 0
+        sum_cpu = sum_offcpu = 0.0
         prefix_keys = operation.prefix_keys
         layers = self.l1l3_kv_layers
         src_indices = operation.host_indices
@@ -3107,23 +3099,11 @@ class HiCacheController:
                 for j in range(pages)
                 if _page_shard_of(batch_hashes[j], nranks) == my
             ]
+            sum_mine += len(mine)
 
             t_batch_start = time.perf_counter() if debug else 0.0
             if debug:
-                cpu_batch_start, rq_batch_start = _thread_stat()
-                # Per-batch audit: grep the page hash to find its writer.
-                logger.info(
-                    "[hicache] L1->L3 batch: op=%d, batch=%d, pages=%d, mine=%d, "
-                    "shard=%d/%d, first=%s, last=%s",
-                    operation.id,
-                    i // self.storage_batch_size,
-                    pages,
-                    len(mine),
-                    my,
-                    nranks,
-                    batch_hashes[0][:16],
-                    batch_hashes[-1][:16],
-                )
+                cpu_batch_start, _ = _thread_stat()
 
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = True
@@ -3148,16 +3128,6 @@ class HiCacheController:
                     )
                     failed += sum(1 for ok in idx_res if not ok)
                     success = failed == 0
-                    if debug:
-                        logger.info(
-                            "[hicache] L1->flat copy + flat->L3 write (indexer): op=%d, "
-                            "%d page(s), device%s, key_suffix=%s, ok=%s",
-                            operation.id,
-                            len(mine),
-                            _idx_range(batch_indices),
-                            self.indexer_key_suffix,
-                            success,
-                        )
                 if success:
                     hicache_page_flatten_batch(
                         layers,
@@ -3175,25 +3145,10 @@ class HiCacheController:
 
             if debug:
                 t_end = time.perf_counter()
-                cpu_batch_end, rq_batch_end = _thread_stat()
+                cpu_batch_end, _ = _thread_stat()
                 cpu_used = cpu_batch_end - cpu_batch_start
-                logger.info(
-                    "[hicache] L1->flat copy + flat->L3 write: op=%d, %d/%d page(s) "
-                    "shard=%d/%d, device%s, done=%d/%d, total=%.3fs, cpu=%.3fs "
-                    "offcpu=%.3fs rqwait=%ss",
-                    operation.id,
-                    len(mine),
-                    pages,
-                    my,
-                    nranks,
-                    _idx_range(batch_indices),
-                    operation.completed_tokens,
-                    len(operation.hash_value) * self.page_size,
-                    t_end - t_batch_start,
-                    cpu_used,
-                    (t_end - t_batch_start) - cpu_used,
-                    _fmt_wait(rq_batch_end, rq_batch_start),
-                )
+                sum_cpu += cpu_used
+                sum_offcpu += (t_end - t_batch_start) - cpu_used
 
             if not success:
                 logger.warning(
@@ -3210,6 +3165,51 @@ class HiCacheController:
             # Full batch, not just this rank's shard: the metric counts pages.
             operation.completed_tokens += self.page_size * pages
 
+        if debug:
+            # Aggregate per request; emitted once the request is finished.
+            total = time.perf_counter() - t_start
+            agg = self._write_summary.get(operation.req_id)
+            if agg is None:
+                agg = {"ops": 0, "pages": 0, "mine": 0, "total": 0.0,
+                       "cpu": 0.0, "offcpu": 0.0, "ts": time.monotonic()}
+                self._write_summary[operation.req_id] = agg
+            agg["ops"] += 1
+            agg["pages"] += len(operation.hash_value)
+            agg["mine"] += sum_mine
+            agg["total"] += total
+            agg["cpu"] += sum_cpu
+            agg["offcpu"] += sum_offcpu
+            agg["ts"] = time.monotonic()
+
+    def seal_write_summary(self, req_id: str) -> None:
+        """Ask the backup thread to emit this request's summary once drained."""
+        if not _hicache_debug():
+            return
+        self.backup_queue.put(_SealWriteSummary(req_id))
+
+    def _flush_write_summary(self, force: bool = False):
+        """Emit one line per finished request; unfinished ones keep aggregating."""
+        if not self._write_summary:
+            return
+        now = time.monotonic()
+        for req_id, agg in list(self._write_summary.items()):
+            sealed = req_id in self._write_summary_sealed or req_id is None
+            if not (sealed or force or now - agg.get("ts", now) > 120.0):
+                continue
+            logger.info(
+                "[hicache] L1->L3 write summary: req=%s, %d page(s), %d op(s), "
+                "mine=%d, total=%.3fs, cpu=%.3fs offcpu=%.3fs",
+                "-" if req_id is None else req_id,
+                agg["pages"],
+                agg["ops"],
+                agg["mine"],
+                agg["total"],
+                agg["cpu"],
+                agg["offcpu"],
+            )
+            self._write_summary.pop(req_id, None)
+            self._write_summary_sealed.discard(req_id)
+
     def backup_thread_func(self):
         """
         Manage backup operations from host memory to storage backend.
@@ -3220,10 +3220,19 @@ class HiCacheController:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                if isinstance(operation, _SealWriteSummary):
+                    # Writes of this request are all ahead of the seal in FIFO
+                    # order, so the aggregate is complete now.
+                    if operation.req_id in self._write_summary:
+                        self._write_summary_sealed.add(operation.req_id)
+                    continue
 
                 if not self.backup_skip:
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:
+                # Queue drained: the current write burst is over, emit its summary.
+                if self._write_summary:
+                    self._flush_write_summary()
                 continue

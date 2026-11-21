@@ -2316,15 +2316,6 @@ class Scheduler(
                 else:
                     matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
-                if envs.SGLANG_HICACHE_DEBUG.get():
-                    logger.info(
-                        "[hicache] prefetch plan: req=%s, offset=%d, "
-                        "device_hit=%d, fetch=%d token(s)",
-                        req.rid,
-                        matched_len,
-                        len(req.prefix_indices),
-                        len(new_input_tokens),
-                    )
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
