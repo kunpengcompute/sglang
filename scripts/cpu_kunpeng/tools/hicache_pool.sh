@@ -5,8 +5,18 @@
 # 任何删除动作默认只预览（dry-run），必须加 -f 才真正执行。
 #
 # 目录结构（HiCacheFile 后端，一页一文件）：
-#   {hash}{config_suffix}.bin           KV 页 blob（target 各层 + MTP draft 层）
-#   {hash}@idxk{config_suffix}.bin      index-K 页 blob（target + draft）
+#   {hash}{suffix}.bin          KV 页 blob（全模型 target 各层 + MTP draft 层）
+#   {hash}@idxk{suffix}.bin     index-K 页 blob（target 非 skip 层 + draft）
+#   {hash}{suffix}.s0..s15      PP 装配哨兵（临时）：PP16 每个 stage 一个 0 字节
+#                               文件（O_CREAT|O_EXCL），各自独立 inode，避免多个
+#                               节点写同一个 4KB 块互相覆盖。整页 .done 建好后由
+#                               最后一个写者删掉，稳态不存在；崩溃残留由本脚本回收。
+#   {hash}{suffix}.stages       装配表的 writers 数（1 字节，临时）：所有 stage 写
+#                               同一个值，读侧据此判定需要几个哨兵（PP4/PP16 混用）。
+#   {hash}{suffix}.done         整页完成标记（0 字节）：PP1 写完直接建；PP16/PP4
+#                               由写完自己哨兵后看齐 writers 个哨兵的写者创建。
+#                               读者一次 stat 即可判定整页可用。
+#   index-K blob 不建任何标记：KV 页的 .done 已蕴含其 index-K 写闭。
 
 set -u
 
@@ -248,6 +258,9 @@ cmd_clean() {
             f = $4
             if (flt != "" && index(f, flt) == 0) next
             print f
+            for (i = 0; i < 16; i++) print substr(f, 1, length(f) - 4) ".s" i
+            print substr(f, 1, length(f) - 4) ".stages"
+            print substr(f, 1, length(f) - 4) ".done"
             n++
             s += $1
             d = int(($3 + off) / 86400)
@@ -327,6 +340,24 @@ cmd_orphan() {
         done
     ' sh "$DIR" "$FILTER" >> "$orphans"
 
+    # PP 装配哨兵 .sN / writers 数 .stages / 完成标记 .done：
+    # 去掉后缀后对应的页 blob 是否存在。
+    find "$DIR" -maxdepth 1 -type f \( -name '*.s[0-9]' -o -name '*.s1[0-5]' \
+        -o -name '*.stages' -o -name '*.done' \) -printf '%f\n' 2>/dev/null |
+    xargs -r -P "$JOBS" -n 64 sh -c '
+        d=$1; flt=$2; shift 2
+        for f in "$@"; do
+            if [ -n "$flt" ]; then
+                case "$f" in *"$flt"*) ;; *) continue ;; esac
+            fi
+            case "$f" in
+                *.done)   [ -e "$d/${f%.done}.bin" ] || printf "%s\n" "$f" ;;
+                *.stages) [ -e "$d/${f%.stages}.bin" ] || printf "%s\n" "$f" ;;
+                *)        [ -e "$d/${f%.s*}.bin" ] || printf "%s\n" "$f" ;;
+            esac
+        done
+    ' sh "$DIR" "$FILTER" >> "$orphans"
+
     cnt=$(wc -l < "$orphans" | tr -d ' ')
     echo "孤儿文件: $cnt 个"
     if [ "$cnt" -gt 0 ]; then
@@ -381,6 +412,9 @@ cmd_size() {
         if (flt != "" && index(name, flt) == 0) next
         if (freed >= need) next
         print name > dl
+        for (i = 0; i < 16; i++) print substr(name, 1, length(name) - 4) ".s" i > dl
+        print substr(name, 1, length(name) - 4) ".stages" > dl
+        print substr(name, 1, length(name) - 4) ".done" > dl
         freed += $2
         cnt++
         d = strftime("%F", $1)

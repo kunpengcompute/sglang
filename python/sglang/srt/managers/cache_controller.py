@@ -25,8 +25,10 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
+    FlatPageLayout,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    flat_kv_key_digest,
 )
 
 if TYPE_CHECKING:
@@ -345,6 +347,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        req_id: Optional[str] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -352,12 +355,26 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # Only used to aggregate the L1->L3 write log per request.
+        self.req_id = req_id
+        # Read-side phase totals, aggregated into the per-request prefetch line.
+        self.read_own = 0.0
+        self.read_gather = 0.0
+        self.read_wait = 0.0
+        self.read_batches = 0
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
     def __lt__(self, other: "StorageOperation"):
         return self.id < other.id
+
+
+class _SealWriteSummary:
+    """Queue message: the request finished inserting, flush its summary now."""
+
+    def __init__(self, req_id: str):
+        self.req_id = req_id
 
 
 class PrefetchOperation(StorageOperation):
@@ -456,6 +473,11 @@ class HiCacheController:
         self.has_l1l3_draft = False
         self.l1l3_kv_layers: list = []
         self._l1l3_io_pending = False
+        # PP-independent page geometry, set by the scheduler before
+        # finalize_l1l3_io().
+        self.total_layers = 0
+        self.total_draft_layers: Optional[int] = None
+        self.global_skip_topk_layers: Optional[List[bool]] = None
         self.tp_shard_enabled = (
             os.environ.get("SGLANG_KUNPENG_HICACHE_TP_SHARD", "1") == "1"
         )
@@ -624,6 +646,10 @@ class HiCacheController:
         )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
+        # Per-request L1->L3 write log aggregation. Only the backup thread
+        # touches these (seal requests arrive through backup_queue).
+        self._write_summary = {}
+        self._write_summary_sealed = set()
 
         self.prefetch_revoke_queue = Queue()
         self.ack_backup_queue = Queue()
@@ -900,6 +926,208 @@ class HiCacheController:
         for buffer in (self.flat_write, self.flat_read):
             self.storage_backend.register_io_buffer(buffer)
 
+        self._build_flat_shard_layout()
+
+    def set_flat_shard_layout(
+        self,
+        num_hidden_layers: int,
+        skip_topk_layers: Optional[List[bool]] = None,
+        draft_layers: int = 0,
+    ) -> None:
+        """Declare the PP-independent page geometry of the L1<->L3 blob.
+
+        Layer counts and DSA skip flags are model-wide, so every stage agrees
+        on the whole-object size; per-stage offsets are derived later.
+        """
+        self.total_layers = int(num_hidden_layers)
+        self.total_draft_layers = int(draft_layers)
+        self.global_skip_topk_layers = (
+            list(skip_topk_layers) if skip_topk_layers is not None else None
+        )
+
+    def _build_flat_shard_layout(self) -> None:
+        """Slice of the whole-page L3 object that this PP stage owns.
+
+        The object always keeps the PP1 layout (target layers, then draft), so
+        any stage writes its own offset and both layouts stay readable. With
+        ``pp_size == 1`` the single stage covers the whole object.
+        """
+        if self.flat_write is None:
+            return
+        kv_bytes = (
+            self.page_size
+            * int(self.mem_pool_device.kv_cache_dim)
+            * self.flat_write.element_size()
+        )
+        draft_pool = (
+            getattr(self, "mem_pool_device_draft", None)
+            if self.has_l1l3_draft
+            else None
+        )
+        draft_layers = len(getattr(draft_pool, "kv_buffer", None) or [])
+        # Counted from the buffer so the segments tile it exactly.
+        target_layers = len(self.l1l3_kv_layers) - draft_layers
+        # Only the last stage can observe the draft size from its own pool.
+        draft_total = (
+            self.total_draft_layers
+            if self.total_draft_layers is not None
+            else draft_layers
+        )
+        start_layer = int(getattr(self.mem_pool_device, "start_layer", 0) or 0)
+        # Model layer count, so a stage places its layers where PP1 did; with a
+        # single stage the pool is authoritative.
+        model_layers = self.total_layers
+        if self.pp_size <= 1 or model_layers < start_layer + target_layers:
+            if model_layers and model_layers != start_layer + target_layers:
+                logger.warning(
+                    "[hicache] model layer count %d != pool layers %d; "
+                    "the L3 page blob uses the pool",
+                    model_layers,
+                    start_layer + target_layers,
+                )
+            total_layers = start_layer + target_layers
+        else:
+            total_layers = model_layers
+
+        # Stages that actually write this object: a stage with no index-K
+        # layers must not hold the index-K writer set open.
+        from sglang.srt.distributed.utils import get_pp_indices
+
+        pp_size = max(1, int(self.pp_size))
+        pp_rank = int(self.pp_rank)
+        pp_ranges = [
+            get_pp_indices(total_layers, k, pp_size) for k in range(pp_size)
+        ]
+
+        def writer_index(contributes) -> tuple:
+            staging = [k for k, ok in enumerate(contributes) if ok]
+            if not staging:
+                return 0, 1
+            return (staging.index(pp_rank) if pp_rank in staging else 0), len(staging)
+
+        kv_writer, kv_writers = writer_index([e > s for (s, e) in pp_ranges])
+        # Only the last stage runs the MTP head, so only it holds real draft
+        # KV; letting the others write that slot would zero the owner's bytes.
+        owns_draft = pp_rank == pp_size - 1
+        kv_segments = []
+        if target_layers:
+            kv_segments.append((0, start_layer * kv_bytes, target_layers * kv_bytes))
+        if draft_layers and owns_draft:
+            kv_segments.append(
+                (
+                    target_layers * kv_bytes,
+                    total_layers * kv_bytes,
+                    draft_layers * kv_bytes,
+                )
+            )
+        kv_layout = FlatPageLayout(
+            tuple(kv_segments),
+            (total_layers + draft_total) * kv_bytes,
+            kv_writer,
+            kv_writers,
+        )
+
+        idx_layout = None
+        if self.indexer_page_elems:
+            idx_layers, idx_elems, _, _ = self._indexer_layout()
+            idx_bytes = (
+                self.page_size
+                * int(idx_elems)
+                * self.flat_write_idx.element_size()
+            )
+            idx_draft = sum(
+                1
+                for buf in (getattr(draft_pool, "index_k_buffer", None) or [])
+                if buf is not None
+            )
+            skip = self.global_skip_topk_layers
+            if skip is None:
+                skip = [False] * max(total_layers, start_layer + target_layers)
+            # Same source as the writer set (the skip table), otherwise a stage
+            # could be counted as a writer with nothing to write.
+            pool_idx_local = len(idx_layers or []) - idx_draft
+            idx_local = sum(
+                1
+                for i in range(start_layer, start_layer + target_layers)
+                if i < len(skip) and not skip[i]
+            )
+            # Same as KV: the draft size is model-wide.
+            idx_draft_total = idx_draft or draft_total
+            # Skip-topk layers own no index-K blob: offsets count allocating
+            # layers, not layer ids.
+            idx_before = sum(1 for s in skip[:start_layer] if not s)
+            idx_total = sum(1 for s in skip[:total_layers] if not s)
+            logger.info(
+                "[hicache] index-K layers: pp=%d/%d start=%d target=%d "
+                "pool=%d skip=%d draft=%d before=%d total=%d",
+                pp_rank,
+                pp_size,
+                start_layer,
+                target_layers,
+                pool_idx_local,
+                idx_local,
+                idx_draft,
+                idx_before,
+                idx_total,
+            )
+            if pool_idx_local != idx_local:
+                logger.warning(
+                    "[hicache] index-K layer mismatch at pp=%d/%d: pool=%d "
+                    "skip=%d (start=%d target=%d); using the skip table",
+                    pp_rank,
+                    pp_size,
+                    pool_idx_local,
+                    idx_local,
+                    start_layer,
+                    target_layers,
+                )
+            idx_writer, idx_writers = writer_index(
+                [
+                    any(not skip[i] for i in range(s, min(e, len(skip))))
+                    for (s, e) in pp_ranges
+                ]
+            )
+            idx_segments = []
+            if idx_local:
+                idx_segments.append(
+                    (0, idx_before * idx_bytes, idx_local * idx_bytes)
+                )
+            if idx_draft and owns_draft:
+                idx_segments.append(
+                    (
+                        idx_local * idx_bytes,
+                        idx_total * idx_bytes,
+                        idx_draft * idx_bytes,
+                    )
+                )
+            idx_layout = FlatPageLayout(
+                tuple(idx_segments),
+                (idx_total + idx_draft_total) * idx_bytes,
+                idx_writer,
+                idx_writers,
+            )
+
+        self.storage_backend.set_flat_layout(
+            kv_layout, idx_layout, self.indexer_key_suffix
+        )
+        logger.info(
+            "[hicache] L3 page layout: pp=%d/%d start=%d target=%d draft=%d "
+            "draft_owner=%s kv_total=%d kv_seg=%s writer=%d/%d "
+            "idx_total=%s idx_seg=%s",
+            pp_rank,
+            pp_size,
+            start_layer,
+            target_layers,
+            draft_layers,
+            owns_draft,
+            kv_layout.total_bytes,
+            kv_layout.segments,
+            kv_layout.writer,
+            kv_layout.writers,
+            None if idx_layout is None else idx_layout.total_bytes,
+            None if idx_layout is None else idx_layout.segments,
+        )
+
     def finalize_l1l3_io(self) -> None:
         """Build the flat buffers and the tp-shard segment (two-tier mode).
 
@@ -1115,6 +1343,17 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
+        # Two-tier: name a page by what it holds, never by who wrote it.
+        key_digest = None
+        if self.l1l3_only:
+            key_digest = flat_kv_key_digest(
+                model_name,
+                self.mem_pool_device.dtype,
+                self.page_size,
+                int(getattr(self.mem_pool_device, "kv_cache_dim", 0) or 0),
+                int(getattr(self.mem_pool_device, "index_head_dim", 0) or 0),
+            )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -1134,6 +1373,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            key_digest=key_digest,
         )
 
     def reset(self):
@@ -2046,6 +2286,8 @@ class HiCacheController:
                     [job.hashes[j] for j in range(my, pages, nranks)],
                     [self.flat_read[s] for s in range(n_mine)],
                     HiCacheStorageExtraInfo(prefix_keys=job.prefix_keys),
+                    # Just confirmed by the hit query on this rank.
+                    verify=False,
                 )
                 for s, hit in enumerate(hits):
                     if hit:
@@ -2230,7 +2472,9 @@ class HiCacheController:
         pages = len(batch_hashes)
         extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
         hits = self.storage_backend.batch_get_flat(
-            batch_hashes, [self.flat_read[j] for j in range(pages)], extra_info
+            batch_hashes,
+            [self.flat_read[j] for j in range(pages)],
+            extra_info,
         )
         hit_pages = 0
         for hit in hits:
@@ -2238,10 +2482,14 @@ class HiCacheController:
                 break
             hit_pages += 1
         if hit_pages and self.indexer_page_elems:
+            # Index-K carries no marker of its own: the KV page's ``.done`` is
+            # written only after every stage closed its Index-K object, and the
+            # KV page hit above already proved that.
             idx_hits = self.storage_backend.batch_get_flat(
                 self._indexer_keys(batch_hashes[:hit_pages]),
                 [self.flat_read_idx[j] for j in range(hit_pages)],
                 extra_info,
+                verify=False,
             )
             idx_hit_pages = 0
             for hit in idx_hits:
@@ -2303,9 +2551,7 @@ class HiCacheController:
 
             # ---- own shard: the read-ahead published it while we gathered i-1 ----
             if self.tp_shard_ahead_pending is None:
-                self._tp_shard_ahead_submit(
-                    operation, op_tag, i, batch_idx, prefix_keys
-                )
+                self._tp_shard_ahead_submit(operation, op_tag, i, batch_idx, prefix_keys)
             job = self.tp_shard_ahead_pending
             self.tp_shard_ahead_pending = None
             if not job.done.wait(timeout=self.tp_shard_timeout) or job.error:
@@ -2360,6 +2606,8 @@ class HiCacheController:
                             self._indexer_keys(batch_hashes[my:hit_pages:nranks]),
                             [self.flat_read_idx[s] for s in range(n_mine_idx)],
                             HiCacheStorageExtraInfo(prefix_keys=prefix_keys),
+                            # Already confirmed by the hit query.
+                            verify=False,
                         )
                         for s, hit in enumerate(idx_hits):
                             if hit:
@@ -2386,6 +2634,7 @@ class HiCacheController:
                         self._indexer_keys(batch_hashes[:hit_pages]),
                         [self.flat_read_idx[j] for j in range(hit_pages)],
                         HiCacheStorageExtraInfo(prefix_keys=prefix_keys),
+                        verify=False,
                     )
                     idx_hit_pages = 0
                     for hit in idx_hits:
@@ -2408,19 +2657,10 @@ class HiCacheController:
             still_running = operation.increment(hit_pages * self.page_size)
             if debug:
                 t_end = time.perf_counter()
-                logger.info(
-                    "[hicache] tp-shard: req=%s, %d/%d page(s), device%s, "
-                    "done=%d/%d, ack_wait=%.3fs own=%.3fs gather=%.3fs",
-                    operation.request_id,
-                    hit_pages,
-                    pages,
-                    _idx_range(batch_indices),
-                    operation.completed_tokens,
-                    len(operation.hash_value) * self.page_size,
-                    t_wait,
-                    t_read,
-                    t_end - t_b - t_wait - t_read,
-                )
+                operation.read_wait += t_wait
+                operation.read_own += t_read
+                operation.read_gather += t_end - t_b - t_wait - t_read
+                operation.read_batches += 1
             if not still_running:
                 operation.mark_terminate()
                 break
@@ -2549,18 +2789,18 @@ class HiCacheController:
         return False
 
     def _query_shards(self) -> int:
-        """Ranks that share the L3 existence query (1 = every rank asks all)."""
+        """Ranks sharing the existence query; must match the read's shard space."""
         if os.environ.get("SGLANG_KUNPENG_HICACHE_QUERY_SHARD", "1") != "1":
             return 1
-        return max(1, int(getattr(self, "tp_size", 1)))
+        nranks = getattr(self, "tp_shard_nranks", None) or getattr(
+            self, "tp_size", 1
+        )
+        return max(1, int(nranks))
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         """Return the operation's hash chain and its first missing page.
 
-        With query sharding each page is checked by exactly one rank of the
-        group (``page_index % tp_size``), so the metadata cost is divided by
-        the group size. The caller MIN-reduces the first missing page, which
-        is the leading run of hits every rank needs.
+        Each page is checked by one rank; the caller MIN-reduces the result.
         """
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
@@ -2630,8 +2870,8 @@ class HiCacheController:
             )
             self.prefetch_io_aux_thread.start()
         else:
-            # Reuse the live consumer and its buffer; a second one would race on
-            # the shared flat_read buffer and the broadcast slots.
+            # Reuse the live consumer: a second one would race on the shared
+            # flat_read buffer.
             logger.warning(
                 "[hicache] prefetch_io_aux thread already running; "
                 "reusing it instead of starting a second one"
@@ -2670,15 +2910,6 @@ class HiCacheController:
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] %s: req=%s, %d page(s), %s%s",
-                            "L3->flat start" if self.l1l3_only else "L3->L2 start",
-                            operation.request_id,
-                            storage_hit_count // self.page_size,
-                            "flat" if self.l1l3_only else "host",
-                            _idx_range(operation.host_indices),
-                        )
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
@@ -2701,6 +2932,7 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        req_id: Optional[str] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
@@ -2710,26 +2942,13 @@ class HiCacheController:
         straight out of L1 into the flat buffer and writes that out.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices,
+            token_ids,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
+            req_id=req_id,
         )
         self.backup_queue.put(operation)
-        if _hicache_debug():
-            if self.l1l3_only:
-                logger.info(
-                    "[hicache] L1->L3 queued: op=%d, %d page(s), device%s, %d token(s)",
-                    operation.id,
-                    len(operation.hash_value),
-                    _idx_range(host_indices),
-                    len(token_ids),
-                )
-            else:
-                logger.info(
-                    "[hicache] L2->L3 queued: op=%d, %d page(s), host%s, %d token(s)",
-                    operation.id,
-                    len(operation.hash_value),
-                    _idx_range(host_indices),
-                    len(token_ids),
-                )
         return operation.id
 
     # todo: deprecate
@@ -2853,21 +3072,16 @@ class HiCacheController:
                 )
 
     def _page_backup_l1l3(self, operation):
-        """Two-tier L1 -> L3 write: gather each batch's L1 device pages into the
-        flat buffer, then hand the buffer to the backend.
+        """Two-tier L1 -> L3 write: gather a batch into the flat buffer, then
+        hand it to the backend (zero-copy out of the registered buffer).
 
-        Runs on the backup thread: the gather is the serial batch kernel (safe
-        there), the backend call is zero-copy out of the registered flat buffer.
-        ``operation.host_indices`` holds L1 device slots in this mode.
-
-        Pages are sharded across the attention group by ``crc32(page_hash) %
-        tp_size``: every rank owns a disjoint slice, so each page is stored
-        exactly once and the per-rank I/O drops to ``1/tp_size``. The L3 hit
-        query applies the same rule, which keeps a rank stat-ing only the pages
-        it wrote. ``completed_tokens`` still charges the whole batch, so the
-        backup metrics keep counting pages rather than shards.
+        Pages are sharded across the attention group, so each page is stored
+        once; the hit query applies the same rule.
         """
         debug = _hicache_debug()
+        t_start = time.perf_counter() if debug else 0.0
+        sum_mine = 0
+        sum_cpu = sum_offcpu = 0.0
         prefix_keys = operation.prefix_keys
         layers = self.l1l3_kv_layers
         src_indices = operation.host_indices
@@ -2885,80 +3099,64 @@ class HiCacheController:
                 for j in range(pages)
                 if _page_shard_of(batch_hashes[j], nranks) == my
             ]
+            sum_mine += len(mine)
 
             t_batch_start = time.perf_counter() if debug else 0.0
             if debug:
-                cpu_batch_start, rq_batch_start = _thread_stat()
+                cpu_batch_start, _ = _thread_stat()
 
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = True
+            failed = 0
             page_starts = None
             if mine:
                 page_starts = self._device_page_starts(batch_indices, pages, "L1->L3")
-                hicache_page_flatten_batch(
-                    layers,
-                    self.flat_write[: len(mine)],
-                    page_starts[mine],
-                    self.page_size,
-                )
-                success = all(
-                    self.storage_backend.batch_set_flat(
-                        [batch_hashes[j] for j in mine],
-                        [self.flat_write[k] for k in range(len(mine))],
-                        extra_info,
+                # Index-K first: the KV completion marker is what a reader
+                # trusts for the whole page, so it must appear last.
+                if self.indexer_page_elems:
+                    page_ids = page_starts // self.page_size
+                    hicache_page_flatten_batch(
+                        self._indexer_page_layers(),
+                        self.flat_write_idx[: len(mine)],
+                        page_ids[mine],
+                        1,
                     )
-                )
-            if success and page_starts is not None and self.indexer_page_elems:
-                page_ids = page_starts // self.page_size
-                hicache_page_flatten_batch(
-                    self._indexer_page_layers(),
-                    self.flat_write_idx[: len(mine)],
-                    page_ids[mine],
-                    1,
-                )
-                success = all(
-                    self.storage_backend.batch_set_flat(
+                    idx_res = self.storage_backend.batch_set_flat(
                         self._indexer_keys([batch_hashes[j] for j in mine]),
                         [self.flat_write_idx[k] for k in range(len(mine))],
                         extra_info,
                     )
-                )
-                if debug:
-                    logger.info(
-                        "[hicache] L1->flat copy + flat->L3 write (indexer): op=%d, "
-                        "%d page(s), device%s, key_suffix=%s, ok=%s",
-                        operation.id,
-                        len(mine),
-                        _idx_range(batch_indices),
-                        self.indexer_key_suffix,
-                        success,
+                    failed += sum(1 for ok in idx_res if not ok)
+                    success = failed == 0
+                if success:
+                    hicache_page_flatten_batch(
+                        layers,
+                        self.flat_write[: len(mine)],
+                        page_starts[mine],
+                        self.page_size,
                     )
+                    kv_res = self.storage_backend.batch_set_flat(
+                        [batch_hashes[j] for j in mine],
+                        [self.flat_write[k] for k in range(len(mine))],
+                        extra_info,
+                    )
+                    failed += sum(1 for ok in kv_res if not ok)
+                    success = failed == 0
 
             if debug:
                 t_end = time.perf_counter()
-                cpu_batch_end, rq_batch_end = _thread_stat()
+                cpu_batch_end, _ = _thread_stat()
                 cpu_used = cpu_batch_end - cpu_batch_start
-                logger.info(
-                    "[hicache] L1->flat copy + flat->L3 write: op=%d, %d/%d page(s) "
-                    "shard=%d/%d, device%s, done=%d/%d, total=%.3fs, cpu=%.3fs "
-                    "offcpu=%.3fs rqwait=%ss",
-                    operation.id,
-                    len(mine),
-                    pages,
-                    my,
-                    nranks,
-                    _idx_range(batch_indices),
-                    operation.completed_tokens,
-                    len(operation.hash_value) * self.page_size,
-                    t_end - t_batch_start,
-                    cpu_used,
-                    (t_end - t_batch_start) - cpu_used,
-                    _fmt_wait(rq_batch_end, rq_batch_start),
-                )
+                sum_cpu += cpu_used
+                sum_offcpu += (t_end - t_batch_start) - cpu_used
 
             if not success:
                 logger.warning(
-                    f"Write page to storage: {len(mine)} of {pages} page(s) failed."
+                    "Write page to storage: %d of %d page(s) failed "
+                    "(this rank owns %d).",
+                    failed,
+                    pages,
+                    len(mine),
                 )
                 break
 
@@ -2966,6 +3164,51 @@ class HiCacheController:
                 prefix_keys += batch_hashes
             # Full batch, not just this rank's shard: the metric counts pages.
             operation.completed_tokens += self.page_size * pages
+
+        if debug:
+            # Aggregate per request; emitted once the request is finished.
+            total = time.perf_counter() - t_start
+            agg = self._write_summary.get(operation.req_id)
+            if agg is None:
+                agg = {"ops": 0, "pages": 0, "mine": 0, "total": 0.0,
+                       "cpu": 0.0, "offcpu": 0.0, "ts": time.monotonic()}
+                self._write_summary[operation.req_id] = agg
+            agg["ops"] += 1
+            agg["pages"] += len(operation.hash_value)
+            agg["mine"] += sum_mine
+            agg["total"] += total
+            agg["cpu"] += sum_cpu
+            agg["offcpu"] += sum_offcpu
+            agg["ts"] = time.monotonic()
+
+    def seal_write_summary(self, req_id: str) -> None:
+        """Ask the backup thread to emit this request's summary once drained."""
+        if not _hicache_debug():
+            return
+        self.backup_queue.put(_SealWriteSummary(req_id))
+
+    def _flush_write_summary(self, force: bool = False):
+        """Emit one line per finished request; unfinished ones keep aggregating."""
+        if not self._write_summary:
+            return
+        now = time.monotonic()
+        for req_id, agg in list(self._write_summary.items()):
+            sealed = req_id in self._write_summary_sealed or req_id is None
+            if not (sealed or force or now - agg.get("ts", now) > 120.0):
+                continue
+            logger.info(
+                "[hicache] L1->L3 write summary: req=%s, %d page(s), %d op(s), "
+                "mine=%d, total=%.3fs, cpu=%.3fs offcpu=%.3fs",
+                "-" if req_id is None else req_id,
+                agg["pages"],
+                agg["ops"],
+                agg["mine"],
+                agg["total"],
+                agg["cpu"],
+                agg["offcpu"],
+            )
+            self._write_summary.pop(req_id, None)
+            self._write_summary_sealed.discard(req_id)
 
     def backup_thread_func(self):
         """
@@ -2977,10 +3220,19 @@ class HiCacheController:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                if isinstance(operation, _SealWriteSummary):
+                    # Writes of this request are all ahead of the seal in FIFO
+                    # order, so the aggregate is complete now.
+                    if operation.req_id in self._write_summary:
+                        self._write_summary_sealed.add(operation.req_id)
+                    continue
 
                 if not self.backup_skip:
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:
+                # Queue drained: the current write burst is over, emit its summary.
+                if self._write_summary:
+                    self._flush_write_summary()
                 continue

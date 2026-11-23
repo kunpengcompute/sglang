@@ -40,7 +40,12 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    ModelImpl,
+    dsa_layer_skips_topk,
+    is_deepseek_nsa,
+)
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -1261,6 +1266,13 @@ class Scheduler(
             # stale and only hurt acceptance, not the final answer.
             draft_kv_pool, _ = self._get_draft_kv_pool()
             controller = self.tree_cache.cache_controller
+            # The shared page blob keeps the PP1 layout, so every stage needs
+            # the model-wide geometry.
+            controller.set_flat_shard_layout(
+                self.model_config.hf_config.num_hidden_layers,
+                self._global_skip_topk_layers(),
+                draft_layers=self._draft_kv_layer_count(draft_kv_pool),
+            )
             if draft_kv_pool is not None:
                 controller.set_draft_kv_pool(draft_kv_pool)
             controller.finalize_l1l3_io()
@@ -1305,6 +1317,32 @@ class Scheduler(
             return
 
         self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+
+    def _draft_kv_layer_count(self, draft_kv_pool) -> int:
+        """MTP draft KV layers that the shared L3 page blob carries at its tail.
+
+        The draft pool only exists on the last PP stage, but every stage needs
+        the whole-object size, so the others fall back to the model's MTP layer
+        count (which is what that pool is built from).
+        """
+        if draft_kv_pool is not None:
+            return len(getattr(draft_kv_pool, "kv_buffer", None) or [])
+        return int(self.model_config.num_nextn_predict_layers or 0)
+
+    def _global_skip_topk_layers(self):
+        """Per-layer DSA skip-topk flags over every target layer.
+
+        None when the pool has no DSA indexer. The flags are a pure function of
+        the global layer id, so every PP stage derives the same list and thus
+        the same index-K offsets inside the shared L3 page blob.
+        """
+        hf_config = self.model_config.hf_config
+        if not is_deepseek_nsa(hf_config):
+            return None
+        return [
+            dsa_layer_skips_topk(hf_config, layer_id)
+            for layer_id in range(int(hf_config.num_hidden_layers))
+        ]
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -2269,7 +2307,14 @@ class Scheduler(
             )
             if anchor_ready or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
-                matched_len = len(req.prefix_indices) + req.host_hit_length
+                if getattr(self.tree_cache, "l1l3_only", False):
+                    # The fetched suffix must start exactly where the anchor's
+                    # key ends: nodes below it may be L3-only, and
+                    # len(prefix_indices) skips those, which shifts the offset
+                    # and makes the published pages unmatchable.
+                    matched_len = self.tree_cache.prefix_depth(last_host_node)
+                else:
+                    matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (
@@ -2808,6 +2853,20 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.enable_hicache_storage
+                and req.storage_hit_length
+                and envs.SGLANG_HICACHE_DEBUG.get()
+            ):
+                logger.info(
+                    "[hicache] prefill match: req=%s, storage_hit=%d, "
+                    "device_hit=%d, extend=%d, seqlen=%d",
+                    req.rid,
+                    req.storage_hit_length,
+                    len(req.prefix_indices),
+                    req.extend_input_len,
+                    req.seqlen,
+                )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

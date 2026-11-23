@@ -297,6 +297,13 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
+    # PP1 and PP16 share one page file: drop the per-stage name suffix and let
+    # every stage pwrite only its own layers into the PP1 byte layout.
+    SGLANG_HICACHE_FILE_PP_SHARED = EnvBool(True)
+    # Seconds a prefetch read waits for a page another PP stage is still
+    # assembling (its .stages marker is partially filled) before calling it a
+    # miss. Keeps a nearly complete prefix from being recomputed in full.
+    SGLANG_HICACHE_INCOMPLETE_WAIT = EnvFloat(6.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_DEBUG = EnvBool(False)
     SGLANG_KUNPENG_HICACHE_CPU_OFFSET = EnvInt(19)
