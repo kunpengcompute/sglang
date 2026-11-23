@@ -1062,28 +1062,10 @@ class HiRadixCache(RadixCache):
                     # budget (see _trim_storage_index), not by L1 eviction.
                     continue
                 if x.storage_backed:
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] L1 evict node=%d, %d token(s), "
-                            "device[%d..%d] -> L3-only",
-                            x.id,
-                            len(x.value),
-                            int(x.value[0]),
-                            int(x.value[-1]),
-                        )
                     n = self._evict_storage_backed(x)
                     num_evicted += n
                     evicted_to_l3 += n
                 else:
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] L1 evict node=%d, %d token(s), "
-                            "device[%d..%d] -> dropped (not in L3)",
-                            x.id,
-                            len(x.value),
-                            int(x.value[0]),
-                            int(x.value[-1]),
-                        )
                     n = self._evict_regular(x)
                     num_evicted += n
                     evicted_dropped += n
