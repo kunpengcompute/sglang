@@ -38,7 +38,8 @@ bash "$TOOL/run.sh" pack  "$CONFIG"
 
 - `build`：从选定源码编译 sgl_kernel，输出到 `DEPLOY_DIR/build`；编译记录为 `KERNEL_BUILD.json`。
 - `pack`：校验源码、构建产物和依赖，冻结 Python 应用、原生库和工具到 `release`，制作16份 rank 私有 NUMA 镜像到 `numa_images`。输出是目录，不是自动生成的压缩包。
-- 源码需要有本次完整的 Git 快照；不能修改 Python/C++ 后借用旧 DSO 打包。已有匹配构建记录时可设置 `KERNEL_BUILD_RECEIPT`，但 SDK/源码/DSO 校验仍执行。
+- 修改`python/`下的模型/框架代码或部署脚本后，可在新的`DEPLOY_DIR`配置`KERNEL_BUILD_RECEIPT`指向原构建记录，直接pack；允许未提交的Python调试改动，打包时记录当前commit及修改状态。
+- 修改`sgl-kernel/csrc`、`sgl-kernel/include`或`sgl-kernel/python`后须重新build。新构建记录按文件内容核对编译输入；旧记录兼容原算子目录干净、仅Python或部署脚本变化的情况。SDK和DSO校验保持。
 - 不覆盖已有 build、release 或 NUMA 镜像。升级代码或 SDK 使用新的 `DEPLOY_DIR`。
 
 `release/app` 不塞入整套 SDK 或模型权重。NUMA 镜像会复制运行所需的部分 ELF 和依赖，纯 Python 内容仍可能链接到本机环境；这与把整个 HPCKit/SDK 打成压缩包不同。

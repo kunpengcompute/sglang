@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.check_dependencies import check as check_dependencies
-from tools.runtime_contract import environment, sha256, snapshot, verify_payload
+from tools.runtime_contract import environment, sha256, snapshot, verify_payload, verify_kernel_source
 
 
 def copy_tree(source, target):
@@ -30,11 +30,7 @@ def build(kit, deploy):
         raise RuntimeError('先从源码完成 build.sh')
     if Path(kernel_build['kernel_root']).resolve() != Path(env['KERNEL_PACKAGE_ROOT']).resolve():
         raise RuntimeError('算子输入不是本次源码构建输出')
-    if kernel_build['source_commit'] != subprocess.check_output(
-            ['git', '-C', env['SGLANG_SOURCE'], 'rev-parse', 'HEAD'], text=True).strip():
-        raise RuntimeError('构建记录与当前源码commit不匹配，不复用旧kernel')
-    subprocess.run(['git', '-C', env['SGLANG_SOURCE'], 'diff', '--quiet', 'HEAD', '--',
-                    'python', 'sgl-kernel'], check=True)
+    verify_kernel_source(env['SGLANG_SOURCE'], kernel_build)
     for key, library in [('KUTACC_PREFIX', 'libkutacc.so'), ('KUPL_PREFIX', 'libkupl.so')]:
         if sha256(Path(env[key])/'lib'/library) != kernel_build['dependencies'][key]['sha256']:
             raise RuntimeError('SDK与原构建记录不匹配：' + key)
@@ -124,7 +120,9 @@ def build(kit, deploy):
                 stderr=subprocess.STDOUT, check=True)
         result['phase'] = 'COMPLETE'
     except BaseException as error:
-        result.update(phase='FAILED', error=repr(error))
+        result.update(phase='FAILED', error=repr(error), log=str(logs / 'numa_images.log'))
+        if isinstance(error, subprocess.CalledProcessError):
+            raise RuntimeError('NUMA副本准备失败，详细日志：' + str(logs / 'numa_images.log')) from error
         raise
     finally:
         receipt_path.write_text(json.dumps(result, indent=2) + '\n')

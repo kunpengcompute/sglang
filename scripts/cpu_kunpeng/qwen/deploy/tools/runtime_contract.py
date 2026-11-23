@@ -28,6 +28,43 @@ def sha256(path):
     return digest.hexdigest()
 
 
+KERNEL_SOURCE_DIRS = ('sgl-kernel/csrc', 'sgl-kernel/include', 'sgl-kernel/python')
+
+
+def kernel_source_files(source):
+    source = Path(source)
+    return {
+        str(path.relative_to(source)): sha256(path)
+        for directory in KERNEL_SOURCE_DIRS
+        for path in sorted((source / directory).rglob('*'))
+        if path.is_file() and '__pycache__' not in path.parts
+        and path.suffix not in ('.pyc', '.pyo', '.so')
+        and '.so.' not in path.name and path.name != '.DS_Store'
+    }
+
+
+def verify_kernel_source(source, build):
+    expected = build.get('source_files')
+    if expected is not None:
+        current = kernel_source_files(source)
+        changed = sorted(name for name in expected.keys() | current.keys()
+                         if expected.get(name) != current.get(name))
+    else:
+        # Older receipts can reuse a clean kernel tree across Python-only commits.
+        if any('sgl-kernel/' in line for line in build.get('source_dirty_status', '').splitlines()):
+            raise RuntimeError('旧构建记录含未提交的算子改动，无法核对产物；请重新执行run.sh build')
+        changed = []
+        for args in (['diff', '--name-only', build['source_commit']],
+                     ['ls-files', '--others', '--exclude-standard']):
+            changed += subprocess.check_output(
+                ['git', '-C', str(source), *args, '--', *KERNEL_SOURCE_DIRS], text=True
+            ).splitlines()
+        changed = sorted(set(changed))
+    if changed:
+        raise RuntimeError('算子编译输入已变化，请重新执行run.sh build；变更文件：\n'
+                           + '\n'.join(changed))
+
+
 def environment(dependencies_only=False):
     required = ['PYTHON', 'KUTACC_PREFIX', 'KUPL_PREFIX']
     if not dependencies_only:

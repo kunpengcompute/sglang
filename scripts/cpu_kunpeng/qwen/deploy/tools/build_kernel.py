@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+from runtime_contract import kernel_source_files, verify_kernel_source
 
 
 def digest(path):
@@ -64,6 +65,7 @@ def main():
             ['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
         record['source_dirty_status'] = subprocess.check_output(
             ['git', '-C', str(source), 'status', '--porcelain'], text=True)
+        record['source_files'] = kernel_source_files(source)
         record['dependencies'] = {
             key: {'prefix': env[key], 'sha256': digest(Path(env[key]) / 'lib' / library)}
             for key, library in [('KUTACC_PREFIX', 'libkutacc.so'),
@@ -82,6 +84,7 @@ def main():
         native = list((kernel / 'sgl_kernel').glob('*.so'))
         if not any(p.name.startswith('common_ops') for p in native):
             raise RuntimeError('CMake did not install common_ops')
+        verify_kernel_source(source, record)
         record.update(phase='COMPLETE', finished_epoch=time.time(),
                       native_sha256={p.name: digest(p) for p in native},
                       compiled_translation_units=len(json.loads((build / 'compile_commands.json').read_text())))
