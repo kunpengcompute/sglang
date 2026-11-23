@@ -743,6 +743,16 @@ class KunpengSwapManager:
             dtype,
         )
 
+    def _is_direct_index_k_layer(self, layer_id: int, pool) -> bool:
+        """Whether ``layer_id`` keeps its index-K in DDR (no HBM swap).
+
+        The leading full indexers are marked on the pool (absolute layer ids,
+        config-derived). They read/write DDR directly, so the swap manager
+        must neither mirror them into HBM nor wait on their (nonexistent)
+        swap-in events.
+        """
+        return layer_id in getattr(pool, "index_k_direct_layers", ())
+
     def swap_index_k_layer(
         self, layer_id: int, index_k_ddr: torch.Tensor
     ) -> None:
@@ -752,6 +762,12 @@ class KunpengSwapManager:
         (shared/S) layers have no index-K buffer and never reach here.
         Reuses the generic ``kupl_sdma_kv_swapin`` chunked-memcpy graph op --
         it is a plain byte copy and has no KV-specific semantics.
+
+        Callers must skip layers in ``pool.index_k_direct_layers`` (the
+        leading full indexers that stay in DDR); recording one of those here
+        would set ``_cur_index_k_ddr`` / ``_index_k_layer`` to a layer that
+        has no HBM mirror, and ``get_index_k_cache`` would then hand the
+        recycled (stale) HBM buffer to a different layer.
         """
         self._cur_index_k_ddr = index_k_ddr
         self._index_k_layer = layer_id
@@ -785,19 +801,27 @@ class KunpengSwapManager:
         )
 
     def _first_full_index_k_layer(self, forward_batch) -> Optional[int]:
-        """Absolute layer id of this rank's first full (non-skip-topk) layer."""
+        """Absolute layer id of this rank's first SWAPPED full indexer.
+
+        Leading full indexers that stay in DDR (``index_k_direct_layers``)
+        are skipped: the HBM mirror must start at the first full layer that
+        follows a shared gap, so its DDR->HBM DMA can overlap the intervening
+        shared-layer compute instead of stalling back-to-back full layers.
+        """
         pool = forward_batch.token_to_kv_pool
         start = getattr(pool, "start_layer", 0)
         for offset, buf in enumerate(pool.index_k_buffer):
-            if buf is not None:
-                return start + offset
+            layer_id = start + offset
+            if buf is not None and not self._is_direct_index_k_layer(layer_id, pool):
+                return layer_id
         return None
 
     def swap_first_index_k_layer(self, forward_batch) -> None:
-        """Swap the first full layer's index-K at forward entry.
+        """Swap the first SWAPPED full layer's index-K at forward entry.
 
         Always re-issues the copy (the DDR cache gained new tokens since the
-        previous forward), unlike the per-layer prefetch guard.
+        previous forward), unlike the per-layer prefetch guard. Direct-DDR
+        leading indexers are skipped (see :meth:`_first_full_index_k_layer`).
         """
         if not self.enable_swap_index_k_in or self._idle_forward:
             return
@@ -811,12 +835,13 @@ class KunpengSwapManager:
     def swap_next_index_k_layer(
         self, current_layer_id: int, forward_batch
     ) -> None:
-        """Prefetch the next FULL layer's index-K via SDMA.
+        """Prefetch the next SWAPPED FULL layer's index-K via SDMA.
 
         Skip-topk (shared/S) layers carry ``None`` index-K buffers, so scan
-        forward to the nearest full layer within this rank's KV range. A layer
-        already mirrored into HBM is not re-copied within this forward (the
-        entry swap refreshes it on the next forward), avoiding duplicate
+        forward to the nearest full layer within this rank's KV range. Direct-
+        DDR leading full indexers are skipped too: they are never mirrored.
+        A layer already mirrored into HBM is not re-copied within this forward
+        (the entry swap refreshes it on the next forward), avoiding duplicate
         in-flight SDMA events while skip layers intervene.
         """
         if not self.enable_swap_index_k_in or self._idle_forward:
@@ -826,6 +851,8 @@ class KunpengSwapManager:
         for layer_id in range(current_layer_id + 1, self._kv_end_layer):
             buf = pool.index_k_buffer[layer_id - start]
             if buf is None:
+                continue
+            if self._is_direct_index_k_layer(layer_id, pool):
                 continue
             if layer_id == self._index_k_layer:
                 return

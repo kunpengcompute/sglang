@@ -43,6 +43,9 @@ Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
      stitch behind the ColumnParallel wq_b + batched allgather, the shard
      boundary / head-alignment invariants, and the sharded linear weight
      shapes (auto-skip when the modules are not importable).
+   M. index-K swap leading-full skip: config-derived count of consecutive
+      leading full indexers kept in DDR, and the swap manager first/next
+      scan starting at the first non-direct full indexer.
 """
 
 import random
@@ -62,6 +65,8 @@ try:
     from sglang.srt.configs.model_config import (
         count_indexer_layers,
         dsa_layer_skips_topk,
+        leading_full_indexer_layers,
+        leading_indexer_layer_ids,
     )
     from sglang.srt.configs.model_config import is_deepseek_nsa as _is_nsa
 
@@ -683,6 +688,119 @@ def test_count_indexer_layers_ranges():
     assert count_indexer_layers(cfg, 3, 6) == 0
     assert count_indexer_layers(cfg, 6, 10) == 1
     assert count_indexer_layers(cfg, 0, None) == 21
+
+
+def test_leading_full_indexer_layers():
+    """D/M: leading-full-run detection for the index-K direct-DDR swap skip."""
+    assert _HAVE_MODEL_CONFIG
+    from types import SimpleNamespace
+
+    # GLM-5.3 indexer_types F,F,F,S,... -> 3 leading full indexers; the
+    # first 3 FULL indexers are exactly layers 0/1/2.
+    cfg = _glm53_config()
+    assert leading_full_indexer_layers(cfg) == 3
+    assert leading_indexer_layer_ids(cfg, 3) == {0, 1, 2}
+    assert leading_indexer_layer_ids(cfg, 0) == set()
+    assert leading_indexer_layer_ids(cfg, -1) == set()
+    # A count larger than the leading run extends to the next full indexer
+    # (layer 6), using ABSOLUTE ids, not full-ordinal indices.
+    assert leading_indexer_layer_ids(cfg, 4) == {0, 1, 2, 6}
+    # The set uses ABSOLUTE ids: a PP rank whose layers start at layer 6 sees
+    # none of the leading-direct ids (layers 0/1/2 are on an earlier rank).
+    assert leading_indexer_layer_ids(cfg, 3) & set(range(6, 78)) == set()
+
+    # Equivalent freq=4 + offset=3 derivation must give the same answer.
+    cfg2 = _glm53_config()
+    del cfg2.indexer_types
+    cfg2.index_topk_freq = 4
+    cfg2.index_skip_topk_offset = 3
+    assert leading_full_indexer_layers(cfg2) == 3
+    assert leading_indexer_layer_ids(cfg2, 3) == {0, 1, 2}
+
+    # Pattern form also agrees.
+    cfg3 = _glm53_config()
+    del cfg3.indexer_types
+    cfg3.index_topk_pattern = "FFFS" + "S" * 74
+    assert leading_full_indexer_layers(cfg3) == 3
+
+    # cli_factor=3 -> full at 0 only (single leading full layer) -> 0 (legacy).
+    cfg4 = SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLM"], index_topk=2048,
+        num_hidden_layers=8, cli_factor=3,
+    )
+    assert leading_full_indexer_layers(cfg4) == 0
+
+    # All-full model: no shared gap to hide a later DMA behind -> 0 (legacy),
+    # so the swap is not silently turned off.
+    cfg5 = SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLM"], index_topk=2048,
+        num_hidden_layers=8, index_topk_freq=1,
+    )
+    assert leading_full_indexer_layers(cfg5) == 0
+
+
+def test_index_k_swap_skips_direct_layers():
+    """M: swap manager starts at the first non-direct full indexer.
+
+    GLM-5.3 layers 0/1/2 stay in DDR, so the HBM mirror must begin at layer
+    6 (the 4th indexer) and must never be issued for a direct layer.
+    """
+    try:
+        from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
+            KunpengSwapManager,
+        )
+    except Exception:
+        print("  [skip] swap_manager not importable")
+        return
+
+    from types import SimpleNamespace
+
+    # Build the swap manager without __init__ (avoids SDMA init / HBW pool).
+    mgr = object.__new__(KunpengSwapManager)
+    mgr.enable_swap_index_k_in = True
+    mgr._idle_forward = False
+    mgr._kv_end_layer = 12
+    mgr._index_k_layer = None
+
+    # index_k_buffer layout for GLM-5.3 (12-layer slice): full at 0,1,2,6,10;
+    # shared layers (None) in between. first 3 full indexers are direct-DDR.
+    full = torch.zeros(2, 4, dtype=torch.bfloat16)
+    pool = SimpleNamespace(
+        start_layer=0,
+        index_k_buffer=[
+            full, full, full, None, None, None, full, None, None, None, full, None
+        ],
+        index_k_direct_layers=frozenset({0, 1, 2}),
+    )
+    fb = SimpleNamespace(token_to_kv_pool=pool)
+
+    # Record swap_index_k_layer calls without touching the real SDMA op.
+    calls = []
+    mgr.swap_index_k_layer = lambda layer_id, buf: calls.append(layer_id)
+
+    assert mgr._first_full_index_k_layer(fb) == 6
+    mgr.swap_first_index_k_layer(fb)
+    assert calls == [6], f"entry swap must target layer 6, got {calls}"
+
+    # From a direct layer (0), the next swapped full layer is 6, not 1/2.
+    calls.clear()
+    mgr._index_k_layer = None
+    mgr.swap_next_index_k_layer(0, fb)
+    assert calls == [6], f"next swap from layer 0 must be 6, got {calls}"
+
+    # From a swapped full layer (6), the next swapped full layer is 10.
+    calls.clear()
+    mgr._index_k_layer = None
+    mgr.swap_next_index_k_layer(6, fb)
+    assert calls == [10], f"next swap from layer 6 must be 10, got {calls}"
+
+    # Legacy: empty direct set -> entry swap starts at layer 0 as before.
+    pool.index_k_direct_layers = frozenset()
+    calls.clear()
+    mgr._index_k_layer = None
+    assert mgr._first_full_index_k_layer(fb) == 0
+    mgr.swap_first_index_k_layer(fb)
+    assert calls == [0]
 
 
 def test_skip_topk_chain():
@@ -1606,6 +1724,8 @@ def main():
         ("D. test_dsa_layer_skips_topk_edges", test_dsa_layer_skips_topk_edges),
         ("D. test_dsa_layer_skips_topk_asserts", test_dsa_layer_skips_topk_asserts),
         ("D. test_count_indexer_layers_ranges", test_count_indexer_layers_ranges),
+        ("M. test_leading_full_indexer_layers", test_leading_full_indexer_layers),
+        ("M. test_index_k_swap_skips_direct_layers", test_index_k_swap_skips_direct_layers),
         ("D. test_skip_topk_chain", test_skip_topk_chain),
         ("E. test_index_topk_share", test_index_topk_share),
         ("E. test_index_topk_share_seed_capture", test_index_topk_share_seed_capture),
