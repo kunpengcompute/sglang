@@ -30,6 +30,9 @@ Behavior (controlled by environment variables):
     - Block-wise (decode when BLOCKWISE=1): copy only needed blocks, write back.
 - SGLANG_KUNPENG_SWAP_KV_OUT: enable KV cache write-back (SDMA write to DDR)
 - SGLANG_KUNPENG_SWAP_KV_BLOCKWISE: use block-wise KV swap in decode mode.
+- SGLANG_KUNPENG_SWAP_INDEX_K_IN: DSA index-K DDR->HBM mirror; two ping-pong
+    HBM buffers prefetch two full indexers ahead so the whole-pool DMA is
+    hidden under the intervening layer compute.
 
 Usage:
     mgr = KunpengSwapManager.get_instance()
@@ -123,11 +126,20 @@ class KunpengSwapManager:
         self._kv_end_layer: int = 0
         self._idle_forward: bool = False
 
-        # Index-K whole-layer swap: one HBM buffer recycled across full
-        # layers, plus the DDR buffer of the layer currently mirrored.
+        # Index-K whole-layer swap: TWO HBM mirrors recycled in a ping-pong
+        # pipeline. With one buffer the prefetch distance is a single full
+        # indexer (only 3 shared layers of compute), too short for a whole-pool
+        # DDR->HBM DMA when the index-K pool is shared across NUMA nodes. Two
+        # buffers let the next-but-one full layer be copied while the current
+        # layer is scored, roughly doubling the overlap window.
         self._cur_index_k_ddr: Optional[torch.Tensor] = None
-        self._cur_index_k_hbm: Optional[torch.Tensor] = None
+        self._index_k_hbm_buffers = [None, None]
+        self._index_k_buffer_layers = [None, None]
+        self._index_k_buffer_free = [True, True]
+        self._index_k_next_buffer = 0
         self._index_k_layer: Optional[int] = None
+        # Legacy alias (buffer 0) for introspection / external callers.
+        self._cur_index_k_hbm: Optional[torch.Tensor] = None
 
         # Block-wise KV swap: DDR->HBM block mapping for the current decode
         # step (computed by the attention backend, cached here for all layers).
@@ -174,11 +186,18 @@ class KunpengSwapManager:
         self._kv_swap_in_event_num_tensor = torch.tensor([0], dtype=torch.int32)
         self._kv_ddr_event_tensor = torch.zeros(sdma_event_num, dtype=torch.int32)
         self._kv_ddr_event_num_tensor = torch.tensor([0], dtype=torch.int32)
-        # Dedicated event table for index-K swap-in (same global SDMA pool).
-        self._index_k_swap_in_event_tensor = torch.zeros(
-            sdma_event_num, dtype=torch.int32
-        )
-        self._index_k_swap_in_event_num_tensor = torch.tensor([0], dtype=torch.int32)
+        # One dedicated event table per index-K HBM mirror (same global SDMA
+        # event pool). Each table is drained when its own buffer is consumed,
+        # so a wait never blocks on the copy filling the other buffer.
+        self._index_k_swap_in_event_tensors = [
+            torch.zeros(sdma_event_num, dtype=torch.int32) for _ in range(2)
+        ]
+        self._index_k_swap_in_event_num_tensors = [
+            torch.tensor([0], dtype=torch.int32) for _ in range(2)
+        ]
+        # Legacy aliases (buffer 0) for introspection / external callers.
+        self._index_k_swap_in_event_tensor = self._index_k_swap_in_event_tensors[0]
+        self._index_k_swap_in_event_num_tensor = self._index_k_swap_in_event_num_tensors[0]
 
         logger.info(
             "KunpengSwapManager initialized: swap_expert=%s swap_kv_in=%s "
@@ -720,106 +739,209 @@ class KunpengSwapManager:
     # DSA/NSA index-K whole-layer swap (DDR -> HBM via SDMA)
     # ------------------------------------------------------------------
 
+    def _ensure_index_k_state(self) -> None:
+        """Fill ping-pong state for instances built via ``object.__new__``.
+
+        Tests construct the manager without ``__init__`` to avoid SDMA / HBW
+        initialisation; keep those instances working with the two buffers.
+        """
+        if not hasattr(self, "_index_k_hbm_buffers"):
+            self._index_k_hbm_buffers = [None, None]
+        if not hasattr(self, "_index_k_buffer_layers"):
+            self._index_k_buffer_layers = [None, None]
+        if not hasattr(self, "_index_k_buffer_free"):
+            self._index_k_buffer_free = [True, True]
+        if not hasattr(self, "_index_k_next_buffer"):
+            self._index_k_next_buffer = 0
+        if not hasattr(self, "_index_k_layer"):
+            self._index_k_layer = None
+        if not hasattr(self, "_index_k_swap_in_event_tensors"):
+            self._index_k_swap_in_event_tensors = [None, None]
+        if not hasattr(self, "_index_k_swap_in_event_num_tensors"):
+            self._index_k_swap_in_event_num_tensors = [None, None]
+
+    def _index_k_buffer_for(self, layer_id: Optional[int]) -> Optional[int]:
+        """Index (0/1) of the HBM mirror currently holding ``layer_id``."""
+        self._ensure_index_k_state()
+        if layer_id is None:
+            return None
+        for idx, owner in enumerate(self._index_k_buffer_layers):
+            if owner == layer_id:
+                return idx
+        return None
+
     def init_index_k_buffer(
         self,
         num_slots: int,
         index_head_dim: int,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        """Allocate the single-layer HBM index-K buffer. Idempotent.
+        """Allocate both HBM index-K mirrors. Idempotent.
 
-        Shape: ``(num_slots, index_head_dim)``. Recycled across full layers
-        exactly like the KV HBM buffer -- only one layer's index-K resides in
-        HBM at any time. Must be called before :meth:`swap_index_k_layer`.
+        Shape: ``(num_slots, index_head_dim)`` each. Recycled in ping-pong
+        order across full layers: while one is being scored by the current
+        full indexer, the other can already hold the next layer's copy.
+        Must be called before :meth:`swap_index_k_layer`.
         """
-        if not self.enable_swap_index_k_in or self._cur_index_k_hbm is not None:
+        self._ensure_index_k_state()
+        if (
+            not self.enable_swap_index_k_in
+            or self._index_k_hbm_buffers[0] is not None
+        ):
             return
-        self._cur_index_k_hbm = self._hbw_pool.alloc(
-            (num_slots, index_head_dim), dtype=dtype
-        )
+        shape = (num_slots, index_head_dim)
+        self._index_k_hbm_buffers = [
+            self._hbw_pool.alloc(shape, dtype=dtype) for _ in range(2)
+        ]
+        self._cur_index_k_hbm = self._index_k_hbm_buffers[0]
         logger.info(
-            "index-K HBM buffer allocated: shape=%s dtype=%s",
-            (num_slots, index_head_dim),
+            "index-K HBM buffers allocated: 2 x shape=%s dtype=%s",
+            shape,
             dtype,
         )
+
+    def _is_direct_index_k_layer(self, layer_id: int, pool) -> bool:
+        """Whether ``layer_id`` keeps its index-K in DDR (no HBM swap).
+
+        The leading full indexers are marked on the pool (absolute layer ids,
+        config-derived). They read/write DDR directly, so the swap manager
+        must neither mirror them into HBM nor wait on their (nonexistent)
+        swap-in events.
+        """
+        return layer_id in getattr(pool, "index_k_direct_layers", ())
 
     def swap_index_k_layer(
         self, layer_id: int, index_k_ddr: torch.Tensor
     ) -> None:
         """Mirror one FULL layer's index-K DDR cache into HBM via SDMA.
 
-        Always records the DDR buffer of the mirrored layer. Skip-topk
-        (shared/S) layers have no index-K buffer and never reach here.
-        Reuses the generic ``kupl_sdma_kv_swapin`` chunked-memcpy graph op --
-        it is a plain byte copy and has no KV-specific semantics.
+        Picks a free mirror, issues ``kupl_sdma_kv_swapin`` into it with that
+        mirror's own event table, and records the layer->mirror mapping used
+        by :meth:`wait_index_k_swap_in` / :meth:`get_index_k_cache`. If both
+        mirrors are in use the copy is skipped and the caller retries later
+        in the forward, so no DMA overwrites a buffer whose layer is still
+        being scored.
+
+        Callers must skip layers in ``pool.index_k_direct_layers`` (the
+        leading full indexers that stay in DDR); recording one of those here
+        would hand a stale mirror to a different layer.
         """
+        self._ensure_index_k_state()
         self._cur_index_k_ddr = index_k_ddr
-        self._index_k_layer = layer_id
 
         if self._idle_forward or not self.enable_swap_index_k_in:
             return
-        if self._cur_index_k_hbm is None:
+        if layer_id in self._index_k_buffer_layers:
+            return  # already mirrored / in flight
+        free = [i for i, is_free in enumerate(self._index_k_buffer_free) if is_free]
+        if not free:
+            return
+        buf_idx = free[self._index_k_next_buffer % len(free)]
+        hbm = self._index_k_hbm_buffers[buf_idx]
+        if hbm is None:
             raise RuntimeError(
                 "index-K HBM buffer not allocated. "
                 "Call init_index_k_buffer(...) first."
             )
-        # The shared HBM buffer is sized by the FIRST runner (target or draft);
-        # a larger layer pool would write past it into adjacent HBW allocations.
+        # Mirrors are sized by the FIRST runner (target or draft); a larger
+        # layer pool would write past them into adjacent HBW allocations.
         if (
-            index_k_ddr.shape[0] > self._cur_index_k_hbm.shape[0]
-            or index_k_ddr.shape[1:] != self._cur_index_k_hbm.shape[1:]
+            index_k_ddr.shape[0] > hbm.shape[0]
+            or index_k_ddr.shape[1:] != hbm.shape[1:]
         ):
             raise RuntimeError(
                 f"index-K swap-in size mismatch: ddr {tuple(index_k_ddr.shape)} "
-                f"does not fit the shared HBM buffer "
-                f"{tuple(self._cur_index_k_hbm.shape)}"
+                f"does not fit the shared HBM buffer {tuple(hbm.shape)}"
             )
+        event_tensor = self._index_k_swap_in_event_tensors[buf_idx]
+        event_num_tensor = self._index_k_swap_in_event_num_tensors[buf_idx]
+        if event_tensor is None or event_num_tensor is None:
+            raise RuntimeError("index-K SDMA event tables not initialised.")
+
         total_bytes = index_k_ddr.numel() * index_k_ddr.element_size()
         kunpeng.kupl_sdma_kv_swapin(
-            self._cur_index_k_hbm,
+            hbm,
             index_k_ddr,
-            self._index_k_swap_in_event_tensor,
-            self._index_k_swap_in_event_num_tensor,
+            event_tensor,
+            event_num_tensor,
             total_bytes,
             profile_name="kupl_sdma_kv_swapin@index_k",
         )
+        self._index_k_buffer_layers[buf_idx] = layer_id
+        self._index_k_buffer_free[buf_idx] = False
+        self._index_k_next_buffer = 1 - buf_idx
+        self._index_k_layer = layer_id
 
-    def _first_full_index_k_layer(self, forward_batch) -> Optional[int]:
-        """Absolute layer id of this rank's first full (non-skip-topk) layer."""
+    def _first_full_index_k_layers(
+        self, forward_batch, count: int = 2
+    ) -> list:
+        """First ``count`` swapped full layers of this rank, in layer order.
+
+        Leading full indexers that stay in DDR (``index_k_direct_layers``)
+        are skipped: the HBM mirrors must start at the first full layer that
+        follows a shared gap, so their DMAs overlap the intervening compute
+        instead of stalling back-to-back full layers.
+        """
         pool = forward_batch.token_to_kv_pool
         start = getattr(pool, "start_layer", 0)
+        layers = []
         for offset, buf in enumerate(pool.index_k_buffer):
-            if buf is not None:
-                return start + offset
-        return None
+            layer_id = start + offset
+            if buf is None or self._is_direct_index_k_layer(layer_id, pool):
+                continue
+            layers.append(layer_id)
+            if len(layers) >= count:
+                break
+        return layers
 
-    def swap_first_index_k_layer(self, forward_batch) -> None:
-        """Swap the first full layer's index-K at forward entry.
+    def _first_full_index_k_layer(self, forward_batch) -> Optional[int]:
+        """Absolute layer id of this rank's first SWAPPED full indexer."""
+        layers = self._first_full_index_k_layers(forward_batch, count=1)
+        return layers[0] if layers else None
 
-        Always re-issues the copy (the DDR cache gained new tokens since the
-        previous forward), unlike the per-layer prefetch guard.
+    def swap_first_index_k_layers(
+        self, forward_batch, count: int = 2
+    ) -> None:
+        """Prefetch the first ``count`` swapped full layers at forward entry.
+
+        Both mirrors are free here, so issuing two copies gives the pipeline
+        a two-full-layer head start; per-layer calls then refill whichever
+        mirror has been consumed.
         """
+        self._ensure_index_k_state()
         if not self.enable_swap_index_k_in or self._idle_forward:
             return
+        # New forward: mirrors' events were drained by their consumers. Reset
+        # bookkeeping; event counters are left untouched (appending to an
+        # already-empty table is a no-op).
+        self._index_k_buffer_layers = [None, None]
+        self._index_k_buffer_free = [True, True]
+        self._index_k_next_buffer = 0
         pool = forward_batch.token_to_kv_pool
-        layer_id = self._first_full_index_k_layer(forward_batch)
-        if layer_id is None:
-            return
-        buf = pool.index_k_buffer[layer_id - getattr(pool, "start_layer", 0)]
-        self.swap_index_k_layer(layer_id, buf)
+        start = getattr(pool, "start_layer", 0)
+        for layer_id in self._first_full_index_k_layers(forward_batch, count):
+            self.swap_index_k_layer(
+                layer_id, pool.index_k_buffer[layer_id - start]
+            )
+
+    def swap_first_index_k_layer(self, forward_batch) -> None:
+        """Prefetch only the first swapped full layer (legacy call sites)."""
+        self.swap_first_index_k_layers(forward_batch, count=1)
 
     def swap_next_index_k_layer(
         self, current_layer_id: int, forward_batch
     ) -> None:
-        """Prefetch the next FULL layer's index-K via SDMA.
+        """Refill a consumed mirror with the next not-yet-mirrored full layer.
 
-        Skip-topk (shared/S) layers carry ``None`` index-K buffers, so scan
-        forward to the nearest full layer within this rank's KV range. A layer
-        already mirrored into HBM is not re-copied within this forward (the
-        entry swap refreshes it on the next forward), avoiding duplicate
-        in-flight SDMA events while skip layers intervene.
+        Called after every decoder layer's attention. Shared layers and
+        direct-DDR leaders are skipped; layers already in either mirror are
+        skipped so no copy is duplicated within one forward. When both mirrors
+        are busy the call is a no-op -- a later layer's call retries.
         """
+        self._ensure_index_k_state()
         if not self.enable_swap_index_k_in or self._idle_forward:
+            return
+        if not any(self._index_k_buffer_free):
             return
         pool = forward_batch.token_to_kv_pool
         start = getattr(pool, "start_layer", 0)
@@ -827,36 +949,57 @@ class KunpengSwapManager:
             buf = pool.index_k_buffer[layer_id - start]
             if buf is None:
                 continue
-            if layer_id == self._index_k_layer:
-                return
+            if self._is_direct_index_k_layer(layer_id, pool):
+                continue
+            if layer_id in self._index_k_buffer_layers:
+                continue
             self.swap_index_k_layer(layer_id, buf)
             return
 
-    def wait_index_k_swap_in(self) -> None:
-        """Drain pending DDR→HBM index-K copy events of the current layer.
+    def wait_index_k_swap_in(self, layer_id: Optional[int] = None) -> None:
+        """Drain the DDR→HBM copy events of ``layer_id``'s mirror.
 
-        Must run before the pool reads (scoring) or double-writes new tokens
-        into the HBM mirror, so a late whole-pool DMA cannot clobber fresh
-        data -- the same hazard the KV ``wait_kv_swap_in`` guards against.
+        Must run before the pool double-writes new tokens into that mirror,
+        otherwise a late whole-pool DMA could clobber the fresh rows. The
+        waited mirror is marked free so the decoder can refill it with a
+        later full layer's copy once this layer finishes scoring.
+
+        ``layer_id=None`` drains every mirror (legacy callers / tests).
         """
-        if self.enable_swap_index_k_in:
+        if not self.enable_swap_index_k_in:
+            return
+        self._ensure_index_k_state()
+        buf_idx = self._index_k_buffer_for(layer_id)
+        indices = (
+            [buf_idx]
+            if buf_idx is not None
+            else list(range(len(self._index_k_hbm_buffers)))
+        )
+        for i in indices:
+            event_tensor = self._index_k_swap_in_event_tensors[i]
+            event_num_tensor = self._index_k_swap_in_event_num_tensors[i]
+            if event_tensor is None or event_num_tensor is None:
+                continue
             kunpeng.kupl_sdma_wait_all(
-                self._index_k_swap_in_event_tensor,
-                self._index_k_swap_in_event_num_tensor,
+                event_tensor,
+                event_num_tensor,
                 profile_name="kupl_sdma_wait_all@index_k_swap_in_before_write",
             )
+            self._index_k_buffer_free[i] = True
 
-    def get_index_k_cache(self) -> torch.Tensor:
-        """Return the current layer's index-K: HBM mirror (swap on) or DDR.
+    def get_index_k_cache(self, layer_id: Optional[int] = None) -> torch.Tensor:
+        """Return ``layer_id``'s index-K HBM mirror (swap on) or DDR.
 
-        Does NOT drain the layer's pending DDR->HBM copy events: the write
-        side already did. ``set_index_k_buffer`` calls
-        :meth:`wait_index_k_swap_in` (tagged
-        ``@index_k_swap_in_before_write``) before its HBM double-write, which
-        drains the event table and zeroes its counter. A second wait here
-        would see an empty table and return immediately -- measured at 1.2 us
-        per layer, with nothing in between that issues new SDMA events.
+        Does NOT wait: :meth:`wait_index_k_swap_in` already drained this
+        mirror's events before the write side touched it.
         """
         if self.enable_swap_index_k_in:
-            return self._cur_index_k_hbm
+            self._ensure_index_k_state()
+            buf_idx = self._index_k_buffer_for(layer_id)
+            if buf_idx is None:
+                buf_idx = self._index_k_next_buffer  # last issued
+            hbm = self._index_k_hbm_buffers[buf_idx]
+            if hbm is None:
+                raise RuntimeError("index-K HBM buffer not allocated.")
+            return hbm
         return self._cur_index_k_ddr

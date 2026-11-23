@@ -179,6 +179,62 @@ def count_indexer_layers(
     return sum(1 for l in range(start, end) if not dsa_layer_skips_topk(config, l))
 
 
+def leading_full_indexer_layers(config: PretrainedConfig) -> int:
+    """Number of consecutive FULL (own-indexer) DSA layers at layer 0.
+
+    Walking ``dsa_layer_skips_topk`` from layer 0 until the first shared
+    (skip-topk) layer gives the leading run of back-to-back full indexers.
+    On Kunpeng 920F the index-K whole-layer swap uses ONE recycled HBM
+    buffer: swapping back-to-back full layers exposes the full DDR->HBM DMA
+    latency (there is no intervening shared-layer compute to hide it under),
+    whereas a full layer after a shared gap has several layers of compute to
+    overlap its DMA. Keeping this leading run in DDR (direct read/write) and
+    starting the swap at the first full layer that follows a shared gap
+    removes that stall.
+
+    GLM-5.3 ``indexer_types = F,F,F,S,S,S,F,...`` -> 3. Returns 0 (legacy
+    "swap every full layer") when there is no shared gap to hide a later DMA
+    behind, or when the leading run is only one layer. Config-derived, so it
+    stays correct across GLM-5.3 / DeepSeek-V3.2 / pattern / freq variants.
+    """
+    assert is_deepseek_nsa(config)
+    n = 0
+    for layer_id in range(config.num_hidden_layers):
+        if dsa_layer_skips_topk(config, layer_id):
+            break
+        n += 1
+    # No shared layer exists to hide a later full layer's DMA behind (every
+    # layer runs its own indexer). Directly serving ALL of them from DDR would
+    # silently turn the swap off, so keep the legacy behaviour (0 = swap every
+    # full layer) in that degenerate case.
+    if n >= config.num_hidden_layers:
+        return 0
+    # A single leading full indexer still has a full shared gap between it
+    # and the next full indexer, so its DMA overlaps too. Only a run of >= 2
+    # back-to-back full indexers exposes the stall; keep 1 as legacy (0).
+    return n if n >= 2 else 0
+
+
+def leading_indexer_layer_ids(config: PretrainedConfig, count: int) -> set:
+    """Absolute layer ids of the first ``count`` full DSA indexers.
+
+    Used to mark the index-K layers that stay in DDR (no HBM swap). The walk
+    is over ABSOLUTE model layer ids, so PP ranks whose layers start after the
+    leading run correctly get an empty intersection. ``count <= 0`` yields an
+    empty set (legacy behaviour: swap every full layer). ``count`` larger than
+    the leading run simply extends direct-DDR to the following full indexers.
+    """
+    if count <= 0:
+        return set()
+    assert is_deepseek_nsa(config)
+    ids = set()
+    for layer_id in range(config.num_hidden_layers):
+        if not dsa_layer_skips_topk(config, layer_id):
+            ids.add(layer_id)
+            if len(ids) >= count:
+                break
+    return ids
+
 class ModelConfig:
     def __init__(
         self,
