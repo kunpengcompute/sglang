@@ -16,7 +16,9 @@ listed in ``index_k_direct_layers`` (absolute layer ids) deliberately bypass
 the swap and read/write their index-K directly in DDR. Those back-to-back
 full layers cannot hide the whole-pool DDR->HBM DMA under intervening
 shared-layer compute, so keeping them in DDR avoids the exposed stall; the
-swap starts at the first full indexer that follows a shared gap.
+swap starts at the first full indexer that follows a shared gap. The swapped
+layers use two ping-pong HBM mirrors, so the copy for the next-but-one full
+layer overlaps the current layer's scoring.
 """
 
 import logging
@@ -256,9 +258,9 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
             # DMA over the whole pool, so a copy of the stale DDR contents
             # landing at the new-token slots after the write would clobber
             # the freshly written rows.
-            swap_mgr.wait_index_k_swap_in()
+            swap_mgr.wait_index_k_swap_in(layer_id)
             kunpeng.set_kv_buffer_kunpeng(
-                swap_mgr.get_index_k_cache(),
+                swap_mgr.get_index_k_cache(layer_id),
                 loc,
                 index_k,
                 profile_name="set_kv_buffer_kunpeng@index_k_hbm",
@@ -279,8 +281,8 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         # Leading full indexers read their index-K directly from DDR: they are
-        # never mirrored into HBM, so the recycled swap buffer (belonging to a
-        # later full layer) must not be returned here.
+        # never mirrored into HBM, so a recycled mirror (belonging to a later
+        # full layer) must not be returned here.
         if layer_id in self.index_k_direct_layers:
             return self._index_k_buf(layer_id)
         from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
@@ -289,7 +291,7 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
 
         swap_mgr = KunpengSwapManager.get_instance()
         if swap_mgr.enable_swap_index_k_in:
-            return swap_mgr.get_index_k_cache()
+            return swap_mgr.get_index_k_cache(layer_id)
         return self._index_k_buf(layer_id)
 
     def get_index_k_size_bytes(self) -> int:

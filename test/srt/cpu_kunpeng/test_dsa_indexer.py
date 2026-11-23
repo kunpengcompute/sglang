@@ -760,7 +760,13 @@ def test_index_k_swap_skips_direct_layers():
     mgr.enable_swap_index_k_in = True
     mgr._idle_forward = False
     mgr._kv_end_layer = 12
-    mgr._index_k_layer = None
+    mgr._ensure_index_k_state()
+
+    def reset_mirror_state():
+        mgr._index_k_buffer_layers = [None, None]
+        mgr._index_k_buffer_free = [True, True]
+        mgr._index_k_next_buffer = 0
+        mgr._index_k_layer = None
 
     # index_k_buffer layout for GLM-5.3 (12-layer slice): full at 0,1,2,6,10;
     # shared layers (None) in between. first 3 full indexers are direct-DDR.
@@ -784,23 +790,113 @@ def test_index_k_swap_skips_direct_layers():
 
     # From a direct layer (0), the next swapped full layer is 6, not 1/2.
     calls.clear()
-    mgr._index_k_layer = None
+    reset_mirror_state()
     mgr.swap_next_index_k_layer(0, fb)
     assert calls == [6], f"next swap from layer 0 must be 6, got {calls}"
 
     # From a swapped full layer (6), the next swapped full layer is 10.
     calls.clear()
-    mgr._index_k_layer = None
+    reset_mirror_state()
     mgr.swap_next_index_k_layer(6, fb)
     assert calls == [10], f"next swap from layer 6 must be 10, got {calls}"
 
     # Legacy: empty direct set -> entry swap starts at layer 0 as before.
     pool.index_k_direct_layers = frozenset()
     calls.clear()
-    mgr._index_k_layer = None
+    reset_mirror_state()
     assert mgr._first_full_index_k_layer(fb) == 0
     mgr.swap_first_index_k_layer(fb)
     assert calls == [0]
+
+
+def test_index_k_double_buffer_prefetch():
+    """Two HBM mirrors prefetch two full layers ahead without overlap.
+
+    Entry fills both mirrors; a mirror is refilled only after its consumer
+    layer has drained the copy, so the other mirror's in-flight copy is never
+    waited on (or overwritten).
+    """
+    try:
+        from sglang.srt.graph import ops as kunpeng
+        from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
+            KunpengSwapManager,
+        )
+    except Exception:
+        print("  [skip] swap_manager not importable")
+        return
+
+    from types import SimpleNamespace
+
+    mgr = object.__new__(KunpengSwapManager)
+    mgr.enable_swap_index_k_in = True
+    mgr._idle_forward = False
+    mgr._kv_end_layer = 20
+    mgr._ensure_index_k_state()
+    hbm = [torch.zeros(4, 4, dtype=torch.bfloat16) for _ in range(2)]
+    mgr._index_k_hbm_buffers = hbm
+    mgr._index_k_swap_in_event_tensors = [
+        torch.zeros(8, dtype=torch.int32) for _ in range(2)
+    ]
+    mgr._index_k_swap_in_event_num_tensors = [
+        torch.tensor([0], dtype=torch.int32) for _ in range(2)
+    ]
+
+    full_by_layer = {i: torch.zeros(4, 4, dtype=torch.bfloat16) for i in (0, 1, 2, 6, 10, 14, 18)}
+    pool = SimpleNamespace(
+        start_layer=0,
+        index_k_buffer=[
+            full_by_layer.get(i) for i in range(20)
+        ],
+        index_k_direct_layers=frozenset({0, 1, 2}),
+    )
+    fb = SimpleNamespace(token_to_kv_pool=pool)
+    ptr_to_layer = {t.data_ptr(): i for i, t in full_by_layer.items()}
+
+    orig_swapin = kunpeng.kupl_sdma_kv_swapin
+    orig_wait = kunpeng.kupl_sdma_wait_all
+    issued = []
+    waited = []
+
+    def fake_swapin(dst, src, events, event_num, total_bytes, profile_name=""):
+        issued.append((ptr_to_layer[src.data_ptr()], dst.data_ptr(), events.data_ptr()))
+
+    def fake_wait(events, event_num, profile_name=""):
+        waited.append(events.data_ptr())
+        event_num[0] = 0
+
+    kunpeng.kupl_sdma_kv_swapin = fake_swapin
+    kunpeng.kupl_sdma_wait_all = fake_wait
+    try:
+        mgr.swap_first_index_k_layers(fb, count=2)
+        assert [i[0] for i in issued] == [6, 10], issued
+        assert issued[0][1] == hbm[0].data_ptr() and issued[1][1] == hbm[1].data_ptr()
+
+        # Both mirrors busy: no copy is issued from a shared layer.
+        mgr.swap_next_index_k_layer(7, fb)
+        assert len(issued) == 2, issued
+
+        # L6 consumes mirror 0; its wait must not touch mirror 1's events.
+        mgr.wait_index_k_swap_in(6)
+        assert waited == [mgr._index_k_swap_in_event_tensors[0].data_ptr()]
+        assert mgr.get_index_k_cache(6) is hbm[0]
+
+        # Refill mirror 0 with the next-but-one full layer (14).
+        mgr.swap_next_index_k_layer(6, fb)
+        assert issued[-1][0] == 14 and issued[-1][1] == hbm[0].data_ptr(), issued
+        mgr.swap_next_index_k_layer(7, fb)
+        assert len(issued) == 3, issued
+
+        # L10 consumes mirror 1; now layer 18 can be prefetched into it.
+        mgr.wait_index_k_swap_in(10)
+        assert waited[-1] == mgr._index_k_swap_in_event_tensors[1].data_ptr()
+        assert mgr.get_index_k_cache(10) is hbm[1]
+        mgr.swap_next_index_k_layer(10, fb)
+        assert issued[-1][0] == 18 and issued[-1][1] == hbm[1].data_ptr(), issued
+        assert mgr.get_index_k_cache(14) is hbm[0]
+        assert mgr.get_index_k_cache(18) is hbm[1]
+    finally:
+        kunpeng.kupl_sdma_kv_swapin = orig_swapin
+        kunpeng.kupl_sdma_wait_all = orig_wait
 
 
 def test_skip_topk_chain():
