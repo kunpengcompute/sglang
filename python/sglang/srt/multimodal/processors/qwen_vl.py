@@ -155,6 +155,327 @@ def kunpeng_vision_align64(img, min_pixels: int, resample=None):
     return img
 
 
+def _kunpeng_preproc_profile_enabled() -> bool:
+    """One line per image request breaking down the preprocessing stages.
+
+    Diagnostic only - this runs on the frontend PIL/numpy path (kupl-free);
+    disable with SGLANG_KUNPENG_PREPROC_PROFILE=0 once the campaign is over.
+    """
+    if not is_cpu_920f():
+        return False
+    return os.environ.get("SGLANG_KUNPENG_PREPROC_PROFILE", "1") not in ("", "0")
+
+
+def _kunpeng_preproc_profile_note(processor, images, load_ms, align_ms, hf_ms):
+    """Attribute one request's hf_call budget between pixel math and framework.
+
+    Replays the two numeric stages of the classic HF image processor (PIL
+    resize to the factor-32 target; numpy rescale + normalize + transpose)
+    on the already-loaded image and prints the split; the remainder of the
+    hf_call budget is framework overhead. Read-only: replayed tensors are
+    discarded and the request itself is untouched.
+    """
+    try:
+        image_processor = getattr(processor, "image_processor", None)
+        mean = np.asarray(
+            getattr(image_processor, "image_mean", None) or [0.5, 0.5, 0.5],
+            dtype=np.float32,
+        )
+        std = np.asarray(
+            getattr(image_processor, "image_std", None) or [0.5, 0.5, 0.5],
+            dtype=np.float32,
+        )
+        min_pixels = int(
+            getattr(image_processor, "min_pixels", 0) or MIN_PIXELS
+        )
+        max_pixels = int(
+            getattr(image_processor, "max_pixels", 0) or MAX_PIXELS
+        )
+        img = images[0]
+        target_h, target_w = smart_resize(
+            img.height,
+            img.width,
+            factor=32,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+        t0 = time.perf_counter()
+        r_img = img.resize(
+            (target_w, target_h), RESIZE_RESAMPLE or Image.BILINEAR
+        )
+        t_resize = (time.perf_counter() - t0) * 1e3
+        arr = np.asarray(r_img, dtype=np.uint8)
+        t0 = time.perf_counter()
+        x = arr.astype(np.float32) / 255.0
+        x = (x - mean) / std
+        x = x.transpose(2, 0, 1)
+        t_norm = (time.perf_counter() - t0) * 1e3
+        logger.info(
+            "[kunpeng-preproc] n_img=%d src=%dx%d->%dx%d load=%.1f align64=%.1f"
+            " hf_call=%.1f | replay resize=%.1f normalize=%.1f framework~=%.1fms",
+            len(images),
+            img.height,
+            img.width,
+            target_h,
+            target_w,
+            load_ms,
+            align_ms,
+            hf_ms,
+            t_resize,
+            t_norm,
+            max(hf_ms - t_resize - t_norm, 0.0),
+        )
+    except Exception as e:
+        logger.info("[kunpeng-preproc] profile note skipped (%s)", e)
+
+
+# ── Fused PIL/numpy pixel_values fast path (Kunpeng 920F frontend) ──────
+# The classic (slow, PIL/numpy) image processor spends its hf_call budget
+# on framework overhead plus a multi-pass rescale/normalize chain (the
+# stage breakdown probe above attributes ~14ms fixed + ~57ms/Mpx to it at
+# steady state, vs ~30ms/Mpx for a plain numpy re-implementation). Replace
+# the instance's preprocess with a one-pass fused numpy version:
+# (x / 255 - mean) / std == x * A + B (A, B pre-assembled per channel),
+# the temporal frame repeat, and the Qwen patch flattening order mirrored
+# from transform_patches_to_flatten in the NPU fast-path patch. The very
+# first fusable input runs BOTH implementations and compares pixel_values
+# element-wise (plus image_grid_thw); any mismatch or computational
+# surprise falls back to the untouched original for good, while
+# non-image inputs (videos, tensors) simply keep the original per call
+# and leave the gate armed. Pure PIL/numpy - no torch compute
+# op ever runs here, so the kupl thread rules of this frontend process
+# are not engaged. Env switch SGLANG_KUNPENG_PREPROC_FASTPATH (default
+# on).
+def _kunpeng_preproc_fast_enabled() -> bool:
+    if not is_cpu_920f():
+        return False
+    return os.environ.get("SGLANG_KUNPENG_PREPROC_FASTPATH", "1") not in ("", "0")
+
+
+def _kunpeng_fused_flatten(
+    img,
+    patch_size,
+    temporal_patch_size,
+    merge_size,
+    min_pixels,
+    max_pixels,
+    mean,
+    std,
+    resample,
+):
+    """One image -> (flat [gh*gw, tp*C*p*p] float32, (1, gh, gw))."""
+    target_h, target_w = smart_resize(
+        img.height,
+        img.width,
+        factor=patch_size * merge_size,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    if img.mode != "RGB":
+        # match do_convert_rgb of the classic processor (which runs before
+        # the resize): grayscale and palette images must not leak
+        # palette-index or alpha channels into the pixel array
+        img = img.convert("RGB")
+    if (target_h, target_w) != (img.height, img.width):
+        img = img.resize(
+            (target_w, target_h), RESIZE_RESAMPLE or resample or Image.BILINEAR
+        )
+    arr = np.asarray(img, dtype=np.uint8)
+    mean3 = np.asarray(mean, dtype=np.float32).reshape(1, 1, -1)
+    std3 = np.asarray(std, dtype=np.float32).reshape(1, 1, -1)
+    # (x / 255 - mean) / std fused into a single multiply-add pass
+    a = (np.float32(1.0) / (np.float32(255.0) * std3)).astype(np.float32)
+    b = (-mean3 / std3).astype(np.float32)
+    x = arr.astype(np.float32) * a + b  # [H, W, C]
+    x = x.transpose(2, 0, 1)  # [C, H, W]
+    tp, p, m = temporal_patch_size, patch_size, merge_size
+    c = x.shape[0]
+    if c == 3 and tp > 1:
+        # single frame repeats to fill the temporal patch dimension
+        x = np.concatenate([x] * tp, axis=0)  # [tp*C, H, W]
+    gh, gw = target_h // p, target_w // p
+    # flattening order mirrored from transform_patches_to_flatten (NPU
+    # patch), with the batch/temporal-grid leading dims dropped (B == 1)
+    v = x.reshape(tp * c, gh // m, m, p, gw // m, m, p)
+    v = v.transpose(0, 1, 4, 2, 5, 3, 6)
+    v = v.reshape(tp, c, gh * gw, p, p)
+    v = v.transpose(2, 1, 0, 3, 4)
+    flat = v.reshape(gh * gw, -1)
+    return flat, (1, gh, gw)
+
+
+def _kunpeng_fused_call(image_processor, images, kwargs):
+    """Build the BatchFeature the classic preprocess would return."""
+    from transformers.image_processing_utils import BatchFeature
+
+    p = image_processor
+    patch_size = int(getattr(p, "patch_size", 0) or 16)
+    temporal_patch_size = int(getattr(p, "temporal_patch_size", 0) or 2)
+    merge_size = int(getattr(p, "merge_size", 0) or 2)
+    mean = getattr(p, "image_mean", None) or [0.5, 0.5, 0.5]
+    std = getattr(p, "image_std", None) or [0.5, 0.5, 0.5]
+    min_pixels = int(getattr(p, "min_pixels", 0) or MIN_PIXELS)
+    max_pixels = int(getattr(p, "max_pixels", 0) or MAX_PIXELS)
+    resample = kwargs.get("resample") or getattr(p, "resample", None)
+    flats = []
+    grids = []
+    for img in images:
+        if not isinstance(img, Image.Image):
+            # tensor / precomputed inputs keep the original path
+            raise TypeError("non-PIL image input")
+        flat, grid = _kunpeng_fused_flatten(
+            img,
+            patch_size,
+            temporal_patch_size,
+            merge_size,
+            min_pixels,
+            max_pixels,
+            mean,
+            std,
+            resample,
+        )
+        flats.append(flat)
+        grids.append(list(grid))
+    pixel_values = torch.from_numpy(np.concatenate(flats, axis=0))
+    image_grid_thw = torch.tensor(grids, dtype=torch.int64)
+    return BatchFeature(
+        data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw},
+        tensor_type=kwargs.get("return_tensors"),
+    )
+
+
+def _kunpeng_preproc_ab_diff(out_feat, ref_feat):
+    """Element-wise relative diff of the two preprocessing outputs."""
+    a = out_feat.get("pixel_values")
+    b = ref_feat.get("pixel_values")
+    if a is None or b is None:
+        return None, "missing pixel_values"
+    an = a.detach().numpy() if isinstance(a, torch.Tensor) else np.asarray(a)
+    bn = b.detach().numpy() if isinstance(b, torch.Tensor) else np.asarray(b)
+    shape_note = f"{tuple(bn.shape)}"
+    if an.shape != bn.shape:
+        if an.size != bn.size:
+            return None, f"shape {tuple(an.shape)} vs {tuple(bn.shape)}"
+        an = an.reshape(bn.shape)  # leading singleton dims may differ
+    ad = an.astype(np.float64)
+    bd = bn.astype(np.float64)
+    diff = float(np.abs(ad - bd).max())
+    denom = float(np.abs(bd).max()) or 1.0
+    ga = out_feat.get("image_grid_thw")
+    gb = ref_feat.get("image_grid_thw")
+    if ga is not None and gb is not None:
+        if np.asarray(ga).tolist() != np.asarray(gb).tolist():
+            return None, f"grid {np.asarray(ga).tolist()} vs {np.asarray(gb).tolist()}"
+    return diff / denom, shape_note
+
+
+def _kunpeng_patch_image_processor(processor):
+    """Instance-level fused fast path for the classic image processor."""
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return
+    if type(image_processor).__name__.endswith("Fast"):
+        return  # the torchvision backend is not our target (and not used on 920F)
+    if getattr(image_processor, "_kunpeng_fused_preprocess", None) is not None:
+        return
+    orig = image_processor.preprocess
+    state = {"checked": False, "use": False, "shape": None}
+
+    def _fused_input(images, kwargs):
+        # Only a flat list of PIL images takes the fused path; tensors,
+        # nested video frames or a videos kwarg stay with the original.
+        if isinstance(images, Image.Image):
+            images = [images]
+        if kwargs.get("videos") is not None:
+            raise TypeError("video input")
+        if not isinstance(images, (list, tuple)) or not images:
+            raise TypeError("unsupported image input")
+        for img in images:
+            if not isinstance(img, Image.Image):
+                raise TypeError("non-PIL image input")
+        return images
+
+    def _with_ref_shape(out):
+        # The classic path may return a leading batch dim the fused layout
+        # does not carry; realign only when the element count agrees.
+        shape = state["shape"]
+        pv = out["pixel_values"]
+        if (
+            shape is not None
+            and tuple(pv.shape) != shape
+            and pv.numel() == int(np.prod(shape))
+        ):
+            out["pixel_values"] = pv.reshape(shape)
+        return out
+
+    def _fused_preprocess(images, *args, **kwargs):
+        if state["use"]:
+            try:
+                imgs = _fused_input(images, kwargs)
+                if args:
+                    raise TypeError("unexpected positional args")
+                return _with_ref_shape(
+                    _kunpeng_fused_call(image_processor, imgs, kwargs)
+                )
+            except Exception as e:
+                # steady-state surprise (non-PIL input, video frames, an
+                # unsupported kwarg, ...): permanently fall back to the
+                # untouched original
+                state["use"] = False
+                logger.info(
+                    "[kunpeng-preproc-fast] 稳态输入不支持（%s） -> 永久回退", e
+                )
+                return orig(images, *args, **kwargs)
+        if not state["checked"]:
+            # A non-fusable input (e.g. a video) must not burn the one-shot
+            # A/B check - quietly stay on the original for this call.
+            try:
+                imgs = _fused_input(images, kwargs)
+                if args:
+                    raise TypeError("unexpected positional args")
+            except TypeError:
+                return orig(images, *args, **kwargs)
+            # First real fusable input: run BOTH implementations and gate
+            # the fast path on an element-wise comparison (plus the grid).
+            state["checked"] = True
+            ref = orig(images, *args, **kwargs)
+            try:
+                out = _kunpeng_fused_call(image_processor, imgs, kwargs)
+            except Exception as e:
+                logger.info(
+                    "[kunpeng-preproc-fast] fused 实现异常（%s） -> 回退", e
+                )
+                return ref
+            rel, note = _kunpeng_preproc_ab_diff(out, ref)
+            n_img = len(imgs)
+            if rel is not None and rel <= 1e-3:
+                state["use"] = True
+                b = ref.get("pixel_values")
+                if (
+                    isinstance(b, torch.Tensor)
+                    and tuple(b.shape) != tuple(out["pixel_values"].shape)
+                ):
+                    state["shape"] = tuple(b.shape)
+                out = _with_ref_shape(out)
+                logger.info(
+                    "[kunpeng-preproc-fast] n_img=%d A/B err=%.1e %s -> 启用",
+                    n_img,
+                    rel,
+                    note,
+                )
+                return out
+            logger.info(
+                "[kunpeng-preproc-fast] n_img=%d A/B 失败（%s） -> 回退",
+                n_img,
+                note if rel is None else f"err={rel:.1e} {note}",
+            )
+            return ref
+        return orig(images, *args, **kwargs)
+
+    image_processor._kunpeng_fused_preprocess = _fused_preprocess
+    image_processor.preprocess = _fused_preprocess
+
+
 def smart_nframes(
     ele: dict,
     total_frames: int,
@@ -327,6 +648,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+        # Kunpeng 920F: swap the classic (PIL/numpy) image processor's
+        # numeric stage for the fused one-pass version. The swap is
+        # instance-level and gated by a first-input A/B - see
+        # _kunpeng_patch_image_processor for the gate and the fallback
+        # rules.
+        if _kunpeng_preproc_fast_enabled():
+            _kunpeng_patch_image_processor(self._processor)
 
     def build_input_ids_with_timestamps(
         self, prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
@@ -564,10 +893,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             image_processor = getattr(self._processor, "image_processor", None)
             min_pixels = int(getattr(image_processor, "min_pixels", 0) or 65_536)
             resample = getattr(image_processor, "resample", None)
+            _t_align = time.perf_counter()
             base_output.images = [
                 kunpeng_vision_align64(img, min_pixels, resample)
                 for img in base_output.images
             ]
+            align_ms = (time.perf_counter() - _t_align) * 1e3
+        else:
+            align_ms = 0.0
 
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
@@ -582,6 +915,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         preprocess_time = time.perf_counter()
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+        _t_hf = time.perf_counter()
         if self.hf_config.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
@@ -597,6 +931,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output, self.mm_tokens
+            )
+        _hf_ms = (time.perf_counter() - _t_hf) * 1e3
+        if base_output.images and _kunpeng_preproc_profile_enabled():
+            _kunpeng_preproc_profile_note(
+                self._processor,
+                base_output.images,
+                (load_time - entry_time) * 1e3,
+                align_ms,
+                _hf_ms,
             )
 
         audio_feature_lengths = None
