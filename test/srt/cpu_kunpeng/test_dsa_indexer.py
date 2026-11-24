@@ -88,6 +88,15 @@ except Exception:
     _HAVE_POOL = False
 
 try:
+    from sglang.srt.disaggregation.mooncake.conn import (
+        KVArgsRegisterInfo,
+    )
+
+    _HAVE_MOONCAKE_CONN = True
+except Exception:
+    _HAVE_MOONCAKE_CONN = False
+
+try:
     from sglang.srt.layers.attention.nsa.nsa_indexer import (
         _validate_cpu_indexer_input,
     )
@@ -2155,28 +2164,130 @@ def test_m_fp8_pool_allocates_uint8():
     assert pool.get_index_k_size_bytes() == 2 * (4 + 1) * (4 * 1 + 1 * 1)
 
 
-def test_m_fp8_pd_rejected():
-    """get_state_buf_infos must fail loudly under fp8 (PD is rejected at
-    startup by the model runner guard; reaching here is a bug)."""
+def test_m_fp8_state_buf_infos():
+    """PD transfer buffer lists (bare pool): get_state_buf_infos (e4m3 codes)
+    and get_state_scale_buf_infos (ue8m0 scale bytes) are both layer-aligned
+    -- one entry per layer, skip layers share a full-size placeholder that
+    repeats (the engine registration dedupes), code item_len is one page of
+    uint8 rows (D * page_size) and scale item_len is page_size (1 B/token).
+    A bf16 pool has no scale list at all."""
     if not _HAVE_POOL:
         print("  [skip] memory_pool_kunpeng not importable")
         return
-    codes = torch.zeros(8, 4, dtype=torch.uint8)
-    scale = torch.zeros(8, dtype=torch.uint8)
+    codes = [torch.zeros(8, 4, dtype=torch.uint8) for _ in range(2)]
+    scales = [torch.zeros(8, dtype=torch.uint8) for _ in range(2)]
     pool = object.__new__(KunpengNSATokenToKVPool)
-    pool.index_k_buffer = [codes]
-    pool.index_k_scale_buffer = [scale]
+    pool.index_k_buffer = [codes[0], None, codes[1], None]
+    pool.index_k_scale_buffer = [scales[0], None, scales[1], None]
     pool.layer_transfer_counter = None
     pool.start_layer = 0
     pool.index_k_is_fp8 = True
-    pool.page_size = 1
-    pool.skip_topk_layers = [False]
-    pool.layer_num = 1
-    try:
-        pool.get_state_buf_infos()
-        raise AssertionError("fp8 get_state_buf_infos must raise")
-    except RuntimeError as e:
-        assert "not supported" in str(e), str(e)
+    pool.page_size = 2
+    pool.skip_topk_layers = [False, True, False, True]
+    pool.layer_num = 4
+    pool._state_scratch = None
+    pool._state_scale_scratch = None
+
+    ptrs, lens, items = pool.get_state_buf_infos()
+    assert len(ptrs) == len(lens) == len(items) == 4, "one entry per layer"
+    assert ptrs[0] == codes[0].data_ptr() and ptrs[2] == codes[1].data_ptr()
+    # Skip layers share ONE placeholder, so its region repeats in the list.
+    assert ptrs[1] == ptrs[3] == pool._state_scratch.data_ptr()
+    assert pool._state_scratch.dtype == torch.uint8
+    assert lens[0] == codes[0].nbytes and lens[1] == pool._state_scratch.nbytes
+    # One page of uint8 code rows: index_head_dim (4) * page_size (2).
+    assert items == [4 * 2] * 4
+
+    sptrs, slens, sitems = pool.get_state_scale_buf_infos()
+    # Layer-aligned with the code list: same length, same skip placeholders.
+    assert len(sptrs) == len(slens) == len(sitems) == 4
+    assert sptrs[0] == scales[0].data_ptr() and sptrs[2] == scales[1].data_ptr()
+    assert sptrs[1] == sptrs[3] == pool._state_scale_scratch.data_ptr()
+    assert pool._state_scale_scratch.dtype == torch.uint8
+    assert slens[0] == scales[0].nbytes
+    # 1 byte per token row -> one page = page_size bytes.
+    assert sitems == [1 * 2] * 4
+
+    # bf16 pool: no scale bytes, so no scale list -- callers skip the pass.
+    pool_bf16 = object.__new__(KunpengNSATokenToKVPool)
+    pool_bf16.index_k_is_fp8 = False
+    assert pool_bf16.get_state_scale_buf_infos() == ([], [], [])
+
+
+def test_m_fp8_pd_register_frames():
+    """mooncake KVArgsRegisterInfo wire format: the fp8 scale frames (17/18)
+    ride AFTER the staging frames (15/16), so an older peer still parses
+    staging at its historical position; a legacy message (no scale frames)
+    decodes to empty scale lists. Roundtrips the exact frame layout packed
+    by MooncakeKVReceiver._register_kv_args."""
+    if not _HAVE_MOONCAKE_CONN:
+        print("  [skip] mooncake conn not importable")
+        return
+    import struct as _struct
+
+    def pack_u64(vals):
+        return b"".join(_struct.pack("Q", v) for v in vals)
+
+    def pack_u32(vals):
+        return b"".join(_struct.pack("I", v) for v in vals)
+
+    kv_ptrs = [0x1000, 0x2000]
+    aux_ptrs = [0x3000]
+    state_ptrs = [0x4000, 0x5000, 0x6000]
+    scale_ptrs = [0x7000, 0x8000, 0x9000]
+    state_item_lens = [256, 256, 256]
+    scale_item_lens = [2, 2, 2]
+
+    def build_msg(staging_ptr=b"", staging_size=b"", scale=True):
+        msg = [
+            b"room-1",  # room
+            b"10.0.0.1",  # endpoint
+            b"4242",  # dst_port
+            b"sess-1",  # session
+            pack_u64(kv_ptrs),
+            pack_u64(aux_ptrs),
+            pack_u64(state_ptrs),
+            b"0",  # dst_tp_rank
+            b"1",  # dst_attn_tp_size
+            b"2048",  # dst_kv_item_len
+            pack_u32(state_item_lens),
+            b"",  # state_dim_per_tensor
+            b"0",  # enable_hisparse
+            b"0",  # decode_start_layer
+            b"61",  # decode_num_layers
+            staging_ptr,
+            staging_size,
+        ]
+        if scale:
+            msg += [pack_u64(scale_ptrs), pack_u32(scale_item_lens)]
+        return msg
+
+    # Full message: scale frames present, staging empty (disabled).
+    info = KVArgsRegisterInfo.from_zmq(build_msg())
+    assert info.dst_state_data_ptrs == state_ptrs
+    assert info.dst_state_item_lens == state_item_lens
+    assert info.decode_num_layers == 61
+    assert info.dst_state_scale_data_ptrs == scale_ptrs
+    assert info.dst_state_scale_item_lens == scale_item_lens
+    assert info.staging is None
+
+    # Staging enabled AND scale frames present: staging still parses at 15/16.
+    info = KVArgsRegisterInfo.from_zmq(
+        build_msg(
+            staging_ptr=_struct.pack("Q", 0xF0000000),
+            staging_size=b"1073741824",
+        )
+    )
+    assert info.dst_state_scale_data_ptrs == scale_ptrs
+    assert info.staging is not None
+    assert info.staging.base_ptr == 0xF0000000
+    assert info.staging.total_size == 1073741824
+
+    # Legacy message (bf16 decode, no scale frames): empty scale lists.
+    info = KVArgsRegisterInfo.from_zmq(build_msg(scale=False))
+    assert info.dst_state_scale_data_ptrs == []
+    assert info.dst_state_scale_item_lens == []
+    assert info.dst_state_data_ptrs == state_ptrs
 
 
 # ---------------------------------------------------------------------------
@@ -2236,7 +2347,8 @@ def main():
         ("M. test_m_fp8_quantized_overlap", test_m_fp8_quantized_overlap),
         ("M. test_m_fp8_pool_buffers", test_m_fp8_pool_buffers),
         ("M. test_m_fp8_pool_allocates_uint8", test_m_fp8_pool_allocates_uint8),
-        ("M. test_m_fp8_pd_rejected", test_m_fp8_pd_rejected),
+        ("M. test_m_fp8_state_buf_infos", test_m_fp8_state_buf_infos),
+        ("M. test_m_fp8_pd_register_frames", test_m_fp8_pd_register_frames),
     ]
     failed = 0
     for name, fn in tests:

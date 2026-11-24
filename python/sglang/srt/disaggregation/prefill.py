@@ -199,6 +199,18 @@ class PrefillBootstrapQueue:
             kv_args.state_data_ptrs = state_data_ptrs
             kv_args.state_data_lens = state_data_lens
             kv_args.state_item_lens = state_item_lens
+            # fp8 index-K pools: per-layer ue8m0 scale bytes, parallel to the
+            # code list above (empty lists for bf16 pools).
+            if hasattr(self.token_to_kv_pool, "get_state_scale_buf_infos"):
+                (
+                    kv_args.state_scale_data_ptrs,
+                    kv_args.state_scale_data_lens,
+                    kv_args.state_scale_item_lens,
+                ) = self.token_to_kv_pool.get_state_scale_buf_infos()
+            else:
+                kv_args.state_scale_data_ptrs = []
+                kv_args.state_scale_data_lens = []
+                kv_args.state_scale_item_lens = []
 
             if isinstance(self.token_to_kv_pool, SWAKVPool):
                 kv_args.state_type = "swa"
@@ -222,6 +234,17 @@ class PrefillBootstrapQueue:
                     kv_args.state_data_ptrs += draft_state_data_ptrs
                     kv_args.state_data_lens += draft_state_data_lens
                     kv_args.state_item_lens += draft_state_item_lens
+                    if hasattr(
+                        self.draft_token_to_kv_pool, "get_state_scale_buf_infos"
+                    ):
+                        (
+                            draft_state_scale_data_ptrs,
+                            draft_state_scale_data_lens,
+                            draft_state_scale_item_lens,
+                        ) = self.draft_token_to_kv_pool.get_state_scale_buf_infos()
+                        kv_args.state_scale_data_ptrs += draft_state_scale_data_ptrs
+                        kv_args.state_scale_data_lens += draft_state_scale_data_lens
+                        kv_args.state_scale_item_lens += draft_state_scale_item_lens
 
             else:
                 kv_args.state_type = "none"
@@ -229,6 +252,9 @@ class PrefillBootstrapQueue:
             kv_args.state_data_ptrs = []
             kv_args.state_data_lens = []
             kv_args.state_item_lens = []
+            kv_args.state_scale_data_ptrs = []
+            kv_args.state_scale_data_lens = []
+            kv_args.state_scale_item_lens = []
             kv_args.state_type = "none"
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)

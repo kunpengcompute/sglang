@@ -552,17 +552,13 @@ class ModelRunnerKVCacheMixin:
                     KunpengNSATokenToKVPool,
                 )
 
-                if (
-                    envs.SGLANG_KUNPENG_INDEXER_K_FP8.get()
-                    and self.server_args.disaggregation_mode != "null"
-                ):
-                    raise ValueError(
-                        "SGLANG_KUNPENG_INDEXER_K_FP8=1 is not supported with "
-                        "PD disaggregation yet: the fp8 index-K pool has two "
-                        "buffers per layer (e4m3 codes + ue8m0 scale bytes) while "
-                        "the transfer layer's per-layer state mapping "
-                        "assumes one. Leave the flag off on PD deployments."
-                    )
+                # fp8 index-K + PD disaggregation is supported: the codes
+                # transfer via get_state_buf_infos (one entry per layer) and
+                # the per-token ue8m0 scale bytes via the parallel
+                # get_state_scale_buf_infos list, both sliced identically by
+                # the PD layer mapping. The transfer is raw bytes, so a
+                # prefill/decode flag mismatch is rejected per-request at
+                # registration time (see maybe_send_extra).
 
                 kunpeng_kwargs = {
                     k: v for k, v in nsa_pool_kwargs.items() if k != "kv_cache_dim"

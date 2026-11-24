@@ -141,6 +141,7 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         # Placeholder for shared (skip-topk) layers in get_state_buf_infos();
         # allocated lazily, never read (only the P side copies into/out of it).
         self._state_scratch = None
+        self._state_scale_scratch = None
 
         # Flat token-slot index-K buffers; None for shared (skip-topk) layers.
         indexer_request = (
@@ -265,6 +266,7 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
                 self._shared_indexer_storage.layout.name,
             )
         self._state_scratch = None
+        self._state_scale_scratch = None
 
     def _index_k_buf(self, layer_id: int) -> torch.Tensor:
         buf = self.index_k_buffer[layer_id - self.start_layer]
@@ -408,7 +410,7 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         return total
 
     def get_state_buf_infos(self):
-        """Per-layer index-K buffers for PD (de-)registration and transfer.
+        """Per-layer index-K CODE buffers for PD (de-)registration and transfer.
 
         One entry PER LAYER in this pool's range, in layer order: the PD layer
         mapping slices these lists by absolute layer id (see
@@ -418,11 +420,10 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         same size so the per-token copy stays in bounds -- the data written
         there is never read (shared layers reuse the carried top-k).
 
-        The fp8 path currently has no PD support: the per-layer state mapping
-        of the transfer layer (nixl: get_mla_kv_ptrs_with_pp) assumes exactly
-        one entry per layer, while the fp8 pool has two (codes + scales).
-        The startup guard in model_runner_kv_cache_mixin rejects the
-        combination; reaching here anyway is a bug -- fail loudly.
+        fp8 pools store uint8 e4m3 codes here (item granularity stays one
+        page); the per-token ue8m0 scale bytes live in a PARALLEL list (see
+        get_state_scale_buf_infos) and MUST be transferred alongside -- the
+        codes alone cannot be scored. bf16 pools have no scale list.
 
         NOTE: because every shared layer reuses the same placeholder, the
         returned ``data_ptrs`` may contain the same region many times. Callers
@@ -430,14 +431,6 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         engine rejects overlapping regions and would drop the WHOLE batch
         (see MooncakeKVManager.register_buffer_to_engine).
         """
-        if self.index_k_is_fp8:
-            raise RuntimeError(
-                "get_state_buf_infos (PD transfer) is not supported with "
-                "SGLANG_KUNPENG_INDEXER_K_FP8=1 yet: the fp8 index-K pool "
-                "has two buffers per layer (codes + scales) while the "
-                "transfer layer's per-layer state mapping assumes one"
-            )
-
         if self._state_scratch is None:
             ref = next(b for b in self.index_k_buffer if b is not None)
             self._state_scratch = torch.zeros_like(ref)
@@ -450,5 +443,36 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         # (addr = ptr + page_index * item_len). This buffer is flat
         # [slot, index_head_dim], so one row is a single token -- scale it by
         # page_size to match the main-KV convention (whose [0] is one page).
+        # fp8 codes: one uint8 row of index_head_dim bytes (128 B/token).
+        item_lens = [b[0].nbytes * self.page_size for b in bufs]
+        return data_ptrs, data_lens, item_lens
+
+    def get_state_scale_buf_infos(self):
+        """Per-layer index-K SCALE buffers (fp8 pools only), parallel to
+        ``get_state_buf_infos``.
+
+        One entry PER LAYER, layer-aligned with the code-buffer list so the
+        PD layer mapping and layer sharding slice both lists identically
+        (the transfer issues one code-page pass plus one scale-page pass with
+        the same page indices). Item granularity is one page: the scale row
+        is ``[num_slots]`` uint8 (1 B/token), so item_len == page_size.
+
+        Shared (skip-topk) layers get a shared ``[num_slots]`` uint8
+        placeholder (same never-read contract as the code placeholder).
+        bf16 pools have no scale bytes: three empty lists, and callers skip
+        the scale pass entirely.
+        """
+        if not self.index_k_is_fp8:
+            return [], [], []
+        if self._state_scale_scratch is None:
+            ref = next(b for b in self.index_k_scale_buffer if b is not None)
+            self._state_scale_scratch = torch.zeros_like(ref)
+        bufs = [
+            b if b is not None else self._state_scale_scratch
+            for b in self.index_k_scale_buffer
+        ]
+        data_ptrs = [b.data_ptr() for b in bufs]
+        data_lens = [b.nbytes for b in bufs]
+        # 1 byte per token row -> page_size bytes per page.
         item_lens = [b[0].nbytes * self.page_size for b in bufs]
         return data_ptrs, data_lens, item_lens
