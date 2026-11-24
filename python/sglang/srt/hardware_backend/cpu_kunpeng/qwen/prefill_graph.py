@@ -11,7 +11,7 @@ import os
 import torch
 from sgl_kernel import common_ops
 from sglang.srt.graph import ops, register_op
-from sglang.srt.utils.common import is_cpu_920f
+from . import image_prefill_graph_enabled
 from .capabilities import get_capabilities
 
 
@@ -35,7 +35,11 @@ def unsupported_reason(fb):
         return "prefill_total_tokens_outside_1_4096"
     if not 1 <= fb.batch_size <= fb.input_ids.numel():
         return "prefill_invalid_request_count"
-    if fb.contains_image_inputs():
+    if fb.contains_image_inputs() and not image_prefill_graph_enabled():
+        # War B: with SGLANG_KUNPENG_GRAPH_IMAGE_PREFILL=1 the provider's
+        # bind() runs the vision tower + mm merge eagerly and binds the
+        # merged embeddings as dynamic graph inputs, so the captured body
+        # is the language tower + logits only (graph_provider.py).
         return "image_inputs"
     if fb.mamba_track_mask is not None:
         return "mamba_state_tracking"

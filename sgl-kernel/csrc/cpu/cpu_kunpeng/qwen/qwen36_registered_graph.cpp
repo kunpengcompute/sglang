@@ -89,11 +89,13 @@ extern "C" void qwen_graph_rope_dispatch(std::vector<at::Tensor> &t,
                     t[6].sizes() == t[0].sizes() && t[7].sizes() == t[1].sizes(),
                 "QKNorm RoPE shapes");
     auto *pos = static_cast<const int64_t *>(t[5].data_ptr());
-    for (int64_t row = 0; row < rows; ++row) {
-        TORCH_CHECK(pos[row] >= 0 && pos[row] < t[4].size(0), "RoPE position out of range");
-        for (int64_t axis = 1; axis < t[5].numel() / rows; ++axis)
-            TORCH_CHECK(pos[axis * rows + row] == pos[row], "Text-only RoPE axes must agree");
-    }
+    // War B: image-prefill graphs replay with genuinely distinct t/h/w rows.
+    // The legacy kernel reads only the first component per row -- exactly
+    // what the eager legacy path has always done for image prefill -- so
+    // distinct axes are accepted; the range check now covers every
+    // component. 1-D positions are unaffected.
+    for (int64_t i = 0; i < t[5].numel(); ++i)
+        TORCH_CHECK(pos[i] >= 0 && pos[i] < t[4].size(0), "RoPE position out of range");
     auto rc = qwen36_attention_qknorm_rope_bf16(
         bf(t[0]), bf(t[1]), bf(t[2]), bf(t[3]), bf(t[4]), pos, bf_out(t[6]), bf_out(t[7]), rows,
         t[4].size(0), static_cast<float>(std::get<double>(s[0])), std::get<int64_t>(s[1]));
@@ -103,13 +105,13 @@ extern "C" void qwen_graph_rope_dispatch(std::vector<at::Tensor> &t,
 extern "C" void qwen_graph_rope_mrope_dispatch(std::vector<at::Tensor> &t,
                                                const std::vector<ScalarArg> &s) {
     // Same contract as qwen_graph_rope_dispatch plus the three mrope_section
-    // scalars; positions must be the full [3, rows] M-RoPE tensor. Replay
-    // stays text-only for now: image prefill is still rejected by the
-    // admission gates (prefill_graph.py / unsupported_reason) and runs the
-    // mrope entry eagerly, so the axes-agree guard is kept deliberately --
-    // equal components reduce this kernel to the single-position one
-    // bit-for-bit, and a future image-prefill graph would have to remove the
-    // guard as a conscious step.
+    // scalars; positions must be the full [3, rows] M-RoPE tensor. Image
+    // prefill graphs (War B, SGLANG_KUNPENG_GRAPH_IMAGE_PREFILL=1) replay
+    // with genuinely distinct t/h/w rows, so the historical axes-agree guard
+    // was removed as the conscious step this comment once anticipated: the
+    // eager mrope entry has always accepted distinct rows, and equal
+    // components still reduce this kernel to the single-position one
+    // bit-for-bit.
     TORCH_CHECK(t.size() == 8 && s.size() == 5, "QKNorm M-RoPE graph ABI");
     for (int i : {0, 1, 2, 3, 4, 6, 7})
         check(t[i], at::kBFloat16);
@@ -126,11 +128,10 @@ extern "C" void qwen_graph_rope_mrope_dispatch(std::vector<at::Tensor> &t,
                     section_w >= 0 && section_t + section_h + section_w == 32,
                 "QKNorm M-RoPE shapes");
     auto *pos = static_cast<const int64_t *>(t[5].data_ptr());
-    for (int64_t row = 0; row < rows; ++row) {
-        TORCH_CHECK(pos[row] >= 0 && pos[row] < t[4].size(0), "RoPE position out of range");
-        for (int64_t axis = 1; axis < 3; ++axis)
-            TORCH_CHECK(pos[axis * rows + row] == pos[row], "Text-only RoPE axes must agree");
-    }
+    // War B: range is validated for all three components; distinct t/h/w
+    // rows are the normal image-prefill replay input now.
+    for (int64_t i = 0; i < 3 * rows; ++i)
+        TORCH_CHECK(pos[i] >= 0 && pos[i] < t[4].size(0), "RoPE position out of range");
     auto rc = qwen36_attention_qknorm_rope_mrope_bf16(
         bf(t[0]), bf(t[1]), bf(t[2]), bf(t[3]), bf(t[4]), pos, bf_out(t[6]), bf_out(t[7]), rows,
         t[4].size(0), static_cast<float>(std::get<double>(s[0])), std::get<int64_t>(s[1]),
