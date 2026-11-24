@@ -46,9 +46,9 @@ export QWEN_CONTEXT_LENGTH=69632
 export QWEN_MAX_TOTAL_TOKENS=73728
 export QWEN_MAX_RUNNING_REQUESTS=16
 export QWEN_SEED=77101
-# 注意力后端：多模态(vision)部署必须torch_native；kunpeng_cpu与vision运行时组合在init即失败。
-# 纯文本部署可删除本行（launch.py缺省仍传kunpeng_cpu）。
-export QWEN_ATTENTION_BACKEND="torch_native"
+# 注意力后端：不设。launch.py缺省传kunpeng_cpu；视觉Qwen运行时下该槽位与
+# torch_native解析到同一后端（attention_registry按运行时路由），历史上为绕开
+# vision运行时init崩溃而设的torch_native覆盖已不再需要（2026-11-24上机验证）。
 export QWEN_TEST_INPUT_TOKENS=1024
 export QWEN_TEST_OUTPUT_TOKENS=1024
 export QWEN_TEST_CONCURRENCY=1
