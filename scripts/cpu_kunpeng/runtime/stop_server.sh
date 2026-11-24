@@ -42,7 +42,7 @@ echo "Killing $ROLE on $WORLD_SIZE node(s)"
 for i in "${!NODES[@]}"; do
     node="${NODES[i]}"
 
-    ssh "$node" '
+    ssh "$(ssh_target "$node")" '
         PAT="sglang[.]launch_server|sglang[_]server|sglang[:]:"
         MAIN_PIDS=$(ps aux | grep -E "$PAT" | grep -v grep | awk "{print \$2}")
 
@@ -80,18 +80,32 @@ for i in "${!NODES[@]}"; do
         fi
 
         # Wipe the whole POSIX shm namespace instead of matching individual
-        # segment names (shm_mmap_*, sgk_hicache_shard_*, ...). Nothing else
-        # on these nodes relies on /dev/shm after the server is stopped.
-        rm -rf /dev/shm/*
+        # segment names (shm_mmap_*, sgk_hicache_shard_*, ...). Under a non-root
+        # deployment root-owned leftovers go through the site helper; otherwise
+        # fall back to removing segments owned by the current user.
+        if [ "'"${SGLANG_ENABLE_NOROOT_USER:-0}"'" = "1" ]; then
+            "'"${SGLANG_KUNPENG_NOROOT_PROXY_PATH}"'/root_proxy" sgl_clean_shm.sh 2>/dev/null \
+                || rm -rf /dev/shm/* 2>/dev/null || true
+        else
+            rm -rf /dev/shm/*
+        fi
 
         for i in $(seq 0 31); do
-            echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
+            if [ "'"${SGLANG_ENABLE_NOROOT_USER:-0}"'" = "1" ]; then
+                "'"${SGLANG_KUNPENG_NOROOT_PROXY_PATH}"'/root_proxy" hugepage_2m.sh 0 ${i}
+            else
+                echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
+            fi
         done
 
         # Drop caches if configured
         if [ "'"${DROP_CACHES:-0}"'" = "1" ]; then
             echo "Dropping caches on '"$node"'..."
-            echo 3 > /proc/sys/vm/drop_caches
+            if [ "'"${SGLANG_ENABLE_NOROOT_USER:-0}"'" = "1" ]; then
+                "'"${SGLANG_KUNPENG_NOROOT_PROXY_PATH}"'/root_proxy" sgl_drop_cache.sh
+            else
+                echo 3 > /proc/sys/vm/drop_caches
+            fi
         fi
     ' &
 done

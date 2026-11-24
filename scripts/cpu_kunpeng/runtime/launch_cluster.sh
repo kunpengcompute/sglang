@@ -79,7 +79,7 @@ for i in "${!NODES[@]}"; do
     node_rank="$i"
     echo "[$(date +%T)] Starting node_rank $node_rank ($node_ip)"
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-        "root@$node_ip" \
+        "$(ssh_target "$node_ip")" \
         "cd \"$PWD\" && bash runtime/server_cluster.sh \"$ROLE\" \"$node_rank\" \"$LOG_DIR\" \"$INSTANCE\"" \
         >"$LOG_DIR/ssh_${ROLE}_rank${node_rank}.log" 2>&1 &
 done

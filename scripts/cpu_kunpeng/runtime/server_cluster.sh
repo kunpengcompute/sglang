@@ -51,11 +51,21 @@ if [[ "${SGLANG_KUNPENG_CLEAR_SHM:-1}" != "0" ]]; then
     fi
     _shm_used=$(du -sh /dev/shm 2>/dev/null | cut -f1)
     echo "[$(date +%T)] clearing /dev/shm on $(hostname) (was ${_shm_used:-unknown})"
-    rm -rf /dev/shm/* 2>/dev/null || true
+    clean_shm_dev
 fi
 
-rmmod sdma_dae 2>/dev/null || true
-insmod "$SDMA_KO_PATH" safe_mode=0 share_chns=160
+# Non-root mode: all privileged setup goes through the site root proxy.
+# sgl_hugepage_perm.sh opens /dev/zdax so kupl can use SLS instead of posix;
+# SDMA needs insmod and /dev/mem register writes for the driver reload and
+# threshold setup.
+if [[ "${SGLANG_ENABLE_NOROOT_USER:-0}" == "1" ]]; then
+    noroot_proxy_run sgl_hugepage_perm.sh
+    noroot_proxy_run sgl_reload_sdma.sh
+    noroot_proxy_run sdma_threshold.sh
+else
+    rmmod sdma_dae 2>/dev/null || true
+    insmod "$SDMA_KO_PATH" safe_mode=0 share_chns=160
+fi
 
 # Base arguments common to both roles
 BASE_ARGS=(
@@ -369,8 +379,15 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
         fi
 
         ON_PACKAGE_MEMORY_NODE=$((RANK_IN_NODE +16))
-        echo 0 > /sys/devices/system/node/node${RANK_IN_NODE}/hugepages/hugepages-2048kB/nr_hugepages
-        echo 2020 > /sys/devices/system/node/node${ON_PACKAGE_MEMORY_NODE}/hugepages/hugepages-2048kB/nr_hugepages
+        # 2M hugepage setup needs root; under non-root deployment it goes
+        # through the site root proxy.
+        if [[ "${SGLANG_ENABLE_NOROOT_USER:-0}" == "1" ]]; then
+            noroot_proxy_run hugepage_2m.sh 0 "${RANK_IN_NODE}"
+            noroot_proxy_run hugepage_2m.sh 2020 "${ON_PACKAGE_MEMORY_NODE}"
+        else
+            echo 0 > /sys/devices/system/node/node${RANK_IN_NODE}/hugepages/hugepages-2048kB/nr_hugepages
+            echo 2020 > /sys/devices/system/node/node${ON_PACKAGE_MEMORY_NODE}/hugepages/hugepages-2048kB/nr_hugepages
+        fi
 
         # Per-rank IB device: map RANK_IN_NODE to an index in IB_DEVICE_ALL.
         if [[ "$ROLE" == "prefill" || "$ROLE" == "decode" ]]; then

@@ -58,7 +58,7 @@ sh "$SCRIPT_DIR/stop.sh" tokenizer "${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}"
 
 echo "[$(date +%T)] Launching $TOK_SIDE${TOK_INSTANCE:+ ($TOK_INSTANCE)} tokenizer HTTP server on $ROUTER_IP"
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-    "root@$ROUTER_IP" \
+    "$(ssh_target "$ROUTER_IP")" \
     "cd \"$PWD\" && bash runtime/server_tokenizer.sh \"$TOK_SIDE\" \"$LOG_DIR\" \"$TOK_INSTANCE\"" \
     >"$LOG_DIR/ssh_tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_${TOK_INSTANCE}}.log" 2>&1 &
 
