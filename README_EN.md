@@ -265,6 +265,45 @@ runtime/env_base.sh (shared defaults; loads .user_env.sh then runtime/.user_env_
 
 Role defaults: prefill sets `SGLANG_KUNPENG_MAX_SEQ_NUM=8` and `SGLANG_KUNPENG_MAX_CUR_LEN=576` (native uses the same prefill-side values); decode sets `SGLANG_KUNPENG_MAX_SEQ_NUM=64` and `SGLANG_KUNPENG_MAX_CUR_LEN=1` (automatically `SGLANG_SPECULATIVE_NUM_STEPS+1` when MTP is enabled).
 
+#### 3.4.1 Non-root User Deployment (root_proxy)
+
+The default flow logs in as root on every node and directly runs `insmod`, writes `/sys` hugepage knobs and `/proc/sys/vm/drop_caches`. If the cluster only provides an ordinary user, switch to the "non-root + site root proxy" mode with these two variables:
+
+```bash
+# runtime/.user_env_base.sh (or .user_env.sh)
+export SGLANG_ENABLE_NOROOT_USER=1
+export SGLANG_KUNPENG_NOROOT_PROXY_PATH="/path/to/root_proxy_dir"
+```
+
+- **SGLANG\_ENABLE\_NOROOT\_USER**: `1` enables non-root mode; defaults to `0`, which keeps the original root flow untouched. When enabled, SSH no longer uses `root@` and every privileged operation goes through the site-provided setuid proxy `root_proxy`.
+- **SGLANG\_KUNPENG\_NOROOT\_PROXY\_PATH**: proxy directory. It must contain `root_proxy`, `sgl_reload_sdma.sh`, `sdma_threshold.sh`, `hugepage_2m.sh`, `sgl_drop_cache.sh` and `sgl_hugepage_perm.sh`; an optional `sgl_clean_shm.sh` is used to wipe root-owned `/dev/shm` leftovers. Usage is `root_proxy <script-name> [args...]`; the script name must not contain `/` (the proxy only resolves scripts inside its own directory).
+
+Privileged operations and their proxy scripts:
+
+| Operation | root mode (default) | non-root mode |
+| --- | --- | --- |
+| Reload SDMA driver / write threshold registers | `rmmod`+`insmod`, direct register writes | `root_proxy sgl_reload_sdma.sh` / `sdma_threshold.sh` |
+| Open up `/dev/zdax` (required by kupl SLS) | not needed | `root_proxy sgl_hugepage_perm.sh` (runs automatically per node at startup) |
+| 2M hugepages per rank | write `nr_hugepages` directly | `root_proxy hugepage_2m.sh <count> <node>` |
+| Release hugepages | write `nr_hugepages` directly | `root_proxy hugepage_2m.sh 0 <node>` |
+| Clear `/dev/shm` | `rm -rf /dev/shm/*` | `root_proxy sgl_clean_shm.sh` (falls back to removing the current user's segments) |
+| `drop_caches` | write directly | `root_proxy sgl_drop_cache.sh` |
+
+Reference content of `sgl_hugepage_perm.sh` (it only opens up the SLS device and the hugepage mount):
+
+```bash
+#!/bin/bash
+[ -e /dev/zdax ] && { chgrp eapp /dev/zdax; chmod 660 /dev/zdax; }
+chmod 1777 /dev/hugepages 2>/dev/null
+exit 0
+```
+
+Notes:
+
+- **`KUPL_SHM_ENABLE_HUGEPAGE` must stay `y`** (its default). If set to `n`, kupl SLS leaves the process mempolicy bound to a CPU node (whose hugepages have been cleared to 0) when creating shared-memory windows, so the later sgl-kernel HBW weight pool `mmap MAP_HUGETLB` fails with `ENOMEM` (`FAILED: errno=12` followed by `mmap with MAP_HUGETLB failed`). Setting `SGLANG_KUNPENG_HBW_BIND_BEFORE_MMAP=1` is a safe second line of defense (it binds to the HBM node around the mmap and then restores the previous policy).
+- The only condition for kupl SLS is a successful `open("/dev/zdax", O_RDWR)`; otherwise it prints `sls init failed` and falls back to posix. If a node has no `/dev/zdax`, that node can only use posix and carries the `kupl_parallel_for` deadlock risk; check the device registration first (`/sys/class/zcopy/zdax/dev`).
+- The hugepage `nr_hugepages` knobs are root-only sysfs; non-root writes always fail with `EACCES`, so they must go through the proxy.
+
 ### 3.5 PD Disaggregated Deployment
 
 In PD disaggregation mode the tokenizer is separated from the inference processes by default (`SGLANG_ENABLE_TOKENIZER_SEPERATE=1`, set automatically per role by `env_base.sh`; off by default in native mode). The request path is: client → SGLang Model Gateway (router node) → per-side tokenizer HTTP servers (router node, default ports 30001 for prefill and 30002 for decode) → prefill/decode clusters. The Model Gateway's backend addresses are the tokenizer ports instead of the inference masters' port 30000, and each prefill backend also carries its instance's bootstrap port (default 9001) for KV transfer bootstrap.

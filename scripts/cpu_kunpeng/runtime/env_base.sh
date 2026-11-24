@@ -85,6 +85,14 @@ export DATASET_PATH="/path-to-dataset"
 export LIBPTHREAD_HOOK_PATH="/path/to/libpthread_hook.so"
 # Kunpeng SDMA driver
 export SDMA_KO_PATH="/path-to-sdma-ko"
+# Non-root deployment switch: 1 = privileged operations (SDMA driver reload /
+# threshold, 2M hugepages, drop_caches) are executed through the site root proxy
+# and ssh no longer uses root@. Default 0 keeps the original root flow. The
+# proxy directory must contain root_proxy, sgl_reload_sdma.sh,
+# sdma_threshold.sh, hugepage_2m.sh and sgl_drop_cache.sh; an optional
+# sgl_clean_shm.sh there is used to wipe root-owned /dev/shm leftovers.
+export SGLANG_ENABLE_NOROOT_USER="${SGLANG_ENABLE_NOROOT_USER:-0}"
+export SGLANG_KUNPENG_NOROOT_PROXY_PATH="${SGLANG_KUNPENG_NOROOT_PROXY_PATH:-/path-to-noroot-proxy}"
 # Required when SGLANG_ENABLE_KUCCL=1
 export KUCCL_PATH="/path-to-KUCCL"
 

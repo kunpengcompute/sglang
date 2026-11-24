@@ -24,7 +24,7 @@ cd "$SCRIPT_DIR"
 SKIP_CONDA=1 source ./env.sh store
 
 echo "Killing mooncake store service on $MOONCAKE_STORE_NODE"
-ssh "root@$MOONCAKE_STORE_NODE" '
+ssh "$(ssh_target "$MOONCAKE_STORE_NODE")" '
     if pkill -f mooncake.mooncake_store_service; then
         echo "Mooncake store service stopped."
     else
