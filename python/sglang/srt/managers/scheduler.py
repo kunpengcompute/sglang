@@ -291,6 +291,7 @@ _PP_PREFETCH_WAIT_POLL_SEC = 0.02
 _PP_PREFETCH_WAIT_MAX_SEC = 180.0
 _PP_PREFETCH_QUERY_GRACE_SEC = 5.0
 _PP_PREFETCH_SCAN_MAX = 32
+_PP_PREFETCH_MAX_DEFER = 3
 
 
 def _pp_needs_prefetch_lockstep(scheduler) -> bool:
@@ -2383,28 +2384,41 @@ class Scheduler(
                 )
 
     def _pp_prefetch_gate(self, req: Req, allow_skip: bool) -> bool:
-        """Wait (bounded) for this request's prefetch; re-issue once if limited.
+        """Wait (bounded) for this request's prefetch; defer it while L1 is short.
 
-        Returns False only when the batch already has other requests, so the
-        round is never dropped entirely.
+        Fetching a full prefix from L3 is an order of magnitude cheaper than
+        recomputing it, so a request whose prefetch cannot get L1 space is
+        skipped instead of computed: the next scheduling round retries it while
+        other runnable requests keep the PP ring fed. After
+        _PP_PREFETCH_MAX_DEFER failed attempts it is computed without the L3
+        prefix. Returning False is only allowed when the batch already has
+        other requests, so a round is never dropped entirely.
         """
         rid = req.rid
         start = time.monotonic()
         deadline = start + _PP_PREFETCH_WAIT_MAX_SEC
-        retried = False
+        counts = getattr(self, "_prefetch_defer_count", None)
+        if counts is None:
+            counts = {}
+            self._prefetch_defer_count = counts
         while True:
             if self.tree_cache.check_prefetch_progress(rid):
+                counts.pop(rid, None)
                 return True
             pending = getattr(self.tree_cache, "ongoing_prefetch", {})
             if rid not in pending:
-                if retried:
-                    # Still over the in-flight budget or no L3 data: compute.
+                tries = counts.get(rid, 0) + 1
+                if tries > _PP_PREFETCH_MAX_DEFER:
+                    counts.pop(rid, None)
                     return True
-                retried = True
+                if len(counts) > 1024:
+                    for stale in list(counts)[:512]:
+                        counts.pop(stale, None)
+                counts[rid] = tries
                 self._prefetch_kvcache(req)
                 if rid in getattr(self.tree_cache, "ongoing_prefetch", {}):
                     continue
-                return True
+                return not allow_skip
             entry = pending.get(rid)
             operation = entry[3] if entry is not None else None
             # The hit query normally fills hash_value within ~100ms. Staying
@@ -2429,6 +2443,7 @@ class Scheduler(
                     _PP_PREFETCH_WAIT_MAX_SEC,
                     rid,
                 )
+                counts.pop(rid, None)
                 return True
             time.sleep(_PP_PREFETCH_WAIT_POLL_SEC)
 
@@ -2949,12 +2964,16 @@ class Scheduler(
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done and _pp_needs_prefetch_lockstep(self):
-                    # PP: never drop the round, or the downstream stage waits for
-                    # this stage's proxy tensors forever.
-                    prefetch_done = self._pp_prefetch_gate(
-                        req, allow_skip=len(adder.can_run_list) > 0
+                if not prefetch_done and _needs_prefetch_retry(self):
+                    # PP>1: never drop the round, or the downstream stage waits
+                    # for this stage's proxy tensors forever. PP=1 has no ring,
+                    # so the request may always be deferred (bounded by
+                    # _PP_PREFETCH_MAX_DEFER) instead of recomputed right away.
+                    allow_skip = (
+                        not _pp_needs_prefetch_lockstep(self)
+                        or len(adder.can_run_list) > 0
                     )
+                    prefetch_done = self._pp_prefetch_gate(req, allow_skip=allow_skip)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
