@@ -2348,24 +2348,26 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            l1l3_only = getattr(self.tree_cache, "l1l3_only", False)
             last_host_node = req.last_host_node
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            if l1l3_only:
+                # A storage-only anchor holds no L1 pages: anchoring there would
+                # fetch only the tail beyond it and never bring the evicted pages
+                # back (a repeated prompt would be fully recomputed). Anchor at
+                # the device-resident node instead; the publish path promotes the
+                # covered storage-only nodes.
+                last_host_node = req.last_node
+                matched_len = len(req.prefix_indices)
             # In the two-tier mode (no L2 pool) the anchor is "this prefix is in
             # L3" rather than "this prefix is backed up in host memory".
             anchor_ready = (
                 self.tree_cache.is_storage_indexed(last_host_node)
-                if getattr(self.tree_cache, "l1l3_only", False)
+                if l1l3_only
                 else last_host_node.backuped
             )
             if anchor_ready or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
-                if getattr(self.tree_cache, "l1l3_only", False):
-                    # The fetched suffix must start exactly where the anchor's
-                    # key ends: nodes below it may be L3-only, and
-                    # len(prefix_indices) skips those, which shifts the offset
-                    # and makes the published pages unmatchable.
-                    matched_len = self.tree_cache.prefix_depth(last_host_node)
-                else:
-                    matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (
