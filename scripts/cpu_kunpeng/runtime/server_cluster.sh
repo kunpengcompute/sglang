@@ -59,8 +59,9 @@ fi
 # SDMA needs insmod and /dev/mem register writes for the driver reload and
 # threshold setup.
 if [[ "${SGLANG_ENABLE_NOROOT_USER:-0}" == "1" ]]; then
-    noroot_proxy_run sgl_hugepage_perm.sh
     noroot_proxy_run sgl_reload_sdma.sh
+    noroot_proxy_run sgl_reload_zcopy.sh
+    noroot_proxy_run sgl_hugepage_perm.sh
     noroot_proxy_run sdma_threshold.sh
 else
     rmmod sdma_dae 2>/dev/null || true
