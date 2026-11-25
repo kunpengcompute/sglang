@@ -283,6 +283,57 @@ _is_cpu_920f = is_cpu_920f()
 _is_skip_http = is_skip_http()
 _enable_kunpeng_profile = envs.SGLANG_KUNPENG_PROFILE.get()
 
+# The PP ring requires every stage to produce a batch for the same microbatch.
+# If one stage skips the round because its HiCache prefetch is not ready yet, the
+# downstream stages block forever in the proxy-tensor recv. So under PP, waiting
+# for the prefetch (bounded) replaces skipping; the timeout policy still lives in
+# check_prefetch_progress, and non-PP / non-920F keeps the original behavior.
+_PP_PREFETCH_WAIT_POLL_SEC = 0.02
+_PP_PREFETCH_WAIT_MAX_SEC = 180.0
+_PP_PREFETCH_QUERY_GRACE_SEC = 5.0
+
+
+def _pp_needs_prefetch_lockstep(scheduler) -> bool:
+    # Only meaningful with HiCache storage on and PP > 1 on 920F.
+    return (
+        _is_cpu_920f
+        and scheduler.enable_hicache_storage
+        and scheduler.server_args.pp_size > 1
+    )
+
+
+def _pp_wait_prefetch_progress(tree_cache, req_id: str) -> bool:
+    """Wait for this stage's prefetch to land or time out (PP lockstep)."""
+    start = time.monotonic()
+    deadline = start + _PP_PREFETCH_WAIT_MAX_SEC
+    while time.monotonic() < deadline:
+        if tree_cache.check_prefetch_progress(req_id):
+            return True
+        entry = getattr(tree_cache, "ongoing_prefetch", {}).get(req_id)
+        if entry is None:
+            return True
+        # The hit query normally fills hash_value within ~100ms. Staying empty
+        # means the prefetch was revoked (hit below threshold); every stage sees
+        # the same condition and skips together, so no need to wait the timeout.
+        if not getattr(entry[3], "hash_value", None) and (
+            time.monotonic() - start > _PP_PREFETCH_QUERY_GRACE_SEC
+        ):
+            logger.debug(
+                "[hicache] PP prefetch wait: req=%s has no hash after %.1fs, "
+                "falling back to skip",
+                req_id,
+                _PP_PREFETCH_QUERY_GRACE_SEC,
+            )
+            return False
+        time.sleep(_PP_PREFETCH_WAIT_POLL_SEC)
+    logger.warning(
+        "[hicache] PP prefetch wait exceeded %.0fs: req=%s, skipping the "
+        "microbatch (the PP ring may stall)",
+        _PP_PREFETCH_WAIT_MAX_SEC,
+        req_id,
+    )
+    return False
+
 
 @dataclass
 class EmbeddingBatchResult:
@@ -2844,6 +2895,12 @@ class Scheduler(
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done and _pp_needs_prefetch_lockstep(self):
+                    # PP: never drop the round, or the downstream stage waits for
+                    # this stage's proxy tensors forever.
+                    prefetch_done = _pp_wait_prefetch_progress(
+                        self.tree_cache, req.rid
+                    )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
