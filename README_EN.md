@@ -276,13 +276,14 @@ export SGLANG_KUNPENG_NOROOT_PROXY_PATH="/path/to/root_proxy_dir"
 ```
 
 - **SGLANG\_ENABLE\_NOROOT\_USER**: `1` enables non-root mode; defaults to `0`, which keeps the original root flow untouched. When enabled, SSH no longer uses `root@` and every privileged operation goes through the site-provided setuid proxy `root_proxy`.
-- **SGLANG\_KUNPENG\_NOROOT\_PROXY\_PATH**: proxy directory. It must contain `root_proxy`, `sgl_reload_sdma.sh`, `sdma_threshold.sh`, `hugepage_2m.sh`, `sgl_drop_cache.sh` and `sgl_hugepage_perm.sh`; an optional `sgl_clean_shm.sh` is used to wipe root-owned `/dev/shm` leftovers. Usage is `root_proxy <script-name> [args...]`; the script name must not contain `/` (the proxy only resolves scripts inside its own directory).
+- **SGLANG\_KUNPENG\_NOROOT\_PROXY\_PATH**: proxy directory. It must contain `root_proxy`, `sgl_reload_sdma.sh`, `sgl_reload_zcopy.sh`, `sdma_threshold.sh`, `hugepage_2m.sh`, `sgl_drop_cache.sh` and `sgl_hugepage_perm.sh`; an optional `sgl_clean_shm.sh` is used to wipe root-owned `/dev/shm` leftovers. Usage is `root_proxy <script-name> [args...]`; the script name must not contain `/` (the proxy only resolves scripts inside its own directory).
 
 Privileged operations and their proxy scripts:
 
 | Operation | root mode (default) | non-root mode |
 | --- | --- | --- |
 | Reload SDMA driver / write threshold registers | `rmmod`+`insmod`, direct register writes | `root_proxy sgl_reload_sdma.sh` / `sdma_threshold.sh` |
+| Load the zcopy driver (creates `/dev/zdax`) | `insmod mod/zcopy_kylin.ko` | `root_proxy sgl_reload_zcopy.sh` |
 | Open up `/dev/zdax` (required by kupl SLS) | not needed | `root_proxy sgl_hugepage_perm.sh` (runs automatically per node at startup) |
 | 2M hugepages per rank | write `nr_hugepages` directly | `root_proxy hugepage_2m.sh <count> <node>` |
 | Release hugepages | write `nr_hugepages` directly | `root_proxy hugepage_2m.sh 0 <node>` |

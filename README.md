@@ -275,13 +275,14 @@ export SGLANG_KUNPENG_NOROOT_PROXY_PATH="/path/to/root_proxy_dir"
 ```
 
 - **SGLANG\_ENABLE\_NOROOT\_USER**：`1`开启非root模式，默认`0`，root流程完全保持原样。开启后SSH不再使用`root@`，所有特权操作改由站点提供的setuid代理`root_proxy`执行。
-- **SGLANG\_KUNPENG\_NOROOT\_PROXY\_PATH**：代理目录，需包含`root_proxy`、`sgl_reload_sdma.sh`、`sdma_threshold.sh`、`hugepage_2m.sh`、`sgl_drop_cache.sh`、`sgl_hugepage_perm.sh`；可选`sgl_clean_shm.sh`用于清理root遗留的`/dev/shm`段。`root_proxy`用法为`root_proxy <脚本名> [参数...]`，脚本名不能带`/`（代理只在自己目录下解析脚本）。
+- **SGLANG\_KUNPENG\_NOROOT\_PROXY\_PATH**：代理目录，需包含`root_proxy`、`sgl_reload_sdma.sh`、`sgl_reload_zcopy.sh`、`sdma_threshold.sh`、`hugepage_2m.sh`、`sgl_drop_cache.sh`、`sgl_hugepage_perm.sh`；可选`sgl_clean_shm.sh`用于清理root遗留的`/dev/shm`段。`root_proxy`用法为`root_proxy <脚本名> [参数...]`，脚本名不能带`/`（代理只在自己目录下解析脚本）。
 
 特权操作与代理脚本对应关系：
 
 | 操作 | root模式（默认） | 非root模式 |
 | --- | --- | --- |
 | 重载SDMA驱动 / 写阈值寄存器 | `rmmod`+`insmod`，直接写寄存器 | `root_proxy sgl_reload_sdma.sh` / `sdma_threshold.sh` |
+| 加载 zcopy 驱动（创建`/dev/zdax`） | `insmod mod/zcopy_kylin.ko` | `root_proxy sgl_reload_zcopy.sh` |
 | 放行`/dev/zdax`（kupl SLS 必需） | 无需处理 | `root_proxy sgl_hugepage_perm.sh`（每节点启动时自动执行） |
 | 每rank 2M大页 | 直接写`nr_hugepages` | `root_proxy hugepage_2m.sh <count> <node>` |
 | 回收大页 | 直接写`nr_hugepages` | `root_proxy hugepage_2m.sh 0 <node>` |
