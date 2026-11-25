@@ -1111,16 +1111,6 @@ class HiRadixCache(RadixCache):
                     self.evictable_size(),
                     self.protected_size(),
                 )
-            if num_evicted < num_tokens:
-                logger.warning(
-                    "[hicache] L1 evict shortfall: need=%d, got=%d, "
-                    "l3_index=%d, evictable=%d, protected=%d (leaves locked?)",
-                    num_tokens,
-                    num_evicted,
-                    self.storage_only_tokens,
-                    self.evictable_size(),
-                    self.protected_size(),
-                )
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -1766,10 +1756,6 @@ class HiRadixCache(RadixCache):
                 )
             if host_indices is None:
                 last_host_node.release_host()
-                logger.warning(
-                    "[hicache] prefetch skipped: not enough L1 slots for %d tokens",
-                    prefetch_length,
-                )
                 return
             if _hicache_debug():
                 logger.info(

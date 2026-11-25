@@ -283,14 +283,14 @@ _is_cpu_920f = is_cpu_920f()
 _is_skip_http = is_skip_http()
 _enable_kunpeng_profile = envs.SGLANG_KUNPENG_PROFILE.get()
 
-# The PP ring requires every stage to produce a batch for the same microbatch.
-# If one stage skips the round because its HiCache prefetch is not ready yet, the
-# downstream stages block forever in the proxy-tensor recv. So under PP, waiting
-# for the prefetch (bounded) replaces skipping; the timeout policy still lives in
-# check_prefetch_progress, and non-PP / non-920F keeps the original behavior.
+# Under PP every stage must produce a batch for the same microbatch, so a stage
+# that waits for its HiCache prefetch must not skip the round (the downstream
+# stages would block in the proxy-tensor recv). Prefetch is retried for the queue
+# head, since the enqueue-time attempt is one-shot and gets lost under a burst.
 _PP_PREFETCH_WAIT_POLL_SEC = 0.02
 _PP_PREFETCH_WAIT_MAX_SEC = 180.0
 _PP_PREFETCH_QUERY_GRACE_SEC = 5.0
+_PP_PREFETCH_SCAN_MAX = 32
 
 
 def _pp_needs_prefetch_lockstep(scheduler) -> bool:
@@ -302,37 +302,9 @@ def _pp_needs_prefetch_lockstep(scheduler) -> bool:
     )
 
 
-def _pp_wait_prefetch_progress(tree_cache, req_id: str) -> bool:
-    """Wait for this stage's prefetch to land or time out (PP lockstep)."""
-    start = time.monotonic()
-    deadline = start + _PP_PREFETCH_WAIT_MAX_SEC
-    while time.monotonic() < deadline:
-        if tree_cache.check_prefetch_progress(req_id):
-            return True
-        entry = getattr(tree_cache, "ongoing_prefetch", {}).get(req_id)
-        if entry is None:
-            return True
-        # The hit query normally fills hash_value within ~100ms. Staying empty
-        # means the prefetch was revoked (hit below threshold); every stage sees
-        # the same condition and skips together, so no need to wait the timeout.
-        if not getattr(entry[3], "hash_value", None) and (
-            time.monotonic() - start > _PP_PREFETCH_QUERY_GRACE_SEC
-        ):
-            logger.debug(
-                "[hicache] PP prefetch wait: req=%s has no hash after %.1fs, "
-                "falling back to skip",
-                req_id,
-                _PP_PREFETCH_QUERY_GRACE_SEC,
-            )
-            return False
-        time.sleep(_PP_PREFETCH_WAIT_POLL_SEC)
-    logger.warning(
-        "[hicache] PP prefetch wait exceeded %.0fs: req=%s, skipping the "
-        "microbatch (the PP ring may stall)",
-        _PP_PREFETCH_WAIT_MAX_SEC,
-        req_id,
-    )
-    return False
+def _needs_prefetch_retry(scheduler) -> bool:
+    # Retrying the queue-head prefetch is PP-independent; 920F only.
+    return _is_cpu_920f and scheduler.enable_hicache_storage
 
 
 @dataclass
@@ -2383,6 +2355,83 @@ class Scheduler(
                     prefix_keys,
                 )
 
+    def _retry_prefetch_waiting_head(self) -> None:
+        """Retry the one-shot enqueue-time prefetch for the queue head."""
+        cc = getattr(self.tree_cache, "cache_controller", None)
+        if cc is None:
+            return
+        pending = getattr(self.tree_cache, "ongoing_prefetch", {})
+        scanned = 0
+        for req in self.waiting_queue:
+            if scanned >= _PP_PREFETCH_SCAN_MAX:
+                break
+            scanned += 1
+            if req.rid in pending:
+                continue
+            if len(req.prefix_indices) + self.page_size >= len(req.fill_ids):
+                # Already device-resident: skip the radix walk.
+                continue
+            if cc.prefetch_rate_limited():
+                break
+            try:
+                self._prefetch_kvcache(req)
+            except Exception:
+                logger.warning(
+                    "[hicache] PP prefetch retry failed: req=%s",
+                    req.rid,
+                    exc_info=True,
+                )
+
+    def _pp_prefetch_gate(self, req: Req, allow_skip: bool) -> bool:
+        """Wait (bounded) for this request's prefetch; re-issue once if limited.
+
+        Returns False only when the batch already has other requests, so the
+        round is never dropped entirely.
+        """
+        rid = req.rid
+        start = time.monotonic()
+        deadline = start + _PP_PREFETCH_WAIT_MAX_SEC
+        retried = False
+        while True:
+            if self.tree_cache.check_prefetch_progress(rid):
+                return True
+            pending = getattr(self.tree_cache, "ongoing_prefetch", {})
+            if rid not in pending:
+                if retried:
+                    # Still over the in-flight budget or no L3 data: compute.
+                    return True
+                retried = True
+                self._prefetch_kvcache(req)
+                if rid in getattr(self.tree_cache, "ongoing_prefetch", {}):
+                    continue
+                return True
+            entry = pending.get(rid)
+            operation = entry[3] if entry is not None else None
+            # The hit query normally fills hash_value within ~100ms. Staying
+            # empty means the prefetch was revoked (hit below threshold); every
+            # stage sees the same condition, so skipping this round is
+            # consistent as long as the batch has other requests.
+            if (
+                operation is not None
+                and not getattr(operation, "hash_value", None)
+                and time.monotonic() - start > _PP_PREFETCH_QUERY_GRACE_SEC
+            ):
+                logger.debug(
+                    "[hicache] PP prefetch wait: req=%s has no hash after %.1fs",
+                    rid,
+                    _PP_PREFETCH_QUERY_GRACE_SEC,
+                )
+                return not allow_skip
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "[hicache] PP prefetch wait exceeded %.0fs: req=%s, "
+                    "scheduling without the L3 prefix",
+                    _PP_PREFETCH_WAIT_MAX_SEC,
+                    rid,
+                )
+                return True
+            time.sleep(_PP_PREFETCH_WAIT_POLL_SEC)
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
@@ -2862,6 +2911,9 @@ class Scheduler(
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
+        if _needs_prefetch_retry(self):
+            # The enqueue-time prefetch is one-shot and can be lost under a burst.
+            self._retry_prefetch_waiting_head()
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
@@ -2900,8 +2952,8 @@ class Scheduler(
                 if not prefetch_done and _pp_needs_prefetch_lockstep(self):
                     # PP: never drop the round, or the downstream stage waits for
                     # this stage's proxy tensors forever.
-                    prefetch_done = _pp_wait_prefetch_progress(
-                        self.tree_cache, req.rid
+                    prefetch_done = self._pp_prefetch_gate(
+                        req, allow_skip=len(adder.can_run_list) > 0
                     )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
