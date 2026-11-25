@@ -545,11 +545,24 @@ class ModelRunnerKVCacheMixin:
                 )
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
             elif _is_cpu_920f:
-                # Kunpeng 920F: flat bf16 index-K pool; shared (skip-topk)
-                # layers get no index-K buffer.
+                # Kunpeng 920F: flat index-K pool (bf16 or fp8 e4m3 with
+                # SGLANG_KUNPENG_INDEXER_K_FP8); shared (skip-topk) layers
+                # get no index-K buffer.
                 from sglang.srt.hardware_backend.cpu_kunpeng.memory_pool_kunpeng import (
                     KunpengNSATokenToKVPool,
                 )
+
+                if (
+                    envs.SGLANG_KUNPENG_INDEXER_K_FP8.get()
+                    and self.server_args.disaggregation_mode != "null"
+                ):
+                    raise ValueError(
+                        "SGLANG_KUNPENG_INDEXER_K_FP8=1 is not supported with "
+                        "PD disaggregation yet: the fp8 index-K pool has two "
+                        "buffers per layer (e4m3 codes + ue8m0 scale bytes) while "
+                        "the transfer layer's per-layer state mapping "
+                        "assumes one. Leave the flag off on PD deployments."
+                    )
 
                 kunpeng_kwargs = {
                     k: v for k, v in nsa_pool_kwargs.items() if k != "kv_cache_dim"

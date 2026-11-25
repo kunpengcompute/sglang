@@ -683,6 +683,12 @@ class Envs:
     # the two pools live in separate shm segments and may use different group
     # sizes (the index-K rows are identical on every attn-TP rank).
     SGLANG_KUNPENG_INDEXER_SHARE_GROUP = EnvInt(0)
+    # DSA index-K cache FP8 (e4m3) storage: bf16 rows -> uint8 e4m3 codes +
+    # one ue8m0 scale byte per token (129 vs 256 B/token); scoring
+    # dequantizes in the kutacc kernel. All ranks of a shared index-K group
+    # must agree, and PD / index-K swap are rejected with the flag on (fail
+    # loudly at init).
+    SGLANG_KUNPENG_INDEXER_K_FP8 = EnvBool(False)
     # Temporary PD KV-transfer timing logs, for locating slow kv transfers.
     # Prints one line per stage on the prefill side (enqueue -> worker pick ->
     # RDMA write -> status success) and one per rank on the decode side.

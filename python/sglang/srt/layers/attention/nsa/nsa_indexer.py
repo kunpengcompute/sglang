@@ -1401,21 +1401,45 @@ class Indexer(MultiPlatformOp):
         if row_start is None or row_rows is None:
             row_start, row_rows = 0, -1
 
-        kunpeng.paged_mqa_logits_topk_kunpeng(
-            q,
-            kv_paged,
-            weights,
-            block_tables,
-            seq_lens,
-            cur_lens,
-            output,
-            workspace,
-            topk,
-            output_coord,
-            sched_mode,
-            row_start,
-            row_rows,
-        )
+        if getattr(pool, "index_k_is_fp8", False):
+            # FP8 (e4m3) index-K cache: the kutacc kernel decodes to bf16
+            # (exact) and folds the per-slot ue8m0 scale (2^(b-127), decoded
+            # from one byte) after the head sum, so the compute semantics
+            # (ReLU gating, fp32 accumulation, deterministic topk) are
+            # identical to the bf16 pool path.
+            k_scale = pool.get_index_k_scale_buffer(layer_id)
+            kunpeng.paged_mqa_logits_topk_fp8_kunpeng(
+                q,
+                kv_paged,
+                k_scale,
+                weights,
+                block_tables,
+                seq_lens,
+                cur_lens,
+                output,
+                workspace,
+                topk,
+                output_coord,
+                sched_mode,
+                row_start,
+                row_rows,
+            )
+        else:
+            kunpeng.paged_mqa_logits_topk_kunpeng(
+                q,
+                kv_paged,
+                weights,
+                block_tables,
+                seq_lens,
+                cur_lens,
+                output,
+                workspace,
+                topk,
+                output_coord,
+                sched_mode,
+                row_start,
+                row_rows,
+            )
         if is_draft_extend:
             # The pre-padded pad rows scored as garbage (q=0 -> all-tie ->
             # smallest valid positions, which no downstream filter can

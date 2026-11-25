@@ -48,16 +48,20 @@ Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
       scan starting at the first non-direct full indexer.
 """
 
+import os
 import random
 import traceback
 
 import torch
 
-from sglang.srt.layers.attention.nsa.indexer_cpu import (
+from indexer_cpu import (
     OUTPUT_COORD_POSITION,
     OUTPUT_COORD_SLOT,
+    decode_index_k_fp8,
+    decode_ue8m0_scale,
     indexer_topk_from_slot_lists,
     paged_mqa_logits_topk_cpu,
+    paged_mqa_logits_topk_fp8_cpu,
     topk_length_from_seq_lens,
 )
 
@@ -1793,6 +1797,389 @@ def test_score_r3_draft_extend_equivalence():
 
 
 # ---------------------------------------------------------------------------
+# M. fp8 (e4m3) index-K cache: decode LUT, golden vs naive, fused kernel
+#    comparison (decoder sweep + production store-op path), quantized-vs-bf16
+#    topk overlap, pool fp8 buffers
+# ---------------------------------------------------------------------------
+
+
+def _scalar_e4m3(code):
+    """Independent float reference decoder (mirrors the C++/kutacc one on
+    purpose: agreement is what these tests pin)."""
+    e = (code >> 3) & 0xF
+    m = code & 0x7
+    v = float((1.0 + m / 8.0) * (2.0 ** (e - 7))) if e != 0 else float(m) * 2.0**-9
+    return -v if code & 0x80 else v
+
+
+def test_m_fp8_decode_lut():
+    """The 256-entry decode LUT must match the scalar IEEE reference on ALL
+    codes, including the subnormals, +/-0 and the NaN don't-cares (which
+    decode via the normal formula to +/-480, matching kutacc)."""
+    codes = torch.arange(256, dtype=torch.uint8)
+    decoded = decode_index_k_fp8(codes)
+    for c in range(256):
+        got = float(decoded[c])
+        want = _scalar_e4m3(c)
+        assert got == want, f"code 0x{c:02x}: {got} != {want}"
+    # LUT round-shape: 2D codes keep their shape.
+    grid = codes.repeat(2).view(2, 128)
+    assert decode_index_k_fp8(grid).shape == (2, 128)
+
+
+def _naive_paged_topk_fp8(q, codes_paged, k_scale, weight, bt, sl, cl, topk):
+    """Independent float64 reference over the fp8 cache (slot coordinate):
+    k = decode(code) * 2^(b-127), per-head ReLU, causal visibility,
+    ties -> smaller slot."""
+    T, H, D = q.shape
+    block_size = codes_paged.shape[1]
+    num_slots = codes_paged.shape[0] * block_size
+    flat_codes = codes_paged.reshape(num_slots, D)
+    scales = decode_ue8m0_scale(k_scale).double()
+    out = torch.full((T, topk), -1, dtype=torch.int32)
+    cur_list = [int(x) for x in cl]
+    seq_list = [int(x) for x in sl]
+    offsets = [sum(cur_list[:b]) for b in range(len(cur_list))]
+    for ti in range(T):
+        b = next(i for i in range(len(cur_list)) if offsets[i] <= ti < offsets[i] + cur_list[i])
+        pos = ti - offsets[b]
+        k_end = seq_list[b] - cur_list[b] + pos + 1
+        cands = []
+        for si in range(k_end):
+            slot = int(bt[b][si // block_size]) * block_size + si % block_size
+            k = decode_index_k_fp8(flat_codes[slot]).double() * scales[slot]
+            score = 0.0
+            for h in range(H):
+                dot = float(q[ti, h].double() @ k)
+                score += max(dot, 0.0) * float(weight[ti, h])
+            cands.append((score, slot))
+        cands.sort(key=lambda x: (-x[0], x[1]))
+        for j in range(min(topk, len(cands))):
+            out[ti, j] = cands[j][1]
+    return out
+
+
+def _make_fp8_case(rng, n_heads, head_dim, block_size, topk, n_seq, cur_list, delta):
+    """Random paged fp8 case: uniform 0..255 codes (decoder sweep), random
+    ue8m0 scale bytes (exponents 64..127 sweep scales 2^-63 .. 1.0). Returns
+    (q, codes, k_scale, weight, bt, sl, cl, seq, cur)."""
+    T = sum(cur_list)
+    seq_lens = [c + d for c, d in zip(cur_list, delta)]
+    num_slots = 64
+    q = torch.randn(T, n_heads, head_dim, dtype=torch.bfloat16) * 0.5
+    weight = torch.randn(T, n_heads, dtype=torch.bfloat16) * 0.5
+    codes = torch.randint(
+        0, 256, (num_slots // block_size, block_size, head_dim), dtype=torch.uint8
+    )
+    k_scale = torch.randint(64, 128, (num_slots,), dtype=torch.uint8)
+
+    max_blocks = max((s + block_size - 1) // block_size for s in seq_lens)
+    pages = list(range(num_slots // block_size))
+    rng.shuffle(pages)
+    bt = torch.zeros(n_seq, max_blocks, dtype=torch.int32)
+    for b in range(n_seq):
+        need = (seq_lens[b] + block_size - 1) // block_size
+        bt[b, :need] = torch.tensor(pages[b * need : (b + 1) * need])
+    return (
+        q,
+        codes,
+        k_scale,
+        weight,
+        bt,
+        torch.tensor(seq_lens, dtype=torch.int32),
+        torch.tensor(cur_list, dtype=torch.int32),
+        seq_lens,
+        cur_list,
+    )
+
+
+def test_m_fp8_golden_matches_naive():
+    """The pure-torch fp8 golden must track an independent float64 loop on
+    quantized-shaped inputs (random codes + scales): exact valid-prefix
+    equality per row."""
+    rng = random.Random(41)
+    for n_head, head_dim, block_size, topk, n_seq, cur, delta in (
+        (1, 2, 1, 3, 1, 1, 5),
+        (2, 4, 2, 3, 2, 2, 3),
+        (2, 4, 4, 8, 3, 3, 5),
+    ):
+        cur_list = [cur] * n_seq
+        (q, codes, k_scale, weight, bt, sl, cl, _, _) = _make_fp8_case(
+            rng, n_head, head_dim, block_size, topk, n_seq, cur_list, [delta] * n_seq
+        )
+        got = paged_mqa_logits_topk_fp8_cpu(q, codes, k_scale, weight, bt, sl, cl, topk)
+        ref = _naive_paged_topk_fp8(q, codes, k_scale, weight, bt, sl, cl, topk)
+        for r in range(got.shape[0]):
+            assert _valid_prefix(got[r].tolist()) == _valid_prefix(ref[r].tolist()), (
+                f"row {r} mismatch (H={n_head},D={head_dim}): "
+                f"{got[r].tolist()} vs {ref[r].tolist()}"
+            )
+
+
+def _run_kutacc_fp8_topk(q, codes, k_scale, weight, bt, sl, cl, tk, output_coord,
+                        mode=0, row_start=0, row_rows=-1):
+    out = torch.full((q.shape[0], tk), -1, dtype=torch.int32)
+    max_k_end = int(sl.max())
+    ws_bytes = int(_sgl_kernel.get_paged_mqa_logits_topk_workspace_size(max_k_end))
+    workspace = torch.empty(ws_bytes, dtype=torch.uint8)
+    _sgl_kernel.paged_mqa_logits_topk_fp8_kunpeng(
+        q, codes, k_scale, weight, bt, sl, cl, out, workspace, tk,
+        output_coord, mode, row_start, row_rows,
+    )
+    return out
+
+
+def test_m_fp8_kutacc_matches_cpu():
+    """Fused fp8 kernel vs the CPU golden: strict elementwise equality on
+    uniform-random codes (all 256 codes swept through the decoder) with
+    random per-slot scales, in both coordinates and both scheduling modes."""
+    if _sgl_kernel is None or not hasattr(_sgl_kernel, "paged_mqa_logits_topk_fp8_kunpeng"):
+        print("  [skip] sgl_kernel fp8 op not available (fused fp8 comparison)")
+        return
+    rng = random.Random(42)
+    for mode in (0, 1):
+        for coord in (OUTPUT_COORD_SLOT, OUTPUT_COORD_POSITION):
+            for n_head, head_dim, block_size, topk, n_seq, cur, delta in (
+                (1, 2, 1, 3, 1, 1, 5),
+                (2, 4, 2, 3, 2, 2, 3),
+                (2, 4, 4, 8, 3, 3, 5),
+            ):
+                cur_list = [cur] * n_seq
+                (q, codes, k_scale, weight, bt, sl, cl, _, _) = _make_fp8_case(
+                    rng, n_head, head_dim, block_size, topk, n_seq, cur_list,
+                    [delta] * n_seq,
+                )
+                cpu = paged_mqa_logits_topk_fp8_cpu(
+                    q, codes, k_scale, weight, bt, sl, cl, topk, output_coord=coord
+                )
+                got = _run_kutacc_fp8_topk(
+                    q, codes, k_scale, weight, bt, sl, cl, topk, coord, mode=mode
+                )
+                assert got.tolist() == cpu.tolist(), (
+                    f"fp8 kutacc(mode={mode},coord={coord}) != cpu "
+                    f"cfg=({n_head},{head_dim},{block_size},{topk}): {got} vs {cpu}"
+                )
+
+
+def test_m_fp8_store_op_quantization():
+    """The production store op (set_index_k_fp8_buffer_kunpeng) must produce
+    codes+scale that dequantize back to the bf16 source within the e4m3
+    relative error budget, and loc<0 rows must be skipped. The scoring
+    equivalence of the stored cache is then checked end-to-end: kernel over
+    the stored fp8 pool vs the golden over the same stored bytes."""
+    if _sgl_kernel is None or not hasattr(_sgl_kernel, "set_index_k_fp8_buffer_kunpeng"):
+        print("  [skip] sgl_kernel fp8 op not available (store op)")
+        return
+    torch.manual_seed(43)
+    slots, D = 32, 128
+    src = torch.randn(slots, D, dtype=torch.bfloat16) * 2.0
+    codes = torch.zeros(slots, D, dtype=torch.uint8)
+    scale = torch.zeros(slots, dtype=torch.uint8)
+    # Write every slot; loc with -1 entries must be skipped entirely.
+    loc = torch.arange(slots, dtype=torch.int64)
+    loc[5] = -1
+    codes_before = codes.clone()
+    _sgl_kernel.set_index_k_fp8_buffer_kunpeng(codes, scale, loc, src)
+    assert torch.equal(codes[5], codes_before[5]), "loc=-1 row must be untouched"
+    # Row 6 becomes an exact zero row: codes 0 with scale byte 0 (decode 0).
+    src6 = src.clone()
+    src6[6] = 0.0
+    _sgl_kernel.set_index_k_fp8_buffer_kunpeng(
+        codes, scale, torch.arange(slots, dtype=torch.int64), src6
+    )
+    deq = decode_index_k_fp8(codes) * decode_ue8m0_scale(scale).unsqueeze(-1)
+    # e4m3 relative error: the ue8m0 ceil scale keeps the row inside [-448,
+    # 448] (up to half a binade of headroom), so every element error is
+    # bounded by half an e4m3 ulp (~6.25% relative) of its row amax.
+    rel = (deq - src6.float()).abs() / src6.float().abs().clamp_min(1e-6)
+    nonzero = src6.float().abs() > 1e-6
+    assert rel[nonzero].max().item() < 0.07, (
+        f"dequant relative error too large: {rel[nonzero].max().item()}"
+    )
+    # All-zero row: codes are all 0x00 and the scale byte is 0 (decode 0.0).
+    assert bool((codes[6] == 0).all()) and scale[6].item() == 0, (
+        "all-zero row must store code 0 with scale byte 0"
+    )
+    # RNE is monotone in |v|, so the row's amax element carries the row's
+    # largest magnitude code (with the ue8m0 ceil scale it no longer maps
+    # to exactly +/-448 -- only exact power-of-two amax rows would).
+    amax_idx = src6[0].float().abs().argmax().item()
+    mag = codes[0].to(torch.int32) & 0x7F
+    assert mag[amax_idx] == mag.max().item(), (
+        f"row amax element must carry the row's largest magnitude code, "
+        f"got 0x{codes[0, amax_idx]:02x} vs max 0x{int(mag.max()):02x}"
+    )
+
+    # End-to-end: score over the stored pool bytes with the fused kernel and
+    # compare against the golden reading the SAME stored codes/scale.
+    T, H, block, topk = 3, 2, 4, 5
+    q = torch.randn(T, H, D, dtype=torch.bfloat16) * 0.5
+    weight = torch.randn(T, H, dtype=torch.bfloat16) * 0.5
+    seq, cur = 28, [1, 1, 1]
+    bt = torch.zeros(3, 8, dtype=torch.int32)
+    for b in range(3):
+        need = (seq + block - 1) // block
+        bt[b, :need] = torch.arange(b * need, (b + 1) * need, dtype=torch.int32)
+    sl = torch.tensor([seq, seq, seq], dtype=torch.int32)
+    cl = torch.tensor(cur, dtype=torch.int32)
+    got = _run_kutacc_fp8_topk(
+        q, codes.view(-1, block, D), scale, weight, bt, sl, cl, topk,
+        OUTPUT_COORD_POSITION, mode=1,
+    )
+    cpu = paged_mqa_logits_topk_fp8_cpu(
+        q, codes.view(-1, block, D), scale, weight, bt, sl, cl, topk,
+        output_coord=OUTPUT_COORD_POSITION,
+    )
+    assert got.tolist() == cpu.tolist(), f"stored-pool scoring: {got} vs {cpu}"
+
+
+def test_m_fp8_quantized_overlap():
+    """Accuracy budget: scoring a REALISTICALLY quantized cache (ue8m0
+    ceil(amax/448), production encoder via the store op) must overlap the
+    bf16 kernel's top-k on the raw cache by >= 99%."""
+    if _sgl_kernel is None or not hasattr(_sgl_kernel, "paged_mqa_logits_topk_fp8_kunpeng"):
+        print("  [skip] sgl_kernel fp8 op not available (quantized overlap)")
+        return
+    torch.manual_seed(44)
+    H, D, block, seq, topk = 8, 128, 64, 512, 64
+    slots = (seq + block - 1) // block * block
+    q = torch.randn(1, H, D, dtype=torch.bfloat16) * 0.5
+    weight = torch.randn(1, H, dtype=torch.bfloat16) * 0.5
+    kv_bf16 = torch.randn(slots, D, dtype=torch.bfloat16) * 0.5
+    codes = torch.zeros(slots, D, dtype=torch.uint8)
+    scale = torch.zeros(slots, dtype=torch.uint8)
+    _sgl_kernel.set_index_k_fp8_buffer_kunpeng(
+        codes, scale, torch.arange(slots, dtype=torch.int64), kv_bf16
+    )
+
+    bt = torch.zeros(1, slots // block, dtype=torch.int32)
+    bt[0] = torch.arange(slots // block, dtype=torch.int32)
+    sl = torch.tensor([seq], dtype=torch.int32)
+    cl = torch.tensor([1], dtype=torch.int32)
+
+    bf16_out = _run_kutacc_topk(q, kv_bf16.view(-1, block, D), weight, bt, sl, cl, topk, 0)
+    fp8_out = _run_kutacc_fp8_topk(
+        q, codes.view(-1, block, D), scale, weight, bt, sl, cl, topk, 0
+    )
+    ref = paged_mqa_logits_topk_fp8_cpu(
+        q, codes.view(-1, block, D), scale, weight, bt, sl, cl, topk
+    )
+    assert fp8_out.tolist() == ref.tolist(), "kernel vs golden must agree exactly"
+    a = {int(v) for v in bf16_out[0] if v >= 0}
+    b = {int(v) for v in fp8_out[0] if v >= 0}
+    overlap = len(a & b) / max(1, len(a))
+    assert overlap >= 0.99, f"fp8-vs-bf16 topk overlap too low: {overlap:.4f}"
+
+
+def test_m_fp8_pool_buffers():
+    """KunpengNSATokenToKVPool fp8 branch (bare pool): the fp8 store routes
+    to set_index_k_fp8_buffer_kunpeng (uint8 codes + ue8m0 scale bytes), the
+    bf16 branch keeps the historical set_kv_buffer path, and size accounting
+    covers both arrays."""
+    if not _HAVE_POOL:
+        print("  [skip] memory_pool_kunpeng not importable")
+        return
+    if _sgl_kernel is None or not hasattr(_sgl_kernel, "set_index_k_fp8_buffer_kunpeng"):
+        print("  [skip] sgl_kernel fp8 op not available (pool fp8 buffers)")
+        return
+
+    # head_dim is fixed at 128: the C++ store op requires kdim == 128 (one
+    # ue8m0 scale byte covers the whole token row).
+    D = 128
+    codes = torch.zeros(8, D, dtype=torch.uint8)
+    scale = torch.zeros(8, dtype=torch.uint8)
+    pool = object.__new__(KunpengNSATokenToKVPool)
+    pool.index_k_buffer = [codes]
+    pool.index_k_scale_buffer = [scale]
+    pool.layer_transfer_counter = None
+    pool.start_layer = 0
+    pool.index_k_is_fp8 = True
+    pool.index_k_dtype = torch.uint8
+    pool.index_k_scale_dtype = torch.uint8
+
+    k = torch.randn(3, D, dtype=torch.bfloat16)
+    pool.set_index_k_buffer(0, torch.tensor([7, 0, 3]), k)
+    deq = decode_index_k_fp8(codes) * decode_ue8m0_scale(scale).unsqueeze(-1)
+    for row, slot in enumerate((7, 0, 3)):
+        torch.testing.assert_close(
+            deq[slot], k[row].float(), rtol=7e-2, atol=7e-2
+        ), f"slot {slot} must hold a quantized copy of row {row}"
+    assert pool.get_index_k_buffer(0) is codes
+    assert pool.get_index_k_scale_buffer(0) is scale
+    expected_bytes = codes.numel() * codes.element_size() + scale.numel() * scale.element_size()
+    assert pool.get_index_k_size_bytes() == expected_bytes
+
+    # bf16 branch (fp8 off) keeps the historical scatter semantics.
+    buf = torch.zeros(8, 4, dtype=torch.bfloat16)
+    pool_bf16 = object.__new__(KunpengNSATokenToKVPool)
+    pool_bf16.index_k_buffer = [buf]
+    pool_bf16.index_k_scale_buffer = [None]
+    pool_bf16.layer_transfer_counter = None
+    pool_bf16.start_layer = 0
+    pool_bf16.index_k_is_fp8 = False
+    k2 = torch.randn(2, 4, dtype=torch.bfloat16)
+    pool_bf16.set_index_k_buffer(0, torch.tensor([-1, 2]), k2)
+    assert torch.equal(buf[2], k2[1]), "bf16 branch must scatter unchanged"
+    assert torch.equal(buf[0], torch.zeros(4, dtype=torch.bfloat16)), (
+        "bf16 branch: loc=-1 must skip"
+    )
+
+
+def test_m_fp8_pool_allocates_uint8():
+    """Real pool construction with the flag on (env patched): uint8 code
+    buffers + ue8m0 scale-byte buffers + the logged dtype. Auto-skips when
+    the environment cannot allocate the main MLA pool."""
+    if not _HAVE_POOL:
+        print("  [skip] memory_pool_kunpeng not importable")
+        return
+    saved = os.environ.get("SGLANG_KUNPENG_INDEXER_K_FP8")
+    os.environ["SGLANG_KUNPENG_INDEXER_K_FP8"] = "1"
+    try:
+        pool = KunpengNSATokenToKVPool(
+            size=4, page_size=1, dtype=torch.bfloat16,
+            kv_lora_rank=8, qk_rope_head_dim=4, layer_num=2, device="cpu",
+            enable_memory_saver=False, index_head_dim=4,
+        )
+    except Exception:
+        print("  [skip] pool allocation unsupported in this environment")
+        return
+    finally:
+        if saved is None:
+            os.environ.pop("SGLANG_KUNPENG_INDEXER_K_FP8", None)
+        else:
+            os.environ["SGLANG_KUNPENG_INDEXER_K_FP8"] = saved
+    assert pool.index_k_is_fp8 is True
+    assert all(b is not None and b.dtype == torch.uint8 for b in pool.index_k_buffer)
+    assert all(s is not None and s.dtype == torch.uint8 for s in pool.index_k_scale_buffer)
+    # 129 B/token/layer vs 256 B/token/layer for bf16 (128 code + 1 scale).
+    assert pool.get_index_k_size_bytes() == 2 * (4 + 1) * (4 * 1 + 1 * 1)
+
+
+def test_m_fp8_pd_rejected():
+    """get_state_buf_infos must fail loudly under fp8 (PD is rejected at
+    startup by the model runner guard; reaching here is a bug)."""
+    if not _HAVE_POOL:
+        print("  [skip] memory_pool_kunpeng not importable")
+        return
+    codes = torch.zeros(8, 4, dtype=torch.uint8)
+    scale = torch.zeros(8, dtype=torch.uint8)
+    pool = object.__new__(KunpengNSATokenToKVPool)
+    pool.index_k_buffer = [codes]
+    pool.index_k_scale_buffer = [scale]
+    pool.layer_transfer_counter = None
+    pool.start_layer = 0
+    pool.index_k_is_fp8 = True
+    pool.page_size = 1
+    pool.skip_topk_layers = [False]
+    pool.layer_num = 1
+    try:
+        pool.get_state_buf_infos()
+        raise AssertionError("fp8 get_state_buf_infos must raise")
+    except RuntimeError as e:
+        assert "not supported" in str(e), str(e)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1842,6 +2229,14 @@ def main():
         ("L. test_score_tp_split_window_equivalence", test_score_tp_split_window_equivalence),
         ("L. test_fill_mtp_pad_prefix", test_fill_mtp_pad_prefix),
         ("L. test_score_r3_draft_extend_equivalence", test_score_r3_draft_extend_equivalence),
+        ("M. test_m_fp8_decode_lut", test_m_fp8_decode_lut),
+        ("M. test_m_fp8_golden_matches_naive", test_m_fp8_golden_matches_naive),
+        ("M. test_m_fp8_kutacc_matches_cpu", test_m_fp8_kutacc_matches_cpu),
+        ("M. test_m_fp8_store_op_quantization", test_m_fp8_store_op_quantization),
+        ("M. test_m_fp8_quantized_overlap", test_m_fp8_quantized_overlap),
+        ("M. test_m_fp8_pool_buffers", test_m_fp8_pool_buffers),
+        ("M. test_m_fp8_pool_allocates_uint8", test_m_fp8_pool_allocates_uint8),
+        ("M. test_m_fp8_pd_rejected", test_m_fp8_pd_rejected),
     ]
     failed = 0
     for name, fn in tests:

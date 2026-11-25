@@ -1663,6 +1663,16 @@ class KunpengGraphRunner:
             for buf in index_k_buffers:
                 if buf is not None:
                     fixed.append(buf)
+        # FP8 (e4m3) index-K storage: the per-token ue8m0 scale-byte buffers
+        # are a separate pool array and must be captured just like the code
+        # buffers.
+        index_k_scale_buffers = getattr(
+            self.model_runner.token_to_kv_pool, "index_k_scale_buffer", None
+        )
+        if index_k_scale_buffers:
+            for buf in index_k_scale_buffers:
+                if buf is not None:
+                    fixed.append(buf)
         indexer_ws = getattr(attn_backend, "indexer_workspace", None)
         if indexer_ws is not None:
             fixed.append(indexer_ws)

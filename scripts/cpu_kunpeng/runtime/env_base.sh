@@ -212,6 +212,12 @@ export SGLANG_KUNPENG_SWAP_KV_OUT=0
 export SGLANG_KUNPENG_SWAP_KV_BLOCKWISE=0
 export SGLANG_KUNPENG_SWAP_MAX_KV_BLOCKS=512
 export SGLANG_KUNPENG_SWAP_INDEX_K_IN=0
+# FP8 (e4m3 codes + 1 B/token ue8m0 scale) index-K storage: ~50% pool and
+# scoring-read bandwidth saving. Must be identical across every rank of a
+# shared index-K group and between PD prefill/decode sides (raw-byte
+# transfer, no conversion); not supported with
+# SGLANG_KUNPENG_SWAP_INDEX_K_IN=1 (the swap mirror drops the scale bytes).
+export SGLANG_KUNPENG_INDEXER_K_FP8=0
 
 
 # Kunpeng SDMA parameters

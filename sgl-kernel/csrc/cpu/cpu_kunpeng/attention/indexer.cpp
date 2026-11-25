@@ -22,9 +22,11 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 
+#include "fp8_quant.h"
 #include "../utils/utils.h"
 
 // ---------------------------------------------------------------------------
@@ -133,4 +135,156 @@ int64_t get_paged_mqa_logits_topk_workspace_size(int64_t max_k_end)
     TORCH_CHECK(false, "This KuTACC build does not provide SGLANG_KUTACC_HAS_DSA_INDEXER; install a matching KuTACC release to use get_paged_mqa_logits_topk_workspace_size");
 
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// FP8 (e4m3) index-K cache path.
+//
+// Storage: per-layer uint8 code buffer [num_slots, D] plus one ue8m0 scale
+// byte per absolute slot -- a single scale covers the whole [D] token row
+// (the DSA index head_dim D is fixed at 128): scale = 2^(b-127), the exact power-of-two ceil of amax/448
+// (ceil >= amax/448, so nothing clips). The ue8m0 scale row is
+// deliberately DDR-resident and never mirrored into HBW -- the kernel
+// reads it straight from DDR (1 B/token, negligible); the HBW residency
+// (swap-in HBM mirror) covers only the code rows. Scoring runs the kutacc fp8
+// overload: decode e4m3 -> bf16 (exact), decode the ue8m0 byte to 2^(b-127)
+// and fold the per-slot scale after the head sum inside the kernel; q stays
+// bf16.
+// ---------------------------------------------------------------------------
+
+#if defined(KUTACC_FEATURE_INDEXER_FP8) && SGLANG_KUTACC_HAS_DSA_INDEXER
+#define SGLANG_KUTACC_HAS_DSA_INDEXER_FP8 1
+#else
+#define SGLANG_KUTACC_HAS_DSA_INDEXER_FP8 0
+#endif
+
+// Real DSA indexer scoring kernel (kutacc adapter, fp8 e4m3 index-K cache).
+// Tensor contract mirrors paged_mqa_logits_topk_kunpeng with cur_kv_cache a
+// uint8 code tensor [num_blocks, block_size, D] and one extra uint8 k_scale
+// [num_slots] of ue8m0 scale bytes (scale = 2^(b-127), indexed by absolute
+// slot; byte 0 decodes to 0.0f).
+void paged_mqa_logits_topk_fp8_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
+                                       at::Tensor k_scale, at::Tensor weight,
+                                       at::Tensor block_tables, at::Tensor seq_lens,
+                                       at::Tensor cur_lens, at::Tensor output,
+                                       at::Tensor workspace, int64_t topk,
+                                       int64_t output_coord, int64_t mode,
+                                       int64_t row_start, int64_t row_rows)
+{
+#if SGLANG_KUTACC_HAS_DSA_INDEXER_FP8
+    auto kt_q = to_kutacc<bfloat16_t, 3>(q);
+    auto kt_kv = to_kutacc<uint8_t, 3>(cur_kv_cache);
+    auto kt_ks = to_kutacc<uint8_t, 1>(k_scale);
+    auto kt_weight = to_kutacc<bfloat16_t, 2>(weight);
+    auto kt_block_tables = to_kutacc<int, 2>(block_tables);
+    auto kt_seq = to_kutacc<int, 1>(seq_lens);
+    auto kt_cur = to_kutacc<int, 1>(cur_lens);
+    auto kt_output = to_kutacc<int, 2>(output);
+    auto kt_workspace = to_kutacc<uint8_t, 1>(workspace);
+
+    kutacc::attention_schedule schedule;
+    schedule.mode = mode == 1 ? kutacc::attention_schedule::Mode::kSplitKV
+                              : kutacc::attention_schedule::Mode::kTokenBalance;
+    schedule.output_coord = output_coord == 1
+                                ? kutacc::attention_schedule::OutputCoord::kPosition
+                                : kutacc::attention_schedule::OutputCoord::kSlot;
+    schedule.row_start = static_cast<int32_t>(row_start);
+    schedule.row_rows = static_cast<int32_t>(row_rows);
+
+    // Windowed (TP-sharded) calls pre-fill the whole output with -1 (same
+    // rationale as the bf16 adapter).
+    if (row_start != 0 || row_rows >= 0) {
+        int32_t *out_p = output.data_ptr<int32_t>();
+        std::fill(out_p, out_p + output.numel(), -1);
+    }
+
+    kutacc::paged_mqa_logits_topk(kt_q, kt_kv, kt_ks, kt_weight, kt_block_tables,
+                                  kt_seq, kt_cur, kt_output, schedule,
+                                  kt_workspace, static_cast<int>(topk));
+#else
+    TORCH_CHECK(false, "This KuTACC build does not provide the fp8 index-K overload (KUTACC_FEATURE_INDEXER_FP8); install a matching KuTACC release to use paged_mqa_logits_topk_fp8_kunpeng");
+#endif
+}
+
+// Store-side quantization: bf16 index-K rows [T, D] -> e4m3 codes written
+// into the uint8 pool buffer at flat slots `loc`, plus one ue8m0 scale byte
+// per row (scale = 2^ceil(log2(amax/448)), see fp8_quant.h) covering the
+// whole [D] row. loc < 0 (padding / foreign rows) is skipped, same contract
+// contract as set_kv_buffer_kunpeng, so the write is graph-replay safe.
+void set_index_k_fp8_buffer_kunpeng(at::Tensor kv_buffer, at::Tensor k_scale_buffer,
+                                    at::Tensor loc, at::Tensor cache_k)
+{
+    TORCH_CHECK(kv_buffer.dim() == 2 && kv_buffer.scalar_type() == at::kByte,
+                "kv_buffer must be a 2D uint8 tensor");
+    TORCH_CHECK(k_scale_buffer.dim() == 1 && k_scale_buffer.scalar_type() == at::kByte,
+                "k_scale_buffer must be a 1D uint8 (ue8m0 scale byte) tensor");
+    TORCH_CHECK(loc.dim() == 1, "loc must be 1D");
+    TORCH_CHECK(cache_k.dim() == 2 && cache_k.scalar_type() == at::kBFloat16,
+                "cache_k must be a 2D bf16 tensor");
+    const int64_t tokens = loc.size(0);
+    const int64_t kdim = kv_buffer.size(1);
+    TORCH_CHECK(cache_k.size(0) == tokens, "cache_k and loc token count mismatch");
+    TORCH_CHECK(cache_k.size(1) == kdim, "cache_k dim-1 must match kv_buffer dim-1");
+    TORCH_CHECK(kv_buffer.stride(1) == 1 && cache_k.stride(1) == 1,
+                "kv_buffer and cache_k must have contiguous dim-1 (stride==1)");
+    TORCH_CHECK(kdim == 128, "fp8 index-K store requires head_dim == 128 (one ue8m0 scale byte per token row), got ", kdim);
+
+    uint8_t *buf = kv_buffer.data_ptr<uint8_t>();
+    uint8_t *scale_buf = k_scale_buffer.data_ptr<uint8_t>();
+    const int64_t buf_stride = kv_buffer.stride(0);
+    const int64_t src_stride = cache_k.stride(0);
+    // Same 2-byte layout as __bf16; at::BFloat16 provides the float cast.
+    const at::BFloat16 *src = cache_k.data_ptr<at::BFloat16>();
+
+    auto quant_row = [&](int64_t slot, int64_t t) {
+        float amax = 0.0f;
+        const at::BFloat16 *row = src + t * src_stride;
+        for (int64_t d = 0; d < kdim; ++d) {
+            amax = std::max(amax, std::fabs(static_cast<float>(row[d])));
+        }
+        // All-zero row: scale byte 0 decodes to 0.0f and every code is 0, so
+        // the row round-trips to 0 (inv_scale 0 keeps the divide finite).
+        const uint8_t scale_byte =
+            amax > 0.0f ? fp32_to_ue8m0_byte(amax / 448.0f) : 0u;
+        // Exact power of two (bit trick in fp8_quant.h): the divide below
+        // introduces no rounding of its own.
+        const float scale = ue8m0_byte_to_f32(scale_byte);
+        const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+        uint8_t *dst = buf + slot * buf_stride;
+        for (int64_t d = 0; d < kdim; ++d) {
+            // ceil scale >= amax/448 keeps |x * inv_scale| <= 448 by
+            // construction; the clamp additionally absorbs any fp32
+            // rounding above 448 so the NaN codes are never produced.
+            float v = static_cast<float>(row[d]) * inv_scale;
+            v = std::min(448.0f, std::max(-448.0f, v));
+            dst[d] = fp32_to_e4m3fn_byte(v);
+        }
+        scale_buf[slot] = scale_byte;
+    };
+
+    // Token rows are independent (each writes its own slot; loc values are
+    // unique per token by contract), so split over the kupl executors with
+    // kutacc::parallel_for, the same pattern as the kunpeng attention
+    // kernels. Only the forward/graph-replay thread reaches this op (the
+    // nsa_indexer store path); HiCache background threads must not call it
+    // and never do.
+    const bool loc_is_int = loc.scalar_type() == at::kInt;
+    if (!loc_is_int) {
+        TORCH_CHECK(loc.scalar_type() == at::kLong, "loc must be int32 or int64");
+    }
+    kutacc::parallel_for(0, tokens, 1, [&](int64_t start, int64_t end) {
+        if (loc_is_int) {
+            const int32_t *idx = loc.data_ptr<int32_t>();
+            for (int64_t i = start; i < end; ++i) {
+                if (idx[i] < 0) continue;
+                quant_row(idx[i], i);
+            }
+        } else {
+            const int64_t *idx = loc.data_ptr<int64_t>();
+            for (int64_t i = start; i < end; ++i) {
+                if (idx[i] < 0) continue;
+                quant_row(idx[i], i);
+            }
+        }
+    });
 }
