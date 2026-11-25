@@ -24,7 +24,7 @@ cd "$SCRIPT_DIR"
 SKIP_CONDA=1 source ./env.sh none
 
 echo "Killing gateway on $ROUTER_IP"
-ssh "root@$ROUTER_IP" '
+ssh "$(ssh_target "$ROUTER_IP")" '
     MAIN_PIDS=$(ps aux | grep "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
     if [ -n "$MAIN_PIDS" ]; then
         echo "Killing process(es): $MAIN_PIDS"

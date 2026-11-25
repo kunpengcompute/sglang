@@ -17,8 +17,8 @@ class RollingLog:
     def __init__(self, path, max_bytes=None, backups=None, env=None):
         env = os.environ if env is None else env
         self.path = Path(path)
-        self.limit = int(env.get('QWEN_LOG_MAX_MIB', '16')) * 1024 * 1024 if max_bytes is None else max_bytes
-        self.backups = int(env.get('QWEN_LOG_BACKUPS', '2')) if backups is None else backups
+        self.limit = int(env.get('LOG_MAX_MIB', '16')) * 1024 * 1024 if max_bytes is None else max_bytes
+        self.backups = int(env.get('LOG_BACKUPS', '2')) if backups is None else backups
         if self.limit < 1 or not 0 <= self.backups <= 20:
             raise ValueError('日志大小须为正数，QWEN_LOG_BACKUPS须在0..20之间')
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -14,7 +14,7 @@ from .capabilities import NATIVE_DECODE_MAX_TOKENS
 _libraries = []
 rows_capture_count = 0
 _p2_gdn_head_route = None
-_P20_FLAG = "SGLANG_KUNPENG_P20_GDN_POSTCONV_STRIDED"
+_P20_FLAG = "SGLANG_KUNPENG_QWEN_GDN_POSTCONV_STRIDED"
 _p20_bridge = None
 
 
@@ -27,7 +27,7 @@ def _register_graph_dispatch(bridge, name, symbol):
 
 
 def p2_gdn_head_selected(B, HQ, HV, DK, DV):
-    if B < 8 or os.getenv("SGLANG_KUNPENG_P2_GDN_HEAD_PARALLEL", "0") != "1":
+    if B < 8 or os.getenv("SGLANG_KUNPENG_QWEN_GDN_HEAD_PARALLEL", "0") != "1":
         return False
     return _p2_gdn_head_route is not None and bool(_p2_gdn_head_route(B, HQ, HV, DK, DV))
 
@@ -102,7 +102,7 @@ def register_primitives():
         [ctypes.c_void_p] * 7 + [ctypes.c_int64] * 6
     )
     conv.qwen36_gdn_conv_verify_bf16_row_major.restype = ctypes.c_int
-    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_CONV_REQUEST_PARALLEL", "0") == "1":
         request_conv = conv.qwen36_gdn_causal_conv_bf16_row_major_requests
         request_conv.argtypes = conv.qwen36_gdn_causal_conv_bf16_row_major.argtypes
         request_conv.restype = ctypes.c_int
@@ -130,7 +130,7 @@ def register_primitives():
         ("qwen_ar_unpack_block", "qwen_graph_ar_unpack_block_dispatch"),
     ]:
         _register_graph_dispatch(bridge, name, symbol)
-    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_CONV_REQUEST_PARALLEL", "0") == "1":
         _register_graph_dispatch(bridge, "qwen_p2_decode_conv_requests",
                                  "qwen_graph_p2_decode_conv_requests_dispatch")
 
@@ -164,7 +164,7 @@ def register_primitives():
         ),
     )
 
-    if os.environ.get("SGLANG_KUNPENG_P2_AR_SMALLROW_COPY", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_AR_SMALLROW_COPY", "0") == "1":
         for name, symbol in [
             ("qwen_p2_ar_pack_smallrow", "qwen_graph_p2_ar_pack_smallrow_dispatch"),
             ("qwen_p2_ar_unpack_smallrow", "qwen_graph_p2_ar_unpack_smallrow_dispatch"),
@@ -299,9 +299,9 @@ def register_primitives():
         from .tilelang_gdn_verify import register_tilelang_verify
 
         register_tilelang_verify(bridge, _register_graph_dispatch)
-    if os.getenv("SGLANG_KUNPENG_P20_GDN_POSTCONV_STRIDED", "0") == "1":
+    if os.getenv("SGLANG_KUNPENG_QWEN_GDN_POSTCONV_STRIDED", "0") == "1":
         _register_p20(bridge)
-    if os.getenv("SGLANG_KUNPENG_P2_GDN_HEAD_PARALLEL", "0") == "1":
+    if os.getenv("SGLANG_KUNPENG_QWEN_GDN_HEAD_PARALLEL", "0") == "1":
         head_native = bridge.qwen36_gdn_decode_head_parallel_with_workspace
         head_native.argtypes = gdn.qwen36_gdn_decode_with_workspace.argtypes
         head_native.restype = ctypes.c_int
@@ -335,7 +335,7 @@ def register_primitives():
             raise RuntimeError(f"Conv eager failed {rc}")
         return output
 
-    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_CONV_REQUEST_PARALLEL", "0") == "1":
         def request_conv_eager(x, state, weight, indices):
             output = torch.empty_like(x)
             rc = request_conv(x.data_ptr(), state.data_ptr(), weight.data_ptr(), indices.data_ptr(),

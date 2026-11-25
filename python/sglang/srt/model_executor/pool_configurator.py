@@ -47,9 +47,11 @@ def _shared_flat_index_k_layers(mr: ModelRunner, num_layers: int) -> Optional[in
     try:
         from sglang.srt.environ import envs
 
+        # 0 and 1 both mean "no sharing"; only a group size > 1 changes the
+        # per-token layer accounting for the shared-pool layout.
         if (
-            envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() <= 0
-            and envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() <= 0
+            envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() <= 1
+            and envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() <= 1
         ):
             return None
         from sglang.srt.utils.common import is_cpu_920f

@@ -1,9 +1,9 @@
 {
   "name": "Qwen920F source build and deployment",
-  "base_commit": "9660497f543079166782caed4db80ba4197feee1",
+  "base_commit": "e97174380cab8341d0ebe1429d1e0b19fcdda81e",
   "mode": "non-MTP or NEXTN/EAGLE MTP",
-  "tool_revision": "20261120_r9_clean_bounded_logs",
-  "launcher_revision": "20261120_r9_clean_bounded_logs",
-  "validation": "local source-equivalence, single/PD configuration, bounded subprocess logging and safe history-prune checks passed; no fresh 920F native rebuild, package or model performance validation",
-  "validated_parent_source": "20261119_q38_prefill_residency_vl_merge_06/groupB/sglang R9; TP16 PP4 Prefill plus TP16 PP1 Decode"
+  "tool_revision": "20261125_upstream348_sls_tilelang",
+  "launcher_revision": "20261125_upstream348_sls_tilelang",
+  "validation": "Local syntax, semantic kernel-flag equivalence and PD role budgets passed; native build, package and service evidence is recorded per deployment.",
+  "validated_parent_source": "c3e6e1983ac327765572008aa900666c92c8114d; native KuPL SLS and node-local TileLang cache validated on 4P1D"
 }

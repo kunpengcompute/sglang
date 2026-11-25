@@ -2466,9 +2466,11 @@ class DeepseekV2Model(nn.Module):
                 self.start_layer,
                 forward_batch.token_to_kv_pool.get_key_buffer(self.start_layer),
             )
-            # DSA index-K: mirror the first full layer's DDR cache into HBM.
+            # DSA index-K: prefetch the first TWO swapped full layers into the
+            # ping-pong HBM mirrors so the steady-state pipeline has a
+            # two-full-layer head start over the SDMA copies.
             # Skip-topk layers carry no index-K buffer and are skipped inside.
-            self.swap_mgr.swap_first_index_k_layer(forward_batch)
+            self.swap_mgr.swap_first_index_k_layers(forward_batch)
 
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:

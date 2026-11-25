@@ -50,6 +50,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.tokens_after_think_end -= 1
 
     def accept_token(self, token: int):
+        # Track the last accepted token on the wrapper itself (mirroring
+        # XGrammarGrammar.accept_token). Disaggregation's process_prebuilt uses
+        # `grammar.current_token is None` to detect a retracted request whose
+        # token was already accepted and must not be re-accepted. Without this,
+        # a ReasonerGrammarObject's current_token stays None forever (the inner
+        # grammar's is updated, not the wrapper's), so the guard never fires and
+        # the token is accepted twice -> "Tokens not accepted" -> FINISH_ABORT.
+        self.current_token = token
         if self.tokens_after_think_end >= 0:
             self.grammar.accept_token(token)
         self.transfer_state(token)

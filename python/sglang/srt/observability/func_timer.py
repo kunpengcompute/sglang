@@ -32,6 +32,14 @@ def enable_func_timer():
     global enable_metrics, FUNC_LATENCY
     enable_metrics = True
 
+    # Make registration idempotent. On a watchdog-sigquit restart the new
+    # server process can re-enter the lifespan in the same interpreter where
+    # FUNC_LATENCY is already registered; constructing a second Histogram with
+    # the same name raises "Duplicated timeseries in CollectorRegistry" and
+    # aborts application startup. Reuse the existing metric instead.
+    if FUNC_LATENCY is not None:
+        return
+
     FUNC_LATENCY = Histogram(
         "sglang:func_latency_seconds",
         "Function latency in seconds",

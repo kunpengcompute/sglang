@@ -10,6 +10,15 @@ without re-layout.
 Shared (skip_topk) layers never read their index-K cache (they reuse the
 carried top-k), so no buffer is allocated for them -- pass
 ``skip_topk_layers`` generated from ``dsa_layer_skips_topk``.
+
+When the layer-wise index-K HBM swap is enabled, the leading FULL indexers
+listed in ``index_k_direct_layers`` (absolute layer ids) deliberately bypass
+the swap and read/write their index-K directly in DDR. Those back-to-back
+full layers cannot hide the whole-pool DDR->HBM DMA under intervening
+shared-layer compute, so keeping them in DDR avoids the exposed stall; the
+swap starts at the first full indexer that follows a shared gap. The swapped
+layers use two ping-pong HBM mirrors, so the copy for the next-but-one full
+layer overlaps the current layer's scoring.
 """
 
 import logging
@@ -24,6 +33,15 @@ logger = logging.getLogger(__name__)
 
 class KunpengNSATokenToKVPool(MLATokenToKVPool):
     index_k_dtype = torch.bfloat16
+
+    # Absolute layer ids of the leading FULL indexers that stay in DDR (no
+    # HBM swap mirror). Class-level default keeps ``object.__new__`` bare pools
+    # (used in tests) working; ``__init__`` overrides it per pool instance.
+    # Stored PER POOL (not on the process-wide KunpengSwapManager singleton):
+    # target and draft runners each own a pool but share that singleton, so a
+    # singleton-level set would let one runner's registration clobber the
+    # other's. See index_k_direct_layers in model_runner_kv_cache_mixin.py.
+    index_k_direct_layers = frozenset()
 
     def __init__(
         self,
@@ -40,9 +58,10 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         index_head_dim: int = 128,
         skip_topk_layers=None,
         shared_pool_requests=None,
+        index_k_direct_layers=None,
     ):
         # --- shared pools (SGLANG_KUNPENG_KV_SHARE_GROUP /
-        #     SGLANG_KUNPENG_INDEXER_SHARE_GROUP = 4/8/16) -------------------
+        #     SGLANG_KUNPENG_INDEXER_SHARE_GROUP = 4/8/16; 0/1 = no sharing) --
         # The two switches are independent and each pool has its OWN shm
         # segment: KV may be shared while index-K stays private, or the other
         # way round, and the two group sizes may differ.
@@ -55,6 +74,9 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         self._shared_kv_storage = None
         self._shared_indexer_storage = None
         self.index_head_dim = index_head_dim
+        # Absolute layer ids whose index-K cache is read/written directly in
+        # DDR (no HBM swap mirror). Empty by default -> legacy behaviour.
+        self.index_k_direct_layers = frozenset(index_k_direct_layers or ())
         if skip_topk_layers is None:
             skip_topk_layers = [False] * layer_num
         assert len(skip_topk_layers) == layer_num, (
@@ -199,6 +221,9 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         current layer's HBM mirror is double-written. The HBM access drains
         the layer's pending swap-in first, so a late whole-pool DMA cannot
         clobber the freshly written rows.
+
+        Layers in ``index_k_direct_layers`` (the leading full indexers) skip
+        the HBM double-write entirely and stay in DDR.
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -220,16 +245,22 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
             profile_name="set_kv_buffer_kunpeng@index_k_ddr",
         )
 
+        # Leading full indexers stay in DDR: no swap-in to drain, no HBM
+        # double-write. The HBM mirror (when present) belongs to a DIFFERENT,
+        # later full layer and must not receive this layer's new tokens.
+        if layer_id in self.index_k_direct_layers:
+            return
+
         swap_mgr = KunpengSwapManager.get_instance()
         if swap_mgr.enable_swap_index_k_in:
-            # get_index_k_cache() waits for the swap-in events, then returns
-            # the HBM mirror of the current layer.
+            # Drain the layer's pending DDR->HBM copy before writing this
+            # step's new tokens into the HBM mirror: the swap-in is an async
+            # DMA over the whole pool, so a copy of the stale DDR contents
+            # landing at the new-token slots after the write would clobber
+            # the freshly written rows.
+            swap_mgr.wait_index_k_swap_in(layer_id)
             kunpeng.set_kv_buffer_kunpeng(
-                swap_mgr.get_index_k_cache(
-                    profile_name=(
-                        "kupl_sdma_wait_all@index_k_swap_in_before_write"
-                    )
-                ),
+                swap_mgr.get_index_k_cache(layer_id),
                 loc,
                 index_k,
                 profile_name="set_kv_buffer_kunpeng@index_k_hbm",
@@ -238,21 +269,29 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         """[num_slots, index_head_dim] bf16 flat index-K buffer.
 
-        Swap enabled: the current layer's HBM mirror (the access drains its
-        pending DDR->HBM SDMA events). Otherwise: this layer's DDR buffer.
-        Skip-topk (shared/S) layers never call this -- they have no buffer.
+        Swap enabled: the current layer's HBM mirror. Otherwise: this layer's
+        DDR buffer. Skip-topk (shared/S) layers never call this -- they have
+        no buffer. Layers in ``index_k_direct_layers`` always return their
+        DDR buffer (they are never mirrored into HBM).
+
+        The HBM mirror is already complete here: ``set_index_k_buffer`` drains
+        this layer's pending DDR->HBM copy events before writing the new
+        tokens, so no wait is needed on the read side.
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        # Leading full indexers read their index-K directly from DDR: they are
+        # never mirrored into HBM, so a recycled mirror (belonging to a later
+        # full layer) must not be returned here.
+        if layer_id in self.index_k_direct_layers:
+            return self._index_k_buf(layer_id)
         from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
             KunpengSwapManager,
         )
 
         swap_mgr = KunpengSwapManager.get_instance()
         if swap_mgr.enable_swap_index_k_in:
-            return swap_mgr.get_index_k_cache(
-                profile_name="kupl_sdma_wait_all@index_k_swap_in_before_read"
-            )
+            return swap_mgr.get_index_k_cache(layer_id)
         return self._index_k_buf(layer_id)
 
     def get_index_k_size_bytes(self) -> int:

@@ -159,7 +159,7 @@ ln -sfn "$LOG_DIR" "$LOG_BASE_DIR/latest/router"
 
 echo "[$(date +%T)] Launching gateway on $ROUTER_IP"
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-    "root@$ROUTER_IP" \
+    "$(ssh_target "$ROUTER_IP")" \
     "cd \"$PWD\" && bash runtime/server_router.sh \"$LOG_DIR\"" \
     >"$LOG_DIR/ssh_router.log" 2>&1 &
 

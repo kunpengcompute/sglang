@@ -89,10 +89,10 @@ def main():
     parser.add_argument('--apply', action='store_true', help='Actually delete selected completed log files')
     args = parser.parse_args()
     deploy = Path(os.environ['DEPLOY_DIR']).expanduser().resolve()
-    days = int(os.environ.get('QWEN_LOG_KEEP_DAYS', '7'))
-    runs = int(os.environ.get('QWEN_LOG_KEEP_RUNS', '5'))
+    days = int(os.environ.get('LOG_KEEP_DAYS', '7'))
+    runs = int(os.environ.get('LOG_KEEP_RUNS', '5'))
     if min(days, runs) < 1:
-        parser.error('QWEN_LOG_KEEP_DAYS and QWEN_LOG_KEEP_RUNS must be positive')
+        parser.error('LOG_KEEP_DAYS and LOG_KEEP_RUNS must be positive')
     if not deploy.is_dir():
         parser.error('DEPLOY_DIR does not exist')
     with (deploy / '.prune-logs.lock').open('a') as lock:

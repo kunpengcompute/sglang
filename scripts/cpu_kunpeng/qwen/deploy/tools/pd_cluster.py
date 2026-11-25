@@ -58,16 +58,13 @@ def role_runtime_overrides(role):
         'QWEN_DRAFT_RESIDENCY_V2': 'SGLANG_KUNPENG_QWEN_DRAFT_RESIDENCY_V2',
         'PREFILL_WORKSPACE_HBM': 'SGLANG_KUNPENG_QWEN_PREFILL_WORKSPACE_HBM',
         'GQA_DOUBLE_PAIR': 'SGLANG_KUNPENG_QWEN_GQA_DOUBLE_PAIR',
-        'LAST_MTP_MLP_TAIL': 'SGLANG_KUNPENG_MTP_MLP_TAIL',
-        'SDMA_THRESHOLD_PRESET': 'SGLANG_KUNPENG_SDMA_THRESHOLD_PRESET',
-        'SDMA_THRESHOLD': 'SGLANG_KUNPENG_SDMA_THRESHOLD',
         'IS_PREFILL': 'IS_PREFILL',
     }
     integers = {
-        'MAX_RUNNING_REQUESTS': 'QWEN_MAX_RUNNING_REQUESTS',
-        'MAX_TOTAL_TOKENS': 'QWEN_MAX_TOTAL_TOKENS',
+        'MAX_RUNNING_REQUESTS': 'MAX_RUNNING_REQUESTS',
+        'MAX_TOTAL_TOKENS': 'MAX_TOTAL_TOKENS',
         'MAX_SEQ_NUM': 'SGLANG_KUNPENG_MAX_SEQ_NUM',
-        'SHARED_HBW_SHM_MIB': 'SGLANG_KUNPENG_SHARED_HBW_SHM_PREFIX_MIB',
+        'SHARED_HBW_SHM_MIB': 'SHM_MIB',
         'GRAPH_MAX_REQUESTS': 'SGLANG_KUNPENG_QWEN_DECODE_MAX_REQUESTS',
         'GRAPH_MAX_TOKENS': 'SGLANG_KUNPENG_QWEN_DECODE_MAX_TOKENS',
     }
@@ -77,7 +74,7 @@ def role_runtime_overrides(role):
         value = os.environ.get(prefix + field, '').strip()
         if not value:
             continue  # Unspecified fields preserve the existing base config.
-        if field == 'SDMA_THRESHOLD' or field in integers:
+        if field in integers:
             if not re.fullmatch(r'[0-9]+', value) or int(value) < 1:
                 raise ValueError(prefix + field + '必须为正整数')
             value = str(int(value))
@@ -92,15 +89,10 @@ def role_runtime_overrides(role):
         raise ValueError('Qwen draft mirror reuse仅用于Decode；Prefill保持0')
     if role == 'prefill' and values.get('SGLANG_KUNPENG_QWEN_DRAFT_RESIDENCY_V2') == '1':
         raise ValueError('Qwen draft residency v2仅用于Decode；Prefill保持0')
-    shm = values.get('SGLANG_KUNPENG_SHARED_HBW_SHM_PREFIX_MIB')
+    shm = values.get('SHM_MIB')
     if shm is not None:
         if int(shm) >= 4000:
             raise ValueError(prefix + 'SHARED_HBW_SHM_MIB必须小于4000MiB总预算')
-        values.update(SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB=shm,
-                      SGLANG_KUNPENG_DECODE_SHM_SIZE_MB=shm)
-    if values.get('SGLANG_KUNPENG_SDMA_THRESHOLD_PRESET') == '1':
-        if values.get('SGLANG_KUNPENG_SDMA_THRESHOLD') != '5':
-            raise ValueError(prefix + 'SDMA_THRESHOLD_PRESET=1要求显式配置同角色SDMA_THRESHOLD=5')
     return values
 
 
@@ -123,8 +115,8 @@ def configuration():
     if not base.is_file():
         raise FileNotFoundError(base)
     ports = {name: int(os.environ.get(key, default)) for name, key, default in [
-        ('service_port', 'PD_SERVICE_PORT', '31086'), ('dist_port', 'PD_DIST_PORT', '29986'),
-        ('bootstrap_port', 'PD_BOOTSTRAP_PORT', '9001'), ('router_port', 'PD_ROUTER_PORT', '30000'),
+        ('service_port', 'SERVER_PORT', '31086'), ('dist_port', 'DIST_PORT', '29986'),
+        ('bootstrap_port', 'DISAGGREGATION_BOOTSTRAP_PORT', '9001'), ('router_port', 'PD_ROUTER_PORT', '30000'),
         ('metrics_port', 'PD_ROUTER_METRICS_PORT', '30010')]}
     if any(not 1 <= value <= 65535 for value in ports.values()) or ports['service_port'] > 55535:
         raise ValueError('端口无效；服务HTTP端口须<=55535（上游还派生HTTP+10000）')
@@ -160,9 +152,6 @@ def configuration():
         node_rank = index % layout['nnodes']
         first = (0 if role == 'prefill' else p) + index - node_rank
         runtime_overrides = dict(layout['runtime_overrides'])
-        tail = 'SGLANG_KUNPENG_MTP_MLP_TAIL'
-        if tail in runtime_overrides and (role != 'prefill' or node_rank != layout['pp_size'] - 1):
-            runtime_overrides[tail] = '0'
         nodes.append({'id': role + str(index), 'role': role, 'host': host, 'address': addr,
                       'instance_id': role + str(index // layout['nnodes']),
                       'node_rank': node_rank, 'pp_rank': node_rank,
@@ -194,18 +183,17 @@ def render(plan):
         folder = run / node['id']
         folder.mkdir()
         node.update(config=str(folder / 'config.sh'), state_file=str(folder / 'STATE.json'))
-        # Re-enter the same run.sh through the local node lifecycle. QWEN_PD_MODE
+        # Re-enter the same run.sh through the local node lifecycle. DISAGGREGATION_MODE
         # still selects the real prefill/decode server protocol in start.py.
-        overrides = dict(QWEN_DEPLOY_MODE='single',
-            QWEN_HOST=node['address'], QWEN_HTTP_PORT=plan['service_port'],
-            QWEN_DIST_PORT=plan['dist_port'], QWEN_PD_MODE=node['role'],
-            QWEN_TP_SIZE=node['tp_size'], QWEN_PP_SIZE=node['pp_size'],
-            QWEN_NNODES=node['nnodes'], QWEN_NODE_RANK=node['node_rank'],
-            QWEN_DIST_INIT_ADDR=node['dist_init_addr'],
+        overrides = dict(DEPLOY_MODE='single',
+            SERVER_HOST=node['address'], SERVER_PORT=plan['service_port'],
+            DIST_PORT=plan['dist_port'], DISAGGREGATION_MODE=node['role'],
+            TP_SIZE=node['tp_size'], PP_SIZE=node['pp_size'],
+            NNODES=node['nnodes'], NODE_RANK=node['node_rank'],
+            DIST_INIT_ADDR=node['dist_init_addr'],
             SGLANG_KUNPENG_PP_LAYOUT='node_block',
-            PP_SIZE=node['pp_size'],
-            QWEN_PD_BOOTSTRAP_PORT=plan['bootstrap_port'], QWEN_PD_IB_DEVICE=plan['ib_device'],
-            QWEN_CLUSTER_STATE_FILE=node['state_file'], QWEN_CLUSTER_TOKEN=plan['token'],
+            DISAGGREGATION_BOOTSTRAP_PORT=plan['bootstrap_port'], DISAGGREGATION_IB_DEVICE=plan['ib_device'],
+            CLUSTER_STATE_FILE=node['state_file'], CLUSTER_TOKEN=plan['token'],
             PD_START_TIMEOUT=plan['start_timeout'],
             CPU_REMAP_SAME_NUMA=0, SGLANG_ENABLE_TOKENIZER_SEPERATE=0, SGLANG_DISAGG_STAGING_BUFFER=0)
         overrides.update(node.get('runtime_overrides', {}))
@@ -286,7 +274,7 @@ def router_command(plan, env):
                 '--port', str(plan['router_port']), '--prometheus-port', str(plan['metrics_port']),
                 '--prometheus-host', '127.0.0.1', '--worker-startup-timeout-secs', str(plan['start_timeout']),
                 '--request-timeout-secs', '600', '--disable-retries']
-    command += ['--log-level', env.get('QWEN_LOG_LEVEL', 'warning').replace('warning', 'warn')]
+    command += ['--log-level', env.get('LOG_LEVEL', 'warning').replace('warning', 'warn')]
     if plan['router_cpus']:
         command = ['taskset', '-c', plan['router_cpus'], *command]
     return command

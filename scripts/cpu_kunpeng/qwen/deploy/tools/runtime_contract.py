@@ -68,7 +68,9 @@ def verify_kernel_source(source, build):
 def environment(dependencies_only=False):
     required = ['PYTHON', 'KUTACC_PREFIX', 'KUPL_PREFIX']
     if not dependencies_only:
-        required += ['SGLANG_SOURCE', 'MODEL']
+        required += ['SGLANG_SOURCE', 'MODEL_PATH']
+    if os.environ.get('SGLANG_KUNPENG_GDN_VERIFY_TILELANG') == '1':
+        required.append('TL_ROOT')
     for key in required:
         if not os.environ.get(key) or '请填写' in os.environ[key]:
             raise ValueError('先填写配置：' + key)
@@ -77,23 +79,25 @@ def environment(dependencies_only=False):
              Path(os.environ['KUPL_PREFIX']) / 'lib/libkupl.so']
     if not dependencies_only:
         paths += [Path(os.environ['SGLANG_SOURCE']) / 'python/sglang',
-                  Path(os.environ['MODEL']) / 'config.json',
+                  Path(os.environ['MODEL_PATH']) / 'config.json',
                   Path(os.environ['TILING_FILE']), Path(os.environ['CHAT_TEMPLATE'])]
     for path in paths:
         if not path.exists():
             raise FileNotFoundError(path)
     vendor = Path(os.environ['PYTHON']).parent.parent
-    kit = Path(os.environ.get('QWEN_PAYLOAD_ROOT', os.environ['QWEN_KIT']))
+    kit = Path(os.environ.get('DEPLOY_PAYLOAD_ROOT', os.environ['DEPLOY_TOOLS']))
     if (kit / 'RUNTIME_LOCK.json').is_file():
         for key, relative in [('SGLANG_SOURCE', 'app/sglang'), ('KERNEL_PACKAGE_ROOT', 'app/kernel')]:
             if Path(os.environ[key]).resolve() != (kit / relative).resolve():
                 raise ValueError('部署包必须使用包内应用：' + key)
     env = dict(os.environ)
     env['PYTHONPATH'] = ':'.join(p for p in [os.environ['SGLANG_SOURCE'] + '/python',
-                                           os.environ.get('KERNEL_PACKAGE_ROOT', '')] if p)
+        os.environ.get('KERNEL_PACKAGE_ROOT', ''),
+        os.environ.get('TL_ROOT', '') if env.get('SGLANG_KUNPENG_GDN_VERIFY_TILELANG') == '1' else ''] if p)
     env['LD_LIBRARY_PATH'] = ':'.join(p for p in [os.environ['KUTACC_PREFIX'] + '/lib',
         os.environ['KUPL_PREFIX'] + '/lib', str(vendor / 'lib'),
         str(vendor / 'lib/python3.12/site-packages/torch/lib'),
+        env.get('TVM_LIBRARY_PATH', '') if env.get('SGLANG_KUNPENG_GDN_VERIFY_TILELANG') == '1' else '',
         os.environ.get('COMPILER_RUNTIME_LIB', ''),
         os.environ.get('EXTRA_LIBRARY_PATH', ''), '/usr/lib64', '/lib64'] if p)
     env['LD_PRELOAD'] = os.environ['KUTACC_PREFIX'] + '/lib/libkutacc.so'
@@ -102,7 +106,7 @@ def environment(dependencies_only=False):
 
 def snapshot(env, dependencies, load_modules=True):
     """Probe the selected interpreter, including actual loaded library paths."""
-    code = '''import sys,sysconfig,platform,json,importlib.metadata as md,site,importlib.machinery as machinery
+    code = '''import os,sys,sysconfig,platform,json,importlib.metadata as md,site,importlib.machinery as machinery
 from pathlib import Path
 sys.path.extend(p for p in site.getsitepackages() if p not in sys.path)
 names=['torch','transformers','tokenizers','safetensors','numpy','fastapi','uvicorn','pyzmq','msgspec']
@@ -110,6 +114,11 @@ versions={}
 for name in names:
     try: versions[name]=md.version(name)
     except md.PackageNotFoundError: versions[name]=None
+if os.environ.get('SGLANG_KUNPENG_GDN_VERIFY_TILELANG') == '1':
+    import setuptools  # TVM needs its distutils shim under Python 3.12 / -S.
+    import tilelang,tilelang.language as T,tvm
+    if not hasattr(T,'sve'): raise RuntimeError('TileLang lacks Kunpeng T.sve support')
+    versions.update(tilelang=tilelang.__version__,tvm=tvm.__version__)
 imports={}
 for name in ('torch','sgl_kernel','sglang'):
     spec=machinery.PathFinder.find_spec(name,sys.path)
@@ -150,10 +159,12 @@ imports=imports)))'''.replace('LOAD_MODULES', repr(load_modules))
         path = Path(row['path']).resolve()
         if torch_dir in path.parents:
             native['torch/' + str(path.relative_to(torch_dir))] = sha256(path)
+        elif path.name in ('libtilelang_module.so', 'libtvm.so'):
+            native[path.name] = sha256(path)
     # Lock non-system numerical/compiler dependencies and what was really loaded.
     prefixes = ('libkupl.so', 'libkutacc.so', 'libomp.so', 'libopenblas.so',
                 'libflang', 'libbsmath', 'libtorch', 'libc10.so',
-                'libstdc++.so', 'libgcc_s.so')
+                'libstdc++.so', 'libgcc_s.so', 'libtilelang_module.so', 'libtvm.so')
     selected = {}
     for name, paths in dependencies['resolved'].items():
         if name.startswith(prefixes):

@@ -32,7 +32,7 @@ ln -sfn "$LOG_DIR" "$LOG_BASE_DIR/latest/store"
 echo "[$(date +%T)] Launching mooncake store service on $MOONCAKE_STORE_NODE:$MOONCAKE_STORE_PORT (segment $MOONCAKE_GLOBAL_SEGMENT_SIZE, master $MOONCAKE_MASTER)"
 
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-    "root@$MOONCAKE_STORE_NODE" \
+    "$(ssh_target "$MOONCAKE_STORE_NODE")" \
     "cd \"$PWD\" && mkdir -p \"$LOG_DIR\" && \
      setsid nohup sh ./runtime/server_store.sh \"$LOG_DIR\" \
        </dev/null >\"$LOG_DIR/store_service.log\" 2>&1 &" \
@@ -45,7 +45,7 @@ _store_ready_timeout="${MOONCAKE_STORE_READY_TIMEOUT:-300}"
 _ready=0
 for _ in $(seq 1 "$_store_ready_timeout"); do
     if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-        "root@$MOONCAKE_STORE_NODE" \
+        "$(ssh_target "$MOONCAKE_STORE_NODE")" \
         "ss -lnt | grep -q ':$MOONCAKE_STORE_PORT '"; then
         _ready=1
         break

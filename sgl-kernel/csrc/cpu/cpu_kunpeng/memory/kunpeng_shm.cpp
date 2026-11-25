@@ -25,9 +25,6 @@
 #include <cstdlib>
 #include <limits>
 #include <utility>
-#include <numa.h>
-#include <numaif.h>
-#include <sched.h>
 #include <cerrno>
 #include <fstream>
 #include <cstdint>
@@ -65,64 +62,6 @@ static int64_t shared_hbw_mib(const char *name, int64_t fallback)
     return value;
 }
 
-
-// A narrow thread policy is necessary because the vendor POSIX allocation API
-// zero-fills the local window before returning. Its POSIX mmap has no HBM policy.
-// Fence windows remain outside this scope and retain their caller DDR policy.
-class ScopedShmHBWPolicy {
-    int old_mode_ = 0;
-    unsigned long bits_ = 0;
-    std::vector<unsigned long> old_mask_;
-    std::vector<unsigned long> verify_mask_;
-    bool active_ = false;
-
-    bool restore_noexcept() noexcept {
-        if (!active_) return true;
-        if (set_mempolicy(old_mode_, old_mask_.data(), bits_) != 0) return false;
-        int mode = 0;
-        std::fill(verify_mask_.begin(), verify_mask_.end(), 0);
-        if (get_mempolicy(&mode, verify_mask_.data(), bits_, nullptr, 0) != 0) return false;
-        if (mode != old_mode_ || verify_mask_ != old_mask_) return false;
-        active_ = false;
-        return true;
-    }
-public:
-    ScopedShmHBWPolicy() {
-        const int cpu = sched_getcpu();
-        TORCH_CHECK(cpu >= 0, "Cannot identify caller CPU for SHM HBM policy");
-        const int cpu_node = numa_node_of_cpu(cpu);
-        const int hbm_node = cpu_node + 16;
-        TORCH_CHECK(cpu_node >= 0 && hbm_node <= numa_max_node(), "Missing near HBM node for caller");
-        const unsigned long word_bits = sizeof(unsigned long) * 8;
-        bits_ = ((static_cast<unsigned long>(numa_max_node()) + 1 + word_bits - 1) / word_bits) * word_bits;
-        old_mask_.assign(bits_ / word_bits, 0);
-        verify_mask_.assign(old_mask_.size(), 0);
-        TORCH_CHECK(get_mempolicy(&old_mode_, old_mask_.data(), bits_, nullptr, 0) == 0,
-                    "Cannot read original SHM caller memory policy: ", strerror(errno));
-        std::vector<unsigned long> target(old_mask_.size(), 0);
-        target[hbm_node / word_bits] = 1UL << (hbm_node % word_bits);
-        TORCH_CHECK(set_mempolicy(MPOL_BIND, target.data(), bits_) == 0,
-                    "Cannot bind SHM first touch to near HBM: ", strerror(errno));
-        active_ = true;
-        try {
-            int mode = 0;
-            std::vector<unsigned long> check(target.size(), 0);
-            TORCH_CHECK(get_mempolicy(&mode, check.data(), bits_, nullptr, 0) == 0
-                        && mode == MPOL_BIND && check == target,
-                        "SHM HBM first-touch memory policy did not take effect");
-        } catch (...) {
-            restore_checked();
-            throw;
-        }
-    }
-    void restore_checked() {
-        TORCH_CHECK(restore_noexcept(), "SHM caller original memory policy restoration failed: ", strerror(errno));
-    }
-    ~ScopedShmHBWPolicy() noexcept {
-        if (!restore_noexcept())
-            std::cerr << "[KuTACC] ERROR: SHM caller memory policy restore failed" << std::endl;
-    }
-};
 
 kupl_shm_win_h kupl_win_intra_node;
 kupl_shm_win_h kupl_win_intra_socket;
@@ -204,9 +143,9 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
         }
         // Use only the existing vendor entry point. Require explicit placement policy;
         // physical placement still must be verified from the actual returned mapping.
-        for (auto setting : {std::pair<const char *, const char *>{"KUPL_SHM_TYPE", g_split_hbw ? "posix" : "sls"},
-                             {"KUPL_SHM_ON_PACKAGE", g_split_hbw ? "n" : "y"},
-                             {"KUPL_SHM_ENABLE_HUGEPAGE", g_split_hbw ? "n" : "y"}}) {
+        for (auto setting : {std::pair<const char *, const char *>{"KUPL_SHM_TYPE", "sls"},
+                             {"KUPL_SHM_ON_PACKAGE", "y"},
+                             {"KUPL_SHM_ENABLE_HUGEPAGE", "y"}}) {
             const char *value = std::getenv(setting.first);
             TORCH_CHECK(value && std::strcmp(value, setting.second) == 0,
                         "Shared HBW requires ", setting.first, "=", setting.second);
@@ -251,21 +190,8 @@ void shm_pool_create_kunpeng(int64_t intra_node_pg, int64_t intra_socket_pg, int
     int success = kupl_shm_win_alloc(64, kupl_intra_socket_comm, (void **)&kupl_intra_socketfence_baseptr,
                                      &kupl_win_intra_socket);
     success = kupl_shm_win_alloc(64, kupl_intra_die_comm, (void **)&kupl_intra_diefence_baseptr, &kupl_win_intra_die);
-    if (g_split_hbw) {
-        ScopedShmHBWPolicy policy;
-        try {
-            // The vendor API's own memset performs the first touch under HBM.
-            success = kupl_shm_win_alloc(g_window_size, kupl_intra_node_comm,
-                                         (void **)&kupl_shm_baseptr, &kupl_win_intra_node);
-        } catch (...) {
-            policy.restore_checked();
-            throw;
-        }
-        policy.restore_checked();
-    } else {
-        success = kupl_shm_win_alloc(g_window_size, kupl_intra_node_comm,
-                                     (void **)&kupl_shm_baseptr, &kupl_win_intra_node);
-    }
+    success = kupl_shm_win_alloc(g_window_size, kupl_intra_node_comm,
+                                 (void **)&kupl_shm_baseptr, &kupl_win_intra_node);
 
     TORCH_CHECK(success == 0, "kupl_shm_win_alloc failed");
 

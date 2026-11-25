@@ -108,7 +108,7 @@ def main():
         "--model-loader-extra-config",
         '{"enable_multithread_load":false}',
         "--attention-backend",
-        os.environ.get("QWEN_ATTENTION_BACKEND", "kunpeng_cpu"),
+        os.environ.get("ATTENTION_BACKEND", "kunpeng_cpu"),
         "--trust-remote-code",
         "--host",
         args.host,
@@ -159,13 +159,13 @@ def main():
         "--chat-template",
         str(args.chat_template.resolve()),
         "--tool-call-parser",
-        os.environ.get("QWEN_TOOL_CALL_PARSER", "qwen3_coder"),
+        os.environ.get("TOOL_CALL_PARSER", "qwen3_coder"),
         "--reasoning-parser",
         "qwen3",
         "--log-level",
-        os.environ.get("QWEN_LOG_LEVEL", "warning"),
+        os.environ.get("LOG_LEVEL", "warning"),
         "--log-level-http",
-        os.environ.get("QWEN_LOG_LEVEL", "warning"),
+        os.environ.get("LOG_LEVEL", "warning"),
     ]
     base_env = json.loads(args.environment.read_text())
     base_env.update(SGLANG_KUNPENG_PP_LAYOUT="node_block", PP_SIZE=str(args.pp_size))
@@ -213,18 +213,14 @@ def main():
                 KUTACC_LIB=str(image / "lib"),
                 KUPL_LIB=str(image / "lib"),
             )
-            # taskset expands a scheduler-inherited single-CPU affinity before
-            # numactl validates the mask; the job cgroup still bounds permitted CPUs.
-            # Both bindings precede Python/ELF faults.
+            # Bind CPUs before Python/ELF faults. Native allocators select memory
+            # placement; SLS must be able to reserve hugepages on HBW nodes.
             base = rank * 38
             cpus = f"{base}-{base + 15},{base + 21}-{base + 36}"
             cmd = [
                 "taskset",
                 "-c",
                 cpus,
-                "numactl",
-                f"--physcpubind={cpus}",
-                f"--membind={rank}",
                 "/usr/bin/env",
                 *[f"{key}={value}" for key, value in env.items()],
                 str(image / "bin/python"),

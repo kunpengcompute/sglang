@@ -16,11 +16,13 @@
 Two independent switches, both default 0 (off):
 
 ``SGLANG_KUNPENG_KV_SHARE_GROUP``
-    0  (default) = every rank allocates its own KV pool (baseline)
+    0 / 1        = every rank allocates its own KV pool (baseline); 1 is an
+                   alias of 0 and means "no sharing"
     4 / 8 / 16   = that many consecutive TP ranks share ONE KV pool
 
 ``SGLANG_KUNPENG_INDEXER_SHARE_GROUP``
-    0  (default) = every rank allocates its own DSA index-K cache (baseline)
+    0 / 1        = every rank allocates its own DSA index-K cache (baseline);
+                   1 is an alias of 0 and means "no sharing"
     4 / 8 / 16   = that many consecutive TP ranks share ONE index-K pool
 
 The two pools live in SEPARATE segments, so they may use DIFFERENT group
@@ -106,8 +108,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 KV_SHARE_GROUP_DISABLED: int = 0
+#: A group size of 1 means a single-rank group, i.e. NOTHING is shared. It is
+#: accepted on input but normalized to :data:`KV_SHARE_GROUP_DISABLED` in
+#: :func:`get_share_group`, so every consumer only ever sees 0 or one of
+#: :data:`KV_SHARE_GROUP_CHOICES`.
+KV_SHARE_GROUP_NO_SHARE: int = 1
 #: Legal ``SGLANG_KUNPENG_KV_SHARE_GROUP`` / ``..._INDEXER_SHARE_GROUP`` values
-#: (besides 0).
+#: that actually turn sharing on (besides the no-share values 0 and 1).
 KV_SHARE_GROUP_CHOICES: Tuple[int, ...] = (4, 8, 16)
 
 #: The two pools a rank can share. Each kind has its own switch, its own group
@@ -254,19 +261,24 @@ def get_share_group(kind: str = POOL_KIND_KV) -> int:
 
     ``kv`` reads ``SGLANG_KUNPENG_KV_SHARE_GROUP``, ``indexer`` reads
     ``SGLANG_KUNPENG_INDEXER_SHARE_GROUP``. The two switches are independent.
+
+    A value of 1 ("one rank per group") shares nothing, so it is normalized to
+    0 here and every consumer can keep treating 0 as the single off value.
     """
     try:
         from sglang.srt.environ import envs
 
         if kind == POOL_KIND_INDEXER:
-            return int(envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get())
-        return int(envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get())
+            value = int(envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get())
+        else:
+            value = int(envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get())
+        return KV_SHARE_GROUP_DISABLED if value == KV_SHARE_GROUP_NO_SHARE else value
     except Exception:
         return KV_SHARE_GROUP_DISABLED
 
 
 def get_kv_share_group() -> int:
-    """Read ``SGLANG_KUNPENG_KV_SHARE_GROUP`` (0 = disabled)."""
+    """Read ``SGLANG_KUNPENG_KV_SHARE_GROUP`` (0 = disabled; 1 reads back as 0)."""
     return get_share_group(POOL_KIND_KV)
 
 
@@ -671,7 +683,7 @@ def _build_request(
     if group_size not in KV_SHARE_GROUP_CHOICES:
         raise SharedKvPoolError(
             f"{_env_name(kind)}={group_size} is not supported; "
-            f"valid values are 0 and {list(KV_SHARE_GROUP_CHOICES)}"
+            f"valid values are 0, 1 (no sharing) and {list(KV_SHARE_GROUP_CHOICES)}"
         )
     role = pool_role(model_runner)
     key = (kind, role)
@@ -1023,7 +1035,7 @@ def group_pool_budget_bytes(model_runner: Any) -> Optional[int]:
     if group_size not in KV_SHARE_GROUP_CHOICES:
         raise SharedKvPoolError(
             f"SGLANG_KUNPENG_KV_SHARE_GROUP={group_size} is not supported; "
-            f"valid values are 0 and {list(KV_SHARE_GROUP_CHOICES)}"
+            f"valid values are 0, 1 (no sharing) and {list(KV_SHARE_GROUP_CHOICES)}"
         )
     if not _is_920f_host():
         return None

@@ -209,10 +209,11 @@ parse_ranks() {
   echo "${ranks[*]}"
 }
 
-# Target host/port: defaults to ROUTER_IP (the gateway node), read from the
-# base env via `source env.sh none` (see the IP resolution below). CURL_HOST
-# still overrides it, e.g. to hit a standalone decode master directly for
-# fake-transfer decode-throughput tests:
+# Target host/port: defaults to this node's own NIC address (enp26s0f0, the
+# interface the runtime uses for Gloo/Mooncake), so it hits that node's own
+# service instead of the gateway. CURL_HOST overrides it, e.g. to hit a
+# standalone decode master directly for fake-transfer decode-throughput
+# tests, or another node's gateway:
 #   CURL_HOST=<decode master IP> ./curl.sh -d 0-15 -n 512 -m 384
 # With -F (fake transfer), the port auto-derives from the runtime layout
 # (same rule as runtime/env_decode.sh): 30001 + the decode entry's position
@@ -328,18 +329,19 @@ tokenizer_separate() {
   echo "${v:-1}"
 }
 
-# ROUTER_IP (the gateway node) lives in the base env: env.sh none loads
-# runtime/env_base.sh defaults plus .user_env.sh / .user_env_base.sh
-# overrides, then returns before any role config / conda activation. Source
-# it in a subshell so its INSTANCES / tokenizer defaults cannot clobber the
-# caller's exported overrides used by _side_entry / tokenizer_separate above.
-# CURL_HOST keeps the highest priority; localhost is only a last-resort
-# fallback when the base env defines no ROUTER_IP at all.
-CURL_BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROUTER_IP=$(SKIP_CONDA=1 bash -c '
-  source "$1/env.sh" none >/dev/null 2>&1
-  printf "%s" "${ROUTER_IP:-}"' _ "$CURL_BASE_DIR")
-IP=${CURL_HOST:-${ROUTER_IP:-127.0.0.1}}
+# Target host: this node's own NIC address by default, resolved the same way
+# the runtime does for Gloo/Mooncake (enp26s0f0), so the request hits the
+# service on this node instead of the gateway. CURL_HOST overrides it,
+# CURL_IFNAME picks another interface.
+_CURL_IF="${CURL_IFNAME:-${GLOO_SOCKET_IFNAME:-enp26s0f0}}"
+_CURL_LOCAL_IP="$(ifconfig "$_CURL_IF" 2>/dev/null |
+  grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
+# Fall back to the source address of the default route when the runtime NIC
+# is absent (login nodes, renamed interfaces), then to localhost.
+[ -n "$_CURL_LOCAL_IP" ] ||
+  _CURL_LOCAL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null |
+    grep -oP '(?<=src )\d+(\.\d+){3}')"
+IP=${CURL_HOST:-${_CURL_LOCAL_IP:-127.0.0.1}}
 if [ "$FAKE" = true ]; then
   PORT=${CURL_PORT:-$(resolve_decode_tok_port 0)}
 else
@@ -367,8 +369,8 @@ fi
 #     server itself, so the control request goes to
 #     http://<prefill|decode master>:30000 (the tokenizer port does not exist).
 #   - Native layout: the primary target (:30000).
-# Under the default primary target (router gateway :30000) the gateway is
-# skipped: it does not proxy control endpoints.
+# Under the default primary target (this node :30000) control requests go
+# straight to it; a gateway is not proxied.
 profile_req() {
   local action=$1 u urls prefill_ep decode_ep p
   if [ "$(tokenizer_separate)" = "1" ]; then

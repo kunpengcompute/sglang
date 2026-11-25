@@ -325,7 +325,8 @@ class MooncakeKVManager(CommonKVManager):
         """
         env_kv = envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get()
         env_indexer = envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get()
-        if env_kv == 0 and env_indexer == 0:
+        # 0 and 1 both mean "not shared": nothing to shard, nothing to log.
+        if env_kv <= 1 and env_indexer <= 1:
             return
         from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
             POOL_KIND_INDEXER,
@@ -2485,13 +2486,15 @@ class MooncakeKVReceiver(CommonKVReceiver):
         # involved.
         kv_shard_spec = None
         state_shard_spec = None
-        if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0:
+        # A group size of 1 (or 0) means no sharing, so the pool keeps the
+        # legacy full-copy path; only > 1 enables layer sharding.
+        if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() > 1:
             from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
                 pd_kv_shard_spec,
             )
 
             kv_shard_spec = pd_kv_shard_spec()
-        if envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() != 0:
+        if envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() > 1:
             from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
                 pd_indexer_shard_spec,
             )

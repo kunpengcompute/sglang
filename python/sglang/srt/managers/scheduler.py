@@ -40,7 +40,12 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    ModelImpl,
+    dsa_layer_skips_topk,
+    is_deepseek_nsa,
+)
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -277,6 +282,30 @@ _is_npu = is_npu()
 _is_cpu_920f = is_cpu_920f()
 _is_skip_http = is_skip_http()
 _enable_kunpeng_profile = envs.SGLANG_KUNPENG_PROFILE.get()
+
+# Under PP every stage must produce a batch for the same microbatch, so a stage
+# that waits for its HiCache prefetch must not skip the round (the downstream
+# stages would block in the proxy-tensor recv). Prefetch is retried for the queue
+# head, since the enqueue-time attempt is one-shot and gets lost under a burst.
+_PP_PREFETCH_WAIT_POLL_SEC = 0.02
+_PP_PREFETCH_WAIT_MAX_SEC = 180.0
+_PP_PREFETCH_QUERY_GRACE_SEC = 5.0
+_PP_PREFETCH_SCAN_MAX = 32
+_PP_PREFETCH_MAX_DEFER = 3
+
+
+def _pp_needs_prefetch_lockstep(scheduler) -> bool:
+    # Only meaningful with HiCache storage on and PP > 1 on 920F.
+    return (
+        _is_cpu_920f
+        and scheduler.enable_hicache_storage
+        and scheduler.server_args.pp_size > 1
+    )
+
+
+def _needs_prefetch_retry(scheduler) -> bool:
+    # Retrying the queue-head prefetch is PP-independent; 920F only.
+    return _is_cpu_920f and scheduler.enable_hicache_storage
 
 
 @dataclass
@@ -1261,6 +1290,13 @@ class Scheduler(
             # stale and only hurt acceptance, not the final answer.
             draft_kv_pool, _ = self._get_draft_kv_pool()
             controller = self.tree_cache.cache_controller
+            # The shared page blob keeps the PP1 layout, so every stage needs
+            # the model-wide geometry.
+            controller.set_flat_shard_layout(
+                self.model_config.hf_config.num_hidden_layers,
+                self._global_skip_topk_layers(),
+                draft_layers=self._draft_kv_layer_count(draft_kv_pool),
+            )
             if draft_kv_pool is not None:
                 controller.set_draft_kv_pool(draft_kv_pool)
             controller.finalize_l1l3_io()
@@ -1305,6 +1341,32 @@ class Scheduler(
             return
 
         self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+
+    def _draft_kv_layer_count(self, draft_kv_pool) -> int:
+        """MTP draft KV layers that the shared L3 page blob carries at its tail.
+
+        The draft pool only exists on the last PP stage, but every stage needs
+        the whole-object size, so the others fall back to the model's MTP layer
+        count (which is what that pool is built from).
+        """
+        if draft_kv_pool is not None:
+            return len(getattr(draft_kv_pool, "kv_buffer", None) or [])
+        return int(self.model_config.num_nextn_predict_layers or 0)
+
+    def _global_skip_topk_layers(self):
+        """Per-layer DSA skip-topk flags over every target layer.
+
+        None when the pool has no DSA indexer. The flags are a pure function of
+        the global layer id, so every PP stage derives the same list and thus
+        the same index-K offsets inside the shared L3 page blob.
+        """
+        hf_config = self.model_config.hf_config
+        if not is_deepseek_nsa(hf_config):
+            return None
+        return [
+            dsa_layer_skips_topk(hf_config, layer_id)
+            for layer_id in range(int(hf_config.num_hidden_layers))
+        ]
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -2259,17 +2321,26 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            l1l3_only = getattr(self.tree_cache, "l1l3_only", False)
             last_host_node = req.last_host_node
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            if l1l3_only:
+                # A storage-only anchor holds no L1 pages: anchoring there would
+                # fetch only the tail beyond it and never bring the evicted pages
+                # back (a repeated prompt would be fully recomputed). Anchor at
+                # the device-resident node instead; the publish path promotes the
+                # covered storage-only nodes.
+                last_host_node = req.last_node
+                matched_len = len(req.prefix_indices)
             # In the two-tier mode (no L2 pool) the anchor is "this prefix is in
             # L3" rather than "this prefix is backed up in host memory".
             anchor_ready = (
                 self.tree_cache.is_storage_indexed(last_host_node)
-                if getattr(self.tree_cache, "l1l3_only", False)
+                if l1l3_only
                 else last_host_node.backuped
             )
             if anchor_ready or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
-                matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (
@@ -2284,6 +2355,97 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+
+    def _retry_prefetch_waiting_head(self) -> None:
+        """Retry the one-shot enqueue-time prefetch for the queue head."""
+        cc = getattr(self.tree_cache, "cache_controller", None)
+        if cc is None:
+            return
+        pending = getattr(self.tree_cache, "ongoing_prefetch", {})
+        scanned = 0
+        for req in self.waiting_queue:
+            if scanned >= _PP_PREFETCH_SCAN_MAX:
+                break
+            scanned += 1
+            if req.rid in pending:
+                continue
+            if len(req.prefix_indices) + self.page_size >= len(req.fill_ids):
+                # Already device-resident: skip the radix walk.
+                continue
+            if cc.prefetch_rate_limited():
+                break
+            try:
+                self._prefetch_kvcache(req)
+            except Exception:
+                logger.warning(
+                    "[hicache] PP prefetch retry failed: req=%s",
+                    req.rid,
+                    exc_info=True,
+                )
+
+    def _pp_prefetch_gate(self, req: Req, allow_skip: bool) -> bool:
+        """Wait (bounded) for this request's prefetch; defer it while L1 is short.
+
+        Fetching a full prefix from L3 is an order of magnitude cheaper than
+        recomputing it, so a request whose prefetch cannot get L1 space is
+        skipped instead of computed: the next scheduling round retries it while
+        other runnable requests keep the PP ring fed. After
+        _PP_PREFETCH_MAX_DEFER failed attempts it is computed without the L3
+        prefix. Returning False is only allowed when the batch already has
+        other requests, so a round is never dropped entirely.
+        """
+        rid = req.rid
+        start = time.monotonic()
+        deadline = start + _PP_PREFETCH_WAIT_MAX_SEC
+        counts = getattr(self, "_prefetch_defer_count", None)
+        if counts is None:
+            counts = {}
+            self._prefetch_defer_count = counts
+        while True:
+            if self.tree_cache.check_prefetch_progress(rid):
+                counts.pop(rid, None)
+                return True
+            pending = getattr(self.tree_cache, "ongoing_prefetch", {})
+            if rid not in pending:
+                tries = counts.get(rid, 0) + 1
+                if tries > _PP_PREFETCH_MAX_DEFER:
+                    counts.pop(rid, None)
+                    return True
+                if len(counts) > 1024:
+                    for stale in list(counts)[:512]:
+                        counts.pop(stale, None)
+                counts[rid] = tries
+                self._prefetch_kvcache(req)
+                if rid in getattr(self.tree_cache, "ongoing_prefetch", {}):
+                    continue
+                return not allow_skip
+            entry = pending.get(rid)
+            operation = entry[3] if entry is not None else None
+            # The hit query normally fills hash_value within ~100ms. Staying
+            # empty means the prefetch was revoked (hit below threshold); every
+            # stage sees the same condition, so skipping this round is
+            # consistent as long as the batch has other requests.
+            if (
+                operation is not None
+                and not getattr(operation, "hash_value", None)
+                and time.monotonic() - start > _PP_PREFETCH_QUERY_GRACE_SEC
+            ):
+                logger.debug(
+                    "[hicache] PP prefetch wait: req=%s has no hash after %.1fs",
+                    rid,
+                    _PP_PREFETCH_QUERY_GRACE_SEC,
+                )
+                return not allow_skip
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "[hicache] PP prefetch wait exceeded %.0fs: req=%s, "
+                    "scheduling without the L3 prefix",
+                    _PP_PREFETCH_WAIT_MAX_SEC,
+                    rid,
+                )
+                counts.pop(rid, None)
+                return True
+            time.sleep(_PP_PREFETCH_WAIT_POLL_SEC)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2764,6 +2926,9 @@ class Scheduler(
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
+        if _needs_prefetch_retry(self):
+            # The enqueue-time prefetch is one-shot and can be lost under a burst.
+            self._retry_prefetch_waiting_head()
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
@@ -2799,6 +2964,16 @@ class Scheduler(
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done and _needs_prefetch_retry(self):
+                    # PP>1: never drop the round, or the downstream stage waits
+                    # for this stage's proxy tensors forever. PP=1 has no ring,
+                    # so the request may always be deferred (bounded by
+                    # _PP_PREFETCH_MAX_DEFER) instead of recomputed right away.
+                    allow_skip = (
+                        not _pp_needs_prefetch_lockstep(self)
+                        or len(adder.can_run_list) > 0
+                    )
+                    prefetch_done = self._pp_prefetch_gate(req, allow_skip=allow_skip)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
@@ -2808,6 +2983,20 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.enable_hicache_storage
+                and req.storage_hit_length
+                and envs.SGLANG_HICACHE_DEBUG.get()
+            ):
+                logger.info(
+                    "[hicache] prefill match: req=%s, storage_hit=%d, "
+                    "device_hit=%d, extend=%d, seqlen=%d",
+                    req.rid,
+                    req.storage_hit_length,
+                    len(req.prefix_indices),
+                    req.extend_input_len,
+                    req.seqlen,
+                )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

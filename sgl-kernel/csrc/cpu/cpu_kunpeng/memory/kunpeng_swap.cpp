@@ -36,17 +36,8 @@ int64_t get_sdma_event_num()
 
 void kupl_sdma_init_torch(int64_t sdmathreshold)
 {
-    const auto env_is = [](const char *name, const char *expected) {
-        const char *value = std::getenv(name);
-        return value && std::strcmp(value, expected) == 0;
-    };
-    if (env_is("SGLANG_KUNPENG_SDMA_THRESHOLD_PRESET", "1")) {
-        // The launcher must retain the privileged helper's threshold=5 readback
-        // receipt. Ordinary workers do not need direct /dev/mem access here.
-        TORCH_CHECK(env_is("SGLANG_USE_CPU_920F", "1") &&
-                        env_is("SGLANG_KUNPENG_QWEN", "1") && sdmathreshold == 5,
-                    "SDMA threshold preset requires Qwen CPU920F and threshold 5");
-    } else {
+    const char *noroot = std::getenv("SGLANG_ENABLE_NOROOT_USER");
+    if (!(noroot && std::strcmp(noroot, "1") == 0)) {
         TORCH_CHECK(SdmaCtlThredInit() == 0,
                     "SDMA threshold initialization failed; cannot map /dev/mem");
         SetSdmaThreshold(sdmathreshold);

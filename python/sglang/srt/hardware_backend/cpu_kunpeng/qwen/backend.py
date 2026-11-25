@@ -428,7 +428,7 @@ def conv_decode(x, state, weight, bias, activation, conv_state_indices, **kwargs
             kwargs["intermediate_state_indices"],
         )
     get_capabilities().require_decode(x.shape[0], x.shape[0])
-    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1" and 8 <= x.shape[0] <= 32:
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_CONV_REQUEST_PARALLEL", "0") == "1" and 8 <= x.shape[0] <= 32:
         return ops.qwen_p2_decode_conv_requests(contiguous(x), state, weight, conv_state_indices)
     return ops.qwen_causal_conv(contiguous(x), state, weight, conv_state_indices)
 
@@ -800,11 +800,11 @@ class QwenGatedRMSNorm(RMSNorm):
         if x.shape[0] <= 96:
             from .norm_rowgroups_full_occupancy import decode_norm
             return decode_norm(contiguous(x), self.weight, contiguous(z), self.eps)
-        if os.environ.get("SGLANG_KUNPENG_P2_NORM_REDUCE_KEEP_SILU", "0") == "1":
+        if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_NORM_REDUCE_KEEP_SILU", "0") == "1":
             from . import prefill_graph
             prefill_graph.register()
             activated = ops.tensor_unary(cast(z, torch.float32), 5)
-            width = int(os.environ["SGLANG_KUNPENG_P2_REFERENCE_VECTOR_WIDTH"])
+            width = int(os.environ["SGLANG_KUNPENG_QWEN_GDN_NORM_VECTOR_WIDTH"])
             return ops.qwen_p2_norm_reduce_keep_silu(x, self.weight, activated, float(self.eps), width)
         original = x.dtype
         x, z, weight = cast(x, torch.float32), cast(z, torch.float32), cast(self.weight, torch.float32)

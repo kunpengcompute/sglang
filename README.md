@@ -264,6 +264,46 @@ runtime/env_base.sh（共享默认值；内部依次加载.user_env.sh与runtime
 
 角色默认值：prefill侧`SGLANG_KUNPENG_MAX_SEQ_NUM=8`、`SGLANG_KUNPENG_MAX_CUR_LEN=576`（native取同prefill侧值）；decode侧`SGLANG_KUNPENG_MAX_SEQ_NUM=64`、`SGLANG_KUNPENG_MAX_CUR_LEN=1`（开启MTP时自动取`SGLANG_SPECULATIVE_NUM_STEPS+1`）。
 
+#### 3.4.1 非root用户部署（root_proxy）
+
+默认流程以root登录各节点，直接执行`insmod`、写`/sys`大页、写`/proc/sys/vm/drop_caches`。若集群只提供普通用户，可用下面两个变量切到"非root + 站点root代理"模式：
+
+```bash
+# runtime/.user_env_base.sh（或 .user_env.sh）
+export SGLANG_ENABLE_NOROOT_USER=1
+export SGLANG_KUNPENG_NOROOT_PROXY_PATH="/path/to/root_proxy_dir"
+```
+
+- **SGLANG\_ENABLE\_NOROOT\_USER**：`1`开启非root模式，默认`0`，root流程完全保持原样。开启后SSH不再使用`root@`，所有特权操作改由站点提供的setuid代理`root_proxy`执行。
+- **SGLANG\_KUNPENG\_NOROOT\_PROXY\_PATH**：代理目录，需包含`root_proxy`、`sgl_reload_sdma.sh`、`sgl_reload_zcopy.sh`、`sdma_threshold.sh`、`hugepage_2m.sh`、`sgl_drop_cache.sh`、`sgl_hugepage_perm.sh`；可选`sgl_clean_shm.sh`用于清理root遗留的`/dev/shm`段。`root_proxy`用法为`root_proxy <脚本名> [参数...]`，脚本名不能带`/`（代理只在自己目录下解析脚本）。
+
+特权操作与代理脚本对应关系：
+
+| 操作 | root模式（默认） | 非root模式 |
+| --- | --- | --- |
+| 重载SDMA驱动 / 写阈值寄存器 | `rmmod`+`insmod`，直接写寄存器 | `root_proxy sgl_reload_sdma.sh` / `sdma_threshold.sh` |
+| 加载 zcopy 驱动（创建`/dev/zdax`） | `insmod mod/zcopy_kylin.ko` | `root_proxy sgl_reload_zcopy.sh` |
+| 放行`/dev/zdax`（kupl SLS 必需） | 无需处理 | `root_proxy sgl_hugepage_perm.sh`（每节点启动时自动执行） |
+| 每rank 2M大页 | 直接写`nr_hugepages` | `root_proxy hugepage_2m.sh <count> <node>` |
+| 回收大页 | 直接写`nr_hugepages` | `root_proxy hugepage_2m.sh 0 <node>` |
+| 清`/dev/shm` | `rm -rf /dev/shm/*` | `root_proxy sgl_clean_shm.sh`（缺失时尽力删除本用户段） |
+| `drop_caches` | 直接写 | `root_proxy sgl_drop_cache.sh` |
+
+`sgl_hugepage_perm.sh` 参考内容（只做两件事：放行SLS设备、给`/dev/hugepages`写权限）：
+
+```bash
+#!/bin/bash
+[ -e /dev/zdax ] && { chgrp eapp /dev/zdax; chmod 660 /dev/zdax; }
+chmod 1777 /dev/hugepages 2>/dev/null
+exit 0
+```
+
+注意事项：
+
+- **`KUPL_SHM_ENABLE_HUGEPAGE` 必须保持 `y`**（默认值）。若设为`n`，kupl SLS建立共享内存窗口时会把进程mempolicy残留绑定到CPU节点（该节点大页已被清0），导致随后sgl-kernel的HBW权重池`mmap MAP_HUGETLB`返回`ENOMEM`（日志`FAILED: errno=12` + `mmap with MAP_HUGETLB failed`）。可额外设置`SGLANG_KUNPENG_HBW_BIND_BEFORE_MMAP=1`作为双保险（mmap前临时绑定HBM节点，用完恢复）。
+- kupl SLS生效的唯一条件是`open("/dev/zdax", O_RDWR)`成功；失败时打印`sls init failed`并回退posix。若某节点缺少`/dev/zdax`，该节点只能走posix，存在`kupl_parallel_for`死锁风险，建议先确认设备的注册情况（`/sys/class/zcopy/zdax/dev`）。
+- 大页的`nr_hugepages`是root-only sysfs，非root直接写入必然`EACCES`，必须走代理。
+
 ### 3.5 PD分离部署
 
 PD分离模式下tokenizer默认与推理进程分离（`SGLANG_ENABLE_TOKENIZER_SEPERATE=1`，由`env_base.sh`按角色自动设置；native模式默认关闭）。请求路径为：客户端→SGLang Model Gateway（router节点）→各侧tokenizer HTTP server（router节点，prefill侧默认端口30001、decode侧默认30002）→prefill/decode集群。Model Gateway的后端地址是tokenizer端口而非推理master的30000端口，每个prefill后端同时携带该实例的bootstrap端口（默认9001）用于KV传输引导。

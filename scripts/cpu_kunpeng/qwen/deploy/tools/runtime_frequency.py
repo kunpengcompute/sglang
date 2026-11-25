@@ -21,7 +21,7 @@ def start(output_jsonl: Path, plan_path: Path, interval_s: float = 1.0) -> dict:
     """Start a read-only sampler; caller must call stop() before cleanup begins."""
     if output_jsonl.exists() or output_jsonl.is_symlink():
         raise FileExistsError(output_jsonl)
-    mode = os.environ.get('QWEN_FREQUENCY_LOG', 'summary')
+    mode = os.environ.get('FREQUENCY_LOG', 'summary')
     if mode not in ('summary', 'full'):
         raise ValueError('QWEN_FREQUENCY_LOG须为summary或full')
     plan = json.loads(plan_path.read_text(encoding="utf-8"))

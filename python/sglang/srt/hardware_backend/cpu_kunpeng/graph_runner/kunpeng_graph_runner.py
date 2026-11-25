@@ -1753,16 +1753,16 @@ class KunpengGraphRunner:
                 if buf is not None:
                     fixed.append(buf)
         if self.swap_mgr.enable_swap_index_k_in:
-            # The recycled HBM index-K mirror and its dedicated SDMA event
-            # table are persistent fixed-address storages, exactly like the
+            # Both recycled HBM index-K mirrors and their dedicated SDMA event
+            # tables are persistent fixed-address storages, exactly like the
             # main-KV swap buffers above. kupl_sdma_kv_swapin takes them as
-            # non-return-value parameters during capture, so they must be
-            # registered as fixed storage before capture or lookup_or_register
-            # fails on the first (HBM destination) parameter.
+            # non-return-value parameters during capture, so every buffer /
+            # table used by the ping-pong pipeline must be registered before
+            # capture or lookup_or_register fails on the HBM destination.
             for buf in (
-                self.swap_mgr._cur_index_k_hbm,
-                self.swap_mgr._index_k_swap_in_event_tensor,
-                self.swap_mgr._index_k_swap_in_event_num_tensor,
+                self.swap_mgr._index_k_hbm_buffers
+                + self.swap_mgr._index_k_swap_in_event_tensors
+                + self.swap_mgr._index_k_swap_in_event_num_tensors
             ):
                 if buf is not None:
                     fixed.append(buf)

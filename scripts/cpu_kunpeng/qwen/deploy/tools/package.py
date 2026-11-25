@@ -48,7 +48,7 @@ def build(kit, deploy):
         stage.mkdir()
         for name in ('run.sh', 'start.py', 'config.example.sh', 'README.md', 'VERSION.json'):
             shutil.copy2(kit / name, stage / name)
-        shutil.copy2(env['QWEN_CONFIG_PATH'], stage / 'config.sh')
+        shutil.copy2(env['DEPLOY_CONFIG'], stage / 'config.sh')
         copy_tree(kit / 'tools', stage / 'tools')
         shutil.copy2(receipt, stage / 'KERNEL_BUILD.json')
         (stage / 'app/sglang/python').mkdir(parents=True)
@@ -88,9 +88,9 @@ def build(kit, deploy):
         # The external config remains editable and outside payload integrity checks.
         config = (stage / 'config.sh').read_text()
         config = config.replace('export SGLANG_SOURCE="/请填写/sglang"',
-                                'export SGLANG_SOURCE="${QWEN_KIT}/app/sglang"')
+                                'export SGLANG_SOURCE="${DEPLOY_TOOLS}/app/sglang"')
         config = config.replace('export KERNEL_PACKAGE_ROOT=""',
-                                'export KERNEL_PACKAGE_ROOT="${QWEN_KIT}/app/kernel"')
+                                'export KERNEL_PACKAGE_ROOT="${DEPLOY_TOOLS}/app/kernel"')
         (stage / 'config.sh').write_text(config)
         manifest = {str(p.relative_to(stage)): sha256(p) for p in sorted(stage.rglob('*'))
                     if p.is_file() and p != stage / 'config.sh'}
@@ -99,7 +99,7 @@ def build(kit, deploy):
         release = deploy / 'release'
         stage.rename(release)
     # NUMA images reference the final frozen app, never a temporary staging path.
-    image_env = dict(env, QWEN_KIT=str(release),
+    image_env = dict(env, DEPLOY_TOOLS=str(release),
                      SGLANG_SOURCE=str(release / 'app/sglang'),
                      KERNEL_PACKAGE_ROOT=str(release / 'app/kernel'))
     image_env['PYTHONPATH'] = str(release / 'app/sglang/python') + ':' + str(release / 'app/kernel')
@@ -130,4 +130,4 @@ def build(kit, deploy):
 
 
 if __name__ == '__main__':
-    build(Path(os.environ['QWEN_KIT']), Path(os.environ['DEPLOY_DIR']).expanduser().resolve())
+    build(Path(os.environ['DEPLOY_TOOLS']), Path(os.environ['DEPLOY_DIR']).expanduser().resolve())

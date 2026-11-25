@@ -9,6 +9,8 @@ from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     get_nsa_index_head_dim,
     is_deepseek_nsa,
+    leading_full_indexer_layers,
+    leading_indexer_layer_ids,
 )
 from sglang.srt.distributed.parallel_state import (
     get_pp_group,
@@ -41,6 +43,7 @@ from sglang.srt.utils.common import (
     is_cpu_920f,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_kunpeng_swap_index_k_in,
     is_npu,
     is_cpu,
 )
@@ -559,6 +562,28 @@ class ModelRunnerKVCacheMixin:
                     )
                 ]
 
+                # Leading FULL indexers (GLM-5.3: layers 0/1/2) run
+                # back-to-back, so the single recycled HBM index-K swap buffer
+                # cannot hide its whole-pool DDR->HBM DMA under shared-layer
+                # compute. Keep that leading run in DDR (direct read/write)
+                # and start the swap at the 4th indexer (the first full layer
+                # after a shared gap). Derived from the model config, so no
+                # extra switch is needed: models without a shared gap (or with
+                # a single leading full indexer) keep legacy behaviour.
+                if is_kunpeng_swap_index_k_in():
+                    direct_ids = leading_indexer_layer_ids(
+                        self.model_config.hf_config,
+                        leading_full_indexer_layers(self.model_config.hf_config),
+                    )
+                    kunpeng_kwargs["index_k_direct_layers"] = direct_ids
+                    logger.info(
+                        "Kunpeng index-K swap: %d leading full indexer(s) %s "
+                        "stay in DDR (direct read/write); swap starts at the "
+                        "next full indexer",
+                        len(direct_ids),
+                        sorted(direct_ids),
+                    )
+
                 # --- shared pools (920F GLM-5) ---------------------------
                 # Two independent switches, both off by default: the KV pool
                 # (SGLANG_KUNPENG_KV_SHARE_GROUP) and the DSA index-K pool
@@ -568,10 +593,12 @@ class ModelRunnerKVCacheMixin:
                 # NO rank allocates a private buffer of that kind. Any failure
                 # raises SharedKvPoolError and aborts startup -- there is
                 # deliberately NO fallback to per-rank pools.
-                # With both switches off this block is a no-op.
+                # With both switches off this block is a no-op. A value of 1
+                # means no sharing (alias of 0) and is skipped as well; only
+                # group sizes > 1 enter the shared-pool path.
                 if (
-                    envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0
-                    or envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() != 0
+                    envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() > 1
+                    or envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() > 1
                 ):
                     from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
                         shared_pool_requests,
