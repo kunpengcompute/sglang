@@ -18,6 +18,11 @@ The trace is accumulated by the C++ ``record_expert_activation_kunpeng`` op
 (a graph-replay-safe in-place counter registered as a fixed tensor) and the
 JSON is rewritten at the end of every forward batch; an ``atexit`` hook also
 saves one final time on process exit.
+
+This dump exists only for the DeepSeek redundant-expert offline pipeline
+(1.5 experts/rank, ``ep512_mutil_experts*.json``). It is disabled by default;
+do not enable it on other models -- use the EPLB expert-distribution recorder
+instead.
 """
 
 import atexit
@@ -36,8 +41,15 @@ logger = logging.getLogger(__name__)
 
 _AT_TRACE_SUBDIR = "at_trace"
 
-# Enabled by default; set SGLANG_KUNPENG_SAVE_AT_TRACE=0 to disable.
-_IS_ENABLED = os.environ.get("SGLANG_KUNPENG_SAVE_AT_TRACE", "1") != "0"
+# DeepSeek redundant-expert pipeline only. Disabled unless explicitly enabled.
+_IS_ENABLED = os.environ.get("SGLANG_KUNPENG_SAVE_AT_TRACE", "0") == "1"
+
+if _IS_ENABLED:
+    logger.warning(
+        "[ATTrace] SGLANG_KUNPENG_SAVE_AT_TRACE=1: this dump is only for the "
+        "DeepSeek redundant-expert (1.5 experts/rank) offline pipeline; do not "
+        "enable it on other models."
+    )
 
 
 class _ActivationTraceState:

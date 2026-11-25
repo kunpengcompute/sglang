@@ -15,6 +15,7 @@
  */
 
 #include <ATen/Tensor.h>
+#include <c10/util/Optional.h>
 #include <torch/library.h>
 
 #include <random>
@@ -25,13 +26,15 @@
 // remap_topk_ids_to_rank_slot_kunpeng
 //
 // Map logical expert ids to (peer_rank, local_slot) pairs for the Kunpeng
-// RDMA dispatcher and write them into the interleaved SHM buffer.
+// dispatchers and write them into the interleaved SHM buffer.
 //
-// ``grouped_topk_kunpeng`` writes logical expert ids into the even columns
-// of ``topk_ids_index_buf`` and leaves the odd columns (local slot) as
-// zero.  The kutacc dispatch kernel reads the interleaved pairs as
-// ``(peer_rank, local_expert)``, so redundant/EPLB layouts must remap
-// logical ids to their physical slots first.  This mirrors the CUDA
+// The interleaved buffer holds ONE canonical encoding shared by every
+// consumer (the kutacc RDMA dispatch kernel, moe_local_dispatch_kunpeng /
+// moe_local_sum_kunpeng): even columns = peer rank, odd columns = local
+// expert slot.  Producers: this kernel (from the EPLB dispatch map; the
+// non-EPLB trivial layout reuses it with the identity gather table where
+// physical slot == logical id, see _kunpeng_publish_topk_ids_rank_slot), its
+// dynamic-remap variant, and the ETP remap.  This mirrors the CUDA
 // ``topk_ids_logical_to_physical`` step and the reference
 // ``topk_ids2rank_slot`` op.
 //
@@ -55,7 +58,9 @@ void remap_topk_ids_to_rank_slot_impl(const int16_t *ids, int64_t ids_stride0, i
             TORCH_CHECK(logical >= 0 && logical < num_logical_experts,
                         "remap_topk_ids_to_rank_slot_kunpeng: logical expert id ", logical,
                         " out of range [0, ", num_logical_experts, ")");
-            int64_t physical = dispatch_map[logical];
+            // Identity mode (dispatch_map == nullptr, from python None): the
+            // trivial layout keeps physical slot == logical id.
+            int64_t physical = (dispatch_map != nullptr) ? dispatch_map[logical] : logical;
             int64_t rank = (physical / num_local_physical_experts) * moe_tp_size;
             int64_t local = physical % num_local_physical_experts;
             buf[i * buf_stride0 + (2 * j) * buf_stride1] = static_cast<int16_t>(rank);
@@ -66,7 +71,8 @@ void remap_topk_ids_to_rank_slot_impl(const int16_t *ids, int64_t ids_stride0, i
 
 }  // namespace
 
-void remap_topk_ids_to_rank_slot_kunpeng(at::Tensor topk_ids, at::Tensor full_buf, at::Tensor dispatch_map,
+void remap_topk_ids_to_rank_slot_kunpeng(at::Tensor topk_ids, at::Tensor full_buf,
+                                         const c10::optional<at::Tensor> &dispatch_map,
                                          int64_t num_physical_experts, int64_t ep_size, int64_t moe_tp_size)
 {
     TORCH_CHECK(topk_ids.scalar_type() == at::kShort, "remap_topk_ids_to_rank_slot_kunpeng: topk_ids must be int16");
@@ -77,9 +83,17 @@ void remap_topk_ids_to_rank_slot_kunpeng(at::Tensor topk_ids, at::Tensor full_bu
                 "remap_topk_ids_to_rank_slot_kunpeng: full_buf rows must match topk_ids rows");
     TORCH_CHECK(full_buf.size(1) == topk_ids.size(1) * 2,
                 "remap_topk_ids_to_rank_slot_kunpeng: full_buf cols must be 2 * topk");
-    TORCH_CHECK(dispatch_map.dim() == 1, "remap_topk_ids_to_rank_slot_kunpeng: dispatch_map must be 1D");
-    TORCH_CHECK(dispatch_map.scalar_type() == at::kLong || dispatch_map.scalar_type() == at::kInt,
-                "remap_topk_ids_to_rank_slot_kunpeng: dispatch_map must be int64 or int32");
+    // dispatch_map may be None: the trivial non-EPLB layout
+    // keeps physical slot == logical id, so no gather table is needed.
+    // An undefined tensor reaches the optional with has_value() == true
+    // (graph replay materializes a captured None that way), so treat it as
+    // "no map" too instead of failing the dtype check below.
+    const bool identity_map = !dispatch_map.has_value() || !dispatch_map->defined();
+    if (!identity_map) {
+        TORCH_CHECK(dispatch_map->dim() == 1, "remap_topk_ids_to_rank_slot_kunpeng: dispatch_map must be 1D");
+        TORCH_CHECK(dispatch_map->scalar_type() == at::kLong || dispatch_map->scalar_type() == at::kInt,
+                    "remap_topk_ids_to_rank_slot_kunpeng: dispatch_map must be int64 or int32");
+    }
     TORCH_CHECK(num_physical_experts > 0 && ep_size > 0 && moe_tp_size > 0,
                 "remap_topk_ids_to_rank_slot_kunpeng: sizes must be positive");
     TORCH_CHECK(num_physical_experts % ep_size == 0,
@@ -94,15 +108,21 @@ void remap_topk_ids_to_rank_slot_kunpeng(at::Tensor topk_ids, at::Tensor full_bu
 
     const int16_t *ids = topk_ids.data_ptr<int16_t>();
     int16_t *buf = full_buf.data_ptr<int16_t>();
-    int64_t num_logical_experts = dispatch_map.size(0);
+    // In identity mode every logical id must be a valid physical slot.
+    int64_t num_logical_experts = identity_map ? num_physical_experts : dispatch_map->size(0);
 
-    if (dispatch_map.scalar_type() == at::kLong) {
+    if (identity_map) {
         remap_topk_ids_to_rank_slot_impl(ids, topk_ids.stride(0), topk_ids.stride(1), buf, full_buf.stride(0),
-                                         full_buf.stride(1), num_tokens, topk, dispatch_map.data_ptr<int64_t>(),
+                                         full_buf.stride(1), num_tokens, topk,
+                                         static_cast<const int64_t *>(nullptr),
+                                         num_logical_experts, num_local_physical_experts, moe_tp_size);
+    } else if (dispatch_map->scalar_type() == at::kLong) {
+        remap_topk_ids_to_rank_slot_impl(ids, topk_ids.stride(0), topk_ids.stride(1), buf, full_buf.stride(0),
+                                         full_buf.stride(1), num_tokens, topk, dispatch_map->data_ptr<int64_t>(),
                                          num_logical_experts, num_local_physical_experts, moe_tp_size);
     } else {
         remap_topk_ids_to_rank_slot_impl(ids, topk_ids.stride(0), topk_ids.stride(1), buf, full_buf.stride(0),
-                                         full_buf.stride(1), num_tokens, topk, dispatch_map.data_ptr<int32_t>(),
+                                         full_buf.stride(1), num_tokens, topk, dispatch_map->data_ptr<int32_t>(),
                                          num_logical_experts, num_local_physical_experts, moe_tp_size);
     }
 }
@@ -115,7 +135,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 {
     m.def(
         "remap_topk_ids_to_rank_slot_kunpeng("
-        "Tensor topk_ids, Tensor(a!) full_buf, Tensor dispatch_map, "
+        "Tensor topk_ids, Tensor(a!) full_buf, Tensor? dispatch_map, "
         "int num_physical_experts, int ep_size, int moe_tp_size) -> ()");
     m.impl("remap_topk_ids_to_rank_slot_kunpeng", remap_topk_ids_to_rank_slot_kunpeng);
 }
@@ -124,9 +144,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 // Graph-op registration (replay mode)
 // ==========================================================================
 
+// Graph dispatch only accepts bare at::Tensor args (make_dispatch_v rejects
+// optional types): replay materializes the captured None as an undefined
+// tensor, which converts back to c10::optional here.
+void remap_topk_ids_to_rank_slot_kunpeng_graph(at::Tensor topk_ids, at::Tensor full_buf, at::Tensor dispatch_map,
+                                               int64_t num_physical_experts, int64_t ep_size, int64_t moe_tp_size)
+{
+    remap_topk_ids_to_rank_slot_kunpeng(
+        topk_ids, full_buf,
+        dispatch_map.defined() ? c10::optional<at::Tensor>(dispatch_map) : c10::nullopt, num_physical_experts,
+        ep_size, moe_tp_size);
+}
+
 static KernelRegistrar _r_remap_topk_ids_to_rank_slot(
     "remap_topk_ids_to_rank_slot_kunpeng",
-    make_dispatch_v<decltype(&remap_topk_ids_to_rank_slot_kunpeng), &remap_topk_ids_to_rank_slot_kunpeng>);
+    make_dispatch_v<decltype(&remap_topk_ids_to_rank_slot_kunpeng_graph),
+                    &remap_topk_ids_to_rank_slot_kunpeng_graph>);
 
 
 thread_local std::mt19937 g_kunpeng_moe_rng(123);

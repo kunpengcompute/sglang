@@ -87,6 +87,51 @@ expand_ip_range() {
 
 
 # ------------------------------------------------------------
+# Helper: ssh target for a node.
+# Connects as root by default; with SGLANG_ENABLE_NOROOT_USER=1 it uses the
+# current user and privileged work is delegated to the site root proxy
+# (see noroot_proxy_run).
+# ------------------------------------------------------------
+ssh_target() {
+    if [[ "${SGLANG_ENABLE_NOROOT_USER:-0}" == "1" ]]; then
+        echo "$1"
+    else
+        echo "root@$1"
+    fi
+}
+
+# ------------------------------------------------------------
+# Helper: run a privileged script through the site root proxy
+# (SGLANG_ENABLE_NOROOT_USER=1).
+# root_proxy only accepts a script NAME (no '/'), resolved in its own
+# directory, so callers pass e.g. "hugepage_2m.sh", not a full path.
+# Usage: noroot_proxy_run <script_name> [args...]
+# ------------------------------------------------------------
+noroot_proxy_run() {
+    local script="$1"
+    shift
+    "$SGLANG_KUNPENG_NOROOT_PROXY_PATH/root_proxy" "$script" "$@"
+}
+
+# ------------------------------------------------------------
+# Helper: clear /dev/shm leftovers.
+# In non-root mode, segments created by earlier root runs are not removable by
+# the current user, so delegate to the optional site script sgl_clean_shm.sh
+# found in the proxy directory; otherwise fall back to a best-effort local
+# removal (own segments only, errors ignored).
+# ------------------------------------------------------------
+clean_shm_dev() {
+    local shm_script="sgl_clean_shm.sh"
+    if [[ "${SGLANG_ENABLE_NOROOT_USER:-0}" == "1" \
+          && -x "$SGLANG_KUNPENG_NOROOT_PROXY_PATH/$shm_script" ]]; then
+        noroot_proxy_run "$shm_script"
+        return
+    fi
+    rm -rf /dev/shm/* 2>/dev/null || true
+}
+
+
+# ------------------------------------------------------------
 # Helper: per-instance router-node resource indexes.
 # _instance_indexes <entry> prints "<global_idx> <side_idx>" for the entry
 # ("<role>" or "<role>_<instance>") within the comma-separated INSTANCES

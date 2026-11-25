@@ -59,6 +59,18 @@ export SGLANG_ENABLE_MTP=0
 export SGLANG_SPECULATIVE_NUM_STEPS=3
 # 共享checkpoint可留空；需要独立draft权重时填写对应目录。
 export SPECULATIVE_DRAFT_MODEL_PATH=""
+# 1 = GDN verify 使用 C++ 算子，可被 Tilelang 算子开关覆盖
+# 0 = GDN verify 使用 Pytorch 算子，可被 Tilelang 算子开关覆盖
+export SGLANG_KUNPENG_GDN_VERIFY_FUSED="1"
+# 1 = GDN verify 改用 TileLang 算子（替代 C++ SVE 融合核）
+# 0 = 保持 Pytorch 或 C++ 算子实现，便于做性能回退对比
+export SGLANG_KUNPENG_GDN_VERIFY_TILELANG="1"
+# 1 = 在启动阶段提前编译各 batch_size 的 TileLang 算子
+# 0 = 在实际遇到对应 batch_size 的输入时，再才编译指定 shape 的 TileLang 算子
+export SGLANG_KUNPENG_TL_OP_PRECOMPILE="1"
+# 对 Tilelang 算子进行回退，主要用来优化 bs1 的场景（bs1时cpp算子性能比tl算子性能更优）
+# 支持传入 "3", "1,3,4,5" 用来表示回退 bs{3} 或者回退 bs{1,3,4,5}
+export SGLANG_KUNPENG_GDN_VERIFY_TILELANG_FALLBACK_BATCH_SIZE="1"
 
 # Qwen公共运行配方。更改容量时同步映射下面三个字段。
 export EP_SIZE="1"
@@ -92,9 +104,6 @@ export SGLANG_KUNPENG_ENABLE_PREFILL_GRAPH="1"
 export SGLANG_KUNPENG_ENABLE_SHM_FENCE="0"
 export SGLANG_KUNPENG_GRAPH_CACHE_SIZE="40"
 export SGLANG_KUNPENG_GRAPH_LOG_REPLAY="0"
-# 已验证MTP配方：原生验证、draft图捕获及固定draft-extend行布局。
-export SGLANG_KUNPENG_GDN_VERIFY_FUSED="1"
-export SGLANG_KUNPENG_QWEN_DRAFT_GRAPH_CAPTURE="1"
 export SGLANG_KUNPENG_QWEN_DRAFT_EXTEND_PAD="1"
 export SGLANG_KUNPENG_HBW_ALLOW_DDR_FALLBACK="0"
 export SGLANG_KUNPENG_HBW_LOG_PLACEMENT="0"

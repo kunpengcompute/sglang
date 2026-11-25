@@ -485,6 +485,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = self.gating(layer.A_log, a, b, layer.dt_bias)
+            # Kernels that can snapshot the single boundary the prefix cache
+            # consumes avoid materializing every per-chunk state (`h`).
+            h_track_buf = None
+            if (
+                forward_metadata.has_mamba_track_mask
+                and forward_metadata.track_ssm_h_src.numel() > 0
+                and getattr(
+                    self.kernel_dispatcher.extend_kernel,
+                    "supports_track_state_snapshot",
+                    False,
+                )
+            ):
+                h_track_buf = self._track_state_buffer(
+                    cache_indices.shape[0], ssm_states.shape[1:]
+                )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -494,6 +509,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                track_state=h_track_buf,
+                track_chunk_idx=(
+                    forward_metadata.track_chunk_idx
+                    if h_track_buf is not None
+                    else None
+                ),
             )
 
             if (
@@ -504,9 +525,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            if h is not None:
+            if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
+                    forward_batch,
+                    h,
+                    ssm_states,
+                    forward_metadata,
+                    h_track_buf=h_track_buf,
                 )
 
         return core_attn_out
+
+    def _track_state_buffer(
+        self, batch_size: int, state_shape: torch.Size
+    ) -> torch.Tensor:
+        """Per-batch fp32 snapshot buffer for kernels that write one checkpoint.
+
+        Reused across layers: the tracked rows are copied into the mamba pool
+        before the next layer runs, so a single buffer is enough. Capacity
+        grows geometrically and is keyed by the actual batch size, not the
+        request pool (which can be orders of magnitude larger).
+        """
+        buffer = getattr(self, "_track_state_buffer_cache", None)
+        if buffer is None or buffer.shape[0] < batch_size:
+            capacity = max(batch_size, 8)
+            if buffer is not None:
+                capacity = max(capacity, 2 * buffer.shape[0])
+            buffer = torch.empty(
+                (capacity, *state_shape),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._track_state_buffer_cache = buffer
+        return buffer[:batch_size]

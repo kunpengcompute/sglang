@@ -40,6 +40,11 @@ usage() {
   echo "  -d RANK|RANGE  DP rank (e.g. 5: every request pinned to it) or ranks"
   echo "              (e.g. 0-15, 0,2,5: requests round-robin across them)."
   echo "              Omit -d for the server default load balancing (round robin)."
+  echo "              Sends routed_dp_rank + disagg_prefill_dp_rank together:"
+  echo "              with prefill --load-balance-method follow_bootstrap_room"
+  echo "              the gateway picks a random bootstrap_room, so the pin only"
+  echo "              works with SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1"
+  echo "              on the prefill side."
   echo "  -n NUM      Number of requests (default: all lines from file; prompts"
   echo "              cycle when NUM exceeds the file size). NUM=1 keeps EOS"
   echo "              enabled (no ignore_eos), so the model may stop naturally."
@@ -204,9 +209,11 @@ parse_ranks() {
   echo "${ranks[*]}"
 }
 
-# Target host/port: defaults to the local NIC (in-cluster router/instance).
-# Override to hit a standalone decode master directly, e.g. fake-transfer
-# decode-throughput tests:
+# Target host/port: defaults to this node's own NIC address (enp26s0f0, the
+# interface the runtime uses for Gloo/Mooncake), so it hits that node's own
+# service instead of the gateway. CURL_HOST overrides it, e.g. to hit a
+# standalone decode master directly for fake-transfer decode-throughput
+# tests, or another node's gateway:
 #   CURL_HOST=<decode master IP> ./curl.sh -d 0-15 -n 512 -m 384
 # With -F (fake transfer), the port auto-derives from the runtime layout
 # (same rule as runtime/env_decode.sh): 30001 + the decode entry's position
@@ -283,7 +290,7 @@ resolve_prefill_tok_port() {
 
 # The side's own HTTP endpoint when the tokenizer HTTP server is NOT split
 # out (SGLANG_ENABLE_TOKENIZER_SEPERATE=0): the prefill/decode master hosts
-# it on --port 30000 (see server.sh / server_router.sh's backend URL), so
+# it on --port 30000 (see runtime/server_cluster.sh / server_router.sh's backend URL), so
 # there is no router-node tokenizer port to address. The master address is
 # read from the side's role env (per-instance overrides included) in a
 # subshell, exactly like launch_router.sh. Echoes nothing when the layout
@@ -322,7 +329,19 @@ tokenizer_separate() {
   echo "${v:-1}"
 }
 
-IP=${CURL_HOST:-$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')}
+# Target host: this node's own NIC address by default, resolved the same way
+# the runtime does for Gloo/Mooncake (enp26s0f0), so the request hits the
+# service on this node instead of the gateway. CURL_HOST overrides it,
+# CURL_IFNAME picks another interface.
+_CURL_IF="${CURL_IFNAME:-${GLOO_SOCKET_IFNAME:-enp26s0f0}}"
+_CURL_LOCAL_IP="$(ifconfig "$_CURL_IF" 2>/dev/null |
+  grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
+# Fall back to the source address of the default route when the runtime NIC
+# is absent (login nodes, renamed interfaces), then to localhost.
+[ -n "$_CURL_LOCAL_IP" ] ||
+  _CURL_LOCAL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null |
+    grep -oP '(?<=src )\d+(\.\d+){3}')"
+IP=${CURL_HOST:-${_CURL_LOCAL_IP:-127.0.0.1}}
 if [ "$FAKE" = true ]; then
   PORT=${CURL_PORT:-$(resolve_decode_tok_port 0)}
 else
@@ -350,8 +369,8 @@ fi
 #     server itself, so the control request goes to
 #     http://<prefill|decode master>:30000 (the tokenizer port does not exist).
 #   - Native layout: the primary target (:30000).
-# Under the default primary target (router gateway :30000) the gateway is
-# skipped: it does not proxy control endpoints.
+# Under the default primary target (this node :30000) control requests go
+# straight to it; a gateway is not proxied.
 profile_req() {
   local action=$1 u urls prefill_ep decode_ep p
   if [ "$(tokenizer_separate)" = "1" ]; then
@@ -462,11 +481,16 @@ if [ "$INTERACTIVE" = false ]; then
 
   send_request() {
     local idx=$1
+    # -d pins both sides: routed_dp_rank picks the prefill DP worker and
+    # disagg_prefill_dp_rank tells decode which prefill worker owns the KV.
+    # Under follow_bootstrap_room the gateway assigns a random bootstrap_room,
+    # so the prefill would otherwise dispatch by room % dp_size instead.
     local rank_line=""
     if [ "$ROUND_ROBIN" = true ]; then
-      rank_line=",\"routed_dp_rank\": ${DP_RANKS[$((idx % NUM_RANKS))]}"
+      local rr_rank=${DP_RANKS[$((idx % NUM_RANKS))]}
+      rank_line=",\"routed_dp_rank\": $rr_rank,\"disagg_prefill_dp_rank\": $rr_rank"
     elif [ "$DP_ENABLED" = true ]; then
-      rank_line=",\"routed_dp_rank\": $DP_RANK"
+      rank_line=",\"routed_dp_rank\": $DP_RANK,\"disagg_prefill_dp_rank\": $DP_RANK"
     fi
     # Fake transfer: unique room per request + magic host; the decode side
     # (_is_fake_transfer) then force-selects the FAKE receiver and decodes
@@ -1236,7 +1260,7 @@ if [ "$INTERACTIVE" = true ]; then
 
     DP_LINE=""
     if [ "$DP_ENABLED" = true ]; then
-      DP_LINE=",\"routed_dp_rank\":$DP_RANK"
+      DP_LINE=",\"routed_dp_rank\":$DP_RANK,\"disagg_prefill_dp_rank\":$DP_RANK"
     fi
 
     BODY="{"

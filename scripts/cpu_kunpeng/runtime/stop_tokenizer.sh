@@ -109,7 +109,7 @@ _pat_masters="$(IFS='|'; echo "${masters[*]}")"
 TOK_PAT="sglang[.]launch_server.*(--port |--dist-init-addr [^[:space:]]*:)(${_pat_ports}|${_pat_masters})([[:space:]]|\$)"
 
 echo "Killing tokenizer ($TOK_SIDE) on $ROUTER_IP (HTTP port(s): ${ports[*]}; master port(s): ${masters[*]})"
-ssh "root@$ROUTER_IP" "
+ssh "$(ssh_target "$ROUTER_IP")" "
     MAIN_PIDS=\$(ps aux | grep -E '$TOK_PAT' | grep -v grep | awk '{print \$2}')
     echo \"Main tokenizer PID(s): \$MAIN_PIDS\"
     if [ -n \"\$MAIN_PIDS\" ]; then

@@ -47,6 +47,7 @@ import traceback
 import types
 import uuid
 import warnings
+from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -104,6 +105,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor.
+
+    Uses NumPy here to speed up the conversion by using memcpy
+    instead of a per-element PyLong-to-int64 walk.
+    """
+    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
+    cpu_t = torch.from_numpy(combined)
+    if pin:
+        cpu_t = cpu_t.pin_memory()
+    return cpu_t.to(device, non_blocking=True)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -279,6 +295,11 @@ def is_kunpeng_swap_kv_blockwise() -> bool:
     )
 
 
+def is_kunpeng_swap_index_k_in() -> bool:
+    """Whether the DSA/NSA index-K cache is swapped DDR -> HBM layer-wise via SDMA."""
+    return is_kunpeng_hbw_pool() and os.environ.get("SGLANG_KUNPENG_SWAP_INDEX_K_IN") == "1"
+
+
 def is_kunpeng_graph_capture() -> bool:
     return is_cpu_920f() and os.environ.get("SGLANG_ENABLE_GRAPH_CAPTURE") == "1"
 
@@ -314,7 +335,9 @@ def is_kunpeng_flash_comm() -> bool:
     # SGLANG_KUNPENG_FLASH_COMM=1; decode/native roles keep the plain path.
     # Gates two sub-features: (1) token-sliced sequence-parallel prefill MoE
     # (requires attn-TP > 1; per-rank topk tables merged by one
-    # shm_dual_allgather, combine writes only the home slice) and
+    # shm_dual_allgather; on the RDMA dispatch path the combine writes only
+    # the home slice, on the local SHM dispatch path combine_recv extracts
+    # it; PP > 1 hands the slice between stages via PPProxyTensors) and
     # (2) shared-expert co-location as logical expert n_routed in the EPLB
     # map (requires a non-trivial --init-expert-location with n_routed+1
     # logical experts).

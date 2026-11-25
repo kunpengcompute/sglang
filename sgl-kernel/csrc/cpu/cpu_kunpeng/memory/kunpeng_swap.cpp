@@ -17,6 +17,7 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cstdlib>
 #include <cstring>
 
 #include "cpu_kunpeng/adapters/register_graph_kernels.h"
@@ -33,8 +34,15 @@ int64_t get_sdma_event_num()
 
 void kupl_sdma_init_torch(int64_t sdmathreshold)
 {
-    SdmaCtlThredInit();
-    SetSdmaThreshold(sdmathreshold);
+    // Programming the SDMA control registers goes through /dev/mem and needs
+    // root. In a non-root deployment the site root proxy (sdma_threshold.sh,
+    // see scripts/cpu_kunpeng/runtime/server_cluster.sh) sets the threshold, so
+    // skip the in-process register writes.
+    const char *noroot = std::getenv("SGLANG_ENABLE_NOROOT_USER");
+    if (!(noroot != nullptr && std::strcmp(noroot, "1") == 0)) {
+        SdmaCtlThredInit();
+        SetSdmaThreshold(sdmathreshold);
+    }
     utils::kupl_sdma_init();
 }
 

@@ -571,6 +571,16 @@ class DeepseekV2MoE(nn.Module):
         if _is_kunpeng_flash_comm:
             self.experts.should_fuse_routed_scaling_factor_in_topk = True
 
+        if is_nextn:
+            # Dedicated MTP row: draft heat/padding land in the last metadata row.
+            from sglang.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            metadata = get_global_expert_location_metadata()
+            if metadata is not None and metadata.has_draft_layer:
+                self.experts.record_layer_id = metadata.draft_layer_id
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             layer_id=self.layer_id,
@@ -592,6 +602,8 @@ class DeepseekV2MoE(nn.Module):
                 and (not get_moe_runner_backend().is_flashinfer_trtllm())
                 else None
             ),
+            # NextN padding rows belong to the draft EPLB row.
+            pad_layer_id=getattr(self.experts, "record_layer_id", None),
         )
 
         self.shared_experts_is_int8 = False
@@ -2072,6 +2084,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if _is_cpu_920f and (not self.is_nextn):
             self._swap_mgr.swap_next_kv_layer(self.layer_id, forward_batch)
+            self._swap_mgr.swap_next_index_k_layer(self.layer_id, forward_batch)
 
         # Flash-comm SP dense layers: reduce-scatter instead of allreduce
         # around the MLP (see _forward_dense_sp_prepare_mlp /
@@ -2453,6 +2466,11 @@ class DeepseekV2Model(nn.Module):
                 self.start_layer,
                 forward_batch.token_to_kv_pool.get_key_buffer(self.start_layer),
             )
+            # DSA index-K: prefetch the first TWO swapped full layers into the
+            # ping-pong HBM mirrors so the steady-state pipeline has a
+            # two-full-layer head start over the SDMA copies.
+            # Skip-topk layers carry no index-K buffer and are skipped inside.
+            self.swap_mgr.swap_first_index_k_layers(forward_batch)
 
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
@@ -2484,6 +2502,29 @@ class DeepseekV2Model(nn.Module):
                 f"({get_attn_tensor_model_parallel_world_size()}). Enable "
                 f"power-of-2 extend padding "
                 f"(SGLANG_KUNPENG_EXTEND_POWER_2_PADDING=1) or pad the batch."
+            )
+        if (
+            not self.pp_group.is_first_rank
+            and is_kunpeng_flash_comm()
+            and get_moe_a2a_backend().is_kunpeng_cpu()
+            and not forward_batch.forward_mode.is_idle()
+            and forward_batch.input_ids is not None
+            and hidden_states.shape[0] > 0
+            and hidden_states.shape[0] * get_attn_tensor_model_parallel_world_size()
+            != forward_batch.input_ids.shape[0]
+        ):
+            # Flash-comm SP with PP > 1: the predecessor stage hands each
+            # attn-TP rank its token slice through PPProxyTensors, so the
+            # incoming hidden_states must be exactly input_ids / attn_tp_size
+            # rows. A mismatch means the stages disagree on the SP schedule.
+            raise ValueError(
+                f"PP stage starting at layer {self.start_layer} received "
+                f"{hidden_states.shape[0]} hidden_states rows from the "
+                f"predecessor, but flash-comm SP expects the rank's token "
+                f"slice of {forward_batch.input_ids.shape[0]} rows "
+                f"(/ attn_tp_size="
+                f"{get_attn_tensor_model_parallel_world_size()}): the "
+                f"predecessor stage must run the same flash-comm SP schedule."
             )
         # DSA topk carry: this stage starts on a skip-topk (shared) layer, so the
         # predecessor must have shipped its top-k. Idle/empty batches compute

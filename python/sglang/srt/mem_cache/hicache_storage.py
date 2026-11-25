@@ -1,9 +1,11 @@
+import hashlib
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Set
+from typing import Any, List, Optional, Set, Tuple
 
 import torch
 
@@ -29,12 +31,54 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Topology-free blob identity: every PP/TP layout names files identically.
+    key_digest: Optional[str] = None
+
+
+def flat_kv_key_digest(
+    model_name: Optional[str],
+    dtype: torch.dtype,
+    page_size: int,
+    kv_dim: int,
+    index_head_dim: int = 0,
+) -> str:
+    """Topology-free page identity: what the blob holds, not who wrote it."""
+    raw = "|".join(
+        [
+            model_name or "",
+            str(dtype).replace("torch.", ""),
+            str(int(page_size)),
+            str(int(kv_dim)),
+            str(int(index_head_dim)),
+        ]
+    )
+    return hashlib.sha1(raw.encode()).hexdigest()[:12]
 
 
 @dataclass
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = (None,)
     extra_info: Optional[dict] = None
+
+
+# PP stages that can share one page: each owns one sentinel of ``{stem}.s<k>``.
+L3_STAGE_SLOTS = 16
+
+
+@dataclass(frozen=True)
+class FlatPageLayout:
+    """Bytes this PP stage owns inside a whole-page L3 object.
+
+    The object always keeps the PP1 byte layout (target layers, then draft), so
+    any layout can read what another one wrote. ``segments`` are
+    ``(buffer_offset, file_offset, length)`` triples; ``writer``/``writers``
+    index this stage's byte in the ``.stages`` file.
+    """
+
+    segments: Tuple[Tuple[int, int, int], ...]
+    total_bytes: int
+    writer: int = 0
+    writers: int = 1
 
 
 class PoolName(str, Enum):
@@ -248,18 +292,33 @@ class HiCacheStorage(ABC):
         """
         pass
 
+    def set_flat_layout(
+        self,
+        kv_layout: Optional["FlatPageLayout"],
+        idx_layout: Optional["FlatPageLayout"] = None,
+        idx_key_suffix: str = "@idx",
+    ) -> None:
+        """Declare the shared PP page geometry used by the flat interface.
+
+        Backends that keep one whole page per object (the file backend when
+        ``SGLANG_HICACHE_FILE_PP_SHARED`` is on) use this to pwrite/pread only
+        the slice of the current PP stage, so a PP1 and a PP16 process can
+        share one pool. The default keeps whole-page I/O, i.e. the flat
+        interface behaves exactly as before.
+        """
+        pass
+
     def batch_get_flat(
         self,
         keys: List[str],
         buffers: List[torch.Tensor],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        verify: bool = True,
     ) -> List[bool]:
         """Read one page blob per key into the matching 1-D buffer.
 
-        ``buffers[i]`` is a view of the caller's flat I/O buffer and is exactly
-        one page blob wide; the caller guarantees it stays alive until this
-        returns. Returns per-key success, same contract as :meth:`batch_get_v1`.
-        Only called when :meth:`supports_flat_io` is True.
+        ``verify=False`` skips the readiness check: the hit query already
+        confirmed these pages, so re-checking would double the metadata traffic.
         """
         raise NotImplementedError()
 
@@ -406,15 +465,296 @@ class HiCacheFile(HiCacheStorage):
             storage_config.is_mla_model,
         )
         model_name = "-".join(model_name.split("/")) if model_name else ""
-        enable_pp = pp_size > 1
-        self.config_suffix = f"_{model_name}"
-        if not is_mla_model:
-            self.config_suffix += f"_{tp_rank}_{tp_size}"
-        if enable_pp:
-            self.config_suffix += f"_{pp_size}_{pp_rank}"
+        self.pp_rank = int(pp_rank)
+        self.pp_size = int(pp_size)
+        self.pp_shared = envs.SGLANG_HICACHE_FILE_PP_SHARED.get()
+        if storage_config.key_digest and self.pp_shared:
+            # Two-tier: name by content, so every PP/TP layout shares the files.
+            self.config_suffix = (
+                f"_{model_name}-{storage_config.key_digest}"
+                if model_name
+                else f"_{storage_config.key_digest}"
+            )
+        else:
+            self.config_suffix = f"_{model_name}"
+            if not is_mla_model:
+                self.config_suffix += f"_{tp_rank}_{tp_size}"
+            # Shared key off: keep the old private per-stage files.
+            if not self.pp_shared and self.pp_size > 1:
+                self.config_suffix += f"_{self.pp_size}_{self.pp_rank}"
+        self.kv_layout: Optional[FlatPageLayout] = None
+        self.idx_layout: Optional[FlatPageLayout] = None
+        self.idx_key_suffix = "@idx"
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
+
+    def set_flat_layout(
+        self,
+        kv_layout: Optional[FlatPageLayout],
+        idx_layout: Optional[FlatPageLayout] = None,
+        idx_key_suffix: str = "@idx",
+    ) -> None:
+        if not self.pp_shared:
+            return
+        self.kv_layout = kv_layout
+        self.idx_layout = idx_layout
+        self.idx_key_suffix = idx_key_suffix
+
+    def _layout_for(self, key: str) -> Optional[FlatPageLayout]:
+        """Page layout of one key; ``None`` means the legacy whole-file I/O."""
+        if self.kv_layout is None:
+            return None
+        if self.idx_layout is not None and self.idx_key_suffix in key:
+            return self.idx_layout
+        return self.kv_layout
+
+    @staticmethod
+    def _stage_path(path: str, stage: int) -> str:
+        """Zero-byte sentinel of one PP stage; every stage owns its own inode."""
+        stem = path[:-4] if path.endswith(".bin") else path
+        return f"{stem}.s{stage}"
+
+    @staticmethod
+    def _stages_path(path: str) -> str:
+        """Writer count of the page (one byte, written identically by all)."""
+        stem = path[:-4] if path.endswith(".bin") else path
+        return f"{stem}.stages"
+
+    def _mark_stage(self, path: str, stage: int, writers: int) -> bool:
+        """Mark this stage done and record how many stages the page has.
+
+        A shared file cannot carry the stage marks: 16 nodes writing bytes of
+        one 4KB block lose each other's updates on this filesystem (measured),
+        while every stage's own sentinel is a separate inode. The count byte is
+        written by all of them with the same value, so a racing write is
+        idempotent.
+        """
+        if not self._create_file(self._stage_path(path, stage)):
+            return False
+        try:
+            fd = os.open(self._stages_path(path), os.O_WRONLY | os.O_CREAT, 0o644)
+            try:
+                if os.pwrite(fd, bytes([writers]), 0) != 1:
+                    return False
+            finally:
+                os.close(fd)
+            return True
+        except OSError as e:
+            logger.warning("[hicache] writer count failed for %s: %s", path, e)
+            return False
+
+    @staticmethod
+    def _done_path(path: str) -> str:
+        """Zero-byte whole-page marker: readers answer readiness with one stat."""
+        stem = path[:-4] if path.endswith(".bin") else path
+        return f"{stem}.done"
+
+    def _stage_state(self, path: str) -> Tuple[int, int]:
+        """``(stages finished, stages expected)`` from the sentinels and count.
+
+        The expected count is whatever the writers recorded, so a PP1/PP4/PP16
+        reader judges every page the same way instead of assuming its own stage
+        count.
+        """
+        try:
+            with open(self._stages_path(path), "rb") as f:
+                data = f.read(1)
+        except OSError:
+            return 0, 0
+        need = data[0] if data else 0
+        if not need:
+            return 0, 0
+        filled = sum(
+            1 for k in range(need) if os.path.exists(self._stage_path(path, k))
+        )
+        return filled, need
+
+    def _drop_stage_marks(self, path: str, need: int) -> None:
+        """Delete the sentinels and the count file once ``.done`` exists.
+
+        Readers only trust ``.done``, so these records are dead weight after
+        the page is elected; removing them keeps the directory at three entries
+        per page. Missing files are fine (a concurrent writer may have won).
+        """
+        for p in [self._stage_path(path, k) for k in range(need)] + [
+            self._stages_path(path)
+        ]:
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                # Another writer may be removing the same file right now.
+                if os.path.exists(p):
+                    logger.warning("[hicache] marker unlink failed for %s: %s", p, e)
+
+    def _page_ready(self, path: str, layout: FlatPageLayout) -> bool:
+        """Whole page present: ``.done`` exists, or the slow full check passes.
+
+        Size alone is not enough: the draft slice sits at the very end, so the
+        first write already stretches the file to ``total_bytes``.
+        """
+        if layout.writers > L3_STAGE_SLOTS:
+            return False
+        if os.path.exists(self._done_path(path)):
+            return True
+        # Slow path: verify once, then repair the marker (one stat from now on).
+        try:
+            size = os.stat(path).st_size
+        except OSError:
+            return False
+        if size != layout.total_bytes:
+            return False
+        filled, need = self._stage_state(path)
+        if not need or filled < need:
+            return False
+        self._create_file(self._done_path(path))
+        return True
+
+    def _wait_incomplete(
+        self,
+        path: str,
+        layout: FlatPageLayout,
+        budget: float = None,
+    ) -> bool:
+        """Wait for a page another stage is still assembling (0 < set < need)."""
+        if layout.writers > L3_STAGE_SLOTS:
+            return False
+        filled, need = self._stage_state(path)
+        if filled == 0 or filled >= need:
+            return False
+        if budget is None:
+            budget = float(envs.SGLANG_HICACHE_INCOMPLETE_WAIT.get())
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            if self._page_ready(path, layout):
+                return True
+        logger.warning(
+            "[hicache] L3 page %s stayed incomplete for %.1fs (%d/%d stages); "
+            "treating it as a miss",
+            os.path.basename(path),
+            budget,
+            filled,
+            need,
+        )
+        return False
+
+    def _read_slices(
+        self, path: str, buffer: torch.Tensor, layout: FlatPageLayout
+    ) -> bool:
+        """Read each segment at its file offset; a short read means a miss."""
+        buf = memoryview(buffer.view(torch.uint8).contiguous().numpy())
+        with open(path, "rb", buffering=0) as f:
+            for src, dst, length in layout.segments:
+                f.seek(dst)
+                if f.readinto(buf[src : src + length]) != length:
+                    return False
+        return True
+
+    @staticmethod
+    def _create_file(path: str) -> bool:
+        """Atomically create a zero-byte marker (idempotent)."""
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+            return True
+        except FileExistsError:
+            return True
+        except OSError as e:
+            logger.warning("[hicache] marker create failed for %s: %s", path, e)
+            return False
+
+    def _write_slices(
+        self,
+        path: str,
+        buffer: torch.Tensor,
+        layout: FlatPageLayout,
+        markers: bool = True,
+    ) -> bool:
+        """Write this stage's slices; ``markers=False`` for the index-K object.
+
+        Index-K carries no completion records: the KV object's ``.done`` is only
+        written after every contributing stage closed its index-K object, so it
+        already proves the index-K page complete.
+        """
+        if not layout.segments:
+            # Nothing to write, so no record either: a non-contributing stage
+            # shares writer id 0 and would otherwise close the page early.
+            return True
+        if markers and layout.writers > L3_STAGE_SLOTS:
+            logger.warning(
+                "[hicache] L3 page %s needs %d PP stage slots but only %d are "
+                "supported; skipping write",
+                os.path.basename(path),
+                layout.writers,
+                L3_STAGE_SLOTS,
+            )
+            return False
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+        if size > layout.total_bytes:
+            # Written with another page geometry; truncating would wipe it.
+            logger.warning(
+                "[hicache] L3 page %s is larger than the shared layout "
+                "(%d > %d bytes), skipping write",
+                os.path.basename(path),
+                size,
+                layout.total_bytes,
+            )
+            return False
+        if markers and size == layout.total_bytes:
+            filled, need = self._stage_state(path)
+            if os.path.exists(self._done_path(path)) or (need and filled >= need):
+                # Already complete: just make sure the page carries its marker.
+                self._create_file(self._done_path(path))
+                return True
+        data = memoryview(buffer.view(torch.uint8).contiguous().numpy())
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            for src, dst, length in layout.segments:
+                view = data[src : src + length]
+                if len(view) < length:
+                    logger.warning(
+                        "[hicache] L3 page %s buffer shorter than its slice "
+                        "(%d < %d), skipping write",
+                        os.path.basename(path),
+                        len(view),
+                        length,
+                    )
+                    return False
+                done = 0
+                while done < length:
+                    n = os.pwrite(fd, view[done:], dst + done)
+                    if n <= 0:
+                        logger.warning(
+                            "[hicache] L3 page %s write stalled at %d/%d bytes",
+                            os.path.basename(path),
+                            done,
+                            length,
+                        )
+                        return False
+                    done += n
+        finally:
+            os.close(fd)
+        # Record this stage's own byte in the .stages file (disjoint offsets).
+        if markers:
+            if layout.writers == 1:
+                # A whole-object writer needs no per-stage records.
+                ok = self._create_file(self._done_path(path))
+            else:
+                ok = self._mark_stage(path, layout.writer, layout.writers)
+                filled, need = self._stage_state(path) if ok else (0, 0)
+                if need and filled >= need:
+                    # Last writer elects the page for O(1) reader checks, then
+                    # drops the per-stage records nothing reads any more.
+                    if self._create_file(self._done_path(path)):
+                        self._drop_stage_marks(path, need)
+            if not ok:
+                return False
+        return True
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -610,14 +950,19 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def exists(self, key: str) -> bool:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        return os.path.exists(tensor_path)
+        tensor_path = os.path.join(self.file_path, f"{self._get_suffixed_key(key)}.bin")
+        layout = self._layout_for(key)
+        if layout is None:
+            return os.path.exists(tensor_path)
+        # A half-assembled page is not usable yet (one stat via ``.done``).
+        return self._page_ready(tensor_path, layout)
 
     def batch_exists_bits(
-        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+        self,
+        keys: List[str],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        """One `stat` per page; the sharded hit query splits these across ranks."""
+        """One existence check per page (split across ranks by the query)."""
         return [self.exists(key) for key in keys]
 
     def supports_flat_io(self) -> bool:
@@ -630,14 +975,25 @@ class HiCacheFile(HiCacheStorage):
         keys: List[str],
         buffers: List[torch.Tensor],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        verify: bool = True,
     ) -> List[bool]:
         results = []
         for key, buffer in zip(keys, buffers):
             tensor_path = os.path.join(
                 self.file_path, f"{self._get_suffixed_key(key)}.bin"
             )
-            expected = buffer.numel() * buffer.element_size()
+            layout = self._layout_for(key)
             try:
+                if layout is not None:
+                    if verify and not self._page_ready(tensor_path, layout) and not (
+                        # Another stage is still assembling it: wait briefly.
+                        self._wait_incomplete(tensor_path, layout)
+                    ):
+                        results.append(False)
+                        continue
+                    results.append(self._read_slices(tensor_path, buffer, layout))
+                    continue
+                expected = buffer.numel() * buffer.element_size()
                 with open(tensor_path, "rb", buffering=0) as f:
                     buf = memoryview(buffer.view(torch.uint8).contiguous().numpy())
                     results.append(f.readinto(buf) == expected)
@@ -654,13 +1010,31 @@ class HiCacheFile(HiCacheStorage):
     ) -> List[bool]:
         results = []
         for key, buffer in zip(keys, buffers):
-            if self.exists(key):
-                results.append(True)
-                continue
             tensor_path = os.path.join(
                 self.file_path, f"{self._get_suffixed_key(key)}.bin"
             )
+            layout = self._layout_for(key)
             try:
+                if layout is not None:
+                    # Writes only this stage's slices; concurrent stages fill
+                    # the rest. Index-K needs no completion records.
+                    results.append(
+                        self._write_slices(
+                            tensor_path,
+                            buffer,
+                            layout,
+                            markers=layout is not self.idx_layout,
+                        )
+                    )
+                    continue
+                needed = buffer.numel() * buffer.element_size()
+                # Write-once unless the blob has the wrong size (older layout).
+                try:
+                    if os.path.getsize(tensor_path) == needed:
+                        results.append(True)
+                        continue
+                except OSError:
+                    pass
                 buffer.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
                 results.append(True)
             except Exception as e:

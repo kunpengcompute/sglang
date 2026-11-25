@@ -228,7 +228,20 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     ), "hybrid_gdn can only be used with non-MLA models."
 
     if cfg := runner.mambaish_config:
-        if runner.server_args.attention_backend == "kunpeng_cpu" and getattr(runner.model, "_kunpeng_explicit_graph", False):
+        explicit_kunpeng = (
+            runner.server_args.attention_backend == "kunpeng_cpu"
+            and getattr(runner.model, "_kunpeng_explicit_graph", False)
+        )
+        if (
+            getattr(runner.server_args, "mamba_checkpoint_stride_pages", None)
+            is not None
+            and not explicit_kunpeng
+        ):
+            raise ValueError(
+                "Mamba multi-checkpoint tracking requires the explicit "
+                "Kunpeng Qwen backend"
+            )
+        if explicit_kunpeng:
             from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_hybrid_backend import KunpengHybridBackend
             return KunpengHybridBackend(runner, full_attn_backend)
         from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as _kunpeng_qwen_enabled

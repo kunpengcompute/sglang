@@ -150,7 +150,7 @@ def is_capturing():
     return _C.CaptureManager.instance().is_capturing()
 
 
-def lookup_or_register(tensor, idx=0):
+def lookup_or_register(tensor, idx=0, where=""):
     global _none_storage_id, _captured_input_map
     mgr = _C.CaptureManager.instance()
     if tensor is None:
@@ -175,14 +175,18 @@ def lookup_or_register(tensor, idx=0):
     sid = mgr.lookup_storage(base)
     if sid < 0:
         print(
-            f"[capture] lookup_or_register FAIL at {idx}-th parameter: "
+            f"[capture] lookup_or_register FAIL ({where or 'unknown op'}) "
+            f"at {idx}-th parameter: "
             f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
             f"numel={tensor.numel()}, "
             f"data_ptr=0x{tensor.data_ptr():x}, "
             f"storage_base=0x{base:x}",
             flush=True,
         )
-    assert sid >= 0, "non-return-value parameter tensor not registered"
+    assert sid >= 0, (
+        f"non-return-value parameter tensor not registered ({where or 'unknown op'}, "
+        f"arg {idx}, shape={tuple(tensor.shape)})"
+    )
 
     if _captured_input_views is not None and sid < len(_captured_input_map):
         # The common executor already rebinds secondary input views on every

@@ -23,6 +23,10 @@ extern "C" int qwen36_gdn_prefill_with_workspace(const uint16_t *, const uint16_
                                                  float *, const int32_t *, uint16_t *, int64_t,
                                                  int64_t, int64_t, int64_t, int64_t, int64_t,
                                                  float *, int64_t);
+extern "C" int qwen36_gdn_prefill_parallel_with_multi_track_workspace(
+    const uint16_t *, const uint16_t *, const uint16_t *, const float *, const float *, float *,
+    const int32_t *, uint16_t *, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    float *, const int32_t *, const int32_t *, float *, int64_t);
 void qwen_prefill_flash_shared_gather(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                       at::Tensor, at::Tensor, at::Tensor, int64_t, double);
 
@@ -236,6 +240,101 @@ void gdn(std::vector<at::Tensor> &t, int64_t grain) {
         t[7].data_ptr<float>(), t[7].numel());
     TORCH_CHECK(rc == 0, "GDN prefill graph kernel error ", rc);
 }
+void gdn_multi_checkpoint(std::vector<at::Tensor> &t, int64_t grain) {
+    // Replay hands over inputs first and the fresh output last, so the output
+    // must sit at the end of the ABI rather than next to q/k/v.
+    TORCH_CHECK(t.size() == 16 && grain == 32, "GDN multi-checkpoint prefill graph ABI");
+    for (int i : {0, 1, 2, 8, 9, 15}) check(t[i], at::kBFloat16);
+    for (int i : {3, 4, 5, 7, 12}) check(t[i], at::kFloat);
+    for (int i : {6, 10, 11, 13, 14}) check(t[i], at::kInt);
+    TORCH_CHECK(t[0].dim() == 4 && t[0].size(0) == 1 && t[0].size(1) > 0 &&
+                    t[0].size(1) <= 4096 && t[1].sizes() == t[0].sizes() &&
+                    t[2].dim() == 4 && t[2].size(0) == 1 && t[2].size(1) == t[0].size(1) &&
+                    t[15].sizes() == t[2].sizes(),
+                "GDN multi-checkpoint token shapes");
+    // Power-of-2 bucket padding appends rows that belong to no segment: tensor
+    // shapes use the padded row count, while the recurrence and the workspace
+    // contract follow the live token count carried by qsl.
+    const auto padded_tokens = t[0].size(1), hk = t[0].size(2), dk = t[0].size(3);
+    const auto hv = t[2].size(2), dv = t[2].size(3);
+    const auto m = integer(t[6], t[6].numel() - 1);
+    TORCH_CHECK(m > 0 && m <= padded_tokens,
+                "GDN multi-checkpoint live tokens exceed the row count");
+    const auto sequences = validate_cu(t[6], m);
+    // Tracking always runs the parallel recurrence, so its workspace layout
+    // applies to short prefills as well.
+    const auto required =
+        2 * m * hk + sequences * hv * ((dv + grain - 1) / grain) * 3 * grain;
+    TORCH_CHECK(hk == 1 && hv == 3 && dk == 128 && dv == 128 &&
+                    t[3].numel() == padded_tokens * hv &&
+                    t[4].numel() == padded_tokens * hv &&
+                    t[5].sizes() == at::IntArrayRef({sequences, hv, dk, dv}) && t[7].dim() == 1 &&
+                    t[7].numel() >= required,
+                "GDN multi-checkpoint state/metadata/workspace shapes");
+    TORCH_CHECK(t[8].dim() == 2 && t[8].size(0) == padded_tokens && t[8].size(1) > 0 &&
+                    t[9].dim() == 3 && t[9].size(0) > 0 && t[9].size(1) == t[8].size(1),
+                "GDN multi-checkpoint conv snapshot shapes");
+    const auto width = t[9].size(2);
+    const auto rows = t[10].numel();
+    TORCH_CHECK(width > 0 && width <= 4096 && rows > 0 && t[11].numel() == rows &&
+                    t[14].numel() == rows &&
+                    t[12].sizes() == at::IntArrayRef({rows, hv, dk, dv}) &&
+                    t[13].numel() == sequences + 1 && integer(t[13], 0) == 0 &&
+                    integer(t[13], sequences) <= rows,
+                "GDN multi-checkpoint tracking shapes");
+    for (int64_t seq = 0; seq < sequences; ++seq)
+        TORCH_CHECK(integer(t[13], seq) <= integer(t[13], seq + 1),
+                    "GDN multi-checkpoint track offsets");
+    for (int64_t row = 0; row < rows; ++row) {
+        const auto start = integer(t[11], row);
+        TORCH_CHECK(integer(t[10], row) >= 0 && integer(t[10], row) < t[9].size(0),
+                    "GDN multi-checkpoint conv snapshot slot");
+        // Negative starts mark static-shape padding rows, which never capture.
+        if (start < 0)
+            continue;
+        TORCH_CHECK(start + width <= m, "GDN multi-checkpoint conv snapshot window");
+    }
+    isolated(t, {5, 7, 9, 12, 15});
+    // conv rows are (channels, width) while mixed_qkv is (tokens, channels).
+    // Copy each window through ATen's strided kernel: a scalar transpose here
+    // would issue channels*width cache-missing single-element loads per row.
+    for (int64_t row = 0; row < rows; ++row) {
+        const auto start = integer(t[11], row);
+        if (start < 0)
+            continue;
+        t[9].select(0, integer(t[10], row))
+            .copy_(t[8].narrow(0, start, width).transpose(0, 1));
+    }
+    const auto rc = qwen36_gdn_prefill_parallel_with_multi_track_workspace(
+        reinterpret_cast<const uint16_t *>(t[0].data_ptr()),
+        reinterpret_cast<const uint16_t *>(t[1].data_ptr()),
+        reinterpret_cast<const uint16_t *>(t[2].data_ptr()), t[3].data_ptr<float>(),
+        t[4].data_ptr<float>(), t[5].data_ptr<float>(), t[6].data_ptr<int32_t>(),
+        reinterpret_cast<uint16_t *>(t[15].data_ptr()), sequences, m, hk, hv, dk, dv, grain,
+        t[12].data_ptr<float>(), t[13].data_ptr<int32_t>(), t[14].data_ptr<int32_t>(),
+        t[7].data_ptr<float>(), t[7].numel());
+    TORCH_CHECK(rc == 0, "GDN multi-checkpoint prefill graph kernel error ", rc);
+    // Padding tail: the kernel only produces the live rows; zero the rest so
+    // uninitialized pool bytes (possibly NaN/Inf) never reach the residual
+    // stream and the finiteness-checked rmsnorm/quant kernels downstream.
+    // The boundary is recomputed from qsl on every execution, like gdn().
+    if (m < t[15].size(1))
+        t[15].narrow(1, m, t[15].size(1) - m).zero_();
+    // A target equal to the request's extend length snapshots the state after
+    // its last token, which the recurrence has just produced in place.
+    float *track = t[12].data_ptr<float>();
+    const float *final_state = t[5].data_ptr<float>();
+    const int64_t head = hv * dk * dv;
+    for (int64_t seq = 0; seq < sequences; ++seq) {
+        const auto length = integer(t[6], seq + 1) - integer(t[6], seq);
+        for (int64_t row = integer(t[13], seq); row < integer(t[13], seq + 1); ++row) {
+            if (integer(t[14], row) != length)
+                continue;
+            std::memcpy(track + row * head, final_state + seq * head,
+                        static_cast<size_t>(head) * sizeof(float));
+        }
+    }
+}
 void shared(std::vector<at::Tensor> &t, double scale, bool metadata_validated = false) {
     TORCH_CHECK(t.size() == 15, "Shared prefill graph ABI");
     for (int i : {0, 1, 2, 9, 10, 11, 12, 13})
@@ -297,6 +396,11 @@ extern "C" void qwen_graph_gdn_prefill_dispatch(std::vector<at::Tensor> &t,
     TORCH_CHECK(s.size() == 1, "GDN prefill graph scalar ABI");
     gdn(t, std::get<int64_t>(s[0]));
 }
+extern "C" void qwen_graph_gdn_prefill_multi_checkpoint_dispatch(
+    std::vector<at::Tensor> &t, const std::vector<ScalarArg> &s) {
+    TORCH_CHECK(s.size() == 1, "GDN multi-checkpoint prefill graph scalar ABI");
+    gdn_multi_checkpoint(t, std::get<int64_t>(s[0]));
+}
 extern "C" void qwen_graph_prefill_shared_dispatch(std::vector<at::Tensor> &t,
                                                    const std::vector<ScalarArg> &s) {
     TORCH_CHECK(s.size() == 1 || (s.size() == 2 && std::holds_alternative<bool>(s[1])),
@@ -320,6 +424,21 @@ static at::Tensor eager_gdn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor
     auto out = at::empty_like(v);
     std::vector<at::Tensor> t{q, k, v, g, beta, state, qsl, workspace, out};
     gdn(t, grain);
+    return out;
+}
+static at::Tensor eager_gdn_multi_checkpoint(at::Tensor q, at::Tensor k, at::Tensor v,
+                                             at::Tensor g, at::Tensor beta, at::Tensor state,
+                                             at::Tensor qsl, at::Tensor workspace,
+                                             at::Tensor mixed_qkv, at::Tensor conv,
+                                             at::Tensor conv_dst, at::Tensor conv_start,
+                                             at::Tensor track_states, at::Tensor track_offsets,
+                                             at::Tensor track_tokens, int64_t grain) {
+    auto out = at::empty_like(v);
+    std::vector<at::Tensor> t{q,           k,             v,          g,     beta,
+                              state,       qsl,           workspace,  mixed_qkv, conv,
+                              conv_dst,    conv_start,    track_states, track_offsets,
+                              track_tokens, out};
+    gdn_multi_checkpoint(t, grain);
     return out;
 }
 static void eager_shared(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor table, at::Tensor req,
@@ -357,6 +476,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
     m.def("qwen_registered_gdn_prefill(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
           "Tensor(a!) state, Tensor qsl, Tensor(b!) workspace, int grain) -> Tensor",
           &eager_gdn);
+    m.def("qwen_registered_gdn_prefill_multi_checkpoint(Tensor q, Tensor k, Tensor v, Tensor g, "
+          "Tensor beta, Tensor(a!) state, Tensor qsl, Tensor(b!) workspace, Tensor mixed_qkv, "
+          "Tensor(c!) conv, Tensor conv_dst, Tensor conv_start, Tensor(d!) track_states, "
+          "Tensor track_offsets, Tensor track_tokens, int grain) -> Tensor",
+          &eager_gdn_multi_checkpoint);
     m.def("qwen_registered_prefill_shared(Tensor q, Tensor k, Tensor v, Tensor table, Tensor req, "
           "Tensor seq, Tensor prefix, Tensor count, Tensor start, Tensor(a!) out, Tensor(b!) qb, "
           "Tensor(c!) pk, Tensor(d!) pv, Tensor(e!) ob, Tensor(f!) scratch, float scale) -> ()",

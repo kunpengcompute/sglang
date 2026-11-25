@@ -599,6 +599,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         buffers: List[torch.Tensor],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        verify: bool = True,
     ) -> List[bool]:
         key_strs = self._flat_keys(keys)
         assert len(key_strs) == len(buffers)

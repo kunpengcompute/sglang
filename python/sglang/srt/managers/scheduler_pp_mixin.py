@@ -6,6 +6,7 @@ import os
 import pickle
 import struct
 import time
+from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -47,7 +48,14 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.distributed import get_socket_tp_group
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_bool_env_var, get_device_module, is_xpu, is_cpu_920f, is_shm_available
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    get_device_module,
+    is_cpu_920f,
+    is_kunpeng_flash_comm,
+    is_shm_available,
+    is_xpu,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,11 +117,34 @@ def _is_idle_only_batch(batch: Optional[ScheduleBatch]) -> bool:
     )
 
 
+def _pp_proxy_payloads_sp_sliced() -> bool:
+    """True when flash-comm SP proxy payloads are per-rank token slices.
+
+    With flash-comm SP (prefill) each attn-TP rank's PPProxyTensors carry a
+    UNIQUE token slice (rows [r*n, (r+1)*n)), not the identical full-batch
+    copies the PP send-allgather scheme assumes (every rank sends chunk
+    ``tensor.reshape(attn_tp_size, -1)[rank]``, receivers all-gather the
+    chunks).  Applied to unique slices that interleaves bytes of different
+    ranks' payloads into a shape-correct but data-scrambled tensor — silent,
+    because the SP row-count invariants still hold.  Proxy messages must
+    instead travel 1:1 unsharded, which is byte-neutral per RDMA link (a
+    slice is already 1/attn_tp of the batch, the same size as one shard) and
+    drops the node-local all_gather on receive.  "output" messages keep the
+    shard scheme: the last stage gathers full rows before the final norm /
+    lm_head, so those payloads stay identical copies.
+    """
+    if not (_is_cpu_920f and is_kunpeng_flash_comm()):
+        return False
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    return get_moe_a2a_backend().is_kunpeng_cpu()
+
+
 def _ppmtp_log(self, msg: str, *args) -> None:
     """Log PP+MTP debug info with the pp_rank prefix."""
     if not _DEBUG_PP_MTP:
         return
-    pp_rank = getattr(self, "pp_rank", None)
+    pp_rank = getattr(self.ps, "pp_rank", None)
     logger.info(f"[PP{pp_rank}] {msg}", *args)
 
 
@@ -189,10 +220,10 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.recv_requests()
+                    recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -306,7 +337,7 @@ class SchedulerPPMixin:
 
         # Communication overlap is only enabled for prefill with PP=16; other
         # pp_size values are not validated, so keep the original schedule.
-        pp_prefill_overlap_comm = _pp_prefill_overlap_comm and self.pp_size == 16
+        pp_prefill_overlap_comm = _pp_prefill_overlap_comm and self.ps.pp_size == 16
 
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
@@ -325,7 +356,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
@@ -335,7 +366,7 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 pp_perf_start(f"mb{mb_id}", tag=f"pp{self.pp_group.rank_in_group}")
-                recv_reqs = self.recv_requests()
+                recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank and not pp_prefill_overlap_comm:
@@ -354,7 +385,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                batch = self.maybe_prepare_mlp_sync_batch(batch)
+                batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -492,7 +523,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
@@ -504,7 +535,7 @@ class SchedulerPPMixin:
 
                 pp_perf_start(f"mb{mb_id}", tag=f"pp{self.pp_group.rank_in_group}")
                 # 1.recv_requests / proc_input (decorated methods)
-                recv_reqs = self.recv_requests()
+                recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
@@ -670,7 +701,7 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
+        self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_nsa_prefill_context_parallel
@@ -700,7 +731,7 @@ class SchedulerPPMixin:
         # Finished requests carry [-1] * num_steps placeholders that are
         # skipped at the stash sites.
         self._pp_mtp_enabled = (
-            self.pp_size > 1
+            self.ps.pp_size > 1
             and self.spec_algorithm is not None
             and not self.spec_algorithm.is_none()
         )
@@ -717,7 +748,7 @@ class SchedulerPPMixin:
             self,
             f"init: pp_mtp_enabled={self._pp_mtp_enabled} "
             f"num_steps={self._pp_mtp_num_steps} "
-            f"pp_size={self.pp_size} spec={self.spec_algorithm}",
+            f"pp_size={self.ps.pp_size} spec={self.spec_algorithm}",
         )
 
     def profile_and_init_predictor(self: Scheduler):
@@ -733,7 +764,7 @@ class SchedulerPPMixin:
         if self.pp_group.is_first_rank:
             model_runner = self.tp_worker.model_runner
             model_config = model_runner.model_config
-            input_ids_list = []
+            input_ids_list: List[array[int]] = []
             for i in range(128):
                 chunk_size = int(
                     self.chunked_prefill_size * 1.25
@@ -741,9 +772,12 @@ class SchedulerPPMixin:
                 )
                 if chunk_size <= 0:
                     break
-                input_ids = np.random.randint(
-                    0, 10000, size=chunk_size, dtype=np.int64
-                ).tolist()
+                input_ids = array(
+                    "q",
+                    np.random.randint(
+                        0, 10000, size=chunk_size, dtype=np.int64
+                    ).tobytes(),
+                )
                 input_ids_list.append(input_ids)
 
             sampling_params = SamplingParams(
@@ -812,9 +846,8 @@ class SchedulerPPMixin:
 
                 start = time.perf_counter()
                 batch.prepare_for_extend()
-                model_worker_batch = batch.get_model_worker_batch()
 
-                forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+                forward_batch = ForwardBatch.init_new(batch, model_runner)
                 set_is_extend_in_batch(batch.forward_mode.is_extend())
 
                 _ = model_runner.forward(
@@ -842,7 +875,7 @@ class SchedulerPPMixin:
                 f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
 
-            if self.attn_tp_size > 1:
+            if self.ps.attn_tp_size > 1:
                 data_to_sync_tp = [seq_lens, latencies]
                 data_to_sync_tp = broadcast_pyobj(
                     data_to_sync_tp,
@@ -852,7 +885,7 @@ class SchedulerPPMixin:
                 )
                 seq_lens, latencies = data_to_sync_tp
 
-            if self.attn_cp_size > 1:
+            if self.ps.attn_cp_size > 1:
                 data_to_sync_tp = [seq_lens, latencies]
                 data_to_sync_tp = broadcast_pyobj(
                     data_to_sync_tp,
@@ -873,7 +906,7 @@ class SchedulerPPMixin:
         self.length_predictor.set_target_latency(self.chunked_prefill_size)
         self.length_predictor.is_ready = True
         logger.info(
-            f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
+            f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predictor ready (quadratic). "
             f"Target latency: {self.length_predictor.target_latency:.2f}ms"
         )
 
@@ -894,7 +927,7 @@ class SchedulerPPMixin:
         ):
             return None
 
-        max_chunk_size = getattr(self, "max_prefill_tokens", None)
+        max_chunk_size = self.max_prefill_tokens
         predicted_size = self.length_predictor.predict_next_chunk_size(
             history_len=history_len,
             base_chunk_size=self.chunked_prefill_size,
@@ -905,7 +938,7 @@ class SchedulerPPMixin:
 
         if predicted_size is not None:
             logger.debug(
-                f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predicted chunk size: "
+                f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predicted chunk size: "
                 f"{predicted_size} (history_len={history_len})"
             )
 
@@ -1292,7 +1325,7 @@ class SchedulerPPMixin:
         all_gather_group = (
             self.attn_tp_group if self.require_attn_tp_allgather else None
         )
-        upstream = (self.pp_rank - 1) % self.pp_size
+        upstream = (self.ps.pp_rank - 1) % self.ps.pp_size
         while True:
             # 1) Drain upstream data first (breaks the circular ACK wait).
             #    This must run even when this rank has NO inflight messages:
@@ -1367,29 +1400,30 @@ class SchedulerPPMixin:
         comm = self.pp_group.kunpeng_pp_communicator
         if comm is None:
             return
-        dst = (self.pp_rank + 1) % self.pp_size
+        dst = (self.ps.pp_rank + 1) % self.ps.pp_size
         while comm.inflight(dst) >= _PP_MSG_SLOTS - 1:
             self._pp_wait_acks(max_inflight=_PP_MSG_SLOTS - 2)
 
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
-        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
             if self.pp_group.kunpeng_pp_communicator is not None and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1":
                 # Unified RDMA message (async single-sided write); the peer
                 # acks on receive and the commit waits for the ack.
                 self._pp_ensure_send_slot()
                 self.pp_group.kunpeng_pp_communicator.send_pyobj(
-                    data, (self.pp_rank + 1) % self.pp_size
+                    data, (self.ps.pp_rank + 1) % self.ps.pp_size
                 )
             else:
-                dp_offset = self.attn_dp_rank * self.attn_tp_size
+                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
                 p2p_work = point_to_point_pyobj(
                     data,
-                    self.pp_rank * self.tp_size + dp_offset,
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
                     self.world_group.cpu_group,
-                    self.pp_rank * self.tp_size + dp_offset,
-                    ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size
+                    + dp_offset,
                     async_send=async_send,
                 )
         return p2p_work
@@ -1406,7 +1440,7 @@ class SchedulerPPMixin:
         reassembles the bytes and unpickles, so the object reaching
         process_input_requests is identical on every PP stage.
         """
-        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
+        if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
             return []
 
         # Gloo has no per-message size cap and its receiver consumes exactly
@@ -1488,22 +1522,23 @@ class SchedulerPPMixin:
 
     @Kunpeng_PP_Profiler(depth=1)
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
-        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
             if self.pp_group.kunpeng_pp_communicator is not None and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1":
                 data = self._pp_recv_message("pyobj")["data"]
             else:
-                dp_offset = self.attn_dp_rank * self.attn_tp_size
+                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
                 data = point_to_point_pyobj(
                     [],
-                    self.pp_rank * self.tp_size + dp_offset,
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
                     self.world_group.cpu_group,
-                    ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
-                    self.pp_rank * self.tp_size + dp_offset,
+                    ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size
+                    + dp_offset,
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
                 )
         else:
             data = None
 
-        if self.attn_tp_size > 1:
+        if self.ps.attn_tp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_tp_group.rank,
@@ -1511,7 +1546,7 @@ class SchedulerPPMixin:
                 src=self.attn_tp_group.ranks[0],
             )
 
-        if self.attn_cp_size > 1:
+        if self.ps.attn_cp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_cp_group.rank,
@@ -1570,15 +1605,24 @@ class SchedulerPPMixin:
             and self.pp_group.kunpeng_pp_communicator is not None
         ):
             self._pp_ensure_send_slot()
+        # Flash-comm SP: proxy payloads are per-rank token slices, unique per
+        # attn-TP rank — ship each slice 1:1 unsharded and skip the shard /
+        # all-gather reassembly (see _pp_proxy_payloads_sp_sliced).  The
+        # receiver mirrors this in _pp_consume_message.
+        sp_sliced = msg_type == "proxy" and _pp_proxy_payloads_sp_sliced()
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
                 dst=dst,
                 all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                    None
+                    if sp_sliced
+                    else (
+                        self.attn_tp_group if self.require_attn_tp_allgather else None
+                    )
                 ),
-                per_key_group=self._pp_per_key_shard_groups(),
+                per_key_group=(None if sp_sliced else self._pp_per_key_shard_groups()),
                 async_send=async_send,
             )
         )
@@ -1738,7 +1782,18 @@ class SchedulerPPMixin:
         # The recv side must read the offset the sender wrote to. kutacc::pp_put
         # writes local[off] -> remote[off] with one offset, so both sides agree
         # on the slot: output and proxy frames each advance their own slot ring.
-        is_output = _msg_type_from_metadata(recv_metadata_list) == "output"
+        msg_type = _msg_type_from_metadata(recv_metadata_list)
+        is_output = msg_type == "output"
+        if (
+            default_group is not None
+            and msg_type == "proxy"
+            and _pp_proxy_payloads_sp_sliced()
+        ):
+            # Flash-comm SP: the sender shipped each rank's token slice 1:1
+            # unsharded (see _pp_send_dict_to_next_stage); re-sharding and
+            # all-gathering here would interleave bytes of different ranks'
+            # slices into a shape-correct but data-scrambled tensor.
+            default_group = None
         offset_base = (
             comm.output_recv_offset(src) if is_output else comm.proxy_recv_offset(src)
         )
@@ -1820,7 +1875,7 @@ class SchedulerPPMixin:
                 self.attn_tp_group if self.require_attn_tp_allgather else None
             )
         if src is None:
-            src = (self.pp_rank - 1) % self.pp_size
+            src = (self.ps.pp_rank - 1) % self.ps.pp_size
         while True:
             msg = self._pp_consume_message(src, all_gather_group)
             if msg is None:
@@ -1874,7 +1929,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        batch.output_ids = pp_outputs["next_token_ids"]
+        batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
 
         if self._pp_mtp_enabled:
             # PP + MTP: stash the per-req drafts for the next verify round and
@@ -2062,9 +2117,9 @@ class SchedulerPPMixin:
         # XPU: even ranks send first, odd ranks recv first.
         # CPU (gloo): isend may be blocking, use parity-based ordering to avoid deadlock.
         if _is_cpu_920f:
-            send_first = (self.pp_rank % 2) == 0
+            send_first = (self.ps.pp_rank % 2) == 0
         else:
-            send_first = (not is_xpu()) or ((self.pp_rank % 2) == 0)
+            send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
@@ -2412,24 +2467,24 @@ class SchedulerPPMixin:
         self: Scheduler, data_list: List[Any], sub_kind: int = _PP_BUNDLE_SUB_FORWARD
     ) -> List[P2PWork]:
         work = []
-        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
             if (
                 self.pp_group.kunpeng_pp_communicator is not None
                 and os.getenv("SGLANG_KUNPENG_RDMA_PP_COMM") == "1"
             ):
                 self._pp_ensure_send_slot()
                 self.pp_group.kunpeng_pp_communicator.send_pyobjs_bundle(
-                    data_list, (self.pp_rank + 1) % self.pp_size, sub_kind
+                    data_list, (self.ps.pp_rank + 1) % self.ps.pp_size, sub_kind
                 )
             else:
                 for data in data_list:
-                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
                     work += point_to_point_pyobj(
                         data,
-                        self.pp_rank * self.tp_size + dp_offset,
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
                         self.world_group.cpu_group,
-                        self.pp_rank * self.tp_size + dp_offset,
-                        ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                        ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
                         async_send=True,
                     )
         return work
@@ -2445,7 +2500,7 @@ class SchedulerPPMixin:
             # RDMA bundle: only (tp0, cp0) demuxes the single bundle through the
             # unified channel (stashing any non-target kind that arrives first),
             # then the list is broadcast to the rest of the tp/cp ranks.
-            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 # Demux by the frame-header sub-kind: "bundle" = forward
                 # consensus (step2), "ringback" = ring-back consensus (step7).
                 # _pp_recv_message consumes any interleaved frames first and
@@ -2461,14 +2516,14 @@ class SchedulerPPMixin:
                 )
             else:
                 data = None
-            if self.attn_tp_size > 1:
+            if self.ps.attn_tp_size > 1:
                 data = broadcast_pyobj(
                     data,
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
-            if self.attn_cp_size > 1:
+            if self.ps.attn_cp_size > 1:
                 data = broadcast_pyobj(
                     data,
                     self.attn_cp_group.rank,
@@ -2723,11 +2778,11 @@ class ChunkSizePredictor:
     def set_target_latency(self, base_chunk_size: int):
         """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
 
-        def f(l: float) -> float:
-            """Total latency function: f(l) = al^2 + bl + c (or bl + c for linear)"""
+        def f(length: float) -> float:
+            """Total latency function: f(length) = a*length^2 + b*length + c."""
             return (
-                self.quadratic_coeff_a * l * l
-                + self.linear_coeff_b * l
+                self.quadratic_coeff_a * length * length
+                + self.linear_coeff_b * length
                 + self.constant_coeff_c
             )
 

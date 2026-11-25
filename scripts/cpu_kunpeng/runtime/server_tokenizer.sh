@@ -90,6 +90,12 @@ HTTP_COMMON_ARGS=(
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"}
 )
 
+# Enable Prometheus metrics (TTFT/time_to_first_token_seconds are observed
+# here by the tokenizer manager, so this process needs --enable-metrics too).
+if [[ "${SGLANG_ENABLE_METRICS:-0}" == "1" ]]; then
+    HTTP_COMMON_ARGS+=(--enable-metrics)
+fi
+
 # Request logging (inputs/outputs of all requests), gated by LOG_REQUESTS.
 # The HTTP server / tokenizer manager runs here in PD-separated mode, so the
 # Receive/Finish request logs are emitted by this process.
@@ -125,18 +131,21 @@ python -m sglang.launch_server \
     --disaggregation-mode "$TOK_SIDE" \
 >> "$_tok_log" 2>&1 &
 
-# Poll until the HTTP server is ready (up to 30 minutes)
+# Poll until the HTTP server is ready (up to 30 minutes).
 echo "Waiting for HTTP server on port $TOK_PORT to be ready..."
 ready=0
-for i in $(seq 1 18000); do  # up to 30 minutes
-    if curl -sf --noproxy "*" --max-time 5 "http://${ROUTER_IP}:${TOK_PORT}/health" >/dev/null 2>&1; then
-        ready=1
-        break
-    fi
-    sleep 0.1
+probe_code=""
+probe_interval=1
+probe_deadline=$(( $(date +%s) + 1800 ))
+while (( $(date +%s) < probe_deadline )); do
+    probe_code="$(curl -s -o /dev/null -w '%{http_code}' --noproxy "*" --max-time 2 \
+        "http://${ROUTER_IP}:${TOK_PORT}/v1/models" 2>/dev/null)"
+    [[ "$probe_code" == "200" ]] && { ready=1; break; }
+    sleep "$probe_interval"
+    (( probe_interval = probe_interval < 10 ? probe_interval * 2 : 10 ))
 done
 [[ "$ready" -eq 1 ]] || {
-    echo "ERROR: HTTP server on port $TOK_PORT not ready within 30 minutes" >&2
+    echo "ERROR: HTTP server on port $TOK_PORT not ready within 30 minutes (last probe: ${probe_code:-no-response} http://${ROUTER_IP}:${TOK_PORT}/v1/models)" >&2
     exit 1
 }
 echo "HTTP server on port $TOK_PORT ready"

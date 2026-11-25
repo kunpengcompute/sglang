@@ -16,12 +16,16 @@
 # benchmark.sh - Launch GSM8K / MMLU benchmarks against the gateway.
 #
 # Usage:
-#   bash benchmark.sh gsm8k [extra python args...]
-#   bash benchmark.sh mmlu  [extra python args...]
+#   bash benchmark.sh <suite> [-p|--profile] [extra python args...]
+#   e.g. bash benchmark.sh sharegpt -p
 #   Extra args override the defaults, e.g.:
 #     bash benchmark.sh gsm8k --max-new-tokens 128 --num-questions 50
 #     bash benchmark.sh mmlu  --nsub 60 --parallel 32
 #   (note: use hyphens, e.g. --max-new-tokens, not --max_new_tokens)
+#   -p/--profile POSTs /start_profile before the run and /stop_profile after
+#   (also on failure); targets PROFILE_URLS (comma-separated, default decode
+#   port -- the gateway does not proxy control endpoints).
+#   --port PORT overrides the gateway port for all suites (overrides $PORT).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -33,6 +37,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ============================================================================
 DEFAULT_PORT=30000                  # (both) gateway port
 DEFAULT_PARALLEL=10                 # (both) client concurrency
+DEFAULT_PROFILE_PORT=30002          # (profile) fallback decode tokenizer port
+                                    #  (used when INSTANCES has no decode entry;
+                                    #  otherwise 30001 + decode entry position)
 
 # gsm8k
 DEFAULT_NUM_QUESTIONS=100           # (gsm8k) number of questions
@@ -112,14 +119,107 @@ fi
 SUITE="${1:-}"
 shift || true
 
+# -p/--profile: start profiling before the suite and stop it afterwards;
+# --port <PORT>: gateway port override. Remaining args go to the suite command.
+PROFILE=0
+EXTRA_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--profile)
+            PROFILE=1
+            shift
+            ;;
+        --port)
+            [[ -n "${2:-}" ]] || { echo "benchmark.sh: $1 requires a port" >&2; exit 2; }
+            PORT="$2"
+            shift 2
+            ;;
+        --port=*)
+            PORT="${1#*=}"
+            shift
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${EXTRA_ARGS[@]}"
+
 # Gateway host: $HOST > $ROUTER_IP (from env.sh) > 127.0.0.1
 GATEWAY_HOST="${HOST:-${ROUTER_IP:-127.0.0.1}}"
 GATEWAY_PORT="${PORT:-$DEFAULT_PORT}"
 PARALLEL="${PARALLEL:-$DEFAULT_PARALLEL}"
 
+# Profiling helpers: POST /start_profile before the run, /stop_profile after
+# (including failures). PROFILE_URLS is a comma-separated base-URL list so a PD
+# deployment can be profiled on both prefill and decode workers, e.g.:
+#   PROFILE_URLS=http://10.36.174.1:30000,http://10.36.174.17:30000 \
+#       bash benchmark.sh sharegpt -p
+# Default target is the decode endpoint on the router node (the gateway does
+# not proxy /start_profile). Its port is derived from the layout exactly like
+# runtime/env_decode.sh: 30001 + the decode entry's global position in
+# INSTANCES, so one prefill -> 30002, two prefills -> 30003.
+resolve_profile_port() {
+    local entry inst port
+    for entry in ${INSTANCES//,/ }; do
+        entry="${entry//[[:space:]]/}"
+        [[ -z "$entry" ]] && continue
+        [[ "${entry%%_*}" == "decode" ]] || continue
+        [[ "$entry" == *_* ]] && inst="${entry#*_}" || inst=""
+        port="$(SKIP_CONDA=1 bash -c "
+            source '$SCRIPT_DIR/env.sh' decode '$inst' >/dev/null 2>&1
+            echo \"\${DECODE_TOK_PORT:-}\"" 2>/dev/null)"
+        [[ -n "$port" ]] && { echo "$port"; return; }
+        break
+    done
+    echo "$DEFAULT_PROFILE_PORT"
+}
+PROFILE_PORT="${PROFILE_PORT:-$(resolve_profile_port)}"
+PROFILE_URLS="${PROFILE_URLS// /}"
+PROFILE_URLS="${PROFILE_URLS:-http://${GATEWAY_HOST}:${PROFILE_PORT}}"
+PROFILE_STARTED=0
+
+profile_send() {  # $1 = start|stop
+    local mode="$1" path url rc=0 body='{}'
+    local tmo="${PROFILE_TIMEOUT:-600}"
+    path="/${mode}_profile"
+    [[ "$mode" == "start" && -n "${PROFILE_OUTPUT_DIR:-}" ]] && \
+        body="{\"output_dir\": \"${PROFILE_OUTPUT_DIR}\"}"
+    local IFS=','
+    for url in $PROFILE_URLS; do
+        url="${url%/}"
+        echo "[profile] $mode: $url$path (timeout ${tmo}s)" >&2
+        if ! curl -fsS -m "$tmo" -X POST -H 'Content-Type: application/json' \
+                -d "$body" "$url$path" >/dev/null; then
+            echo "[profile] $mode failed: $url$path" >&2
+            [[ "$mode" == "stop" ]] && \
+                echo "[profile] stop may still be running server-side (profile dump); raise PROFILE_TIMEOUT if needed" >&2
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+cleanup_profile() {
+    if [[ "$PROFILE_STARTED" == "1" ]]; then
+        PROFILE_STARTED=0
+        profile_send stop || true
+    fi
+}
+
 show_help() {
     cat <<'EOF'
-Usage: bash benchmark.sh <suite> [extra python args...]
+Usage: bash benchmark.sh <suite> [-p|--profile] [extra python args...]
+  -p, --profile   POST /start_profile before the run, /stop_profile after
+                  PROFILE_URLS: comma-separated base URLs (default decode port)
+                  PROFILE_PORT: port used when PROFILE_URLS is unset (default:
+                  decode tokenizer from INSTANCES, 30002 with one prefill /
+                  30003 with two; --port does not affect it)
+                  PROFILE_OUTPUT_DIR: optional, passed as start_profile output_dir
+                  PROFILE_TIMEOUT: curl timeout in seconds (default 600;
+                  /stop_profile synchronously dumps profiles and can be slow)
+  --port PORT     gateway port (overrides $PORT; e.g. --port 30002)
 
 Available test suites (6):
   gsm8k    Few-shot GSM8K evaluation
@@ -203,13 +303,38 @@ if [[ -z "$SUITE" ]]; then
     exit 1
 fi
 
+# Validate the suite before touching the profiler, then start profiling if
+# -p/--profile was given; the EXIT trap stops it even when the suite fails.
+case "$SUITE" in
+    -h|--help|help)
+        show_help
+        exit 0
+        ;;
+    gsm8k|mmlu|aisbench|sharegpt) ;;
+    *)
+        echo "Unknown suite: '$SUITE'" >&2
+        show_help >&2
+        exit 1
+        ;;
+esac
+
+if [[ "$PROFILE" == "1" ]]; then
+    command -v curl >/dev/null 2>&1 || {
+        echo "benchmark.sh: -p/--profile requires curl" >&2
+        exit 2
+    }
+    trap cleanup_profile EXIT
+    profile_send start || exit 1
+    PROFILE_STARTED=1
+fi
+
 case "$SUITE" in
     -h|--help|help)
         show_help
         exit 0
         ;;
     gsm8k)
-        exec python "$SGLANG_PATH/python/sglang/test/few_shot_gsm8k.py" \
+        python "$SGLANG_PATH/python/sglang/test/few_shot_gsm8k.py" \
             --num-questions "${NUM_QUESTIONS:-$DEFAULT_NUM_QUESTIONS}" \
             --num-shots "${NUM_SHOTS:-$DEFAULT_NUM_SHOTS}" \
             --max-new-tokens "${MAX_NEW_TOKENS:-$DEFAULT_MAX_NEW_TOKENS}" \
@@ -225,7 +350,7 @@ case "$SUITE" in
         if [[ -n "${RAW_RESULT_FILE:-$DEFAULT_RAW_RESULT_FILE}" ]]; then
             raw_result_args=(--raw-result-file "${RAW_RESULT_FILE:-$DEFAULT_RAW_RESULT_FILE}")
         fi
-        exec python "$SGLANG_PATH/benchmark/mmlu/bench_sglang.py" \
+        python "$SGLANG_PATH/benchmark/mmlu/bench_sglang.py" \
             --parallel "$PARALLEL" \
             --data_dir "${DATA_DIR:-$DATASET_PATH/mmlu}" \
             --ntrain "${NTRAIN:-$DEFAULT_NTRAIN}" \
@@ -512,7 +637,7 @@ case "$SUITE" in
                 --max-concurrency "${SHAREGPT_MAX_CONCURRENCY:-$DEFAULT_SHAREGPT_MAX_CONCURRENCY}"
             )
         fi
-        exec "${launch_prefix[@]}" python3 -m sglang.bench_serving \
+        "${launch_prefix[@]}" python3 -m sglang.bench_serving \
             --backend "${SHAREGPT_BACKEND:-$DEFAULT_SHAREGPT_BACKEND}" \
             --host "$GATEWAY_HOST" \
             --port "${PORT:-$DEFAULT_SHAREGPT_PORT}" \

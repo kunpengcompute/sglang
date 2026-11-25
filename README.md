@@ -185,10 +185,12 @@ sh launch.sh all
 
 flash-comm是prefill实例的通信与MoE优化，包含两项子特性：
 
-- **SP prefill MoE（token切片序列并行）**：attn-TP组内每个rank只持有序列的一个token切片；注意力输出reduce-scatter后在本地切片上做LayerNorm与MLP，各rank的topk表用一次`shm_dual_allgather`合并成全表，MoE combine只写回本rank的home切片，避免逐层全量allgather/allreduce；
+- **SP prefill MoE（token切片序列并行）**：attn-TP组内每个rank只持有序列的一个token切片；注意力输出reduce-scatter后在本地切片上做LayerNorm与MLP，各rank的topk表用一次`shm_dual_allgather`合并成全表（RDMA dispatch路径下MoE combine只写回本rank的home切片，本地SHM dispatch路径下由combine_recv提取本rank切片），避免逐层全量allgather/allreduce；
 - **共享专家EPLB共置**：共享专家作为第`n_routed`个逻辑专家（GLM-5.3为256）放进EPLB物理专家表，与路由专家共用同一条dispatch/combine流水线；`grouped_topk`内核直接把`routed_scaling_factor`折入路由权重（共享专家列权重固定为1.0），forward侧不再单独缩放。
 
-启用前提（启动时逐项校验，违反即报错退出）：仅prefill实例（decode侧`IS_PREFILL=0`自动失效）；attn-TP > 1；需走RDMA dispatch路径（单节点本地SHM dispatch拓扑不支持home切片combine）；prefill实例需PP=1；`ep_size == tp_size`（不支持ETP）。
+启用前提（启动时逐项校验，违反即报错退出）：仅prefill实例（decode侧`IS_PREFILL=0`自动失效）；attn-TP > 1；`ep_size == tp_size`（不支持ETP）。
+
+**PP拓扑**：PP=1与PP>1（如pp=16 prefill）均可启用。PP>1时非末级stage通过PPProxyTensors把（hidden_states, residual）token切片传给下一stage，接收stage首个layer在prepare_attn聚回全量行（layer_input_mode按全局layer_id推导），Kunpeng graph runner按`input_ids / attn_tp_size`行数校验切片负载。dispatch路径两条均可：RDMA dispatch（combine写home切片，最小通信）与单节点本地SHM dispatch（每stage一节点的pp=16即此拓扑；dispatch/combine保持全量布局，combine_recv提取home切片，home切片写优化仅RDMA路径，但router/topk每rank只算1/attn_tp的收益不受影响）。
 
 三个环境变量（prefill实例侧设置，如`runtime/.user_env_prefill[_<instance>].sh`）：
 
@@ -242,7 +244,7 @@ python add_shared_expert_glm5.py \
 ```
 launch.sh（任务分发器：./launch.sh <role> [instance]）
   ├─→ runtime/launch_cluster.sh（prefill/decode/native：env加载、stop前置、SSH分发到各节点）
-  │      └─→ server.sh（单节点进程启动）
+  │      └─→ runtime/server_cluster.sh（单节点进程启动）
   ├─→ runtime/launch_tokenizer.sh（tokenizer：SSH到router节点）
   │      └─→ runtime/server_tokenizer.sh（tokenizer HTTP server）
   ├─→ runtime/launch_mooncake.sh（mooncake：store master）
@@ -261,6 +263,46 @@ runtime/env_base.sh（共享默认值；内部依次加载.user_env.sh与runtime
 ```
 
 角色默认值：prefill侧`SGLANG_KUNPENG_MAX_SEQ_NUM=8`、`SGLANG_KUNPENG_MAX_CUR_LEN=576`（native取同prefill侧值）；decode侧`SGLANG_KUNPENG_MAX_SEQ_NUM=64`、`SGLANG_KUNPENG_MAX_CUR_LEN=1`（开启MTP时自动取`SGLANG_SPECULATIVE_NUM_STEPS+1`）。
+
+#### 3.4.1 非root用户部署（root_proxy）
+
+默认流程以root登录各节点，直接执行`insmod`、写`/sys`大页、写`/proc/sys/vm/drop_caches`。若集群只提供普通用户，可用下面两个变量切到"非root + 站点root代理"模式：
+
+```bash
+# runtime/.user_env_base.sh（或 .user_env.sh）
+export SGLANG_ENABLE_NOROOT_USER=1
+export SGLANG_KUNPENG_NOROOT_PROXY_PATH="/path/to/root_proxy_dir"
+```
+
+- **SGLANG\_ENABLE\_NOROOT\_USER**：`1`开启非root模式，默认`0`，root流程完全保持原样。开启后SSH不再使用`root@`，所有特权操作改由站点提供的setuid代理`root_proxy`执行。
+- **SGLANG\_KUNPENG\_NOROOT\_PROXY\_PATH**：代理目录，需包含`root_proxy`、`sgl_reload_sdma.sh`、`sgl_reload_zcopy.sh`、`sdma_threshold.sh`、`hugepage_2m.sh`、`sgl_drop_cache.sh`、`sgl_hugepage_perm.sh`；可选`sgl_clean_shm.sh`用于清理root遗留的`/dev/shm`段。`root_proxy`用法为`root_proxy <脚本名> [参数...]`，脚本名不能带`/`（代理只在自己目录下解析脚本）。
+
+特权操作与代理脚本对应关系：
+
+| 操作 | root模式（默认） | 非root模式 |
+| --- | --- | --- |
+| 重载SDMA驱动 / 写阈值寄存器 | `rmmod`+`insmod`，直接写寄存器 | `root_proxy sgl_reload_sdma.sh` / `sdma_threshold.sh` |
+| 加载 zcopy 驱动（创建`/dev/zdax`） | `insmod mod/zcopy_kylin.ko` | `root_proxy sgl_reload_zcopy.sh` |
+| 放行`/dev/zdax`（kupl SLS 必需） | 无需处理 | `root_proxy sgl_hugepage_perm.sh`（每节点启动时自动执行） |
+| 每rank 2M大页 | 直接写`nr_hugepages` | `root_proxy hugepage_2m.sh <count> <node>` |
+| 回收大页 | 直接写`nr_hugepages` | `root_proxy hugepage_2m.sh 0 <node>` |
+| 清`/dev/shm` | `rm -rf /dev/shm/*` | `root_proxy sgl_clean_shm.sh`（缺失时尽力删除本用户段） |
+| `drop_caches` | 直接写 | `root_proxy sgl_drop_cache.sh` |
+
+`sgl_hugepage_perm.sh` 参考内容（只做两件事：放行SLS设备、给`/dev/hugepages`写权限）：
+
+```bash
+#!/bin/bash
+[ -e /dev/zdax ] && { chgrp eapp /dev/zdax; chmod 660 /dev/zdax; }
+chmod 1777 /dev/hugepages 2>/dev/null
+exit 0
+```
+
+注意事项：
+
+- **`KUPL_SHM_ENABLE_HUGEPAGE` 必须保持 `y`**（默认值）。若设为`n`，kupl SLS建立共享内存窗口时会把进程mempolicy残留绑定到CPU节点（该节点大页已被清0），导致随后sgl-kernel的HBW权重池`mmap MAP_HUGETLB`返回`ENOMEM`（日志`FAILED: errno=12` + `mmap with MAP_HUGETLB failed`）。可额外设置`SGLANG_KUNPENG_HBW_BIND_BEFORE_MMAP=1`作为双保险（mmap前临时绑定HBM节点，用完恢复）。
+- kupl SLS生效的唯一条件是`open("/dev/zdax", O_RDWR)`成功；失败时打印`sls init failed`并回退posix。若某节点缺少`/dev/zdax`，该节点只能走posix，存在`kupl_parallel_for`死锁风险，建议先确认设备的注册情况（`/sys/class/zcopy/zdax/dev`）。
+- 大页的`nr_hugepages`是root-only sysfs，非root直接写入必然`EACCES`，必须走代理。
 
 ### 3.5 PD分离部署
 
@@ -327,7 +369,7 @@ export SGLANG_ENABLE_BINARY_LAUNCH=1      # 默认开
 export SGLANG_ENABLE_NUMA_DUPLICATION=1   # 默认开
 ```
 
-- **作用**：每个scheduler进程独立启动，使用`--tp-rank-in-node`区分rank号。`server.sh`遍历`RANK_IN_NODE`逐个启动进程，绑CPU核（`taskset -c`）并配置大页。关闭时仅有一个`python -m sglang.launch_server`进程。
+- **作用**：每个scheduler进程独立启动，使用`--tp-rank-in-node`区分rank号。`runtime/server_cluster.sh`遍历`RANK_IN_NODE`逐个启动进程，绑CPU核（`taskset -c`）并配置大页。关闭时仅有一个`python -m sglang.launch_server`进程。
 - **SGLANG\_ENABLE\_NUMA\_DUPLICATION**：在上述基础上，每个NUMA节点使用`PYINSTALL_PATH/dist/sglang_server_tp{rank}/`下的独立预编译二进制（`SGLANG_ENABLE_BINARY_LAUNCH`开启前提下），实现各NUMA节点内存本地化，减少跨NUMA访存。关闭时所有rank共享一个二进制，同时影响`LD_LIBRARY_PATH`的设置逻辑。多副本的构建（PyInstaller打包与NUMA副本复制）请参考[PyInstaller打包工具说明](scripts/cpu_kunpeng/pyinstall/readme.md)。
 
 **2. SGLANG\_ENABLE\_TOKENIZER\_SEPERATE — 分离Tokenizer**
@@ -563,7 +605,7 @@ sh curl.sh -p -s -f prompts/ragged.txt
 | `-F`             | fake-transfer模式（注入bootstrap\_host=2.2.2.2，decode跳过KV传输；端口从INSTANCES的decode条目自动推导，`CURL_PORT`可覆盖） | 关闭              |
 | `-i`             | 多轮交互式对话模式                                                         | 关闭              |
 
-通过`CURL_HOST`/`CURL_PORT`环境变量可指定目标地址与端口（默认本机网卡IP:30000）。根据请求的返回结果对正确性进行验证。
+请求默认发往`env.sh`中配置的`ROUTER_IP`（gateway所在节点，`curl.sh`通过`source env.sh none`读取）；通过`CURL_HOST`/`CURL_PORT`环境变量可覆盖目标地址与端口（默认端口30000）。根据请求的返回结果对正确性进行验证。
 
 ### 4.5 基准测试
 

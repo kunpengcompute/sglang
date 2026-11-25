@@ -176,6 +176,9 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    # Recorder row for the padding histogram; defaults to `layer_id` (nextn
+    # overrides it so padding lands in the same row as its heat).
+    pad_layer_id: Optional[int] = None
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -282,6 +285,7 @@ class TopK(MultiPlatformOp):
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
+        pad_layer_id: Optional[int] = None,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -305,6 +309,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            pad_layer_id=pad_layer_id,
         )
 
     def forward_native(
@@ -688,10 +693,11 @@ def _get_kunpeng_topk_buffers(batch_size: int, topk: int):
     When the KunpengMoE dispatcher is active, the router writes topk results
     into the contiguous SHM buffers (topk_weights_buf / topk_ids_flat_buf).
     topk_ids_flat_buf is contiguous so that the per-rank slices can be
-    merged with shm_dual_allgather; afterwards the merged ids are copied
-    into the even columns of the interleaved topk_ids_index_buf consumed by
-    the RDMA dispatcher (odd columns hold the per-expert token index written
-    by the kutacc dispatch kernel).
+    merged with shm_dual_allgather; afterwards the merged ids are published
+    as (peer rank, local expert slot) pairs into the interleaved
+    topk_ids_index_buf consumed by the RDMA / local SHM dispatchers (on the
+    RDMA path the kutacc dispatch kernel later reuses the odd columns as
+    its per-expert token-index workspace).
 
     In SP mode ``batch_size`` is the per-rank token count and only this
     rank's segment of the SHM buffers is returned.
@@ -794,16 +800,51 @@ def _kunpeng_etp_remap_topk_ids(topk_ids: torch.Tensor):
     )
 
 
+def _kunpeng_publish_topk_ids_rank_slot(
+    state, topk_ids: torch.Tensor, start: int
+) -> None:
+    """Publish logical topk ids as (rank, local slot) pairs into the dispatch buffer.
+
+    Every producer filling ``topk_ids_index_buf`` must emit the ONE canonical
+    encoding its consumers read: even columns = peer rank, odd columns = local
+    expert slot.  The EPLB remap kernels and the ETP remap already write
+    these pairs; this helper serves the non-redundant (no-EPLB) path by
+    reusing the graph-registered remap op with the identity dispatch table —
+    the trivial layout keeps logical id == physical slot, so rank = id //
+    num_local_experts and slot = id % num_local_experts (exactly the packed-id
+    decode the local dispatch/sum kernels performed before the encoding was
+    unified).
+
+    The table is passed explicitly instead of ``None``: a captured ``None``
+    is replayed as an undefined/placeholder tensor, which the remap kernel
+    rejects as a non-int64 dispatch map.  ``identity_dispatch_map`` is a
+    persistent int64 tensor registered as a fixed graph storage so replay
+    hands the kernel a real 1-D gather table.
+    """
+    identity_map = state.identity_dispatch_map
+    assert identity_map is not None, (
+        "Kunpeng identity dispatch map is not initialized; "
+        "_init_buffers must allocate it"
+    )
+    kunpeng.remap_topk_ids_to_rank_slot_kunpeng(
+        topk_ids,
+        state.topk_ids_index_buf[start : start + topk_ids.shape[0]],
+        identity_map,
+        state.num_local_experts * state.ep_size,
+        state.ep_size,
+        state.moe_tp_size,
+    )
+
+
 def _kunpeng_publish_and_sync_topk_ids(topk_ids: torch.Tensor) -> None:
-    """Publish the logical ids into the dispatch buffer and sync across ranks.
+    """Publish the routing table into the dispatch buffer and sync across ranks.
 
     Used on the non-redundant-expert path (no ``remap_topk_ids_to_rank_slot``):
-    the interleaved dispatch buffer's even columns hold the logical ids, which
-    may differ across ranks after the rank-local load-balance fill.  This
-    re-publishes ``topk_ids`` and runs the same single allgather used by the
-    remap path, so every rank agrees on the routing table.  Under ETP the
-    even/odd columns hold the expert group leader rank and the local expert
-    slot instead of the raw logical id.
+    the interleaved dispatch buffer's even/odd columns hold (peer rank, local
+    expert slot) pairs, which may differ across ranks after the rank-local
+    load-balance fill.  This re-publishes ``topk_ids`` and runs the same single
+    allgather used by the remap path, so every rank agrees on the routing
+    table.
     """
     from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
         _KunpengDispatcherState,
@@ -816,7 +857,7 @@ def _kunpeng_publish_and_sync_topk_ids(topk_ids: torch.Tensor) -> None:
     if state.etp_enabled:
         _kunpeng_etp_remap_topk_ids(topk_ids)
     else:
-        kunpeng.copy_kunpeng(full_buf[start : start + num_tokens, 0::2], topk_ids)
+        _kunpeng_publish_topk_ids_rank_slot(state, topk_ids, start)
     _kunpeng_allgather_interleaved_slots(full_buf, full_tokens, topk)
 
 
@@ -864,10 +905,9 @@ def grouped_topk_kunpeng(
     # scaling; python post-processing would not be graph-replayed.
 
     if topk_ids_out is not None:
-        # Publish the consistent full ids table into the interleaved
-        # dispatch buffer (even columns); every rank writes identical data.
-        # Under ETP the even/odd columns hold the expert group leader rank
-        # and the local expert slot instead of the raw logical id.
+        # Publish the consistent full routing table into the interleaved
+        # dispatch buffer as (peer rank, local expert slot) pairs; every rank
+        # writes identical data.
         from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
             _KunpengDispatcherState,
         )
@@ -878,12 +918,7 @@ def grouped_topk_kunpeng(
             _kunpeng_etp_remap_topk_ids(topk_ids)
         else:
             start, _ = _kunpeng_topk_slice(state, topk_ids.shape[0])
-            kunpeng.copy_kunpeng(
-                state.topk_ids_index_buf[
-                    start : start + topk_ids.shape[0], 0::2
-                ],
-                topk_ids,
-            )
+            _kunpeng_publish_topk_ids_rank_slot(state, topk_ids, start)
 
     return topk_weights, topk_ids
 
@@ -1284,6 +1319,7 @@ def _load_balance_padded_tokens_kunpeng(
     num_token_non_padded: torch.Tensor,
     num_experts: int,
     topk: int,
+    layer_id: Optional[int] = None,
 ) -> torch.Tensor:
     force_balance = get_bool_env_var("SGLANG_KUNPENG_MOE_FORCE_LOAD_BALANCE")
     # Rotate the t_high target window per DP rank so aggregated loads stay
@@ -1308,6 +1344,15 @@ def _load_balance_padded_tokens_kunpeng(
     kunpeng.load_balance_padded_tokens_kunpeng(
         topk_ids, topk_weights, num_token_non_padded, num_experts, topk,
         force_balance, expert_offset, slice_offset)
+    # Record the padding-row logical-expert histogram for offline subtraction.
+    # Non-SP topk_ids is replicated across the attn-TP group, so record once.
+    record_pad = state.use_sp or state.attn_tp_rank == 0
+    if record_pad and layer_id is not None and num_token_non_padded is not None:
+        pad_counter = get_global_expert_distribution_recorder().get_kunpeng_pad_counter()
+        if pad_counter is not None:
+            kunpeng.record_padded_expert_activation_kunpeng(
+                topk_ids, num_token_non_padded, pad_counter, int(layer_id),
+                int(num_experts), int(slice_offset))
     return topk_ids, topk_weights
 
 
@@ -1317,12 +1362,14 @@ def _remap_kunpeng_topk_ids_to_rank_slot(
 ) -> torch.Tensor:
     """Map logical expert ids to (rank, local) slots for the Kunpeng RDMA dispatcher.
 
-    ``grouped_topk_kunpeng`` writes logical expert ids into the even columns of
-    ``topk_ids_index_buf`` and leaves the odd columns (local slot) as zero.  The
-    kutacc dispatch kernel reads the interleaved pairs as ``(peer_rank,
-    local_expert)``, so redundant/EPLB layouts must remap logical ids to their
-    physical slots first.  This mirrors the CUDA ``topk_ids_logical_to_physical``
-    step and the reference ``topk_ids2rank_slot`` op.
+    ``grouped_topk_kunpeng`` publishes (rank, local slot) pairs for the
+    trivial no-EPLB layout; this remap rewrites them per the EPLB dispatch
+    map so redundant experts route to their physical copies.  The kutacc
+    dispatch kernel and the local SHM dispatch/sum kernels read the
+    interleaved pairs as ``(peer_rank, local_expert)``, so every producer
+    must emit that pair encoding.  This mirrors the CUDA
+    ``topk_ids_logical_to_physical`` step and the reference
+    ``topk_ids2rank_slot`` op.
 
     The actual remap runs in a C++ kernel (``remap_topk_ids_to_rank_slot_kunpeng``
     for static EPLB, ``remap_topk_ids_to_rank_slot_dynamic_kunpeng`` for the
@@ -1484,10 +1531,9 @@ def biased_grouped_topk_kunpeng(
             num_fused_shared_experts, _rsf)
 
     if topk_ids_out is not None:
-        # Publish the consistent full ids table into the interleaved
-        # dispatch buffer (even columns); every rank writes identical data.
-        # Under ETP the even/odd columns hold the expert group leader rank
-        # and the local expert slot instead of the raw logical id.
+        # Publish the consistent full routing table into the interleaved
+        # dispatch buffer as (peer rank, local expert slot) pairs; every rank
+        # writes identical data.
         from sglang.srt.layers.moe.token_dispatcher.kunpeng import (
             _KunpengDispatcherState,
         )
@@ -1498,12 +1544,7 @@ def biased_grouped_topk_kunpeng(
             _kunpeng_etp_remap_topk_ids(topk_ids)
         else:
             start, _ = _kunpeng_topk_slice(state, topk_ids.shape[0])
-            kunpeng.copy_kunpeng(
-                state.topk_ids_index_buf[
-                    start : start + topk_ids.shape[0], 0::2
-                ],
-                topk_ids,
-            )
+            _kunpeng_publish_topk_ids_rank_slot(state, topk_ids, start)
 
     return topk_weights, topk_ids
 
@@ -1607,6 +1648,11 @@ def _post_process_topk_ids(
             num_token_non_padded=num_token_non_padded,
             num_experts=router_logits.shape[1],
             topk=topk_ids.shape[1],
+            layer_id=(
+                topk_config.pad_layer_id
+                if topk_config.pad_layer_id is not None
+                else layer_id
+            ),
         )
         if expert_location_dispatch_info is not None:
             topk_ids = _remap_kunpeng_topk_ids_to_rank_slot(

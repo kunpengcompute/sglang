@@ -9,6 +9,8 @@ from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     get_nsa_index_head_dim,
     is_deepseek_nsa,
+    leading_full_indexer_layers,
+    leading_indexer_layer_ids,
 )
 from sglang.srt.distributed.parallel_state import (
     get_pp_group,
@@ -41,6 +43,7 @@ from sglang.srt.utils.common import (
     is_cpu_920f,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_kunpeng_swap_index_k_in,
     is_npu,
     is_cpu,
 )
@@ -97,10 +100,10 @@ class ModelRunnerKVCacheMixin:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
         rest_bytes = int(rest_memory * (1 << 30))  # return in bytes
+        self._log_profile(pre_model_load_memory, post_model_load_memory, rest_bytes)
         shared_bytes = self._shared_pool_available_bytes()
         if shared_bytes is None:
             return rest_bytes
-        self._log_profile(pre_model_load_memory, post_model_load_memory, rest_bytes)
         logger.info(
             "[kv-share] KV pool budget %.2f GiB from the group's NUMA nodes "
             "(the per-rank profiled value was %.2f GiB); --max-total-tokens "
@@ -116,7 +119,7 @@ class ModelRunnerKVCacheMixin:
         post_model_load_memory: float,
         rest_bytes: int,
     ) -> None:
-        """Print every term of the per-rank profile (shared mode only).
+        """Print every term of the per-rank memory profile.
 
         ``get_available_gpu_memory`` describes "device memory free after the
         weights are loaded" and, on the CPU platform, that figure already
@@ -132,13 +135,18 @@ class ModelRunnerKVCacheMixin:
             f"pre({pre_model_load_memory:.2f}) * "
             f"(1 - {self.mem_fraction_static:.2f})"
         )
+        cpu_note = (
+            "; on CPU each figure is psutil available / NUMA node count, and "
+            "tmpfs (/dev/shm) segments already count as used"
+            if self.device == "cpu"
+            else ""
+        )
         logger.info(
-            "[kv-share] profile: %s = %.2f GiB%s; device free after load is "
-            "total-minus-used, so tmpfs (/dev/shm) segments already count as "
-            "used",
+            "KV cache memory profile: %s = %.2f GiB%s%s",
             formula,
             rest_bytes / 2**30,
             " (mamba cache already subtracted)" if self.mambaish_config else "",
+            cpu_note,
         )
 
     def _shared_pool_available_bytes(self: ModelRunner) -> Optional[int]:
@@ -554,20 +562,51 @@ class ModelRunnerKVCacheMixin:
                     )
                 ]
 
-                # --- shared KV pool (920F GLM-5) ---------------------------
-                # One switch, off by default. When it is ON the pool is built
-                # DIRECTLY on the group's POSIX shm segment: the group leader
-                # creates it on its own NUMA node, the other ranks attach, and
-                # NO rank allocates a private KV / index-K buffer. Any failure
-                # raises SharedKvPoolError and aborts startup -- there is
-                # deliberately NO fallback to per-rank pools.
-                # With the switch off this block is a no-op.
-                if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0:
-                    from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
-                        shared_kv_request,
+                # Leading FULL indexers (GLM-5.3: layers 0/1/2) run
+                # back-to-back, so the single recycled HBM index-K swap buffer
+                # cannot hide its whole-pool DDR->HBM DMA under shared-layer
+                # compute. Keep that leading run in DDR (direct read/write)
+                # and start the swap at the 4th indexer (the first full layer
+                # after a shared gap). Derived from the model config, so no
+                # extra switch is needed: models without a shared gap (or with
+                # a single leading full indexer) keep legacy behaviour.
+                if is_kunpeng_swap_index_k_in():
+                    direct_ids = leading_indexer_layer_ids(
+                        self.model_config.hf_config,
+                        leading_full_indexer_layers(self.model_config.hf_config),
+                    )
+                    kunpeng_kwargs["index_k_direct_layers"] = direct_ids
+                    logger.info(
+                        "Kunpeng index-K swap: %d leading full indexer(s) %s "
+                        "stay in DDR (direct read/write); swap starts at the "
+                        "next full indexer",
+                        len(direct_ids),
+                        sorted(direct_ids),
                     )
 
-                    kunpeng_kwargs["shared_kv_request"] = shared_kv_request(self)
+                # --- shared pools (920F GLM-5) ---------------------------
+                # Two independent switches, both off by default: the KV pool
+                # (SGLANG_KUNPENG_KV_SHARE_GROUP) and the DSA index-K pool
+                # (SGLANG_KUNPENG_INDEXER_SHARE_GROUP). Each enabled kind is
+                # built DIRECTLY on its own POSIX shm segment: the group leader
+                # creates it on its own NUMA node, the other ranks attach, and
+                # NO rank allocates a private buffer of that kind. Any failure
+                # raises SharedKvPoolError and aborts startup -- there is
+                # deliberately NO fallback to per-rank pools.
+                # With both switches off this block is a no-op. A value of 1
+                # means no sharing (alias of 0) and is skipped as well; only
+                # group sizes > 1 enter the shared-pool path.
+                if (
+                    envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() > 1
+                    or envs.SGLANG_KUNPENG_INDEXER_SHARE_GROUP.get() > 1
+                ):
+                    from sglang.srt.hardware_backend.cpu_kunpeng.shared_kv_pool import (
+                        shared_pool_requests,
+                    )
+
+                    kunpeng_kwargs["shared_pool_requests"] = shared_pool_requests(
+                        self
+                    )
 
                 self.token_to_kv_pool = KunpengNSATokenToKVPool(**kunpeng_kwargs)
             else:
@@ -907,22 +946,28 @@ class ModelRunnerKVCacheMixin:
         config = configurator.calculate_pool_sizes(available_bytes, page_size)
         profiled_tokens = config.max_total_num_tokens
 
+        # Print the full arithmetic behind the profiled capacity so the
+        # "profiled value" quoted by the --max-total-tokens warning is
+        # traceable: bytes budget, per-token cost, page alignment.
+        cell_size = int(getattr(configurator, "_cell_size", 0))
+        logger.info(
+            "Profiled max_total_num_tokens=%d: available_bytes=%d B (%.2f GiB) "
+            "// cell_size=%s = %d raw tokens, aligned to page_size=%d",
+            profiled_tokens,
+            available_bytes,
+            available_bytes / 2**30,
+            f"{cell_size} B/token ({cell_size / 1024:.1f} KiB/token)"
+            if cell_size
+            else "n/a",
+            available_bytes // cell_size if cell_size else 0,
+            page_size,
+        )
+
         # Apply external constraints (user cap, page alignment, PP sync)
         constrained = self._apply_token_constraints(config.max_total_num_tokens)
         if constrained != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 constrained, page_size
-            )
-        if envs.SGLANG_KUNPENG_KV_SHARE_GROUP.get() != 0:
-            cell_size = int(getattr(configurator, "_cell_size", 0))
-            logger.info(
-                "[kv-share] pool sizing: available=%.2f GiB // cell_size=%s "
-                "= %d tokens (page_size=%d); after user cap: %d tokens",
-                available_bytes / 2**30,
-                f"{cell_size / 1024:.1f}KiB/token" if cell_size else "?",
-                profiled_tokens,
-                page_size,
-                config.max_total_num_tokens,
             )
 
         config.max_running_requests = self._resolve_max_num_reqs(

@@ -60,6 +60,53 @@ TREE_SPEC_KERNEL_AVAILABLE = (
 )  # This kernel is only available for CUDA and MUSA now
 
 
+def record_stream_each(tensors, stream):
+    """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
+    non-tensor / non-cuda entries. Tells the caching allocator that the
+    tensors are also used on `stream`, so memory is not recycled while
+    queued work is still in flight after Python refs drop.
+    """
+    for t in tensors:
+        if isinstance(t, torch.Tensor) and t.is_cuda:
+            t.record_stream(stream)
+
+
+def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
+    """Mark pre-prepare SB / verify_input GPU tensors as used on `fwd_stream`.
+
+    Spec V2 mutates SB mid-forward (`prepare_for_v2_verify` rebinds
+    `batch.input_ids` / `out_cache_loc`; `_draft_extend_for_decode` later
+    replaces `batch.input_ids` again). Each rebind drops the only SB Python
+    ref to the old tensor while the verify forward kernel may still be
+    reading its memory on `fwd_stream`; `record_stream` tells the caching
+    allocator to wait for `fwd_stream` before recycling the block.
+
+    Covers pre-prepare tensors only; caller must also `record_stream_each`
+    the post-prepare rebinds (new `batch.input_ids` / `out_cache_loc`).
+    """
+    candidates = [
+        batch.seq_lens,
+        batch.req_pool_indices,
+        batch.input_ids,
+        batch.out_cache_loc,
+    ]
+    if verify_input is not None:
+        candidates.extend(
+            [
+                getattr(verify_input, attr, None)
+                for attr in (
+                    "draft_token",
+                    "custom_mask",
+                    "positions",
+                    "retrieve_index",
+                    "retrieve_next_token",
+                    "retrieve_next_sibling",
+                )
+            ]
+        )
+    record_stream_each(candidates, fwd_stream)
+
+
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
@@ -767,27 +814,40 @@ def traverse_tree(
         if accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(draft_tokens[curr])
-            if not grammar.is_terminated():
-                # Generate the bitmask for the current token
-                grammar.fill_vocab_mask(allocate_token_bitmask, curr)
-                if retrieve_next_token[curr] != -1:
-                    # Visit the child node
-                    dfs(
-                        retrieve_next_token[curr],
-                        retrieve_next_token,
-                        retrieve_next_sibling,
-                        curr,
+                try:
+                    grammar.accept_token(int(draft_tokens[curr]))
+                except ValueError:
+                    # The matcher can reject a draft token that passed the parent
+                    # mask row (mask/matcher desync, e.g. a disagg retracted-request
+                    # double-accept). Clear it in the parent row so verify won't
+                    # accept it, and prune this branch rather than raising to -- and
+                    # killing -- the scheduler. The accept failed, so the grammar is
+                    # still at the parent state; no rollback is owed for this node.
+                    parent_bitmask[int(curr_token_id) // 32] &= ~(
+                        1 << (int(curr_token_id) % 32)
                     )
+                    accepted = False
+            if accepted:
+                if not grammar.is_terminated():
+                    # Generate the bitmask for the current token
+                    grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                    if retrieve_next_token[curr] != -1:
+                        # Visit the child node
+                        dfs(
+                            int(retrieve_next_token[curr]),
+                            retrieve_next_token,
+                            retrieve_next_sibling,
+                            curr,
+                        )
 
-            if curr != 0:
-                # Rollback the current token
-                grammar.rollback(1)
+                if curr != 0:
+                    # Rollback the current token
+                    grammar.rollback(1)
 
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
             dfs(
-                retrieve_next_sibling[curr],
+                int(retrieve_next_sibling[curr]),
                 retrieve_next_token,
                 retrieve_next_sibling,
                 parent_pos,

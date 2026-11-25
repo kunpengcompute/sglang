@@ -186,10 +186,12 @@ sh launch.sh all
 
 flash-comm is a communication/MoE optimization for prefill instances, with two sub-features:
 
-- **SP prefill MoE (token-sliced sequence parallelism)**: within the attn-TP group each rank holds only one token slice of the sequence; attention outputs are reduce-scattered so LayerNorm and the MLP run on the local slice, per-rank topk tables are merged into the full table by a single `shm_dual_allgather`, and the MoE combine writes back only this rank's home slice — avoiding full-batch allgather/allreduce at every layer;
+- **SP prefill MoE (token-sliced sequence parallelism)**: within the attn-TP group each rank holds only one token slice of the sequence; attention outputs are reduce-scattered so LayerNorm and the MLP run on the local slice, per-rank topk tables are merged into the full table by a single `shm_dual_allgather`, and only this rank's home slice is kept (the RDMA-dispatch combine writes home slices directly; the local-SHM-dispatch path extracts the home slice in combine_recv) — avoiding full-batch allgather/allreduce at every layer;
 - **Shared-expert EPLB co-location**: the shared expert enters the EPLB physical expert map as logical expert `n_routed` (256 for GLM-5.3) and shares the dispatch/combine pipeline with routed experts; the `grouped_topk` kernel bakes `routed_scaling_factor` into the routed weights (the shared column's weight is fixed at 1.0), so the forward pass no longer scales separately.
 
-Prerequisites (validated at startup — violations abort): prefill instances only (decode is inert via `IS_PREFILL=0`); attn-TP > 1; the RDMA dispatch path (single-node local-SHM-dispatch topologies do not implement home-slice combine); PP=1 on the prefill instance; `ep_size == tp_size` (ETP not supported).
+Prerequisites (validated at startup — violations abort): prefill instances only (decode is inert via `IS_PREFILL=0`); attn-TP > 1; `ep_size == tp_size` (ETP not supported).
+
+**PP topologies**: both PP=1 and PP>1 (e.g. pp=16 prefill) are supported. With PP>1, non-last stages hand the (hidden_states, residual) token slices to the next stage through PPProxyTensors; the receiving stage's first layer gathers full rows in prepare_attn (layer_input_mode is derived from the global layer_id), and the Kunpeng graph runner validates the sliced payload against `input_ids / attn_tp_size` rows. Either dispatch path works: RDMA dispatch (combine writes home slices, minimal communication) and single-node local SHM dispatch (the one-node-per-stage pp=16 topology; dispatch/combine keep the full-batch layout and combine_recv extracts the home slice — the home-slice write optimization remains RDMA-only, while the per-rank router/topk savings apply unchanged).
 
 The three environment variables (set on the prefill side, e.g. in `runtime/.user_env_prefill[_<instance>].sh`):
 
@@ -243,7 +245,7 @@ Script call hierarchy (`launch.sh` is a pure task dispatcher; the real logic liv
 ```
 launch.sh (dispatcher: ./launch.sh <role> [instance])
   ├─→ runtime/launch_cluster.sh (prefill/decode/native: env loading, stop-first, SSH fan-out to nodes)
-  │      └─→ server.sh (single-node process launch)
+  │      └─→ runtime/server_cluster.sh (single-node process launch)
   ├─→ runtime/launch_tokenizer.sh (tokenizer: SSH to the router node)
   │      └─→ runtime/server_tokenizer.sh (tokenizer HTTP server)
   ├─→ runtime/launch_mooncake.sh (mooncake: store master)
@@ -262,6 +264,46 @@ runtime/env_base.sh (shared defaults; loads .user_env.sh then runtime/.user_env_
 ```
 
 Role defaults: prefill sets `SGLANG_KUNPENG_MAX_SEQ_NUM=8` and `SGLANG_KUNPENG_MAX_CUR_LEN=576` (native uses the same prefill-side values); decode sets `SGLANG_KUNPENG_MAX_SEQ_NUM=64` and `SGLANG_KUNPENG_MAX_CUR_LEN=1` (automatically `SGLANG_SPECULATIVE_NUM_STEPS+1` when MTP is enabled).
+
+#### 3.4.1 Non-root User Deployment (root_proxy)
+
+The default flow logs in as root on every node and directly runs `insmod`, writes `/sys` hugepage knobs and `/proc/sys/vm/drop_caches`. If the cluster only provides an ordinary user, switch to the "non-root + site root proxy" mode with these two variables:
+
+```bash
+# runtime/.user_env_base.sh (or .user_env.sh)
+export SGLANG_ENABLE_NOROOT_USER=1
+export SGLANG_KUNPENG_NOROOT_PROXY_PATH="/path/to/root_proxy_dir"
+```
+
+- **SGLANG\_ENABLE\_NOROOT\_USER**: `1` enables non-root mode; defaults to `0`, which keeps the original root flow untouched. When enabled, SSH no longer uses `root@` and every privileged operation goes through the site-provided setuid proxy `root_proxy`.
+- **SGLANG\_KUNPENG\_NOROOT\_PROXY\_PATH**: proxy directory. It must contain `root_proxy`, `sgl_reload_sdma.sh`, `sgl_reload_zcopy.sh`, `sdma_threshold.sh`, `hugepage_2m.sh`, `sgl_drop_cache.sh` and `sgl_hugepage_perm.sh`; an optional `sgl_clean_shm.sh` is used to wipe root-owned `/dev/shm` leftovers. Usage is `root_proxy <script-name> [args...]`; the script name must not contain `/` (the proxy only resolves scripts inside its own directory).
+
+Privileged operations and their proxy scripts:
+
+| Operation | root mode (default) | non-root mode |
+| --- | --- | --- |
+| Reload SDMA driver / write threshold registers | `rmmod`+`insmod`, direct register writes | `root_proxy sgl_reload_sdma.sh` / `sdma_threshold.sh` |
+| Load the zcopy driver (creates `/dev/zdax`) | `insmod mod/zcopy_kylin.ko` | `root_proxy sgl_reload_zcopy.sh` |
+| Open up `/dev/zdax` (required by kupl SLS) | not needed | `root_proxy sgl_hugepage_perm.sh` (runs automatically per node at startup) |
+| 2M hugepages per rank | write `nr_hugepages` directly | `root_proxy hugepage_2m.sh <count> <node>` |
+| Release hugepages | write `nr_hugepages` directly | `root_proxy hugepage_2m.sh 0 <node>` |
+| Clear `/dev/shm` | `rm -rf /dev/shm/*` | `root_proxy sgl_clean_shm.sh` (falls back to removing the current user's segments) |
+| `drop_caches` | write directly | `root_proxy sgl_drop_cache.sh` |
+
+Reference content of `sgl_hugepage_perm.sh` (it only opens up the SLS device and the hugepage mount):
+
+```bash
+#!/bin/bash
+[ -e /dev/zdax ] && { chgrp eapp /dev/zdax; chmod 660 /dev/zdax; }
+chmod 1777 /dev/hugepages 2>/dev/null
+exit 0
+```
+
+Notes:
+
+- **`KUPL_SHM_ENABLE_HUGEPAGE` must stay `y`** (its default). If set to `n`, kupl SLS leaves the process mempolicy bound to a CPU node (whose hugepages have been cleared to 0) when creating shared-memory windows, so the later sgl-kernel HBW weight pool `mmap MAP_HUGETLB` fails with `ENOMEM` (`FAILED: errno=12` followed by `mmap with MAP_HUGETLB failed`). Setting `SGLANG_KUNPENG_HBW_BIND_BEFORE_MMAP=1` is a safe second line of defense (it binds to the HBM node around the mmap and then restores the previous policy).
+- The only condition for kupl SLS is a successful `open("/dev/zdax", O_RDWR)`; otherwise it prints `sls init failed` and falls back to posix. If a node has no `/dev/zdax`, that node can only use posix and carries the `kupl_parallel_for` deadlock risk; check the device registration first (`/sys/class/zcopy/zdax/dev`).
+- The hugepage `nr_hugepages` knobs are root-only sysfs; non-root writes always fail with `EACCES`, so they must go through the proxy.
 
 ### 3.5 PD Disaggregated Deployment
 
@@ -328,7 +370,7 @@ export SGLANG_ENABLE_BINARY_LAUNCH=1      # default on
 export SGLANG_ENABLE_NUMA_DUPLICATION=1   # default on
 ```
 
-- **Effect**: Each scheduler process starts independently using `--tp-rank-in-node` to distinguish ranks. `server.sh` iterates `RANK_IN_NODE` to launch processes one by one, pinning CPU cores (`taskset -c`) and configuring huge pages. When disabled, only a single `python -m sglang.launch_server` process is used.
+- **Effect**: Each scheduler process starts independently using `--tp-rank-in-node` to distinguish ranks. `runtime/server_cluster.sh` iterates `RANK_IN_NODE` to launch processes one by one, pinning CPU cores (`taskset -c`) and configuring huge pages. When disabled, only a single `python -m sglang.launch_server` process is used.
 - **SGLANG\_ENABLE\_NUMA\_DUPLICATION**: On top of the above, each NUMA node uses its own pre-built binary from `PYINSTALL_PATH/dist/sglang_server_tp{rank}/` (requires `SGLANG_ENABLE_BINARY_LAUNCH`), achieving per-NUMA memory locality and reducing cross-NUMA access. When disabled, all ranks share one binary and the `LD_LIBRARY_PATH` setup logic changes. For building the replicas (PyInstaller packaging and NUMA duplication), refer to the [PyInstaller packaging guide](scripts/cpu_kunpeng/pyinstall/readme.md).
 
 **2. SGLANG\_ENABLE\_TOKENIZER\_SEPERATE — Separate Tokenizer**
@@ -564,7 +606,7 @@ sh curl.sh -p -s -f prompts/ragged.txt
 | `-F` | Fake-transfer mode (injects bootstrap_host=2.2.2.2; decode skips KV transfer; port auto-derived from the decode entry in INSTANCES, `CURL_PORT` overrides) | off |
 | `-i` | Multi-turn interactive chat mode | off |
 
-The target address and port can be overridden via the `CURL_HOST`/`CURL_PORT` environment variables (default: local NIC IP:30000). Verify correctness based on the response returned by the request.
+Requests go to `ROUTER_IP` (the gateway node) by default, which `curl.sh` reads via `source env.sh none`. The target address and port can be overridden via the `CURL_HOST`/`CURL_PORT` environment variables (default port: 30000). Verify correctness based on the response returned by the request.
 
 ### 4.5 Benchmarks
 

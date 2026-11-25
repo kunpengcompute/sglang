@@ -179,7 +179,7 @@ def start(r, logs):
                or k in ('EP_SIZE','PP_SIZE','WORLD_SIZE','HF_HUB_OFFLINE','TRANSFORMERS_OFFLINE',
                         'KMP_AFFINITY','MV2_COMM_WORLD_LOCAL_SIZE','OMP_NUM_THREADS','OMP_PROC_BIND',
                         'PYTHONNOUSERSITE','TORCH_COMPILE_DISABLE','TORCH_USE_KUPL',
-                        'SPECULATIVE_DRAFT_MODEL_PATH')}
+                        'SPECULATIVE_DRAFT_MODEL_PATH', 'LD_LIBRARY_PATH')}
     (r/'environment.json').write_text(json.dumps(profile, indent=2)+'\n')
     state = {'phase': 'RESOURCES', 'run': str(r), 'http_port': int(os.environ['QWEN_HTTP_PORT']),
              'tools_path': str(kit), 'tools_revision': json.loads((kit/'VERSION.json').read_text())['tool_revision'],

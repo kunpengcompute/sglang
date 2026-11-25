@@ -14,8 +14,8 @@
 
 #!/bin/bash
 # stop_server.sh - Kill sglang on the role's cluster nodes (all of them,
-# in parallel via SSH), then clean up zombies / shm / hugepages (incl. the
-# stale HiCache tp0-bcast segment when that feature is enabled).
+# in parallel via SSH), then clean up zombies / shm / hugepages. All entries
+# under /dev/shm are removed outright, so no stale segment name matching.
 # Invoked by: ./stop.sh server [prefill|decode|native] [instance]
 # Usage: bash runtime/stop_server.sh [prefill|decode|native] [instance]
 
@@ -33,18 +33,6 @@ cd "$SCRIPT_DIR"
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
 SKIP_CONDA=1 source ./env.sh "$ROLE" "$INSTANCE"
 
-# HiCache tp-shard leaves a POSIX shm segment (sgk_hicache_shard_*) on each
-# node. It is created lazily at the first prefetch and never unlinked, so it
-# outlives the server. A later run with a different geometry would attach the
-# stale segment and index past its end. Wipe it on stop whenever this
-# role/instance actually runs HiCache with the tp-shard segment.
-CLEAN_HICACHE_SHARD=0
-if [[ "$ROLE" == "prefill" || "$ROLE" == "native" ]] &&
-   [[ "${ENABLE_KUNPENG_HICACHE:-0}" == "1" ]] &&
-   [[ "${SGLANG_KUNPENG_HICACHE_TP_SHARD:-1}" == "1" ]]; then
-    CLEAN_HICACHE_SHARD=1
-fi
-
 # Convert space-separated IP list to array
 IFS=' ' read -ra NODES <<< "$NODE_IPS_LIST"
 WORLD_SIZE=${#NODES[@]}
@@ -54,7 +42,7 @@ echo "Killing $ROLE on $WORLD_SIZE node(s)"
 for i in "${!NODES[@]}"; do
     node="${NODES[i]}"
 
-    ssh "$node" '
+    ssh "$(ssh_target "$node")" '
         PAT="sglang[.]launch_server|sglang[_]server|sglang[:]:"
         MAIN_PIDS=$(ps aux | grep -E "$PAT" | grep -v grep | awk "{print \$2}")
 
@@ -91,19 +79,33 @@ for i in "${!NODES[@]}"; do
             done
         fi
 
-        rm -rf /dev/shm/shm_mmap_*
-        if [ "'"${CLEAN_HICACHE_SHARD}"'" = "1" ]; then
-            echo "Removing stale HiCache TP shard shm on '"$node"'"
-            rm -f /dev/shm/sgk_hicache_shard_*
+        # Wipe the whole POSIX shm namespace instead of matching individual
+        # segment names (shm_mmap_*, sgk_hicache_shard_*, ...). Under a non-root
+        # deployment root-owned leftovers go through the site helper; otherwise
+        # fall back to removing segments owned by the current user.
+        if [ "'"${SGLANG_ENABLE_NOROOT_USER:-0}"'" = "1" ]; then
+            "'"${SGLANG_KUNPENG_NOROOT_PROXY_PATH}"'/root_proxy" sgl_clean_shm.sh 2>/dev/null \
+                || rm -rf /dev/shm/* 2>/dev/null || true
+        else
+            rm -rf /dev/shm/*
         fi
+
         for i in $(seq 0 31); do
-            echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
+            if [ "'"${SGLANG_ENABLE_NOROOT_USER:-0}"'" = "1" ]; then
+                "'"${SGLANG_KUNPENG_NOROOT_PROXY_PATH}"'/root_proxy" hugepage_2m.sh 0 ${i}
+            else
+                echo 0 > /sys/devices/system/node/node${i}/hugepages/hugepages-2048kB/nr_hugepages
+            fi
         done
 
         # Drop caches if configured
         if [ "'"${DROP_CACHES:-0}"'" = "1" ]; then
             echo "Dropping caches on '"$node"'..."
-            echo 3 > /proc/sys/vm/drop_caches
+            if [ "'"${SGLANG_ENABLE_NOROOT_USER:-0}"'" = "1" ]; then
+                "'"${SGLANG_KUNPENG_NOROOT_PROXY_PATH}"'/root_proxy" sgl_drop_cache.sh
+            else
+                echo 3 > /proc/sys/vm/drop_caches
+            fi
         fi
     ' &
 done

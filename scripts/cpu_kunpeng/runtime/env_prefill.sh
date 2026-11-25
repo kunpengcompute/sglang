@@ -36,7 +36,7 @@ PREFILL_MASTER_ADDR="${PREFILL_MASTER_ADDR:-xxx.xxx.xxx.1}"
 # PP_SIZE=2 to the stale env_base defaults.
 
 
-# Per-DP-rank chunked prefill size; server.sh multiplies it by DP_SIZE
+# Per-DP-rank chunked prefill size; runtime/server_cluster.sh multiplies it by DP_SIZE
 # for the global --chunked-prefill-size.
 export CHUNKED_PREFILL_SIZE_PER_DP=4096
 
@@ -99,13 +99,13 @@ export SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB="${SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB:
 #            (empty L3_DIR = L3 off, L1<->L2 only); layer_first host layout.
 #   mooncake mooncake store master (runtime/env_mooncake.sh), needs
 #            MOONCAKE_MASTER* and the RDMA settings in .user_env.sh; the store
-#            is page_first-only, so server.sh selects that layout.
+#            is page_first-only, so runtime/server_cluster.sh selects that layout.
 # PREFETCH_POLICY (default timeout): wait_complete blocks the request until the
 # whole L3->L2 load is done (so no recompute); timeout/best_effort give up early.
 # The timeout budget is base + pages x per_ki_token (code defaults 1s / 0.25s);
 # EXTRA_CONFIG passes the whole --hicache-storage-backend-extra-config JSON
 # through and wins over the two timeout knobs. DEBUG = verbose per-transfer
-# "[hicache]" logs. Off by default; server.sh wires it for prefill.
+# "[hicache]" logs. Off by default; runtime/server_cluster.sh wires it for prefill.
 # ------------------------------------------------------------
 export ENABLE_KUNPENG_HICACHE="${ENABLE_KUNPENG_HICACHE:-0}"
 export KUNPENG_HICACHE_BACKEND="${KUNPENG_HICACHE_BACKEND:-file}"
@@ -133,8 +133,22 @@ export SGLANG_KUNPENG_MAX_SEQ_LEN="${SGLANG_KUNPENG_MAX_SEQ_LEN:-65536}"
 # flash-comm: prefill SP MoE + shared-expert EPLB co-location (=1 to enable;
 # also needs INIT_EXPERT_LOCATION / REDUNDANT_EXPERTS, see README section 3.2-4).
 export SGLANG_KUNPENG_FLASH_COMM="${SGLANG_KUNPENG_FLASH_COMM:-0}"
-# Fused MoE GEMM inner tile (rows); 2048 = prefill reference. Sync with ep_moe/layer.py.
-export KUTACC_FUSEDMOE_TILEBUF="${KUTACC_FUSEDMOE_TILEBUF:-2048}"
+
+# ---- external DP pinning with --load-balance-method follow_bootstrap_room ----
+# The gateway assigns a random bootstrap_room per request, so a client-side
+# routed_dp_rank would otherwise trip the "follow_bootstrap_room conflict"
+# check (room % dp_size != dispatched rank). Allowing mixed routing here lets
+# routed_dp_rank win and registers the actual rank for decode to look up.
+# Prefill only: enabling it on decode would send EVERY request through the
+# /query_dp_ranks slow path.
+export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK="${SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK:-1}"
+
+# ---- kutacc fused-MoE switches --------------------------------------------
+# Fused MoE GEMM inner tile (rows); 2048 = prefill reference, one chunk per
+# rank in the per-expert loop. ETP instances (8 local experts, ~8x the rows)
+# must raise TILEBUF. Sync with ep_moe/layer.py.
+export KUTACC_FUSEDMOE_TILEBUF="${KUTACC_FUSEDMOE_TILEBUF:-2048}"      # single-wave capacity
+export KUTACC_FUSEDMOE_MULTI_OPERAND_GEMM="${KUTACC_FUSEDMOE_MULTI_OPERAND_GEMM:-0}"  # 1 = all experts in one kernel call (ETP only), 0 = per-expert loop
 
 # Per-server overrides (sourced after role defaults so they take priority).
 # With an instance (env.sh prefill 128p -> INSTANCE=128p), ONLY the instance

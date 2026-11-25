@@ -33,11 +33,16 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
+from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_world_size,
+)
 from sglang.srt.hardware_backend.cpu_kunpeng.pp_perf import pp_span
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.utils import (
     is_cpu_920f,
+    is_kunpeng_flash_comm,
     is_kunpeng_graph_capture,
     is_kunpeng_hbw_pool,
     is_kunpeng_hbw_resident_expert_weights,
@@ -116,8 +121,21 @@ class KunpengGraphRunner:
         self._graph_replay_count = 0
         self._decode_coverage = {}
         self._prefill_coverage = {}
+        self._decline_logged = set()
         self._sglang_graph_max_cache = int(
             os.environ.get("SGLANG_KUNPENG_GRAPH_CACHE_SIZE", "4")
+        )
+        logger.info(
+            "[graph] kunpeng runner: graph_active=%s (resolved at import), "
+            "env SGLANG_ENABLE_GRAPH_CAPTURE=%s, "
+            "SGLANG_KUNPENG_ENABLE_PREFILL_GRAPH=%s, "
+            "SGLANG_KUNPENG_GRAPH_LOG_REPLAY=%s, "
+            "SGLANG_KUNPENG_PP_PROFILE=%s",
+            _is_kunpeng_graph_capture,
+            os.environ.get("SGLANG_ENABLE_GRAPH_CAPTURE"),
+            os.environ.get("SGLANG_KUNPENG_ENABLE_PREFILL_GRAPH"),
+            os.environ.get("SGLANG_KUNPENG_GRAPH_LOG_REPLAY", "1"),
+            os.environ.get("SGLANG_KUNPENG_PP_PROFILE", "0"),
         )
 
         # HBW pool and swap manager
@@ -192,7 +210,11 @@ class KunpengGraphRunner:
     def init_swap_buffers(self):
         """Initialize HBM swap buffers for expert weights and KV cache."""
         if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
-            if self.swap_mgr.enable_swap_expert or self.swap_mgr.enable_swap_kv_in:
+            if (
+                self.swap_mgr.enable_swap_expert
+                or self.swap_mgr.enable_swap_kv_in
+                or self.swap_mgr.enable_swap_index_k_in
+            ):
                 raise ValueError(
                     "Attached MTP requires independent DDR KV with swap disabled"
                 )
@@ -235,6 +257,18 @@ class KunpengGraphRunner:
                 head_num=head_num,
                 kv_cache_dim=kv_cache_dim,
                 dtype=self.model_runner.kv_cache_dtype,
+            )
+
+        if self.swap_mgr.enable_swap_index_k_in:
+            nsa_pool = self.model_runner.token_to_kv_pool
+            # Any full (non-skip-topk) layer has the same flat geometry; skip
+            # layers carry None. Sized by the first runner (target/draft) like
+            # the KV HBM buffer -- swap_index_k_layer fails loudly on a mismatch.
+            full_index_k = next(b for b in nsa_pool.index_k_buffer if b is not None)
+            self.swap_mgr.init_index_k_buffer(
+                num_slots=full_index_k.shape[0],
+                index_head_dim=full_index_k.shape[1],
+                dtype=nsa_pool.index_k_dtype,
             )
 
     def _move_parameter_to_hbw(self, name, param, label=None):
@@ -997,7 +1031,28 @@ class KunpengGraphRunner:
         )
         return decline(forward_batch, kwargs) if decline is not None else None
 
+    def _explicit_backend_veto(self, forward_batch):
+        """Structural decline reasons for an explicit (provider-less) backend.
+
+        Multi-checkpoint batches expose fixed-shape padded metadata, so the
+        fused primitive records them; single-track decoding stays eager.
+        """
+        checkpoints = getattr(forward_batch, "mamba_checkpoint_offsets", None)
+        if checkpoints is None:
+            mask = forward_batch.mamba_track_mask
+            if mask is not None and bool(mask.any()):
+                return "mamba_state_tracking"
+            return None
+        if getattr(forward_batch, "kunpeng_checkpoint_plan", None) is None:
+            return "checkpoint_plan_unavailable"
+        return None
+
     def _graph_unsupported_reason(self, forward_batch, kwargs):
+        if (
+            self.is_graph_active()
+            and self._pp_row_mismatch(forward_batch, kwargs) is not None
+        ):
+            return "pp_shape_mismatch"
         provider = self._provider_for_forward()
         if not self.is_graph_active():
             reason = "graph_disabled"
@@ -1005,7 +1060,8 @@ class KunpengGraphRunner:
             reason = provider.unsupported_reason(forward_batch, kwargs)
         elif provider is None:
             reason = (
-                self._explicit_backend_unsupported_reason(
+                self._explicit_backend_veto(forward_batch)
+                or self._explicit_backend_unsupported_reason(
                     forward_batch, kwargs
                 )
                 or "provider_unsupported"
@@ -1019,9 +1075,39 @@ class KunpengGraphRunner:
             reason = "provider_unsupported"
         return reason
 
+    def _log_decline(self, forward_batch, reason):
+        """One line per (mode, shape, reason) so an eager fallback is never silent."""
+        tokens = int(forward_batch.input_ids.numel())
+        key = (forward_batch.forward_mode.name, tokens, reason)
+        if key in self._decline_logged:
+            return
+        self._decline_logged.add(key)
+        logger.info(
+            "[graph] decline mode=%s total_tokens=%d batch_size=%d reason=%s",
+            key[0],
+            tokens,
+            int(forward_batch.batch_size),
+            reason,
+        )
+
     def _graph_supports_forward(self, forward_batch, kwargs):
         if not self.is_graph_active():
             return False
+        # Choke point: decode/extend/idle all pass through here.  The guard is
+        # re-evaluated (pure) in _graph_unsupported_reason() to name the
+        # coverage reason, so only this call site logs.
+        mismatch = self._pp_row_mismatch(forward_batch, kwargs)
+        if mismatch is not None:
+            logger.warning(
+                "[PP-SHAPE-MISMATCH] upstream=%d local=%d mode=%s pp=%s -> eager "
+                "(replay would trip the RMSNorm assert)",
+                mismatch[0], mismatch[1], forward_batch.forward_mode.name,
+                getattr(self.model_runner, "pp_rank", -1),
+            )
+            return False
+        if getattr(self.model_runner.attn_backend, "_kunpeng_explicit_graph", False):
+            if self._explicit_backend_veto(forward_batch) is not None:
+                return False
         provider = self._provider_for_forward()
         if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
             # Attached MTP draft: only the dedicated draft provider may capture
@@ -1067,6 +1153,49 @@ class KunpengGraphRunner:
             self._decode_coverage[key] = row
         return row
 
+    def _pp_row_mismatch(self, forward_batch, kwargs) -> Optional[tuple]:
+        """Return (upstream rows, local rows) when this stage must not replay.
+
+        A captured graph is keyed by this stage's own token count
+        (input_ids.shape[0]) and every in-graph buffer was frozen at that
+        shape.  Replaying with an upstream payload of a different row count
+        feeds those buffers the other shape and RMSNorm trips
+        TORCH_CHECK(outs.size(0) == height), killing the worker.  Returns None
+        when replay is safe; the caller owns all bookkeeping.
+
+        Flash-comm SP: the upstream stage hands each attn-TP rank its token
+        slice through PPProxyTensors, so the expected payload is
+        input_ids / attn_tp_size rows, not the full batch.
+        """
+        if not getattr(self.model_runner, "support_pp", False):
+            return None
+        proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if proxy_tensors is None:
+            return None  # First stage: it produces the payload.
+        hidden = proxy_tensors.tensors.get("hidden_states")
+        if hidden is None or hidden.dim() == 0:
+            return None
+        if forward_batch.forward_mode.is_idle():
+            # Idle never carries a payload: replay() rewrites the proxy tensors
+            # to zero-row views and the input set is rebuilt at 0 tokens, so
+            # there is nothing to cross-check.
+            return None
+        n_up = int(hidden.shape[0])
+        n_local = int(forward_batch.input_ids.shape[0])
+        if (
+            is_kunpeng_flash_comm()
+            and get_moe_a2a_backend().is_kunpeng_cpu()
+        ):
+            attn_tp_size = get_attn_tensor_model_parallel_world_size()
+            if attn_tp_size > 1:
+                # Flash-comm SP: the upstream stage hands each attn-TP rank
+                # its token slice, so the proxy payload carries
+                # input_ids / attn_tp_size rows, not the full batch.
+                if n_local % attn_tp_size != 0 or n_up != n_local // attn_tp_size:
+                    return (n_up, n_local)
+                return None
+        return None if n_up == n_local else (n_up, n_local)
+
     def _forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -1087,6 +1216,7 @@ class KunpengGraphRunner:
         if not supported:
             if coverage is not None:
                 coverage["eager"] += 1
+            self._log_decline(forward_batch, reason)
             # Eager fallback – plain model.forward
             with self._forward_hbw_scope():
                 return self.model_runner.model.forward(
@@ -1139,6 +1269,7 @@ class KunpengGraphRunner:
             if row is not None:
                 row["eager"] += 1
                 row["reasons"][reason] = row["reasons"].get(reason, 0) + 1
+            self._log_decline(forward_batch, reason)
             with self._forward_hbw_scope():
                 return self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -1471,6 +1602,46 @@ class KunpengGraphRunner:
             return list(self._graph_bindings.all_fixed_tensors())
         fixed = self.graph_fixed_weights[:]
         backend = self._resolve_attn_backend(self.model_runner, forward_batch)
+        # Explicit Qwen graphs have no graph provider, so nothing else reserves
+        # the SHM slots that eager fallbacks use. A prefill batch with Mamba
+        # state tracking bypasses the graph and runs the embedding all-reduce
+        # through the pool, which fails once the graph has claimed the remaining
+        # bytes. Reserve both row buckets before the backend early return below.
+        server_args = self.model_runner.server_args
+        if (
+            getattr(self.model_runner.attn_backend, "_kunpeng_explicit_graph", False)
+            and server_args.enable_mamba_extra_buffer()
+        ):
+            try:
+                from sglang.srt.distributed.parallel_state import get_tp_group
+
+                comm = get_tp_group().kunpeng_communicator
+                if comm is not None:
+                    width = self.model_runner.model_config.hidden_size
+                    rows = comm.max_tokens
+                    chunk = server_args.chunked_prefill_size
+                    if chunk is not None and chunk > 0:
+                        from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_hybrid_backend import (
+                            extend_pad_cap,
+                            padded_tokens,
+                        )
+
+                        rows = min(
+                            rows, padded_tokens(int(chunk), cap=extend_pad_cap())
+                        )
+                    reserve = torch.ops.sgl_kernel.get_or_create_shm_tensor_kunpeng
+                    reserve(width, 1)
+                    reserve(width, rows)
+                    logger.info(
+                        "[graph] reserved eager all-reduce SHM buckets: "
+                        f"width={width} rows={rows}"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[graph] failed to reserve eager all-reduce SHM buckets: %s", exc
+                )
+                raise
+
         if hasattr(backend, "get_graph_fixed_tensors"):
             fixed.extend(backend.get_graph_fixed_tensors(forward_batch))
             seen = set()
@@ -1535,6 +1706,20 @@ class KunpengGraphRunner:
             ):
                 if buf is not None:
                     fixed.append(buf)
+        if self.swap_mgr.enable_swap_index_k_in:
+            # Both recycled HBM index-K mirrors and their dedicated SDMA event
+            # tables are persistent fixed-address storages, exactly like the
+            # main-KV swap buffers above. kupl_sdma_kv_swapin takes them as
+            # non-return-value parameters during capture, so every buffer /
+            # table used by the ping-pong pipeline must be registered before
+            # capture or lookup_or_register fails on the HBM destination.
+            for buf in (
+                self.swap_mgr._index_k_hbm_buffers
+                + self.swap_mgr._index_k_swap_in_event_tensors
+                + self.swap_mgr._index_k_swap_in_event_num_tensors
+            ):
+                if buf is not None:
+                    fixed.append(buf)
         if self.swap_mgr.enable_swap_kv_out:
             for buf in (
                 self.swap_mgr._kv_ddr_event_tensor,
@@ -1563,6 +1748,11 @@ class KunpengGraphRunner:
                 "topk_weights_buf",
                 "topk_ids_flat_buf",
                 "topk_ids_index_buf",
+                # Explicit int64 identity gather table consumed by the
+                # non-EPLB publish path (remap_topk_ids_to_rank_slot_kunpeng
+                # with logical == physical). Persistent, so its storage must
+                # be registered before capture like the other topk buffers.
+                "identity_dispatch_map",
                 "dynamic_remap_counter",
                 # ETP node-shared buffers: consumed by
                 # moe_etp_dispatch_share_kunpeng / moe_etp_reduce_kunpeng
@@ -1602,6 +1792,11 @@ class KunpengGraphRunner:
             )
             if recorder_counter is not None:
                 fixed.append(recorder_counter)
+            recorder_pad_counter = (
+                get_global_expert_distribution_recorder().get_kunpeng_pad_counter()
+            )
+            if recorder_pad_counter is not None:
+                fixed.append(recorder_pad_counter)
         except Exception:
             pass
         # EPLB static dispatch map (logical -> physical expert per layer),
@@ -1738,6 +1933,14 @@ class KunpengGraphRunner:
             mtp_carry_key = _carry_si is not None and (
                 getattr(_carry_si, "dsa_topk_indices", None) is not None
             )
+        # Explicit Qwen checkpoint graphs add four dynamic inputs and a fixed
+        # tracking buffer. Provider bindings are absent here, so the checkpoint
+        # variant and its padded row count must split the cache key explicitly.
+        checkpoint_plan = getattr(forward_batch, "kunpeng_checkpoint_plan", None)
+        checkpoint_graph_key = (
+            checkpoint_plan is not None,
+            checkpoint_plan.tokens.numel() if checkpoint_plan is not None else 0,
+        )
         graph_cache_key = (
             forward_batch.forward_mode,
             total_tokens,
@@ -1751,6 +1954,7 @@ class KunpengGraphRunner:
             absorbed_prefill_key,
             all_padding_key,
             mtp_carry_key,
+            checkpoint_graph_key,
         )
 
         # index_share_for_mtp_iteration: the incoming carry (the
@@ -1774,9 +1978,11 @@ class KunpengGraphRunner:
             )
         prefill_coverage = None
         if self._graph_bindings is not None and forward_batch.forward_mode.name == "EXTEND":
-            prefill_coverage = self._prefill_coverage[
+            # The row is only created for provider-based backends; explicit
+            # backends (Qwen) do not track per-shape coverage.
+            prefill_coverage = self._prefill_coverage.get(
                 (int(total_tokens), int(forward_batch.batch_size))
-            ]
+            )
         if graph_cache_key not in self._sglang_graph_cache:
             if prefill_coverage is not None:
                 prefill_coverage["cache_misses"] += 1

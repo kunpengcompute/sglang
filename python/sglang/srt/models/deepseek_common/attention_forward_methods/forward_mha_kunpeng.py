@@ -316,7 +316,8 @@ class DeepseekMHAKunpengForwardMixin:
             # new-token slots would clobber the freshly written rows).
             self.swap_mgr.wait_kv_swap_in()
             self.swap_mgr.set_kv_buffer_2(
-                self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, kv_a, k_pe
+                self.swap_mgr._cur_kv_hbm, forward_batch.out_cache_loc, kv_a, k_pe,
+                profile_name="set_kv_buffer_2_kunpeng@main_kv_hbm",
             )
             if self.swap_mgr.enable_swap_kv_out:
                 self.swap_mgr.set_kv_buffer_2_sdma(
@@ -324,11 +325,13 @@ class DeepseekMHAKunpengForwardMixin:
                 )
             else:
                 self.swap_mgr.set_kv_buffer_2(
-                    self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, kv_a, k_pe
+                    self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, kv_a, k_pe,
+                    profile_name="set_kv_buffer_2_kunpeng@main_kv_ddr",
                 )
         else:
             self.swap_mgr.set_kv_buffer_2(
-                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, kv_a, k_pe
+                self.swap_mgr._cur_kv_ddr, forward_batch.out_cache_loc, kv_a, k_pe,
+                profile_name="set_kv_buffer_2_kunpeng@main_kv_ddr",
             )
 
     def _get_mla_kv_buffer_kunpeng(

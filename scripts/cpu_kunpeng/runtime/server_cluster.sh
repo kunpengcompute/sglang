@@ -13,10 +13,11 @@
 # ==============================================================================
 
 #!/bin/bash
-# server.sh - Single node execution for SGLang (prefill/decode/native).
+# server_cluster.sh - Single node execution for SGLang (prefill/decode/native).
+# Invoked remotely by runtime/launch_cluster.sh, one per cluster node.
 # Router (gateway) is launched by runtime/server_router.sh instead.
 # Tokenizer HTTP servers are launched by runtime/server_tokenizer.sh instead.
-# Usage: ./server.sh <role> <dp_rank> <log_path> [instance]
+# Usage: bash runtime/server_cluster.sh <role> <dp_rank> <log_path> [instance]
 
 if [[ $# -lt 3 ]]; then
     echo "Usage: $0 <role> <dp_rank> <log_path> [instance]" >&2
@@ -33,7 +34,9 @@ INSTANCE="${4:-}"
 IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 
 # Source environment config (exports CONDA_ACTIVATE_CMD, PYTHON_SCRIPT, etc.)
-source ./env.sh "$ROLE" "$INSTANCE" || exit 1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$SCRIPT_DIR"
+source "$SCRIPT_DIR/env.sh" "$ROLE" "$INSTANCE" || exit 1
 
 # --- /dev/shm hygiene -------------------------------------------------------
 # Every run leaves POSIX shm behind: our sgkv* KV segments, psm_* Python
@@ -48,11 +51,22 @@ if [[ "${SGLANG_KUNPENG_CLEAR_SHM:-1}" != "0" ]]; then
     fi
     _shm_used=$(du -sh /dev/shm 2>/dev/null | cut -f1)
     echo "[$(date +%T)] clearing /dev/shm on $(hostname) (was ${_shm_used:-unknown})"
-    rm -rf /dev/shm/* 2>/dev/null || true
+    clean_shm_dev
 fi
 
-rmmod sdma_dae 2>/dev/null || true
-insmod "$SDMA_KO_PATH" safe_mode=0 share_chns=160
+# Non-root mode: all privileged setup goes through the site root proxy.
+# sgl_hugepage_perm.sh opens /dev/zdax so kupl can use SLS instead of posix;
+# SDMA needs insmod and /dev/mem register writes for the driver reload and
+# threshold setup.
+if [[ "${SGLANG_ENABLE_NOROOT_USER:-0}" == "1" ]]; then
+    noroot_proxy_run sgl_reload_sdma.sh
+    noroot_proxy_run sgl_reload_zcopy.sh
+    noroot_proxy_run sgl_hugepage_perm.sh
+    noroot_proxy_run sdma_threshold.sh
+else
+    rmmod sdma_dae 2>/dev/null || true
+    insmod "$SDMA_KO_PATH" safe_mode=0 share_chns=160
+fi
 
 # Base arguments common to both roles
 BASE_ARGS=(
@@ -99,6 +113,11 @@ if [[ "${LOG_REQUESTS:-0}" == "1" ]]; then
     )
 fi
 
+# Per-request time stats logging, gated by SGLANG_ENABLE_REQUEST_TIME_STATS_LOGGING
+if [[ "${SGLANG_ENABLE_REQUEST_TIME_STATS_LOGGING:-0}" == "1" ]]; then
+    BASE_ARGS+=(--enable-request-time-stats-logging)
+fi
+
 # Add redundant experts only when enabled (REDUNDANT_EXPERTS > 0)
 if [[ "${REDUNDANT_EXPERTS:-0}" -gt 0 ]]; then
     BASE_ARGS+=(--ep-num-redundant-experts "$REDUNDANT_EXPERTS")
@@ -134,6 +153,11 @@ if [[ "$SGLANG_DISABLE_RADIX_CACHE" == "1" ]]; then
     BASE_ARGS+=(--disable-radix-cache)
 fi
 
+# Enable Prometheus metrics
+if [[ "${SGLANG_ENABLE_METRICS:-0}" == "1" ]]; then
+    BASE_ARGS+=(--enable-metrics)
+fi
+
 # Disable overlap schedule
 if [[ "$SGLANG_ENABLE_OVERLAP" == "0" ]]; then
     BASE_ARGS+=(
@@ -163,7 +187,7 @@ case "$ROLE" in
             --max-total-tokens "${PREFILL_MAX_TOTAL_TOKENS:-131072}"
             --prefill-max-requests "$SGLANG_KUNPENG_MAX_SEQ_NUM"
             --max-running-requests $((8 * SGLANG_KUNPENG_MAX_SEQ_NUM * DP_SIZE))
-            --load-balance-method round_robin
+            --load-balance-method "${PREFILL_LB_METHOD:-follow_bootstrap_room}"
             --enable-dynamic-batch-tokenizer
             --disaggregation-bootstrap-port "${PREFILL_BOOTSTRAP_PORT:-9001}"
         )
@@ -193,13 +217,13 @@ case "$ROLE" in
         ;;
     tokenizer)
         # Tokenizer HTTP servers now live in runtime/server_tokenizer.sh,
-        # invoked by runtime/launch_tokenizer.sh. server.sh no longer handles it.
+        # invoked by runtime/launch_tokenizer.sh. server_cluster.sh no longer handles it.
         echo "Error: role 'tokenizer' is handled by runtime/server_tokenizer.sh" >&2
         exit 1
         ;;
     router)
         # Router (gateway) launch now lives in runtime/server_router.sh,
-        # invoked by runtime/launch_router.sh. server.sh no longer handles it.
+        # invoked by runtime/launch_router.sh. server_cluster.sh no longer handles it.
         echo "Error: role 'router' is handled by runtime/server_router.sh" >&2
         exit 1
         ;;
@@ -356,8 +380,15 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
         fi
 
         ON_PACKAGE_MEMORY_NODE=$((RANK_IN_NODE +16))
-        echo 0 > /sys/devices/system/node/node${RANK_IN_NODE}/hugepages/hugepages-2048kB/nr_hugepages
-        echo 2020 > /sys/devices/system/node/node${ON_PACKAGE_MEMORY_NODE}/hugepages/hugepages-2048kB/nr_hugepages
+        # 2M hugepage setup needs root; under non-root deployment it goes
+        # through the site root proxy.
+        if [[ "${SGLANG_ENABLE_NOROOT_USER:-0}" == "1" ]]; then
+            noroot_proxy_run hugepage_2m.sh 0 "${RANK_IN_NODE}"
+            noroot_proxy_run hugepage_2m.sh 2020 "${ON_PACKAGE_MEMORY_NODE}"
+        else
+            echo 0 > /sys/devices/system/node/node${RANK_IN_NODE}/hugepages/hugepages-2048kB/nr_hugepages
+            echo 2020 > /sys/devices/system/node/node${ON_PACKAGE_MEMORY_NODE}/hugepages/hugepages-2048kB/nr_hugepages
+        fi
 
         # Per-rank IB device: map RANK_IN_NODE to an index in IB_DEVICE_ALL.
         if [[ "$ROLE" == "prefill" || "$ROLE" == "decode" ]]; then

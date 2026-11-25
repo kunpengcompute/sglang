@@ -112,8 +112,9 @@ class _KunpengDispatcherState:
         # Contiguous [max_tokens_per_mb, router_topk] int16 SHM buffer holding the
         # router's topk ids.  The router computes each rank's token slice
         # into this buffer, then shm_dual_allgather merges all slices into
-        # one consistent full table; afterwards the ids are copied into the
-        # even columns of topk_ids_index_buf for the RDMA dispatcher.
+        # one consistent full table; afterwards the ids are published as
+        # (peer rank, local expert slot) pairs into topk_ids_index_buf for
+        # the RDMA / local SHM dispatchers.
         self.topk_ids_flat_buf: Optional[torch.Tensor] = None
 
         # Size info
@@ -136,6 +137,13 @@ class _KunpengDispatcherState:
         # address is stable across graph captures; sized to the full logical
         # expert count (>= the routed rows of the EPLB all-physical map).
         self.dynamic_remap_counter: Optional[torch.Tensor] = None
+        # Explicit int64 logical->physical gather table used by the non-EPLB
+        # (trivial layout) publish path of remap_topk_ids_to_rank_slot_kunpeng.
+        # logical id == physical slot, so it is a plain arange.  Allocated once
+        # (stable address for graph capture) and passed instead of ``None``:
+        # a captured None is replayed as an undefined tensor, which the remap
+        # kernel rejects as a non-int64 dispatch map.
+        self.identity_dispatch_map: Optional[torch.Tensor] = None
         self.router_topk: int = 0
         self.attn_tp_size: int = 0
         self.attn_tp_rank: int = 0
@@ -294,8 +302,24 @@ def _ensure_rdma_initialized(
             else state.num_experts
         )
 
-        # Flash-comm SP: prefill role only; requires the RDMA dispatch path
-        # and a sliced attention-TP domain > 1.
+        # Flash-comm SP: prefill role only; requires a sliced attention-TP
+        # domain > 1. Supported on BOTH dispatch backends and with PP > 1
+        # (e.g. prefill pp=16):
+        # - RDMA dispatch: the combine writes each token's result to its home
+        #   rank only (allgather=False), the minimal-communication mode.
+        # - Local SHM dispatch (single node per PP stage): dispatch still
+        #   assembles the full packed_recv_x (every rank's quantized slice is
+        #   gathered over node SHM) and moe_local_sum + shm_allreduce still
+        #   produce full combined_x rows; combine_recv then extracts this
+        #   rank's home slice. The home-slice WRITE optimization stays
+        #   RDMA-only, but the per-rank router/topk savings apply unchanged.
+        # PP > 1: non-last stages hand (hidden_states, residual) token slices
+        # to the next stage via PPProxyTensors; the receiving stage's first
+        # layer gathers full rows in prepare_attn (its layer_input_mode is
+        # SCATTERED -- statically for a sparse predecessor, or via the
+        # flash-comm input-mode patch in deepseek_v2.py for a dense
+        # predecessor, both keyed on the global layer_id). The Kunpeng graph
+        # runner expects the sliced payload (see _pp_row_mismatch).
         state.use_sp = is_kunpeng_flash_comm()
         if state.use_sp:
             if state.attn_tp_size <= 1:
@@ -303,27 +327,10 @@ def _ensure_rdma_initialized(
                     "Kunpeng flash-comm SP requires attention-TP > 1 "
                     "(token slicing over the attn-TP group)"
                 )
-            if state.use_local_dis_com:
-                raise ValueError(
-                    "Kunpeng flash-comm SP requires the RDMA dispatch path "
-                    "(local SHM dispatch does not implement home-slice combine)"
-                )
             if state.etp_enabled:
                 raise ValueError(
                     "Kunpeng flash-comm SP is incompatible with ETP "
                     "(run prefill with ep_size == tp_size)"
-                )
-            from sglang.srt.distributed.parallel_state import (
-                get_pipeline_model_parallel_world_size,
-            )
-
-            if get_pipeline_model_parallel_world_size() > 1:
-                # Non-last PP stages hand the token slice to the next stage
-                # via PPProxyTensors; the receiving stage's scatter modes are
-                # not validated for that handoff. Block until tested.
-                raise ValueError(
-                    "Kunpeng flash-comm SP requires PP=1 (token-slice handoff "
-                    "through PPProxyTensors is untested)"
                 )
 
         # Step 1: RDMA communication domain.  Only needed when MoE dispatch/
@@ -341,6 +348,14 @@ def _ensure_rdma_initialized(
         # Dynamic redundant-expert remap counter: one int64 slot per logical
         # expert, allocated once so the address stays stable for graph capture.
         state.dynamic_remap_counter = torch.zeros(state.num_experts, dtype=torch.int64)
+
+        # Identity logical->physical gather table for the non-EPLB publish
+        # path.  Sized like the num_physical_experts passed there
+        # (num_local_experts * ep_size) so the remap kernel's bounds check and
+        # the physical/rank decode stay identical to the previous None path.
+        state.identity_dispatch_map = torch.arange(
+            state.num_local_experts * state.ep_size, dtype=torch.int64
+        )
 
         # Step 3: Dispatch & combine init
         if state.use_local_dis_com:

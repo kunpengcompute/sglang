@@ -79,15 +79,15 @@ for i in "${!NODES[@]}"; do
     node_rank="$i"
     echo "[$(date +%T)] Starting node_rank $node_rank ($node_ip)"
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-        "root@$node_ip" \
-        "cd \"$PWD\" && sh ./server.sh \"$ROLE\" \"$node_rank\" \"$LOG_DIR\" \"$INSTANCE\"" \
+        "$(ssh_target "$node_ip")" \
+        "cd \"$PWD\" && bash runtime/server_cluster.sh \"$ROLE\" \"$node_rank\" \"$LOG_DIR\" \"$INSTANCE\"" \
         >"$LOG_DIR/ssh_${ROLE}_rank${node_rank}.log" 2>&1 &
 done
 
 echo "All $ROLE nodes launched."
 
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
-    # Binary launch names each log by its true rank (see server.sh):
+    # Binary launch names each log by its true rank (see runtime/server_cluster.sh):
     # pp{pp}_dp{dp}_tp{tp}_{ip}.log. Rank 0 = node 0, rank-in-node 0 = pp0/dp0/tp0.
     rank0_log_file="$LOG_DIR/pp0_dp0_tp0_${NODES[0]}.log"
 else

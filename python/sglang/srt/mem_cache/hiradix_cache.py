@@ -579,15 +579,15 @@ class HiRadixCache(RadixCache):
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
                     if self.l1l3_only:
+                        # Only now is the page actually in L3: a write can be
+                        # dropped half way, so leave the flag unset and let
+                        # _flush_l1l3_node retry it.
+                        expected = len(operation.hash_value) * self.page_size
+                        if operation.completed_tokens >= expected:
+                            entry.storage_backed = True
                         # Two-tier: the L1 slots were pinned with a lock ref
                         # (there is no host_value protection to release).
                         self.dec_lock_ref(entry)
-                        if _hicache_debug():
-                            logger.info(
-                                "[hicache] L3 write ack: op=%d, %d token(s) unpinned",
-                                ack_id,
-                                len(entry.value) if entry.value is not None else 0,
-                            )
                     else:
                         entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
@@ -690,6 +690,11 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         TreeNode.counter = 0
+        # controller.reset() clears the ack queue: drop in-flight bookkeeping
+        # or those nodes stay pinned and never get retried.
+        for node in self.ongoing_backup.values():
+            self.dec_lock_ref(node)
+        self.ongoing_backup.clear()
         self.cache_controller.reset()
         if not self.l1l3_only:
             self.token_to_kv_pool_host.clear()
@@ -754,9 +759,9 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
-    def write_backup(self, node: TreeNode, write_back=False) -> int:
+    def write_backup(self, node: TreeNode, write_back=False, req_id=None) -> int:
         if self.l1l3_only:
-            return self._write_backup_l1l3(node, write_back)
+            return self._write_backup_l1l3(node, write_back, req_id)
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed
         # up yet;
@@ -791,7 +796,7 @@ class HiRadixCache(RadixCache):
 
         return len(host_indices)
 
-    def _write_backup_l1l3(self, node: TreeNode, write_back: bool = False) -> int:
+    def _write_backup_l1l3(self, node: TreeNode, write_back: bool = False, req_id=None) -> int:
         """Queue an L1 -> L3 write for *node* (two-tier mode).
 
         Nothing is allocated and no data moves here: the backup thread gathers
@@ -813,6 +818,9 @@ class HiRadixCache(RadixCache):
             # Without an L3 backend the two-tier mode degenerates to a plain L1
             # radix cache: nothing to write, nothing to index.
             return 0
+        if any(n is node for n in self.ongoing_backup.values()):
+            # Already queued (repeated chunks would queue it again).
+            return 0
 
         prefix_keys = (
             node.get_prefix_hash_values(node.parent)
@@ -825,9 +833,11 @@ class HiRadixCache(RadixCache):
             node.hash_value,
             prefix_keys,
             **self._get_extra_pools(),
+            req_id=req_id,
         )
         self.ongoing_backup[operation_id] = node
-        node.storage_backed = True
+        # storage_backed is set on the ack, not here: a queued write can still
+        # be dropped and must stay retryable.
         self.inc_lock_ref(node)
         return len(node.value)
 
@@ -848,19 +858,35 @@ class HiRadixCache(RadixCache):
         self.ongoing_backup[operation_id] = node
         node.protect_host()
 
-    def _inc_hit_count(self, node: TreeNode, chunked=False):
-        # skip the hit count update for chunked requests
-        if self.cache_controller.write_policy == "write_back" or chunked:
+    def _inc_hit_count(self, node: TreeNode, chunked=False, req_id=None):
+        if self.cache_controller.write_policy == "write_back":
+            return
+        # Chunked inserts are skipped only in the generic path; the two-tier
+        # path flushes them via _flush_l1l3_node.
+        if chunked and not self.l1l3_only:
             return
         node.hit_count += 1
 
         # Two-tier mode has no host_value to test, so "already backed up" is the
-        # L3 flag (set when the write is queued).
+        # L3 flag (set on the write ack).
         already_backed = node.storage_backed if self.l1l3_only else node.backuped
         if not already_backed:
             if node.hit_count >= self.write_through_threshold:
                 # write to host if the node is not backuped
-                self.write_backup(node)
+                self.write_backup(node, req_id=req_id)
+
+    def _flush_l1l3_node(self, node: TreeNode, req_id=None) -> None:
+        """Queue this node's L1 pages for L3 if they are not there yet.
+
+        Fills the holes left by chunked prefills and by the prefix-continuity
+        rule (an earlier skipped node would leave every later one unwritten).
+        """
+        if not self.l1l3_only or self.disable:
+            return
+        if node.evicted or node.storage_backed:
+            return
+        # write_backup() re-checks the value, the backend and the queue.
+        self.write_backup(node, write_back=True, req_id=req_id)
 
     def writing_check(self, write_back=False):
         if self.l1l3_only:
@@ -933,10 +959,6 @@ class HiRadixCache(RadixCache):
 
     def evictable_size(self):
         return self.evictable_size_
-
-    def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
-        """Convert raw token_ids to a RadixKey; must be list (not tuple) for paged match."""
-        return RadixKey(token_ids=list(token_ids))
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
@@ -1040,28 +1062,10 @@ class HiRadixCache(RadixCache):
                     # budget (see _trim_storage_index), not by L1 eviction.
                     continue
                 if x.storage_backed:
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] L1 evict node=%d, %d token(s), "
-                            "device[%d..%d] -> L3-only",
-                            x.id,
-                            len(x.value),
-                            int(x.value[0]),
-                            int(x.value[-1]),
-                        )
                     n = self._evict_storage_backed(x)
                     num_evicted += n
                     evicted_to_l3 += n
                 else:
-                    if _hicache_debug():
-                        logger.info(
-                            "[hicache] L1 evict node=%d, %d token(s), "
-                            "device[%d..%d] -> dropped (not in L3)",
-                            x.id,
-                            len(x.value),
-                            int(x.value[0]),
-                            int(x.value[-1]),
-                        )
                     n = self._evict_regular(x)
                     num_evicted += n
                     evicted_dropped += n
@@ -1424,11 +1428,15 @@ class HiRadixCache(RadixCache):
 
     # Timeout is linearly increasing with the number of pages
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
-        # If hash_value has not been computed in timeout_base seconds, terminate it.
+        # hash_value is empty until the hit query returns; charge the query
+        # phase by the request's own page count, not the bare base budget.
+        pages = max(
+            len(operation.hash_value),
+            len(operation.token_ids) // self.page_size,
+        )
         return (
             time.monotonic() - operation.start_time
-            > self.prefetch_timeout_base
-            + len(operation.hash_value) * self.prefetch_timeout_per_page
+            > self.prefetch_timeout_base + pages * self.prefetch_timeout_per_page
         )
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):
@@ -1492,6 +1500,10 @@ class HiRadixCache(RadixCache):
         # classify by how much actually landed instead.
         if completed_tokens >= total_tokens:
             stop_reason = "complete"
+        elif not operation.hash_value:
+            # Empty hash: the hit query never returned (a real 0-page hit is
+            # revoked earlier).
+            stop_reason = "query-timeout"
         elif self.prefetch_stop_policy == "timeout" and self.is_prefetch_timeout(
             operation
         ):
@@ -1504,9 +1516,18 @@ class HiRadixCache(RadixCache):
             stop_reason = "partial"
         if _hicache_debug():
             emit = logger.info if stop_reason == "complete" else logger.warning
+            read = ""
+            if getattr(operation, "read_batches", 0):
+                # Read-side phase totals, one line for the whole request.
+                read = ", read=own %.3fs gather %.3fs wait %.3fs (%d batch)" % (
+                    operation.read_own,
+                    operation.read_gather,
+                    operation.read_wait,
+                    operation.read_batches,
+                )
             emit(
                 "[hicache] prefetch %s: req=%s, %d/%d token(s), %d/%d page(s), "
-                "elapsed=%.3fs",
+                "elapsed=%.3fs%s",
                 stop_reason,
                 req_id,
                 completed_tokens,
@@ -1514,6 +1535,7 @@ class HiRadixCache(RadixCache):
                 completed_tokens // self.page_size,
                 total_tokens // self.page_size,
                 elapsed,
+                read,
             )
 
         min_completed_tokens = completed_tokens
@@ -1580,6 +1602,7 @@ class HiRadixCache(RadixCache):
             self.cache_controller.append_host_mem_release(
                 host_indices[min_completed_tokens:completed_tokens]
             )
+        anchor_depth = self.prefix_depth(last_host_node)
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
@@ -1589,9 +1612,11 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         if _hicache_debug():
             logger.info(
-                "[hicache] prefetch published: req=%s, %d/%d token(s) into L1 "
-                "(%d already resident), %d token(s) will be recomputed",
+                "[hicache] prefetch published: req=%s, anchor_depth=%d, "
+                "%d/%d token(s) into L1 (%d already resident), "
+                "%d token(s) will be recomputed",
                 req_id,
+                anchor_depth,
                 loaded_from_storage,
                 total_tokens,
                 matched_length,
@@ -1628,6 +1653,18 @@ class HiRadixCache(RadixCache):
         was queued for the node.
         """
         return node.storage_backed
+
+    def prefix_depth(self, node: TreeNode) -> int:
+        """Token depth of *node* in the radix tree (root = 0).
+
+        ``len(prefix_indices)`` cannot stand in for it: it skips L3-only nodes,
+        so the prefetch offset would drift.
+        """
+        depth = 0
+        while node is not None and node is not self.root_node:
+            depth += len(node.key)
+            node = node.parent
+        return depth
 
     def match_prefix(self, params: MatchPrefixParams):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -1700,11 +1737,18 @@ class HiRadixCache(RadixCache):
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold:
+            return
+        if self.cache_controller.prefetch_rate_limited():
+            if _hicache_debug():
+                logger.info(
+                    "[hicache] prefetch skipped (rate limited): req=%s, need=%d, "
+                    "in-flight=%d/%d token(s)",
+                    req_id,
+                    prefetch_length,
+                    self.cache_controller.prefetch_tokens_occupied,
+                    self.cache_controller.prefetch_capacity_limit,
+                )
             return
 
         last_host_node.protect_host()
@@ -1971,6 +2015,7 @@ class HiRadixCache(RadixCache):
         value = params.value
         chunked = params.chunked
         priority = params.priority
+        req_id = params.req_id
 
         if priority is None:
             priority = 0
@@ -2007,8 +2052,9 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
                 else:
-                    self._inc_hit_count(node, chunked)
+                    self._inc_hit_count(node, chunked, req_id)
                     total_prefix_length += prefix_len
+                self._flush_l1l3_node(node, req_id)
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -2024,8 +2070,9 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
                 else:
-                    self._inc_hit_count(new_node, chunked)
+                    self._inc_hit_count(new_node, chunked, req_id)
                     total_prefix_length += prefix_len
+                self._flush_l1l3_node(new_node, req_id)
                 node = new_node
 
             key = key[prefix_len:]
@@ -2052,11 +2099,23 @@ class HiRadixCache(RadixCache):
             self._record_store_event(new_node)
 
             if self.cache_controller.write_policy != "write_back":
-                self._inc_hit_count(new_node, chunked)
+                self._inc_hit_count(new_node, chunked, req_id)
+            self._flush_l1l3_node(new_node, req_id)
         return InsertResult(prefix_len=total_prefix_length)
+
+    def cache_finished_req(self, req, is_insert: bool = True):
+        super().cache_finished_req(req, is_insert=is_insert)
+        # All inserts of this request are done: emit its L1->L3 write summary
+        # once the queued writes drain (see _flush_write_summary).
+        seal = getattr(self.cache_controller, "seal_write_summary", None)
+        if seal is not None:
+            seal(req.rid)
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
+        seal = getattr(self.cache_controller, "seal_write_summary", None)
+        if seal is not None:
+            seal(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:

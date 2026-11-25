@@ -443,11 +443,8 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
         if is_nextn:
-            # The NextN draft layer dispatches through the target's last
-            # MoE-layer EPLB mapping (ExpertLocationDispatchInfo.init_new
-            # remaps layer_id to num_layers - 1), so its recorded expert
-            # heat must land in that same recorder counter row:
-            # KunpengMoE.run_moe_core writes `record_layer_id` when set.
+            # Draft heat/padding must land in the same row it dispatches through
+            # (dedicated draft row, or the target's last layer in legacy mode).
             from sglang.srt.eplb.expert_location import (
                 get_global_expert_location_metadata,
             )
@@ -470,6 +467,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 self.experts, "should_fuse_routed_scaling_factor_in_topk", False
             ),
             fused_shared_experts_scaling_factor=1,
+            # Keep the padding-token histogram in the same recorder row as the
+            # layer's expert heat (the target's last row for the nextn layer).
+            pad_layer_id=getattr(self.experts, "record_layer_id", None),
         )
 
         self.shared_experts_is_int8 = False
