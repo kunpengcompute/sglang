@@ -33,6 +33,28 @@ benign bf16 accumulation noise (~1e-4). The live weight is
 never modified in place: losers and fallbacks (odd runtime shapes,
 uncontiguous inputs, graph capture) run plain F.linear on the untouched
 row-major weight - the pre-patch behavior, bit for bit.
+
+Plan-A native-INT8 campaign (SGLANG_KUNPENG_VISION_I8_GEMM, default 1; set 0
+to force the whole tower back onto the BF16 tiers): the
+checkpoint INT8 payload of the quantized vision projections (attn.qkv,
+attn.proj, mlp.linear_fc1; fc2/merger/patch_embed carry no INT8 in the
+checkpoint and are untouched) additionally stays in its native form. At load
+time each unique shard shape packs through the AMX 32-task tile contract
+(raw shape first; the prime N=269 fc1 shard retries zero-padded up the
+16/32-multiple ladder) and an in-service startup A/B
+(SGLANG_KUNPENG_VISION_I8_GEMM_PROBE_ROWS, default "1600,4096") times the
+full runtime callable (per-token quant + SME INT8 GEMM + N-tail slice)
+against this layer's exact production BF16 path (packed GEMM where the BF16
+campaign switched it, F.linear on the dequantized weight otherwise). A
+variant wins only when it is implementation-exact against the fp32 math of
+the SAME quantized inputs (Frobenius <= 5e-3; the residual is the BF16
+output cast) and faster at every probed row count; the quantization loss
+versus the BF16 path is logged as a diagnostic only - the semantic decision
+rides on caption A/B, not on that number. Graph capture keeps the traced
+eager path; losers and runtime surprises (odd shapes, non-contiguous input)
+run the untouched BF16 path. Production logs carry one verdict line per
+unique shard shape; the per-rung ladder detail and the per-row timings sit
+behind SGLANG_KUNPENG_VISION_I8_GEMM_VERBOSE (default 0).
 """
 
 import os
@@ -44,8 +66,33 @@ from torch.nn import Parameter
 
 from sglang.srt.layers.quantization.modelslim.schemes.cpu920f_w8a8_dynamic import (
     CPU920FModelSlimW8A8Dynamic,
+    quantize_zero_safe,
     validate_int8_payload,
+    validate_prequantized_activation,
 )
+
+
+def _i8_gemm_enabled():
+    """Plan-A switch: keep the quantized vision shards native INT8.
+
+    Default on since the 2026-11-26 field validation (fc1 won its ladder
+    1.39-1.47x on every rank, qkv/proj were vetoed); set
+    SGLANG_KUNPENG_VISION_I8_GEMM=0 to force the whole tower back onto the
+    BF16 tiers.
+    """
+    return os.environ.get("SGLANG_KUNPENG_VISION_I8_GEMM", "1") not in ("", "0")
+
+
+def _i8_probe_verbose():
+    """Startup A/B detail (ladder rungs, per-row timings) behind a switch.
+
+    Production logs carry only the one verdict line per unique shape;
+    SGLANG_KUNPENG_VISION_I8_GEMM_VERBOSE=1 restores the full evidence
+    trail for diagnostics.
+    """
+    return os.environ.get(
+        "SGLANG_KUNPENG_VISION_I8_GEMM_VERBOSE", "0"
+    ) not in ("", "0")
 
 
 class CPU920FVisionDequantW8A8Dynamic(CPU920FModelSlimW8A8Dynamic):
@@ -55,12 +102,25 @@ class CPU920FVisionDequantW8A8Dynamic(CPU920FModelSlimW8A8Dynamic):
     # across its layers; the probe ladder runs once per unique shape.
     _packed_probe_cache = {}
 
+    # (n, k) -> (n_pad, tile_n, tile_k) or None: the native-INT8 ladder runs
+    # once per unique shard shape (same discipline as _packed_probe_cache).
+    _i8_probe_cache = {}
+
     def process_weights_after_loading(self, layer):
         if getattr(layer, "_cpu920f_w8a8_packed", False):
             raise RuntimeError("Vision component must not enter the AMX pack path")
         if getattr(layer, "_vision_w8a8_dequantized", False):
             raise RuntimeError("Vision INT8 weight must be dequantized exactly once")
+        if getattr(layer, "_vision_i8_packed", False):
+            raise RuntimeError("Vision INT8 payload must be packed exactly once")
         validate_int8_payload(layer.weight, layer.weight_scale, layer.weight_offset)
+        # Plan-A native-INT8: snapshot the checkpoint payload before the
+        # dequant consumes it, so the i8 setup can pack the real INT8 bytes.
+        # A disabled tower (env 0) costs nothing - not even the clone.
+        i8_raw = i8_scale = None
+        if _i8_gemm_enabled():
+            i8_raw = layer.weight.detach().clone()
+            i8_scale = layer.weight_scale.detach().clone()
         # Symmetric per-output-channel dequantization; scale/offset stay F32
         # during the product so no precision is lost before the BF16 cast.
         weight = layer.weight.to(torch.float32) * layer.weight_scale
@@ -87,6 +147,19 @@ class CPU920FVisionDequantW8A8Dynamic(CPU920FModelSlimW8A8Dynamic):
                     f"[vision-bf16-gemm] n={layer.weight.shape[0]}"
                     f" k={layer.weight.shape[1]} setup 异常"
                     f"（{' '.join(str(e).split())[:72]}） -> F.linear",
+                    flush=True,
+                )
+        if i8_raw is not None:
+            # Best-effort native-INT8 tier on top of the BF16 tiers: any
+            # surprise verdict keeps this layer on its BF16 path, and the
+            # BF16 tiers below stay exactly as they were.
+            try:
+                self._setup_i8_packed(layer, i8_raw, i8_scale)
+            except Exception as e:
+                print(
+                    f"[vision-i8-gemm] n={i8_raw.shape[0]}"
+                    f" k={i8_raw.shape[1]} setup 异常"
+                    f"（{' '.join(str(e).split())[:72]}） -> BF16 执行",
                     flush=True,
                 )
 
@@ -283,6 +356,315 @@ class CPU920FVisionDequantW8A8Dynamic(CPU920FModelSlimW8A8Dynamic):
             )
         return use
 
+    @classmethod
+    def _setup_i8_packed(cls, layer, raw, scale):
+        """Native-INT8 tier for one shard: probe once per shape, then pack.
+
+        The verdict is cached per unique (n, k) across the tower's layers;
+        a losing shape never sets _vision_i8_packed and keeps running its
+        BF16 tier (packed GEMM or F.linear) untouched.
+        """
+        n, k = tuple(raw.shape)
+        if (n, k) in cls._i8_probe_cache:
+            plan = cls._i8_probe_cache[(n, k)]
+        else:
+            plan = cls._probe_i8(layer, raw, scale)
+            cls._i8_probe_cache[(n, k)] = plan
+            # One verdict line per unique shape per process; the repeated
+            # shard shapes above hit the class cache and stay silent.
+            if plan is None:
+                print(
+                    f"[vision-i8-gemm] n={n} k={k} -> BF16 执行",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[vision-i8-gemm] n={n} k={k}{cls._pad_tag(plan[0])}"
+                    f" tn={plan[1]} tk={plan[2]} -> INT8 执行",
+                    flush=True,
+                )
+        if plan is None:
+            return
+        n_pad, tile_n, tile_k = plan
+        if n_pad is None:
+            src = raw
+        else:
+            src = torch.nn.functional.pad(raw, (0, 0, 0, n_pad - n))
+        packed = torch.empty_like(src)
+        torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+            src.contiguous(), packed, tile_n, tile_k
+        )
+        # Readable ones-tailed scale storage: the SME N-tail DQ reads 16 F32
+        # beyond the logical N (same ABI as the text pack path). Pad rows sit
+        # on zero weight rows, so their scale=1 is inert.
+        n_eff = n if n_pad is None else n_pad
+        scale_storage = torch.ones((n_eff + 16, 1), dtype=torch.float32)
+        scale_storage[:n].copy_(scale)
+        layer._vision_i8_weight = packed
+        layer._vision_i8_scale_storage = scale_storage
+        layer._vision_i8_n = n
+        layer._vision_i8_plan = (tile_n, tile_k)
+        layer._vision_i8_packed = True
+
+    @classmethod
+    def _probe_i8(cls, layer, raw, scale):
+        """INT8 ladder for one unique shape: raw N first, then 16/32-multiple pads.
+
+        Every rung must satisfy the AMX 32-task tile contract (the kernel
+        dispatch assumes 32 owned workers); the first rung whose full
+        runtime callable beats this layer's production BF16 path at every
+        probed row count wins. Returns (n_pad, tile_n, tile_k) or None.
+        """
+        n, k = tuple(raw.shape)
+        verbose = _i8_probe_verbose()
+        # Tightest legal pad first: the 16-multiple rung is the one the
+        # static account chose for the prime N=269 fc1 shard (269 -> 272,
+        # +1.1% slack); the 32-multiple rungs (+7% for fc1) follow. Rungs
+        # equal to n are skipped below, and dict.fromkeys dedups repeats.
+        ceil16 = ((n + 15) // 16) * 16
+        base = ((n + 31) // 32) * 32
+        targets = [None, ceil16, base, base + 32]
+        if base + 32 < 1024:
+            targets.append(1024)
+        for n_pad in dict.fromkeys(targets):
+            if n_pad is not None and n_pad == n:
+                continue
+            n_eff = n if n_pad is None else n_pad
+            tag = cls._pad_tag(n_pad)
+            try:
+                _, tile_n, tile_k = torch.ops.sgl_kernel.igemm_find_optimal_tiling_plan(
+                    1, n_eff, k
+                )
+            except RuntimeError as e:
+                if verbose:
+                    print(
+                        f"[vision-i8-gemm] n={n} k={k}{tag} 规划异常"
+                        f"（{' '.join(str(e).split())[:60]}） -> 下一档",
+                        flush=True,
+                    )
+                continue
+            if (
+                tile_n < 32
+                or tile_n % 4
+                or tile_k <= 0
+                or k % tile_k
+                or tile_k % 4
+                or n_eff % tile_n
+                or (n_eff // tile_n) * (k // tile_k) != 32
+            ):
+                if verbose:
+                    print(
+                        f"[vision-i8-gemm] n={n} k={k}{tag} tn={tile_n} tk={tile_k}"
+                        f" 不满足 32 任务契约 -> 下一档",
+                        flush=True,
+                    )
+                continue
+            try:
+                if n_pad is None:
+                    src = raw
+                else:
+                    src = torch.nn.functional.pad(raw, (0, 0, 0, n_pad - n))
+                packed = torch.empty_like(src)
+                torch.ops.sgl_kernel.s8_gemm_pack_kunpeng(
+                    src.contiguous(), packed, tile_n, tile_k
+                )
+                if cls._probe_i8_variant(
+                    layer, raw, scale, packed, n_pad, tile_n, tile_k
+                ):
+                    return n_pad, tile_n, tile_k
+            except Exception as e:
+                # A crash inside one rung (pack, probe, reference math) must
+                # not abort the remaining ladder rungs for this shape.
+                if verbose:
+                    print(
+                        f"[vision-i8-gemm] n={n} k={k}{tag} 垫片档异常"
+                        f"（{' '.join(str(e).split())[:60]}） -> 下一档",
+                        flush=True,
+                    )
+        return None
+
+    @classmethod
+    def _probe_i8_variant(cls, layer, raw, scale, packed, n_pad, tile_n, tile_k):
+        """In-service startup A/B: this layer's production BF16 path vs INT8.
+
+        The baseline is exactly what apply_weights runs for this layer
+        today: the BF16 campaign's packed GEMM where it switched this
+        shard, plain F.linear on the dequantized weight otherwise. The INT8
+        side is the full runtime callable (per-token quant + scratch and
+        workspace + SME INT8 GEMM + N-tail slice). A variant wins only when
+        it is exact against the fp32 math of the SAME quantized inputs
+        (Frobenius <= 5e-3; the residual is the BF16 exit cast) and faster
+        at every probed row count. The quantization loss versus the BF16
+        output is logged as a diagnostic only - the semantic decision rides
+        on the caption A/B, not on that number.
+        """
+        n, k = tuple(raw.shape)
+        n_eff = n if n_pad is None else n_pad
+        tag = cls._pad_tag(n_pad)
+        verbose = _i8_probe_verbose()
+        rows_env = os.environ.get(
+            "SGLANG_KUNPENG_VISION_I8_GEMM_PROBE_ROWS", "1600,4096"
+        ).strip()
+        rows = [int(p) for p in rows_env.split(",") if p.strip().isdigit() and int(p) > 0]
+        if not rows:
+            if verbose:
+                print(
+                    f"[vision-i8-gemm] n={n} k={k}{tag} probe 跳过 -> 直接启用",
+                    flush=True,
+                )
+            return True
+        # Match the serving thread count so the baseline is not measured
+        # with a different global pool than at runtime.
+        try:
+            torch.set_num_threads(
+                int(os.environ.get("SGLANG_KUNPENG_TORCH_NUM_THREADS", "32"))
+            )
+        except (ValueError, RuntimeError):
+            pass
+        from sglang.srt.graph import ops as kunpeng
+
+        # This layer's production BF16 callable, whatever apply_weights
+        # would run for this shard right now.
+        bf16_packed = bool(getattr(layer, "_vision_bf16_packed", False))
+        b_weight = getattr(layer, "_vision_bf16_packed_weight", None)
+        b_out_n = getattr(layer, "_vision_bf16_out_n", None)
+
+        def run_base(x):
+            if bf16_packed:
+                out = cls._packed_gemm(b_weight, x, b_out_n)
+                if out is not None:
+                    return out
+            return torch.nn.functional.linear(x, layer.weight)
+
+        # The exact runtime INT8 callable: quant, scratch, workspace, GEMM,
+        # tail slice - nothing amortized away.
+        blocks_k = k // tile_k
+        if n_pad is None:
+            w_ref = raw.to(torch.float32)
+        else:
+            w_ref = torch.nn.functional.pad(raw, (0, 0, 0, n_pad - n)).to(
+                torch.float32
+            )
+        scale_storage = torch.ones((n_eff + 16, 1), dtype=torch.float32)
+        scale_storage[:n].copy_(scale)
+        w_scale = scale_storage[:n_eff].flatten()
+
+        def run_i8(x):
+            q_i, a_i = validate_prequantized_activation(quantize_zero_safe(x), k)
+            scratch = torch.empty_like(q_i)
+            m_i = q_i.shape[0]
+            workspace = torch.empty(
+                blocks_k * n_eff * m_i + 1024 if blocks_k > 1 else 1,
+                dtype=torch.bfloat16,
+            )
+            out = kunpeng.s8_s8_gemm_bf16_dq_kunpeng(
+                q_i,
+                scratch,
+                packed,
+                a_i,
+                w_scale,
+                workspace,
+                m_i,
+                tile_n,
+                tile_k,
+            )
+            if n_eff != n:
+                out = out[:, :n].contiguous()
+            return out
+
+        use = True
+        for m in rows:
+            x = torch.randn(m, k, dtype=torch.bfloat16)
+            base_ref = run_base(x)
+            out = run_i8(x)
+            # Implementation-exactness gate: the SAME quantized inputs
+            # replayed in exact fp32 math. The int8 products accumulate
+            # exactly in int32 inside the kernel, so the residual is the
+            # BF16 exit cast; anything larger is a packing/scale bug.
+            q, a_scale = validate_prequantized_activation(quantize_zero_safe(x), k)
+            ref = q.to(torch.float32) @ w_ref.T
+            ref = ref * a_scale.reshape(m, 1) * w_scale.reshape(1, n_eff)
+            if n_eff != n:
+                # Padded rung: the runtime callable slices the zero-weight
+                # tail columns off, so compare on the same live columns. The
+                # un-sliced reference previously crashed the whole ladder
+                # with a (n) vs (n_pad) broadcast error.
+                ref = ref[:, :n]
+            diff = out.double() - ref.double()
+            err = (diff.norm() / ref.double().norm().clamp_min(1e-6)).item()
+            # Diagnostic only: the loss versus the production BF16 output
+            # (a different input quantization, not an implementation bug).
+            diff_q = out.double() - base_ref.double()
+            q_loss = (diff_q.norm() / base_ref.double().norm().clamp_min(1e-6)).item()
+            # Warm up once, then time both full callables.
+            run_base(x)
+            run_i8(x)
+            t0 = time.perf_counter()
+            for _ in range(3):
+                run_base(x)
+            t_base = (time.perf_counter() - t0) / 3 * 1e3
+            t0 = time.perf_counter()
+            for _ in range(3):
+                run_i8(x)
+            t_i8 = (time.perf_counter() - t0) / 3 * 1e3
+            ok = err <= 5e-3 and t_i8 < t_base
+            use = use and ok
+            if verbose:
+                print(
+                    f"[vision-i8-gemm] n={n} k={k}{tag} m={m}:"
+                    f" bf16={t_base:.1f}ms i8={t_i8:.1f}ms ({t_base / t_i8:.2f}x)"
+                    f" err={err:.1e} 量化损失={q_loss:.1e}"
+                    f" -> {'启用' if ok else '回退'}",
+                    flush=True,
+                )
+        return use
+
+    @staticmethod
+    def _i8_gemm(layer, flat):
+        """[m,k] BF16 -> per-token INT8 quant -> SME INT8 GEMM -> [m,n] BF16.
+
+        None = fall back to the BF16 tiers (graph capture, odd runtime
+        shapes, non-contiguous input, quant surprise).
+        """
+        from sglang.srt.graph import is_capturing, ops as kunpeng
+
+        if is_capturing():
+            # Capture was traced against the BF16 path; keep replay
+            # equivalence by not switching kernels under capture.
+            return None
+        packed = layer._vision_i8_weight
+        n_eff, k = tuple(packed.shape)
+        n = layer._vision_i8_n
+        m = flat.shape[0]
+        if m <= 0 or flat.shape[1] != k:
+            return None
+        try:
+            q, a_scale = validate_prequantized_activation(quantize_zero_safe(flat), k)
+        except (ValueError, RuntimeError):
+            return None
+        tile_n, tile_k = layer._vision_i8_plan
+        blocks_k = k // tile_k
+        scratch = torch.empty_like(q)
+        workspace = torch.empty(
+            blocks_k * n_eff * m + 1024 if blocks_k > 1 else 1,
+            dtype=torch.bfloat16,
+        )
+        out = kunpeng.s8_s8_gemm_bf16_dq_kunpeng(
+            q,
+            scratch,
+            packed,
+            a_scale,
+            layer._vision_i8_scale_storage[:n_eff].flatten(),
+            workspace,
+            m,
+            tile_n,
+            tile_k,
+        )
+        if n_eff != n:
+            # Padded variant: drop the zero-row tail columns.
+            return out[:, :n].contiguous()
+        return out
+
     def apply_weights(self, layer, x, bias: Optional[torch.Tensor] = None):
         if not getattr(layer, "_vision_w8a8_dequantized", False):
             raise RuntimeError("Vision INT8 weight was not dequantized")
@@ -294,6 +676,17 @@ class CPU920FVisionDequantW8A8Dynamic(CPU920FModelSlimW8A8Dynamic):
             raise ValueError("Vision scheme requires a CPU activation tensor")
         if x.dtype != torch.bfloat16:
             x = x.to(torch.bfloat16)
+        if (
+            getattr(layer, "_vision_i8_packed", False)
+            and x.is_contiguous()
+            and x.dim() >= 2
+        ):
+            out = self._i8_gemm(layer, x.reshape(-1, x.shape[-1]))
+            if out is not None:
+                output = out.reshape(*x.shape[:-1], out.shape[-1])
+                if bias is not None:
+                    output = output + bias.to(output.dtype)
+                return output
         if (
             getattr(layer, "_vision_bf16_packed", False)
             and x.is_contiguous()
