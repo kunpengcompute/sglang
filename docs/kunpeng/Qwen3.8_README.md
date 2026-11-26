@@ -23,6 +23,28 @@
 | SGLang | `https://gitcode.com/kunpengcompute/sglang.git` | `v0.5.11` |
 | KuTACC | `https://gitcode.com/zhengzhong722/kutacc.git` | `sglang_930`（按 README 安装） |
 
+### 模型权重下载
+
+从 ModelScope 获取 Qwen3.8-27B-W8A8 量化权重（即后续 config.sh 中 `MODEL` 要填写的目录）。
+
+模型页：<https://modelscope.cn/models/Eco-Tech/Qwen3.8-27B-w8a8/files>
+
+```bash
+# 方式一：ModelScope CLI（需 pip install modelscope）
+modelscope download --model Eco-Tech/Qwen3.8-27B-w8a8 --local_dir <模型存放目录>
+
+# 方式二：git clone（权重为 LFS 大文件，需先安装 git-lfs）
+git clone https://www.modelscope.cn/Eco-Tech/Qwen3.8-27B-w8a8.git <模型存放目录>
+```
+
+> **注意**：本指南配套的是 **2026-08-17 之前发布**的权重版本；该日期之后仓库如有更新，请回退到该日期之前的版本再使用：
+>
+> ```bash
+> cd <模型存放目录>
+> git log --until=2026-08-17 --oneline    # 查看该日期之前的提交
+> git checkout <该日期之前的 commit>
+> ```
+
 ### 环境变量
 
 ```bash
@@ -258,8 +280,8 @@ cp "$TOOL/config.example.sh" "$DEPLOY/config.sh"
 
 编辑 `$DEPLOY/config.sh`，主要内容：
 
-- **路径**：`SGLANG_SOURCE`（sglang 源码目录）、`PYTHON`（配套 Python 解释器）、`CC`/`CXX`（毕昇编译器）、`KUTACC_PREFIX`、`KUPL_PREFIX`、`COMPILER_RUNTIME_LIB`（毕昇运行库）、`MODEL`（Qwen3.8-27B-w8a8 权重目录）、`PERF_TUNE`（已授权的 performance_tune 目录，即第 3 节的 `$PERFORMANCE_TUNE`）；
-- **服务参数**：`QWEN_HOST`、`QWEN_HTTP_PORT`（示例默认 31086）、`QWEN_DIST_PORT`（示例默认 29986）、`QWEN_CONTEXT_LENGTH`、`QWEN_MAX_TOTAL_TOKENS`、`QWEN_MAX_RUNNING_REQUESTS`；
+- **路径**：`SGLANG_SOURCE`（sglang 源码目录）、`PYTHON`（配套 Python 解释器）、`CC`/`CXX`（毕昇编译器）、`KUTACC_PREFIX`、`KUPL_PREFIX`、`COMPILER_RUNTIME_LIB`（毕昇运行库）、`MODEL`（Qwen3.8-27B-w8a8 权重目录，获取方式见第 1 节「模型权重下载」）、`PERF_TUNE`（已授权的 performance_tune 目录，即第 3 节的 `$PERFORMANCE_TUNE`）；
+- **服务参数**：`QWEN_HOST`、`QWEN_HTTP_PORT`（config 示例默认 31086，本文示例统一用 30000）、`QWEN_DIST_PORT`（示例默认 29986）、`QWEN_CONTEXT_LENGTH`、`QWEN_MAX_TOTAL_TOKENS`、`QWEN_MAX_RUNNING_REQUESTS`；
 - **资源与调频**（示例已给出默认值）：`SGLANG_KUNPENG_WEIGHTS_HBW_POOL_SIZE_MB=4000`、`SGLANG_KUNPENG_PREFILL/DECODE_SHM_SIZE_MB=384`、`HBM_HUGEPAGE_MODE=ensure`、`HBM_HUGEPAGE_MB_PER_NODE=auto`（对应每 HBM 节点 1810 个 2MiB 大页，换算见第 3 节）、`CPU_FREQ_MODE=apply`、`CPU_FREQ_TARGET_MHZ=2000`、`CPU_FREQ_TOLERANCE_MHZ=20`；无法可靠识别原标称频率时，按管理员确认值填写 `CPU_FREQ_RESTORE_MHZ`；
 - **MTP**：`SGLANG_ENABLE_MTP=0` 关闭；开启设 `1` 并配置 `SGLANG_SPECULATIVE_NUM_STEPS`（默认 3）；共享 checkpoint 时 `SPECULATIVE_DRAFT_MODEL_PATH` 可留空；
 - **默认配方**（`config.example.sh` 已配好，一般无需改动）：prefill 走 KuTACC（`SGLANG_KUNPENG_QWEN_PREFILL_BACKEND=kutacc`）、M4096（`SGLANG_KUNPENG_COLLECTIVE_MAX_TOKENS=4096`）、M96（`KUTACC_INT8_LARGE_M_MACRO_M96=1`）、图捕获与 CPU 绑核开启、**默认关闭 thinking**（`SGLANG_QWEN_DEFAULT_THINKING=0`）。
@@ -329,6 +351,72 @@ bash "$TOOL/run.sh" status "$DEPLOY/config.sh"
 # 停止服务；stop 会清理自有进程/SHM 并恢复本次资源改动（大页/频率）
 bash "$TOOL/run.sh" stop "$DEPLOY/config.sh"
 ```
+
+**curl 直接请求示例**（OpenAI 兼容接口；端口取 config.sh 的 `QWEN_HTTP_PORT`，下例为 30000）：
+
+```bash
+# 查询服务实际模型名
+curl --noproxy '*' http://127.0.0.1:30000/v1/models
+
+# 非流式对话请求
+curl --noproxy '*' http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<上一步返回的模型名>",
+    "messages": [{"role": "user", "content": "你好，简单介绍一下你自己"}],
+    "max_tokens": 128,
+    "temperature": 0.7
+  }'
+```
+
+**预期返回**（`/v1/models`，`data[0].id` 即请求体中要填的模型名）：
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Qwen3.8-27B-w8a8",
+      "object": "model",
+      "created": 1760000000,
+      "owned_by": "sglang",
+      "root": null,
+      "parent": null,
+      "max_model_len": 69632
+    }
+  ]
+}
+```
+
+**预期返回**（`/v1/chat/completions`，HTTP 200）：
+
+```json
+{
+  "id": "chatcmpl-1a2b3c",
+  "object": "chat.completion",
+  "created": 1760000000,
+  "model": "Qwen3.8-27B-w8a8",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "你好！我是 Qwen3.8-27B-W8A8……"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 8,
+    "completion_tokens": 64,
+    "total_tokens": 72
+  }
+}
+```
+
+> 以上 JSON 中 `id`、`created`、`usage` 数值与生成正文均为示例，以实际返回为准。判定成功的基本条件是 **HTTP 200 且 `choices[0].message.content` 非空**（因 `max_tokens` 截断时 `finish_reason` 为 `"length"`）；开启 thinking（见下方说明）后 `message` 中还会多出 `reasoning_content` 字段；流式响应为 SSE 格式，`object` 为 `chat.completion.chunk`，逐块输出 `delta` 内容。
+
+> 流式输出在请求体加 `"stream": true`；服务默认关闭 thinking，需要开启时在请求体加 `"chat_template_kwargs": {"enable_thinking": true}`。
 
 **说明**：
 
