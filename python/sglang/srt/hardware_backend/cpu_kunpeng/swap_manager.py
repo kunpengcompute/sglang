@@ -32,7 +32,10 @@ Behavior (controlled by environment variables):
 - SGLANG_KUNPENG_SWAP_KV_BLOCKWISE: use block-wise KV swap in decode mode.
 - SGLANG_KUNPENG_SWAP_INDEX_K_IN: DSA index-K DDR->HBM mirror; two ping-pong
     HBM buffers prefetch two full indexers ahead so the whole-pool DMA is
-    hidden under the intervening layer compute.
+    hidden under the intervening layer compute. The mirror dtype follows the
+    pool's index_k_dtype (uint8 e4m3 codes with SGLANG_KUNPENG_INDEXER_K_FP8):
+    it covers ONLY the code rows -- the per-token ue8m0 scale bytes stay
+    DDR-resident and are read straight from DDR at scoring time.
 
 Usage:
     mgr = KunpengSwapManager.get_instance()
@@ -778,9 +781,13 @@ class KunpengSwapManager:
     ) -> None:
         """Allocate both HBM index-K mirrors. Idempotent.
 
-        Shape: ``(num_slots, index_head_dim)`` each. Recycled in ping-pong
-        order across full layers: while one is being scored by the current
-        full indexer, the other can already hold the next layer's copy.
+        Shape: ``(num_slots, index_head_dim)`` each, ``dtype`` from the pool
+        (bf16 rows, or uint8 e4m3 codes with SGLANG_KUNPENG_INDEXER_K_FP8 --
+        the mirror covers ONLY the code rows; the per-token ue8m0 scale bytes
+        are never mirrored, scoring reads them straight from DDR). Recycled
+        in ping-pong order across full layers: while one is being scored by
+        the current full indexer, the other can already hold the next
+        layer's copy.
         Must be called before :meth:`swap_index_k_layer`.
         """
         self._ensure_index_k_state()
@@ -845,13 +852,18 @@ class KunpengSwapManager:
             )
         # Mirrors are sized by the FIRST runner (target or draft); a larger
         # layer pool would write past them into adjacent HBW allocations.
+        # The dtype check guards the byte count too: an fp8 (uint8) DDR pool
+        # copied into a bf16 mirror (or vice versa) would DMA 2x the mirror
+        # capacity before the shape check's guard fires.
         if (
             index_k_ddr.shape[0] > hbm.shape[0]
             or index_k_ddr.shape[1:] != hbm.shape[1:]
+            or index_k_ddr.dtype != hbm.dtype
         ):
             raise RuntimeError(
                 f"index-K swap-in size mismatch: ddr {tuple(index_k_ddr.shape)} "
-                f"does not fit the shared HBM buffer {tuple(hbm.shape)}"
+                f"{index_k_ddr.dtype} does not fit the shared HBM buffer "
+                f"{tuple(hbm.shape)} {hbm.dtype}"
             )
         event_tensor = self._index_k_swap_in_event_tensors[buf_idx]
         event_num_tensor = self._index_k_swap_in_event_num_tensors[buf_idx]

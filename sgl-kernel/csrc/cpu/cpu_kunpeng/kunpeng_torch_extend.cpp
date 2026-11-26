@@ -162,6 +162,19 @@ void paged_mqa_logits_topk_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
                                    int64_t row_rows);
 int64_t get_paged_mqa_logits_topk_workspace_size(int64_t max_k_end);
 
+// DSA indexer scoring kernel (kutacc adapter, fp8 e4m3 index-K cache) and
+// the store-side bf16 -> e4m3 + per-slot scale quantization: see
+// attention/indexer.cpp.
+void paged_mqa_logits_topk_fp8_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
+                                       at::Tensor k_scale, at::Tensor weight,
+                                       at::Tensor block_tables, at::Tensor seq_lens,
+                                       at::Tensor cur_lens, at::Tensor output,
+                                       at::Tensor workspace, int64_t topk,
+                                       int64_t output_coord, int64_t mode,
+                                       int64_t row_start, int64_t row_rows);
+void set_index_k_fp8_buffer_kunpeng(at::Tensor kv_buffer, at::Tensor k_scale_buffer,
+                                    at::Tensor loc, at::Tensor cache_k);
+
 void fake_indexer_topk_kunpeng(const at::Tensor &seq_lens, int64_t topk, at::Tensor indices);
 void fake_indexer_topk_mtp_kunpeng(const at::Tensor &seq_lens, const c10::optional<at::Tensor> &extend_seq_lens,
                                    int64_t num_rows, int64_t topk, at::Tensor indices);
@@ -774,6 +787,28 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
     m.impl("paged_mqa_logits_topk_kunpeng", paged_mqa_logits_topk_kunpeng);
     m.def("get_paged_mqa_logits_topk_workspace_size(int max_k_end) -> int");
     m.impl("get_paged_mqa_logits_topk_workspace_size", get_paged_mqa_logits_topk_workspace_size);
+
+    // DSA indexer scoring kernel (kutacc adapter, fp8 e4m3 index-K cache).
+    // Same scheduling/window scalars as the bf16 op; cur_kv_cache is uint8
+    // e4m3 codes [num_blocks, block_size, D] and k_scale is the uint8
+    // ue8m0 per-slot scale [num_slots] (2^(b-127), byte 0 -> 0.0f), folded
+    // after the head sum.
+    m.def(
+        "paged_mqa_logits_topk_fp8_kunpeng(Tensor q, Tensor cur_kv_cache, "
+        "Tensor k_scale, Tensor weight, Tensor block_tables, Tensor seq_lens, "
+        "Tensor cur_lens, Tensor(a!) output, Tensor workspace, int topk, "
+        "int output_coord, int mode, int row_start, int row_rows) -> ()");
+    m.impl("paged_mqa_logits_topk_fp8_kunpeng", paged_mqa_logits_topk_fp8_kunpeng);
+
+    // DSA indexer store-side fp8 quantization: bf16 rows [T, D] -> e4m3
+    // codes scattered into the uint8 pool buffer at slots `loc` plus one
+    // ue8m0 scale byte per row at the same slot (2^ceil(log2(amax/448)) as
+    // 2^(b-127); byte 0 -> 0.0f). Direct-write (graph-replay safe; loc < 0
+    // rows are skipped).
+    m.def(
+        "set_index_k_fp8_buffer_kunpeng(Tensor(a!) kv_buffer, "
+        "Tensor(b!) k_scale_buffer, Tensor loc, Tensor cache_k) -> ()");
+    m.impl("set_index_k_fp8_buffer_kunpeng", set_index_k_fp8_buffer_kunpeng);
 
     // Fake indexer (920F DSA bring-up): all-ids selection, exact when
     // seq_len <= index_topk (guarded on the Python side).

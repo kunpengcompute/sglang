@@ -124,3 +124,15 @@ static KernelRegistrar _r_set_kv_buffer_2(
     "set_kv_buffer_2_kunpeng",
     make_dispatch_v<decltype(&set_kv_buffer_2_kunpeng),
                     &set_kv_buffer_2_kunpeng>);
+
+// DSA indexer store-side fp8 quantization (bf16 rows -> e4m3 codes + fp32
+// per-slot scale scattered into the pool buffers; see attention/indexer.cpp).
+// Direct-write, same graph contract as set_kv_buffer_kunpeng: tensors
+// (kv_buffer, k_scale_buffer, loc, cache_k), no extra outputs.
+void set_index_k_fp8_buffer_kunpeng(at::Tensor kv_buffer, at::Tensor k_scale_buffer,
+                                    at::Tensor loc, at::Tensor cache_k);
+
+static KernelRegistrar _r_set_index_k_fp8_buffer(
+    "set_index_k_fp8_buffer_kunpeng",
+    make_dispatch_v<decltype(&set_index_k_fp8_buffer_kunpeng),
+                    &set_index_k_fp8_buffer_kunpeng>);

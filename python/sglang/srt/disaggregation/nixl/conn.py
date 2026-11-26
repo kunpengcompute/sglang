@@ -872,6 +872,16 @@ class NixlKVManager(CommonKVManager):
                     f"State index length mismatch: prefill={len(prefill_state_indices)}, "
                     f"dst={len(dst_state_indices)}"
                 )
+            if getattr(self.kv_args, "state_scale_data_ptrs", None):
+                # fp8 (e4m3) index-K: the per-token ue8m0 scale bytes travel
+                # in a parallel per-layer list (see mooncake maybe_send_extra);
+                # the NIXL path has no scale pass implemented yet.
+                raise RuntimeError(
+                    "PD Disaggregation via NIXL does NOT support fp8 (e4m3) "
+                    "index-K yet (SGLANG_KUNPENG_INDEXER_K_FP8=1): the "
+                    "parallel ue8m0 scale transfer is only implemented on "
+                    "the mooncake backend."
+                )
             return self._send_kvcache_generic(
                 peer_name=peer_name,
                 src_data_ptrs=self.kv_args.state_data_ptrs,

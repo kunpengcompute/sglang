@@ -264,6 +264,8 @@ class KunpengGraphRunner:
             # Any full (non-skip-topk) layer has the same flat geometry; skip
             # layers carry None. Sized by the first runner (target/draft) like
             # the KV HBM buffer -- swap_index_k_layer fails loudly on a mismatch.
+            # dtype = index_k_dtype: uint8 e4m3 code rows with fp8 index-K (the
+            # ue8m0 scale bytes stay DDR-resident, no scale mirror).
             full_index_k = next(b for b in nsa_pool.index_k_buffer if b is not None)
             self.swap_mgr.init_index_k_buffer(
                 num_slots=full_index_k.shape[0],
@@ -1661,6 +1663,16 @@ class KunpengGraphRunner:
         )
         if index_k_buffers:
             for buf in index_k_buffers:
+                if buf is not None:
+                    fixed.append(buf)
+        # FP8 (e4m3) index-K storage: the per-token ue8m0 scale-byte buffers
+        # are a separate pool array and must be captured just like the code
+        # buffers.
+        index_k_scale_buffers = getattr(
+            self.model_runner.token_to_kv_pool, "index_k_scale_buffer", None
+        )
+        if index_k_scale_buffers:
+            for buf in index_k_scale_buffers:
                 if buf is not None:
                     fixed.append(buf)
         indexer_ws = getattr(attn_backend, "indexer_workspace", None)

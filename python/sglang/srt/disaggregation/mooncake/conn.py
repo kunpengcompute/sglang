@@ -178,7 +178,16 @@ class KVArgsRegisterInfo:
     # decode-side layer info, used to slice prefill src when prefill pp != decode pp
     decode_start_layer: int = 0
     decode_num_layers: int = 0
-    # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
+    # fp8 (e4m3) index-K only: per-layer ue8m0 scale-byte buffers of the
+    # decode pool, parallel to dst_state_data_ptrs (one entry per layer,
+    # layer-aligned). Empty lists when the decode side runs bf16 -- the
+    # prefill side rejects a mixed fp8/bf16 pair loudly.
+    dst_state_scale_data_ptrs: list = dataclasses.field(default_factory=list)
+    dst_state_scale_item_lens: list = dataclasses.field(default_factory=list)
+    # Note: the staging fields follow; the optional fp8 scale frames are
+    # appended after them (frames 17/18, strictly length-guarded), so an
+    # older peer still parses the staging frames at their historical
+    # positions.
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
@@ -217,7 +226,16 @@ class KVArgsRegisterInfo:
                 if len(msg) > 14 and len(msg[14]) > 0
                 else 0
             ),
-            # Note: always put the staging field at the final
+            dst_state_scale_data_ptrs=(
+                list(struct.unpack(f"{len(msg[17])//8}Q", msg[17]))
+                if len(msg) > 17 and len(msg[17]) > 0
+                else []
+            ),
+            dst_state_scale_item_lens=(
+                list(struct.unpack(f"{len(msg[18])//4}I", msg[18]))
+                if len(msg) > 18 and len(msg[18]) > 0
+                else []
+            ),
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15),
         )
 
@@ -381,23 +399,23 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         # Batch register state/extra pool data buffers
-        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
-            # state_data_ptrs is layer-aligned (one entry per layer) so the PD
-            # layer mapping can slice it by absolute layer id -- see
-            # get_mla_kv_ptrs_with_pp. Kunpeng DSA pools fill the shared
-            # (skip-topk) layers with a single shared placeholder buffer, so the
-            # same region can appear many times in the list. mooncake rejects
-            # overlapping regions and aborts the WHOLE batch, which leaves even
-            # the real layer buffers unregistered; the index-K (NSA state)
-            # transfer then fails with "Failed to get segment descriptor".
-            # Register unique regions only; the layer-aligned list is kept as-is
-            # for addressing.
+        def _register_unique(ptrs: list[int], lens: list[int]):
+            # state_data_ptrs (and its fp8 scale sibling) is layer-aligned
+            # (one entry per layer) so the PD layer mapping can slice it by
+            # absolute layer id -- see get_mla_kv_ptrs_with_pp. Kunpeng DSA
+            # pools fill the shared (skip-topk) layers with a single shared
+            # placeholder buffer, so the same region can appear many times in
+            # the list. mooncake rejects overlapping regions and aborts the
+            # WHOLE batch, which leaves even the real layer buffers
+            # unregistered; the index-K (NSA state) transfer then fails with
+            # "Failed to get segment descriptor". Register unique regions
+            # only; the layer-aligned list is kept as-is for addressing.
+            if not ptrs or not lens:
+                return
             uniq_ptrs: list[int] = []
             uniq_lens: list[int] = []
             seen: set = set()
-            for ptr, length in zip(
-                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-            ):
+            for ptr, length in zip(ptrs, lens):
                 key = (ptr, length)
                 if key in seen:
                     continue
@@ -405,6 +423,14 @@ class MooncakeKVManager(CommonKVManager):
                 uniq_ptrs.append(ptr)
                 uniq_lens.append(length)
             self.engine.batch_register(uniq_ptrs, uniq_lens)
+
+        _register_unique(self.kv_args.state_data_ptrs, self.kv_args.state_data_lens)
+        # fp8 index-K: per-layer ue8m0 scale buffers, same placeholder-dedupe
+        # contract as the code buffers.
+        _register_unique(
+            getattr(self.kv_args, "state_scale_data_ptrs", []),
+            getattr(self.kv_args, "state_scale_data_lens", []),
+        )
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -1298,7 +1324,97 @@ class MooncakeKVManager(CommonKVManager):
             dst_state_indices = np.array(dst_state_indices, dtype=np.int32)
             # Per-request decode layer info from the registration (do NOT read
             # the shared self.kv_args here: racy between transfer threads).
-            return self._send_kvcache_generic(
+            decode_start_layer = (
+                getattr(target_rank_registration_info, "decode_start_layer", 0)
+                if target_rank_registration_info is not None
+                else None
+            )
+            decode_num_layers = (
+                getattr(target_rank_registration_info, "decode_num_layers", 0)
+                if target_rank_registration_info is not None
+                else None
+            )
+            # fp8 (e4m3) index-K: per-token ue8m0 scale bytes travel in a
+            # PARALLEL pass. Both the code and the scale list are
+            # layer-aligned (one entry per layer, target + draft), so the
+            # same page indices, layer mapping, and layer shard slice the
+            # two lists identically. Validate BEFORE any bytes move: the
+            # codes pass below addresses the decode buffers with the
+            # PREFILL-side item_len, so a fp8/bf16 mismatch (or a scale
+            # list not exactly as long as the code list) would already
+            # corrupt the decode pool during that first pass.
+            src_scale_ptrs = getattr(self.kv_args, "state_scale_data_ptrs", [])
+            dst_scale_ptrs = (
+                getattr(
+                    target_rank_registration_info, "dst_state_scale_data_ptrs", []
+                )
+                if target_rank_registration_info is not None
+                else []
+            )
+            if (src_scale_ptrs or dst_scale_ptrs) and (
+                not src_scale_ptrs or not dst_scale_ptrs
+            ):
+                # Raw-byte transfer: prefill and decode must run the same
+                # SGLANG_KUNPENG_INDEXER_K_FP8 setting, else the D side
+                # would score codes without scales (or vice versa).
+                raise RuntimeError(
+                    "PD index-K transfer dtype mismatch: "
+                    f"prefill has {'fp8' if src_scale_ptrs else 'bf16'} index-K "
+                    f"while decode has {'fp8' if dst_scale_ptrs else 'bf16'} -- "
+                    "SGLANG_KUNPENG_INDEXER_K_FP8 must be identical on the "
+                    "prefill and decode sides (raw-byte transfer, no conversion)."
+                )
+            if src_scale_ptrs and (
+                len(src_scale_ptrs) != len(self.kv_args.state_data_ptrs)
+                or len(dst_scale_ptrs) != len(dst_state_data_ptrs)
+            ):
+                raise RuntimeError(
+                    "PD index-K scale list is not layer-aligned with the code "
+                    f"list: src {len(src_scale_ptrs)} vs {len(self.kv_args.state_data_ptrs)}, "
+                    f"dst {len(dst_scale_ptrs)} vs {len(dst_state_data_ptrs)} -- "
+                    "the scale pass would slice a different layer range than "
+                    "the codes pass (mixed target/draft pool types?)"
+                )
+            # The scale pass addresses BOTH sides with the prefill-side scale
+            # item_len (see _send_kvcache_generic: the same item_len computes
+            # src_addr and dst_addr), so the decode-side scale item lens sent
+            # at registration (frame 18) must agree. Every value is
+            # page_size by contract (1 B/token per row, one page per item);
+            # a deviation (different page_size on the decode side, corrupted
+            # registration) would scatter the scale bytes across wrong
+            # slots on the decode side.
+            if src_scale_ptrs:
+                src_scale_item_lens = getattr(
+                    self.kv_args, "state_scale_item_lens", []
+                )
+                dst_scale_item_lens = (
+                    getattr(
+                        target_rank_registration_info,
+                        "dst_state_scale_item_lens",
+                        [],
+                    )
+                    if target_rank_registration_info is not None
+                    else []
+                )
+                if len(src_scale_item_lens) != len(src_scale_ptrs) or len(
+                    dst_scale_item_lens
+                ) != len(dst_scale_ptrs):
+                    raise RuntimeError(
+                        "PD index-K scale item_len list is not layer-aligned "
+                        "with the scale pointers: src "
+                        f"{len(src_scale_item_lens)} lens vs {len(src_scale_ptrs)} ptrs, "
+                        f"dst {len(dst_scale_item_lens)} lens vs "
+                        f"{len(dst_scale_ptrs)} ptrs"
+                    )
+                if len(set(src_scale_item_lens) | set(dst_scale_item_lens)) != 1:
+                    raise RuntimeError(
+                        "PD index-K scale item_len mismatch: prefill "
+                        f"{sorted(set(src_scale_item_lens))} vs decode "
+                        f"{sorted(set(dst_scale_item_lens))} -- the transfer "
+                        "addresses both sides with one item_len (== "
+                        "page_size), so every layer must agree"
+                    )
+            ret = self._send_kvcache_generic(
                 mooncake_session_id=req.mooncake_session_id,
                 src_data_ptrs=self.kv_args.state_data_ptrs,
                 dst_data_ptrs=dst_state_data_ptrs,
@@ -1306,20 +1422,58 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_data_indices=prefill_state_indices,
                 dst_data_indices=dst_state_indices,
                 executor=executor,
-                decode_start_layer=(
-                    getattr(target_rank_registration_info, "decode_start_layer", 0)
-                    if target_rank_registration_info is not None
-                    else None
-                ),
-                decode_num_layers=(
-                    getattr(target_rank_registration_info, "decode_num_layers", 0)
-                    if target_rank_registration_info is not None
-                    else None
-                ),
+                decode_start_layer=decode_start_layer,
+                decode_num_layers=decode_num_layers,
                 layer_shard=layer_shard,
             )
+            if ret != 0:
+                return ret
+            if src_scale_ptrs:
+                return self._send_kvcache_generic(
+                    mooncake_session_id=req.mooncake_session_id,
+                    src_data_ptrs=src_scale_ptrs,
+                    dst_data_ptrs=dst_scale_ptrs,
+                    item_lens=getattr(self.kv_args, "state_scale_item_lens", []),
+                    prefill_data_indices=prefill_state_indices,
+                    dst_data_indices=dst_state_indices,
+                    executor=executor,
+                    decode_start_layer=decode_start_layer,
+                    decode_num_layers=decode_num_layers,
+                    layer_shard=layer_shard,
+                )
+            return ret
         else:
             return 0
+
+    def _fail_send_chunk(
+        self,
+        req: TransferInfo,
+        room: str,
+        prefill_unique_rank: int,
+        what: str,
+    ) -> None:
+        """Per-chunk transfer failure handling shared by the main KV send and
+        the index-K state send: dead-letter the session, mark the room Failed
+        and tell the decode endpoint so the request is failed loudly."""
+        with self.session_lock:
+            self.session_failures[req.mooncake_session_id] += 1
+            # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+            if self.session_failures[req.mooncake_session_id] >= 1:
+                self.failed_sessions.add(req.mooncake_session_id)
+                logger.error(f"Session {req.mooncake_session_id} failed.")
+        self.record_failure(
+            room,
+            f"Failed to send {what} of {room} to "
+            f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+        )
+        self.update_status(room, KVPoll.Failed)
+        self.sync_status_to_decode_endpoint(
+            req.endpoint,
+            req.dst_port,
+            req.room,
+            KVPoll.Failed,
+            prefill_unique_rank,
+        )
 
     def _send_mamba_state(
         self,
@@ -1662,32 +1816,14 @@ class MooncakeKVManager(CommonKVManager):
                                 ),
                             )
                         if ret != 0:
-                            with self.session_lock:
-                                self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
-                            self.record_failure(
-                                kv_chunk.room,
-                                f"Failed to send kv chunk of {kv_chunk.room} to "
-                                f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
-                            )
-                            self.update_status(kv_chunk.room, KVPoll.Failed)
-                            self.sync_status_to_decode_endpoint(
-                                req.endpoint,
-                                req.dst_port,
-                                req.room,
-                                KVPoll.Failed,
-                                prefill_unique_rank,
+                            self._fail_send_chunk(
+                                req, kv_chunk.room, prefill_unique_rank, "kv chunk"
                             )
                             break
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices is not None and not skip_state:
-                                self.maybe_send_extra(
+                                ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     target_rank_registration_info.dst_state_data_ptrs,
@@ -1695,6 +1831,21 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info,
                                     layer_shard=state_layer_shard,
                                 )
+                                if ret != 0:
+                                    # The fp8 index-K state is a two-pass
+                                    # (codes + scale) transfer and NOT atomic:
+                                    # a failed scale pass may have already
+                                    # landed the codes on the decode side.
+                                    # Report the room Failed -- a Success
+                                    # would let decode score codes without
+                                    # (or with stale) scale bytes.
+                                    self._fail_send_chunk(
+                                        req,
+                                        kv_chunk.room,
+                                        prefill_unique_rank,
+                                        "index-K state",
+                                    )
+                                    break
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
@@ -2312,6 +2463,22 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = b"".join(
                 struct.pack("I", dim) for dim in state_dim_per_tensor
             )
+            # fp8 index-K: the per-layer ue8m0 scale-byte buffers, parallel to
+            # packed_state_data_ptrs. Appended AFTER the staging frames (17/18)
+            # with strict length guards, so an older prefill still parses the
+            # staging frames at their historical positions.
+            packed_state_scale_data_ptrs = b"".join(
+                struct.pack("Q", ptr)
+                for ptr in getattr(
+                    self.kv_mgr.kv_args, "state_scale_data_ptrs", []
+                )
+            )
+            packed_state_scale_item_lens = b"".join(
+                struct.pack("I", item_len)
+                for item_len in getattr(
+                    self.kv_mgr.kv_args, "state_scale_item_lens", []
+                )
+            )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
@@ -2357,6 +2524,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ).encode("ascii"),
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        packed_state_scale_data_ptrs,
+                        packed_state_scale_item_lens,
                     ]
                 )
 
