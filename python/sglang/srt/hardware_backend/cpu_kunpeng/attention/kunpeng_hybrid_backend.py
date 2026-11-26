@@ -299,7 +299,7 @@ class KunpengGDNBackend(GDNAttnBackend):
         fb=forward_batch
         conv, state, indices, qsl = self._state(layer, fb)
         metadata = self.forward_metadata
-        prefill_graph.validate_extend_metadata(qsl, indices, mixed_qkv.shape[0], state.shape[0])
+        prefill_graph.validate_extend_metadata(qsl, indices, state.shape[0])
         if fb.mamba_checkpoint_offsets is not None:
             return self._forward_extend_multi_checkpoints(
                 layer, fb, mixed_qkv, a, b, conv, state, indices, qsl

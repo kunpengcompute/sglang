@@ -406,10 +406,15 @@ def prepare_checkpoint_plan(fb, query_start_loc, conv_width, dummy_slot, state_s
     return plan
 
 
-def validate_extend_metadata(qsl, indices, tokens, slots):
-    """Record a read-only runtime check before conv/gather/global state writes."""
+def validate_extend_metadata(qsl, indices, slots):
+    """Record a read-only runtime check before conv/gather/global state writes.
+
+    The token boundary is not a parameter: it would become a capture-time
+    scalar while ``qsl`` is replayed live, and the native check reads the
+    boundary from ``qsl`` itself instead.
+    """
     register()
-    ops.qwen_validate_extend_metadata(qsl, indices, tokens, slots)
+    ops.qwen_validate_extend_metadata(qsl, indices, slots)
 
 
 def resources():

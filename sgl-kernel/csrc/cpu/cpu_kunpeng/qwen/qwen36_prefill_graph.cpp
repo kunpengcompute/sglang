@@ -68,9 +68,11 @@ int64_t validate_cu(const at::Tensor &qsl, int64_t m) {
                     "GDN extend invalid interval");
     return sequences;
 }
-void validate_extend_metadata(const at::Tensor &qsl, const at::Tensor &indices, int64_t m,
-                              int64_t slots) {
-    const auto sequences = validate_cu(qsl, m);
+void validate_extend_metadata(const at::Tensor &qsl, const at::Tensor &indices, int64_t slots) {
+    check(qsl, at::kInt);
+    TORCH_CHECK(qsl.dim() == 1 && qsl.numel() >= 2, "GDN extend live token/sequence metadata");
+    const auto live = integer(qsl, qsl.numel() - 1);
+    const auto sequences = validate_cu(qsl, live);
     TORCH_CHECK(slots > 0 && indices.device().is_cpu() && indices.is_contiguous() &&
                     (indices.scalar_type() == at::kInt || indices.scalar_type() == at::kLong) &&
                     indices.dim() == 1 && indices.numel() == sequences,
@@ -98,7 +100,7 @@ void conv(std::vector<at::Tensor> &t, bool metadata_validated = false) {
                     t[2].size(1) == channels && t[2].size(2) == 3 &&
                     t[9].sizes() == t[0].sizes(), "Segmented conv shapes");
     if (!metadata_validated)
-        validate_extend_metadata(t[5], t[4], m, t[2].size(0));
+        validate_extend_metadata(t[5], t[4], t[2].size(0));
     const auto sequences = t[5].numel() - 1;
     TORCH_CHECK(t[3].dim() == 1 && t[3].numel() == sequences &&
                     t[6].dim() == 1 && t[6].numel() >= channels * (m + 3) &&
@@ -388,8 +390,8 @@ void shared(std::vector<at::Tensor> &t, double scale, bool metadata_validated = 
 
 extern "C" void qwen_graph_validate_extend_metadata_dispatch(std::vector<at::Tensor> &t,
                                                              const std::vector<ScalarArg> &s) {
-    TORCH_CHECK(t.size() == 2 && s.size() == 2, "GDN extend validation graph ABI");
-    validate_extend_metadata(t[0], t[1], std::get<int64_t>(s[0]), std::get<int64_t>(s[1]));
+    TORCH_CHECK(t.size() == 2 && s.size() == 1, "GDN extend validation graph ABI");
+    validate_extend_metadata(t[0], t[1], std::get<int64_t>(s[0]));
 }
 extern "C" void qwen_graph_gdn_prefill_dispatch(std::vector<at::Tensor> &t,
                                                 const std::vector<ScalarArg> &s) {
@@ -470,8 +472,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
     m.def("qwen_registered_validate_prefill_kv(Tensor table, Tensor req, Tensor seq, Tensor prefix, "
           "Tensor count, Tensor start, Tensor locations, int tokens, int slots, int capacity, "
           "bool write_cache) -> ()", &eager_validate_kv);
-    m.def("qwen_registered_validate_extend_metadata(Tensor qsl, Tensor indices, int tokens, int "
-          "slots) -> ()",
+    m.def("qwen_registered_validate_extend_metadata(Tensor qsl, Tensor indices, int slots) -> ()",
           &validate_extend_metadata);
     m.def("qwen_registered_gdn_prefill(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
           "Tensor(a!) state, Tensor qsl, Tensor(b!) workspace, int grain) -> Tensor",
