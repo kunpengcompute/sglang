@@ -557,4 +557,7 @@ def forward_attention(q, k, v, layer, fb, save_kv_cache):
         float(layer.scaling),
         True,  # Same live metadata was validated before the two KV stores above.
     )
+    # The padding tail of `output` is zeroed by the shared kernel itself: it
+    # recomputes the live coverage from the replayed metadata, while a slice
+    # taken here would freeze the capture batch's boundary into the graph.
     return output.reshape(-1, heads * dim)

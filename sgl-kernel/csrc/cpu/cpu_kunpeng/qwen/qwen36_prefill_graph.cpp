@@ -169,7 +169,8 @@ int64_t attention_segments(const at::Tensor &table, const at::Tensor &req,
                         "Shared prefill KV index out of range");
         covered += n;
     }
-    TORCH_CHECK(covered == m, "Shared prefill segments must cover all new tokens");
+    TORCH_CHECK(covered <= m, "Shared prefill segments overflow the token count");
+    TORCH_CHECK(m - covered <= 4096, "Shared prefill padding tail is unbounded");
     return batches;
 }
 
@@ -180,8 +181,14 @@ void validate_prefill_kv(std::vector<at::Tensor> &t, int64_t m, int64_t slots,
     TORCH_CHECK(t[6].dim() == 1 && t[6].numel() == m, "Prefill KV output locations");
     (void)integer(t[6]);
     if (!write_cache) return;
+    // Only the live prefix is stored; the padding tail carries the -1 skip
+    // sentinel that set_kv_buffer_kunpeng never writes.
+    int64_t live = 0;
+    for (int64_t batch = 0; batch < batches; ++batch)
+        live += integer(t[4], batch);
+    TORCH_CHECK(live <= m, "Prefill KV live coverage exceeds the token count");
     std::unordered_set<int64_t> written;
-    for (int64_t row = 0; row < m; ++row) {
+    for (int64_t row = 0; row < live; ++row) {
         const auto slot = integer(t[6], row);
         TORCH_CHECK(slot >= 0 && slot < slots && written.insert(slot).second,
                     "Prefill KV writes require unique valid output locations");
@@ -210,14 +217,16 @@ void gdn(std::vector<at::Tensor> &t, int64_t grain) {
                     t[1].sizes() == t[0].sizes() && t[2].dim() == 4 && t[2].size(0) == 1 &&
                     t[2].size(1) == t[0].size(1) && t[8].sizes() == t[2].sizes(),
                 "GDN prefill graph token shapes");
-    const auto m = t[0].size(1), hk = t[0].size(2), dk = t[0].size(3);
+    const auto m = integer(t[6], t[6].numel() - 1);
+    TORCH_CHECK(m > 0 && m <= t[0].size(1), "GDN prefill live tokens exceed the row count");
+    const auto hk = t[0].size(2), dk = t[0].size(3);
     const auto hv = t[2].size(2), dv = t[2].size(3);
     const auto sequences = validate_cu(t[6], m);
     const auto required =
         (m <= 32 ? 2 * hk + 3 * dv
                  : 2 * m * hk + sequences * hv * ((dv + grain - 1) / grain) * 3 * grain);
-    TORCH_CHECK(hk == 1 && hv == 3 && dk == 128 && dv == 128 && t[3].numel() == m * hv &&
-                    t[4].numel() == m * hv &&
+    TORCH_CHECK(hk == 1 && hv == 3 && dk == 128 && dv == 128 &&
+                    t[3].numel() == t[0].size(1) * hv && t[4].numel() == t[3].numel() &&
                     t[5].sizes() == at::IntArrayRef({sequences, hv, dk, dv}) && t[7].dim() == 1 &&
                     t[7].numel() >= required,
                 "GDN prefill graph state/metadata/workspace shapes");
@@ -231,16 +240,23 @@ void gdn(std::vector<at::Tensor> &t, int64_t grain) {
             reinterpret_cast<uint16_t *>(t[8].data_ptr()), sequences, m, hk, hv, dk, dv,
             t[7].data_ptr<float>(), t[7].numel());
         TORCH_CHECK(rc == 0, "GDN serial prefill graph kernel error ", rc);
-        return;
+    } else {
+        const auto rc = qwen36_gdn_prefill_parallel_with_workspace(
+            reinterpret_cast<const uint16_t *>(t[0].data_ptr()),
+            reinterpret_cast<const uint16_t *>(t[1].data_ptr()),
+            reinterpret_cast<const uint16_t *>(t[2].data_ptr()), t[3].data_ptr<float>(),
+            t[4].data_ptr<float>(), t[5].data_ptr<float>(), t[6].data_ptr<int32_t>(),
+            reinterpret_cast<uint16_t *>(t[8].data_ptr()), sequences, m, hk, hv, dk, dv, grain,
+            t[7].data_ptr<float>(), t[7].numel());
+        TORCH_CHECK(rc == 0, "GDN prefill graph kernel error ", rc);
     }
-    const auto rc = qwen36_gdn_prefill_parallel_with_workspace(
-        reinterpret_cast<const uint16_t *>(t[0].data_ptr()),
-        reinterpret_cast<const uint16_t *>(t[1].data_ptr()),
-        reinterpret_cast<const uint16_t *>(t[2].data_ptr()), t[3].data_ptr<float>(),
-        t[4].data_ptr<float>(), t[5].data_ptr<float>(), t[6].data_ptr<int32_t>(),
-        reinterpret_cast<uint16_t *>(t[8].data_ptr()), sequences, m, hk, hv, dk, dv, grain,
-        t[7].data_ptr<float>(), t[7].numel());
-    TORCH_CHECK(rc == 0, "GDN prefill graph kernel error ", rc);
+    // Padding tail: the kernels only produce the live rows; zero the rest so
+    // uninitialized pool bytes (possibly NaN/Inf) never reach the residual
+    // stream and the finiteness-checked rmsnorm/quant kernels downstream.
+    // The boundary is recomputed from qsl on every execution, like the
+    // shared() tail.
+    if (m < t[8].size(1))
+        t[8].narrow(1, m, t[8].size(1) - m).zero_();
 }
 void gdn_multi_checkpoint(std::vector<at::Tensor> &t, int64_t grain) {
     // Replay hands over inputs first and the fresh output last, so the output
@@ -375,6 +391,7 @@ void shared(std::vector<at::Tensor> &t, double scale, bool metadata_validated = 
     const auto batches = metadata_validated ? t[4].numel() :
         attention_segments(t[3], t[4], t[5], t[6], t[7], t[8], m, t[1].size(0), capacity);
     isolated(t, {9, 10, 11, 12, 13, 14});
+    int64_t covered = 0;
     for (int64_t batch = 0; batch < batches; ++batch) {
         const auto req = integer(t[4], batch), length = integer(t[5], batch);
         const auto count = integer(t[7], batch), start = integer(t[8], batch);
@@ -384,7 +401,15 @@ void shared(std::vector<at::Tensor> &t, double scale, bool metadata_validated = 
         qwen_prefill_flash_shared_gather(t[10], t[1], t[2],
             t[3].select(0, req).narrow(0, 0, length), t[13], t[11], t[12], t[14], count, scale);
         std::memcpy(t[9].select(0, start).data_ptr(), t[13].data_ptr(), count * heads * dim * 2);
+        covered += count;
     }
+    // Only the live prefix [0, covered) was produced by the segments; zero
+    // the padding tail so stale graph-pool bytes never leak downstream. The
+    // boundary is recomputed from the live metadata on every execution, so a
+    // captured graph replays correctly for any live count in its bucket (a
+    // Python-side slice here would freeze the capture batch's boundary).
+    if (covered < m)
+        t[9].narrow(0, covered, m - covered).zero_();
 }
 } // namespace
 
