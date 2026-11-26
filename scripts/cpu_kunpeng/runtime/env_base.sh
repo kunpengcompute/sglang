@@ -215,8 +215,9 @@ export SGLANG_KUNPENG_SWAP_INDEX_K_IN=0
 # FP8 (e4m3 codes + 1 B/token ue8m0 scale) index-K storage: ~50% pool and
 # scoring-read bandwidth saving. Must be identical across every rank of a
 # shared index-K group and between PD prefill/decode sides (raw-byte
-# transfer, no conversion); not supported with
-# SGLANG_KUNPENG_SWAP_INDEX_K_IN=1 (the swap mirror drops the scale bytes).
+# transfer, no conversion). Composable with SGLANG_KUNPENG_SWAP_INDEX_K_IN=1:
+# the HBM mirror covers only the uint8 code rows; the ue8m0 scale row stays
+# DDR-resident and is read straight from DDR at scoring time.
 export SGLANG_KUNPENG_INDEXER_K_FP8=0
 
 

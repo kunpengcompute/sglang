@@ -103,20 +103,12 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         )
         if self.index_k_is_fp8:
             self.index_k_scale_dtype = torch.uint8
-            # The swap manager's HBM mirror double-write covers only the
-            # code buffer (bf16-shaped); the fp8 store also writes
-            # per-token ue8m0 scale bytes, which the mirror would drop.
-            # Reject the combination at startup instead of silently corrupting.
-            from sglang.srt.utils.common import is_kunpeng_swap_index_k_in
+            # Composable with the index-K HBM swap (SGLANG_KUNPENG_SWAP_
+            # INDEX_K_IN): the mirror covers ONLY the uint8 e4m3 code rows
+            # (same shape as the bf16 pool, half the bytes); the per-token
+            # ue8m0 scale bytes are deliberately DDR-resident and read
+            # straight from DDR at scoring time, so no scale mirror exists.
 
-            if is_kunpeng_swap_index_k_in():
-                raise ValueError(
-                    "SGLANG_KUNPENG_INDEXER_K_FP8=1 is not supported with "
-                    "SGLANG_KUNPENG_SWAP_INDEX_K_IN=1 yet: the index-K HBM "
-                    "mirror double-write only covers the code buffer, not "
-                    "the per-token ue8m0 scale bytes. Leave the swap flag "
-                    "off on fp8 index-K deployments."
-                )
         if skip_topk_layers is None:
             skip_topk_layers = [False] * layer_num
         assert len(skip_topk_layers) == layer_num, (
@@ -298,12 +290,15 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         store ops (the C++ kernels skip loc < 0), so the write is replayed
         inside a captured graph.
 
-        With index-K whole-layer swap enabled (bf16 only -- fp8 + swap is
-        rejected at init), the DDR pool stays the authoritative copy
-        (PD / shared segment / HiCache read it) and the current layer's
-        HBM mirror is double-written. The HBM access drains the layer's
-        pending swap-in first, so a late whole-pool DMA cannot clobber the
-        freshly written rows.
+        With index-K whole-layer swap enabled, the DDR pool stays the
+        authoritative copy (PD / shared segment / HiCache read it) and the
+        current layer's HBM mirror is double-written: bf16 rows via
+        ``set_kv_buffer_kunpeng``, fp8 via the same quantize-on-write op as
+        the DDR store (deterministic, so both copies hold identical codes;
+        the ue8m0 scale bytes land on the authoritative DDR scale row again,
+        which is idempotent -- the mirror has no scale region). The HBM
+        access drains the layer's pending swap-in first, so a late
+        whole-pool DMA cannot clobber the freshly written rows.
 
         Layers in ``index_k_direct_layers`` (the leading full indexers) skip
         the HBM double-write entirely and stay in DDR.
@@ -325,7 +320,11 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
         # (quantize on write); bf16 stores the rows directly.
         if getattr(self, "index_k_is_fp8", False):
             kunpeng.set_index_k_fp8_buffer_kunpeng(
-                ddr_buf, self._index_k_scale_buf(layer_id), loc, index_k
+                ddr_buf,
+                self._index_k_scale_buf(layer_id),
+                loc,
+                index_k,
+                profile_name="set_index_k_fp8_buffer_kunpeng@index_k_ddr",
             )
         else:
             kunpeng.set_kv_buffer_kunpeng(
@@ -348,28 +347,40 @@ class KunpengNSATokenToKVPool(MLATokenToKVPool):
             # DMA over the whole pool, so a copy of the stale DDR contents
             # landing at the new-token slots after the write would clobber
             # the freshly written rows.
-            # (bf16 only -- the fp8 + swap combination is rejected at init.)
             swap_mgr.wait_index_k_swap_in(layer_id)
-            kunpeng.set_kv_buffer_kunpeng(
-                swap_mgr.get_index_k_cache(layer_id),
-                loc,
-                index_k,
-                profile_name="set_kv_buffer_kunpeng@index_k_hbm",
-            )
+            if getattr(self, "index_k_is_fp8", False):
+                # fp8: quantize-on-write into the code mirror. The scale
+                # bytes go to the authoritative DDR scale row again --
+                # identical bytes, idempotent (scoring reads scale from DDR,
+                # the mirror has no scale region).
+                kunpeng.set_index_k_fp8_buffer_kunpeng(
+                    swap_mgr.get_index_k_cache(layer_id),
+                    self._index_k_scale_buf(layer_id),
+                    loc,
+                    index_k,
+                    profile_name="set_index_k_fp8_buffer_kunpeng@index_k_hbm",
+                )
+            else:
+                kunpeng.set_kv_buffer_kunpeng(
+                    swap_mgr.get_index_k_cache(layer_id),
+                    loc,
+                    index_k,
+                    profile_name="set_kv_buffer_kunpeng@index_k_hbm",
+                )
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         """[num_slots, index_head_dim] flat index-K buffer (bf16 or uint8).
 
-        Swap enabled (bf16 only -- fp8 + swap is rejected at init): the
-        current layer's HBM mirror. Otherwise: this layer's DDR buffer.
+        Swap enabled: the current layer's HBM mirror. fp8 pools mirror ONLY
+        the e4m3 code rows; the ue8m0 scale row stays DDR-resident and is
+        fetched separately via :meth:`get_index_k_scale_buffer`.
         Skip-topk (shared/S) layers never call this -- they have no buffer.
         Layers in ``index_k_direct_layers`` always return their DDR buffer
         (they are never mirrored into HBM).
 
         The HBM mirror is already complete here: ``set_index_k_buffer`` drains
         this layer's pending DDR->HBM copy events before writing the new
-        tokens, so no wait is needed on the read side. (The fp8 + swap
-        combination is rejected at init.)
+        tokens, so no wait is needed on the read side.
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)

@@ -264,6 +264,8 @@ class KunpengGraphRunner:
             # Any full (non-skip-topk) layer has the same flat geometry; skip
             # layers carry None. Sized by the first runner (target/draft) like
             # the KV HBM buffer -- swap_index_k_layer fails loudly on a mismatch.
+            # dtype = index_k_dtype: uint8 e4m3 code rows with fp8 index-K (the
+            # ue8m0 scale bytes stay DDR-resident, no scale mirror).
             full_index_k = next(b for b in nsa_pool.index_k_buffer if b is not None)
             self.swap_mgr.init_index_k_buffer(
                 num_slots=full_index_k.shape[0],

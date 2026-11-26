@@ -43,9 +43,12 @@ Covers (see doc/GLM-5.3_Kunpeng_Indexer实现计划.md §9.4):
      stitch behind the ColumnParallel wq_b + batched allgather, the shard
      boundary / head-alignment invariants, and the sharded linear weight
      shapes (auto-skip when the modules are not importable).
-   M. index-K swap leading-full skip: config-derived count of consecutive
-      leading full indexers kept in DDR, and the swap manager first/next
-      scan starting at the first non-direct full indexer.
+   M. index-K swap + fp8 storage: config-derived count of consecutive
+      leading full indexers kept in DDR and the swap manager first/next
+      scan starting at the first non-direct full indexer; the fp8 (e4m3 +
+      ue8m0) pool paths (decode golden, store op, buffers, PD wire format)
+      including the fp8 + HBM-swap double-write (code mirror only, scale
+      row stays DDR).
 """
 
 import os
@@ -2134,6 +2137,123 @@ def test_m_fp8_pool_buffers():
     )
 
 
+def test_m_fp8_swap_double_write():
+    """fp8 index-K + HBM swap-in (SGLANG_KUNPENG_SWAP_INDEX_K_IN): the
+    double-write dispatches through the SAME fp8 quantize-on-write op as the
+    authoritative DDR store, targeting the HBM code mirror + the DDR scale
+    row (no scale mirror exists); the pending swap-in is drained before the
+    mirror write; direct (leading full) layers skip the double-write; bf16
+    pools keep the historical set_kv_buffer mirror write; and
+    get_index_k_buffer hands out the mirror (DDR for direct layers).
+
+    The kunpeng store ops are replaced by recorders, so this runs everywhere
+    (no compiled sgl_kernel needed); the quantization semantics themselves
+    are covered by test_m_fp8_store_op_quantization."""
+    if not _HAVE_POOL:
+        print("  [skip] memory_pool_kunpeng not importable")
+        return
+    try:
+        from sglang.srt.graph import ops as kunpeng_ops
+        from sglang.srt.hardware_backend.cpu_kunpeng.swap_manager import (
+            KunpengSwapManager,
+        )
+    except Exception:
+        print("  [skip] graph ops / swap manager not importable")
+        return
+
+    D = 128
+    slots = 8
+
+    def make_fp8_pool(direct_layers=frozenset()):
+        pool = object.__new__(KunpengNSATokenToKVPool)
+        pool.index_k_buffer = [torch.zeros(slots, D, dtype=torch.uint8)]
+        pool.index_k_scale_buffer = [torch.zeros(slots, dtype=torch.uint8)]
+        pool.layer_transfer_counter = None
+        pool.start_layer = 0
+        pool.index_k_is_fp8 = True
+        pool.index_k_dtype = torch.uint8
+        pool.index_k_scale_dtype = torch.uint8
+        pool.index_k_direct_layers = direct_layers
+        return pool
+
+    pool = make_fp8_pool()
+    hbm_mirror = torch.zeros(slots, D, dtype=torch.uint8)
+
+    waited = []
+
+    class _StubSwapMgr:
+        enable_swap_index_k_in = True
+
+        def wait_index_k_swap_in(self, layer_id=None):
+            waited.append(layer_id)
+
+        def get_index_k_cache(self, layer_id=None):
+            return hbm_mirror
+
+    stub = _StubSwapMgr()
+    orig_get_instance = KunpengSwapManager.__dict__["get_instance"]
+    orig_fp8 = kunpeng_ops.set_index_k_fp8_buffer_kunpeng
+    orig_bf16 = kunpeng_ops.set_kv_buffer_kunpeng
+    fp8_calls = []
+    bf16_calls = []
+
+    def fake_fp8(buf, scale_buf, loc, cache_k, profile_name=""):
+        fp8_calls.append((buf, scale_buf, profile_name))
+
+    def fake_bf16(buf, loc, cache_k, profile_name=""):
+        bf16_calls.append((buf, profile_name))
+
+    KunpengSwapManager.get_instance = classmethod(lambda cls: stub)
+    kunpeng_ops.set_index_k_fp8_buffer_kunpeng = fake_fp8
+    kunpeng_ops.set_kv_buffer_kunpeng = fake_bf16
+    try:
+        k = torch.randn(3, D, dtype=torch.bfloat16)
+        loc = torch.tensor([7, 0, 3])
+        pool.set_index_k_buffer(0, loc, k)
+        # Authoritative DDR store + HBM mirror double-write, both via the
+        # fp8 quantize-on-write op, DDR first, drain before the mirror write.
+        assert len(fp8_calls) == 2, (
+            f"fp8+swap must issue the fp8 store twice (DDR + HBM), got {len(fp8_calls)}"
+        )
+        ddr_buf, ddr_scale, ddr_prof = fp8_calls[0]
+        mir_buf, mir_scale, mir_prof = fp8_calls[1]
+        assert ddr_buf is pool.index_k_buffer[0], "first store must target DDR codes"
+        assert ddr_scale is pool.index_k_scale_buffer[0]
+        assert ddr_prof == "set_index_k_fp8_buffer_kunpeng@index_k_ddr", ddr_prof
+        assert mir_buf is hbm_mirror, "double-write must target the HBM code mirror"
+        assert (
+            mir_scale is pool.index_k_scale_buffer[0]
+        ), "mirror write must reuse the authoritative DDR scale row (no scale mirror)"
+        assert mir_prof == "set_index_k_fp8_buffer_kunpeng@index_k_hbm", mir_prof
+        assert waited == [0], "the layer's pending swap-in must be drained first"
+
+        # Read side: swapped layers get the mirror, direct layers get DDR.
+        assert pool.get_index_k_buffer(0) is hbm_mirror
+        pool_direct = make_fp8_pool(direct_layers=frozenset({0}))
+        pool_direct.set_index_k_buffer(0, loc, k)
+        assert len(fp8_calls) == 3, "direct layers: DDR store only, no double-write"
+        assert pool_direct.get_index_k_buffer(0) is pool_direct.index_k_buffer[0]
+        assert waited == [0], "direct layers never wait on swap-in events"
+
+        # bf16 pool + swap: the mirror write keeps the historical bf16 op.
+        pool_bf16 = object.__new__(KunpengNSATokenToKVPool)
+        pool_bf16.index_k_buffer = [torch.zeros(slots, 4, dtype=torch.bfloat16)]
+        pool_bf16.index_k_scale_buffer = [None]
+        pool_bf16.layer_transfer_counter = None
+        pool_bf16.start_layer = 0
+        pool_bf16.index_k_is_fp8 = False
+        pool_bf16.index_k_direct_layers = frozenset()
+        pool_bf16.set_index_k_buffer(0, torch.tensor([2]), torch.randn(1, 4, dtype=torch.bfloat16))
+        assert len(fp8_calls) == 3, "bf16 pool must not use the fp8 op"
+        assert len(bf16_calls) == 2, "bf16 pool: DDR store + HBM mirror write"
+        assert bf16_calls[0][0] is pool_bf16.index_k_buffer[0]
+        assert bf16_calls[1][0] is hbm_mirror
+    finally:
+        KunpengSwapManager.get_instance = orig_get_instance
+        kunpeng_ops.set_index_k_fp8_buffer_kunpeng = orig_fp8
+        kunpeng_ops.set_kv_buffer_kunpeng = orig_bf16
+
+
 def test_m_fp8_pool_allocates_uint8():
     """Real pool construction with the flag on (env patched): uint8 code
     buffers + ue8m0 scale-byte buffers + the logged dtype. Auto-skips when
@@ -2346,6 +2466,7 @@ def main():
         ("M. test_m_fp8_store_op_quantization", test_m_fp8_store_op_quantization),
         ("M. test_m_fp8_quantized_overlap", test_m_fp8_quantized_overlap),
         ("M. test_m_fp8_pool_buffers", test_m_fp8_pool_buffers),
+        ("M. test_m_fp8_swap_double_write", test_m_fp8_swap_double_write),
         ("M. test_m_fp8_pool_allocates_uint8", test_m_fp8_pool_allocates_uint8),
         ("M. test_m_fp8_state_buf_infos", test_m_fp8_state_buf_infos),
         ("M. test_m_fp8_pd_register_frames", test_m_fp8_pd_register_frames),
