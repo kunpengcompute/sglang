@@ -602,6 +602,18 @@ class TokenizerManager(
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
+            # PD asymmetric DP: a benchmark may size routed_dp_rank for the
+            # decode instance (e.g. dp32) while the prefill instance only has
+            # dp16. Wrap non-negative ranks into this instance's DP space so
+            # the prefill lands on routed_dp_rank % dp_size instead of
+            # rejecting the value; in-range ranks are unchanged. Decode must
+            # receive the wrapped rank via disagg_prefill_dp_rank.
+            if (
+                self.server_args.disaggregation_mode == "prefill"
+                and dp_size > 0
+                and obj.routed_dp_rank >= 0
+            ):
+                obj.routed_dp_rank %= dp_size
             if dp_size <= 1 and obj.routed_dp_rank == 0:
                 logger.warning(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
