@@ -14,7 +14,7 @@ from .capabilities import NATIVE_DECODE_MAX_TOKENS
 _libraries = []
 rows_capture_count = 0
 _p2_gdn_head_route = None
-_P20_FLAG = "SGLANG_KUNPENG_P20_GDN_POSTCONV_STRIDED"
+_P20_FLAG = "SGLANG_KUNPENG_QWEN_GDN_POSTCONV_STRIDED"
 _p20_bridge = None
 
 
@@ -27,7 +27,7 @@ def _register_graph_dispatch(bridge, name, symbol):
 
 
 def p2_gdn_head_selected(B, HQ, HV, DK, DV):
-    if B < 8 or os.getenv("SGLANG_KUNPENG_P2_GDN_HEAD_PARALLEL", "0") != "1":
+    if B < 8 or os.getenv("SGLANG_KUNPENG_QWEN_GDN_HEAD_PARALLEL", "0") != "1":
         return False
     return _p2_gdn_head_route is not None and bool(_p2_gdn_head_route(B, HQ, HV, DK, DV))
 
@@ -38,15 +38,21 @@ def register_rows():
     bridge = ctypes.CDLL(common_ops.__file__)
     _libraries.append(bridge)
     _register_graph_dispatch(bridge, "qwen_gqa_rows", "qwen_graph_gqa_rows_dispatch")
+    workspace_numel = bridge.qwen36_gqa_flash_decode_workspace_numel
+    workspace_numel.argtypes = [ctypes.c_int64] * 3
+    workspace_numel.restype = ctypes.c_int64
 
     def shape(q, k, v, t, r, l, s):
         global rows_capture_count
         rows_capture_count += 1
         if not 1 <= q.shape[0] <= NATIVE_DECODE_MAX_TOKENS:
             raise ValueError(f"GQA query rows must be in 1..{NATIVE_DECODE_MAX_TOKENS}")
+        scratch = workspace_numel(min(q.shape[0], 32), q.shape[1], t.shape[1])
+        if scratch <= 0:
+            raise ValueError("Unsupported GQA Flash-Decoding workspace geometry")
         return [
             (tuple(q.shape), q.dtype),
-            ((min(q.shape[0], 32) * q.shape[1] * (t.shape[1] + 256),), torch.float32),
+            ((scratch,), torch.float32),
         ]
 
     register_op("qwen_gqa_rows", shape)
@@ -67,10 +73,11 @@ def register_primitives():
         ctypes.c_int64
     ] * 2
     layout.qwen36_attention_qkv_layout_bf16.restype = ctypes.c_int
-    rope.qwen36_attention_qknorm_rope_bf16.argtypes = (
-        [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 2 + [ctypes.c_float, ctypes.c_int64]
+    rope.qwen36_attention_qknorm_mrope_bf16.argtypes = (
+        [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 2
+        + [ctypes.c_float] + [ctypes.c_int64] * 6
     )
-    rope.qwen36_attention_qknorm_rope_bf16.restype = ctypes.c_int
+    rope.qwen36_attention_qknorm_mrope_bf16.restype = ctypes.c_int
     gdn.qwen36_gdn_decode_with_workspace.argtypes = (
         [ctypes.c_void_p] * 10
         + [ctypes.c_int64] * 6
@@ -95,7 +102,7 @@ def register_primitives():
         [ctypes.c_void_p] * 7 + [ctypes.c_int64] * 6
     )
     conv.qwen36_gdn_conv_verify_bf16_row_major.restype = ctypes.c_int
-    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_CONV_REQUEST_PARALLEL", "0") == "1":
         request_conv = conv.qwen36_gdn_causal_conv_bf16_row_major_requests
         request_conv.argtypes = conv.qwen36_gdn_causal_conv_bf16_row_major.argtypes
         request_conv.restype = ctypes.c_int
@@ -123,7 +130,7 @@ def register_primitives():
         ("qwen_ar_unpack_block", "qwen_graph_ar_unpack_block_dispatch"),
     ]:
         _register_graph_dispatch(bridge, name, symbol)
-    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_CONV_REQUEST_PARALLEL", "0") == "1":
         _register_graph_dispatch(bridge, "qwen_p2_decode_conv_requests",
                                  "qwen_graph_p2_decode_conv_requests_dispatch")
 
@@ -157,7 +164,7 @@ def register_primitives():
         ),
     )
 
-    if os.environ.get("SGLANG_KUNPENG_P2_AR_SMALLROW_COPY", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_AR_SMALLROW_COPY", "0") == "1":
         for name, symbol in [
             ("qwen_p2_ar_pack_smallrow", "qwen_graph_p2_ar_pack_smallrow_dispatch"),
             ("qwen_p2_ar_unpack_smallrow", "qwen_graph_p2_ar_unpack_smallrow_dispatch"),
@@ -292,9 +299,9 @@ def register_primitives():
         from .tilelang_gdn_verify import register_tilelang_verify
 
         register_tilelang_verify(bridge, _register_graph_dispatch)
-    if os.getenv("SGLANG_KUNPENG_P20_GDN_POSTCONV_STRIDED", "0") == "1":
+    if os.getenv("SGLANG_KUNPENG_QWEN_GDN_POSTCONV_STRIDED", "0") == "1":
         _register_p20(bridge)
-    if os.getenv("SGLANG_KUNPENG_P2_GDN_HEAD_PARALLEL", "0") == "1":
+    if os.getenv("SGLANG_KUNPENG_QWEN_GDN_HEAD_PARALLEL", "0") == "1":
         head_native = bridge.qwen36_gdn_decode_head_parallel_with_workspace
         head_native.argtypes = gdn.qwen36_gdn_decode_with_workspace.argtypes
         head_native.restype = ctypes.c_int
@@ -328,7 +335,7 @@ def register_primitives():
             raise RuntimeError(f"Conv eager failed {rc}")
         return output
 
-    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_CONV_REQUEST_PARALLEL", "0") == "1":
         def request_conv_eager(x, state, weight, indices):
             output = torch.empty_like(x)
             rc = request_conv(x.data_ptr(), state.data_ptr(), weight.data_ptr(), indices.data_ptr(),
@@ -422,17 +429,22 @@ def register_primitives():
             raise RuntimeError(f"QKV eager failed {rc}")
         return tuple(outputs)
 
-    def rope_shape(q, k, qw, kw, cache, pos, eps, mode):
+    def rope_shape(q, k, qw, kw, cache, pos, eps, mode, section_t=0, section_h=0, section_w=0, interleaved=False):
         return [(tuple(q.shape), q.dtype), (tuple(k.shape), k.dtype)]
 
-    def rope_eager(q, k, qw, kw, cache, pos, eps, mode):
+    def rope_eager(q, k, qw, kw, cache, pos, eps, mode, section_t=0, section_h=0, section_w=0, interleaved=False):
         qo, ko = torch.empty_like(q), torch.empty_like(k)
-        rc = rope.qwen36_attention_qknorm_rope_bf16(
+        axes = pos.numel() // q.shape[0]
+        if axes == 3 and section_t + section_h + section_w != 32:
+            if not (torch.equal(pos[0], pos[1]) and torch.equal(pos[0], pos[2])):
+                raise ValueError("Three-axis RoPE requires configured sections")
+            axes = 1
+        rc = rope.qwen36_attention_qknorm_mrope_bf16(
             *(t.data_ptr() for t in (q, k, qw, kw, cache, pos, qo, ko)),
             q.shape[0],
             cache.shape[0],
-            eps,
-            mode,
+            eps, mode, axes,
+            section_t, section_h, section_w, int(interleaved),
         )
         if rc:
             raise RuntimeError(f"QKNorm RoPE eager failed {rc}")

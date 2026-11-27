@@ -34,8 +34,8 @@ def unsupported_reason(fb):
         return "prefill_total_tokens_outside_1_4096"
     if not 1 <= fb.batch_size <= fb.input_ids.numel():
         return "prefill_invalid_request_count"
-    if fb.contains_image_inputs():
-        return "image_inputs"
+    if fb.contains_image_inputs() and getattr(fb, "mm_input_embeds", None) is None:
+        return "image_inputs_not_embedded"
     # The provider checks the mask before capture. Calling any() while capturing
     # would create an unregistered scalar tensor in the boxed ATen bridge.
     if getattr(fb, "mamba_checkpoint_offsets", None) is not None and getattr(
@@ -102,7 +102,7 @@ def register():
         info.dispatch_fn = ctypes.cast(getattr(bridge, symbol), ctypes.c_void_p).value
         registry.register_op(name, info)
 
-    if os.environ.get("SGLANG_KUNPENG_P2_NORM_REDUCE_KEEP_SILU", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_NORM_REDUCE_KEEP_SILU", "0") == "1":
         info = graph_cpp.OpInfo()
         info.dispatch_fn = ctypes.cast(
             bridge.qwen_graph_p2_norm_reduce_keep_silu_dispatch, ctypes.c_void_p

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch independent TP16 ranks; Ctrl-C stops only this launch's process groups."""
+"""Launch the TP16 NUMA ranks of one pipeline stage."""
 
 import argparse
 import json
@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from runtime_contract import mtp_settings
+import runtime_logging
 
 HERE = Path(__file__).resolve().parent
 
@@ -24,7 +26,15 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--dist-port", type=int, default=29926)
+    parser.add_argument("--tp-size", type=int, default=16)
+    parser.add_argument("--pp-size", type=int, default=1)
+    parser.add_argument("--nnodes", type=int, default=1)
+    parser.add_argument("--node-rank", type=int, default=0)
+    parser.add_argument("--dist-init-addr", default="")
     parser.add_argument("--random-seed", type=int, default=77101)
+    parser.add_argument("--disaggregation-mode", choices=["null", "prefill", "decode"], default="null")
+    parser.add_argument("--disaggregation-bootstrap-port", type=int, default=9001)
+    parser.add_argument("--disaggregation-ib-device", default="")
     parser.add_argument("--max-running-requests", type=int, default=32)
     parser.add_argument("--context-length", type=int, default=262146)
     parser.add_argument("--max-total-tokens", type=int, default=262208)
@@ -41,6 +51,10 @@ def main():
         parser.error(
             "Upstream derives gRPC port as HTTP+10000; use HTTP<=55535 or set SGLANG_GRPC_PORT"
         )
+    if args.tp_size != 16 or args.pp_size != args.nnodes or not 0 <= args.node_rank < args.nnodes:
+        parser.error("NUMA recipe requires TP16 and one PP stage per node")
+    if args.nnodes > 1 and not args.dist_init_addr:
+        parser.error("Multi-node PP requires a shared --dist-init-addr")
     images = json.loads((args.images / "images.json").read_text())
     if len(images["images"]) != 16:
         raise ValueError("Expected 16 rank-private images")
@@ -94,20 +108,24 @@ def main():
         "--model-loader-extra-config",
         '{"enable_multithread_load":false}',
         "--attention-backend",
-        os.environ.get("QWEN_ATTENTION_BACKEND", "kunpeng_cpu"),
+        os.environ.get("ATTENTION_BACKEND", "kunpeng_cpu"),
         "--trust-remote-code",
         "--host",
         args.host,
         "--port",
         str(args.port),
         "--tp-size",
-        "16",
+        str(args.tp_size),
         "--pp-size",
-        "1",
+        str(args.pp_size),
+        "--nnodes",
+        str(args.nnodes),
+        "--node-rank",
+        str(args.node_rank),
         "--ep-size",
         "1",
         "--dist-init-addr",
-        f"127.0.0.1:{args.dist_port}",
+        args.dist_init_addr or f"{args.host if args.disaggregation_mode != 'null' else '127.0.0.1'}:{args.dist_port}",
         "--nccl-port",
         str(args.dist_port),
         "--context-length",
@@ -141,18 +159,29 @@ def main():
         "--chat-template",
         str(args.chat_template.resolve()),
         "--tool-call-parser",
-        "qwen",
+        os.environ.get("TOOL_CALL_PARSER", "qwen3_coder"),
         "--reasoning-parser",
         "qwen3",
+        "--log-level",
+        os.environ.get("LOG_LEVEL", "warning"),
+        "--log-level-http",
+        os.environ.get("LOG_LEVEL", "warning"),
     ]
     base_env = json.loads(args.environment.read_text())
-    mtp = base_env.get("SGLANG_ENABLE_MTP")
-    if mtp not in ("0", "1"):
-        raise ValueError("SGLANG_ENABLE_MTP must be 0 or 1")
-    steps = int(base_env.get("SGLANG_SPECULATIVE_NUM_STEPS", "3")) if mtp == "1" else 0
-    if mtp == "1":
-        if steps < 1:
-            raise ValueError("SGLANG_SPECULATIVE_NUM_STEPS must be positive")
+    base_env.update(SGLANG_KUNPENG_PP_LAYOUT="node_block", PP_SIZE=str(args.pp_size))
+    if args.pp_size > 1:
+        base_env["WORLD_SIZE"] = str(args.tp_size * args.pp_size)
+    if args.disaggregation_mode != "null":
+        cli += ["--disaggregation-mode", args.disaggregation_mode,
+                "--disaggregation-transfer-backend", "mooncake",
+                "--disaggregation-bootstrap-port", str(args.disaggregation_bootstrap_port)]
+        if args.disaggregation_ib_device:
+            cli += ["--disaggregation-ib-device", args.disaggregation_ib_device]
+        if args.disaggregation_mode == "prefill":
+            cli += ["--prefill-max-requests", str(args.max_running_requests)]
+    settings = mtp_settings(base_env)
+    steps = settings['mtp_steps']
+    if settings['mtp']:
         # NEXTN is normalized to EAGLE by ServerArgs; use the existing CPU chain path.
         cli += ["--speculative-algorithm", "NEXTN", "--speculative-num-steps", str(steps),
                 "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", str(steps + 1)]
@@ -160,9 +189,11 @@ def main():
             cli += ["--speculative-draft-model-path", base_env["SPECULATIVE_DRAFT_MODEL_PATH"]]
     base_env["GEMM_TILING_PLAN_FILE"] = str(args.tiling.resolve())
     (run / "launch_config.json").write_text(json.dumps({"environment": base_env, "cli": cli,
-        "mtp": int(mtp), "mtp_steps": steps,
+        "topology": {"tp_size": args.tp_size, "pp_size": args.pp_size,
+                     "nnodes": args.nnodes, "node_rank": args.node_rank},
+        "mtp": settings['mtp'], "mtp_steps": steps,
         "effective_speculative_algorithm": "EAGLE" if steps else None}, indent=2) + "\n")
-    children, logs = [], []
+    children = []
 
     def interrupted(signum, frame):
         raise KeyboardInterrupt
@@ -182,18 +213,14 @@ def main():
                 KUTACC_LIB=str(image / "lib"),
                 KUPL_LIB=str(image / "lib"),
             )
-            # taskset expands a scheduler-inherited single-CPU affinity before
-            # numactl validates the mask; the job cgroup still bounds permitted CPUs.
-            # Both bindings precede Python/ELF faults.
+            # Bind CPUs before Python/ELF faults. Native allocators select memory
+            # placement; SLS must be able to reserve hugepages on HBW nodes.
             base = rank * 38
             cpus = f"{base}-{base + 15},{base + 21}-{base + 36}"
             cmd = [
                 "taskset",
                 "-c",
                 cpus,
-                "numactl",
-                f"--physcpubind={cpus}",
-                f"--membind={rank}",
                 "/usr/bin/env",
                 *[f"{key}={value}" for key, value in env.items()],
                 str(image / "bin/python"),
@@ -206,19 +233,15 @@ def main():
                 "--tp-rank-in-node",
                 str(rank),
             ]
-            log = (args.log_dir / f"rank{rank}.log").open("xb")
-            logs.append(log)
             clean_env = {
                 k: v
                 for k, v in os.environ.items()
                 if k not in ("LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH")
             }
             children.append(
-                subprocess.Popen(
-                    cmd,
+                runtime_logging.spawn(
+                    cmd, args.log_dir / f"rank{rank}.log",
                     env=clean_env,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
             )
@@ -237,6 +260,8 @@ def main():
             flush=True,
         )
         while True:
+            for child in children:
+                runtime_logging.check(child)
             dead = [
                 (i, p.returncode)
                 for i, p in enumerate(children)
@@ -260,8 +285,10 @@ def main():
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-        for log in logs:
-            log.close()
+        for child in children:
+            error = runtime_logging.finish(child)
+            if error:
+                print('日志收尾警告：' + error, flush=True)
         for endpoint in ports.values():
             if isinstance(endpoint, str) and endpoint.startswith("ipc://"):
                 Path(endpoint[6:]).unlink(missing_ok=True)

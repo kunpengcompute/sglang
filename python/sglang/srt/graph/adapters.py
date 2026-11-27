@@ -942,6 +942,23 @@ def _setup_kupl_sdma_kv_swapin():
     register_op("kupl_sdma_kv_swapin", shape_infer, eager_fn)
 
 
+def _setup_kupl_sdma_gqa_pages():
+    def shape_infer(*args):
+        return []
+
+    # Separate Qwen opt-in operations; default/DeepSeek operations are unchanged.
+    for name in (
+        "kupl_sdma_gqa_prepare_pages", "kupl_sdma_gqa_copy_pages",
+        "qwen_draft_reuse_prepare", "qwen_draft_reuse_commit",
+        "qwen_draft_reuse_invalidate", "qwen_draft_reuse_prepare_v2",
+        "qwen_draft_reuse_commit_v2",
+    ):
+        def eager(*args, _name=name, **kwargs):
+            return getattr(torch.ops.sgl_kernel, _name)(*args, **kwargs)
+
+        register_op(name, shape_infer, eager)
+
+
 def _setup_kupl_sdma_kv_block_swapin():
     def shape_infer(
         dst_hbm,
@@ -1897,6 +1914,7 @@ def setup():
     _setup_moe_local_sum_kunpeng()
     _setup_kupl_sdma_memcpy_chunked()
     _setup_kupl_sdma_kv_swapin()
+    _setup_kupl_sdma_gqa_pages()
     _setup_kupl_sdma_kv_block_swapin()
     _setup_kupl_sdma_wait_all()
     _setup_kupl_sdma_set_kv_buffer()

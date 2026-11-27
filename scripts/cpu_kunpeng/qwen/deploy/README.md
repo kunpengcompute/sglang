@@ -1,138 +1,156 @@
-# Qwen920F：构建一次，兼容节点复用
+# Qwen 920F 部署
 
-适用合入PR301及PR309的Qwen非MTP或MTP、单机920F TP16：DDR NUMA0～15各38个CPU，HBM NUMA16～31。本工具只管理部署，不改模型、算子和框架。完整验证范围见交付记录，不把历史性能当成本修订的实测成绩。
+统一入口为 `bash run.sh ACTION /绝对路径/config.sh`。配置和运行输出放在源码外的 `DEPLOY_DIR`。本示例是4个Prefill节点（TP16×PP4）和1个Decode节点（TP16），MTP3，支持文本及多模态。
 
-## 快速启动（单节点）
+## 1. 环境与配置
 
-本入口启动一套单节点TP16服务，Prefill和Decode在同一服务内执行。无需Router或PD测试控制器。
+复制 `config.example.sh` 为自己的 `config.sh`，按标题从上到下修改。示例已填本集群路径；换机器至少核对以下内容。
+
+| 配置 | 含义 |
+|---|---|
+| `SGLANG_SOURCE` / `DEPLOY_DIR` | 本次源码和新的部署输出目录，不覆盖旧release |
+| `MODEL_PATH` / `SPECULATIVE_DRAFT_MODEL_PATH` | 主模型及Draft权重 |
+| `PYTHON` / `CLIENT_PYTHON` | 推理Python 3.12环境 / 仅运行标准库控制脚本的Python |
+| `CC` / `CXX` / `COMPILER_RUNTIME_LIB` | 配套毕昇编译器及运行库；libomp.so来自编译器环境 |
+| `KUTACC_PREFIX` / `KUPL_PREFIX` | 对应SDK的include/lib前缀 |
+| `TL_ROOT` / `TVM_LIBRARY_PATH` / `TVM_IMPORT_PYTHON_PATH` | Kunpeng TileLang及其TVM路径，启用TileLang时需要 |
+| `PERF_TUNE` | 公共非root代理、驱动、大页和调频脚本目录 |
+| `PD_NODE_HOSTS` / `PD_ADVERTISE_HOSTS` | 已申请节点及可达IP，先P后D；工具不申请节点 |
+| `PD_SSH_OPTIONS` / `PD_IB_DEVICE` / `PD_NET_INTERFACE` | 可信SSH配置、RDMA设备和控制网卡 |
+
+该核表要求aarch64、608 CPU、TP16；DDR NUMA0–15每NUMA 38 CPU，HBW NUMA16–31。同为920F但NUMA/CPU编号不同，需要调整核表。还需准备RDMA设备、驱动、cmake、ldd、taskset、numactl及已授权的公共非root机制。
+
+通用服务参数使用公共名称，由启动工具转为原生SGLang命令行参数，没有新增模型前向接口：
+
+| 配置 | SGLang接口 |
+|---|---|
+| `MODEL_PATH` | `--model-path` |
+| `CONTEXT_LENGTH` | `--context-length` |
+| `SERVER_PORT` / `DIST_PORT` | `--port` / `--nccl-port`及默认分布式初始化地址 |
+| `MAX_RUNNING_REQUESTS` / `MAX_TOTAL_TOKENS` | `--max-running-requests` / `--max-total-tokens` |
+| `TP_SIZE` / `PP_SIZE` / `NNODES` / `NODE_RANK` | 对应TP、PP和多节点参数 |
+| `ATTENTION_BACKEND` / `TOOL_CALL_PARSER` / `RANDOM_SEED` | 对应backend、parser、seed参数 |
+
+PD模式只填写 `PD_PREFILL_*` 和 `PD_DECODE_*` 的请求/KV容量；工具为各角色生成上表中的单节点参数。Router端口单独由 `PD_ROUTER_PORT` 配置。示例 `CONTEXT_LENGTH=262152` 包含256k输入输出总容量及8个内部MTP槽位，不表示256k输入再额外输出256k。
+
+### TileLang配套环境
+
+本次配套版本：
+
+- KuTACC：`kutacc_20261104_edfe1e8fa`。
+- [KuPL](https://atomgit.com/kunpengcompute/kupl)：`sglang_830`分支，`07c66678448819faae8c06a8eaf66d32145d8926`，库版本1.26.2.0，含SLS映射重试/错误清理修复。
+- [Kunpeng TileLang](https://atomgit.com/mccllm/tilelang-kunpeng)：`sve_instruction_1116`分支，`efcb6418834a216f9fd0b59c1eef02ebcd4a150c`。
+- 毕昇：HPCKit 26.0.RC1。Python环境还需SGLang依赖，以及TileLang要求的Cython、ml_dtypes、tornado等依赖。
+
+TileLang是外部SDK；`run.sh build`编译SGLang C++扩展，不下载或重建TileLang。换环境时，先按该SDK安装说明准备匹配环境。对应原生构建方式为：
 
 ```bash
-TOOL=/绝对路径/sglang/scripts/cpu_kunpeng/qwen/deploy
-DEPLOY=/绝对路径/deployments/qwen_20261106_mtp3_920f_tp16
+git clone --recursive --branch sve_instruction_1116 https://atomgit.com/mccllm/tilelang-kunpeng "$TL_ROOT"
+git -C "$TL_ROOT" checkout efcb6418834a216f9fd0b59c1eef02ebcd4a150c
+git -C "$TL_ROOT" submodule update --init --recursive
+mkdir -p "$TL_ROOT/build"
+cat > "$TL_ROOT/build/config.cmake" <<'EOF'
+set(USE_LLVM OFF)
+set(USE_CUDA OFF)
+set(USE_ROCM OFF)
+set(USE_ASCEND OFF)
+set(USE_GTEST OFF)
+set(USE_LIBBACKTRACE OFF)
+EOF
+cmake -S "$TL_ROOT" -B "$TL_ROOT/build" -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX"
+cmake --build "$TL_ROOT/build" --target tilelang_module --parallel 32
+"$PYTHON" -c 'import site,os; from pathlib import Path; Path(site.getsitepackages()[0], "tilelang_kunpeng.pth").write_text(os.environ["TL_ROOT"]+"\n")'
+```
+
+在已分配计算资源上编译SDK，不在登录节点编译。最后一行将SDK登记到选定Python环境，供NUMA副本正常导入；仅填写TL_ROOT不能代替这一步。启用 `SGLANG_KUNPENG_GDN_VERIFY_TILELANG=1` 后，pack/check会核对TileLang/TVM依赖、`T.sve`及原生库内容。`SGLANG_KUNPENG_TL_OP_PRECOMPILE=1`复用上游预编译流程，实际核验TileLang的`target="pto"`编译入口；它不是TVM的同名target kind。batch=1沿用上游配置的C++回退。关闭TileLang时不要求这些SDK文件。
+
+`TILELANG_CACHE_DIR`必须为当前节点可写目录，示例使用本地 `/tmp/${USER}_qwen_tilelang`。同节点TP ranks共享缓存，不同节点各自缓存；可按部署版本设置目录。此集群共享ODC目录出现过缓存文件锁长等待，故不作为默认缓存位置。源码/SDK仍可放共享目录。
+
+## 2. build → pack → start
+
+```bash
+SOURCE=/home/share/lidonghua/workspaces_inference/inference_work/qwen36_27b_bf16/sglang_20261125_upstream348_delivery
+DEPLOY=/home/share/lidonghua/workspaces_inference/inference_work/qwen36_27b_bf16/deployments/qwen38_upstream348_20261125_01
+TOOL="$SOURCE/scripts/cpu_kunpeng/qwen/deploy"
+CONFIG="$DEPLOY/config.sh"
 mkdir -p "$DEPLOY"
-cp "$TOOL/config.example.sh" "$DEPLOY/config.sh"
-# 填写config.sh顶部的路径；MTP3设SGLANG_ENABLE_MTP=1、SGLANG_SPECULATIVE_NUM_STEPS=3。
-# 新源码首次部署保留KERNEL_BUILD_RECEIPT为空，使用本次build的结果。
-bash "$TOOL/run.sh" build "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" pack "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" start "$DEPLOY/config.sh"
+cp "$TOOL/config.example.sh" "$CONFIG"
+# 核对路径、已申请节点、可信SSH配置、端口和容量。
+bash "$TOOL/run.sh" build "$CONFIG"
+bash "$TOOL/run.sh" pack  "$CONFIG"
+RUN="$DEPLOY/release/run.sh"
+bash "$RUN" plan   "$CONFIG"
+bash "$RUN" check  "$CONFIG"
+bash "$RUN" start  "$CONFIG"
 ```
 
-出现READY后，在同一节点另开终端并设置相同TOOL/DEPLOY，再运行：
+- `build`：从源码编译sgl_kernel，输出 `DEPLOY_DIR/build`，记录 `KERNEL_BUILD.json`。
+- `pack`：冻结应用、算子、工具和依赖记录到 `release`，生成16份rank私有NUMA镜像到 `numa_images`。输出为目录；不打包整套SDK或模型权重。
+- `plan`：仅展示拓扑和角色覆盖，不联网、不分配资源。
+- `check`：检查发布、SSH、依赖和网络，不等同整模验收。
+- `start`：使用已冻结发布启动；进入READY前进行真实预热。不自动重新编译或申请节点。
+
+另开终端执行 `bash "$RUN" status "$CONFIG"` 或 `bash "$RUN" stop "$CONFIG"`。Ctrl-C同样触发本次服务收尾；资源恢复确认后再释放调度作业。
+
+修改Python/部署脚本后，在新DEPLOY_DIR中可将 `KERNEL_BUILD_RECEIPT` 指向旧构建记录并重新pack；原生算子编译输入变化则须重新build。已冻结release和NUMA镜像不原地覆盖。SDK版本变化也需重新build/pack。
+
+同一共享环境的多个节点可复用一份pack，各节点的进程、实例状态和日志独立。不同Python/SDK/系统ABI、绝对路径或NUMA布局，需要重新build/pack，不能只修改config后搬用旧NUMA镜像。
+
+单节点可设置 `DEPLOY_MODE=single`，另填 `SHM_MIB`、`MAX_RUNNING_REQUESTS`、`MAX_TOTAL_TOKENS`；`SERVER_HOST`默认0.0.0.0，拓扑默认TP16/PP1。PD节点配置由工具生成，不必手工填写这些值。
+
+## 3. SHM、HBW和权限
+
+对外SHM仅保留两个角色配置：
 
 ```bash
-bash "$TOOL/run.sh" request "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" bench "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" status "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" stop "$DEPLOY/config.sh"
+export PD_PREFILL_SHARED_HBW_SHM_MIB=384
+export PD_DECODE_SHARED_HBW_SHM_MIB=128
 ```
 
-后续启动相同release只需start；源码或原生依赖更新时换一个DEPLOY_DIR并重新build/pack。start始终使用该目录的冻结release，不会自动切换到config中另一个源码目录。
+工具生成每个节点的 `SHM_MIB`，统一推导KuPL窗口大小和私有池预算。底层 `SGLANG_KUNPENG_*SHM*` 字段由工具生成，不再在总配置中重复填写。数值单位均为MiB、每rank计。
 
-本次接入保留上游PR301/PR309的模型实现。旧验证版的性能不代表本次上游合入版已完成原生构建或整模性能验证。
+| 每rank | Prefill | Decode |
+|---|---:|---:|
+| 主HBW预算 | 4000MiB | 4000MiB |
+| KuPL共享窗口 | 384MiB | 128MiB |
+| 私有HBW池 | 3616MiB | 3872MiB |
+| 最大请求 / KV token容量 | 32 / 524544 | 8 / 262720 |
+| Target换入 / 双镜像 | 关闭 / 关闭 | 开启 / 开启 |
+| Prefill工作区HBW | 开启 | 关闭 |
+| Draft驻留 | 关闭 | 开启 |
 
-## 1. 配置与输出
+KuPL使用 `KUPL_SHM_TYPE=sls`、`KUPL_SHM_ON_PACKAGE=y`、`KUPL_SHM_ENABLE_HUGEPAGE=y` 原生HBW大页窗口。内部保留的“split”字段只表示共享/私有容量拆分，不再由Qwen自行创建共享映射。除4000MiB主预算外，两个显式同步窗口及三个KuPL内部fence窗口另需10MiB。自动预留为每HBW NUMA **2005个2MiB大页，即4010MiB**；两种角色相同。
 
-工具位于SGLang的`scripts/cpu_kunpeng/qwen/deploy`。填写一份`config.sh`：源码、模型、Python、KuTACC/KuPL、BiSheng运行库、资源工具路径、端口、HBM及频率配置。`DEPLOY_DIR`使用版本/依赖/拓扑名称，不使用运行节点名。
+非root配置统一为 `SGLANG_ENABLE_NOROOT_USER=1` 和 `SGLANG_KUNPENG_NOROOT_PROXY_PATH="$PERF_TUNE"`，按公共顺序执行SDMA驱动、ZCopy驱动、大页权限和SDMA阈值脚本，再准备本次大页与频率。节点必须已分配给当前服务，不能与其他模型共享执行驱动重载。
 
-`SGLANG_ENABLE_MTP=0`关闭MTP；设为`1`时使用`SGLANG_SPECULATIVE_NUM_STEPS`（默认3），固定topk=1、draft tokens=steps+1。启动传入NEXTN，框架归一为EAGLE。共享checkpoint可将`SPECULATIVE_DRAFT_MODEL_PATH`留空，需要独立draft权重时填写目录；实例状态和启动记录保存实际开关与步数，测试入口同时支持两种模式。
+`HBM_HUGEPAGE_MODE=ensure`按需补大页；`check`仅核验。`CPU_FREQ_MODE=apply`设置目标频率，`keep`保持当前值。当前计算核目标2000MHz，恢复值1550MHz是本集群配置，换机器需确认。停止时恢复本次记录的资源设置。
 
-```text
-DEPLOY_DIR/                         例如pr301_20261105_920f_tp16
-├── config.sh                       可修改的默认配置
-├── KERNEL_BUILD.json               本目录构建时生成的记录
-├── PACKAGE.json                    pack状态
-├── build/                          本目录构建时生成的CMake及kernel
-├── release/                        冻结应用、kernel、打包时的工具
-├── numa_images/rank0..rank15/       pack一次生成的原生库独立副本
-├── instances/
-│   ├── current/<主机>_<端口>.json   当前实例指针，不再共用LAST_RUN
-│   ├── checks/<检查ID>/            verify/deps/check各自的报告
-│   └── <时间_主机_端口_PID_ID>/     配置快照、STATE.json、资源记录、PID、测试JSON
-└── logs/
-    ├── driver/                     各命令的输出，包含主机、时间、PID
-    ├── build/                      configure/build/install.log
-    ├── pack/                       NUMA副本生成日志
-    └── instances/<实例ID>/          launcher/rank/请求测试/调频等文本日志
-```
+## 4. 配置迁移与历史开关
 
-不生成artifacts或重复压缩包。测试代码不放进SGLang。多节点共享同一个DEPLOY_DIR时，发布文件和副本只保留一套，各节点运行记录分开；每个节点仍须单独申请调度资源。
+通用参数去除旧QWEN前缀，例如 `QWEN_CONTEXT_LENGTH→CONTEXT_LENGTH`、`QWEN_HTTP_PORT→SERVER_PORT`、`QWEN_MAX_RUNNING_REQUESTS→MAX_RUNNING_REQUESTS`、`QWEN_TP_SIZE→TP_SIZE`、`MODEL→MODEL_PATH`。PD请求容量继续使用 `PD_PREFILL_*` / `PD_DECODE_*`，不再同时填写通用基值。新版本请从新模板生成配置，不混用旧config；旧release仍使用自己的旧配置。
 
-## 2. 首次从源码构建、打包
+保留当前有效取值，仅将六个历史开关改为功能命名；以下名称均带 `SGLANG_KUNPENG_` 前缀：
+
+| 旧后缀 | 新后缀 |
+|---|---|
+| `P2_NORM_REDUCE_KEEP_SILU` | `QWEN_GDN_NORM_REDUCE_KEEP_SILU` |
+| `P2_REFERENCE_VECTOR_WIDTH` | `QWEN_GDN_NORM_VECTOR_WIDTH` |
+| `P2_AR_SMALLROW_COPY` | `QWEN_AR_SMALLROW_COPY` |
+| `P2_GDN_HEAD_PARALLEL` | `QWEN_GDN_HEAD_PARALLEL` |
+| `P20_GDN_POSTCONV_STRIDED` | `QWEN_GDN_POSTCONV_STRIDED` |
+| `P2_DECODE_CONV_REQUESTS` | `QWEN_GDN_CONV_REQUEST_PARALLEL` |
+
+删除无消费者的旧配置项：typed-gate、MTP-MLP-tail、Prefill resident/stream及GQA stream/prefetch/layer-pipeline。没有删除仍被调用的算子、图注册符号或修改计算精度。模型专用选项继续保留Qwen标签；上游TileLang开关保持原名。
+
+## 5. 日志与目录
+
+`DEPLOY_DIR`中，`build`为编译结果，`release`为冻结发布，`numa_images`为可复用副本；`instances/<实例ID>`保存配置、PID和资源恢复记录；`cluster/runs/<集群ID>`保存拓扑及各角色配置。
+
+持续日志放 `logs/instances`、`logs/driver` 及对应集群运行目录。默认每流16MiB、2份备份（最多48MiB），不记录请求正文，不启用profile/replay；SDK自行写出的文件和一次性build/pack日志另计。`LOG_KEEP_DAYS=7` / `LOG_KEEP_RUNS=5`为历史策略，不自动删除发布：
 
 ```bash
-TOOL=/绝对路径/sglang/scripts/cpu_kunpeng/qwen/deploy
-DEPLOY=/绝对路径/deployments/pr301_20261105_920f_tp16
-mkdir -p "$DEPLOY"
-cp "$TOOL/config.example.sh" "$DEPLOY/config.sh"
-# 填写config.sh中的路径与参数。
-bash "$TOOL/build.sh" "$DEPLOY/config.sh"
-bash "$TOOL/pack.sh" "$DEPLOY/config.sh"
+bash "$RUN" prune "$CONFIG"          # 预览
+bash "$RUN" prune "$CONFIG" --apply  # 清理已结束且收尾确认的旧日志
 ```
 
-build使用CMake从源码生成sgl_kernel。pack校验构建记录、源码、SDK和DSO，冻结应用，并在相同920F拓扑的构建节点制作16份NUMA副本。start不会执行编译、pack或再次复制镜像。
-
-有同版本、同依赖的完整构建记录时，可以在config中填写`KERNEL_BUILD_RECEIPT`，跳过build，只pack一次。已有release和numa_images不会被覆盖；算子/应用/依赖配方改变时使用新的版本目录。
-
-## 3. 每次启动
-
-在已分配的独占920F计算节点执行，保持原命令形式：
-
-```bash
-bash "$TOOL/run.sh" verify "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" start "$DEPLOY/config.sh"
-```
-
-start流程：
-
-```text
-取得本节点TP16管理锁、创建独立实例
-  → 核验冻结应用/运行库/拓扑及现有副本
-  → 保存本次配置与资源快照
-  → 按配置准备大页、HBM/SHM预算及频率
-  → 用已有NUMA副本启动16个rank
-  → 短请求、选频/同NUMA换核、预热
-  → READY并记录频率状态
-  → stop后清理自有进程/SHM、恢复本次资源改动
-```
-
-副本里的hostname只表示制作来源，换节点不会因此要求重新pack。仍核验软件版本、依赖、Python路径和拓扑。镜像文件可复用不代表物理页永远本地：新节点仍需正确绑核、加载及核验内存放置。
-
-共享文件系统下可直接复用；本版保留绝对路径和inode校验，不承诺把文件搬到任意新路径后免准备启动。不同机器没有共享路径时，应在目标环境准备一次副本并保持依赖匹配；不会因后续每次启动而再准备。
-
-## 4. 请求、测试、状态、停止
-
-同一计算节点另开终端，默认用“当前主机＋配置HTTP端口”定位实例：
-
-```bash
-bash "$TOOL/run.sh" status "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" request "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" bench "$DEPLOY/config.sh"
-bash "$TOOL/run.sh" stop "$DEPLOY/config.sh"
-```
-
-也可以显式指定完整实例ID：
-
-```bash
-bash "$TOOL/run.sh" status "$DEPLOY/config.sh" --instance 实例ID
-bash "$TOOL/run.sh" stop "$DEPLOY/config.sh" --instance 实例ID
-```
-
-共享文件系统下，从登录节点可通过显式ID查看状态或写入协作停止标记。request/bench要求在该实例所在节点执行，避免将另一节点的localhost误认作服务；跨节点发请求可使用HTTP客户端，指定实际节点地址。shared_tools的HTTP客户端继续可用。
-
-同一个deployment同一主机不允许同时启动两个完整TP16管理进程；不同主机互不阻塞。不会回退到其他节点的LAST_RUN。异常杀死管理进程时，文件锁自动释放，但远程服务/资源是否已清理必须依据实例记录确认；不要仅凭锁释放就认定清理成功。
-
-## 5. 资源配置沿用
-
-- 每rank总HBM 4000MiB：SHM 384MiB、私有HBW池3616MiB。SHM包含在总预算内；prefill/decode当前保持同值，不相加两次。
-- `HBM_HUGEPAGE_MODE=ensure|check`；`HBM_HUGEPAGE_MB_PER_NODE=auto`按私有池换算2MiB大页并留2页，当前1810页。保留原配置并只准备/恢复自有改动。
-- `CPU_FREQ_MODE=apply|keep`，目标`CPU_FREQ_TARGET_MHZ=2000`、容差`CPU_FREQ_TOLERANCE_MHZ=20`。
-- `CPU_FREQ_RESTORE_MHZ`按管理员确认的原标称值填写；无法可靠确定时不猜测恢复频点。
-- `CPU_REMAP_SAME_NUMA=1`沿用原工具在同NUMA替换计算worker，不跨NUMA；不能达到要求时明确告警并继续服务。READY和频率合格分开记录。
-- 调频、大页操作沿用授权的root_proxy；不新增权限机制。启动要求调度器已分配完整608CPU，不自行申请其他节点。
-
-## 6. 更新部署工具，不重打已有应用包
-
-只调整部署管理逻辑时，从已更新的SGLang工具目录执行相同run.sh命令即可：新工具读取DEPLOY_DIR中既有的冻结release和numa_images，不跳转回旧release中的旧run.sh。每个实例记录实际工具路径/修订及应用发布位置，以便追溯。
-
-已有旧release里的run.sh保持原样；它不会自动升级，请使用SGLang中的新入口。需要带走完整的新工具版本时，在下一个新版本目录pack；不要手改旧release的完整性清单。本修订不修改原生库、不重新编译、不重建已有镜像。
+当前活动、资源未确认恢复的实例不会清理；release、镜像、STATE/PLAN/配置和构建记录均保留。

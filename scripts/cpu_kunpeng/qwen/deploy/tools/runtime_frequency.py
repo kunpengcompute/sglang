@@ -1,11 +1,15 @@
 """Read-only 512-CPU caller/worker frequency sampler for the formal TP16 INT8 service run."""
 from __future__ import annotations
 
+from contextlib import closing, nullcontext
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import threading
 import time
+from .instances import write_json as save
+from .runtime_logging import RollingLog
 
 
 LOW_KHZ = 1_980_000
@@ -13,18 +17,13 @@ HIGH_KHZ = 2_020_000
 INTERVAL_S = 1.0
 
 
-def save(path: Path, value: dict) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("x", encoding="utf-8") as stream:
-        stream.write(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-        stream.flush()
-    temporary.replace(path)
-
-
 def start(output_jsonl: Path, plan_path: Path, interval_s: float = 1.0) -> dict:
     """Start a read-only sampler; caller must call stop() before cleanup begins."""
     if output_jsonl.exists() or output_jsonl.is_symlink():
         raise FileExistsError(output_jsonl)
+    mode = os.environ.get('FREQUENCY_LOG', 'summary')
+    if mode not in ('summary', 'full'):
+        raise ValueError('QWEN_FREQUENCY_LOG须为summary或full')
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     cpus = sorted(int(cpu) for cpu in plan["selected_compute_cpus"])
     if (len(cpus) != 512 or len(set(cpus)) != 512 or
@@ -33,7 +32,8 @@ def start(output_jsonl: Path, plan_path: Path, interval_s: float = 1.0) -> dict:
     low_khz, high_khz = plan["frequency_window_khz_inclusive"]
     stopped = threading.Event()
     state = {
-        "output_jsonl": output_jsonl,
+        "output_jsonl": str(output_jsonl) if mode == 'full' else None,
+        "log_mode": mode,
         "range_khz": [low_khz, high_khz],
         "interval_s": interval_s,
         "stop_event": stopped,
@@ -55,7 +55,7 @@ def start(output_jsonl: Path, plan_path: Path, interval_s: float = 1.0) -> dict:
 
     def worker() -> None:
         try:
-            with output_jsonl.open("x", encoding="utf-8") as stream:
+            with (closing(RollingLog(output_jsonl)) if mode == 'full' else nullcontext()) as stream:
                 while not stopped.is_set():
                     values = {}
                     for cpu in cpus:
@@ -102,8 +102,8 @@ def start(output_jsonl: Path, plan_path: Path, interval_s: float = 1.0) -> dict:
                         "monotonic_ns": now_mono,
                         "cpu_khz": values,
                     }
-                    stream.write(json.dumps(record, separators=(",", ":")) + "\n")
-                    stream.flush()
+                    if stream is not None:
+                        stream.write_record((json.dumps(record, separators=(",", ":")) + "\n").encode())
                     stopped.wait(interval_s)
         except BaseException as exc:
             state["error"] = f"{type(exc).__name__}: {exc}"
@@ -139,6 +139,8 @@ def stop(state: dict, summary_path: Path) -> dict:
         "finished_utc": finished_utc,
         "finished_epoch_s": time.time(),
         "sample_interval_s": state["interval_s"],
+        "log_mode": state["log_mode"],
+        "output_jsonl": state["output_jsonl"],
         "sample_rounds": state["sample_rounds"],
         "mapped_cpu_count": len(state["cpus"]),
         "mapped_cpu_ids": state["cpus"],

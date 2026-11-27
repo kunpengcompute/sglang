@@ -15,6 +15,7 @@
 """Inference-only Qwen3_5 MTP model."""
 
 import logging
+import os
 from contextlib import ExitStack
 from typing import Iterable, List, Optional, Tuple
 
@@ -73,19 +74,45 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
         from sglang.srt.hardware_backend.cpu_kunpeng.qwen import (
             enabled as qwen_kunpeng_enabled,
         )
 
         if qwen_kunpeng_enabled():
+            if (
+                shared_embed_tokens is None
+                and quant_config is not None
+                and getattr(quant_config, "_cpu920f", False)
+                and quant_config.get_name() == "modelslim"
+            ):
+                quant_config = quant_config.for_component("mtp", execution_enabled=True)
+                self.quant_config = quant_config
             # Same native Gemma-RMSNorm kernels as the target: the generic
             # CPU path reaches forward_native, whose `variance + eps` scalar
             # coercion cannot be captured in a graph.
             from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
                 QwenGemmaRMSNorm as RMSNorm_cls,
             )
+        quantized_cpu_fc = (
+            qwen_kunpeng_enabled()
+            and quant_config is not None
+            and getattr(quant_config, "_cpu920f", False)
+            and quant_config.quant_description.get("mtp.fc.weight") == "W8A8_DYNAMIC"
+        )
+        if quantized_cpu_fc:
+            from sglang.srt.layers.linear import ReplicatedLinear
+
+            self.fc = ReplicatedLinear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix="mtp.fc",
+            )
+            self.fc._kunpeng_mtp_quantized_fc = True
+        else:
+            self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
         )
@@ -100,7 +127,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             shared_embed_tokens=shared_embed_tokens,
         )
 
-        if get_pp_group().is_last_rank:
+        if qwen_kunpeng_enabled() or get_pp_group().is_last_rank:
             if shared_lm_head is not None:
                 self.lm_head = shared_lm_head
             elif config.tie_word_embeddings:
@@ -109,11 +136,37 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
-                    quant_config=quant_config,
+                    quant_config=None if qwen_kunpeng_enabled() else quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
+            if qwen_kunpeng_enabled() and shared_lm_head is None:
+                from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import linear
+
+                self.lm_head._cpu_lm_head_apply = linear
 
         self.logits_processor = LogitsProcessor(config)
+        if (
+            qwen_kunpeng_enabled()
+            and quant_config is not None
+            and getattr(quant_config, "_cpu920f", False)
+            and quant_config.get_name() == "modelslim"
+            and self.tp_size == 16
+            and shared_embed_tokens is None
+        ):
+            # A local PP draft cannot borrow the target's stage-0 embedding.
+            # Reuse the strict checkpoint map, including language embed/head.
+            from sglang.srt.model_loader.unified_checkpoint import UnifiedCheckpointLoader
+
+            self._unified_checkpoint_loader = UnifiedCheckpointLoader(self, mtp_only=True)
+            self._kunpeng_local_mtp = True
+
+    @property
+    def start_layer(self) -> int:
+        return self.model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.end_layer
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -178,7 +231,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         assert input_embeds is None
         input_embeds = forward_batch.mm_input_embeds
-        if (
+        tail_indices = getattr(forward_batch, "_kunpeng_mtp_tail_indices", None)
+        if tail_indices is not None:
+            from sglang.srt.graph import ops
+            tail_ids = ops.tensor_select(input_ids, tail_indices)
+            ops.tensor_scatter(input_embeds, tail_indices, self.model.embed_tokens(tail_ids))
+        elif (
             forward_batch.forward_mode.is_extend()
             and forward_batch.contains_mm_inputs()
             and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
@@ -188,19 +246,36 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 [input_embeds[:-1], self.model.embed_tokens(input_ids[-1].unsqueeze(0))]
             )
 
+        if (
+            getattr(self.pre_fc_norm_embedding, "_kunpeng_qwen", False)
+            and forward_batch.mrope_positions is not None
+        ):
+            positions = forward_batch.mrope_positions
+
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
 
         hidden_states = forward_batch.spec_info.hidden_states
 
         bounded_cpu_pre_fc = (
-            getattr(self, "_runtime_component", None) == "mtp"
-            and getattr(self, "_runtime_capabilities", None) is not None
+            (
+                (
+                    getattr(self, "_runtime_component", None) == "mtp"
+                    and getattr(self, "_runtime_capabilities", None) is not None
+                )
+                or getattr(self, "_kunpeng_local_mtp", False)
+            )
             and input_embeds.device.type == hidden_states.device.type == "cpu"
             and input_embeds.dtype
             == hidden_states.dtype
-            == self.fc.weight.dtype
             == torch.bfloat16
+            and (
+                self.fc.weight.dtype == torch.bfloat16
+                or (
+                    self.fc.weight.dtype == torch.int8
+                    and getattr(self.fc, "_kunpeng_mtp_quantized_fc", False)
+                )
+            )
             and input_embeds.ndim == hidden_states.ndim == 2
             and input_embeds.shape == hidden_states.shape
             and input_embeds.shape[0] > 128
@@ -247,6 +322,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        checker = getattr(self, "_unified_checkpoint_loader", None)
+        if checker is not None:
+            return checker.load(weights)
         if hasattr(self, "_runtime_capabilities"):
             raise RuntimeError(
                 "Attached MTP weights must use the enclosing whole checkpoint loader"

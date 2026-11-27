@@ -19,6 +19,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <vector>
 
 #include "cpu_kunpeng/adapters/register_graph_kernels.h"
 #include "cpu_kunpeng/utils/sdma_util.h"
@@ -34,13 +36,10 @@ int64_t get_sdma_event_num()
 
 void kupl_sdma_init_torch(int64_t sdmathreshold)
 {
-    // Programming the SDMA control registers goes through /dev/mem and needs
-    // root. In a non-root deployment the site root proxy (sdma_threshold.sh,
-    // see scripts/cpu_kunpeng/runtime/server_cluster.sh) sets the threshold, so
-    // skip the in-process register writes.
     const char *noroot = std::getenv("SGLANG_ENABLE_NOROOT_USER");
-    if (!(noroot != nullptr && std::strcmp(noroot, "1") == 0)) {
-        SdmaCtlThredInit();
+    if (!(noroot && std::strcmp(noroot, "1") == 0)) {
+        TORCH_CHECK(SdmaCtlThredInit() == 0,
+                    "SDMA threshold initialization failed; cannot map /dev/mem");
         SetSdmaThreshold(sdmathreshold);
     }
     utils::kupl_sdma_init();
@@ -289,6 +288,130 @@ void kupl_sdma_kv_swapin(at::Tensor dst, at::Tensor src, at::Tensor event_tensor
                              total_bytes, kSwapChunkBytes, kSwapMaxPendingEvents);
 }
 
+// Qwen keeps physical slot indices unchanged. The mask is refreshed by a
+// recorded operation on EVERY replay, using the same row metadata as attention.
+// A page is a copy granule only, not an allocator page or a compacted KV index.
+static int64_t gqa_sdma_index(const at::Tensor &tensor, int64_t index)
+{
+    return tensor.scalar_type() == at::kInt ? tensor.data_ptr<int32_t>()[index]
+                                           : tensor.data_ptr<int64_t>()[index];
+}
+
+void kupl_sdma_gqa_prepare_pages(at::Tensor table, at::Tensor requests,
+                                at::Tensor lengths, at::Tensor pages,
+                                at::Tensor stats, int64_t capacity_rows,
+                                int64_t page_rows)
+{
+    for (const auto &t : {table, requests, lengths, pages, stats})
+        TORCH_CHECK(t.device().is_cpu() && t.is_contiguous(),
+                    "GQA SDMA metadata must be contiguous CPU tensors");
+    TORCH_CHECK(table.dim() == 2 && requests.dim() == 1 && lengths.dim() == 1 &&
+                    requests.numel() == lengths.numel(), "GQA SDMA row metadata shape mismatch");
+    for (const auto &t : {table, requests, lengths})
+        TORCH_CHECK(t.scalar_type() == at::kInt || t.scalar_type() == at::kLong,
+                    "GQA SDMA indices must be int32 or int64");
+    TORCH_CHECK(capacity_rows > 0 && page_rows > 0 && pages.dim() == 1 &&
+                    pages.scalar_type() == at::kInt &&
+                    pages.numel() == (capacity_rows + page_rows - 1) / page_rows &&
+                    stats.scalar_type() == at::kLong && stats.numel() == 8,
+                "GQA SDMA page/stats geometry mismatch");
+    auto *mask = pages.data_ptr<int32_t>();
+    std::fill(mask, mask + pages.numel(), 0);
+    // Verify rows often share one request/history. Scan each request prefix
+    // only once, up to its largest causal row length (including new KV rows).
+    std::vector<int64_t> maxima(table.size(0), -1);
+    for (int64_t row = 0; row < requests.numel(); ++row) {
+        const auto request = gqa_sdma_index(requests, row);
+        const auto length = gqa_sdma_index(lengths, row);
+        TORCH_CHECK(request >= 0 && request < table.size(0) &&
+                        length >= 0 && length <= table.size(1),
+                    "GQA SDMA request/length outside request table");
+        maxima[request] = std::max(maxima[request], length);
+    }
+    int64_t logical_rows = 0;
+    for (int64_t request = 0; request < table.size(0); ++request) {
+        const auto length = maxima[request];
+        if (length <= 0) continue;
+        logical_rows += length;
+        for (int64_t token = 0; token < length; ++token) {
+            const auto slot = gqa_sdma_index(table, request * table.size(1) + token);
+            TORCH_CHECK(slot >= 0 && slot < capacity_rows,
+                        "GQA SDMA physical slot outside KV pool");
+            mask[slot / page_rows] = 1;
+        }
+    }
+    auto *values = stats.data_ptr<int64_t>();
+    values[0] += 1;  // number of runtime preparations, including capture execution
+    values[1] = logical_rows;
+    values[2] = 0;
+    for (int64_t page = 0; page < pages.numel(); ++page) values[2] += mask[page];
+    values[3] = 0;  // last submitted K+V bytes, filled by the copy operation
+    values[6] = 0;  // last coalesced range count
+    values[7] = 0;  // last submitted event count
+}
+
+void kupl_sdma_gqa_copy_pages(at::Tensor dst_key, at::Tensor dst_value,
+                             at::Tensor src_key, at::Tensor src_value,
+                             at::Tensor pages, at::Tensor stats,
+                             at::Tensor events, at::Tensor event_count,
+                             int64_t page_rows)
+{
+    const auto capacity_rows = src_key.size(0);
+    TORCH_CHECK(capacity_rows > 0 && page_rows > 0 && src_key.dim() >= 2 && src_value.sizes() == src_key.sizes() &&
+                    dst_key.sizes() == src_key.sizes() && dst_value.sizes() == src_key.sizes(),
+                "GQA SDMA K/V geometry mismatch");
+    for (const auto &t : {src_key, src_value, dst_key, dst_value})
+        TORCH_CHECK(t.device().is_cpu() && t.is_contiguous() &&
+                        t.scalar_type() == src_key.scalar_type(),
+                    "GQA SDMA K/V must be matching contiguous CPU tensors");
+    TORCH_CHECK(pages.device().is_cpu() && pages.is_contiguous() &&
+                    pages.scalar_type() == at::kInt && pages.dim() == 1 &&
+                    pages.numel() == (capacity_rows + page_rows - 1) / page_rows &&
+                    stats.device().is_cpu() && stats.is_contiguous() &&
+                    stats.scalar_type() == at::kLong && stats.numel() == 8 &&
+                    events.device().is_cpu() && events.is_contiguous() &&
+                    events.scalar_type() == at::kInt &&
+                    event_count.device().is_cpu() && event_count.is_contiguous() &&
+                    event_count.scalar_type() == at::kInt && event_count.numel() == 1,
+                "GQA SDMA copy metadata mismatch");
+    const auto row_bytes = src_key.numel() / capacity_rows * src_key.element_size();
+    const auto *mask = pages.data_ptr<int32_t>();
+    // First validate the whole plan and event capacity before issuing any DMA.
+    int64_t required_events = 0, pair_bytes = 0, ranges = 0;
+    for (int64_t page = 0; page < pages.numel();) {
+        TORCH_CHECK(mask[page] == 0 || mask[page] == 1, "GQA SDMA invalid page mask");
+        if (!mask[page]) { ++page; continue; }
+        const auto begin = page++;
+        while (page < pages.numel() && mask[page] == 1) ++page;
+        const auto stop_row = std::min(page * page_rows, capacity_rows);
+        const auto bytes = (stop_row - begin * page_rows) * row_bytes;
+        required_events += 2 * ((bytes + kSwapChunkBytes - 1) / kSwapChunkBytes);
+        pair_bytes += 2 * bytes;
+        ++ranges;
+    }
+    const auto prior_events = event_count.data_ptr<int32_t>()[0];
+    TORCH_CHECK(prior_events >= 0 && prior_events + required_events <= events.numel() &&
+                    prior_events + required_events <= kSwapMaxPendingEvents,
+                "GQA SDMA event capacity exceeded before submission");
+    for (int64_t page = 0; page < pages.numel();) {
+        if (!mask[page]) { ++page; continue; }
+        const auto begin = page++;
+        while (page < pages.numel() && mask[page] == 1) ++page;
+        const auto offset = begin * page_rows * row_bytes;
+        const auto bytes = (std::min(page * page_rows, capacity_rows) - begin * page_rows) * row_bytes;
+        kupl_sdma_memcpy_chunked(dst_key, src_key, events, event_count,
+                                offset, offset, bytes, kSwapChunkBytes, kSwapMaxPendingEvents);
+        kupl_sdma_memcpy_chunked(dst_value, src_value, events, event_count,
+                                offset, offset, bytes, kSwapChunkBytes, kSwapMaxPendingEvents);
+    }
+    auto *values = stats.data_ptr<int64_t>();
+    values[3] = pair_bytes;
+    values[4] += pair_bytes;  // cumulative actual submitted bytes per owner
+    values[5] += 1;          // layer-pair submissions per owner
+    values[6] = ranges;
+    values[7] = required_events;
+}
+
 // ==========================================================================
 // Block-wise KV swap-in (DDR -> HBM), graph-op entry point
 // ==========================================================================
@@ -387,6 +510,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
         "int total_bytes) -> ()");
     m.impl("kupl_sdma_kv_swapin", kupl_sdma_kv_swapin);
 
+    m.def("kupl_sdma_gqa_prepare_pages(Tensor table, Tensor requests, Tensor lengths, "
+          "Tensor(a!) pages, Tensor(b!) stats, int capacity_rows, int page_rows) -> ()");
+    m.impl("kupl_sdma_gqa_prepare_pages", kupl_sdma_gqa_prepare_pages);
+    m.def("kupl_sdma_gqa_copy_pages(Tensor(a!) dst_key, Tensor(b!) dst_value, "
+          "Tensor src_key, Tensor src_value, Tensor pages, Tensor(c!) stats, "
+          "Tensor(d!) events, Tensor(e!) event_count, int page_rows) -> ()");
+    m.impl("kupl_sdma_gqa_copy_pages", kupl_sdma_gqa_copy_pages);
+
     m.def(
         "kupl_sdma_kv_block_swapin(Tensor dst_hbm, Tensor src_ddr, "
         "Tensor ddr_block_ids, Tensor hbw_block_ids, "
@@ -428,3 +559,10 @@ static KernelRegistrar _r_sdma_set_kv_buffer(
 
 static KernelRegistrar _r_sdma_set_kv_buffer_2(
     "kupl_sdma_set_kv_buffer_2", make_dispatch_v<decltype(&kupl_sdma_set_kv_buffer_2), &kupl_sdma_set_kv_buffer_2>);
+
+static KernelRegistrar _r_sdma_gqa_prepare_pages(
+    "kupl_sdma_gqa_prepare_pages",
+    make_dispatch_v<decltype(&kupl_sdma_gqa_prepare_pages), &kupl_sdma_gqa_prepare_pages>);
+static KernelRegistrar _r_sdma_gqa_copy_pages(
+    "kupl_sdma_gqa_copy_pages",
+    make_dispatch_v<decltype(&kupl_sdma_gqa_copy_pages), &kupl_sdma_gqa_copy_pages>);

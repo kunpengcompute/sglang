@@ -10,32 +10,25 @@ import subprocess
 import time
 from tools import compute_frequency as cores
 from tools import runtime_frequency
+from tools.instances import write_json as save
 
 SYS = Path('/sys/devices/system')
-PAGE_KIB = (64, 2048, 32768, 1048576)
-
-
-def save(path, value):
-    path = Path(path)
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
-    temp.replace(path)
 
 
 def budget():
     total = int(os.environ['SGLANG_KUNPENG_WEIGHTS_HBW_POOL_SIZE_MB'])
-    sizes = [int(os.environ['SGLANG_KUNPENG_' + phase + '_SHM_SIZE_MB'])
-             for phase in ('PREFILL', 'DECODE')]
-    # This launcher uses one role/window; equal sizes also keep either role valid.
-    if total != 4000 or sizes[0] != sizes[1] or not 0 < sizes[0] < total:
-        raise ValueError('当前split配方要求总预算4000MiB、prefill/decode SHM相等且小于总预算')
-    private = total - sizes[0]
+    shm = int(os.environ['SHM_MIB'])
+    if total != 4000 or not 0 < shm < total:
+        raise ValueError('当前split配方要求总预算4000MiB，当前角色SHM_MIB须小于总预算')
+    private = total - shm
     configured = os.environ.get('HBM_HUGEPAGE_MB_PER_NODE', 'auto')
-    pages = math.ceil(private / 2) + 2 if configured == 'auto' else math.ceil(float(configured) / 2)
-    if pages < math.ceil(private / 2):
-        raise ValueError('配置的大页容量不足以覆盖私有HBW池')
-    return dict(total_mib=total, shm_mib=sizes[0], private_mib=private,
-                page_kib=2048, required_pages=math.ceil(private / 2), reserved_pages=pages)
+    # SLS allocates two explicit windows plus three internal fence windows.
+    required = math.ceil(private / 2) + math.ceil(shm / 2) + 5
+    pages = required if configured == 'auto' else math.ceil(float(configured) / 2)
+    if pages < required:
+        raise ValueError('配置的大页容量不足以覆盖私有池与KuPL共享窗口')
+    return dict(total_mib=total, shm_mib=shm, private_mib=private,
+                page_kib=2048, required_pages=required, reserved_pages=pages)
 
 
 def page_snapshot():
@@ -43,20 +36,8 @@ def page_snapshot():
             sorted((SYS / 'node').glob('node*/hugepages/*/nr_hugepages'))}
 
 
-def uniform_page_args(snapshot):
-    args = []
-    for nodes in (range(16), range(16, 32)):
-        for size in PAGE_KIB:
-            values = {snapshot.get(str(SYS / f'node/node{n}/hugepages/hugepages-{size}kB/nr_hugepages'), 0)
-                      for n in nodes}
-            if len(values) != 1:
-                raise RuntimeError('现有大页配置不均匀，旧hugepage.sh不能无损保留；请使用check模式由管理员准备')
-            args.append(str(values.pop()))
-    return args
-
-
 def call_helper(name, args, log):
-    prefix = Path(os.environ['PERF_TUNE'])
+    prefix = Path(os.environ['SGLANG_KUNPENG_NOROOT_PROXY_PATH'])
     with Path(log).open('a') as stream:
         result = subprocess.run([str(prefix / 'root_proxy'), name, *map(str, args)],
                                 cwd=prefix, stdout=stream, stderr=subprocess.STDOUT,
@@ -118,6 +99,7 @@ class Resources:
         self.lock = open(f'/tmp/qwen920f-resources-{os.getuid()}.lock', 'a')
         fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         save(self.run / 'resources_before.json', self.before)
+        self.prepare_privileged()
         mode = os.environ.get('HBM_HUGEPAGE_MODE', 'ensure')
         if mode not in ('check', 'ensure'):
             raise ValueError('HBM_HUGEPAGE_MODE应为check或ensure')
@@ -125,17 +107,37 @@ class Resources:
         paths = [SYS / f'node/node{n}/hugepages/hugepages-2048kB/free_hugepages'
                  for n in range(16, 32)]
         if mode == 'ensure' and any(int(p.read_text()) < required for p in paths):
-            args = uniform_page_args(self.before['pages'])
-            # Never shrink prior reservations; preserve DDR and other page sizes.
-            args[5] = str(max(int(args[5]), self.before['budget']['reserved_pages']))
             try:
-                rc = call_helper('hugepage.sh', args, self.logs / 'hugepages.log')
+                for path in paths:
+                    if int(path.read_text()) >= required:
+                        continue
+                    count_path = str(path.parent / 'nr_hugepages')
+                    target = max(self.before['pages'][count_path], self.before['budget']['reserved_pages'])
+                    node = path.parents[2].name[4:]
+                    if call_helper('hugepage_2m.sh', [target, node], self.logs / 'hugepages.log'):
+                        raise RuntimeError('大页准备失败，详见hugepages.log')
             finally:
                 self.pages_after = page_snapshot()
                 save(self.run / 'resources_applied.json', {'pages': self.pages_after})
-            if rc or any(int(p.read_text()) < required for p in paths):
+            if any(int(p.read_text()) < required for p in paths):
                 raise RuntimeError('大页准备未满足实际需求，详见hugepages.log')
         self.prepare_frequency()
+
+    def prepare_privileged(self):
+        """Use the public non-root startup protocol before any worker starts."""
+        if os.environ.get('SGLANG_ENABLE_NOROOT_USER') != '1':
+            return
+        if os.environ.get('SGLANG_KUNPENG_SDMA_THRESHOLD') != '5':
+            raise ValueError('站点sdma_threshold.sh固定使用threshold=5')
+        for name in ('sgl_reload_sdma.sh', 'sgl_reload_zcopy.sh',
+                     'sgl_hugepage_perm.sh', 'sdma_threshold.sh'):
+            if call_helper(name, [], self.logs / 'privileged_setup.log'):
+                raise RuntimeError(name + '失败，见privileged_setup.log')
+        device = Path('/dev/zdax')
+        if not device.is_char_device() or not os.access(device, os.R_OK | os.W_OK):
+            raise RuntimeError('KuPL SLS需要当前用户可读写/dev/zdax')
+        save(self.run / 'privileged_setup.json',
+             {'nonroot': True, 'sls_device': str(device), 'sdma_threshold': 5})
 
     def prepare_frequency(self):
         mode = os.environ.get('CPU_FREQ_MODE', 'keep')
@@ -209,10 +211,14 @@ class Resources:
             try:
                 if page_snapshot() != self.pages_after:
                     raise RuntimeError('大页预留已被其他操作修改，不覆盖当前设置')
-                rc = call_helper('hugepage.sh', uniform_page_args(self.before['pages']),
-                                 self.logs / 'hugepages_restore.log')
+                for name, count in self.before['pages'].items():
+                    if self.pages_after.get(name) == count:
+                        continue
+                    node = Path(name).parents[2].name[4:]
+                    if call_helper('hugepage_2m.sh', [count, node], self.logs / 'hugepages_restore.log'):
+                        report['errors'].append('HBW node' + node + '大页恢复失败')
                 report['pages_restored'] = page_snapshot() == self.before['pages']
-                if rc or not report['pages_restored']:
+                if not report['pages_restored']:
                     report['errors'].append('大页恢复未确认成功')
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                 report['errors'].append(str(error))

@@ -1250,6 +1250,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         prefix: str = "",
         language_model_cls=Qwen3LLMModel,
         visual_quant_config=None,
+        load_vision_tower: bool = True,
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
@@ -1257,15 +1258,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=visual_quant_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("model.visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
+        if not load_vision_tower:
+            self.visual = PPMissingLayer()
+        else:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=visual_quant_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("model.visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1298,7 +1302,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     self.lm_head = ParallelLMHead(
                         self.config.vocab_size,
                         self.config.hidden_size,
-                        quant_config=quant_config,
+                        quant_config=(
+                            None if getattr(quant_config, "_cpu920f", False) else quant_config
+                        ),
                         use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
                     )
@@ -1413,6 +1419,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_embeds: Optional[torch.Tensor] = None,
     ):
         """Run forward pass for Qwen3-VL.
 
@@ -1428,8 +1435,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         """
         if hasattr(self, "runtime_capabilities"):
             self.runtime_capabilities.require("language")
-            if forward_batch.contains_mm_inputs():
-                self.runtime_capabilities.require("vision")
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
@@ -1443,15 +1448,31 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            use_deepstack=self.use_deepstack,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        if input_embeds is None:
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+                use_deepstack=self.use_deepstack,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                input_deepstack_embeds=getattr(forward_batch, "input_deepstack_embeds", None),
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        if isinstance(hidden_states, PPProxyTensors):
+            for name in ("mm_input_embeds", "mrope_positions", "input_deepstack_embeds"):
+                value = getattr(forward_batch, name, None)
+                if value is not None:
+                    hidden_states.tensors[name] = value
+
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:

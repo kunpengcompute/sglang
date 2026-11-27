@@ -40,6 +40,11 @@ extern "C" int qwen36_attention_qknorm_rope_bf16(const uint16_t *, const uint16_
                                                  const uint16_t *, const int64_t *, uint16_t *,
                                                  uint16_t *, int64_t, int64_t, float, int64_t);
 
+extern "C" int qwen36_attention_qknorm_mrope_bf16(
+    const uint16_t *, const uint16_t *, const uint16_t *, const uint16_t *,
+    const uint16_t *, const int64_t *, uint16_t *, uint16_t *, int64_t, int64_t,
+    float, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+
 static void check(const at::Tensor &t, at::ScalarType dtype) {
     TORCH_CHECK(t.device().is_cpu() && t.scalar_type() == dtype && t.is_contiguous(),
                 "Qwen registered op requires contiguous CPU tensors with exact dtype");
@@ -73,7 +78,7 @@ extern "C" void qwen_graph_qkv_dispatch(std::vector<at::Tensor> &t,
 
 extern "C" void qwen_graph_rope_dispatch(std::vector<at::Tensor> &t,
                                          const std::vector<ScalarArg> &s) {
-    TORCH_CHECK(t.size() == 8 && s.size() == 2, "QKNorm RoPE graph ABI");
+    TORCH_CHECK(t.size() == 8 && (s.size() == 2 || s.size() == 6), "QKNorm RoPE graph ABI");
     for (int i : {0, 1, 2, 3, 4, 6, 7})
         check(t[i], at::kBFloat16);
     check(t[5], at::kLong);
@@ -85,14 +90,24 @@ extern "C" void qwen_graph_rope_dispatch(std::vector<at::Tensor> &t,
                     t[6].sizes() == t[0].sizes() && t[7].sizes() == t[1].sizes(),
                 "QKNorm RoPE shapes");
     auto *pos = static_cast<const int64_t *>(t[5].data_ptr());
-    for (int64_t row = 0; row < rows; ++row) {
-        TORCH_CHECK(pos[row] >= 0 && pos[row] < t[4].size(0), "RoPE position out of range");
-        for (int64_t axis = 1; axis < t[5].numel() / rows; ++axis)
-            TORCH_CHECK(pos[axis * rows + row] == pos[row], "Text-only RoPE axes must agree");
-    }
-    auto rc = qwen36_attention_qknorm_rope_bf16(
+    const int64_t axes = t[5].numel() / rows;
+    const auto section_t = s.size() == 6 ? std::get<int64_t>(s[2]) : 0;
+    const auto section_h = s.size() == 6 ? std::get<int64_t>(s[3]) : 0;
+    const auto section_w = s.size() == 6 ? std::get<int64_t>(s[4]) : 0;
+    const auto interleaved = s.size() == 6 ? std::get<bool>(s[5]) : false;
+    // Legacy text-only records carry repeated position axes and no sections.
+    const int64_t effective_axes = axes == 3 && section_t + section_h + section_w == 32 ? 3 : 1;
+    for (int64_t axis = 0; axis < axes; ++axis)
+        for (int64_t row = 0; row < rows; ++row) {
+            TORCH_CHECK(pos[axis * rows + row] >= 0 && pos[axis * rows + row] < t[4].size(0),
+                        "RoPE position out of range");
+            TORCH_CHECK(effective_axes == 3 || pos[axis * rows + row] == pos[row],
+                        "Three-axis RoPE requires configured sections");
+        }
+    auto rc = qwen36_attention_qknorm_mrope_bf16(
         bf(t[0]), bf(t[1]), bf(t[2]), bf(t[3]), bf(t[4]), pos, bf_out(t[6]), bf_out(t[7]), rows,
-        t[4].size(0), static_cast<float>(std::get<double>(s[0])), std::get<int64_t>(s[1]));
+        t[4].size(0), static_cast<float>(std::get<double>(s[0])), std::get<int64_t>(s[1]),
+        effective_axes, section_t, section_h, section_w, interleaved);
     TORCH_CHECK(rc == 0, "QKNorm RoPE kernel error ", rc);
 }
 

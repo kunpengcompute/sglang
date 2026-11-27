@@ -428,7 +428,7 @@ def conv_decode(x, state, weight, bias, activation, conv_state_indices, **kwargs
             kwargs["intermediate_state_indices"],
         )
     get_capabilities().require_decode(x.shape[0], x.shape[0])
-    if os.environ.get("SGLANG_KUNPENG_P2_DECODE_CONV_REQUESTS", "0") == "1" and 8 <= x.shape[0] <= 32:
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_CONV_REQUEST_PARALLEL", "0") == "1" and 8 <= x.shape[0] <= 32:
         return ops.qwen_p2_decode_conv_requests(contiguous(x), state, weight, conv_state_indices)
     return ops.qwen_causal_conv(contiguous(x), state, weight, conv_state_indices)
 
@@ -489,7 +489,7 @@ def rowwise_gqa(query, kb, vb, table, requests, lengths, scale):
     """
     rows = query.shape[0]
     if not is_capturing() or rows <= GQA_ROW_BLOCK:
-        op = ops.qwen_gqa_rows if is_capturing() and rows >= 8 else ops.qwen_gqa_decode
+        op = ops.qwen_gqa_rows if is_capturing() else ops.qwen_gqa_decode
         output, _ = op(query, kb, vb, table, requests, lengths, scale)
         return output
     output = ops.alloc_buffer(
@@ -510,6 +510,80 @@ def rowwise_gqa(query, kb, vb, table, requests, lengths, scale):
     return output
 
 
+_GQA_SWAP_MANAGER = None
+
+
+def gqa_swap_manager():
+    return _GQA_SWAP_MANAGER
+
+
+def prepare_gqa_swap(runner):
+    """Register each D-side target/draft pool before the first lazy capture."""
+    global _GQA_SWAP_MANAGER
+    manager = runner.kunpeng_runner.swap_mgr
+    if not manager.enable_swap_kv_in or os.environ.get("IS_PREFILL", "1") != "0":
+        return
+    if manager.enable_swap_expert:
+        raise ValueError("Qwen GQA SDMA does not support expert swap")
+    pool = runner.token_to_kv_pool
+    mapping = getattr(pool, "full_attention_layer_id_mapping", None)
+    layers = sorted(mapping) if mapping is not None else list(
+        range(pool.start_layer, pool.end_layer)
+    )
+    swap = _GQA_SWAP_MANAGER
+    if swap is None or swap.manager is not manager:
+        from .kv_swap import QwenKVSwap
+
+        swap = QwenKVSwap(manager)
+    swap.register_gqa_kv_pool(pool, layers, is_target=not runner.is_draft_worker)
+    if runner.is_draft_worker:
+        swap.register_draft_mirror_reuse(pool, runner.req_to_token_pool, runner.server_args)
+    _GQA_SWAP_MANAGER = swap
+
+
+def _prepare_gqa_kv(layer, fb, k, v, loc, save_kv_cache, requests, lengths):
+    """Keep DDR authoritative and mirror new rows only after swap-in waits."""
+    owner = fb.token_to_kv_pool
+    key = owner.get_key_buffer(layer.layer_id)
+    value = owner.get_value_buffer(layer.layer_id)
+    manager = gqa_swap_manager()
+    if manager is not None:
+        # A plain EXTEND (including draft seeding) retains the packed prefill
+        # path. All row-wise decode/verify/draft-extend calls use the mirror.
+        kb, vb = manager.get_gqa_kv(
+            owner, layer.layer_id, fb.req_to_token_pool.req_to_token, requests, lengths
+        )
+    else:
+        kb, vb = key, value
+    if save_kv_cache:
+        cache_k = contiguous(k.reshape(-1, 256))
+        cache_v = contiguous(v.reshape(-1, 256))
+        # Synchronous DDR stores cover speculative tails, acceptance rollback,
+        # slot reuse and PD sends; there is no deferred SDMA write-back state.
+        ops.set_kv_buffer_kunpeng(key.view(-1, 256), loc, cache_k, profile_name="set_kv_buffer_kunpeng@main_kv_ddr_k")
+        ops.set_kv_buffer_kunpeng(value.view(-1, 256), loc, cache_v, profile_name="set_kv_buffer_kunpeng@main_kv_ddr_v")
+        if manager is not None:
+            ops.set_kv_buffer_kunpeng(kb.view(-1, 256), loc, cache_k, profile_name="set_kv_buffer_kunpeng@main_kv_hbw_k")
+            ops.set_kv_buffer_kunpeng(vb.view(-1, 256), loc, cache_v, profile_name="set_kv_buffer_kunpeng@main_kv_hbw_v")
+    if manager is not None:
+        # Publish only after copy wait AND all fresh DDR/HBW stores completed.
+        manager.commit_draft_mirror_reuse(
+            owner, fb.req_to_token_pool.req_to_token, requests)
+    return kb, vb
+
+
+def _prefetch_gqa_kv_before_attention(layer, fb):
+    manager = gqa_swap_manager()
+    if manager is not None:
+        manager.prefetch_gqa_kv_before_attention(fb.token_to_kv_pool, layer.layer_id)
+
+
+def _prefetch_gqa_kv(layer, fb):
+    manager = gqa_swap_manager()
+    if manager is not None:
+        manager.swap_next_gqa_kv(fb.token_to_kv_pool, layer.layer_id)
+
+
 class QwenAttention:
     def __init__(self):
         initialize()
@@ -525,24 +599,17 @@ class QwenAttention:
         if loc is not None and loc.numel() > tokens:
             _note_draft_extend_clip(tokens, loc, fb.extend_seq_lens)
             loc = loc[:tokens]
-        kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        if save_kv_cache:
-            ops.set_kv_buffer_kunpeng(
-                kb.view(-1, 256), loc, k.reshape(-1, 256).contiguous(),
-                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_k",
-            )
-            ops.set_kv_buffer_kunpeng(
-                vb.view(-1, 256), loc, v.reshape(-1, 256).contiguous(),
-                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_v",
-            )
         # The provider precomputes the ragged mapping; the ordinary eager path
         # has no binding and derives it here.
         ragged = getattr(fb, "_draft_extend_ragged", None)
         requests, lengths = (
             draft_extend_ragged(fb) if ragged is None else ragged
         )
+        kb, vb = _prepare_gqa_kv(
+            layer, fb, k, v, loc, save_kv_cache, requests, lengths
+        )
         query = q.reshape(-1, layer.tp_q_head_num, 256).contiguous()
+        _prefetch_gqa_kv_before_attention(layer, fb)
         output = rowwise_gqa(
             query,
             kb,
@@ -552,20 +619,10 @@ class QwenAttention:
             lengths,
             float(layer.scaling),
         )
+        _prefetch_gqa_kv(layer, fb)
         return output.reshape(-1, layer.tp_q_head_num * 256)
 
     def forward_verify(self, q, k, v, layer, fb, save_kv_cache=True):
-        kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        if save_kv_cache:
-            ops.set_kv_buffer_kunpeng(
-                kb.view(-1, 256), fb.out_cache_loc, contiguous(k.reshape(-1, 256)),
-                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_k",
-            )
-            ops.set_kv_buffer_kunpeng(
-                vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256)),
-                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_v",
-            )
         steps = fb.spec_info.draft_token_num
         requests = getattr(fb.spec_info, "_kunpeng_verify_requests", None)
         lengths = getattr(fb.spec_info, "_kunpeng_verify_lengths", None)
@@ -578,7 +635,11 @@ class QwenAttention:
                 )[None, :]
             ).reshape(-1)
             requests = fb.req_pool_indices.repeat_interleave(steps)
+        kb, vb = _prepare_gqa_kv(
+            layer, fb, k, v, fb.out_cache_loc, save_kv_cache, requests, lengths
+        )
         query = contiguous(q.reshape(-1, layer.tp_q_head_num, 256))
+        _prefetch_gqa_kv_before_attention(layer, fb)
         output = rowwise_gqa(
             query,
             kb,
@@ -588,23 +649,18 @@ class QwenAttention:
             lengths,
             float(layer.scaling),
         )
+        _prefetch_gqa_kv(layer, fb)
         return output.reshape(-1, layer.tp_q_head_num * 256)
 
     def forward_decode(self, q, k, v, layer, fb, save_kv_cache=True):
         # Reject unsupported geometry before the first persistent KV write.
         get_capabilities().require_decode(fb.batch_size, fb.input_ids.numel())
-        kb = fb.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        vb = fb.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        if save_kv_cache:
-            ops.set_kv_buffer_kunpeng(
-                kb.view(-1, 256), fb.out_cache_loc, contiguous(k.reshape(-1, 256)),
-                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_k",
-            )
-            ops.set_kv_buffer_kunpeng(
-                vb.view(-1, 256), fb.out_cache_loc, contiguous(v.reshape(-1, 256)),
-                profile_name="set_kv_buffer_kunpeng@main_kv_ddr_v",
-            )
+        kb, vb = _prepare_gqa_kv(
+            layer, fb, k, v, fb.out_cache_loc, save_kv_cache,
+            fb.req_pool_indices, fb.seq_lens
+        )
         query = contiguous(q.reshape(-1, layer.tp_q_head_num, 256))
+        _prefetch_gqa_kv_before_attention(layer, fb)
         output = rowwise_gqa(
             query,
             kb,
@@ -614,6 +670,7 @@ class QwenAttention:
             fb.seq_lens,
             float(layer.scaling),
         )
+        _prefetch_gqa_kv(layer, fb)
         return output.reshape(-1, layer.tp_q_head_num * 256)
 
 
@@ -668,6 +725,10 @@ def native_rope_cache(module):
     rotary = module.rotary_emb
     cache = getattr(rotary, "kunpeng_bf16_cache", None)
     if cache is None:
+        # Prepare speculative tail positions before capture; retain all existing rows.
+        rotary._ensure_cos_sin_cache_length(
+            int(os.environ["SGLANG_KUNPENG_MAX_SEQ_LEN"]) - 1
+        )
         cache = rotary.cos_sin_cache.to(torch.bfloat16).contiguous()
         rotary.kunpeng_bf16_cache = cache
     module.registered_graph_rope_cache = cache
@@ -676,6 +737,7 @@ def native_rope_cache(module):
 
 def qknorm_rope(module, positions, q, k):
     cache = native_rope_cache(module)
+    sections = getattr(module.rotary_emb, "mrope_section", None) or (0, 0, 0)
     return ops.qwen_qknorm_rope(
         q,
         k,
@@ -684,7 +746,8 @@ def qknorm_rope(module, positions, q, k):
         cache,
         positions,
         float(module.q_norm.variance_epsilon),
-        0,
+        0, *map(int, sections),
+        bool(getattr(module.rotary_emb, "mrope_interleaved", False)),
     )
 
 
@@ -737,11 +800,11 @@ class QwenGatedRMSNorm(RMSNorm):
         if x.shape[0] <= 96:
             from .norm_rowgroups_full_occupancy import decode_norm
             return decode_norm(contiguous(x), self.weight, contiguous(z), self.eps)
-        if os.environ.get("SGLANG_KUNPENG_P2_NORM_REDUCE_KEEP_SILU", "0") == "1":
+        if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_NORM_REDUCE_KEEP_SILU", "0") == "1":
             from . import prefill_graph
             prefill_graph.register()
             activated = ops.tensor_unary(cast(z, torch.float32), 5)
-            width = int(os.environ["SGLANG_KUNPENG_P2_REFERENCE_VECTOR_WIDTH"])
+            width = int(os.environ["SGLANG_KUNPENG_QWEN_GDN_NORM_VECTOR_WIDTH"])
             return ops.qwen_p2_norm_reduce_keep_silu(x, self.weight, activated, float(self.eps), width)
         original = x.dtype
         x, z, weight = cast(x, torch.float32), cast(z, torch.float32), cast(self.weight, torch.float32)
@@ -756,13 +819,7 @@ def apply_gqa_output_gate(output, gate, forward_batch):
     return ops.sigmoid_mul_bf16_kunpeng(output, gate)
 
 def allreduce(tensor):
-    rows = tensor.shape[0]
-    if tensor.ndim == 2 and tensor.shape[1] == 5120 and rows > 1:
-        packed = contiguous(tensor.view(rows, 256, 20).transpose(0, 1)).view(rows, 5120)
-        ops.shm_allreduce_kunpeng(packed)
-        ops.copy_kunpeng(tensor.view(rows, 256, 20), packed.view(256, rows, 20).transpose(0, 1))
-    else:
-        ops.shm_allreduce_kunpeng(tensor)
+    ops.shm_allreduce_kunpeng(tensor)
     return tensor
 
 

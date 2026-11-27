@@ -7,7 +7,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import HybridLinearA
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import (
     QwenAttention, QwenGDNKernel, cast, contiguous, conv_decode, conv_prefill, gating,
-    scatter, select, native_rope_cache,
+    scatter, select, native_rope_cache, gqa_swap_manager,
 )
 from sglang.srt.hardware_backend.cpu_kunpeng.qwen import prefill_graph
 from sglang.srt.hardware_backend.cpu_kunpeng.qwen.capabilities import get_capabilities
@@ -327,7 +327,8 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
         super().__init__(full, KunpengGDNBackend(runner), runner.mambaish_config.full_attention_layer_ids)
         self.workspace = prefill_graph.resources()
         from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import prepare
-        prepare(runner.model.lm_head, runner.kunpeng_runner.weight_hbw_pool)
+        if runner.pp_group.is_last_rank:
+            prepare(runner.model.lm_head, runner.kunpeng_runner.weight_hbw_pool)
         for module in runner.model.modules():
             conv = getattr(module, 'conv1d', None)
             attention = getattr(module, 'attn', None)
@@ -335,6 +336,10 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
                 attention.conv_weights = conv.weight.view(attention.conv_weights.shape)
             if hasattr(module,'q_norm') and getattr(module,'rotary_emb',None) is not None:
                 native_rope_cache(module)
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen.graph_provider import (
+            reserve_vision_collectives,
+        )
+        reserve_vision_collectives(runner)
         # New backend resources exist before the first capture; refresh the common collector once.
         runner.kunpeng_runner.init_graph_capture()
 
@@ -387,7 +392,9 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
 
     def get_graph_inputs(self, fb):
         fb.input_ids=fb.input_ids.to(torch.int64)
-        values=[fb.input_ids,fb.positions,fb.req_pool_indices,fb.seq_lens,fb.out_cache_loc,
+        values=[fb.input_ids,fb.positions,fb.input_embeds,fb.mm_input_embeds,
+                fb.mrope_positions,getattr(fb, "input_deepstack_embeds", None),
+                fb.req_pool_indices,fb.seq_lens,fb.out_cache_loc,
                 self.linear_attn_backend.forward_metadata.mamba_cache_indices,
                 self.linear_attn_backend.forward_metadata.query_start_loc]
         if fb.forward_mode.is_extend():
@@ -427,6 +434,9 @@ class KunpengHybridBackend(HybridLinearAttnBackend):
         if plan is not None:
             # Tracking writes into a persistent buffer shared by all GDN layers.
             values.append(plan.track_states)
+        swap = gqa_swap_manager()
+        if swap is not None:
+            values.extend(swap.gqa_kv_fixed_tensors(self.runner.token_to_kv_pool))
         return values
 
 class KunpengVisionHybridBackend(HybridLinearAttnBackend):

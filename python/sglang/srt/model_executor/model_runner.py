@@ -708,13 +708,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Consider PP, so use start_layer and end_layer.
         full_attention_layer_ids = [
             layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            for layer_idx in range(self.start_layer, self.end_layer)
             if hasattr(self.model_config, "full_attention_layer_ids")
             and layer_idx in self.model_config.full_attention_layer_ids
         ]
         swa_attention_layer_ids = [
             layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            for layer_idx in range(self.start_layer, self.end_layer)
             if hasattr(self.model_config, "swa_attention_layer_ids")
             and layer_idx in self.model_config.swa_attention_layer_ids
         ]
@@ -2361,7 +2361,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
-        if self.borrowed_qwen_target_runner is not None:
+        if (self.borrowed_qwen_target_runner is not None
+                or getattr(self.model, "_kunpeng_local_mtp", False)):
             from sglang.srt.layers.attention.torch_native_backend import (
                 TorchNativeAttnBackend,
             )

@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 class UnifiedCheckpointLoader:
-    def __init__(self, model, spec=None):
+    def __init__(self, model, spec=None, *, stage_partition=False, mtp_only=False):
         from sglang.srt.distributed import (
             get_pp_group,
             get_tensor_model_parallel_world_size,
@@ -20,7 +20,12 @@ class UnifiedCheckpointLoader:
 
         self.model = model
         self.tp_size = get_tensor_model_parallel_world_size()
-        if self.tp_size != 16 or get_pp_group().world_size != 1:
+        self.stage_partition = stage_partition
+        self.mtp_only = mtp_only
+        self.pp_group = get_pp_group()
+        if self.tp_size != 16 or (
+            self.pp_group.world_size != 1 and not (stage_partition or mtp_only)
+        ):
             raise ValueError("Qwen W8A8 checkpoint mapping currently supports TP16/PP1")
         mapping = (
             Path(__file__).parents[1]
@@ -41,9 +46,45 @@ class UnifiedCheckpointLoader:
             raise ValueError(
                 "Qwen W8A8 requires BF16 activations and ModelSlim weights"
             )
-        if getattr(load_config, "draft_model_idx", None) is not None:
+        if getattr(load_config, "draft_model_idx", None) is not None and not self.mtp_only:
             raise ValueError("This loader handles the complete target checkpoint")
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen.checkpoint_quantization import (
+            mapping_for_description,
+        )
+
+        description_path = Path(model_config.model_path) / "quant_model_description.json"
+        description = json.loads(description_path.read_text())
+        self.rules = mapping_for_description(self.rules, description)
         self._bound = True
+
+    def _local_target(self, target, component):
+        """Map only explicitly owned tensors; unknown sources still fail."""
+        if self.mtp_only:
+            if component == "mtp":
+                return target.removeprefix("mtp.")
+            if target in ("model.embed_tokens.weight", "lm_head.weight"):
+                return target
+            return None
+        if self.stage_partition:
+            if component == "vision" and not self.pp_group.is_first_rank:
+                return None
+            layer = re.match(r"model\.layers\.(\d+)\.", target)
+            if layer:
+                config = getattr(self.model.config, "text_config", self.model.config)
+                if int(layer[1]) >= config.num_hidden_layers:
+                    raise ValueError(f"Checkpoint layer outside model geometry: {target}")
+            if component == "mtp":
+                draft_layer = re.match(r"mtp\.model\.layers\.(\d+)\.", target)
+                if draft_layer and int(draft_layer[1]) != 0:
+                    raise ValueError(f"Checkpoint MTP layer outside one-layer geometry: {target}")
+                return None  # Loaded independently by the public PPNextNWorker.
+            if layer and not self.model.start_layer <= int(layer[1]) < self.model.end_layer:
+                return None
+            if target.startswith("model.embed_tokens.") and not self.pp_group.is_first_rank:
+                return None
+            if target.startswith(("model.norm.", "lm_head.")) and not self.pp_group.is_last_rank:
+                return None
+        return target
 
     def load(self, weights):
         import torch
@@ -55,7 +96,10 @@ class UnifiedCheckpointLoader:
         loaded_ids, seen = set(), set()
         expected_sources = set()
         for source, rule in self.rules.items():
-            pattern = re.escape(rule["target"]).replace(r"\{index\}", r"(\d+)")
+            local_target = self._local_target(rule["target"], rule["component"])
+            if local_target is None:
+                continue
+            pattern = re.escape(local_target).replace(r"\{index\}", r"(\d+)")
             for target in params:
                 match = re.fullmatch(pattern, target)
                 if match:
@@ -71,7 +115,6 @@ class UnifiedCheckpointLoader:
                 # Text-only build: the checkpoint's vision tower has no target
                 # parameter, so its tensors stay out of loading and coverage.
                 continue
-            seen.add(name)
             match = re.search(r"\.(?:layers|blocks)\.(\d+)\.", name)
             key = re.sub(r"\.(layers|blocks)\.\d+\.", r".\1.{index}.", name)
             rule = self.rules.get(key)
@@ -83,6 +126,10 @@ class UnifiedCheckpointLoader:
             ):
                 raise ValueError(f"Checkpoint dtype/geometry mismatch: {name}")
             target = rule["target"].format(index=match[1] if match else "")
+            target = self._local_target(target, rule["component"])
+            if target is None:
+                continue
+            seen.add(name)
             param = params[target]
             target_dtype = dtypes[rule["dtype"]]
             # Vision quantized biases are F32 in the original checkpoint. Keep
@@ -123,6 +170,8 @@ class UnifiedCheckpointLoader:
     def defer_postprocess(self, module):
         if not self._loaded:
             raise RuntimeError("Packing cannot precede checkpoint loading")
+        if self.mtp_only:
+            return False
         component = getattr(module, "_runtime_component", "language")
         if component == "language":
             return False
@@ -150,6 +199,7 @@ class UnifiedCheckpointLoader:
     def finish(self):
         if not self._loaded or self._postprocessed:
             raise RuntimeError("Invalid checkpoint finalization")
-        for component in ("language", "vision", "mtp"):
-            self.model.runtime_capabilities.loaded_validated(component)
+        if hasattr(self.model, "runtime_capabilities"):
+            for component in ("language", "vision", "mtp"):
+                self.model.runtime_capabilities.loaded_validated(component)
         self._postprocessed = True
