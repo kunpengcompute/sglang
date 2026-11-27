@@ -176,8 +176,29 @@ def _small_output_bf16_linear(x, weight, bias):
 # callable and only shards that are accurate (Frobenius rel err <= 5e-3)
 # and faster at every probed row count switch; losers and fallbacks run
 # plain F.linear on the untouched row-major weight.
-_KPAD_TARGETS = ((1152, 269),)  # vision mlp.fc2 per rank
+_KPAD_TARGETS = (
+    (1152, 269),  # vision mlp.fc2 per rank
+    (288, 4608),  # vision merger linear_fc1 per rank (TP16)
+    (5120, 288),  # vision merger linear_fc2 per rank (TP16)
+)
+# The merger shards serve merged rows (a 640px image is 1600 rows to a
+# block MLP but 400 after the 2x2 merge), so their startup A/B probes at
+# the merged row counts instead of the patch counts.
+_MERGER_BF16_TARGETS = frozenset({(288, 4608), (5120, 288)})
 _kpad_probe_cache = {}
+
+
+def _kpad_probe_verbose():
+    """Startup A/B detail (tiling, per-row timings) behind a switch.
+
+    Production logs carry only the one verdict line per unique shard
+    shape; SGLANG_KUNPENG_KPAD_GEMM_VERBOSE=1 restores the full evidence
+    trail for diagnostics.
+    """
+    return os.environ.get("SGLANG_KUNPENG_KPAD_GEMM_VERBOSE", "0") not in (
+        "",
+        "0",
+    )
 
 
 def _kpad_gemm(packed_weight, flat, k_pad):
@@ -223,7 +244,13 @@ def _kpad_gemm(packed_weight, flat, k_pad):
     return out
 
 
-def _kpad_probe(raw, packed, k_pad):
+def _kpad_probe(
+    raw,
+    packed,
+    k_pad,
+    rows_env_name="SGLANG_KUNPENG_KPAD_GEMM_PROBE_ROWS",
+    rows_default="1600,4096",
+):
     """In-service startup A/B: F.linear vs the K-padded packed GEMM.
 
     Times the exact runtime callable (pad + pack + gemm) and prints one
@@ -234,24 +261,26 @@ def _kpad_probe(raw, packed, k_pad):
     n, k = tuple(raw.shape)
     # Surface the tiling this variant runs with; the tasks field makes any
     # violation of the 32-pair contract visible at a glance.
-    try:
-        _, tn, tk = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(1, n, k_pad)
-        print(
-            f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} tiling tn={tn}"
-            f" tk={tk} tasks={(n // tn) * (k_pad // tk)}",
-            flush=True,
-        )
-    except RuntimeError:
-        pass
-    rows_env = os.environ.get(
-        "SGLANG_KUNPENG_KPAD_GEMM_PROBE_ROWS", "1600,4096"
-    ).strip()
+    if _kpad_probe_verbose():
+        try:
+            _, tn, tk = torch.ops.sgl_kernel.bgemm_find_optimal_tiling_plan(
+                1, n, k_pad
+            )
+            print(
+                f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} tiling tn={tn}"
+                f" tk={tk} tasks={(n // tn) * (k_pad // tk)}",
+                flush=True,
+            )
+        except RuntimeError:
+            pass
+    rows_env = os.environ.get(rows_env_name, rows_default).strip()
     rows = [int(p) for p in rows_env.split(",") if p.strip().isdigit() and int(p) > 0]
     if not rows:
-        print(
-            f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} probe 跳过 -> 直接启用",
-            flush=True,
-        )
+        if _kpad_probe_verbose():
+            print(
+                f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} probe 跳过 -> 直接启用",
+                flush=True,
+            )
         return True
     # Match the serving thread count so the F.linear baseline is not
     # measured with a different global pool than at runtime.
@@ -300,13 +329,14 @@ def _kpad_probe(raw, packed, k_pad):
         t_gemm = (time.perf_counter() - t0) / 3 * 1e3
         ok = err <= 5e-3 and t_gemm < t_lin
         use = use and ok
-        print(
-            f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} m={m}:"
-            f" F.linear={t_lin:.1f}ms bgemm={t_gemm:.1f}ms"
-            f" ({t_lin / t_gemm:.2f}x) err={err:.1e} merr={merr:.1e}"
-            f" -> {'启用' if ok else '回退'}",
-            flush=True,
-        )
+        if _kpad_probe_verbose():
+            print(
+                f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} m={m}:"
+                f" F.linear={t_lin:.1f}ms bgemm={t_gemm:.1f}ms"
+                f" ({t_lin / t_gemm:.2f}x) err={err:.1e} merr={merr:.1e}"
+                f" -> {'启用' if ok else '回退'}",
+                flush=True,
+            )
     return use
 
 
@@ -320,36 +350,73 @@ def _kpad_setup(layer):
     n, k = tuple(layer.weight.shape)
     if layer.weight.dtype != torch.bfloat16:
         return
+    # The merger shards probe at their own merged row counts; every other
+    # target keeps the patch-count rows.
+    merger_rows = (
+        ("SGLANG_KUNPENG_MERGER_BF16_GEMM_PROBE_ROWS", "400,1024")
+        if (n, k) in _MERGER_BF16_TARGETS
+        else None
+    )
     if (n, k) in _kpad_probe_cache:
         use, k_pad = _kpad_probe_cache[(n, k)]
     else:
         raw = layer.weight.detach()
-        # Rungs: the next even 16-aligned K and the next 32-aligned K
-        # (269 -> 272 and 288). A full-K 32-task plan needs tile_n = N/32
-        # to be an integer and tile_k = k_pad even, which both rungs give
-        # for the target shapes.
-        rungs = [((k + 15) // 16) * 16, ((k + 31) // 32) * 32]
+        # Rungs: a 16-aligned K enters unpadded first (the vision merger
+        # shards - the 32-task plan only needs an even tile_k), then the
+        # next 16- and 32-aligned K for odd/prime shards (269 -> 272 and
+        # 288). A full-K 32-task plan needs tile_n = N/32 to be an
+        # integer and tile_k = k_pad even, which the padded rungs give
+        # for the block fc2 target.
+        rungs = [k] if k % 16 == 0 else []
+        rungs += [((k + 15) // 16) * 16, ((k + 31) // 32) * 32]
         use, k_pad = False, None
-        for cand_pad in dict.fromkeys(r for r in rungs if r > k):
-            cand = torch.nn.functional.pad(raw, (0, cand_pad - k))
+        for cand_pad in dict.fromkeys(r for r in rungs if r >= k):
+            cand = (
+                raw.clone()
+                if cand_pad == k
+                else torch.nn.functional.pad(raw, (0, cand_pad - k))
+            )
             try:
                 torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(cand, 1)
             except RuntimeError as e:
-                print(
-                    f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={cand_pad}"
-                    f" prepack 无可用 tiling"
-                    f"（{' '.join(str(e).split())[:72]}）",
-                    flush=True,
-                )
+                if _kpad_probe_verbose():
+                    print(
+                        f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={cand_pad}"
+                        f" prepack 无可用 tiling"
+                        f"（{' '.join(str(e).split())[:72]}）",
+                        flush=True,
+                    )
                 continue
-            if _kpad_probe(raw, cand, cand_pad):
+            if merger_rows is not None:
+                ok = _kpad_probe(raw, cand, cand_pad, *merger_rows)
+            else:
+                ok = _kpad_probe(raw, cand, cand_pad)
+            if ok:
                 use, k_pad = True, cand_pad
                 break
         _kpad_probe_cache[(n, k)] = (use, k_pad)
+        # One verdict line per unique shape per process; repeated shards
+        # of the same shape hit the cache above and stay silent. The
+        # tiling and per-row evidence sit behind
+        # SGLANG_KUNPENG_KPAD_GEMM_VERBOSE.
+        if use:
+            print(
+                f"[kunpeng-kpad-gemm] n={n} k={k} pad_k={k_pad} -> bgemm 执行",
+                flush=True,
+            )
+        else:
+            print(
+                f"[kunpeng-kpad-gemm] n={n} k={k} -> F.linear 执行",
+                flush=True,
+            )
     if not use:
         return
     raw = layer.weight.detach()
-    packed = torch.nn.functional.pad(raw, (0, k_pad - k))
+    packed = (
+        raw.clone()
+        if k_pad == k
+        else torch.nn.functional.pad(raw, (0, k_pad - k))
+    )
     torch.ops.sgl_kernel.bf16_gemm_prepack_kunpeng(packed, 1)
     layer._kunpeng_kpad_weight = packed
     layer._kunpeng_kpad_pad = k_pad
