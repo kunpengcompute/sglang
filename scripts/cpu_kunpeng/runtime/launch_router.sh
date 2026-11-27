@@ -27,11 +27,11 @@ SKIP_CONDA=1 source "$SCRIPT_DIR/env.sh" router
 
 sh "$SCRIPT_DIR/stop.sh" router
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$LOG_ENV_DIR" "$LOG_SSH_DIR" "$LOG_RUNTIME_DIR"
 
 # Resolve a role's master address in its own env.sh subshell (the role /
 # instance env may override the base value). The subshell's stderr is kept in
-# <log>/router_env_<role>[_<inst>].log instead of being dropped: a broken or
+# <log>/env/router_env_<role>[_<inst>].log instead of being dropped: a broken or
 # incomplete role env then fails here with a readable error, instead of
 # surfacing 20 minutes later as ":30000 failed to start".
 _resolve_master_addr() {
@@ -40,7 +40,7 @@ _resolve_master_addr() {
         prefill) _var="PREFILL_MASTER_ADDR" ;;
         decode)  _var="DECODE_MASTER_ADDR" ;;
     esac
-    _log="$LOG_DIR/router_env_${_role}${_inst:+_$_inst}.log"
+    _log="$LOG_ENV_DIR/router_env_${_role}${_inst:+_$_inst}.log"
     _addr="$(SKIP_CONDA=1 bash -c "
         source '$SCRIPT_DIR/env.sh' '$_role' '$_inst' >/dev/null
         echo \"\$$_var\"" 2>"$_log")"
@@ -152,7 +152,7 @@ done
 echo "[$(date +%T)] ===== Prefill and decode servers ready ====="
 
 # "<base>/latest/router" -> this run's router dir
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$LOG_ENV_DIR" "$LOG_SSH_DIR" "$LOG_RUNTIME_DIR"
 mkdir -p "$LOG_BASE_DIR/latest"
 ln -sfn "$LOG_DIR" "$LOG_BASE_DIR/latest/router"
 
@@ -161,11 +161,11 @@ echo "[$(date +%T)] Launching gateway on $ROUTER_IP"
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
     "$(ssh_target "$ROUTER_IP")" \
     "cd \"$PWD\" && bash runtime/server_router.sh \"$LOG_DIR\"" \
-    >"$LOG_DIR/ssh_router.log" 2>&1 &
+    >"$LOG_SSH_DIR/ssh_router.log" 2>&1 &
 
 echo "Gateway launched."
 
-rank0_log_file="$LOG_DIR/router_${ROUTER_IP}.log"
+rank0_log_file="$LOG_RUNTIME_DIR/router_${ROUTER_IP}.log"
 echo "Log file of rank_0: $rank0_log_file"
 
 # ---- End-to-end smoke check through the gateway -------------------------

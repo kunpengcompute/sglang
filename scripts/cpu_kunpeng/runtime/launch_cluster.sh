@@ -58,7 +58,7 @@ cd "$SCRIPT_DIR"
 # Exports NODE_IPS_LIST, CONDA_ACTIVATE_CMD, WORLD_SIZE, etc.
 source "$SCRIPT_DIR/env.sh" "$ROLE" "$INSTANCE" || exit 1
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$LOG_ENV_DIR" "$LOG_SSH_DIR" "$LOG_RUNTIME_DIR"
 # "<base>/latest/<role>[_<instance>]" -> this run's role dir, so the current
 # run is reachable without knowing its date/time. LOG_SUBDIR is
 # instance-qualified ("prefill" / "prefill_128p") so same-role instances
@@ -81,7 +81,7 @@ for i in "${!NODES[@]}"; do
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
         "$(ssh_target "$node_ip")" \
         "cd \"$PWD\" && bash runtime/server_cluster.sh \"$ROLE\" \"$node_rank\" \"$LOG_DIR\" \"$INSTANCE\"" \
-        >"$LOG_DIR/ssh_${ROLE}_rank${node_rank}.log" 2>&1 &
+        >"$LOG_SSH_DIR/ssh_${ROLE}_rank${node_rank}.log" 2>&1 &
 done
 
 echo "All $ROLE nodes launched."
@@ -89,9 +89,9 @@ echo "All $ROLE nodes launched."
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     # Binary launch names each log by its true rank (see runtime/server_cluster.sh):
     # pp{pp}_dp{dp}_tp{tp}_{ip}.log. Rank 0 = node 0, rank-in-node 0 = pp0/dp0/tp0.
-    rank0_log_file="$LOG_DIR/pp0_dp0_tp0_${NODES[0]}.log"
+    rank0_log_file="$LOG_RUNTIME_DIR/pp0_dp0_tp0_${NODES[0]}.log"
 else
-    rank0_log_file="$LOG_DIR/0_${NODES[0]}.log"
+    rank0_log_file="$LOG_RUNTIME_DIR/0_${NODES[0]}.log"
 fi
 
 echo "Log file of rank_0: $rank0_log_file"

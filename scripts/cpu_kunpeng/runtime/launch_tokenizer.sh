@@ -49,9 +49,9 @@ source "$SCRIPT_DIR/env.sh" tokenizer "${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE
 
 # "<base>/latest/<role>[_<instance>]" -> this run's role dir. All tokenizer
 # instances share the "tokenizer/" LOG_SUBDIR: their log files
-# (ssh_tokenizer_*, env_tokenizer_*, tokenizer_*_http.log) already carry the
-# side/instance in their names.
-mkdir -p "$LOG_DIR"
+# (ssh/, env/, runtime/ sub-dirs) already carry the side/instance in their
+# names.
+mkdir -p "$LOG_DIR" "$LOG_ENV_DIR" "$LOG_SSH_DIR" "$LOG_RUNTIME_DIR"
 mkdir -p "$LOG_BASE_DIR/latest"
 ln -sfn "$LOG_DIR" "$LOG_BASE_DIR/latest/$LOG_SUBDIR"
 sh "$SCRIPT_DIR/stop.sh" tokenizer "${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}"
@@ -60,7 +60,7 @@ echo "[$(date +%T)] Launching $TOK_SIDE${TOK_INSTANCE:+ ($TOK_INSTANCE)} tokeniz
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
     "$(ssh_target "$ROUTER_IP")" \
     "cd \"$PWD\" && bash runtime/server_tokenizer.sh \"$TOK_SIDE\" \"$LOG_DIR\" \"$TOK_INSTANCE\"" \
-    >"$LOG_DIR/ssh_tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_${TOK_INSTANCE}}.log" 2>&1 &
+    >"$LOG_SSH_DIR/ssh_tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_${TOK_INSTANCE}}.log" 2>&1 &
 
 echo "Tokenizer launched. The remote script polls until the port is ready."
 
@@ -68,7 +68,7 @@ if [[ "${SKIP_LOG:-0}" == "1" ]]; then
     exit 0
 fi
 
-rank0_log_file="$LOG_DIR/tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}_http.log"
+rank0_log_file="$LOG_RUNTIME_DIR/tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}_http.log"
 echo "Log file of rank_0: $rank0_log_file"
 
 while [ ! -f "$rank0_log_file" ]; do

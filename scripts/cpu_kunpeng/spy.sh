@@ -89,13 +89,17 @@ echo "NODE_IPS (${#NODE_IPS[@]}) = ${NODE_IPS[*]}"
 PYSPY="$CONDA_ENV_PATH/bin/py-spy"
 
 # ------------------------------------------------------------
-# Dump (each run goes into a timestamped subfolder; keep history)
+# Dump into this run's log dir (runtime/pyspy) so the dumps sit
+# next to the logs of the run they were taken from.
+# ROLE=all spans both roles, so it has no single runtime dir -> use the run dir.
 # ------------------------------------------------------------
-DUMP_ROOT="$SGLANG_PATH/logs/dump_file"
+if [[ "$ROLE" == "all" ]]; then
+    DUMP_ROOT="$LOG_RUN_DIR/pyspy"
+else
+    DUMP_ROOT="$LOG_RUNTIME_DIR/pyspy"
+fi
 mkdir -p "$DUMP_ROOT"
-STAMP="$(date +%m%d_%H%M)"
-DUMP_DIR="$DUMP_ROOT/$STAMP"
-mkdir -p "$DUMP_DIR"
+DUMP_DIR="$DUMP_ROOT"
 echo "Dump files -> $DUMP_DIR"
 
 for ip in "${NODE_IPS[@]}"; do
