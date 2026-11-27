@@ -12,27 +12,11 @@ def image_decode_graph_enabled():
     # three components (ForwardBatch._expand_mrope_from_input), so fused
     # kernels that read one position per token row stay correct for image
     # requests while decoding. PREFILL must remain excluded: image prefill
-    # positions have genuinely distinct t/h/w rows. The graph gate
-    # (graph_provider.py) and the use_native_batch gate (qwen3_5.py) must
-    # always flip together because decode graphs share one cache key, hence
-    # a single env for both. Opt out with SGLANG_KUNPENG_GRAPH_IMAGE_DECODE=0.
+    # positions have genuinely distinct t/h/w rows. After the upstream
+    # v0.5.11 refresh the fused use_native_batch path in qwen3_5.py is
+    # unconditional, so this env governs only the decode graph gate
+    # (graph_provider.py). Opt out with SGLANG_KUNPENG_GRAPH_IMAGE_DECODE=0.
     return os.environ.get("SGLANG_KUNPENG_GRAPH_IMAGE_DECODE", "1") != "0"
-
-
-def mrope_section_rope_enabled():
-    # Route the fused qwen_qknorm_rope kernel through the M-RoPE entry that
-    # reads all three position components and rotates each mrope_section
-    # with its own component. Historically the fused kernel read one position
-    # per token row (the t component of the [3, S] M-RoPE tensor): exact for
-    # text and decode traffic (components equal), but image prefill rows have
-    # genuinely distinct t/h/w, so their h/w sections rotated with the
-    # constant t phase. With this enabled the image prefill rotation matches
-    # the Python MRotaryEmbedding path; text and decode stay bit-identical to
-    # the legacy kernel because their components agree. The dispatch is
-    # model-static (config mrope_section), so captured graphs stay
-    # structurally stable. Opt out with SGLANG_KUNPENG_MROPE_SECTION_ROPE=0
-    # to restore the legacy single-component behavior.
-    return os.environ.get("SGLANG_KUNPENG_MROPE_SECTION_ROPE", "1") != "0"
 
 
 def image_prefill_graph_enabled():
@@ -54,7 +38,7 @@ def image_prefill_graph_enabled():
 def configure_hbw_shm():
     """Select the existing split HBM budget before communication creates SHM."""
     if not (enabled() and os.environ.get("SGLANG_ENABLE_HBW_POOL") == "1"
-            and os.environ.get("KUPL_SHM_TYPE") == "posix"):
+            and os.environ.get("KUPL_SHM_TYPE") == "sls"):
         return
     budget = os.environ.get("SGLANG_KUNPENG_WEIGHTS_HBW_POOL_SIZE_MB", "4000")
     if budget != "4000" and "SGLANG_KUNPENG_SHARED_HBW_BACKING" not in os.environ:
@@ -62,12 +46,7 @@ def configure_hbw_shm():
     mode = os.environ.setdefault("SGLANG_KUNPENG_SHARED_HBW_BACKING", "split")
     if mode != "split":
         return
-    os.environ.setdefault("KUPL_SHM_ON_PACKAGE", "n")
-    os.environ.setdefault("KUPL_SHM_ENABLE_HUGEPAGE", "n")
-    os.environ.setdefault(
-        "SGLANG_KUNPENG_SHARED_HBW_TOTAL_MIB",
-        budget,
-    )
+    os.environ.setdefault("SGLANG_KUNPENG_SHARED_HBW_TOTAL_MIB", budget)
     prefill = os.environ.get("IS_PREFILL", "1") == "1"
     size_env = ("SGLANG_KUNPENG_PREFILL_SHM_SIZE_MB" if prefill
                 else "SGLANG_KUNPENG_DECODE_SHM_SIZE_MB")

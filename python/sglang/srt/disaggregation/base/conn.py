@@ -24,6 +24,14 @@ class KVArgs:
     state_data_lens: List[int]
     state_item_lens: List[int]
     state_type: str  # "none", "mamba", "swa"
+    # fp8 (e4m3) index-K pools only: per-layer ue8m0 scale-byte buffers,
+    # parallel to state_data_* (one entry per layer, layer-aligned, so the
+    # PD layer mapping and layer sharding slice both lists identically).
+    # Item granularity is one page (page_size scale bytes: 1 B/token).
+    # Empty lists for non-fp8 pools -- callers skip the scale pass entirely.
+    state_scale_data_ptrs: List[int]
+    state_scale_data_lens: List[int]
+    state_scale_item_lens: List[int]
     # for mamba state different tp slice transfer
     state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
     ib_device: str

@@ -270,6 +270,14 @@ class ModelSlimConfig(QuantizationConfig):
                 raise ValueError(
                     f"CPU920F requires W8A8_DYNAMIC, got {mode!r} for {prefix}"
                 )
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.checkpoint_quantization import (
+                requires_padded_ba_scheme,
+            )
+
+            if requires_padded_ba_scheme(prefix):
+                from sglang.srt.layers.quantization.modelslim.schemes.cpu920f_padded_ba_w8a8 import CPU920FPaddedBAW8A8Dynamic
+
+                return CPU920FPaddedBAW8A8Dynamic(self.quant_description, prefix)
             return CPU920FModelSlimW8A8Dynamic(self.quant_description, prefix)
 
         linear_quant_schemes = [

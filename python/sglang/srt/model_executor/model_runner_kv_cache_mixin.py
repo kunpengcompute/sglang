@@ -545,11 +545,20 @@ class ModelRunnerKVCacheMixin:
                 )
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
             elif _is_cpu_920f:
-                # Kunpeng 920F: flat bf16 index-K pool; shared (skip-topk)
-                # layers get no index-K buffer.
+                # Kunpeng 920F: flat index-K pool (bf16 or fp8 e4m3 with
+                # SGLANG_KUNPENG_INDEXER_K_FP8); shared (skip-topk) layers
+                # get no index-K buffer.
                 from sglang.srt.hardware_backend.cpu_kunpeng.memory_pool_kunpeng import (
                     KunpengNSATokenToKVPool,
                 )
+
+                # fp8 index-K + PD disaggregation is supported: the codes
+                # transfer via get_state_buf_infos (one entry per layer) and
+                # the per-token ue8m0 scale bytes via the parallel
+                # get_state_scale_buf_infos list, both sliced identically by
+                # the PD layer mapping. The transfer is raw bytes, so a
+                # prefill/decode flag mismatch is rejected per-request at
+                # registration time (see maybe_send_extra).
 
                 kunpeng_kwargs = {
                     k: v for k, v in nsa_pool_kwargs.items() if k != "kv_cache_dim"

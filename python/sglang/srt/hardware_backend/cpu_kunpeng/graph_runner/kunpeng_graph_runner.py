@@ -209,6 +209,13 @@ class KunpengGraphRunner:
 
     def init_swap_buffers(self):
         """Initialize HBM swap buffers for expert weights and KV cache."""
+        from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled
+
+        if enabled():
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.backend import prepare_gqa_swap
+
+            prepare_gqa_swap(self.model_runner)
+            return
         if getattr(self.model_runner, "borrowed_qwen_target_runner", None) is not None:
             if (
                 self.swap_mgr.enable_swap_expert
@@ -264,6 +271,8 @@ class KunpengGraphRunner:
             # Any full (non-skip-topk) layer has the same flat geometry; skip
             # layers carry None. Sized by the first runner (target/draft) like
             # the KV HBM buffer -- swap_index_k_layer fails loudly on a mismatch.
+            # dtype = index_k_dtype: uint8 e4m3 code rows with fp8 index-K (the
+            # ue8m0 scale bytes stay DDR-resident, no scale mirror).
             full_index_k = next(b for b in nsa_pool.index_k_buffer if b is not None)
             self.swap_mgr.init_index_k_buffer(
                 num_slots=full_index_k.shape[0],
@@ -325,7 +334,9 @@ class KunpengGraphRunner:
         - SGLANG_KUNPENG_HBW_RESIDENT_EXPERT_WEIGHTS=0 keeps expert weights
           in DDR (layer-wise swap path when SGLANG_KUNPENG_SWAP_EXPERT=1).
         """
-        if self.model_runner.is_draft_worker:
+        if self.model_runner.is_draft_worker and not getattr(
+            self.model_runner.model, "_kunpeng_local_mtp", False
+        ):
             if (
                 self.model_runner.server_args.disaggregation_mode == "decode"
                 and int(os.environ.get("DECODE_PP_SIZE", "1")) > 1
@@ -536,6 +547,16 @@ class KunpengGraphRunner:
             self.move_weights_to_hbw()
             initial_backing = self.weight_hbw_pool.backing_snapshot()
             self._shm_native_init_used_bytes = initial_backing.get("shm_used_bytes")
+        if getattr(self.model_runner.model, "_kunpeng_local_mtp", False):
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_pre_fc import (
+                prepare_mtp_fc,
+            )
+            from sglang.srt.hardware_backend.cpu_kunpeng.bf16_lm_head import prepare
+
+            # A PP-local Qwen draft owns these modules independently. Prepare
+            # them before the first graph fixes their storage addresses.
+            prepare_mtp_fc(self.model_runner.model, self.weight_hbw_pool)
+            prepare(self.model_runner.model.lm_head, self.weight_hbw_pool)
         if _is_kunpeng_graph_capture:
             self.init_graph_capture()
 
@@ -605,6 +626,13 @@ class KunpengGraphRunner:
                 else None
             )
 
+        # Pipeline tensor payloads carry model inputs as well as hidden/residual.
+        if pp_proxy_tensors is not None:
+            for name in ("mm_input_embeds", "mrope_positions", "input_deepstack_embeds"):
+                value = pp_proxy_tensors.tensors.get(name)
+                if value is not None:
+                    setattr(forward_batch, name, value)
+
         # Build common kwargs (mirrors forward_decode/forward_extend/forward_idle)
         kwargs: dict = {}
         if self.model_runner.support_pp:
@@ -634,7 +662,7 @@ class KunpengGraphRunner:
                 kwargs["get_embedding"] = True
 
             output = self._forward_extend(forward_batch, **kwargs)
-            return self._wrap_output(output)
+            return self._wrap_output(output, forward_batch)
 
         elif forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.forward_mode.is_idle():
@@ -690,7 +718,7 @@ class KunpengGraphRunner:
 
                 output = self._forward_decode(forward_batch, **kwargs)
 
-            return self._wrap_output(output)
+            return self._wrap_output(output, forward_batch)
 
         # Unsupported mode – should not reach here
         raise ValueError(
@@ -701,19 +729,29 @@ class KunpengGraphRunner:
     @staticmethod
     def _wrap_output(
         output: Union[PPProxyTensors, LogitsProcessorOutput, tuple],
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         """Normalise output into LogitsProcessorOutput or PPProxyTensors.
 
         Graph mode returns (logits, hidden_states) tuples; eager mode returns
         LogitsProcessorOutput directly.
         """
-        if isinstance(output, (LogitsProcessorOutput, PPProxyTensors)):
-            return output
-        # Graph mode: (logits, hidden_states) tuple
-        logits, hidden_states = output
-        return LogitsProcessorOutput(
-            next_token_logits=logits, hidden_states=hidden_states
-        )
+        if not isinstance(output, (LogitsProcessorOutput, PPProxyTensors)):
+            logits, hidden_states = output
+            output = LogitsProcessorOutput(
+                next_token_logits=logits, hidden_states=hidden_states
+            )
+        # Sideband model inputs are external storages, not graph-produced
+        # intermediates. Reattach the current forward's tensors after replay.
+        if forward_batch is not None:
+            if isinstance(output, PPProxyTensors):
+                for name in ("mm_input_embeds", "mrope_positions", "input_deepstack_embeds"):
+                    value = getattr(forward_batch, name, None)
+                    if value is not None:
+                        output.tensors[name] = value
+            else:
+                output.mm_input_embeds = getattr(forward_batch, "mm_input_embeds", None)
+        return output
 
     # ── Mode-specific forward (internal) ─────────────────────────────────
 
@@ -1340,7 +1378,17 @@ class KunpengGraphRunner:
         backend = self._resolve_attn_backend(self.model_runner, forward_batch)
         if hasattr(backend, "get_graph_inputs"):
             self._graph_bindings = None
-            return backend.get_graph_inputs(forward_batch)
+            inputs = list(backend.get_graph_inputs(forward_batch))
+            proxy = kwargs.get("pp_proxy_tensors")
+            if self.model_runner.support_pp and proxy is not None:
+                seen = {tensor.untyped_storage().data_ptr() for tensor in inputs}
+                for tensor in proxy.tensors.values():
+                    if isinstance(tensor, torch.Tensor):
+                        base = tensor.untyped_storage().data_ptr()
+                        if base not in seen:
+                            inputs.append(tensor)
+                            seen.add(base)
+            return inputs
         provider = self._provider_for_forward()
         if provider is not None:
             with self._forward_hbw_scope():
@@ -1663,6 +1711,16 @@ class KunpengGraphRunner:
             for buf in index_k_buffers:
                 if buf is not None:
                     fixed.append(buf)
+        # FP8 (e4m3) index-K storage: the per-token ue8m0 scale-byte buffers
+        # are a separate pool array and must be captured just like the code
+        # buffers.
+        index_k_scale_buffers = getattr(
+            self.model_runner.token_to_kv_pool, "index_k_scale_buffer", None
+        )
+        if index_k_scale_buffers:
+            for buf in index_k_scale_buffers:
+                if buf is not None:
+                    fixed.append(buf)
         indexer_ws = getattr(attn_backend, "indexer_workspace", None)
         if indexer_ws is not None:
             fixed.append(indexer_ws)
@@ -1968,6 +2026,10 @@ class KunpengGraphRunner:
             if _spec_info is not None
             else None
         )
+        graph_cache_key += (tuple(
+            (tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype))
+            for tensor in inputs
+        ),)
         if self._graph_bindings is not None:
             graph_cache_key += (self._graph_bindings.cache_signature(),)
 

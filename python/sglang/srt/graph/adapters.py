@@ -942,6 +942,23 @@ def _setup_kupl_sdma_kv_swapin():
     register_op("kupl_sdma_kv_swapin", shape_infer, eager_fn)
 
 
+def _setup_kupl_sdma_gqa_pages():
+    def shape_infer(*args):
+        return []
+
+    # Separate Qwen opt-in operations; default/DeepSeek operations are unchanged.
+    for name in (
+        "kupl_sdma_gqa_prepare_pages", "kupl_sdma_gqa_copy_pages",
+        "qwen_draft_reuse_prepare", "qwen_draft_reuse_commit",
+        "qwen_draft_reuse_invalidate", "qwen_draft_reuse_prepare_v2",
+        "qwen_draft_reuse_commit_v2",
+    ):
+        def eager(*args, _name=name, **kwargs):
+            return getattr(torch.ops.sgl_kernel, _name)(*args, **kwargs)
+
+        register_op(name, shape_infer, eager)
+
+
 def _setup_kupl_sdma_kv_block_swapin():
     def shape_infer(
         dst_hbm,
@@ -1533,6 +1550,46 @@ def _setup_paged_mqa_logits_topk_kunpeng():
     register_op('paged_mqa_logits_topk_kunpeng', shape_infer, eager_fn)
 
 
+def _setup_paged_mqa_logits_topk_fp8_kunpeng():
+    # Real DSA indexer scoring kernel (kutacc, fp8 e4m3 index-K cache): the
+    # decoded codes are exact in bf16 and the per-slot ue8m0 scale (2^(b-127),
+    # decoded from one byte) folds after the head sum inside the kernel; q /
+    # weight stay bf16. Same direct-write / scheduling / row-window contract
+    # as the bf16 op, with the k_scale [num_slots] tensor inserted after
+    # cur_kv_cache.
+    def shape_infer(q, cur_kv_cache, k_scale, weight, block_tables, seq_lens,
+                    cur_lens, output, workspace, topk, output_coord, mode,
+                    row_start, row_rows):
+        return []
+
+    def eager_fn(q, cur_kv_cache, k_scale, weight, block_tables, seq_lens,
+                 cur_lens, output, workspace, topk, output_coord, mode,
+                 row_start, row_rows):
+        torch.ops.sgl_kernel.paged_mqa_logits_topk_fp8_kunpeng(
+            q, cur_kv_cache, k_scale, weight, block_tables, seq_lens,
+            cur_lens, output, workspace, topk, output_coord, mode,
+            row_start, row_rows)
+        return None
+
+    register_op('paged_mqa_logits_topk_fp8_kunpeng', shape_infer, eager_fn)
+
+
+def _setup_set_index_k_fp8_buffer_kunpeng():
+    # DSA indexer store-side fp8 quantization: bf16 rows [T, D] -> e4m3 codes
+    # scattered into the uint8 pool buffer at slots `loc` (loc < 0 skipped,
+    # graph-replay safe) plus one ue8m0 scale byte per token at the same slot
+    # (2^ceil(log2(amax/448)) as 2^(b-127); byte 0 -> 0.0f).
+    def shape_infer(kv_buffer, k_scale_buffer, loc, cache_k):
+        return []
+
+    def eager_fn(kv_buffer, k_scale_buffer, loc, cache_k):
+        torch.ops.sgl_kernel.set_index_k_fp8_buffer_kunpeng(
+            kv_buffer, k_scale_buffer, loc, cache_k)
+        return None
+
+    register_op('set_index_k_fp8_buffer_kunpeng', shape_infer, eager_fn)
+
+
 def _setup_batched_bgemm_kunpeng():
     # SME bf16 batched GEMM for the bf16 kv_b_proj MLA absorb path (e.g.
     # GLM-5): out = input @ weight^T per batch item. weight is the
@@ -1857,6 +1914,7 @@ def setup():
     _setup_moe_local_sum_kunpeng()
     _setup_kupl_sdma_memcpy_chunked()
     _setup_kupl_sdma_kv_swapin()
+    _setup_kupl_sdma_gqa_pages()
     _setup_kupl_sdma_kv_block_swapin()
     _setup_kupl_sdma_wait_all()
     _setup_kupl_sdma_set_kv_buffer()
@@ -1875,6 +1933,8 @@ def setup():
     _setup_fake_indexer_topk_kunpeng()
     _setup_fake_indexer_topk_mtp_kunpeng()
     _setup_paged_mqa_logits_topk_kunpeng()
+    _setup_paged_mqa_logits_topk_fp8_kunpeng()
+    _setup_set_index_k_fp8_buffer_kunpeng()
     _setup_batched_bgemm_kunpeng()
     _setup_batched_bgemm_inplace_kunpeng()
     _setup_shm_mla_o_alltoall_long_context_kunpeng()

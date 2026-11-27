@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.check_dependencies import check as check_dependencies
-from tools.runtime_contract import environment, sha256, snapshot, verify_payload
+from tools.runtime_contract import environment, sha256, snapshot, verify_payload, verify_kernel_source
 
 
 def copy_tree(source, target):
@@ -30,11 +30,7 @@ def build(kit, deploy):
         raise RuntimeError('先从源码完成 build.sh')
     if Path(kernel_build['kernel_root']).resolve() != Path(env['KERNEL_PACKAGE_ROOT']).resolve():
         raise RuntimeError('算子输入不是本次源码构建输出')
-    if kernel_build['source_commit'] != subprocess.check_output(
-            ['git', '-C', env['SGLANG_SOURCE'], 'rev-parse', 'HEAD'], text=True).strip():
-        raise RuntimeError('构建记录与当前源码commit不匹配，不复用旧kernel')
-    subprocess.run(['git', '-C', env['SGLANG_SOURCE'], 'diff', '--quiet', 'HEAD', '--',
-                    'python', 'sgl-kernel'], check=True)
+    verify_kernel_source(env['SGLANG_SOURCE'], kernel_build)
     for key, library in [('KUTACC_PREFIX', 'libkutacc.so'), ('KUPL_PREFIX', 'libkupl.so')]:
         if sha256(Path(env[key])/'lib'/library) != kernel_build['dependencies'][key]['sha256']:
             raise RuntimeError('SDK与原构建记录不匹配：' + key)
@@ -52,7 +48,7 @@ def build(kit, deploy):
         stage.mkdir()
         for name in ('run.sh', 'start.py', 'config.example.sh', 'README.md', 'VERSION.json'):
             shutil.copy2(kit / name, stage / name)
-        shutil.copy2(env['QWEN_CONFIG_PATH'], stage / 'config.sh')
+        shutil.copy2(env['DEPLOY_CONFIG'], stage / 'config.sh')
         copy_tree(kit / 'tools', stage / 'tools')
         shutil.copy2(receipt, stage / 'KERNEL_BUILD.json')
         (stage / 'app/sglang/python').mkdir(parents=True)
@@ -92,9 +88,9 @@ def build(kit, deploy):
         # The external config remains editable and outside payload integrity checks.
         config = (stage / 'config.sh').read_text()
         config = config.replace('export SGLANG_SOURCE="/请填写/sglang"',
-                                'export SGLANG_SOURCE="${QWEN_KIT}/app/sglang"')
+                                'export SGLANG_SOURCE="${DEPLOY_TOOLS}/app/sglang"')
         config = config.replace('export KERNEL_PACKAGE_ROOT=""',
-                                'export KERNEL_PACKAGE_ROOT="${QWEN_KIT}/app/kernel"')
+                                'export KERNEL_PACKAGE_ROOT="${DEPLOY_TOOLS}/app/kernel"')
         (stage / 'config.sh').write_text(config)
         manifest = {str(p.relative_to(stage)): sha256(p) for p in sorted(stage.rglob('*'))
                     if p.is_file() and p != stage / 'config.sh'}
@@ -103,7 +99,7 @@ def build(kit, deploy):
         release = deploy / 'release'
         stage.rename(release)
     # NUMA images reference the final frozen app, never a temporary staging path.
-    image_env = dict(env, QWEN_KIT=str(release),
+    image_env = dict(env, DEPLOY_TOOLS=str(release),
                      SGLANG_SOURCE=str(release / 'app/sglang'),
                      KERNEL_PACKAGE_ROOT=str(release / 'app/kernel'))
     image_env['PYTHONPATH'] = str(release / 'app/sglang/python') + ':' + str(release / 'app/kernel')
@@ -124,7 +120,9 @@ def build(kit, deploy):
                 stderr=subprocess.STDOUT, check=True)
         result['phase'] = 'COMPLETE'
     except BaseException as error:
-        result.update(phase='FAILED', error=repr(error))
+        result.update(phase='FAILED', error=repr(error), log=str(logs / 'numa_images.log'))
+        if isinstance(error, subprocess.CalledProcessError):
+            raise RuntimeError('NUMA副本准备失败，详细日志：' + str(logs / 'numa_images.log')) from error
         raise
     finally:
         receipt_path.write_text(json.dumps(result, indent=2) + '\n')
@@ -132,4 +130,4 @@ def build(kit, deploy):
 
 
 if __name__ == '__main__':
-    build(Path(os.environ['QWEN_KIT']), Path(os.environ['DEPLOY_DIR']).expanduser().resolve())
+    build(Path(os.environ['DEPLOY_TOOLS']), Path(os.environ['DEPLOY_DIR']).expanduser().resolve())

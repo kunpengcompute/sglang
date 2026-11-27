@@ -96,6 +96,19 @@ void shm_allreduce_init_kunpeng(int64_t max_num_elements)
 
     extra_buffers.resize(intra_node_size);
 
+    // kutacc::shm_allreduce_request_create requires max_num_elements to be a
+    // multiple of 8 * num_threads (its intra-kernel split granularity). The
+    // python side passes max_tokens * SHM_ALIGN_SIZE with SHM_ALIGN_SIZE=7168
+    // (2^10 * 7): always divisible when kupl executors are a power of two
+    // (e.g. 32), but not when the count carries an odd factor (e.g. 38 ->
+    // 8 * 38 = 304 = 16 * 19 and 4096 * 7168 % 304 != 0). Round UP to the
+    // next multiple: capacity grows by < one granularity unit and nothing
+    // else consumes max_num_elements.
+    const int64_t granularity = 8 * kutacc::get_thread_num();
+    if (granularity > 0 && max_num_elements % granularity != 0) {
+        max_num_elements = ((max_num_elements + granularity - 1) / granularity) * granularity;
+    }
+
     kutacc::shm_allreduce_request_create(intra_node_rank, intra_node_size, static_cast<size_t>(max_num_elements),
                                          kutacc::SHM_DATATYPE_BFLOAT16, extra_buffer_size, g_ar_request);
     std::cout << "[KuTACC] AllReduce extra_buffer_size = " << extra_buffer_size << std::endl;
@@ -114,7 +127,7 @@ void shm_allreduce_init_kunpeng(int64_t max_num_elements)
 
     g_ar_initialized = true;
     std::cout << "[KuTACC] AllReduce initialized, rank=" << intra_node_rank << ", size=" << intra_node_size
-              << std::endl;
+              << ", max_num_elements=" << max_num_elements << std::endl;
 }
 
 // ── shm_allreduce_naive ──────────────────────────────────────────────────

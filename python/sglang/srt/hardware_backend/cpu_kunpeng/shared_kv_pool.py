@@ -132,12 +132,18 @@ POOL_ROLE_DRAFT: str = "draft"
 
 #: Bumped whenever the byte layout changes; part of the shm name AND the header,
 #: so a stale segment from an older build is never attached.
-_LAYOUT_VERSION: int = 2
+#: v3: the fp8 index-K segment (uint8 e4m3 codes) carries a separate per-token
+#: ue8m0 scale-byte region after the code region (index_k_scale_bytes header
+#: field).
+_LAYOUT_VERSION: int = 3
 
 #: Reserved header area at the start of the segment; data starts after it.
 _HEADER_SIZE: int = 4096
 _MAGIC: bytes = b"SGLKVS01"
-_HEADER_VERSION: int = 1
+# v2: adds index_k_scale_bytes (the fp8 index-K segment carries a separate
+# per-token scale region -- ue8m0 scale bytes, see layout v3 -- after the
+# code region).
+_HEADER_VERSION: int = 2
 
 _DTYPE_CANDIDATES: Tuple[Tuple[str, int], ...] = (
     ("bfloat16", 1),
@@ -163,6 +169,7 @@ _HEADER_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("total_bytes", "Q"),
     ("kv_buffer_bytes", "Q"),
     ("index_k_bytes", "Q"),
+    ("index_k_scale_bytes", "Q"),
     ("num_slots", "I"),
     ("page_size", "I"),
     ("layer_num", "I"),
@@ -226,6 +233,7 @@ _HEADER_COMPARE_ORDER: Tuple[str, ...] = (
     "index_k_dtype_code",
     "kv_buffer_bytes",
     "index_k_bytes",
+    "index_k_scale_bytes",
     "total_bytes",
 )
 
@@ -517,6 +525,15 @@ class KvShareLayout:
                 f"unsupported index-K dtype {self.index_k_dtype} for the "
                 "shared pool"
             )
+        # FP8 (e4m3) index-K storage: the codes region is followed by a
+        # per-token ue8m0 scale-byte region (1 B/token). The flag lives in
+        # the header via index_k_scale_bytes > 0, so a share group with
+        # mixed SGLANG_KUNPENG_INDEXER_K_FP8 settings (or mixed fp32/ue8m0
+        # scale layouts) fails the header check loudly instead of silently
+        # misinterpreting the bytes.
+        self.index_k_is_fp8 = bool(getattr(pool, "index_k_is_fp8", False))
+        if self.index_k_is_fp8:
+            self.index_k_scale_dtype = pool.index_k_scale_dtype
         self.skip_topk_layers: List[bool] = [bool(s) for s in pool.skip_topk_layers]
         if len(self.skip_topk_layers) != self.layer_num:
             raise SharedKvPoolError(
@@ -542,6 +559,13 @@ class KvShareLayout:
             if kind == POOL_KIND_INDEXER
             else 0
         )
+        self.index_k_scale_bytes = (
+            self.num_full_layers
+            * self.num_slots
+            * self.index_k_scale_dtype.itemsize
+            if (kind == POOL_KIND_INDEXER and self.index_k_is_fp8)
+            else 0
+        )
 
         #: Bytes added per token slot of THIS kind (one page slot is used as
         #: scratch/padding, hence ``max_total_num_tokens == num_slots -
@@ -553,12 +577,22 @@ class KvShareLayout:
             else self.num_full_layers
             * self.index_head_dim
             * self.index_k_dtype.itemsize
+            + (
+                self.num_full_layers * self.index_k_scale_dtype.itemsize
+                if self.index_k_is_fp8
+                else 0
+            )
         )
         self.max_total_tokens = self.num_slots - self.page_size
 
         self.kv_offset = _HEADER_SIZE
         self.index_k_offset = _align_up(self.kv_offset + self.kv_buffer_bytes)
-        self.total_bytes = _align_up(self.index_k_offset + self.index_k_bytes)
+        self.index_k_scale_offset = _align_up(
+            self.index_k_offset + self.index_k_bytes
+        )
+        self.total_bytes = _align_up(
+            self.index_k_scale_offset + self.index_k_scale_bytes
+        )
 
         # ``sgkv`` / ``sgix`` keeps a stale segment of the other kind (or of the
         # old single-segment layout) from ever being attached.
@@ -584,6 +618,7 @@ class KvShareLayout:
             "total_bytes": self.total_bytes,
             "kv_buffer_bytes": self.kv_buffer_bytes,
             "index_k_bytes": self.index_k_bytes,
+            "index_k_scale_bytes": self.index_k_scale_bytes,
             "num_slots": self.num_slots,
             "page_size": self.page_size,
             "layer_num": self.layer_num,
@@ -618,6 +653,7 @@ class SharedKvStorage:
         "shm",
         "kv_views",
         "index_k_views",
+        "index_k_scale_views",
         "is_leader",
         "group_size",
         "group_base",
@@ -638,11 +674,17 @@ class SharedKvStorage:
         intra_group_rank: int,
         dp_rank: int,
         numa_node: int,
+        index_k_scale_views: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> None:
         self.layout = layout
         self.shm = shm
         self.kv_views = kv_views
         self.index_k_views = index_k_views
+        self.index_k_scale_views = (
+            index_k_scale_views
+            if index_k_scale_views is not None
+            else [None] * len(index_k_views)
+        )
         self.is_leader = is_leader
         self.group_size = group_size
         self.group_base = group_base
@@ -864,7 +906,7 @@ def open_shared_kv_storage(
         )
 
     try:
-        kv_views, index_views = _build_shared_views(shm, layout)
+        kv_views, index_views, index_scale_views = _build_shared_views(shm, layout)
     except BaseException:
         _release_segment(shm, created=created)
         raise
@@ -896,6 +938,7 @@ def open_shared_kv_storage(
         intra_group_rank=request.intra_group_rank,
         dp_rank=request.dp_rank,
         numa_node=int(numa_node),
+        index_k_scale_views=index_scale_views,
     )
 
 
@@ -1677,7 +1720,7 @@ def _validate_header(
 
 def _build_shared_views(
     shm: shared_memory.SharedMemory, layout: KvShareLayout
-) -> Tuple[List[torch.Tensor], List[Optional[torch.Tensor]]]:
+) -> Tuple[List[torch.Tensor], List[Optional[torch.Tensor]], List[Optional[torch.Tensor]]]:
     if layout.kind == POOL_KIND_KV:
         kv_views: List[torch.Tensor] = []
         for layer_idx in range(layout.layer_num):
@@ -1693,9 +1736,10 @@ def _build_shared_views(
             )
             kv_views.append(view)
         # One segment carries ONE kind; the other kind has its own segment.
-        return kv_views, []
+        return kv_views, [], []
 
     index_views: List[Optional[torch.Tensor]] = []
+    scale_views: List[Optional[torch.Tensor]] = []
     full_idx = 0
     for layer_idx, skip in enumerate(layout.skip_topk_layers):
         if skip:
@@ -1703,6 +1747,7 @@ def _build_shared_views(
             # either; keep the same ``None`` placeholder so the list stays
             # layer-aligned for get_state_buf_infos().
             index_views.append(None)
+            scale_views.append(None)
             continue
         shape = (layout.num_slots, layout.index_head_dim)
         offset = layout.index_k_offset + full_idx * layout.index_layer_stride
@@ -1715,8 +1760,25 @@ def _build_shared_views(
             f"index_k_buffer[{layer_idx}]",
         )
         index_views.append(view)
+        if layout.index_k_is_fp8:
+            scale_shape = (layout.num_slots,)
+            scale_stride = layout.num_slots * layout.index_k_scale_dtype.itemsize
+            scale_offset = layout.index_k_scale_offset + full_idx * scale_stride
+            scale_view = _make_view(
+                shm, scale_offset, scale_shape, layout.index_k_scale_dtype
+            )
+            _assert_view_geometry(
+                scale_view,
+                scale_shape,
+                layout.index_k_scale_dtype,
+                layout.device,
+                f"index_k_scale_buffer[{layer_idx}]",
+            )
+            scale_views.append(scale_view)
+        else:
+            scale_views.append(None)
         full_idx += 1
-    return [], index_views
+    return [], index_views, scale_views
 
 
 def _make_view(

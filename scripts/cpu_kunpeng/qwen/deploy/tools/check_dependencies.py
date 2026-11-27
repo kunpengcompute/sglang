@@ -24,6 +24,9 @@ def inspect(env):
     search = [p for p in clean.get('PYTHONPATH', '').split(':') if p]
     search += [str(p) for p in sites]
     roots = {python}
+    if env.get('SGLANG_KUNPENG_GDN_VERIFY_TILELANG') == '1':
+        sdk = Path(env['TL_ROOT']) / 'build'
+        roots.update((sdk / 'libtilelang_module.so', sdk / 'tvm/libtvm.so'))
     for key, name in [('KUTACC_PREFIX', 'libkutacc.so'), ('KUPL_PREFIX', 'libkupl.so')]:
         roots.add(Path(env[key]) / 'lib' / name)
     # PathFinder only locates packages; it does not execute their __init__.py.

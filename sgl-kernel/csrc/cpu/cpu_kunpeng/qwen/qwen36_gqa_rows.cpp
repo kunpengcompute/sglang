@@ -1,4 +1,4 @@
-// GQA row scheduling and Graph binding; arithmetic remains in the decode kernels.
+// GQA graph binding; source-only Flash-Decoding candidate, not runtime validated.
 #include <cmath>
 #include <cstdint>
 #include <kutacc.h>
@@ -90,11 +90,12 @@ extern "C" int qwen36_gqa_decode_batch(const uint16_t *q, const uint16_t *k, con
         request_slots, scale, parallel_rows, pv.data(), pv.size());
 }
 
-// Common GraphOpRegistry adapter for the independently tested row scheduler.
-extern "C" int qwen36_gqa_decode_rows_long_pv_with_workspace(
+// Preserve the public GraphOp ABI; bind this isolated source-only candidate.
+extern "C" int64_t qwen36_gqa_flash_decode_workspace_numel(int64_t, int64_t, int64_t);
+extern "C" int qwen36_gqa_flash_decode_validated_with_workspace(
     const uint16_t *, const uint16_t *, const uint16_t *, const int32_t *,
-    const int32_t *, const int32_t *, uint16_t *, float *, int64_t, int64_t,
-    int64_t, int64_t, int64_t, float, float *, int64_t);
+    const int32_t *, const int32_t *, uint16_t *, float *, int64_t,
+    int64_t, int64_t, int64_t, float);
 static std::atomic<uint64_t> calls{0}, parallel_calls{0}, fallback_calls{0};
 extern "C" uint64_t qwen_graph_gqa_rows_calls() { return calls.load(); }
 extern "C" uint64_t qwen_graph_gqa_rows_parallel_calls() { return parallel_calls.load(); }
@@ -116,11 +117,12 @@ extern "C" void qwen_graph_gqa_rows_dispatch(std::vector<at::Tensor> &t,
                 "GQA rows ranks");
     auto b = t[0].size(0), h = t[0].size(1), cap = t[3].size(1);
     const auto scratch_rows = std::min<int64_t>(b, 32);
+    const auto required = qwen36_gqa_flash_decode_workspace_numel(scratch_rows, h, cap);
     TORCH_CHECK(b >= 1 && b <= qwen_graph_limits::decode_tokens && (h == 2 || h == 6) && t[0].size(2) == 256 &&
                     t[1].size(1) == 1 && t[1].size(2) == 256 && t[4].numel() == b &&
                     t[5].numel() == b && t[6].sizes() == t[0].sizes() && cap > 0 &&
                     t[1].size(0) > 0 && t[3].size(0) > 0 && t[7].dim() == 1 &&
-                    t[7].numel() >= scratch_rows * h * (cap + 256),
+                    required > 0 && t[7].numel() >= required,
                 "GQA rows shapes");
     const uintptr_t scratch_begin = reinterpret_cast<uintptr_t>(t[7].data_ptr());
     const uintptr_t scratch_end = scratch_begin + t[7].numel() * t[7].element_size();
@@ -132,7 +134,6 @@ extern "C" void qwen_graph_gqa_rows_dispatch(std::vector<at::Tensor> &t,
                         "GQA scratch must not alias tensors");
         }
     int32_t req[qwen_graph_limits::decode_tokens], len[qwen_graph_limits::decode_tokens];
-    bool parallel = b >= 8;
     for (int64_t j = 0; j < b; ++j) {
         for (int i : {4, 5}) {
             auto value = t[i].scalar_type() == at::kInt ? int64_t(t[i].data_ptr<int32_t>()[j])
@@ -142,54 +143,42 @@ extern "C" void qwen_graph_gqa_rows_dispatch(std::vector<at::Tensor> &t,
         }
         TORCH_CHECK(req[j] < t[3].size(0) && len[j] >= 1 && len[j] <= cap,
                     "GQA rows request/length");
-        parallel = parallel && len[j] <= 2048;
     }
     const float scale = float(std::get<double>(s[0]));
     TORCH_CHECK(std::isfinite(scale), "GQA rows finite scale");
-    // A single <=32-row inner call already validates its whole input before writes.
-    // For multiple calls, validate every visible KV index before the first chunk.
-    if (b > 32)
-        for (int64_t row = 0; row < b; ++row) {
-            const auto *indices = t[3].data_ptr<int32_t>() + int64_t(req[row]) * cap;
-            for (int64_t j = 0; j < len[row]; ++j)
-                TORCH_CHECK(indices[j] >= 0 && indices[j] < t[1].size(0), "GQA rows KV index");
+    // Validate each request's visible prefix once, before any output wave.
+    // MTP rows share page-table prefixes but retain distinct causal lengths.
+    int32_t unique_req[qwen_graph_limits::decode_tokens];
+    int32_t unique_len[qwen_graph_limits::decode_tokens];
+    int64_t count = 0;
+    for (int64_t row = 0; row < b; ++row) {
+        int64_t i = 0;
+        while (i < count && unique_req[i] != req[row]) ++i;
+        if (i == count) {
+            unique_req[count] = req[row];
+            unique_len[count++] = len[row];
+        } else {
+            unique_len[i] = std::max(unique_len[i], len[row]);
         }
+    }
+    for (int64_t i = 0; i < count; ++i) {
+        const auto *indices = t[3].data_ptr<int32_t>() + int64_t(unique_req[i]) * cap;
+        for (int64_t token = 0; token < unique_len[i]; ++token)
+            TORCH_CHECK(indices[token] >= 0 && indices[token] < t[1].size(0),
+                        "GQA rows KV index");
+    }
     auto bf = [](const at::Tensor &x) { return reinterpret_cast<const uint16_t *>(x.data_ptr()); };
-    // Scores and PV belong to this op; completed chunks release the same slots.
-    float *pv = t[7].data_ptr<float>() + scratch_rows * h * cap;
+    // The entire graph-owned arena is reused after each completed <=32-row wave.
+    // No old full-history score layout or external forward arena is used.
     for (int64_t row = 0; row < b; row += 32) {
         const auto chunk = std::min<int64_t>(32, b - row);
-        bool use_long_pv = false;
-        // The original short parallel-rows route adds no length traversal.
-        // Serial/parallel and long-PV math remain separate; this adapter
-        // preserves the existing short/long and chunk-routing decisions.
-        if (!parallel && chunk >= 2 && h == 2) {
-            int64_t minimum = len[row], maximum = len[row];
-            for (int64_t j = 1; j < chunk; ++j) {
-                minimum = std::min<int64_t>(minimum, len[row + j]);
-                maximum = std::max<int64_t>(maximum, len[row + j]);
-            }
-            use_long_pv = minimum >= 384 && maximum >= 16384;
-        }
-        int rc;
-        if (use_long_pv) {
-            rc = qwen36_gqa_decode_rows_long_pv_with_workspace(
-                bf(t[0]) + row * h * 256, bf(t[1]), bf(t[2]), t[3].data_ptr<int32_t>(), req + row,
-                len + row, reinterpret_cast<uint16_t *>(t[6].data_ptr()) + row * h * 256,
-                t[7].data_ptr<float>(), chunk, h, cap, t[1].size(0), t[3].size(0), scale,
-                pv, scratch_rows * h * 256);
-        } else {
-            rc = qwen36_gqa_decode_batch_with_workspace(
-                bf(t[0]) + row * h * 256, bf(t[1]), bf(t[2]), t[3].data_ptr<int32_t>(), req + row,
-                len + row, reinterpret_cast<uint16_t *>(t[6].data_ptr()) + row * h * 256,
-                t[7].data_ptr<float>(), chunk, h, cap, t[1].size(0), t[3].size(0), scale,
-                parallel && chunk >= 8, pv, scratch_rows * h * 256);
-        }
-        TORCH_CHECK(rc == 0, "GQA rows native failure ", rc);
+        const int rc = qwen36_gqa_flash_decode_validated_with_workspace(
+            bf(t[0]) + row * h * 256, bf(t[1]), bf(t[2]), t[3].data_ptr<int32_t>(),
+            req + row, len + row,
+            reinterpret_cast<uint16_t *>(t[6].data_ptr()) + row * h * 256,
+            t[7].data_ptr<float>(), t[7].numel(), chunk, h, cap, scale);
+        TORCH_CHECK(rc == 0, "GQA Flash-Decoding native failure ", rc);
     }
     ++calls;
-    if (parallel)
-        ++parallel_calls;
-    else
-        ++fallback_calls;
+    ++parallel_calls; // candidate uses a split phase followed by one merge phase
 }

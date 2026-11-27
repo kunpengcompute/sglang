@@ -1357,6 +1357,7 @@ class EAGLEWorker(TpModelWorker):
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         mm_input_embeds: Optional[torch.Tensor] = None,
+        mrope_positions: Optional[torch.Tensor] = None,
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
@@ -1406,7 +1407,17 @@ class EAGLEWorker(TpModelWorker):
                 setattr(batch, name, value)
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
-            forward_batch.mm_input_embeds = mm_input_embeds
+            from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as qwen_enabled
+            if qwen_enabled():
+                from sglang.srt.hardware_backend.cpu_kunpeng.qwen.mtp_bridge import (
+                    prepare_draft_extend_mm_inputs,
+                )
+
+                prepare_draft_extend_mm_inputs(
+                    forward_batch, mm_input_embeds, mrope_positions
+                )
+            else:
+                forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_model_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         assert isinstance(forward_batch.spec_info, EagleDraftInput)

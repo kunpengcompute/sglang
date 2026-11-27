@@ -107,7 +107,7 @@ def register():
         info.dispatch_fn = ctypes.cast(getattr(bridge, symbol), ctypes.c_void_p).value
         registry.register_op(name, info)
 
-    if os.environ.get("SGLANG_KUNPENG_P2_NORM_REDUCE_KEEP_SILU", "0") == "1":
+    if os.environ.get("SGLANG_KUNPENG_QWEN_GDN_NORM_REDUCE_KEEP_SILU", "0") == "1":
         info = graph_cpp.OpInfo()
         info.dispatch_fn = ctypes.cast(
             bridge.qwen_graph_p2_norm_reduce_keep_silu_dispatch, ctypes.c_void_p

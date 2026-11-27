@@ -39,10 +39,11 @@ extern "C" int qwen36_attention_qknorm_rope_bf16(const uint16_t *, const uint16_
                                                  const uint16_t *, const uint16_t *,
                                                  const uint16_t *, const int64_t *, uint16_t *,
                                                  uint16_t *, int64_t, int64_t, float, int64_t);
-extern "C" int qwen36_attention_qknorm_rope_mrope_bf16(
-    const uint16_t *, const uint16_t *, const uint16_t *, const uint16_t *, const uint16_t *,
-    const int64_t *, uint16_t *, uint16_t *, int64_t, int64_t, float, int64_t, int64_t, int64_t,
-    int64_t);
+
+extern "C" int qwen36_attention_qknorm_mrope_bf16(
+    const uint16_t *, const uint16_t *, const uint16_t *, const uint16_t *,
+    const uint16_t *, const int64_t *, uint16_t *, uint16_t *, int64_t, int64_t,
+    float, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 
 static void check(const at::Tensor &t, at::ScalarType dtype) {
     TORCH_CHECK(t.device().is_cpu() && t.scalar_type() == dtype && t.is_contiguous(),
@@ -77,7 +78,7 @@ extern "C" void qwen_graph_qkv_dispatch(std::vector<at::Tensor> &t,
 
 extern "C" void qwen_graph_rope_dispatch(std::vector<at::Tensor> &t,
                                          const std::vector<ScalarArg> &s) {
-    TORCH_CHECK(t.size() == 8 && s.size() == 2, "QKNorm RoPE graph ABI");
+    TORCH_CHECK(t.size() == 8 && (s.size() == 2 || s.size() == 6), "QKNorm RoPE graph ABI");
     for (int i : {0, 1, 2, 3, 4, 6, 7})
         check(t[i], at::kBFloat16);
     check(t[5], at::kLong);
@@ -89,54 +90,25 @@ extern "C" void qwen_graph_rope_dispatch(std::vector<at::Tensor> &t,
                     t[6].sizes() == t[0].sizes() && t[7].sizes() == t[1].sizes(),
                 "QKNorm RoPE shapes");
     auto *pos = static_cast<const int64_t *>(t[5].data_ptr());
-    // War B: image-prefill graphs replay with genuinely distinct t/h/w rows.
-    // The legacy kernel reads only the first component per row -- exactly
-    // what the eager legacy path has always done for image prefill -- so
-    // distinct axes are accepted; the range check now covers every
-    // component. 1-D positions are unaffected.
-    for (int64_t i = 0; i < t[5].numel(); ++i)
-        TORCH_CHECK(pos[i] >= 0 && pos[i] < t[4].size(0), "RoPE position out of range");
-    auto rc = qwen36_attention_qknorm_rope_bf16(
-        bf(t[0]), bf(t[1]), bf(t[2]), bf(t[3]), bf(t[4]), pos, bf_out(t[6]), bf_out(t[7]), rows,
-        t[4].size(0), static_cast<float>(std::get<double>(s[0])), std::get<int64_t>(s[1]));
-    TORCH_CHECK(rc == 0, "QKNorm RoPE kernel error ", rc);
-}
-
-extern "C" void qwen_graph_rope_mrope_dispatch(std::vector<at::Tensor> &t,
-                                               const std::vector<ScalarArg> &s) {
-    // Same contract as qwen_graph_rope_dispatch plus the three mrope_section
-    // scalars; positions must be the full [3, rows] M-RoPE tensor. Image
-    // prefill graphs (War B, SGLANG_KUNPENG_GRAPH_IMAGE_PREFILL=1) replay
-    // with genuinely distinct t/h/w rows, so the historical axes-agree guard
-    // was removed as the conscious step this comment once anticipated: the
-    // eager mrope entry has always accepted distinct rows, and equal
-    // components still reduce this kernel to the single-position one
-    // bit-for-bit.
-    TORCH_CHECK(t.size() == 8 && s.size() == 5, "QKNorm M-RoPE graph ABI");
-    for (int i : {0, 1, 2, 3, 4, 6, 7})
-        check(t[i], at::kBFloat16);
-    check(t[5], at::kLong);
-    const auto rows = t[0].size(0);
-    const int64_t section_t = std::get<int64_t>(s[2]);
-    const int64_t section_h = std::get<int64_t>(s[3]);
-    const int64_t section_w = std::get<int64_t>(s[4]);
-    TORCH_CHECK(rows > 0 && t[0].sizes() == at::IntArrayRef({rows, 512}) &&
-                    t[1].sizes() == at::IntArrayRef({rows, 256}) && t[2].numel() == 256 &&
-                    t[3].numel() == 256 && t[4].dim() == 2 && t[4].size(1) == 64 &&
-                    t[5].sizes() == at::IntArrayRef({3, rows}) && t[6].sizes() == t[0].sizes() &&
-                    t[7].sizes() == t[1].sizes() && section_t >= 0 && section_h >= 0 &&
-                    section_w >= 0 && section_t + section_h + section_w == 32,
-                "QKNorm M-RoPE shapes");
-    auto *pos = static_cast<const int64_t *>(t[5].data_ptr());
-    // War B: range is validated for all three components; distinct t/h/w
-    // rows are the normal image-prefill replay input now.
-    for (int64_t i = 0; i < 3 * rows; ++i)
-        TORCH_CHECK(pos[i] >= 0 && pos[i] < t[4].size(0), "RoPE position out of range");
-    auto rc = qwen36_attention_qknorm_rope_mrope_bf16(
+    const int64_t axes = t[5].numel() / rows;
+    const auto section_t = s.size() == 6 ? std::get<int64_t>(s[2]) : 0;
+    const auto section_h = s.size() == 6 ? std::get<int64_t>(s[3]) : 0;
+    const auto section_w = s.size() == 6 ? std::get<int64_t>(s[4]) : 0;
+    const auto interleaved = s.size() == 6 ? std::get<bool>(s[5]) : false;
+    // Legacy text-only records carry repeated position axes and no sections.
+    const int64_t effective_axes = axes == 3 && section_t + section_h + section_w == 32 ? 3 : 1;
+    for (int64_t axis = 0; axis < axes; ++axis)
+        for (int64_t row = 0; row < rows; ++row) {
+            TORCH_CHECK(pos[axis * rows + row] >= 0 && pos[axis * rows + row] < t[4].size(0),
+                        "RoPE position out of range");
+            TORCH_CHECK(effective_axes == 3 || pos[axis * rows + row] == pos[row],
+                        "Three-axis RoPE requires configured sections");
+        }
+    auto rc = qwen36_attention_qknorm_mrope_bf16(
         bf(t[0]), bf(t[1]), bf(t[2]), bf(t[3]), bf(t[4]), pos, bf_out(t[6]), bf_out(t[7]), rows,
         t[4].size(0), static_cast<float>(std::get<double>(s[0])), std::get<int64_t>(s[1]),
-        section_t, section_h, section_w);
-    TORCH_CHECK(rc == 0, "QKNorm M-RoPE kernel error ", rc);
+        effective_axes, section_t, section_h, section_w, interleaved);
+    TORCH_CHECK(rc == 0, "QKNorm RoPE kernel error ", rc);
 }
 
 extern "C" void qwen_graph_gdn_dispatch(std::vector<at::Tensor> &t,

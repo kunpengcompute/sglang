@@ -37,3 +37,21 @@ static KernelRegistrar _r_paged_mqa_logits_topk(
     "paged_mqa_logits_topk_kunpeng",
     make_dispatch_v<decltype(&paged_mqa_logits_topk_kunpeng),
                     &paged_mqa_logits_topk_kunpeng>);
+
+// Real DSA indexer scoring kernel (kutacc adapter, fp8 e4m3 index-K cache;
+// see attention/indexer.cpp). Direct-write, same graph contract as the bf16
+// op: the dispatch expands tensors as (q, kv, k_scale, weight, block_tables,
+// seq_lens, cur_lens, output, workspace) and scalars as (topk, output_coord,
+// mode, row_start, row_rows) -- identical to the Python call order.
+void paged_mqa_logits_topk_fp8_kunpeng(at::Tensor q, at::Tensor cur_kv_cache,
+                                       at::Tensor k_scale, at::Tensor weight,
+                                       at::Tensor block_tables, at::Tensor seq_lens,
+                                       at::Tensor cur_lens, at::Tensor output,
+                                       at::Tensor workspace, int64_t topk,
+                                       int64_t output_coord, int64_t mode,
+                                       int64_t row_start, int64_t row_rows);
+
+static KernelRegistrar _r_paged_mqa_logits_topk_fp8(
+    "paged_mqa_logits_topk_fp8_kunpeng",
+    make_dispatch_v<decltype(&paged_mqa_logits_topk_fp8_kunpeng),
+                    &paged_mqa_logits_topk_fp8_kunpeng>);
