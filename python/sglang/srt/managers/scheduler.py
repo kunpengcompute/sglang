@@ -291,16 +291,6 @@ _PP_PREFETCH_WAIT_POLL_SEC = 0.02
 _PP_PREFETCH_WAIT_MAX_SEC = 180.0
 _PP_PREFETCH_QUERY_GRACE_SEC = 5.0
 _PP_PREFETCH_SCAN_MAX = 32
-_PP_PREFETCH_MAX_DEFER = 3
-
-
-def _pp_needs_prefetch_lockstep(scheduler) -> bool:
-    # Only meaningful with HiCache storage on and PP > 1 on 920F.
-    return (
-        _is_cpu_920f
-        and scheduler.enable_hicache_storage
-        and scheduler.server_args.pp_size > 1
-    )
 
 
 def _needs_prefetch_retry(scheduler) -> bool:
@@ -2356,18 +2346,25 @@ class Scheduler(
                     prefix_keys,
                 )
 
+    def _prefetch_no_hit(self) -> set[str]:
+        """Request ids whose L3 query already came back below the threshold."""
+        return getattr(self.tree_cache, "prefetch_no_hit", set())
+
     def _retry_prefetch_waiting_head(self) -> None:
         """Retry the one-shot enqueue-time prefetch for the queue head."""
         cc = getattr(self.tree_cache, "cache_controller", None)
         if cc is None:
             return
         pending = getattr(self.tree_cache, "ongoing_prefetch", {})
+        no_hit = self._prefetch_no_hit()
         scanned = 0
         for req in self.waiting_queue:
             if scanned >= _PP_PREFETCH_SCAN_MAX:
                 break
             scanned += 1
             if req.rid in pending:
+                continue
+            if req.rid in no_hit:
                 continue
             if len(req.prefix_indices) + self.page_size >= len(req.fill_ids):
                 # Already device-resident: skip the radix walk.
@@ -2383,48 +2380,37 @@ class Scheduler(
                     exc_info=True,
                 )
 
-    def _pp_prefetch_gate(self, req: Req, allow_skip: bool) -> bool:
-        """Wait (bounded) for this request's prefetch; defer it while L1 is short.
+    def _pp_prefetch_gate(self, req: Req) -> bool:
+        """Wait (bounded) for this request's prefetch, then compute anyway.
 
-        Fetching a full prefix from L3 is an order of magnitude cheaper than
-        recomputing it, so a request whose prefetch cannot get L1 space is
-        skipped instead of computed: the next scheduling round retries it while
-        other runnable requests keep the PP ring fed. After
-        _PP_PREFETCH_MAX_DEFER failed attempts it is computed without the L3
-        prefix. Returning False is only allowed when the batch already has
-        other requests, so a round is never dropped entirely.
+        Fetching a full prefix from L3 is cheaper than recomputing it, so a
+        pending prefetch gets a bounded window (_PP_PREFETCH_WAIT_MAX_SEC)
+        before the request is computed without it. The request is never
+        skipped: under PP the downstream stages would block in the proxy-tensor
+        recv, and with DP attention an idle DP group drops out of the 256-rank
+        MoE barrier and stalls the others. Every exit path returns True, so the
+        batch always gets this request and the PP ring stays closed.
         """
         rid = req.rid
         start = time.monotonic()
         deadline = start + _PP_PREFETCH_WAIT_MAX_SEC
-        counts = getattr(self, "_prefetch_defer_count", None)
-        if counts is None:
-            counts = {}
-            self._prefetch_defer_count = counts
+        retried = False
         while True:
             if self.tree_cache.check_prefetch_progress(rid):
-                counts.pop(rid, None)
                 return True
             pending = getattr(self.tree_cache, "ongoing_prefetch", {})
-            if rid not in pending:
-                tries = counts.get(rid, 0) + 1
-                if tries > _PP_PREFETCH_MAX_DEFER:
-                    counts.pop(rid, None)
+            if rid not in pending and not retried:
+                if rid in self._prefetch_no_hit():
+                    # L3 has nothing for this prefix (already queried once).
                     return True
-                if len(counts) > 1024:
-                    for stale in list(counts)[:512]:
-                        counts.pop(stale, None)
-                counts[rid] = tries
+                # The enqueue-time attempt was lost or over the in-flight
+                # budget: retry it once, then compute without the L3 prefix.
+                retried = True
                 self._prefetch_kvcache(req)
-                if rid in getattr(self.tree_cache, "ongoing_prefetch", {}):
-                    continue
-                return not allow_skip
             entry = pending.get(rid)
             operation = entry[3] if entry is not None else None
             # The hit query normally fills hash_value within ~100ms. Staying
-            # empty means the prefetch was revoked (hit below threshold); every
-            # stage sees the same condition, so skipping this round is
-            # consistent as long as the batch has other requests.
+            # empty means the prefetch was revoked (hit below threshold).
             if (
                 operation is not None
                 and not getattr(operation, "hash_value", None)
@@ -2435,7 +2421,7 @@ class Scheduler(
                     rid,
                     _PP_PREFETCH_QUERY_GRACE_SEC,
                 )
-                return not allow_skip
+                return True
             if time.monotonic() > deadline:
                 logger.warning(
                     "[hicache] PP prefetch wait exceeded %.0fs: req=%s, "
@@ -2443,7 +2429,6 @@ class Scheduler(
                     _PP_PREFETCH_WAIT_MAX_SEC,
                     rid,
                 )
-                counts.pop(rid, None)
                 return True
             time.sleep(_PP_PREFETCH_WAIT_POLL_SEC)
 
@@ -2964,19 +2949,17 @@ class Scheduler(
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done and _needs_prefetch_retry(self):
-                    # PP>1: never drop the round, or the downstream stage waits
-                    # for this stage's proxy tensors forever. PP=1 has no ring,
-                    # so the request may always be deferred (bounded by
-                    # _PP_PREFETCH_MAX_DEFER) instead of recomputed right away.
-                    allow_skip = (
-                        not _pp_needs_prefetch_lockstep(self)
-                        or len(adder.can_run_list) > 0
-                    )
-                    prefetch_done = self._pp_prefetch_gate(req, allow_skip=allow_skip)
                 if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
+                    if _needs_prefetch_retry(self):
+                        # 920F: wait (bounded) for the prefetch instead of
+                        # skipping the request. Under PP the downstream stage
+                        # waits forever for this stage's proxy tensors, and an
+                        # idle DP group drops out of the 256-rank MoE barrier
+                        # and stalls the others.
+                        self._pp_prefetch_gate(req)
+                    else:
+                        # skip staging requests that are ongoing prefetch
+                        continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid

@@ -2904,6 +2904,12 @@ class HiCacheController:
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
+                    if self.l1l3_only:
+                        # Nothing will be fetched for this request, so mark the
+                        # operation terminated. A scheduler waiting for it then
+                        # stops on the next check instead of burning its whole
+                        # query grace window, which costs 5s per PP stage.
+                        operation.mark_terminate()
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
                     logger.debug(

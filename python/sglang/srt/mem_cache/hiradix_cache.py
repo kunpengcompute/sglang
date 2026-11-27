@@ -190,6 +190,9 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # Request ids whose L3 query already came back below the prefetch
+        # threshold; re-querying them only costs a query + a device alloc.
+        self.prefetch_no_hit: set[str] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -565,6 +568,8 @@ class HiRadixCache(RadixCache):
 
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                # L3 has too little: do not re-query this request per chunk.
+                self.prefetch_no_hit.add(req_id)
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
@@ -702,6 +707,7 @@ class HiRadixCache(RadixCache):
         self.storage_only_tokens = 0
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.prefetch_no_hit.clear()
         self.evictable_host_leaves.clear()
         super().reset()
         if self.l1l3_only:
@@ -2091,6 +2097,7 @@ class HiRadixCache(RadixCache):
 
     def cache_finished_req(self, req, is_insert: bool = True):
         super().cache_finished_req(req, is_insert=is_insert)
+        self.prefetch_no_hit.discard(req.rid)
         # All inserts of this request are done: emit its L1->L3 write summary
         # once the queued writes drain (see _flush_write_summary).
         seal = getattr(self.cache_controller, "seal_write_summary", None)
@@ -2099,6 +2106,7 @@ class HiRadixCache(RadixCache):
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
+        self.prefetch_no_hit.discard(rid)
         seal = getattr(self.cache_controller, "seal_write_summary", None)
         if seal is not None:
             seal(rid)
