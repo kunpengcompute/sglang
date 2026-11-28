@@ -39,10 +39,22 @@ WORLD_SIZE=${#NODES[@]}
 
 echo "Killing $ROLE on $WORLD_SIZE node(s)"
 
+# Fail fast instead of hanging when a node is unreachable: bound the TCP
+# connect and abort on a dead/unresponsive session (BatchMode also avoids
+# hanging on an interactive password prompt).
+SSH_OPTS=(
+    -o BatchMode=yes
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=5
+    -o ServerAliveCountMax=3
+)
+
+pids=()
+nodes=()
 for i in "${!NODES[@]}"; do
     node="${NODES[i]}"
 
-    ssh "$(ssh_target "$node")" '
+    ssh "${SSH_OPTS[@]}" "$(ssh_target "$node")" '
         PAT="sglang[.]launch_server|sglang[_]server|sglang[:]:"
         MAIN_PIDS=$(ps aux | grep -E "$PAT" | grep -v grep | awk "{print \$2}")
 
@@ -108,7 +120,24 @@ for i in "${!NODES[@]}"; do
             fi
         fi
     ' &
+    pids+=("$!")
+    nodes+=("$node")
 done
 
-wait
+failed_nodes=()
+for i in "${!pids[@]}"; do
+    wait "${pids[i]}"
+    rc=$?
+    # 255 = ssh itself failed (connect timeout, keepalive timeout, auth).
+    if [[ $rc -eq 255 ]]; then
+        failed_nodes+=("${nodes[i]}")
+    fi
+done
+
+if [[ ${#failed_nodes[@]} -gt 0 ]]; then
+    echo "ERROR: SSH connection failed or timed out on node(s): ${failed_nodes[*]}" >&2
+    echo "ERROR: cannot stop $ROLE on ${#failed_nodes[@]} of $WORLD_SIZE node(s)" >&2
+    exit 1
+fi
+
 echo "All $ROLE nodes processed."

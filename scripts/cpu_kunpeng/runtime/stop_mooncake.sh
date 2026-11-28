@@ -25,10 +25,26 @@ cd "$SCRIPT_DIR"
 SKIP_CONDA=1 source ./env.sh none
 
 echo "Killing mooncake master on $MOONCAKE_MASTER_NODE"
-ssh "root@$MOONCAKE_MASTER_NODE" '
+
+# Fail fast instead of hanging when the node is unreachable (connect timeout,
+# dead session, or an interactive password prompt).
+SSH_OPTS=(
+    -o BatchMode=yes
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=5
+    -o ServerAliveCountMax=3
+)
+
+ssh "${SSH_OPTS[@]}" "root@$MOONCAKE_MASTER_NODE" '
     if pkill -f mooncake_master; then
         echo "Mooncake master stopped."
     else
         echo "No mooncake master process found."
     fi
 '
+rc=$?
+# 255 = ssh itself failed (connect timeout, keepalive timeout, auth).
+if [[ $rc -eq 255 ]]; then
+    echo "ERROR: SSH connection failed or timed out on mooncake master node $MOONCAKE_MASTER_NODE" >&2
+    exit 1
+fi
