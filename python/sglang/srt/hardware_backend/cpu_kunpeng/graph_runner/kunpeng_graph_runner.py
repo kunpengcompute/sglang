@@ -2026,10 +2026,11 @@ class KunpengGraphRunner:
             if _spec_info is not None
             else None
         )
-        graph_cache_key += (tuple(
-            (tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype))
-            for tensor in inputs
-        ),)
+        if hasattr(attn_backend, "get_graph_inputs"):
+            graph_cache_key += (tuple(
+                (tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype))
+                for tensor in inputs
+            ),)
         if self._graph_bindings is not None:
             graph_cache_key += (self._graph_bindings.cache_signature(),)
 
