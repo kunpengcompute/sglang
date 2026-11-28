@@ -25,7 +25,7 @@ SKIP_CONDA=1 source "$SCRIPT_DIR/env.sh" store || exit 1
 sh "$SCRIPT_DIR/stop.sh" store
 
 # "<base>/latest/store" -> this run's store dir
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$LOG_ENV_DIR" "$LOG_SSH_DIR" "$LOG_RUNTIME_DIR"
 mkdir -p "$LOG_BASE_DIR/latest"
 ln -sfn "$LOG_DIR" "$LOG_BASE_DIR/latest/store"
 
@@ -33,10 +33,10 @@ echo "[$(date +%T)] Launching mooncake store service on $MOONCAKE_STORE_NODE:$MO
 
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
     "$(ssh_target "$MOONCAKE_STORE_NODE")" \
-    "cd \"$PWD\" && mkdir -p \"$LOG_DIR\" && \
+    "cd \"$PWD\" && mkdir -p \"$LOG_RUNTIME_DIR\" && \
      setsid nohup sh ./runtime/server_store.sh \"$LOG_DIR\" \
-       </dev/null >\"$LOG_DIR/store_service.log\" 2>&1 &" \
-    >"$LOG_DIR/ssh_store.log" 2>&1 &
+       </dev/null >\"$LOG_RUNTIME_DIR/store_service.log\" 2>&1 &" \
+    >"$LOG_SSH_DIR/ssh_store.log" 2>&1 &
 
 echo "[$(date +%T)] Waiting for store service on port $MOONCAKE_STORE_PORT ..."
 # Startup cost is dominated by allocating/pinning the L3 segment (MOONCAKE_STORE_SEGMENT_SIZE)
@@ -56,5 +56,5 @@ if [[ "$_ready" == "1" ]]; then
     echo "[$(date +%T)] Mooncake store service ready on $MOONCAKE_STORE_NODE:$MOONCAKE_STORE_PORT"
 else
     echo "WARNING: mooncake store service did not listen on port $MOONCAKE_STORE_PORT within ${_store_ready_timeout}s;" >&2
-    echo "         check $LOG_DIR/store_service.log on $MOONCAKE_STORE_NODE" >&2
+    echo "         check $LOG_RUNTIME_DIR/store_service.log on $MOONCAKE_STORE_NODE" >&2
 fi

@@ -134,6 +134,13 @@ fi
 # time dir instead of scattering "prefill_glm/<time>" and "decode/<time>".
 export LOG_RUN_DIR="${LOG_BASE_DIR}/${LOG_DATE}/${LOG_TIME}"
 export LOG_DIR="${LOG_RUN_DIR}/${LOG_SUBDIR}"
+# Three log sub-dirs under the role dir so the different log kinds never mix:
+#   env/      environment dumps (env_node*.log / env_router.log / env_tokenizer_*)
+#   ssh/      ssh transport output written by the launching control node (ssh_*.log)
+#   runtime/  server stdout/stderr (pp*_dp*_tp*.log, *_http.log, store/mooncake)
+export LOG_ENV_DIR="${LOG_DIR}/env"
+export LOG_SSH_DIR="${LOG_DIR}/ssh"
+export LOG_RUNTIME_DIR="${LOG_DIR}/runtime"
 export SGLANG_TORCH_PROFILER_DIR="${LOG_DIR}/torch_profiler"
 
 # The toolchain env is only skipped for the per-rank pyinstall binaries, which

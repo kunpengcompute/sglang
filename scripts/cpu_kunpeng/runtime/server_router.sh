@@ -29,12 +29,18 @@ IP="$(ifconfig enp26s0f0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
 # directly from the conda env. SKIP_CONDA=1 skips the (slow) activation.
 SKIP_CONDA=1 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/env.sh" router
 
+# Log sub-dirs of this run's role dir: env dumps and gateway stdout/stderr are
+# kept apart from the ssh transport log written by the launching node.
+LOG_ENV_PATH="$LOG_PATH/env"
+LOG_RUNTIME_PATH="$LOG_PATH/runtime"
+mkdir -p "$LOG_ENV_PATH" "$LOG_RUNTIME_PATH"
+
 # Record this node's invocation and full environment for debugging
 {
     echo "[$(date +%T)] invocation: $0 $*"
     echo "---- environment ----"
     env | sort
-} > "$LOG_PATH/env_router.log"
+} > "$LOG_ENV_PATH/env_router.log"
 
 export GATEWAY_CPUS="${GATEWAY_CPUS:-570-590}"
 SPECIFIC_ARGS=(
@@ -151,7 +157,7 @@ if [[ ! -x "$GATEWAY_BIN" ]]; then
 fi
 # Pin the gateway to a dedicated core range so it does not collide with
 # the tokenizer/detokenizer workers (see the NUMA plan in runtime/server_cluster.sh).
-_router_log="$LOG_PATH/router_$IP.log"
+_router_log="$LOG_RUNTIME_PATH/router_$IP.log"
 echo "[$(date +%T)] command: LD_PRELOAD=$LIBPTHREAD_HOOK_PATH taskset -c $GATEWAY_CPUS $GATEWAY_BIN ${SPECIFIC_ARGS[*]}" > "$_router_log"
 LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \
 taskset -c "$GATEWAY_CPUS" "$GATEWAY_BIN" "${SPECIFIC_ARGS[@]}" \

@@ -112,14 +112,19 @@ if [[ "${LOG_REQUESTS:-0}" == "1" ]]; then
 fi
 
 echo "Launching $TOK_SIDE${TOK_INSTANCE:+ ($TOK_INSTANCE)} HTTP server on port $TOK_PORT..."
+# Log sub-dirs of this run's role dir: env dumps and server stdout/stderr are
+# kept apart from the ssh transport log written by the launching node.
+LOG_ENV_PATH="$LOG_PATH/env"
+LOG_RUNTIME_PATH="$LOG_PATH/runtime"
+mkdir -p "$LOG_ENV_PATH" "$LOG_RUNTIME_PATH"
 # Record this instance's invocation and full environment for debugging
 {
     echo "[$(date +%T)] invocation: $0 $*"
     echo "[$(date +%T)] side=$TOK_SIDE instance=${TOK_INSTANCE:-} port=$TOK_PORT bootstrap_port=$TOK_BOOTSTRAP_PORT numa_base=$TOK_NUMA_BASE"
     echo "---- environment ----"
     env | sort
-} > "$LOG_PATH/env_tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}.log"
-_tok_log="$LOG_PATH/tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}_http.log"
+} > "$LOG_ENV_PATH/env_tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}.log"
+_tok_log="$LOG_RUNTIME_PATH/tokenizer_${TOK_SIDE}${TOK_INSTANCE:+_$TOK_INSTANCE}_http.log"
 echo "[$(date +%T)] command: SGLANG_KUNPENG_TOKENIZER_BASE_NUMA=$TOK_NUMA_BASE LD_PRELOAD=$LIBPTHREAD_HOOK_PATH python -m sglang.launch_server ${HTTP_COMMON_ARGS[*]} --dp-size $TOK_DP_SIZE --port $TOK_PORT --dist-init-addr $TOK_DIST_ADDR --disaggregation-mode $TOK_SIDE" > "$_tok_log"
 SGLANG_KUNPENG_TOKENIZER_BASE_NUMA="$TOK_NUMA_BASE" \
 LD_PRELOAD="$LIBPTHREAD_HOOK_PATH" \

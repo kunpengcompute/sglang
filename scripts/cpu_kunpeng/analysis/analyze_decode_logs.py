@@ -20,7 +20,7 @@ charts and an analysis report (no split log files are produced).
 Usage: python analyze_decode_logs.py [log_file] [output_dir]
        When log_file is omitted, the newest rank0 decode log is auto-detected
        under LOG_BASE_DIR
-       (<LOG_BASE_DIR>/<date>/<time>/decode[_<instance>]/pp0_dp0_tp0_*.log,
+       (<LOG_BASE_DIR>/<date>/<time>/decode[_<instance>]/runtime/pp0_dp0_tp0_*.log,
        legacy layout <LOG_BASE_DIR>/<date>/decode/<time>/..., legacy binary
        name 0_0_*.log).
 """
@@ -575,11 +575,12 @@ def resolve_log_base_dir(script_dir):
 
 
 def _rank0_log_in(directory):
-    """First rank0 log inside directory (binary name first, then legacy)."""
-    for pattern in ("pp0_dp0_tp0_*.log", "0_0_*.log", "0_*.log"):
-        hits = sorted(glob.glob(os.path.join(directory, pattern)))
-        if hits:
-            return hits[0]
+    """First rank0 log inside directory (runtime/ subdir first, then legacy root)."""
+    for candidate in (os.path.join(directory, "runtime"), directory):
+        for pattern in ("pp0_dp0_tp0_*.log", "0_0_*.log", "0_*.log"):
+            hits = sorted(glob.glob(os.path.join(candidate, pattern)))
+            if hits:
+                return hits[0]
     return None
 
 
@@ -600,8 +601,9 @@ def find_latest_rank0_log(log_base_dir, role="decode"):
     """Locate the newest rank0 log under LOG_BASE_DIR.
 
     Current layout (created by launch.sh/env.sh):
-        <LOG_BASE_DIR>/<yymmdd>/<HHMMSS>/<role>[_<instance>]/pp0_dp0_tp0_<ip>.log
+        <LOG_BASE_DIR>/<yymmdd>/<HHMMSS>/<role>[_<instance>]/runtime/pp0_dp0_tp0_<ip>.log
     Legacy layout, still honoured:
+        <LOG_BASE_DIR>/<yymmdd>/<HHMMSS>/<role>[_<instance>]/pp0_dp0_tp0_<ip>.log
         <LOG_BASE_DIR>/<yymmdd>/<role>/<HHMMSS>/pp0_dp0_tp0_<node_ip>.log
     Falls back to the legacy binary name 0_0_*.log / non-binary 0_*.log.
     Returns None when no matching log exists.

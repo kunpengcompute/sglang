@@ -38,6 +38,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 source "$SCRIPT_DIR/env.sh" "$ROLE" "$INSTANCE" || exit 1
 
+# Log sub-dirs of this run's role dir: env dumps and server stdout/stderr are
+# kept apart from the ssh transport logs written by the launching node.
+LOG_ENV_PATH="$LOG_PATH/env"
+LOG_RUNTIME_PATH="$LOG_PATH/runtime"
+mkdir -p "$LOG_ENV_PATH" "$LOG_RUNTIME_PATH"
+
 # --- /dev/shm hygiene -------------------------------------------------------
 # Every run leaves POSIX shm behind: our sgkv* KV segments, psm_* Python
 # shared-memory buffers (ShmBroadcast creates them anonymously) and
@@ -329,7 +335,7 @@ IB_DEVICE_ALL="roceroh0,roceroh1,roceroh2,roceroh3,roceroh4,roceroh5,roceroh6,ro
     echo "[$(date +%T)] role=$ROLE node_rank=$NODE_RANK instance=${INSTANCE:-} world_size=${WORLD_SIZE:-}"
     echo "---- environment ----"
     env | sort
-} > "$LOG_PATH/env_node${NODE_RANK}_$IP.log"
+} > "$LOG_ENV_PATH/env_node${NODE_RANK}_$IP.log"
 
 if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
     # ── Log naming: translate (node index, rank-in-node) into the true
@@ -423,7 +429,7 @@ if [[ "$SGLANG_ENABLE_BINARY_LAUNCH" == "1" ]]; then
             TP_RANK_ACTUAL=$((_IN_PP % ATTENTION_TP_SIZE))
         fi
 
-        _rank_log="${LOG_PATH}/pp${PP_RANK}_dp${DP_RANK_ACTUAL}_tp${TP_RANK_ACTUAL}_$IP.log"
+        _rank_log="${LOG_RUNTIME_PATH}/pp${PP_RANK}_dp${DP_RANK_ACTUAL}_tp${TP_RANK_ACTUAL}_$IP.log"
         export SGLANG_KUNPENG_HICACHE_CPU_OFFSET=$((RANK_IN_NODE * 38 + 17))
         echo "[$(date +%T)] command: taskset -c $((RANK_IN_NODE * 38 + 20)) $SERVER_BIN ${BASE_ARGS[*]} ${SPECIFIC_ARGS[*]} ${IB_ARGS[*]} --tp-rank-in-node ${RANK_IN_NODE} --port $((30000 + RANK_IN_NODE))" > "$_rank_log"
         taskset -c $((RANK_IN_NODE * 38 + 20)) \
@@ -444,7 +450,7 @@ else
     if [[ "${SGLANG_ENABLE_KUCCL:-0}" == "1" ]]; then
         export PYTHONPATH="$KUCCL_PATH:${PYTHONPATH}"
     fi
-    _node_log="$LOG_PATH/${NODE_RANK}_$IP.log"
+    _node_log="$LOG_RUNTIME_PATH/${NODE_RANK}_$IP.log"
     echo "[$(date +%T)] command: python -m sglang.launch_server ${BASE_ARGS[*]} ${SPECIFIC_ARGS[*]} ${IB_ARGS[*]} --port 30000" > "$_node_log"
     python -m sglang.launch_server "${BASE_ARGS[@]}" "${SPECIFIC_ARGS[@]}" "${IB_ARGS[@]}" \
       --port 30000 \

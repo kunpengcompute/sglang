@@ -24,10 +24,26 @@ cd "$SCRIPT_DIR"
 SKIP_CONDA=1 source ./env.sh store
 
 echo "Killing mooncake store service on $MOONCAKE_STORE_NODE"
-ssh "$(ssh_target "$MOONCAKE_STORE_NODE")" '
+
+# Fail fast instead of hanging when the node is unreachable (connect timeout,
+# dead session, or an interactive password prompt).
+SSH_OPTS=(
+    -o BatchMode=yes
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=5
+    -o ServerAliveCountMax=3
+)
+
+ssh "${SSH_OPTS[@]}" "$(ssh_target "$MOONCAKE_STORE_NODE")" '
     if pkill -f mooncake.mooncake_store_service; then
         echo "Mooncake store service stopped."
     else
         echo "No mooncake store service process found."
     fi
 '
+rc=$?
+# 255 = ssh itself failed (connect timeout, keepalive timeout, auth).
+if [[ $rc -eq 255 ]]; then
+    echo "ERROR: SSH connection failed or timed out on store node $MOONCAKE_STORE_NODE" >&2
+    exit 1
+fi

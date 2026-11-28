@@ -24,7 +24,17 @@ cd "$SCRIPT_DIR"
 SKIP_CONDA=1 source ./env.sh none
 
 echo "Killing gateway on $ROUTER_IP"
-ssh "$(ssh_target "$ROUTER_IP")" '
+
+# Fail fast instead of hanging when the node is unreachable (connect timeout,
+# dead session, or an interactive password prompt).
+SSH_OPTS=(
+    -o BatchMode=yes
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=5
+    -o ServerAliveCountMax=3
+)
+
+ssh "${SSH_OPTS[@]}" "$(ssh_target "$ROUTER_IP")" '
     MAIN_PIDS=$(ps aux | grep "sgl-model-gateway" | grep -v grep | awk "{print \$2}")
     if [ -n "$MAIN_PIDS" ]; then
         echo "Killing process(es): $MAIN_PIDS"
@@ -39,3 +49,9 @@ ssh "$(ssh_target "$ROUTER_IP")" '
         echo "No router process found."
     fi
 '
+rc=$?
+# 255 = ssh itself failed (connect timeout, keepalive timeout, auth).
+if [[ $rc -eq 255 ]]; then
+    echo "ERROR: SSH connection failed or timed out on router node $ROUTER_IP" >&2
+    exit 1
+fi
