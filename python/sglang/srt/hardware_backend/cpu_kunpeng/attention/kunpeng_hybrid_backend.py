@@ -1,5 +1,7 @@
 """Kunpeng GQA/GDN metadata and persistent resources for the common graph runner."""
 import logging
+import os
+import time
 
 import torch
 from sglang.srt.graph import ops
@@ -121,6 +123,21 @@ def pad_extend_tokens(fb, cap: int = None) -> None:
 
 
 logger = logging.getLogger(__name__)
+
+_GDN_PROBE_ENABLED = None
+
+
+def _gdn_probe_enabled():
+    # Phase 0 GDN attribution probe (env SGLANG_KUNPENG_GDN_PROBE=1, default
+    # off): four-segment wall-clock timing around the per-layer GDN chain.
+    # Image-request language prefills run eager (M-RoPE prefill positions are
+    # excluded from graphs by design), so steady-state Python timing is
+    # visible there. Pure time.perf_counter reads -- no torch ops, nothing
+    # recorded into captured graphs, zero behavior change when disabled.
+    global _GDN_PROBE_ENABLED
+    if _GDN_PROBE_ENABLED is None:
+        _GDN_PROBE_ENABLED = os.environ.get("SGLANG_KUNPENG_GDN_PROBE", "0") == "1"
+    return _GDN_PROBE_ENABLED
 
 
 def _logical_lm_head_mm(x, head, bias=None):
@@ -293,10 +310,16 @@ class KunpengGDNBackend(GDNAttnBackend):
             ].transpose(0, 1)
             conv[metadata.conv_states_mask_indices] = mixed_qkv_to_track
         initial = ops.tensor_scalar(fb.extend_prefix_lens, 0., 2)
+        probe = _gdn_probe_enabled()
+        marks = [time.perf_counter()] if probe else None
         x = conv_prefill(mixed_qkv.transpose(0,1), layer.conv_weights, layer.bias, layer.activation,
-                         conv, initial, indices, qsl, fb.extend_seq_lens_cpu).transpose(0,1)
+                         conv, initial, indices, qsl, fb.extend_seq_lens_cpu, metadata_validated=True).transpose(0,1)
+        if probe:
+            marks.append(time.perf_counter())
         q, k, v = self._split(layer, x)
         g, beta = gating(layer.A_log, a, b, layer.dt_bias)
+        if probe:
+            marks.append(time.perf_counter())
         h_track_buf = None
         if metadata.has_mamba_track_mask and metadata.track_ssm_h_src.numel() > 0:
             h_track_buf = self._track_state_buffer(indices.shape[0], state.shape[1:])
@@ -308,10 +331,25 @@ class KunpengGDNBackend(GDNAttnBackend):
             track_state=h_track_buf,
             track_chunk_idx=metadata.track_chunk_idx if h_track_buf is not None else None,
         )
+        if probe:
+            marks.append(time.perf_counter())
         scatter(state, indices, updated)
         if metadata.has_mamba_track_mask:
             self._track_mamba_state_extend(
                 fb, None, state, metadata, h_track_buf=h_track_buf
+            )
+        if probe:
+            marks.append(time.perf_counter())
+            # mixed_qkv.shape[0] is plain tensor metadata: capture-safe (no
+            # view of a graph input is created), unlike indexing qsl.
+            print(
+                f"[kunpeng-gdn-probe] layer={getattr(layer, 'layer_id', -1)} "
+                f"m={mixed_qkv.shape[0]} seqs={qsl.numel() - 1} "
+                f"conv={1e3 * (marks[1] - marks[0]):.3f}ms "
+                f"gate={1e3 * (marks[2] - marks[1]):.3f}ms "
+                f"scan={1e3 * (marks[3] - marks[2]):.3f}ms "
+                f"scatter={1e3 * (marks[4] - marks[3]):.3f}ms",
+                flush=True,
             )
         return output
 

@@ -8,7 +8,7 @@ import contextlib
 import os
 import torch
 from sglang.srt.graph import ops
-from . import image_decode_graph_enabled, prefill_graph
+from . import image_decode_graph_enabled, image_prefill_graph_enabled, prefill_graph
 from .capabilities import get_capabilities
 from sglang.srt.graph.bindings import (
     GraphBindings,
@@ -43,7 +43,7 @@ def reserve_vision_collectives(runner):
     if not widths:
         return
     vision_rows = min(
-        int(os.environ.get("SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "2304")),
+        int(os.environ.get("SGLANG_KUNPENG_VISION_SHM_MAX_ROWS", "4096")),
         int(communicator.max_tokens),
     )
     rows_by_width = dict.fromkeys(widths, vision_rows)
@@ -144,12 +144,79 @@ class QwenHybridGraphProvider:
     def supports(self, fb, kwargs):
         return self.unsupported_reason(fb, kwargs) is None
 
+    def _embed_mm_inputs_for_graph(self, runner, fb, kwargs):
+        """Eager vision tower + multimodal merge for image-prefill graphs.
+
+        Mirrors the embed stage general_mm_embed_routine runs inside the
+        eager forward (the same embed_mm_inputs call with the same argument
+        assembly), then mirrors its post-merge state (mm_inputs consumed,
+        mm_input_embeds published) and hands the merged tensors to the
+        model forward via kwargs. The model's forward override detects
+        input_embeds and runs the language tower + logits only, which is
+        the capturable body; every replay re-runs this pre-stage because
+        vision features differ per request.
+        """
+        from sglang.srt.managers.mm_utils import embed_mm_inputs
+
+        model = runner.model
+        mm_inputs_list = [
+            mm_input for mm_input in fb.mm_inputs if mm_input is not None
+        ]
+        extend_prefix_lens = [
+            prefix_len
+            for i, prefix_len in enumerate(fb.extend_prefix_lens_cpu)
+            if fb.mm_inputs[i] is not None
+        ]
+        extend_seq_lens = [
+            seq_len
+            for i, seq_len in enumerate(fb.extend_seq_lens_cpu)
+            if fb.mm_inputs[i] is not None
+        ]
+        use_deepstack = getattr(model, "use_deepstack", None)
+        if use_deepstack is None:
+            # qwen3_vl publishes {IMAGE: True, VIDEO: True}; derive the same
+            # policy from the tower's deepstack indexes if the wrapper does
+            # not expose the dict.
+            if getattr(model, "deepstack_visual_indexes", None):
+                from sglang.srt.managers.schedule_batch import Modality
+
+                use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+            else:
+                use_deepstack = {}
+        input_embeds, other_info = embed_mm_inputs(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=fb.input_ids,
+            input_embedding=model.get_input_embeddings(),
+            multimodal_model=model,
+            use_deepstack=use_deepstack,
+        )
+        fb.mm_inputs = None
+        fb.mm_input_embeds = input_embeds
+        kwargs["input_embeds"] = input_embeds
+        deepstack = other_info.get("input_deepstack_embeds")
+        if deepstack is not None:
+            kwargs["input_deepstack_embeds"] = deepstack
+
     def bind(self, runner, fb, kwargs):
         from sglang.srt.graph.collect_weights import collect_model_weights
 
         # Sampling returns int32 IDs; the embedding graph uses int64 for both
         # greedy and sampled decode steps. Normalize before binding inputs.
         fb.input_ids = fb.input_ids.to(torch.int64)
+        if (
+            fb.forward_mode.name == "EXTEND"
+            and fb.contains_image_inputs()
+            and image_prefill_graph_enabled()
+        ):
+            # War B: the image gate released this batch; run the vision
+            # tower + multimodal merge eagerly here (bind runs outside any
+            # capture context), exactly as the eager forward would. The
+            # merged tensors are bound as dynamic inputs below and handed
+            # to the model forward via kwargs, so the captured body is the
+            # language tower + logits only.
+            self._embed_mm_inputs_for_graph(runner, fb, kwargs)
         if self.weights is None:
             for module in runner.model.modules():
                 rotary = getattr(module, "rotary_emb", None)
@@ -198,6 +265,15 @@ class QwenHybridGraphProvider:
             "extend_start_loc",
         ):
             dynamic(name, getattr(fb, name, None))
+        if kwargs.get("input_embeds") is not None:
+            # War B merged multimodal embeddings (see
+            # _embed_mm_inputs_for_graph): bound like any other dynamic
+            # input so every replay refreshes them, and their presence in
+            # the aliases list splits the graph cache signature from
+            # text-prefill graphs of the same (total_tokens, batch_size).
+            dynamic("input_embeds", kwargs["input_embeds"])
+        if kwargs.get("input_deepstack_embeds") is not None:
+            dynamic("input_deepstack_embeds", kwargs["input_deepstack_embeds"])
         ragged = getattr(fb, "_draft_extend_ragged", None)
         if ragged is not None:
             # Data-dependent row mapping of the ragged draft-extend; rebuilt

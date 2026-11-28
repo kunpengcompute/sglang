@@ -12,11 +12,27 @@ def image_decode_graph_enabled():
     # three components (ForwardBatch._expand_mrope_from_input), so fused
     # kernels that read one position per token row stay correct for image
     # requests while decoding. PREFILL must remain excluded: image prefill
-    # positions have genuinely distinct t/h/w rows. The graph gate
-    # (graph_provider.py) and the use_native_batch gate (qwen3_5.py) must
-    # always flip together because decode graphs share one cache key, hence
-    # a single env for both. Opt out with SGLANG_KUNPENG_GRAPH_IMAGE_DECODE=0.
+    # positions have genuinely distinct t/h/w rows. After the upstream
+    # v0.5.11 refresh the fused use_native_batch path in qwen3_5.py is
+    # unconditional, so this env governs only the decode graph gate
+    # (graph_provider.py). Opt out with SGLANG_KUNPENG_GRAPH_IMAGE_DECODE=0.
     return os.environ.get("SGLANG_KUNPENG_GRAPH_IMAGE_DECODE", "1") != "0"
+
+
+def image_prefill_graph_enabled():
+    # Allow image-carrying EXTEND batches into the prefill graph. The graph
+    # provider's bind() runs the vision tower + multimodal merge eagerly
+    # (outside any capture context) and feeds the merged input_embeds /
+    # input_deepstack_embeds as dynamic graph inputs, so the captured body
+    # is the language tower + logits only. The rope entry stays whatever
+    # the eager path uses, so captured numerics equal eager numerics. The
+    # prefill gate (prefill_graph.py) is the only gate that flips: decode
+    # graphs keep their own cache key and image DECODE admission stays
+    # governed by image_decode_graph_enabled. Default on since the
+    # 2026-11-24 validation rounds (numerics + full-size sweep); opt out
+    # with SGLANG_KUNPENG_GRAPH_IMAGE_PREFILL=0. Deployments that do not
+    # enable the prefill graph itself never reach this gate.
+    return os.environ.get("SGLANG_KUNPENG_GRAPH_IMAGE_PREFILL", "1") != "0"
 
 
 def configure_hbw_shm():

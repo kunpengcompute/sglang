@@ -1713,6 +1713,46 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         forward_batch.input_deepstack_embeds = other.get("input_deepstack_embeds")
         forward_batch.mm_inputs = None
 
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *args,
+        **kwargs,
+    ):
+        # Kunpeng image-prefill graph path (War B): the graph provider's
+        # bind() ran the vision tower + multimodal merge eagerly (outside
+        # the capture) and passed the merged embeddings through kwargs.
+        # Run the language tower + logits only -- the capturable body.
+        # Numerics equal the eager path: the same kernels run on the same
+        # merged inputs (graph_provider.py _embed_mm_inputs_for_graph).
+        if (
+            kwargs.get("input_embeds") is not None
+            and not kwargs.get("get_embedding", False)
+            and not getattr(self, "capture_aux_hidden_states", False)
+        ):
+            input_embeds = kwargs.pop("input_embeds")
+            input_deepstack_embeds = kwargs.pop("input_deepstack_embeds", None)
+            if (
+                getattr(self, "is_mrope_enabled", False)
+                and forward_batch.mrope_positions is not None
+            ):
+                positions = forward_batch.mrope_positions
+            hidden_states = self.model(
+                input_ids=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
+                **kwargs,
+            )
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        return super().forward(input_ids, positions, forward_batch, *args, **kwargs)
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
@@ -1872,6 +1912,46 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *args,
+        **kwargs,
+    ):
+        # Kunpeng image-prefill graph path (War B): the graph provider's
+        # bind() ran the vision tower + multimodal merge eagerly (outside
+        # the capture) and passed the merged embeddings through kwargs.
+        # Run the language tower + logits only -- the capturable body.
+        # Numerics equal the eager path: the same kernels run on the same
+        # merged inputs (graph_provider.py _embed_mm_inputs_for_graph).
+        if (
+            kwargs.get("input_embeds") is not None
+            and not kwargs.get("get_embedding", False)
+            and not getattr(self, "capture_aux_hidden_states", False)
+        ):
+            input_embeds = kwargs.pop("input_embeds")
+            input_deepstack_embeds = kwargs.pop("input_deepstack_embeds", None)
+            if (
+                getattr(self, "is_mrope_enabled", False)
+                and forward_batch.mrope_positions is not None
+            ):
+                positions = forward_batch.mrope_positions
+            hidden_states = self.model(
+                input_ids=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
+                **kwargs,
+            )
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        return super().forward(input_ids, positions, forward_batch, *args, **kwargs)
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)

@@ -6,7 +6,7 @@ from sglang.srt.graph import ops
 from sglang.srt.utils.common import is_kunpeng_extend_pad
 
 
-def conv_prefill(x, weight, bias, activation, state, initial, indices, qsl, seq_lens_cpu):
+def conv_prefill(x, weight, bias, activation, state, initial, indices, qsl, seq_lens_cpu, *, metadata_validated=False):
     from . import prefill_graph
     if (
         indices.numel() == 1
@@ -19,7 +19,8 @@ def conv_prefill(x, weight, bias, activation, state, initial, indices, qsl, seq_
         and not is_kunpeng_extend_pad()
     ):
         return prefill_graph.conv_c1(x, weight, bias, activation, state, initial, indices)
-    return prefill_graph.conv_segmented(x, weight, bias, activation, state, initial, indices, qsl)
+    return prefill_graph.conv_segmented(x, weight, bias, activation, state, initial, indices, qsl,
+                                        metadata_validated=metadata_validated)
 
 def gating(A_log, a, b, dt_bias, beta=1., threshold=20.):
     from .backend import cast

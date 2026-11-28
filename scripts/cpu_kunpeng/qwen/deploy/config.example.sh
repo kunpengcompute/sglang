@@ -85,6 +85,21 @@ export CPU_FREQ_TOLERANCE_MHZ=20
 export CPU_FREQ_RESTORE_MHZ=1550  # 本集群恢复值，换机器需确认
 export CPU_REMAP_SAME_NUMA=0
 
+export QWEN_HOST=0.0.0.0
+export QWEN_HTTP_PORT=31086
+export QWEN_DIST_PORT=29986
+export QWEN_CONTEXT_LENGTH=69632
+export QWEN_MAX_TOTAL_TOKENS=73728
+export QWEN_MAX_RUNNING_REQUESTS=16
+export QWEN_SEED=77101
+# 注意力后端：第7节已显式export ATTENTION_BACKEND="kunpeng_cpu"（此前本块约定
+# 不设、依赖launch.py缺省传kunpeng_cpu；历史上为绕开vision运行时init崩溃而设
+# 的torch_native覆盖已不再需要，2026-11-24上机验证）。
+export QWEN_TEST_INPUT_TOKENS=1024
+export QWEN_TEST_OUTPUT_TOKENS=1024
+export QWEN_TEST_CONCURRENCY=1
+export QWEN_TEST_WARMUP_TOKENS=16
+
 # ── 5. 日志：每条流16MiB、2份备份；历史保留由prune命令执行 ──
 export LOG_LEVEL=warning
 export LOG_MAX_MIB=16

@@ -85,7 +85,7 @@ void validate_extend_metadata(const at::Tensor &qsl, const at::Tensor &indices, 
     }
 }
 
-void conv(std::vector<at::Tensor> &t) {
+void conv(std::vector<at::Tensor> &t, bool metadata_validated = false) {
     TORCH_CHECK(t.size() == 10, "Segmented conv prefill graph ABI");
     for (int i : {2, 6, 9}) check(t[i], at::kBFloat16);
     for (int i : {1, 7, 8}) check(t[i], at::kFloat);
@@ -99,24 +99,18 @@ void conv(std::vector<at::Tensor> &t) {
                     t[1].sizes() == at::IntArrayRef({channels, 4}) && t[2].dim() == 3 &&
                     t[2].size(1) == channels && t[2].size(2) == 3 &&
                     t[9].sizes() == t[0].sizes(), "Segmented conv shapes");
-    const auto live_end = integer(t[5], t[5].numel() - 1);
-    TORCH_CHECK(live_end > 0 && live_end <= m, "Segmented conv live tokens exceed the rows");
+    if (!metadata_validated)
+        validate_extend_metadata(t[5], t[4], t[2].size(0));
     const auto sequences = t[5].numel() - 1;
-    TORCH_CHECK(t[3].dim() == 1 && t[3].numel() == sequences && t[4].dim() == 1 &&
-                    t[4].numel() == sequences &&
+    TORCH_CHECK(t[3].dim() == 1 && t[3].numel() == sequences &&
                     t[6].dim() == 1 && t[6].numel() >= channels * (m + 3) &&
                     t[7].dim() == 1 && t[7].numel() >= channels * m * 4 &&
                     t[8].dim() == 1 && t[8].numel() >= channels * m,
                 "Segmented conv explicit workspace/initial-state metadata");
     // Every live boundary/slot/alias is checked before the first state write.
-    std::unordered_set<int64_t> slots;
-    for (int64_t seq = 0; seq < sequences; ++seq) {
+    for (int64_t seq = 0; seq < sequences; ++seq)
         TORCH_CHECK(integer(t[5], seq + 1) > integer(t[5], seq),
                     "Segmented conv requires nonempty requests");
-        const auto slot = integer(t[4], seq);
-        TORCH_CHECK(slot > 0 && slot < t[2].size(0) && slots.insert(slot).second,
-                    "Segmented conv state slot out of range or duplicated");
-    }
     isolated(t, {2, 6, 7, 8, 9});
     const auto weight = t[1].view({1, channels, 1, 4});
     for (int64_t seq = 0; seq < sequences; ++seq) {
@@ -441,19 +435,10 @@ extern "C" void qwen_graph_prefill_shared_dispatch(std::vector<at::Tensor> &t,
     shared(t, std::get<double>(s[0]), s.size() == 2 && std::get<bool>(s[1]));
 }
 extern "C" void qwen_graph_conv_prefill_dispatch(std::vector<at::Tensor> &t,
-                                                 const std::vector<ScalarArg> &s) {
-    // The legacy metadata_validated flag is intentionally NOT accepted: a
-    // recorded bool here proves the running Python predates the power-of-2
-    // padding fix, and silently ignoring it would re-enable the pre-fix
-    // bugs (KV slot pollution, conv_c1 state tail, baked live boundary).
-    TORCH_CHECK(s.empty(),
-                "Segmented conv prefill scalar ABI: the captured op still "
-                "records the legacy metadata_validated flag, so the running "
-                "Python side predates the power-of-2 padding fix. Redeploy "
-                "the sglang Python package (NUMA images) and relaunch; "
-                "running the old Python with the new kernel would silently "
-                "produce corrupted outputs.");
-    conv(t);
+                                                const std::vector<ScalarArg> &s) {
+    TORCH_CHECK(s.empty() || (s.size() == 1 && std::holds_alternative<bool>(s[0])),
+                "Segmented conv prefill scalar ABI");
+    conv(t, !s.empty() && std::get<bool>(s[0]));
 }
 extern "C" void qwen_graph_validate_prefill_kv_dispatch(std::vector<at::Tensor> &t,
                                                       const std::vector<ScalarArg> &s) {

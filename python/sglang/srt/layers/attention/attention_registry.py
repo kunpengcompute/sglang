@@ -184,6 +184,27 @@ def create_kunpeng_backend(runner):
     if getattr(runner.model, "_kunpeng_explicit_graph", False):
         from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_hybrid_backend import KunpengGQABackend
         return KunpengGQABackend()
+    from sglang.srt.hardware_backend.cpu_kunpeng.qwen import enabled as _kunpeng_qwen_enabled
+
+    if _kunpeng_qwen_enabled():
+        # The vision-enabled Qwen runtime (the marker above selects the
+        # text-only explicit-graph class). TorchNativeAttnBackend is the
+        # full-attention backend this runtime has always run with: it
+        # embeds the kunpeng native routing (rowwise GQA decode/verify,
+        # the SME flash prefill through prefill_graph.forward_attention,
+        # SDPA only as the unsupported-batch fallback) and carries the
+        # graph-runner interface the hybrid wrapper delegates to. So the
+        # kunpeng_cpu slot composes into KunpengVisionHybridBackend with
+        # behavior identical to the proven torch_native config.
+        # KunpengCpuBackend is the DeepSeek MLA implementation and its
+        # init dies on this model's config (qk_nope_head_dim) - the
+        # startup crash that forced multimodal deployments to override
+        # the launcher's kunpeng_cpu default.
+        from sglang.srt.layers.attention.torch_native_backend import (
+            TorchNativeAttnBackend,
+        )
+
+        return TorchNativeAttnBackend(runner)
     from sglang.srt.hardware_backend.cpu_kunpeng.attention.kunpeng_cpu_backend import KunpengCpuBackend
 
     return KunpengCpuBackend(runner)

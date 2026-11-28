@@ -11,6 +11,7 @@ import os
 import torch
 from sgl_kernel import common_ops
 from sglang.srt.graph import is_capturing, ops, register_op
+from . import image_prefill_graph_enabled
 from .capabilities import get_capabilities
 
 
@@ -34,8 +35,12 @@ def unsupported_reason(fb):
         return "prefill_total_tokens_outside_1_4096"
     if not 1 <= fb.batch_size <= fb.input_ids.numel():
         return "prefill_invalid_request_count"
-    if fb.contains_image_inputs() and getattr(fb, "mm_input_embeds", None) is None:
-        return "image_inputs_not_embedded"
+    if fb.contains_image_inputs() and not image_prefill_graph_enabled():
+        # War B: with SGLANG_KUNPENG_GRAPH_IMAGE_PREFILL=1 the provider's
+        # bind() runs the vision tower + mm merge eagerly and binds the
+        # merged embeddings as dynamic graph inputs, so the captured body
+        # is the language tower + logits only (graph_provider.py).
+        return "image_inputs"
     # The provider checks the mask before capture. Calling any() while capturing
     # would create an unregistered scalar tensor in the boxed ATen bridge.
     if getattr(fb, "mamba_checkpoint_offsets", None) is not None and getattr(
@@ -205,7 +210,8 @@ def register():
         lambda *args: torch.ops.sgl_kernel.qwen_registered_validate_prefill_kv(*args),
     )
 
-    def conv_shape(x, weight, state, initial, indices, qsl, joined, product, reduced):
+    def conv_shape(x, weight, state, initial, indices, qsl, joined, product, reduced,
+                   metadata_validated=False):
         assert x.ndim == 2 and x.dtype == torch.bfloat16
         channels, tokens = x.shape
         assert tokens_supported(tokens) and weight.shape == (channels, 4)
@@ -221,7 +227,7 @@ def register():
     register_op(
         "qwen_conv_prefill",
         conv_shape,
-        lambda x, w, s, initial, ids, qsl, joined, product, reduced:
+        lambda x, w, s, initial, ids, qsl, joined, product, reduced, metadata_validated=False:
             torch.ops.sgl_kernel.qwen_registered_conv_prefill(
                 x, w, s, initial, ids, qsl, joined, product, reduced),
     )
@@ -477,7 +483,8 @@ def conv_c1(x, weight, bias, activation, state, has_initial_state, indices):
     return output
 
 
-def conv_segmented(x, weight, bias, activation, state, has_initial_state, indices, qsl):
+def conv_segmented(x, weight, bias, activation, state, has_initial_state, indices, qsl,
+                   *, metadata_validated=False):
     """Consume live segment boundaries at replay, retaining the C1 arithmetic."""
     assert bias is None and activation in ("silu", "swish")
     assert weight.shape == (x.shape[0], 4) and tokens_supported(x.shape[1])
@@ -487,9 +494,11 @@ def conv_segmented(x, weight, bias, activation, state, has_initial_state, indice
     joined = ops.alloc_buffer(channels * (tokens + 3), dtype=x.dtype)
     product = ops.alloc_buffer(channels * tokens * 4, dtype=torch.float32)
     reduced = ops.alloc_buffer(channels * tokens, dtype=torch.float32)
+    from sglang.srt.graph import is_capturing
+
     value = ops.qwen_conv_prefill(
         x, contiguous(cast(weight, torch.float32)), state, has_initial_state, indices, qsl,
-        joined, product, reduced,
+        joined, product, reduced, bool(metadata_validated and is_capturing()),
     )
     output = ops.alloc_buffer(x.numel(), dtype=x.dtype).view(x.shape)
     ops.copy_kunpeng(output, value)
