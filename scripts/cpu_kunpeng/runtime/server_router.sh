@@ -130,8 +130,12 @@ if [[ -n "${ROUTER_PREFILL_POLICY:-}" ]]; then
             --prefill-policy "$ROUTER_PREFILL_POLICY"
             --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-64}"
             --balance-rel-threshold "${ROUTER_BALANCE_REL_THRESHOLD:-1.5}"
-            --bucket-adjust-interval-secs "${ROUTER_BUCKET_ADJUST_INTERVAL_SECS:-5}"
         )
+        # bucket_adjust_interval_secs only exists for bucket/grouped_threshold.
+        # So passing it for round_robin/cache_aware makes clap reject the whole command line.
+        if [[ "$ROUTER_PREFILL_POLICY" == "bucket" || "$ROUTER_PREFILL_POLICY" == "grouped_threshold" ]]; then
+            SPECIFIC_ARGS+=(--bucket-adjust-interval-secs "${ROUTER_BUCKET_ADJUST_INTERVAL_SECS:-5}")
+        fi
     fi
 fi
 

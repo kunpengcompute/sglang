@@ -54,7 +54,8 @@ export ROUTER_IP="xxx.xxx.xxx.1"
 # backends — requires >= 2 prefill entries in INSTANCES (e.g.
 # "prefill,prefill_lc,decode"): the gateway sizes request buckets per
 # prefill worker and rebalances them periodically.
-export ROUTER_PREFILL_POLICY=""
+# Keep an env override (ROUTER_PREFILL_POLICY=... launch.sh router); empty by default.
+export ROUTER_PREFILL_POLICY="${ROUTER_PREFILL_POLICY:-}"
 # Bucket-policy tuning knobs (used only when ROUTER_PREFILL_POLICY=bucket):
 export ROUTER_BALANCE_ABS_THRESHOLD=64
 export ROUTER_BALANCE_REL_THRESHOLD=1.5

@@ -1124,7 +1124,13 @@ class GroupCoordinator:
                 )
             else:
                 if _is_cpu_920f:
-                    logger.warning(f"[gloo] fall back to Gloo/kuccl all-gather for {input_.size()}")
+                    # Generic (non-SHM) all-gather; the backend is whatever
+                    # cpu_group was initialized with (it can be gloo or
+                    # kuccl), so the tag names the path, not the backend.
+                    logger.warning(
+                        f"[allgather] fall back to generic all-gather "
+                        f"(no SHM fast path) for {input_.size()}"
+                    )
                 torch.distributed.all_gather_into_tensor(
                     output_tensor,
                     input_,

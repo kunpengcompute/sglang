@@ -141,6 +141,14 @@ export SGLANG_KUNPENG_FLASH_COMM="${SGLANG_KUNPENG_FLASH_COMM:-0}"
 # routed_dp_rank win and registers the actual rank for decode to look up.
 # Prefill only: enabling it on decode would send EVERY request through the
 # /query_dp_ranks slow path.
+#
+# IMPORTANT: with this enabled, any request that pins a prefill rank MUST
+# carry BOTH fields with the same value:
+#   routed_dp_rank            -> prefill dispatch target
+#   disagg_prefill_dp_rank    -> decode-side hint; decode then never queries
+# routed_dp_rank alone is not enough: decode has no hint and falls back to
+# room % dp_size, so it connects to the wrong prefill rank whenever the pinned
+# rank differs from the room. curl.sh -d already sends both fields.
 export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK="${SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK:-1}"
 
 # ---- kutacc fused-MoE switches --------------------------------------------

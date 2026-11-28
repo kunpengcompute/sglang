@@ -1860,17 +1860,24 @@ def run_benchmark(args_: argparse.Namespace):
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
 
-    # Pin bootstrap_room so repeated runs reuse the same rank's prefix cache.
-    # With prefill --load-balance-method follow_bootstrap_room the dp rank is
-    # bootstrap_room % dp_size, so room = base + i pins request i to a fixed
-    # rank.  -1 = let the gateway assign a random room.
-    bootstrap_room_base = getattr(args, "bootstrap_room_base", -1)
-    if bootstrap_room_base >= 0:
+    # Per-request DP pinning for PD benchmarks: routed_dp_rank cycles over the
+    # decode DP ranks (request_index % N); the prefill hint is the same value
+    # wrapped into the prefill DP space (routed % M), matching the prefill-side
+    # routed_dp_rank % dp_size wrap. 0 = disabled.
+    routed_dp_rank_mod = getattr(args, "routed_dp_rank_mod", 0) or 0
+    if routed_dp_rank_mod > 0:
+        prefill_dp_size = getattr(args, "prefill_dp_size", 0) or routed_dp_rank_mod
+        prefill_instances = max(1, getattr(args, "prefill_instance_count", 1) or 1)
         for i, req in enumerate(input_requests):
             if isinstance(req, dict):  # mooncake returns raw dicts
                 continue
             extra = dict(req.extra_request_body or {})
-            extra["bootstrap_room"] = bootstrap_room_base + i
+            # With P prefill instances the router round-robins requests across
+            # them, so repeat each rank P times (0,0,1,1,...): every instance
+            # then sees each rank once per sweep.
+            routed_rank = (i // prefill_instances) % routed_dp_rank_mod
+            extra["routed_dp_rank"] = routed_rank
+            extra["disagg_prefill_dp_rank"] = routed_rank % prefill_dp_size
             req.extra_request_body = extra
 
     # compatible with SimpleNamespace
@@ -2146,12 +2153,28 @@ if __name__ == "__main__":
         "additional generate params like sampling params.",
     )
     parser.add_argument(
-        "--bootstrap-room-base",
+        "--routed-dp-rank-mod",
         type=int,
-        default=-1,
-        help="Set bootstrap_room = base + request_index (base >= 0).  Requires "
-        "prefill --load-balance-method follow_bootstrap_room; the dp rank then "
-        "becomes (base + i) %% dp_size.  -1 = let the gateway assign a room.",
+        default=0,
+        help="Pin each request to routed_dp_rank = request_index %% N (N > 0), "
+        "cycling over the decode DP ranks. 0 = disabled.",
+    )
+    parser.add_argument(
+        "--prefill-dp-size",
+        type=int,
+        default=0,
+        help="With --routed-dp-rank-mod N, send disagg_prefill_dp_rank = "
+        "routed_dp_rank %% M with M = this value (the prefill instance's "
+        "dp_size). 0 = same as N (equal prefill/decode DP sizes).",
+    )
+    parser.add_argument(
+        "--prefill-instance-count",
+        type=int,
+        default=1,
+        help="Number of prefill instances the router round-robins over. With "
+        "P instances each rank is repeated P times (0,0,1,1,...) so every "
+        "instance sees each rank once per sweep. Requires the router's "
+        "prefill policy to be round_robin. Default 1 (0,1,2,...).",
     )
     parser.add_argument(
         "--apply-chat-template",

@@ -100,6 +100,12 @@ DEFAULT_SHAREGPT_RANDOM_OUTPUT_LEN=1024
 # 1 = strictly fixed in/out lengths; 0 = uniform in [1, full_len]
 DEFAULT_SHAREGPT_RANDOM_RANGE_RATIO=1
 DEFAULT_SHAREGPT_MAX_CONCURRENCY=256
+# (sharegpt) per-request DP pinning for PD runs. 1 = pin every request to a
+# DP rank: routed_dp_rank cycles the decode dp_size, repeated once per prefill
+# instance, and the prefill hint wraps into the prefill dp_size. Sizes are
+# auto-derived from the side envs; SHAREGPT_ROUTED_DP_RANK_MOD /
+# SHAREGPT_PREFILL_DP_SIZE / SHAREGPT_PREFILL_INSTANCE_COUNT override them.
+DEFAULT_SHAREGPT_DP_PIN=1
 # (sharegpt) client core binding. Default reuses the aisbench client range
 # (DEFAULT_AIS_TASKSET_CPUS, tuned in runtime/.user_env_base.sh, e.g.
 # 532-568 = NUMA 14) — a NUMA that is idle on the router node. Override with
@@ -208,6 +214,41 @@ cleanup_profile() {
     fi
 }
 
+# First INSTANCES entry of a side ("prefill"/"decode"), echoing its instance
+# suffix (empty for a bare entry). Prints nothing when the side is absent.
+side_first_instance() {
+    local side=$1 entry
+    for entry in ${INSTANCES//,/ }; do
+        entry="${entry//[[:space:]]/}"
+        [[ -z "$entry" ]] && continue
+        if [[ "${entry%%_*}" == "$side" ]]; then
+            [[ "$entry" == *_* ]] && echo "${entry#*_}" || echo ""
+            return
+        fi
+    done
+}
+
+# DECODE_DP_SIZE / PREFILL_DP_SIZE of a side, resolved through env.sh so
+# instance files and .user_env_* overrides are honoured. Empty on failure.
+side_dp_size() {
+    local side=$1 inst=$2 var
+    if [[ "$side" == "prefill" ]]; then var=PREFILL_DP_SIZE; else var=DECODE_DP_SIZE; fi
+    SKIP_CONDA=1 bash -c "
+        source '$SCRIPT_DIR/env.sh' '$side' '$inst' >/dev/null 2>&1
+        echo \"\${$var:-}\"" 2>/dev/null
+}
+
+# Number of prefill entries in INSTANCES (the router round-robins over them).
+prefill_instance_count() {
+    local entry n=0
+    for entry in ${INSTANCES//,/ }; do
+        entry="${entry//[[:space:]]/}"
+        [[ -z "$entry" ]] && continue
+        [[ "${entry%%_*}" == "prefill" ]] && n=$((n + 1))
+    done
+    echo "$n"
+}
+
 show_help() {
     cat <<'EOF'
 Usage: bash benchmark.sh <suite> [-p|--profile] [extra python args...]
@@ -237,6 +278,10 @@ Available test suites (6):
   sharegpt Perf run via the official sglang bench_serving on the local
            ShareGPT JSON (offline: never downloads from HuggingFace).
            Requires SHAREGPT_DATASET_PATH in runtime/.user_env_base.sh.
+           SHAREGPT_DP_PIN=1 pins every request to a DP rank: routed_dp_rank
+           cycles the decode dp_size, each rank repeats once per prefill
+           instance, and the prefill hint wraps into the prefill dp_size
+           (sizes auto-derived from the side envs).
            defaults: backend sglang, model glm-5.3, dataset-name sharegpt,
            1000 prompts (SHAREGPT_DATASET_NAME=random switches to fixed-length
            random prompts built from ShareGPT tokens)
@@ -272,6 +317,10 @@ Env overrides (runtime): HOST PORT PARALLEL
             SHAREGPT_TASKSET_CPUS (default = aisbench's
             DEFAULT_AIS_TASKSET_CPUS, the router node's idle NUMA;
             empty = no taskset binding)
+            SHAREGPT_DP_PIN (1 = per-request DP pinning; sizes auto-derived,
+            override with SHAREGPT_ROUTED_DP_RANK_MOD /
+            SHAREGPT_PREFILL_DP_SIZE / SHAREGPT_PREFILL_INSTANCE_COUNT)
+            SHAREGPT_REQUEST_RATE (req/s; empty or inf = send all at once)
   aisbench: AIS_CONDA_ENV AIS_BASE (default: auto-detected from the conda env)
             AIS_TYPE AIS_REQUESTS AIS_IN_LEN AIS_IN_LEN_MAX
             AIS_OUT_LEN AIS_OUT_LEN_MAX AIS_MAX_OUT_LEN AIS_BATCH
@@ -289,6 +338,7 @@ Examples:
   bash benchmark.sh mmlu  --nsub 60 --parallel 32
   bash benchmark.sh mmlu -h    # show the mmlu python script's own args
   SHAREGPT_NUM_PROMPTS=2000 bash benchmark.sh sharegpt
+  SHAREGPT_DP_PIN=1 bash benchmark.sh sharegpt     # pin rank per request
   SHAREGPT_DATASET_NAME=random bash benchmark.sh sharegpt \
       --output-file /tmp/collect.jsonl
   AIS_REQUESTS=512 AIS_IN_LEN=1024 AIS_OUT_LEN=256 bash benchmark.sh aisbench
@@ -637,6 +687,37 @@ case "$SUITE" in
                 --max-concurrency "${SHAREGPT_MAX_CONCURRENCY:-$DEFAULT_SHAREGPT_MAX_CONCURRENCY}"
             )
         fi
+        # Per-request DP pinning (SHAREGPT_DP_PIN=1). routed_dp_rank cycles the
+        # decode dp_size and the prefill hint wraps into the prefill dp_size;
+        # each rank repeats once per prefill instance so a strictly
+        # round-robin prefill policy gives every instance the full rank sweep.
+        # Explicit command-line args (forwarded via "$@") still win.
+        dp_pin_args=()
+        if [[ "${SHAREGPT_DP_PIN:-$DEFAULT_SHAREGPT_DP_PIN}" == "1" ]]; then
+            routed_mod="${SHAREGPT_ROUTED_DP_RANK_MOD:-$(side_dp_size decode "$(side_first_instance decode)")}"
+            prefill_dp="${SHAREGPT_PREFILL_DP_SIZE:-$(side_dp_size prefill "$(side_first_instance prefill)")}"
+            pf_instances="${SHAREGPT_PREFILL_INSTANCE_COUNT:-$(prefill_instance_count)}"
+            if ! [[ "$routed_mod" =~ ^[0-9]+$ ]] || (( routed_mod <= 0 )); then
+                echo "benchmark.sh: SHAREGPT_DP_PIN=1 but the decode dp_size could not be resolved (set SHAREGPT_ROUTED_DP_RANK_MOD)" >&2
+                exit 2
+            fi
+            if ! [[ "$prefill_dp" =~ ^[0-9]+$ ]] || (( prefill_dp <= 0 )); then
+                echo "benchmark.sh: SHAREGPT_DP_PIN=1 but the prefill dp_size could not be resolved (set SHAREGPT_PREFILL_DP_SIZE)" >&2
+                exit 2
+            fi
+            [[ "$pf_instances" =~ ^[0-9]+$ ]] && (( pf_instances > 0 )) || pf_instances=1
+            dp_pin_args=(
+                --routed-dp-rank-mod "$routed_mod"
+                --prefill-dp-size "$prefill_dp"
+                --prefill-instance-count "$pf_instances"
+            )
+            echo "[sharegpt] dp-pin: routed 0..$((routed_mod - 1)) x ${pf_instances} prefill instance(s), prefill hint mod ${prefill_dp}" >&2
+        fi
+        # Send rate in req/s (SHAREGPT_REQUEST_RATE); empty or inf = send every
+        # request at once (bench_serving default). A finite rate spaces the
+        # requests out so they reach the router in index order, which the DP
+        # pin's "one sweep per prefill instance" assumes.
+        rate_args=(--request-rate "${SHAREGPT_REQUEST_RATE:-inf}")
         "${launch_prefix[@]}" python3 -m sglang.bench_serving \
             --backend "${SHAREGPT_BACKEND:-$DEFAULT_SHAREGPT_BACKEND}" \
             --host "$GATEWAY_HOST" \
@@ -647,6 +728,8 @@ case "$SUITE" in
             --dataset-path "${SHAREGPT_DATASET_PATH:-$DEFAULT_SHAREGPT_DATASET_PATH}" \
             --num-prompts "${SHAREGPT_NUM_PROMPTS:-$DEFAULT_SHAREGPT_NUM_PROMPTS}" \
             "${random_args[@]}" \
+            "${dp_pin_args[@]}" \
+            "${rate_args[@]}" \
             "$@"
         ;;
     *)

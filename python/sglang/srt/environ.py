@@ -597,6 +597,10 @@ class Envs:
     SGLANG_ENABLE_BINARY_LAUNCH = EnvBool(True)
     SGLANG_KUNPENG_RDMA_ALLGATHER = EnvBool(True)
     SGLANG_KUNPENG_MAX_SEQ_NUM = EnvInt(128)
+    # Decode-only per-microbatch request cap (0 = use SGLANG_KUNPENG_MAX_SEQ_NUM).
+    # The DP/MLP-sync path requires MAX_SEQ_NUM >= 8, so a smaller decode mb
+    # (e.g. 1 request per mb for PP tests) must use this separate knob.
+    SGLANG_KUNPENG_DECODE_MB_BATCH_CAP = EnvInt(0)
     SGLANG_KUNPENG_MAX_SEQ_LEN = EnvInt(4096)
     SGLANG_KUNPENG_MEMORY_ALIGNMENT = EnvInt(4096)
     KUTACC_ASYNC_LAUNCH = EnvBool(True)

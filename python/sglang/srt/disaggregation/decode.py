@@ -97,6 +97,13 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 _is_cpu_920f = is_cpu_920f()
 kunpeng_max_seq_num = envs.SGLANG_KUNPENG_MAX_SEQ_NUM.get()
+# Decode-only microbatch cap: the DP/MLP-sync path requires
+# SGLANG_KUNPENG_MAX_SEQ_NUM >= 8, so tests that need fewer requests per mb
+# (e.g. 1 per PP microbatch) set this separate knob. 0 = keep the max-seq value.
+# Only consumed by get_new_prebuilt_batch's batch_cap below.
+_decode_mb_batch_cap = envs.SGLANG_KUNPENG_DECODE_MB_BATCH_CAP.get()
+if _decode_mb_batch_cap > 0:
+    kunpeng_max_seq_num = _decode_mb_batch_cap
 
 
 def _lc_cp_size() -> int:
